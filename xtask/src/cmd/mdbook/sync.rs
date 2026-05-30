@@ -5,7 +5,7 @@ use std::process::Command;
 pub fn run(
     locale: Option<&str>,
     force: bool,
-    provider: Option<&str>,
+    model_provider: Option<&str>,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = repo_root();
@@ -17,6 +17,7 @@ pub fn run(
     require_tool("msginit", "apt install gettext / brew install gettext")?;
     require_tool("msgfmt", "apt install gettext / brew install gettext")?;
     require_tool("msgattrib", "apt install gettext / brew install gettext")?;
+    require_tool("msgcat", "apt install gettext / brew install gettext")?;
 
     let book = book_dir(&root);
     let po_dir = po_dir(&root);
@@ -26,6 +27,7 @@ pub fn run(
 
     // Step 1: extract English msgids
     println!("==> Extracting English msgids → {}", pot.display());
+    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &locale_entries())?;
     run_cmd(
         Command::new(mdbook_program()?)
             .args(["build", "-d", "po-extract"])
@@ -45,6 +47,7 @@ pub fn run(
              cargo install mdbook-i18n-helpers --locked"
         );
     }
+    normalize_gettext_catalog(&pot)?;
 
     // Step 2+3: per-locale merge + AI fill
     let targets: Vec<String> = match locale {
@@ -84,25 +87,26 @@ pub fn run(
                     .arg(&po_file),
             )?;
         }
+        normalize_gettext_catalog(&po_file)?;
 
         if force {
-            if let Some(p) = provider {
+            if let Some(p) = model_provider {
                 println!("==> {locale}: --force: re-translating all entries");
                 fill(&root, &po_file, locale, true, p, batch)?;
             } else {
                 println!(
-                    "==> {locale}: --force requested but no --provider specified — skipping AI step"
+                    "==> {locale}: --force requested but no --model-provider specified — skipping AI step"
                 );
             }
         } else {
             let delta = count_delta(&po_file)?;
             if delta > 0 {
-                if let Some(p) = provider {
+                if let Some(p) = model_provider {
                     println!("==> {locale}: AI-filling {delta} entries");
                     fill(&root, &po_file, locale, false, p, batch)?;
                 } else {
                     println!(
-                        "==> {locale}: {delta} entries need translation (use --provider <name> to auto-fill)"
+                        "==> {locale}: {delta} entries need translation (use --model-provider <name> to auto-fill)"
                     );
                 }
             } else {
@@ -136,7 +140,7 @@ fn fill(
     po_file: &Path,
     locale: &str,
     force: bool,
-    provider: &str,
+    model_provider: &str,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     // Build and invoke the binary directly — `cargo run` wraps the child in a way that
@@ -151,7 +155,7 @@ fn fill(
     cmd.args(["--po"])
         .arg(po_file)
         .args(["--locale", locale])
-        .args(["--provider", provider]);
+        .args(["--model-provider", model_provider]);
     if let Some(b) = batch {
         cmd.args(["--batch", &b.to_string()]);
     }
@@ -159,6 +163,20 @@ fn fill(
         cmd.arg("--force");
     }
     run_cmd(&mut cmd)
+}
+
+fn normalize_gettext_catalog(path: &Path) -> anyhow::Result<()> {
+    run_cmd(
+        Command::new("msgcat")
+            .args([
+                "--sort-output",
+                "--no-wrap",
+                "--add-location=file",
+                "--output-file",
+            ])
+            .arg(path)
+            .arg(path),
+    )
 }
 
 pub fn count_delta(po_file: &Path) -> anyhow::Result<u32> {

@@ -1,6 +1,6 @@
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    ModelProvider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
 /// OpenAI's public API endpoint.
-const BASE_URL: &str = "https://api.openai.com/v1";
+pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
-pub struct OpenAiProvider {
+pub struct OpenAiModelProvider {
+    /// `[model_providers.openai.<alias>]` config-key alias.
+    alias: String,
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
@@ -81,7 +83,7 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
-    /// Raw reasoning content from thinking models; pass-through for providers
+    /// Raw reasoning content from thinking models; pass-through for model_providers
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
@@ -102,8 +104,16 @@ struct NativeToolFunctionSpec {
 }
 
 fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
-    let spec: NativeToolSpec = serde_json::from_value(value)
-        .map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?;
+    let spec: NativeToolSpec = serde_json::from_value(value).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "openai: invalid tool spec"
+        );
+        anyhow::Error::msg(format!("Invalid OpenAI tool specification: {e}"))
+    })?;
 
     if spec.kind != "function" {
         anyhow::bail!(
@@ -178,15 +188,16 @@ impl NativeResponseMessage {
     }
 }
 
-impl OpenAiProvider {
-    pub fn new(credential: Option<&str>) -> Self {
-        Self::with_base_url(None, credential)
+impl OpenAiModelProvider {
+    pub fn new(alias: &str, credential: Option<&str>) -> Self {
+        Self::with_base_url(alias, None, credential)
     }
 
-    /// Create a provider with an optional custom base URL.
-    /// Defaults to `https://api.openai.com/v1` when `base_url` is `None`.
-    pub fn with_base_url(base_url: Option<&str>, credential: Option<&str>) -> Self {
+    /// Create a model_provider with an optional custom base URL.
+    /// Falls back to `https://api.openai.com/v1` when `base_url` is `None`.
+    pub fn with_base_url(alias: &str, base_url: Option<&str>, credential: Option<&str>) -> Self {
         Self {
+            alias: alias.to_string(),
             base_url: base_url
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| BASE_URL.to_string()),
@@ -329,6 +340,7 @@ impl OpenAiProvider {
                 id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
+                extra_content: None,
             })
             .collect::<Vec<_>>();
 
@@ -342,7 +354,7 @@ impl OpenAiProvider {
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.openai",
+            "model_provider.openai",
             120,
             10,
         )
@@ -350,8 +362,8 @@ impl OpenAiProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for OpenAiModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
         Some(BASE_URL)
     }
@@ -364,7 +376,14 @@ impl Provider for OpenAiProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openai: API key not configured"
+            );
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
         let temperature = temperature.unwrap_or(self.default_temperature());
@@ -410,7 +429,15 @@ impl Provider for OpenAiProvider {
             .into_iter()
             .next()
             .map(|c| c.message.effective_content())
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openai: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenAI")
+            })
     }
 
     async fn chat(
@@ -420,7 +447,14 @@ impl Provider for OpenAiProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openai: API key not configured"
+            );
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
         let temperature = temperature.unwrap_or(self.default_temperature());
@@ -459,7 +493,15 @@ impl Provider for OpenAiProvider {
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openai: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenAI")
+            })?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -477,7 +519,14 @@ impl Provider for OpenAiProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openai: API key not configured"
+            );
+            anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
         let temperature = temperature.unwrap_or(self.default_temperature());
@@ -527,7 +576,15 @@ impl Provider for OpenAiProvider {
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openai: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenAI")
+            })?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -552,31 +609,44 @@ impl Provider for OpenAiProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenAiModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::OpenAi,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn creates_with_key() {
-        let p = OpenAiProvider::new(Some("openai-test-credential"));
+        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
         assert_eq!(p.credential.as_deref(), Some("openai-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
-        let p = OpenAiProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_empty_key() {
-        let p = OpenAiProvider::new(Some(""));
+        let p = OpenAiModelProvider::new("test", Some(""));
         assert_eq!(p.credential.as_deref(), Some(""));
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = OpenAiProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -584,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = OpenAiProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -676,8 +746,8 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = OpenAiProvider::new(None);
-        let result = provider.warmup().await;
+        let model_provider = OpenAiModelProvider::new("test", None);
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
@@ -727,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let p = OpenAiProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -752,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_rejects_invalid_tool_shape() {
-        let p = OpenAiProvider::new(Some("openai-test-credential"));
+        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -833,7 +903,7 @@ mod tests {
         }}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let message = resp.choices.into_iter().next().unwrap().message;
-        let parsed = OpenAiProvider::parse_native_response(message);
+        let parsed = OpenAiModelProvider::parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.tool_calls.len(), 1);
     }
@@ -843,13 +913,13 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let message = resp.choices.into_iter().next().unwrap().message;
-        let parsed = OpenAiProvider::parse_native_response(message);
+        let parsed = OpenAiModelProvider::parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
     }
 
     #[test]
     fn convert_messages_round_trips_reasoning_content() {
-        use zeroclaw_api::provider::ChatMessage;
+        use zeroclaw_api::model_provider::ChatMessage;
 
         let history_json = serde_json::json!({
             "content": "I will check",
@@ -862,7 +932,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiProvider::convert_messages(&messages);
+        let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(
             native[0].reasoning_content.as_deref(),
@@ -872,7 +942,7 @@ mod tests {
 
     #[test]
     fn convert_messages_no_reasoning_content_when_absent() {
-        use zeroclaw_api::provider::ChatMessage;
+        use zeroclaw_api::model_provider::ChatMessage;
 
         let history_json = serde_json::json!({
             "content": "I will check",
@@ -884,7 +954,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiProvider::convert_messages(&messages);
+        let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }
@@ -922,26 +992,32 @@ mod tests {
 
     #[test]
     fn adjust_temperature_for_o1_models() {
-        assert_eq!(OpenAiProvider::adjust_temperature_for_model("o1", 0.7), 1.0);
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("o1-2024-12-17", 0.5),
+            OpenAiModelProvider::adjust_temperature_for_model("o1", 0.7),
+            1.0
+        );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("o1-2024-12-17", 0.5),
             1.0
         );
     }
 
     #[test]
     fn adjust_temperature_for_o3_models() {
-        assert_eq!(OpenAiProvider::adjust_temperature_for_model("o3", 0.7), 1.0);
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("o3-2025-04-16", 0.5),
+            OpenAiModelProvider::adjust_temperature_for_model("o3", 0.7),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("o3-mini", 0.3),
+            OpenAiModelProvider::adjust_temperature_for_model("o3-2025-04-16", 0.5),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("o3-mini-2025-01-31", 0.8),
+            OpenAiModelProvider::adjust_temperature_for_model("o3-mini", 0.3),
+            1.0
+        );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("o3-mini-2025-01-31", 0.8),
             1.0
         );
     }
@@ -949,11 +1025,11 @@ mod tests {
     #[test]
     fn adjust_temperature_for_o4_models() {
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("o4-mini", 0.7),
+            OpenAiModelProvider::adjust_temperature_for_model("o4-mini", 0.7),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("o4-mini-2025-04-16", 0.5),
+            OpenAiModelProvider::adjust_temperature_for_model("o4-mini-2025-04-16", 0.5),
             1.0
         );
     }
@@ -961,27 +1037,27 @@ mod tests {
     #[test]
     fn adjust_temperature_for_gpt5_models() {
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5", 0.7),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5", 0.7),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5-2025-08-07", 0.5),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5-2025-08-07", 0.5),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5-mini", 0.3),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5-mini", 0.3),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5-mini-2025-08-07", 0.8),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5-mini-2025-08-07", 0.8),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5-nano", 0.6),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5-nano", 0.6),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5-nano-2025-08-07", 0.4),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5-nano-2025-08-07", 0.4),
             1.0
         );
     }
@@ -989,15 +1065,15 @@ mod tests {
     #[test]
     fn adjust_temperature_for_gpt5_chat_latest_models() {
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5.1-chat-latest", 0.7),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5.1-chat-latest", 0.7),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5.2-chat-latest", 0.5),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5.2-chat-latest", 0.5),
             1.0
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-5.3-chat-latest", 0.3),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-5.3-chat-latest", 0.3),
             1.0
         );
     }
@@ -1005,19 +1081,19 @@ mod tests {
     #[test]
     fn adjust_temperature_preserves_for_standard_models() {
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-4o", 0.7),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-4o", 0.7),
             0.7
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-4-turbo", 0.5),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-4-turbo", 0.5),
             0.5
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-3.5-turbo", 0.3),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-3.5-turbo", 0.3),
             0.3
         );
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-4", 1.0),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-4", 1.0),
             1.0
         );
     }
@@ -1026,13 +1102,16 @@ mod tests {
     fn adjust_temperature_handles_edge_cases() {
         // Temperature 0.0 should be preserved for standard models
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-4o", 0.0),
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-4o", 0.0),
             0.0
         );
         // Temperature 1.0 should be preserved for all models
-        assert_eq!(OpenAiProvider::adjust_temperature_for_model("o1", 1.0), 1.0);
         assert_eq!(
-            OpenAiProvider::adjust_temperature_for_model("gpt-4o", 1.0),
+            OpenAiModelProvider::adjust_temperature_for_model("o1", 1.0),
+            1.0
+        );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("gpt-4o", 1.0),
             1.0
         );
     }

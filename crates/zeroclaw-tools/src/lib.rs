@@ -1,5 +1,6 @@
 //! Tool implementations for agent-callable capabilities.
 
+pub mod attribution;
 pub mod microsoft365;
 pub mod util_helpers;
 
@@ -22,6 +23,7 @@ pub mod data_management;
 pub mod discord_search;
 pub mod escalate;
 pub mod file_edit;
+pub mod file_upload;
 pub mod file_write;
 pub mod gemini_cli;
 pub mod git_operations;
@@ -63,12 +65,10 @@ pub mod report_template_tool;
 pub mod report_templates;
 pub mod screenshot;
 pub mod sessions;
-pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
 pub mod weather_tool;
 pub mod web_fetch;
 pub mod web_search_provider_routing;
 pub mod web_search_tool;
-pub mod workspace_tool;
 pub mod wrappers;

@@ -220,6 +220,12 @@ const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 
+/// Feishu/Lark API business code returned when a card PATCH (or any draft
+/// message edit) is rate-limited. Treated as a soft-failure: we log a warning
+/// but never propagate to the caller, since the user-visible decision is
+/// already delivered out-of-band via the approval oneshot.
+const LARK_DRAFT_RATE_LIMIT_CODE: i64 = 230_020;
+
 /// Max byte size for a single interactive card's markdown content.
 /// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
 const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
@@ -259,6 +265,183 @@ fn build_card_content(markdown: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// Build an approval-request interactive card (Card JSON 2.0).
+///
+/// Card 2.0 is required so PATCH-time updates from
+/// `build_resolved_approval_card` can re-render the card on the user's
+/// client. Feishu's IM PATCH endpoint accepts cross-version PATCH
+/// (1.0 send → 2.0 patch) with `code: 0` but does NOT guarantee the
+/// client re-renders; the same schema must be used on both sides.
+///
+/// Each button's `behaviors[0].value.approval_id` round-trips back via
+/// the `card.action.trigger` event, parsed by `handle_card_action_event`.
+fn build_approval_card(
+    approval_id: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+) -> serde_json::Value {
+    let make_button = |label: &str, button_type: &str, decision: &str| {
+        serde_json::json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": label },
+            "type": button_type,
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "approval_id": approval_id,
+                    "decision": decision
+                }
+            }]
+        })
+    };
+
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "template": "orange",
+            "title": {
+                "tag": "plain_text",
+                "content": "🔧 Tool approval required"
+            }
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!("**Tool:** `{tool_name}`\n\n{arguments_summary}")
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "stretch",
+                    "columns": [
+                        { "tag": "column", "elements": [
+                            make_button("✅ Approve", "primary_filled", "approve")
+                        ]},
+                        { "tag": "column", "elements": [
+                            make_button("❌ Deny", "danger_filled", "deny")
+                        ]},
+                        { "tag": "column", "elements": [
+                            make_button("✅✅ Always", "default", "always")
+                        ]}
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+/// Resolved-state rendering of the approval card (no buttons, decision banner).
+///
+/// Uses Card JSON 2.0 schema (matching `build_card_content`) because the
+/// Feishu IM PATCH endpoint accepts Card 1.0 envelopes with `code: 0` but
+/// silently refuses to re-render the client-side card. Using Card 2.0 (the
+/// schema that the production-validated `build_card_content` uses) is what
+/// actually causes the visual update to land on the user's screen.
+fn build_resolved_approval_card(
+    tool_name: &str,
+    arguments_summary: &str,
+    decision: zeroclaw_api::channel::ChannelApprovalResponse,
+) -> serde_json::Value {
+    use zeroclaw_api::channel::ChannelApprovalResponse;
+
+    let (banner_emoji, banner_text, header_template) = match decision {
+        ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
+        ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
+        ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
+    };
+
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "template": header_template,
+            "title": {
+                "tag": "plain_text",
+                "content": format!("{banner_emoji} Tool approval — {banner_text}")
+            }
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "**Tool:** `{tool_name}`\n\n{arguments_summary}\n\n---\n\n**{banner_emoji} {banner_text}**"
+                    )
+                }
+            ]
+        }
+    })
+}
+
+/// Build a sanitized copy of a `card.action.trigger` event payload that is
+/// safe to emit to structured logs / dashboards / persisted JSONL.
+///
+/// The raw inbound payload from Lark/Feishu carries tenant-specific
+/// identifiers and a callback verification token. These values are
+/// classified as PII / callback secrets by the project's privacy policy
+/// (see each fixture's `_fixture_note` under `tests/fixtures/lark/` for the
+/// authoritative list of fields that must be redacted before any
+/// persistence).
+///
+/// This function replaces the following with deterministic `REDACTED_*`
+/// placeholder strings:
+///
+/// - top-level `token` (Lark callback verification token)
+/// - `operator.open_id` / `union_id` / `user_id` / `tenant_key`
+/// - `context.open_chat_id` / `context.open_message_id`
+///
+/// Non-sensitive business fields (`action.*`, `host`, etc.) are preserved
+/// verbatim so DEBUG operators can still capture production payload shape
+/// for fixture collection.
+///
+/// The input is borrowed read-only; a fresh owned `Value` is returned. The
+/// regression test `sanitize_card_action_payload_redacts_sensitive_fields`
+/// is the gate that fails if any of those raw values can leak through this
+/// path.
+fn sanitize_card_action_payload(event_payload: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut sanitized = event_payload.clone();
+
+    // Top-level callback verification token.
+    if let Some(token) = sanitized.get_mut("token")
+        && !token.is_null()
+    {
+        *token = Value::String("REDACTED_TOKEN".to_string());
+    }
+
+    // operator.* identifiers — only overwrite keys that are actually present
+    // so the sanitized payload still reflects production shape (don't
+    // invent fields that the real event didn't carry).
+    if let Some(Value::Object(operator)) = sanitized.get_mut("operator") {
+        for (key, placeholder) in [
+            ("open_id", "REDACTED_OPERATOR_OPEN_ID"),
+            ("union_id", "REDACTED_OPERATOR_UNION_ID"),
+            ("user_id", "REDACTED_OPERATOR_USER_ID"),
+            ("tenant_key", "REDACTED_OPERATOR_TENANT_KEY"),
+        ] {
+            if operator.contains_key(key) {
+                operator.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    // context.open_* identifiers.
+    if let Some(Value::Object(context)) = sanitized.get_mut("context") {
+        for (key, placeholder) in [
+            ("open_chat_id", "REDACTED_OPEN_CHAT_ID"),
+            ("open_message_id", "REDACTED_OPEN_MESSAGE_ID"),
+        ] {
+            if context.contains_key(key) {
+                context.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    sanitized
 }
 
 /// Build the full message body for sending an interactive card message.
@@ -364,15 +547,29 @@ fn ensure_lark_send_success(
     context: &str,
 ) -> anyhow::Result<()> {
     if !status.is_success() {
-        anyhow::bail!("Lark send failed {context}: status={status}, body={body}");
+        anyhow::bail!("send failed {context}: status={status}, body={body}");
     }
 
     let code = extract_lark_response_code(body).unwrap_or(0);
     if code != 0 {
-        anyhow::bail!("Lark send failed {context}: code={code}, body={body}");
+        anyhow::bail!("send failed {context}: code={code}, body={body}");
     }
 
     Ok(())
+}
+
+/// State carried between sending an approval card and the user's click.
+///
+/// Used to (a) wake the awaiting future via `sender` and (b) re-render
+/// the card after the click so the buttons disappear.
+struct PendingApproval {
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    /// `data.message_id` returned by the send-card POST. Empty string is a
+    /// sentinel meaning "card was sent but message_id was missing from the
+    /// response" — handler will skip the post-click PATCH in that case.
+    message_id: String,
+    tool_name: String,
+    arguments_summary: String,
 }
 
 /// Lark/Feishu channel.
@@ -386,7 +583,13 @@ pub struct LarkChannel {
     app_secret: String,
     verification_token: String,
     port: Option<u16>,
-    allowed_users: Vec<String>,
+    /// The alias key under `[channels.lark.<alias>]` this handle is bound to.
+    /// Used to scope peer-group writes and resolver lookups. (Pre-V3 Feishu
+    /// blocks are folded into `[channels.lark]` with `use_feishu = true`.)
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Bot open_id resolved at runtime via `/bot/v3/info`.
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
@@ -402,6 +605,13 @@ pub struct LarkChannel {
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// In-flight approval requests keyed by `approval_id` (UUID v4).
+    /// Populated by `request_approval`, drained by `handle_card_action_event`.
+    pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    /// Seconds to wait for the user's button click before auto-denying.
+    /// Currently hard-coded to 120; lift to `LarkConfig` when a use case
+    /// for per-channel overrides arises.
+    approval_timeout_secs: u64,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -412,7 +622,8 @@ impl LarkChannel {
         app_secret: String,
         verification_token: String,
         port: Option<u16>,
-        allowed_users: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         mention_only: bool,
     ) -> Self {
         Self::new_with_platform(
@@ -420,10 +631,17 @@ impl LarkChannel {
             app_secret,
             verification_token,
             port,
-            allowed_users,
+            alias,
+            peer_resolver,
             mention_only,
             LarkPlatform::Lark,
         )
+    }
+
+    /// Return the alias under `[channels.lark.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
     }
 
     fn new_with_platform(
@@ -431,7 +649,8 @@ impl LarkChannel {
         app_secret: String,
         verification_token: String,
         port: Option<u16>,
-        allowed_users: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         mention_only: bool,
         platform: LarkPlatform,
     ) -> Self {
@@ -440,7 +659,8 @@ impl LarkChannel {
             app_secret,
             verification_token,
             port,
-            allowed_users,
+            alias: alias.into(),
+            peer_resolver,
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
             platform,
@@ -450,6 +670,8 @@ impl LarkChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            approval_timeout_secs: 120,
             #[cfg(test)]
             api_base_override: None,
         }
@@ -457,7 +679,11 @@ impl LarkChannel {
 
     /// Build from `LarkConfig` using legacy compatibility:
     /// when `use_feishu=true`, this instance routes to Feishu endpoints.
-    pub fn from_config(config: &zeroclaw_config::schema::LarkConfig) -> Self {
+    pub fn from_config(
+        config: &zeroclaw_config::schema::LarkConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         let platform = if config.use_feishu {
             LarkPlatform::Feishu
         } else {
@@ -468,43 +694,10 @@ impl LarkChannel {
             config.app_secret.clone(),
             config.verification_token.clone().unwrap_or_default(),
             config.port,
-            config.allowed_users.clone(),
+            alias,
+            peer_resolver,
             config.mention_only,
             platform,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.proxy_url = config.proxy_url.clone();
-        ch
-    }
-
-    /// Build from `LarkConfig` forcing `LarkPlatform::Lark`, ignoring the
-    /// legacy `use_feishu` flag.  Used by the channel factory when the config
-    /// section is explicitly `[channels_config.lark]`.
-    pub fn from_lark_config(config: &zeroclaw_config::schema::LarkConfig) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            config.mention_only,
-            LarkPlatform::Lark,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.proxy_url = config.proxy_url.clone();
-        ch
-    }
-
-    /// Build from `FeishuConfig` with `LarkPlatform::Feishu`.
-    pub fn from_feishu_config(config: &zeroclaw_config::schema::FeishuConfig) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            config.mention_only,
-            LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
@@ -520,11 +713,27 @@ impl LarkChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Bind the sole registered provider as the agent transcription
+                // provider for the channel-direct ingest path. Multi-provider
+                // setups still resolve via the orchestrator's per-agent
+                // routing (see orchestrator/mod.rs). See wati.rs for full
+                // rationale.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(Arc::new(m));
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, audio transcription disabled: {e}"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "transcription manager init failed, audio transcription disabled"
                 );
             }
         }
@@ -565,6 +774,13 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    /// PATCH endpoint for updating the content of a previously-sent message
+    /// (used to flip an approval card from its interactive state to its
+    /// resolved/banner state after the user clicks a button).
+    fn patch_message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}", self.api_base())
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -630,7 +846,13 @@ impl LarkChannel {
         let mut token = match self.get_tenant_access_token().await {
             Ok(token) => token,
             Err(err) => {
-                tracing::warn!("Lark: failed to fetch token for reaction: {err}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "failed to fetch token for reaction"
+                );
                 return;
             }
         };
@@ -643,7 +865,7 @@ impl LarkChannel {
             {
                 Ok(resp) => resp,
                 Err(err) => {
-                    tracing::warn!("Lark: failed to add reaction for {message_id}: {err}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "message_id": message_id})), "failed to add reaction for");
                     return;
                 }
             };
@@ -653,9 +875,7 @@ impl LarkChannel {
                 token = match self.get_tenant_access_token().await {
                     Ok(new_token) => new_token,
                     Err(err) => {
-                        tracing::warn!(
-                            "Lark: failed to refresh token for reaction on {message_id}: {err}"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"message_id": message_id, "err": err.to_string()})), "failed to refresh token for reaction on");
                         return;
                     }
                 };
@@ -666,16 +886,14 @@ impl LarkChannel {
             if !response.status().is_success() {
                 let status = response.status();
                 let err_body = response.text().await.unwrap_or_default();
-                tracing::warn!(
-                    "Lark: add reaction failed for {message_id}: status={status}, body={err_body}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add reaction failed for : status=, body=");
                 return;
             }
 
             let payload: serde_json::Value = match response.json().await {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::warn!("Lark: add reaction decode failed for {message_id}: {err}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "message_id": message_id})), "add reaction decode failed for");
                     return;
                 }
             };
@@ -686,7 +904,7 @@ impl LarkChannel {
                     .get("msg")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                tracing::warn!("Lark: add reaction returned code={code} for {message_id}: {msg}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code.to_string(), "message_id": message_id, "msg": msg.to_string()})), "add reaction returned code= for");
             }
             return;
         }
@@ -708,14 +926,20 @@ impl LarkChannel {
             .await?;
         if resp.code != 0 {
             anyhow::bail!(
-                "Lark WS endpoint failed: code={} msg={}",
+                "WS endpoint failed: code={} msg={}",
                 resp.code,
                 resp.msg.as_deref().unwrap_or("(none)")
             );
         }
-        let ep = resp
-            .data
-            .ok_or_else(|| anyhow::anyhow!("Lark WS endpoint: empty data"))?;
+        let ep = resp.data.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "WS endpoint: empty data"
+            );
+            anyhow::Error::msg("WS endpoint: empty data")
+        })?;
         Ok((ep.url, ep.client_config.unwrap_or_default()))
     }
 
@@ -735,7 +959,12 @@ impl LarkChannel {
                     .and_then(|v| v.parse::<i32>().ok())
             })
             .unwrap_or(0);
-        tracing::info!("Lark: connecting to {wss_url}");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"wss_url": wss_url})),
+            "connecting to"
+        );
 
         let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
             &wss_url,
@@ -744,7 +973,12 @@ impl LarkChannel {
         )
         .await?;
         let (mut write, mut read) = ws_stream.split();
-        tracing::info!("Lark: WS connected (service_id={service_id})");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"service_id": service_id})),
+            "WS connected (service_id=)"
+        );
 
         let mut ping_secs = client_config.ping_interval.unwrap_or(120).max(10);
         let mut hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
@@ -773,7 +1007,7 @@ impl LarkChannel {
             .await
             .is_err()
         {
-            anyhow::bail!("Lark: initial ping failed");
+            anyhow::bail!("initial ping failed");
         }
         // message_id → (fragment_slots, created_at) for multi-part reassembly
         type FragEntry = (Vec<Option<Vec<u8>>>, Instant);
@@ -791,7 +1025,7 @@ impl LarkChannel {
                         payload: None,
                     };
                     if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
-                        tracing::warn!("Lark: ping failed, reconnecting");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "ping failed, reconnecting");
                         break;
                     }
                     // GC stale fragments > 5 min
@@ -801,7 +1035,7 @@ impl LarkChannel {
 
                 _ = timeout_check.tick() => {
                     if last_recv.elapsed() > WS_HEARTBEAT_TIMEOUT {
-                        tracing::warn!("Lark: heartbeat timeout, reconnecting");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "heartbeat timeout, reconnecting");
                         break;
                     }
                 }
@@ -815,17 +1049,17 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
+                                WsMsg::Close(_) => { ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS closed — reconnecting"); break; }
                                 _ => continue,
                             }
                         }
-                        None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
-                        Some(Err(e)) => { tracing::error!("Lark: WS read error: {e}"); break; }
+                        None => { ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS closed — reconnecting"); break; }
+                        Some(Err(e)) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "WS read error"); break; }
                     };
 
                     let frame = match PbFrame::decode(&raw[..]) {
                         Ok(f) => f,
-                        Err(e) => { tracing::error!("Lark: proto decode: {e}"); continue; }
+                        Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "proto decode"); continue; }
                     };
 
                     // CONTROL frame
@@ -838,7 +1072,7 @@ impl LarkChannel {
                                         if secs != ping_secs {
                                             ping_secs = secs;
                                             hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
-                                            tracing::info!("Lark: ping_interval → {ping_secs}s");
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"ping_secs": ping_secs})), "ping_interval → s");
                                         }
                                     }
                         continue;
@@ -880,22 +1114,40 @@ impl LarkChannel {
 
                     let event: LarkEvent = match serde_json::from_slice(&payload) {
                         Ok(e) => e,
-                        Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
+                        Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "event JSON"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    match event.header.event_type.as_str() {
+                        "im.message.receive_v1" => {}
+                        "card.action.trigger" => {
+                            if let Err(e) = self.handle_card_action_event(&event.event).await {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Dispatch
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                                    "Lark WS: card action dispatch error"
+                                );
+                            }
+                            continue;
+                        }
+                        _ => continue,
+                    }
 
                     let event_payload = event.event;
 
                     let recv: MsgReceivePayload = match serde_json::from_value(event_payload.clone()) {
                         Ok(r) => r,
-                        Err(e) => { tracing::error!("Lark: payload parse: {e}"); continue; }
+                        Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "payload parse"); continue; }
                     };
 
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
 
                     let sender_open_id = recv.sender.sender_id.open_id.as_deref().unwrap_or("");
                     if !self.is_user_allowed(sender_open_id) {
-                        tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender_open_id": sender_open_id})), "WS: ignoring (not in peer group)");
                         continue;
                     }
 
@@ -908,7 +1160,7 @@ impl LarkChannel {
                         // GC
                         seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(30 * 60));
                         if seen.contains_key(&lark_msg.message_id) {
-                            tracing::debug!("Lark WS: dup {}", lark_msg.message_id);
+                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: dup {}", lark_msg.message_id));
                             continue;
                         }
                         seen.insert(lark_msg.message_id.clone(), now);
@@ -937,12 +1189,12 @@ impl LarkChannel {
                             };
                             let image_key = match v.get("image_key").and_then(|k| k.as_str()) {
                                 Some(k) => k.to_string(),
-                                None => { tracing::debug!("Lark WS: image message missing image_key"); continue; }
+                                None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: image message missing image_key"); continue; }
                             };
                             match self.download_image_as_marker(&image_key).await {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
-                                    tracing::warn!("Lark WS: failed to download image {image_key}");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
                                     (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
                                 }
                             }
@@ -954,7 +1206,7 @@ impl LarkChannel {
                             };
                             let file_key = match v.get("file_key").and_then(|k| k.as_str()) {
                                 Some(k) => k.to_string(),
-                                None => { tracing::debug!("Lark WS: file message missing file_key"); continue; }
+                                None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: file message missing file_key"); continue; }
                             };
                             let file_name = v.get("file_name")
                                 .and_then(|n| n.as_str())
@@ -963,14 +1215,14 @@ impl LarkChannel {
                             match self.download_file_as_content(&lark_msg.message_id, &file_key, &file_name).await {
                                 Some(content) => (content, Vec::new()),
                                 None => {
-                                    tracing::warn!("Lark WS: failed to download file {file_key}");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"file_key": file_key})), "WS: failed to download file");
                                     (format!("[ATTACHMENT:{file_name} | download failed]"), Vec::new())
                                 }
                             }
                         }
                         "audio" => {
                             let Some(manager) = self.transcription_manager.as_deref() else {
-                                tracing::debug!("Lark WS: audio message in {} (transcription not configured)", lark_msg.chat_id);
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: audio message in {} (transcription not configured)", lark_msg.chat_id));
                                 continue;
                             };
                             let transcript = self.try_transcribe_audio_message(
@@ -983,13 +1235,11 @@ impl LarkChannel {
                         }
                         "list" => match parse_list_content(&lark_msg.content) {
                             Some(t) => (t, Vec::new()),
-                            None => { tracing::debug!("Lark WS: list message with no extractable text"); continue; }
+                            None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: list message with no extractable text"); continue; }
                         },
-                        _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
+                        _ => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: skipping unsupported type '{}'", lark_msg.message_type)); continue; }
                     };
 
-                    // Strip @_user_N placeholders
-                    let text = strip_at_placeholders(&text);
                     let text = text.trim().to_string();
                     if text.is_empty() { continue; }
 
@@ -1022,6 +1272,7 @@ impl LarkChannel {
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: self.channel_name().to_string(),
+            channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -1029,9 +1280,10 @@ impl LarkChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                     attachments: vec![],
+                        subject: None,
                     };
 
-                    tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
                     if tx.send(channel_msg).await.is_err() { break; }
                 }
             }
@@ -1041,7 +1293,8 @@ impl LarkChannel {
 
     /// Check if a user open_id is allowed
     fn is_user_allowed(&self, open_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == open_id)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, open_id, crate::allowlist::Match::Sensitive)
     }
 
     /// Get or refresh tenant access token
@@ -1067,7 +1320,7 @@ impl LarkChannel {
         let data: serde_json::Value = resp.json().await?;
 
         if !status.is_success() {
-            anyhow::bail!("Lark tenant_access_token request failed: status={status}, body={data}");
+            anyhow::bail!("tenant_access_token request failed: status={status}, body={data}");
         }
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -1076,13 +1329,21 @@ impl LarkChannel {
                 .get("msg")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
-            anyhow::bail!("Lark tenant_access_token failed: {msg}");
+            anyhow::bail!("tenant_access_token failed: {msg}");
         }
 
         let token = data
             .get("tenant_access_token")
             .and_then(|t| t.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing tenant_access_token in response"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "missing tenant_access_token in response"
+                );
+                anyhow::Error::msg("missing tenant_access_token in response")
+            })?
             .to_string();
 
         let ttl_seconds = extract_lark_token_ttl_seconds(&data);
@@ -1111,7 +1372,13 @@ impl LarkChannel {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("Lark: failed to get token for image download: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "failed to get token for image download"
+                );
                 return None;
             }
         };
@@ -1126,15 +1393,28 @@ impl LarkChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Lark: image download request failed for {image_key}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
+                        ),
+                    "image download request failed for"
+                );
                 return None;
             }
         };
 
         if !resp.status().is_success() {
-            tracing::warn!(
-                "Lark: image download failed for {image_key}: status={}",
-                resp.status()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "image download failed for {image_key}: status={}",
+                    resp.status()
+                )
             );
             return None;
         }
@@ -1142,7 +1422,13 @@ impl LarkChannel {
         if let Some(cl) = resp.content_length()
             && cl > LARK_IMAGE_MAX_BYTES as u64
         {
-            tracing::warn!("Lark: image too large for {image_key}: {cl} bytes exceeds limit");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"image_key": image_key, "cl": cl})),
+                "image too large for : bytes exceeds limit"
+            );
             return None;
         }
 
@@ -1155,22 +1441,41 @@ impl LarkChannel {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!("Lark: image body read failed for {image_key}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
+                        ),
+                    "image body read failed for"
+                );
                 return None;
             }
         };
 
         if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
-            tracing::warn!(
-                "Lark: image body empty or too large for {image_key}: {} bytes",
-                bytes.len()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "image body empty or too large for {image_key}: {} bytes",
+                    bytes.len()
+                )
             );
             return None;
         }
 
         let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
         if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
-            tracing::warn!("Lark: unsupported image MIME for {image_key}: {mime}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"image_key": image_key, "mime": mime})),
+                "unsupported image MIME for"
+            );
             return None;
         }
 
@@ -1189,7 +1494,13 @@ impl LarkChannel {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("Lark: failed to get token for file download: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "failed to get token for file download"
+                );
                 return None;
             }
         };
@@ -1204,15 +1515,28 @@ impl LarkChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Lark: file download request failed for {file_key}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "file_key": file_key})
+                        ),
+                    "file download request failed for"
+                );
                 return None;
             }
         };
 
         if !resp.status().is_success() {
-            tracing::warn!(
-                "Lark: file download failed for {file_key}: status={}",
-                resp.status()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "file download failed for {file_key}: status={}",
+                    resp.status()
+                )
             );
             return None;
         }
@@ -1220,7 +1544,13 @@ impl LarkChannel {
         if let Some(cl) = resp.content_length()
             && cl > LARK_FILE_MAX_BYTES as u64
         {
-            tracing::warn!("Lark: file too large for {file_key}: {cl} bytes exceeds limit");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"file_key": file_key, "cl": cl})),
+                "file too large for : bytes exceeds limit"
+            );
             return Some(format!(
                 "[ATTACHMENT:{file_name} | size={cl} bytes | too large to inline]"
             ));
@@ -1236,13 +1566,27 @@ impl LarkChannel {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!("Lark: file body read failed for {file_key}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "file_key": file_key})
+                        ),
+                    "file body read failed for"
+                );
                 return None;
             }
         };
 
         if bytes.is_empty() {
-            tracing::warn!("Lark: file body is empty for {file_key}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"file_key": file_key})),
+                "file body is empty for"
+            );
             return None;
         }
 
@@ -1311,20 +1655,20 @@ impl LarkChannel {
             let (retry_status, retry_body) = self.fetch_bot_open_id_with_token(&refreshed).await?;
             if !retry_status.is_success() {
                 anyhow::bail!(
-                    "Lark bot info request failed after token refresh: status={retry_status}, body={retry_body}"
+                    "bot info request failed after token refresh: status={retry_status}, body={retry_body}"
                 );
             }
             retry_body
         } else {
             if !status.is_success() {
-                anyhow::bail!("Lark bot info request failed: status={status}, body={body}");
+                anyhow::bail!("bot info request failed: status={status}, body={body}");
             }
             body
         };
 
         let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            anyhow::bail!("Lark bot info failed: code={code}, body={body}");
+            anyhow::bail!("bot info failed: code={code}, body={body}");
         }
 
         let bot_open_id = body
@@ -1346,16 +1690,28 @@ impl LarkChannel {
 
         match self.refresh_bot_open_id().await {
             Ok(Some(open_id)) => {
-                tracing::info!("Lark: resolved bot open_id: {open_id}");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"open_id": open_id})),
+                    "resolved bot open_id"
+                );
             }
             Ok(None) => {
-                tracing::warn!(
-                    "Lark: bot open_id missing from /bot/v3/info response; mention_only group messages will be ignored"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "bot open_id missing from /bot/v3/info response; mention_only group messages will be ignored"
                 );
             }
             Err(err) => {
-                tracing::warn!(
-                    "Lark: failed to resolve bot open_id: {err}; mention_only group messages will be ignored"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                    "failed to resolve bot open_id: ; mention_only group messages will be ignored"
                 );
             }
         }
@@ -1366,10 +1722,7 @@ impl LarkChannel {
         while let Some(chunk) = resp.chunk().await? {
             body.extend_from_slice(&chunk);
             if body.len() as u64 > MAX_LARK_AUDIO_BYTES {
-                anyhow::bail!(
-                    "Lark audio download exceeds {} byte limit",
-                    MAX_LARK_AUDIO_BYTES
-                );
+                anyhow::bail!("audio download exceeds {} byte limit", MAX_LARK_AUDIO_BYTES);
             }
         }
         Ok(body)
@@ -1409,7 +1762,7 @@ impl LarkChannel {
                     .await?;
                 if !resp.status().is_success() {
                     anyhow::bail!(
-                        "Lark audio download failed after token refresh: {}",
+                        "audio download failed after token refresh: {}",
                         resp.status()
                     );
                 }
@@ -1417,7 +1770,7 @@ impl LarkChannel {
                 return Ok((bytes, inferred_audio_filename(file_key)));
             }
 
-            anyhow::bail!("Lark audio download failed: {}", status);
+            anyhow::bail!("audio download failed: {}", status);
         }
         let bytes = Self::stream_audio_bytes(resp).await?;
         Ok((bytes, inferred_audio_filename(file_key)))
@@ -1441,18 +1794,39 @@ impl LarkChannel {
         {
             Ok(result) => result,
             Err(e) => {
-                tracing::warn!("Lark: audio download failed for {message_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                        ),
+                    "audio download failed for"
+                );
                 return None;
             }
         };
 
         match manager.transcribe(&audio_data, &filename).await {
             Ok(transcript) => {
-                tracing::debug!("Lark: audio transcribed for {message_id}");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"message_id": message_id})),
+                    "audio transcribed for"
+                );
                 Some(transcript)
             }
             Err(e) => {
-                tracing::warn!("Lark: transcription failed for {message_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                        ),
+                    "transcription failed for"
+                );
                 None
             }
         }
@@ -1480,7 +1854,11 @@ impl LarkChannel {
         }
 
         let Some(manager) = self.transcription_manager.as_deref() else {
-            tracing::debug!("Lark webhook: audio message (transcription not configured)");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "webhook: audio message (transcription not configured)"
+            );
             return vec![];
         };
 
@@ -1489,7 +1867,13 @@ impl LarkChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if !self.is_user_allowed(open_id) {
-            tracing::warn!("Lark: ignoring audio from unauthorized user: {open_id}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"open_id": open_id})),
+                "ignoring audio from unauthorized user"
+            );
             return vec![];
         }
 
@@ -1552,10 +1936,12 @@ impl LarkChannel {
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
+            channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         }]
     }
 
@@ -1613,7 +1999,13 @@ impl LarkChannel {
 
         // Check allowlist
         if !self.is_user_allowed(open_id) {
-            tracing::warn!("Lark: ignoring message from unauthorized user: {open_id}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"open_id": open_id})),
+                "ignoring message from unauthorized user"
+            );
             return messages;
         }
 
@@ -1676,14 +2068,30 @@ impl LarkChannel {
                         let marker = match self.download_image_as_marker(&key).await {
                             Some(m) => m,
                             None => {
-                                tracing::warn!("Lark: failed to download image {key}");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"key": key})),
+                                    "failed to download image"
+                                );
                                 format!("[IMAGE:{key} | download failed]")
                             }
                         };
                         (marker, Vec::new())
                     }
                     None => {
-                        tracing::debug!("Lark: image message missing image_key");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "image message missing image_key"
+                        );
                         return messages;
                     }
                 }
@@ -1707,14 +2115,30 @@ impl LarkChannel {
                         {
                             Some(c) => c,
                             None => {
-                                tracing::warn!("Lark: failed to download file {key}");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"key": key})),
+                                    "failed to download file"
+                                );
                                 format!("[ATTACHMENT:{file_name} | download failed]")
                             }
                         };
                         (content, Vec::new())
                     }
                     None => {
-                        tracing::debug!("Lark: file message missing file_key");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "file message missing file_key"
+                        );
                         return messages;
                     }
                 }
@@ -1722,12 +2146,21 @@ impl LarkChannel {
             "list" => match parse_list_content(content_str) {
                 Some(t) => (t, Vec::new()),
                 None => {
-                    tracing::debug!("Lark: list message with no extractable text");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "list message with no extractable text"
+                    );
                     return messages;
                 }
             },
             _ => {
-                tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"msg_type": msg_type})),
+                    "skipping unsupported message type"
+                );
                 return messages;
             }
         };
@@ -1768,13 +2201,24 @@ impl LarkChannel {
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
+            channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for LarkChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Lark)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1803,7 +2247,7 @@ impl Channel for LarkChannel {
 
                 if should_refresh_lark_tenant_token(retry_status, &retry_response) {
                     anyhow::bail!(
-                        "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                        "send failed after token refresh: status={retry_status}, body={retry_response}"
                     );
                 }
 
@@ -1826,6 +2270,389 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        let approval_id = Uuid::new_v4().to_string();
+        let card =
+            build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
+
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "receive_id_type": "chat_id",
+            "msg_type": "interactive",
+            "content": serde_json::to_string(&card)?,
+        });
+
+        let response_body = {
+            let (status, resp) = self.send_text_once(&url, &token, &body).await?;
+            if should_refresh_lark_tenant_token(status, &resp) {
+                self.invalidate_token().await;
+                let new_token = self.get_tenant_access_token().await?;
+                let (retry_status, retry_body) =
+                    self.send_text_once(&url, &new_token, &body).await?;
+                ensure_lark_send_success(retry_status, &retry_body, "approval retry")?;
+                retry_body
+            } else {
+                ensure_lark_send_success(status, &resp, "approval")?;
+                resp
+            }
+        };
+
+        let message_id = response_body
+            .pointer("/data/message_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(
+                        module_path!(),
+                        ::zeroclaw_log::Action::Note
+                    )
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                    "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
+                );
+                String::new()
+            });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id,
+                tool_name: request.tool_name.clone(),
+                arguments_summary: request.arguments_summary.clone(),
+            },
+        );
+
+        Ok(Some(self.wait_for_decision(rx, &approval_id).await))
+    }
+}
+
+impl LarkChannel {
+    /// Wait for the user's approval click; on timeout, evict the pending entry
+    /// and synthesize a `Deny` response. Never panics.
+    async fn wait_for_decision(
+        &self,
+        rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
+        approval_id: &str,
+    ) -> zeroclaw_api::channel::ChannelApprovalResponse {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            Ok(Ok(response)) => response,
+            _ => {
+                self.pending_approvals.lock().await.remove(approval_id);
+                ChannelApprovalResponse::Deny
+            }
+        }
+    }
+
+    /// PATCH an approval card to its resolved state. Soft-fails on every error
+    /// path (transport / token refresh / rate-limited / non-zero code) — never
+    /// propagates to the caller, since the user-visible decision is already
+    /// delivered via the oneshot.
+    async fn patch_approval_card_resolved(
+        &self,
+        message_id: &str,
+        tool_name: &str,
+        arguments_summary: &str,
+        decision: zeroclaw_api::channel::ChannelApprovalResponse,
+    ) {
+        let card = build_resolved_approval_card(tool_name, arguments_summary, decision);
+        let url = self.patch_message_url(message_id);
+        let body = serde_json::json!({
+            "content": card.to_string(),
+        });
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "message_id": message_id,
+                    "decision": format!("{decision:?}"),
+                })),
+            "Lark: approval card PATCH dispatching"
+        );
+
+        let (status, response) = match self.patch_or_send_once(&url, &body, true).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "error": e.to_string(),
+                        })),
+                    "Lark: approval card PATCH transport error"
+                );
+                return;
+            }
+        };
+
+        let final_body = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            match self.patch_or_send_once(&url, &body, true).await {
+                Ok((retry_status, retry_response)) => {
+                    if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Send
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "body": retry_response.to_string(),
+                            })),
+                            "Lark: approval card PATCH still unauthorized after token refresh"
+                        );
+                        return;
+                    }
+                    retry_response
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "error": e.to_string(),
+                            })),
+                        "Lark: approval card PATCH retry transport error"
+                    );
+                    return;
+                }
+            }
+        } else {
+            response
+        };
+
+        let code = extract_lark_response_code(&final_body).unwrap_or(0);
+        if code == LARK_DRAFT_RATE_LIMIT_CODE {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": LARK_DRAFT_RATE_LIMIT_CODE,
+                    })),
+                "Lark: approval card PATCH rate-limited"
+            );
+        } else if code != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": code,
+                        "status": status.to_string(),
+                        "body": final_body.to_string(),
+                    })),
+                "Lark: approval card PATCH soft-failed"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "status": status.to_string(),
+                    })),
+                "Lark: approval card PATCH succeeded"
+            );
+        }
+    }
+
+    /// Single-shot HTTP request used by `patch_approval_card_resolved`. Builds
+    /// PATCH (when `is_patch=true`) or POST request with current tenant token,
+    /// returns parsed JSON body and the HTTP status. Caller decides whether to
+    /// retry on token refresh.
+    async fn patch_or_send_once(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        is_patch: bool,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let token = self.get_tenant_access_token().await?;
+        let builder = if is_patch {
+            self.http_client().patch(url)
+        } else {
+            self.http_client().post(url)
+        };
+        let resp = builder
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    /// Handle a `card.action.trigger` event: parse `approval_id` + `decision`
+    /// from `event.action.value` (or `event.action.behaviors[0].value` for
+    /// Card 2.0 button click events), resolve the pending oneshot, and
+    /// forward the response. Unknown / expired approval IDs are silently
+    /// dropped (info-log only).
+    async fn handle_card_action_event(
+        &self,
+        event_payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Diagnostic: emit a SANITIZED copy of the inbound payload at DEBUG
+        // so operators can capture real Lark/Feishu `card.action.trigger`
+        // shape evidence for fixture collection WITHOUT leaking
+        // tenant-specific identifiers (token, operator.*, context.open_*)
+        // to runtime logs / dashboards / persisted JSONL.
+        //
+        // `sanitize_card_action_payload` replaces those fields with
+        // deterministic `REDACTED_*` placeholders before the value reaches
+        // `record!`. The regression test
+        // `sanitize_card_action_payload_redacts_sensitive_fields` will fail
+        // if any of those raw values can leak through this path again.
+        //
+        // Default production RUST_LOG (=info) leaves this off, so it costs
+        // nothing at runtime; opt in with:
+        //
+        //   RUST_LOG=info,zeroclaw_log_event=debug
+        //
+        // Captured payloads should land in
+        // `crates/zeroclaw-channels/tests/fixtures/lark/` and are replayed
+        // by the integration test in `tests/lark_approval_live_evidence.rs`.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive).with_attrs(
+                ::serde_json::json!({
+                    "sanitized_payload": sanitize_card_action_payload(event_payload),
+                })
+            ),
+            "card.action.trigger sanitized payload"
+        );
+
+        // Feishu Card 2.0 button click events MAY round-trip the button value at
+        // `event.action.behaviors[0].value` instead of `event.action.value`
+        // (the Card 1.0 path). Both pointers are accepted for forward-compat;
+        // captured fixtures under `tests/fixtures/lark/` lock the shape that
+        // production currently emits.
+        let value = event_payload
+            .pointer("/action/value")
+            .or_else(|| event_payload.pointer("/action/behaviors/0/value"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing event.action.value or event.action.behaviors[0].value"
+                );
+                anyhow::Error::msg(
+                    "card.action.trigger: missing event.action.value or event.action.behaviors[0].value",
+                )
+            })?;
+
+        let approval_id = value
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing approval_id in value"
+                );
+                anyhow::Error::msg("card.action.trigger: missing approval_id in value")
+            })?;
+
+        let decision_str = value
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing decision in value"
+                );
+                anyhow::Error::msg("card.action.trigger: missing decision in value")
+            })?;
+
+        let decision = match decision_str {
+            "approve" => ChannelApprovalResponse::Approve,
+            "deny" => ChannelApprovalResponse::Deny,
+            "always" => ChannelApprovalResponse::AlwaysApprove,
+            other => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"decision_str": other})),
+                    "Lark: unknown approval decision — treating as deny"
+                );
+                ChannelApprovalResponse::Deny
+            }
+        };
+
+        let pending = self.pending_approvals.lock().await.remove(approval_id);
+        let Some(pending) = pending else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "approval_id": approval_id,
+                        "decision": format!("{decision:?}"),
+                    })),
+                "Lark: card action for unknown/expired approval_id"
+            );
+            return Ok(());
+        };
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "approval_id": approval_id,
+                    "decision": format!("{decision:?}"),
+                    "message_id": pending.message_id,
+                    "has_message_id": !pending.message_id.is_empty(),
+                })),
+            "Lark: card action received"
+        );
+
+        let _ = pending.sender.send(decision);
+
+        if !pending.message_id.is_empty() {
+            self.patch_approval_card_resolved(
+                &pending.message_id,
+                &pending.tool_name,
+                &pending.arguments_summary,
+                decision,
+            )
+            .await;
+        }
+
+        Ok(())
     }
 }
 
@@ -1869,6 +2696,31 @@ impl LarkChannel {
                 return (StatusCode::OK, Json(resp)).into_response();
             }
 
+            // Card button click events are not message events — route them
+            // through the approval-card resolver and short-circuit before the
+            // generic message parser sees them.
+            let event_type = payload
+                .pointer("/header/event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if event_type == "card.action.trigger"
+                && let Some(inner) = payload.get("event")
+            {
+                if let Err(e) = state.channel.handle_card_action_event(inner).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Dispatch
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "Lark webhook: card action dispatch error"
+                    );
+                }
+                return (StatusCode::OK, "ok").into_response();
+            }
+
             // Parse event messages
             let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty()
@@ -1890,7 +2742,12 @@ impl LarkChannel {
 
             for msg in messages {
                 if state.tx.send(msg).await.is_err() {
-                    tracing::warn!("Lark: message channel closed");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "message channel closed"
+                    );
                     break;
                 }
             }
@@ -1899,7 +2756,14 @@ impl LarkChannel {
         }
 
         let port = self.port.ok_or_else(|| {
-            anyhow::anyhow!("Lark webhook mode requires `port` to be set in [channels_config.lark]")
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"mode": "webhook", "missing": "port"})),
+                "lark: webhook mode requires port"
+            );
+            anyhow::Error::msg("webhook mode requires `port` to be set in [channels_config.lark]")
         })?;
 
         let state = AppState {
@@ -1913,7 +2777,12 @@ impl LarkChannel {
             .with_state(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        tracing::info!("Lark event callback server listening on {addr}");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"addr": addr})),
+            "event callback server listening on"
+        );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -2403,30 +3272,6 @@ fn extract_inline_text(el: &serde_json::Value, out: &mut String) {
     }
 }
 
-/// Remove `@_user_N` placeholder tokens injected by Feishu in group chats.
-fn strip_at_placeholders(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch == '@' {
-            let rest: String = chars.clone().map(|(_, c)| c).collect();
-            if let Some(after) = rest.strip_prefix("_user_") {
-                let skip =
-                    "_user_".len() + after.chars().take_while(|c| c.is_ascii_digit()).count();
-                for _ in 0..=skip {
-                    chars.next();
-                }
-                if chars.peek().map(|(_, c)| *c == ' ').unwrap_or(false) {
-                    chars.next();
-                }
-                continue;
-            }
-        }
-        result.push(ch);
-    }
-    result
-}
-
 fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -> bool {
     mention
         .pointer("/id/open_id")
@@ -2468,6 +3313,10 @@ mod tests {
         ch
     }
 
+    fn resolver_from(peers: Vec<String>) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(move || peers.clone())
+    }
+
     fn make_channel() -> LarkChannel {
         with_bot_open_id(
             LarkChannel::new(
@@ -2475,7 +3324,8 @@ mod tests {
                 "test_app_secret".into(),
                 "test_verification_token".into(),
                 None,
-                vec!["ou_testuser123".into()],
+                "lark_test_alias",
+                resolver_from(vec!["ou_testuser123".into()]),
                 true,
             ),
             "ou_bot",
@@ -2620,7 +3470,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         assert!(ch.is_user_allowed("ou_anyone"));
@@ -2633,7 +3484,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec![],
+            "lark_test_alias",
+            resolver_from(vec![]),
             true,
         );
         assert!(!ch.is_user_allowed("ou_anyone"));
@@ -2709,7 +3561,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2769,7 +3622,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2798,7 +3652,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2824,7 +3679,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2850,7 +3706,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2888,7 +3745,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2913,7 +3771,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2952,7 +3811,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -2980,19 +3840,18 @@ mod tests {
             app_secret: "secret456".into(),
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.app_id, "cli_app123");
         assert_eq!(parsed.app_secret, "secret456");
         assert_eq!(parsed.verification_token.as_deref(), Some("vtoken789"));
-        assert_eq!(parsed.allowed_users.len(), 2);
     }
 
     #[test]
@@ -3004,18 +3863,17 @@ mod tests {
             app_secret: "secret".into(),
             encrypt_key: None,
             verification_token: Some("tok".into()),
-            allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "app");
         assert_eq!(parsed.verification_token.as_deref(), Some("tok"));
-        assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
     #[test]
@@ -3024,7 +3882,6 @@ mod tests {
         let json = r#"{"app_id":"a","app_secret":"s"}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.verification_token.is_none());
-        assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.mention_only);
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
@@ -3040,15 +3897,15 @@ mod tests {
             app_secret: "secret456".into(),
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
-        let ch = LarkChannel::from_config(&cfg);
+        let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
 
         assert_eq!(ch.api_base(), LARK_BASE_URL);
         assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
@@ -3057,87 +3914,29 @@ mod tests {
     }
 
     #[test]
-    fn lark_from_lark_config_ignores_legacy_feishu_flag() {
+    fn lark_from_config_with_use_feishu_routes_to_feishu() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
             enabled: true,
-            app_id: "cli_app123".into(),
+            app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
-        let ch = LarkChannel::from_lark_config(&cfg);
-
-        assert_eq!(ch.api_base(), LARK_BASE_URL);
-        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
-        assert_eq!(ch.name(), "lark");
-    }
-
-    #[test]
-    fn lark_from_feishu_config_sets_feishu_platform() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            proxy_url: None,
-        };
-
-        let ch = LarkChannel::from_feishu_config(&cfg);
+        let ch =
+            LarkChannel::from_config(&cfg, "feishu_test_alias", resolver_from(vec!["*".into()]));
 
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
-    }
-
-    #[test]
-    fn lark_from_feishu_config_propagates_mention_only() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg_true = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: true,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-        };
-
-        let cfg_false = FeishuConfig {
-            mention_only: false,
-            ..cfg_true.clone()
-        };
-
-        let ch_true = LarkChannel::from_feishu_config(&cfg_true);
-        let ch_false = LarkChannel::from_feishu_config(&cfg_false);
-
-        assert!(
-            ch_true.mention_only,
-            "mention_only = true must propagate through from_feishu_config"
-        );
-        assert!(
-            !ch_false.mention_only,
-            "mention_only = false must propagate through from_feishu_config"
-        );
     }
 
     #[tokio::test]
@@ -3148,7 +3947,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             true,
         );
         let payload = serde_json::json!({
@@ -3176,7 +3976,8 @@ mod tests {
                 "secret".into(),
                 "token".into(),
                 None,
-                vec!["*".into()],
+                "lark_test_alias",
+                resolver_from(vec!["*".into()]),
                 true,
             ),
             "ou_bot_123",
@@ -3240,7 +4041,8 @@ mod tests {
                 "secret".into(),
                 "token".into(),
                 None,
-                vec!["*".into()],
+                "lark_test_alias",
+                resolver_from(vec!["*".into()]),
                 true,
             ),
             "ou_bot_123",
@@ -3292,7 +4094,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec!["*".into()],
+            "lark_test_alias",
+            resolver_from(vec!["*".into()]),
             false,
         );
 
@@ -3321,19 +4124,24 @@ mod tests {
             "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
 
-        let feishu_cfg = zeroclaw_config::schema::FeishuConfig {
+        let feishu_cfg = zeroclaw_config::schema::LarkConfig {
             enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
             mention_only: false,
+            use_feishu: true,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
-        let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
+        let ch_feishu = LarkChannel::from_config(
+            &feishu_cfg,
+            "feishu_test_alias",
+            resolver_from(vec!["*".into()]),
+        );
         assert_eq!(
             ch_feishu.message_reaction_url("om_test_message_id"),
             "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
@@ -3582,7 +4390,6 @@ mod tests {
     fn lark_manager_none_and_warn_on_init_failure() {
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "groq".to_string(),
             api_key: Some(String::new()),
             ..Default::default()
         };
@@ -3699,7 +4506,8 @@ mod tests {
             "secret".into(),
             "token".into(),
             None,
-            vec![],
+            "feishu_test_alias",
+            resolver_from(vec![]),
             false,
             LarkPlatform::Feishu,
         );
@@ -3711,7 +4519,6 @@ mod tests {
         let ch = make_channel();
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
                 url: "http://localhost:0/v1/transcribe".to_string(),
                 bearer_token: Some("unused".to_string()),
@@ -3796,7 +4603,6 @@ mod tests {
 
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
                 url: format!("{}/v1/transcribe", whisper_server.uri()),
                 bearer_token: Some("test-token".to_string()),
@@ -3878,5 +4684,448 @@ mod tests {
         let (bytes, filename) = result.unwrap();
         assert_eq!(bytes.len(), 64);
         assert_eq!(filename, "voice.m4a");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Card 2.0 approval card tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_approval_card_contains_all_three_buttons() {
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo");
+
+        // Card 2.0 schema lock — guard against future regressions where the
+        // send-side schema drifts back to 1.0 (which Feishu's PATCH endpoint
+        // silently refuses to re-render after the click).
+        assert_eq!(
+            card.get("schema").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "approval card must use Card JSON 2.0 schema"
+        );
+
+        let columns = card
+            .pointer("/body/elements/1/columns")
+            .and_then(|v| v.as_array())
+            .expect("column_set with columns missing");
+        assert_eq!(
+            columns.len(),
+            3,
+            "expected 3 button columns (Approve/Deny/Always)"
+        );
+
+        let decisions: Vec<&str> = columns
+            .iter()
+            .filter_map(|c| {
+                c.pointer("/elements/0/behaviors/0/value/decision")
+                    .and_then(|d| d.as_str())
+            })
+            .collect();
+        assert_eq!(decisions, vec!["approve", "deny", "always"]);
+    }
+
+    #[test]
+    fn build_approval_card_round_trips_approval_id_in_all_buttons() {
+        let card = build_approval_card("approval-abc-123", "tool", "args");
+        let columns = card["body"]["elements"][1]["columns"]
+            .as_array()
+            .expect("columns array");
+        for column in columns {
+            assert_eq!(
+                column["elements"][0]["behaviors"][0]["value"]["approval_id"],
+                "approval-abc-123"
+            );
+        }
+    }
+
+    #[test]
+    fn build_approval_card_and_resolved_card_share_schema_version() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let send_card = build_approval_card("id", "shell", "args");
+        let patch_card =
+            build_resolved_approval_card("shell", "args", ChannelApprovalResponse::Approve);
+
+        let send_schema = send_card.get("schema").and_then(|v| v.as_str());
+        let patch_schema = patch_card.get("schema").and_then(|v| v.as_str());
+
+        assert_eq!(
+            send_schema, patch_schema,
+            "send-time approval card and PATCH-time resolved card MUST use the same Card JSON schema; \
+             Feishu's IM PATCH endpoint silently fails to re-render on the client when send/patch \
+             schema versions differ"
+        );
+        assert_eq!(send_schema, Some("2.0"));
+    }
+
+    #[test]
+    fn build_resolved_approval_card_uses_decision_specific_banner() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        for (decision, expected_template, expected_text_fragment) in [
+            (ChannelApprovalResponse::Approve, "green", "Approved"),
+            (
+                ChannelApprovalResponse::AlwaysApprove,
+                "green",
+                "Approved (always)",
+            ),
+            (ChannelApprovalResponse::Deny, "red", "Denied"),
+        ] {
+            let card = build_resolved_approval_card("shell", "args", decision);
+            assert_eq!(
+                card.pointer("/header/template").and_then(|v| v.as_str()),
+                Some(expected_template),
+                "decision={decision:?} should use header template {expected_template}"
+            );
+            let title = card
+                .pointer("/header/title/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(
+                title.contains(expected_text_fragment),
+                "decision={decision:?} header title `{title}` should contain `{expected_text_fragment}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_sensitive_fields() {
+        let raw = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {
+                    "approval_id": "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7",
+                    "decision": "approve"
+                }
+            },
+            "context": {
+                "open_chat_id": "oc_real_chat_id_LEAKED",
+                "open_message_id": "om_real_msg_id_LEAKED"
+            },
+            "host": "im_message",
+            "operator": {
+                "open_id": "ou_real_user_id_LEAKED",
+                "tenant_key": "real_tenant_key_LEAKED",
+                "union_id": "on_real_union_id_LEAKED",
+                "user_id": "real_user_id_LEAKED"
+            },
+            "token": "c-real_callback_token_LEAKED"
+        });
+
+        let sanitized = sanitize_card_action_payload(&raw);
+        let dumped = serde_json::to_string(&sanitized).expect("sanitized must serialize");
+
+        for forbidden in [
+            "oc_real_chat_id_LEAKED",
+            "om_real_msg_id_LEAKED",
+            "ou_real_user_id_LEAKED",
+            "real_tenant_key_LEAKED",
+            "on_real_union_id_LEAKED",
+            "real_user_id_LEAKED",
+            "c-real_callback_token_LEAKED",
+        ] {
+            assert!(
+                !dumped.contains(forbidden),
+                "sanitized payload must not contain raw value {forbidden:?}; got {dumped}"
+            );
+        }
+
+        assert_eq!(sanitized["token"], "REDACTED_TOKEN");
+        assert_eq!(
+            sanitized["operator"]["open_id"],
+            "REDACTED_OPERATOR_OPEN_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["union_id"],
+            "REDACTED_OPERATOR_UNION_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["user_id"],
+            "REDACTED_OPERATOR_USER_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["tenant_key"],
+            "REDACTED_OPERATOR_TENANT_KEY"
+        );
+        assert_eq!(
+            sanitized["context"]["open_chat_id"],
+            "REDACTED_OPEN_CHAT_ID"
+        );
+        assert_eq!(
+            sanitized["context"]["open_message_id"],
+            "REDACTED_OPEN_MESSAGE_ID"
+        );
+
+        assert_eq!(
+            sanitized["action"]["value"]["approval_id"],
+            "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7"
+        );
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+        assert_eq!(sanitized["action"]["tag"], "button");
+        assert_eq!(sanitized["host"], "im_message");
+
+        assert_eq!(raw["token"], "c-real_callback_token_LEAKED");
+        assert_eq!(raw["operator"]["open_id"], "ou_real_user_id_LEAKED");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_handles_missing_optional_fields() {
+        let raw = serde_json::json!({
+            "action": { "value": { "approval_id": "x", "decision": "approve" } }
+        });
+        let sanitized = sanitize_card_action_payload(&raw);
+        assert!(sanitized.get("token").is_none());
+        assert!(sanitized.get("operator").is_none());
+        assert!(sanitized.get("context").is_none());
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_committed_fixtures() {
+        let fixtures: [(&str, &str); 3] = [
+            (
+                "card_action_approve.json",
+                include_str!("../tests/fixtures/lark/card_action_approve.json"),
+            ),
+            (
+                "card_action_deny.json",
+                include_str!("../tests/fixtures/lark/card_action_deny.json"),
+            ),
+            (
+                "card_action_always.json",
+                include_str!("../tests/fixtures/lark/card_action_always.json"),
+            ),
+        ];
+        for (name, raw_text) in fixtures {
+            let raw: serde_json::Value = serde_json::from_str(raw_text)
+                .unwrap_or_else(|e| panic!("parse fixture {name}: {e}"));
+            let sanitized = sanitize_card_action_payload(&raw);
+            let dumped =
+                serde_json::to_string(&sanitized).expect("sanitized fixture must serialize");
+            for placeholder_field in [
+                "REDACTED_TOKEN",
+                "REDACTED_OPERATOR_OPEN_ID",
+                "REDACTED_OPEN_CHAT_ID",
+            ] {
+                assert!(
+                    dumped.contains(placeholder_field),
+                    "sanitizer output for {name} must contain {placeholder_field}; got {dumped}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_card_action_event_routes_approve_to_pending_sender() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = make_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let approval_id = "test-approval-1".to_string();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        let event = serde_json::json!({
+            "action": {
+                "value": { "approval_id": approval_id, "decision": "approve" },
+                "tag": "button"
+            }
+        });
+        ch.handle_card_action_event(&event)
+            .await
+            .expect("handler ok");
+        let result = rx.await.expect("oneshot delivered");
+        assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn handle_card_action_event_parses_card_v2_behaviors_value_payload() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Card 2.0 button click events MAY round-trip via
+        // event.action.behaviors[0].value instead of event.action.value.
+        // Verify the dual-pointer fallback.
+        let ch = make_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let approval_id = "test-v2-approval".to_string();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "behaviors": [{
+                    "type": "callback",
+                    "value": { "approval_id": approval_id, "decision": "always" }
+                }]
+            }
+        });
+        ch.handle_card_action_event(&event)
+            .await
+            .expect("handler ok");
+        let result = rx.await.expect("oneshot delivered");
+        assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    async fn handle_card_action_event_for_unknown_approval_is_not_an_error() {
+        let ch = make_channel();
+        let event = serde_json::json!({
+            "action": {
+                "value": { "approval_id": "never-existed", "decision": "deny" }
+            }
+        });
+        // Unknown approval IDs are dropped silently (info-log only); the
+        // handler must NOT propagate an error to the caller, since stray
+        // clicks (resent after restart) are routine.
+        ch.handle_card_action_event(&event)
+            .await
+            .expect("unknown approval id should not error");
+    }
+    async fn mount_lark_token_and_send_mocks(mock_server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_test_message_id" }
+            })))
+            .expect(1)
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn assert_send_body_matches_recipient_and_text(
+        mock_server: &wiremock::MockServer,
+        expected_recipient: &str,
+        expected_text: &str,
+    ) {
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        let send_request = requests
+            .iter()
+            .find(|r| r.url.path() == "/im/v1/messages")
+            .expect("expected at least one POST /im/v1/messages");
+        assert_eq!(
+            send_request.url.query(),
+            Some("receive_id_type=chat_id"),
+            "send URL must carry receive_id_type=chat_id query param"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&send_request.body).expect("send body should be valid JSON");
+        assert_eq!(
+            body["receive_id"].as_str(),
+            Some(expected_recipient),
+            "receive_id must match the SendMessage recipient; full body: {body}"
+        );
+        assert_eq!(
+            body["msg_type"].as_str(),
+            Some("interactive"),
+            "msg_type must be 'interactive'; full body: {body}"
+        );
+        let content_str = body["content"]
+            .as_str()
+            .expect("content must be a JSON string per Lark interactive-card spec");
+        assert!(
+            content_str.contains(expected_text),
+            "card content should embed the message text {expected_text:?}; got: {content_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_send_via_from_config_emits_post_to_messages_endpoint() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server).await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        assert_eq!(
+            ch.name(),
+            "lark",
+            "use_feishu=false must keep the channel identity as 'lark'"
+        );
+
+        let message = SendMessage::new("hi from cron", "oc_test_chat_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed against mocked Lark endpoint");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn feishu_send_via_from_config_emits_post_to_messages_endpoint() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server).await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: true,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        assert_eq!(
+            ch.name(),
+            "feishu",
+            "use_feishu=true must surface the channel identity as 'feishu' \
+             (registry key alignment — see orchestrator::deliver_announcement)"
+        );
+
+        let message = SendMessage::new("hi from cron", "oc_test_chat_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed against mocked Feishu endpoint");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
     }
 }

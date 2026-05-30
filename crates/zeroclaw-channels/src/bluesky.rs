@@ -7,6 +7,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// Bluesky channel — polls for mentions via AT Protocol and replies as posts.
 pub struct BlueskyChannel {
+    alias: String,
     handle: String,
     app_password: String,
     auth: Mutex<BlueskyAuth>,
@@ -100,8 +101,9 @@ struct PostRef {
 }
 
 impl BlueskyChannel {
-    pub fn new(handle: String, app_password: String) -> Self {
+    pub fn new(alias: String, handle: String, app_password: String) -> Self {
         Self {
+            alias,
             handle,
             app_password,
             auth: Mutex::new(BlueskyAuth {
@@ -135,7 +137,7 @@ impl BlueskyChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Bluesky createSession failed ({status}): {body}");
+            bail!("createSession failed ({status}): {body}");
         }
 
         let session: CreateSessionResponse = resp.json().await?;
@@ -168,7 +170,12 @@ impl BlueskyChannel {
 
         if !resp.status().is_success() {
             // Refresh failed — fall back to full re-auth
-            tracing::warn!("Bluesky session refresh failed, re-authenticating");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "session refresh failed, re-authenticating"
+            );
             return self.create_session().await;
         }
 
@@ -249,10 +256,12 @@ impl BlueskyChannel {
             reply_target,
             content: text.to_string(),
             channel: "bluesky".to_string(),
+            channel_alias: None,
             timestamp,
             thread_ts: Some(notif.uri.clone()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -269,9 +278,25 @@ impl BlueskyChannel {
             .await?;
 
         if !resp.status().is_success() {
-            tracing::warn!("Bluesky updateSeen failed: {}", resp.status());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("updateSeen failed: {}", resp.status())
+            );
         }
         Ok(())
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for BlueskyChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Bluesky,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -343,7 +368,7 @@ impl Channel for BlueskyChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Bluesky post failed ({status}): {body}");
+            bail!("post failed ({status}): {body}");
         }
 
         Ok(())
@@ -353,7 +378,11 @@ impl Channel for BlueskyChannel {
         // Initial auth
         self.create_session().await?;
 
-        tracing::info!("Bluesky channel listening as @{}...", self.handle);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("channel listening as @{}...", self.handle)
+        );
 
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -361,7 +390,13 @@ impl Channel for BlueskyChannel {
             let token = match self.get_access_jwt().await {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!("Bluesky auth error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "auth error"
+                    );
                     continue;
                 }
             };
@@ -378,20 +413,37 @@ impl Channel for BlueskyChannel {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("Bluesky poll error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "poll error"
+                    );
                     continue;
                 }
             };
 
             if !resp.status().is_success() {
-                tracing::warn!("Bluesky notifications failed: {}", resp.status());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("notifications failed: {}", resp.status())
+                );
                 continue;
             }
 
             let listing: NotificationListResponse = match resp.json().await {
                 Ok(l) => l,
                 Err(e) => {
-                    tracing::warn!("Bluesky parse error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "parse error"
+                    );
                     continue;
                 }
             };
@@ -410,7 +462,13 @@ impl Channel for BlueskyChannel {
             if let Some(ref seen_at) = latest_indexed_at
                 && let Err(e) = self.update_seen(seen_at).await
             {
-                tracing::warn!("Bluesky updateSeen error: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "updateSeen error"
+                );
             }
 
             let _ = &listing.cursor; // cursor available for pagination if needed
@@ -427,7 +485,11 @@ mod tests {
     use super::*;
 
     fn make_channel() -> BlueskyChannel {
-        let ch = BlueskyChannel::new("testbot.bsky.social".into(), "app-password".into());
+        let ch = BlueskyChannel::new(
+            "testbot".into(),
+            "testbot.bsky.social".into(),
+            "app-password".into(),
+        );
         // Seed auth with a DID for tests
         {
             let mut auth = ch.auth.lock();

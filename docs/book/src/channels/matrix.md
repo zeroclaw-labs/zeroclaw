@@ -22,9 +22,7 @@ Before testing message flow:
 
 1. The bot account is joined to the target room.
 2. The access token belongs to the same bot account.
-3. `room_id` is correct:
-   - preferred: canonical room ID (`!room:server`)
-   - supported: room alias (`#alias:server`) — ZeroClaw resolves it
+3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Each entry is either a canonical room ID (`!room:server`) or an alias (`#alias:server`); ZeroClaw resolves aliases.
 4. `allowed_users` allows the sender (`["*"]` for open testing).
 5. For E2EE rooms, the bot device has received encryption keys for the room.
 
@@ -35,23 +33,23 @@ All config management goes through `zeroclaw config` or `zeroclaw onboard`. Do n
 Easiest: run the wizard and let it prompt for every Matrix field:
 
 ```bash
-zeroclaw onboard --channels-only
+zeroclaw onboard channels
 ```
 
 Or set individual fields after onboarding:
 
 ```bash
 zeroclaw config set channels.matrix.homeserver https://matrix.example.com
-zeroclaw config set channels.matrix.room-id '!room:matrix.example.com'
 zeroclaw config set channels.matrix.access-token           # prompts, input masked
 zeroclaw config set channels.matrix.user-id @bot:matrix.example.com
 zeroclaw config set channels.matrix.device-id ABCDEF1234
 zeroclaw config set channels.matrix.allowed-users '["*"]'   # open for testing
+zeroclaw config set channels.matrix.allowed-rooms '["!room:matrix.example.com"]'  # empty list = allow all joined rooms
 zeroclaw config set channels.matrix.ack-reactions true       # default: true (👀 → ✅)
 zeroclaw config set channels.matrix.reply-in-thread true     # default: true
 ```
 
-Required: `homeserver`, `access-token`, `room-id`. Strongly recommended for E2EE: `user-id` and `device-id`. For the full field index, see the [Config reference](../reference/config.md).
+Required: `homeserver`, `access-token`, `allowed-users`. Strongly recommended for E2EE: `user-id` and `device-id`. `allowed-rooms` is optional — leave empty to allow every room the bot has joined, or list explicit IDs/aliases to restrict. For the full field index, see the [Config reference](../reference/config.md).
 
 > **Don't have an `access-token` yet?** See §3 below — it walks through the Matrix password-login API call that mints a token plus a stable `device_id` in one shot. If you only need to look up `device_id` for a token you already have, see §5H.
 
@@ -88,30 +86,22 @@ Response:
 zeroclaw config set channels.matrix.access-token    # paste the access_token (input is masked)
 zeroclaw config set channels.matrix.device-id NEWDEVICE
 zeroclaw config set channels.matrix.user-id @bot:example.com
-zeroclaw service restart
 ```
 
-The wizard (`zeroclaw onboard --channels-only`) prompts for these same fields if you'd rather work through it interactively.
+Restart for the new values to take effect: `zeroclaw service restart`.
+
+The wizard (`zeroclaw onboard channels`) prompts for these same fields if you'd rather work through it interactively.
 
 ### Notes
 
 - **Keep a copy of the token** when you first paste it. Secrets are encrypted at rest and `zeroclaw config get` will print `[masked]` for the token field; you can't retrieve it later. Stash it in a scratch note if you'll need it for the curl validation snippets in §5C.
 - **Reuse the same `device_id` on every restart** — changing it forces a new server-side device registration, which breaks key sharing and verification in encrypted rooms. The auto-recovery path in §8 handles the rare cases where wiping is genuinely the right call.
-- **Rotating the access token later** without re-running the wizard:
-  ```bash
-  zeroclaw config set channels.matrix.access-token    # prompts, masked
-  zeroclaw service restart
-  ```
+- **Rotating the access token later** without re-running the wizard: run `zeroclaw config set channels.matrix.access-token` (prompts, input masked), then `zeroclaw service restart`.
 - **Token shows as expired or invalid** at startup: mint a new one with the same curl, repeat Step 2.
 
 ## 4. Quick validation
 
-```bash
-zeroclaw onboard --channels-only
-zeroclaw service restart        # or `zeroclaw daemon` to run foreground
-```
-
-Send a plain-text message in the configured Matrix room. Confirm:
+Run `zeroclaw onboard channels` if you haven't yet, then restart with `zeroclaw service restart` (background) or `zeroclaw daemon` (foreground). Send a plain-text message in the configured Matrix room. Confirm:
 
 - ZeroClaw logs show the Matrix listener starting with no repeated sync/auth errors.
 - In an encrypted room, the bot can read and reply to encrypted messages from allowed users.
@@ -128,11 +118,7 @@ Work through in order.
 ### B. Sender allowlist
 
 - If `allowed_users = []`, all inbound messages are denied.
-- For diagnosis, temporarily open it:
-  ```bash
-  zeroclaw config set channels.matrix.allowed-users '["*"]'
-  zeroclaw service restart
-  ```
+- For diagnosis, temporarily open it: run `zeroclaw config set channels.matrix.allowed-users '["*"]'`, then `zeroclaw service restart`.
 - Tighten to explicit user IDs once the flow works.
 
 ### C. Token and identity
@@ -158,11 +144,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 - Returned `user_id` must match the bot account.
 - If `device_id` is missing from the response, set it manually (see §5H).
-- Rotate the access token without re-running onboard:
-  ```bash
-  zeroclaw config set channels.matrix.access-token    # prompts, masked
-  zeroclaw service restart
-  ```
+- Rotate the access token without re-running onboard: `zeroclaw config set channels.matrix.access-token` (prompts, masked), then `zeroclaw service restart`.
 
 ### D. E2EE-specific checks
 
@@ -220,10 +202,9 @@ If `device_id` is missing, the token was created without a device login (e.g. vi
 
 ```bash
 zeroclaw config set channels.matrix.device-id ABCDEF1234
-zeroclaw service restart
 ```
 
-Keep `device-id` stable — changing it forces a new device registration, which breaks existing key sharing and verification.
+Then `zeroclaw service restart`. Keep `device-id` stable — changing it forces a new device registration, which breaks existing key sharing and verification.
 
 ### H (continued). Crypto-store deletion recovery
 
@@ -298,7 +279,7 @@ Either path works. The onboarding wizard is easier for fresh installs; `zeroclaw
 **Option A — during onboarding:**
 
 ```bash
-zeroclaw onboard --channels-only
+zeroclaw onboard channels
 ```
 
 When prompted:
@@ -313,10 +294,9 @@ Input is masked. The key is encrypted at rest.
 
 ```bash
 zeroclaw config set channels.matrix.recovery-key    # input masked
-zeroclaw service restart
 ```
 
-Encrypted at rest immediately.
+Then `zeroclaw service restart`. The recovery key is encrypted at rest immediately.
 
 #### Step 3 — Restart
 

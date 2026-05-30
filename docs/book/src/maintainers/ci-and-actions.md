@@ -8,7 +8,7 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 
-- **lint** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo check --features ci-all`, strict delta lint on changed lines
+- **lint** — `cargo fmt --check`, `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
 - **build** — matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check** — all features + no-default-features
 - **check-32bit** — `i686-unknown-linux-gnu` with no default features
@@ -38,7 +38,7 @@ Fires after a successful stable release. Posts an announcement tweet.
 
 Fires after every stable release. Auto-opens PRs to update version numbers in the downstream marketplace template repos (docker, k8s, compose).
 
-Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow — run `cargo mdbook sync --provider <name>` before PRing. See [Docs & Translations](./docs-and-translations.md) for details.
+Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow: run `cargo mdbook sync --provider <name>` for dedicated translation-cache PRs, new locales, and release translation passes. Routine English docs PRs may defer broad generated `.po` churn. See [Docs & Translations](./docs-and-translations.md) for details.
 
 ## Manual workflows
 

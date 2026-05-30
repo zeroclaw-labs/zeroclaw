@@ -9,7 +9,7 @@
 //  * string-array → <textarea>, one value per line
 //  * integer/float → <input type="number">
 //  * secret     → <input type="password"> with populated indicator
-//  * provider model field (path matches `providers.models.<name>.model`) →
+//  * provider model field (path matches `model_providers.<name>.model`) →
 //    fetches /api/onboard/catalog/models?provider=<name>, populates a
 //    <datalist>; on fetch failure falls back to free-text with help text.
 //  * everything else → <input type="text">
@@ -19,27 +19,94 @@
 // On error: structured ApiError envelope binds inline to the field by .path.
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
-import { List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { ExternalLink, FolderOpen, List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
+import DirectoryPicker from './DirectoryPicker';
 import {
   ApiError,
-  deleteProp,
   descriptionForPath,
   fetchConfigSchema,
+  getAgentOptions,
   getCatalogModels,
   listProps,
   objectArrayElementProps,
   patchConfig,
+  type AgentOptionsResponse,
   type ConfigApiError,
   type DriftEntry,
   type ListResponseEntry,
   type ObjectArrayPropMeta,
   type PatchOp,
-  type ValidationWarning,
 } from '../../lib/api';
+import { useConfigDraft } from '../../lib/draftStore';
 import { fuzzyFilter } from '../../lib/fuzzy';
+import { isLocalModelProviderName } from '../../lib/modelProviders';
+import EntityEnabledToggle from '../EntityEnabledToggle';
+
+function entryValue(entry: ListResponseEntry): unknown {
+  return entry.populated ? entry.value : undefined;
+}
+
+/**
+ * Inline switch for a `bool` field. Track + thumb pattern with an
+ * adjacent `true` / `false` label so the form stays readable when
+ * dense. The component is dumb — it takes the current `value` and
+ * fires `onChange(next)` on click; the parent owns the draft state.
+ */
+function BoolSwitch({
+  id,
+  value,
+  onChange,
+}: {
+  id?: string;
+  value: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      id={id}
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+      className="inline-flex items-center gap-2 rounded-full px-1 py-1 select-none"
+      style={{
+        background: value
+          ? 'var(--color-status-success-alpha-08)'
+          : 'var(--pc-bg-elevated)',
+        border: '1px solid',
+        borderColor: value
+          ? 'var(--color-status-success-alpha-20)'
+          : 'var(--pc-border)',
+      }}
+    >
+      <span
+        className="relative inline-block h-4 w-7 rounded-full transition-colors"
+        style={{
+          background: value ? 'var(--color-status-success)' : 'var(--pc-border)',
+        }}
+      >
+        <span
+          className="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all"
+          style={{ left: value ? 'calc(100% - 14px)' : '2px' }}
+        />
+      </span>
+      <span
+        className="text-xs font-medium pr-2"
+        style={{
+          color: value
+            ? 'var(--color-status-success)'
+            : 'var(--pc-text-muted)',
+        }}
+      >
+        {value ? 'true' : 'false'}
+      </span>
+    </button>
+  );
+}
 
 interface FieldFormProps {
-  /** Dotted prefix to fetch fields under, e.g. `providers.models.anthropic`. */
+  /** Dotted prefix to fetch fields under, e.g. `model_providers.anthropic`. */
   prefix: string;
   /** Called after a successful save; parent typically advances or refreshes. */
   onSaved?: () => void;
@@ -51,6 +118,19 @@ interface FieldFormProps {
    *  drifted field renders an inline `in-memory: [...] / on-disk: [...]`
    *  comparison next to its label. Empty / undefined when nothing drifted. */
   drift?: DriftEntry[];
+  /** Filter for which entries this form renders. Returning false hides
+   *  the entry. Used to partition a section's fields across tabs (e.g.
+   *  Model providers: Connection / Model / Advanced). The form still
+   *  fetches every entry under `prefix`; the predicate only gates
+   *  rendering, so saves still validate against the full server-side
+   *  config. */
+  includePath?: (path: string) => boolean;
+  /** Render the save bar as a normal inline element instead of
+   *  `sticky bottom-0`. Set when the FieldForm is embedded inside a
+   *  taller composite editor (e.g. an expandable rate-sheet row) where
+   *  the sticky viewport-bottom behavior would conflict with sibling
+   *  content rendered below the form. */
+  inlineSaveBar?: boolean;
 }
 
 /** Imperative handle the parent uses to flush unsaved changes before
@@ -83,6 +163,67 @@ function rendererFor(
 
 function fieldShortLabel(entry: ListResponseEntry): string {
   return entry.path.split('.').pop()!.replace(/[-_]/g, ' ');
+}
+
+function setupFieldPriority(entry: ListResponseEntry): number {
+  const leaf = entry.path.split('.').pop() ?? '';
+  if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
+    const order = ['model', 'api-key', 'requires-openai-auth', 'uri'];
+    const idx = order.indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  if (/^agents\.[^.]+\./.test(entry.path)) {
+    const order = ['enabled', 'model-provider', 'risk-profile', 'runtime-profile', 'channels'];
+    const idx = order.indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  if (entry.path === 'memory.backend') return 0;
+  if (/^risk-profiles\.[^.]+\./.test(entry.path)) {
+    const idx = ['approval-mode', 'allowed-commands', 'sandbox-mode'].indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  if (/^runtime-profiles\.[^.]+\./.test(entry.path)) {
+    const idx = ['agentic', 'max-iterations', 'timeout-secs', 'max-cost-usd'].indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  return 100;
+}
+
+function setupRequirement(entry: ListResponseEntry): { label: string; tone: 'required' | 'choice' | 'optional' } | null {
+  const leaf = entry.path.split('.').pop() ?? '';
+  if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
+    const localProvider = isLocalModelProviderPath(entry.path);
+    if (leaf === 'model') return { label: 'Required', tone: 'required' };
+    if (leaf === 'api-key') {
+      return localProvider
+        ? { label: 'Optional for remote auth', tone: 'optional' }
+        : { label: 'Required for API-key auth', tone: 'required' };
+    }
+    if (leaf === 'requires-openai-auth') return { label: 'Auth option', tone: 'choice' };
+    if (leaf === 'uri') return { label: 'Endpoint option', tone: 'choice' };
+    return { label: 'Optional', tone: 'optional' };
+  }
+  const topLevelAgentField = entry.path.match(/^agents\.[^.]+\.([^.]+)$/)?.[1] ?? null;
+  if (topLevelAgentField) {
+    if (['enabled', 'model-provider', 'risk-profile', 'runtime-profile'].includes(topLevelAgentField)) {
+      return { label: 'Required', tone: 'required' };
+    }
+    return { label: 'Optional', tone: 'optional' };
+  }
+  if (/^risk-profiles\.[^.]+\./.test(entry.path) || /^runtime-profiles\.[^.]+\./.test(entry.path)) {
+    return { label: 'Advanced', tone: 'optional' };
+  }
+  if (entry.path === 'memory.backend') return { label: 'Recommended', tone: 'choice' };
+  return null;
+}
+
+function isLocalModelProviderPath(path: string): boolean {
+  const provider = path.match(/^providers\.models\.([^.]+)\./)?.[1] ?? '';
+  return isLocalModelProviderName(provider);
+}
+
+function modelFallbackExample(path: string): string {
+  return isLocalModelProviderPath(path) ? 'llama3.2' : 'claude-sonnet-4-5-20251101';
 }
 
 function defaultInputValue(entry: ListResponseEntry): string {
@@ -174,23 +315,157 @@ function isOptionalArray(typeHint: string): boolean {
   return compact.startsWith('Option<Vec<') || compact.startsWith('Option<HashSet<');
 }
 
-const modelsCache: Record<string, { models: string[]; live: boolean }> = {};
+// Per-provider+alias catalog cache. Cleared via clearFieldFormCatalogCaches() on
+// nav so a new model alias added under (say) `anthropic` shows up the next
+// time the user opens an agent form without a hard refresh.
+let modelsCache: Record<string, { models: string[]; live: boolean; local: boolean }> = {};
+
+// In-flight `getAgentOptions()` promise so N FieldForm rows mounting at
+// once share a single round-trip. Cleared when the request resolves;
+// the response itself is NOT cached across mounts — each FieldForm mount
+// triggers a fresh fetch so newly-created channels / agents / bundles
+// surface immediately on the next form visit.
+let agentOptionsPromise: Promise<AgentOptionsResponse> | null = null;
+function loadAgentOptions(): Promise<AgentOptionsResponse> {
+  if (agentOptionsPromise) return agentOptionsPromise;
+  agentOptionsPromise = getAgentOptions()
+    .finally(() => {
+      agentOptionsPromise = null;
+    });
+  return agentOptionsPromise;
+}
+
+/// Clear the per-provider model catalog cache. Called by Config.tsx when
+/// the user navigates between sections so a model alias added under e.g.
+/// `providers.models.anthropic` shows up the next time another agent's
+/// `model_provider` dropdown is opened.
+export function clearFieldFormCatalogCaches() {
+  modelsCache = {};
+}
+
+// Single-select alias-ref fields on an agent: render as <select> with the
+// matched options. Mandatory-vs-optional is enforced by `Config::validate()`
+// at the backend on save — the frontend just submits whatever the user
+// picks (including empty) and surfaces structured errors inline.
+//
+// Keys are kebab-case to match `prop_fields()` emission (the macro at
+// crates/zeroclaw-macros/src/lib.rs:1056 converts every snake_case Rust
+// field name to kebab-case for the schema path).
+const AGENT_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  'model-provider': 'model_providers',
+  'risk-profile': 'risk_profiles',
+  'runtime-profile': 'runtime_profiles',
+  'memory-namespace': 'memory_namespaces',
+};
+
+// Multi-select alias-ref fields on an agent: render as the chip editor with
+// a `<datalist>` of the available aliases (no free text expected — the
+// suggestions list is the canonical input source). Same kebab-case
+// convention as AGENT_SINGLE_ALIAS_FIELDS above.
+const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  channels: 'channels',
+  'skill-bundles': 'skill_bundles',
+  'knowledge-bundles': 'knowledge_bundles',
+  'mcp-bundles': 'mcp_bundles',
+};
+
+// Peer-groups carry the same alias-ref shape as agents do: a single
+// `channel` field (one-of the configured channels) plus an `agents`
+// list (subset of configured agents). Mirror agent's picker UX so a
+// peer-groups form doesn't fall back to free-text inputs.
+const PEER_GROUP_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  channel: 'channel_types',
+};
+const PEER_GROUP_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  agents: 'agents',
+};
+
+function agentFieldKey(path: string): string | null {
+  const m = path.match(/^agents\.[^.]+\.(.+)$/);
+  return m && m[1] ? m[1] : null;
+}
+
+function peerGroupFieldKey(path: string): string | null {
+  const m = path.match(/^peer-groups\.[^.]+\.(.+)$/);
+  return m && m[1] ? m[1] : null;
+}
+
+// Cross-section navigation map for agent alias-ref fields. Each entry
+// answers: "where does this field's source live in /config/?"
+// Used both by the empty-state hint and the per-item edit-jump links.
+const AGENT_ALIAS_SOURCE_PATH: Record<keyof AgentOptionsResponse, string> = {
+  channels: '/config/channels',
+  channel_types: '/config/channels',
+  model_providers: '/config/providers',
+  risk_profiles: '/config/risk-profiles',
+  runtime_profiles: '/config/runtime-profiles',
+  skill_bundles: '/config/skill-bundles',
+  knowledge_bundles: '/config/knowledge-bundles',
+  mcp_bundles: '/config/mcp-bundles',
+  agents: '/config/agents',
+  memory_namespaces: '/config/memory-namespaces',
+};
+
+function AgentEmptyAliasFallback({
+  fieldKind,
+}: {
+  fieldKind: keyof AgentOptionsResponse;
+}) {
+  const path = AGENT_ALIAS_SOURCE_PATH[fieldKind];
+  const label = fieldKind.replace(/_/g, ' ');
+  return (
+    <div
+      className="text-xs px-3 py-2 rounded border"
+      style={{
+        color: 'var(--pc-text-muted)',
+        borderColor: 'var(--pc-border)',
+        background: 'var(--pc-bg-surface-subtle)',
+      }}
+    >
+      No {label} configured yet.{' '}
+      <Link
+        to={path}
+        className="inline-flex items-center gap-1 underline"
+        style={{ color: 'var(--pc-text-link)' }}
+      >
+        Configure {label} <ExternalLink className="h-3 w-3" />
+      </Link>
+    </div>
+  );
+}
+
+/// Path resolver for the per-item edit-jump beside picker entries.
+/// `channels` → `/config/channels/<type>/<alias>`; bare-alias sections
+/// like risk_profiles use `/config/<section>/<alias>`. Shape parallels the
+/// AliasListView routes already configured in `Config.tsx`.
+function agentAliasJumpPath(
+  fieldKind: keyof AgentOptionsResponse,
+  alias: string,
+): string {
+  const base = AGENT_ALIAS_SOURCE_PATH[fieldKind];
+  // Channels and model_providers use dotted alias (`telegram.default`,
+  // `anthropic.work`); split into the two URL segments. Single-tier
+  // sections use the alias directly.
+  if (fieldKind === 'channels' || fieldKind === 'model_providers') {
+    const dot = alias.indexOf('.');
+    if (dot > 0) {
+      return `${base}/${encodeURIComponent(alias.slice(0, dot))}/${encodeURIComponent(alias.slice(dot + 1))}`;
+    }
+  }
+  return `${base}/${encodeURIComponent(alias)}`;
+}
 
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm(
-  { prefix, onSaved, showDelete = true, title, drift },
+  { prefix, onSaved, showDelete = true, title, drift, includePath, inlineSaveBar = false },
   ref,
 ) {
+  const configDraft = useConfigDraft();
   const [entries, setEntries] = useState<ListResponseEntry[]>([]);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, ConfigApiError>>({});
   const [topError, setTopError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-  // Non-fatal validation warnings echoed by the gateway after save.
-  // Surfaced inline so dashboard users see what CLI users see on stderr —
-  // e.g. `providers.fallback` referencing a non-existent provider returns
-  // 200 (the value saved) plus a warning the user needs to address.
-  const [warnings, setWarnings] = useState<ValidationWarning[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [schema, setSchema] = useState<Record<string, unknown> | undefined>(undefined);
@@ -214,8 +489,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
       const resp = await listProps(prefix);
       setEntries(resp.entries);
       const seed: Record<string, string> = {};
-      for (const e of resp.entries) seed[e.path] = defaultInputValue(e);
+      const commentSeed: Record<string, string> = {};
+      for (const e of resp.entries) {
+        const staged = configDraft.drafts[e.path];
+        seed[e.path] = staged?.input ?? defaultInputValue(e);
+        const stagedComment = configDraft.comments[e.path];
+        if (stagedComment) commentSeed[e.path] = stagedComment;
+      }
       setDraft(seed);
+      setComments(commentSeed);
     } catch (e) {
       if (e instanceof ApiError) {
         setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
@@ -240,15 +522,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     setSavedAt(null);
     setTopError(null);
     setFieldErrors({});
-    setWarnings([]);
 
     const ops: PatchOp[] = [];
-    for (const e of entries) {
-      const raw = draft[e.path] ?? '';
-      const original = defaultInputValue(e);
-      // Secrets with empty input mean "don't change".
-      if (e.is_secret && raw.length === 0) continue;
-      if (raw === original) continue;
+    const parseStringArrayValue = (e: ListResponseEntry, raw: string): unknown => {
       let value: unknown = parseInput(e, raw);
       // For Option<Vec<String>>: empty rows = "no opinion" → send null
       // (clears the field). Mandatory Vec<String>: empty stays as [] (an
@@ -261,9 +537,42 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
       ) {
         value = null;
       }
-      const op: PatchOp = { op: 'replace', path: e.path, value };
-      const c = comments[e.path];
-      if (c && c.length > 0) op.comment = c;
+      return value;
+    };
+    for (const e of entries) {
+      if (configDraft.tombstones.has(e.path)) {
+        ops.push({ op: 'remove', path: e.path });
+        continue;
+      }
+      const raw = draft[e.path] ?? '';
+      const original = defaultInputValue(e);
+      const valueChanged =
+        !(e.is_secret && raw.length === 0) && raw !== original;
+      const comment = comments[e.path] ?? '';
+      const commentChanged = comment.length > 0;
+      if (!valueChanged && !commentChanged) continue;
+      if (!valueChanged && commentChanged) {
+        // Secret: route through the comment-only op so ciphertext is
+        // preserved. Non-secret: round-trip via replace with the
+        // existing value.
+        if (e.is_secret) {
+          ops.push({ op: 'comment', path: e.path, comment });
+        } else {
+          ops.push({
+            op: 'replace',
+            path: e.path,
+            value: parseStringArrayValue(e, raw),
+            comment,
+          });
+        }
+        continue;
+      }
+      const op: PatchOp = {
+        op: 'replace',
+        path: e.path,
+        value: parseStringArrayValue(e, raw),
+      };
+      if (commentChanged) op.comment = comment;
       ops.push(op);
     }
 
@@ -275,7 +584,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     try {
       const resp = await patchConfig(ops);
       setSavedAt(`Saved ${resp.results.length} field(s).`);
-      setWarnings(resp.warnings ?? []);
+      configDraft.discardSection(prefix);
       await reload();
       onSaved?.();
       return true;
@@ -301,42 +610,52 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     flushSave: handleSave,
   }));
 
-  const handleDelete = async (path: string) => {
-    try {
-      await deleteProp(path);
-      await reload();
-    } catch (e) {
-      if (e instanceof ApiError) {
-        setTopError(`Delete failed: [${e.envelope.code}] ${e.envelope.message}`);
-      } else {
-        setTopError(`Delete failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
+  // Stage a tombstone in the cross-section draft store rather than
+  // POSTing DELETE immediately. The save bar (or the top banner's
+  // Save-all) commits the removal as a JSON Patch `remove` op alongside
+  // any other pending edits. Tombstoned rows render with a strikethrough
+  // + Undo affordance via `tombstones` from the store.
+  const handleDelete = (path: string) => {
+    configDraft.stageTombstone(path);
   };
 
   const sortedEntries = useMemo(() => {
     // Stable order: `enabled` first (drives whether anything below it
-    // matters), then secrets (most-needed), then alphabetical by short
-    // label. Curating `enabled` is safe — it's a load-bearing standard
-    // field name across every section that has on/off semantics.
+    // matters), then first-run required fields, then secrets, then
+    // alphabetical by short label. Curating these standard leaves keeps
+    // onboarding from burying "model" or agent refs below advanced knobs.
     const isEnabledLeaf = (e: ListResponseEntry) => e.path.endsWith('.enabled') || e.path === 'enabled';
     return [...entries].sort((a, b) => {
       const ea = isEnabledLeaf(a);
       const eb = isEnabledLeaf(b);
       if (ea !== eb) return ea ? -1 : 1;
+      const pa = setupFieldPriority(a);
+      const pb = setupFieldPriority(b);
+      if (pa !== pb) return pa - pb;
       if (a.is_secret !== b.is_secret) return a.is_secret ? -1 : 1;
       return fieldShortLabel(a).localeCompare(fieldShortLabel(b));
     });
   }, [entries]);
 
-  // Fuzzy-filter against the short label + dotted path; sections with
-  // a lot of fields (Agent, Channels) are otherwise a wall of inputs.
-  // Empty query falls through to the full sorted list. Matches the
-  // pattern SectionPicker uses so behavior is consistent across views.
+  // The entity-gate `enabled` bool gets hoisted into the title row as a
+  // pill toggle. Hide it from the field list so it isn't editable in two
+  // places at once.
+  const enabledEntry = useMemo(
+    () =>
+      entries.find(
+        (e) => e.path === `${prefix}.enabled` && e.kind === 'bool',
+      ) ?? null,
+    [entries, prefix],
+  );
+
   const visibleEntries = useMemo(() => {
-    if (!filter.trim()) return sortedEntries;
-    return fuzzyFilter(sortedEntries, filter, (e) => `${fieldShortLabel(e)} ${e.path}`);
-  }, [sortedEntries, filter]);
+    const base = enabledEntry
+      ? sortedEntries.filter((e) => e.path !== enabledEntry.path)
+      : sortedEntries;
+    const filtered = includePath ? base.filter((e) => includePath(e.path)) : base;
+    if (!filter.trim()) return filtered;
+    return fuzzyFilter(filtered, filter, (e) => `${fieldShortLabel(e)} ${e.path}`);
+  }, [sortedEntries, filter, includePath, enabledEntry]);
 
   // Count of fields whose draft value differs from the saved display value.
   // Drives the unsaved-changes counter in the sticky save bar. Must be
@@ -345,13 +664,19 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
   const unsavedCount = useMemo(() => {
     let n = 0;
     for (const e of entries) {
+      if (configDraft.tombstones.has(e.path)) {
+        n += 1;
+        continue;
+      }
       const raw = draft[e.path] ?? '';
       const original = defaultInputValue(e);
-      if (e.is_secret && raw.length === 0) continue;
-      if (raw !== original) n += 1;
+      const valueChanged =
+        !(e.is_secret && raw.length === 0) && raw !== original;
+      const commentChanged = (comments[e.path] ?? '').length > 0;
+      if (valueChanged || commentChanged) n += 1;
     }
     return n;
-  }, [entries, draft]);
+  }, [entries, draft, comments, configDraft.tombstones]);
 
   // Warn user before navigating away with unsaved changes.
   useEffect(() => {
@@ -375,25 +700,70 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     );
   }
 
+  // When the parent's `includePath` predicate excludes every entry and the
+  // user hasn't typed a filter, the section truly has nothing to configure
+  // (e.g. `[tunnel]` with `tunnel_provider = "none"` has only the
+  // discriminator field, which the parent excludes). Collapse the whole
+  // form in that case so the operator doesn't see an empty "Foo settings"
+  // header above a useless "No fields match." line.
+  const trulyEmpty =
+    !loading
+    && entries.length > 0
+    && visibleEntries.length === 0
+    && filter.trim().length === 0;
+
+  if (trulyEmpty && !enabledEntry) {
+    return null;
+  }
+
   return (
-    <div className="flex flex-col gap-4 pb-20">
-      {/* pb-20 reserves space at the bottom so the last field isn't covered
-          by the sticky save bar when the form is short. */}
-      {title && (
-        <h2
-          className="text-lg font-semibold"
-          style={{ color: 'var(--pc-text-primary)' }}
-        >
-          {title}
-        </h2>
+    <div
+      className={
+        inlineSaveBar
+          ? 'flex flex-col'
+          : 'flex flex-col gap-4 pb-20 flex-1 min-h-full'
+      }
+    >
+      {/* flex-1 + min-h-full stretches the form to fill the scroll area so
+          the sticky save bar anchors to the viewport bottom even with a
+          short field list. pb-20 reserves room so the last field isn't
+          covered. inlineSaveBar drops both — the save bar is rendered
+          tight against the last field as a footer of the embedding
+          card. */}
+      {(title || enabledEntry) && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          {title ? (
+            <h2
+              className="text-lg font-semibold"
+              style={{ color: 'var(--pc-text-primary)' }}
+            >
+              {title}
+            </h2>
+          ) : <span />}
+          {enabledEntry && (
+            <EntityEnabledToggle
+              prefix={prefix}
+              enabled={entryValue(enabledEntry) === 'true'}
+              onChange={(next) => {
+                setEntries((prev) =>
+                  prev.map((e) =>
+                    e.path === enabledEntry.path
+                      ? { ...e, value: next, populated: true }
+                      : e,
+                  ),
+                );
+              }}
+            />
+          )}
+        </div>
       )}
 
-      {entries.length > 4 && (
+      {visibleEntries.length > 1 && (
         <input
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          placeholder={`Filter ${entries.length} fields — fuzzy match on name or path`}
+          placeholder={`Filter ${visibleEntries.length} fields — fuzzy match on name or path`}
           className="input-electric w-full px-3 py-2 text-sm"
           aria-label="Filter fields"
         />
@@ -420,7 +790,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               className="px-4 py-6 text-sm text-center"
               style={{ color: 'var(--pc-text-muted)' }}
             >
-              No fields match <code style={{ color: 'var(--pc-text-faint)' }}>{filter}</code>.
+              {filter.trim().length === 0 ? (
+                <>No configurable settings for this selection.</>
+              ) : (
+                <>
+                  No fields match{' '}
+                  <code style={{ color: 'var(--pc-text-faint)' }}>{filter}</code>
+                  .
+                </>
+              )}
             </div>
           ) : null}
           {visibleEntries.map((f) => (
@@ -428,9 +806,40 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               key={f.path}
               entry={f}
               value={draft[f.path] ?? ''}
-              onChange={(v) => setDraft((d) => ({ ...d, [f.path]: v }))}
+              onChange={(v) => {
+                setDraft((d) => ({ ...d, [f.path]: v }));
+                const baseline = defaultInputValue(f);
+                if (v === baseline || (f.is_secret && v.length === 0)) {
+                  configDraft.clearDraft(f.path);
+                } else {
+                  let parsed: unknown;
+                  try {
+                    parsed = parseInput(f, v);
+                  } catch {
+                    parsed = v;
+                  }
+                  if (
+                    f.kind === 'string-array'
+                    && Array.isArray(parsed)
+                    && parsed.length === 0
+                    && isOptionalArray(f.type_hint)
+                  ) {
+                    parsed = null;
+                  }
+                  configDraft.setDraft(f.path, v, parsed);
+                }
+              }}
               comment={comments[f.path] ?? ''}
-              onCommentChange={(v) => setComments((c) => ({ ...c, [f.path]: v }))}
+              onCommentChange={(v) => {
+                setComments((c) => ({ ...c, [f.path]: v }));
+                if (v.length > 0) {
+                  configDraft.setComment(f.path, v);
+                } else {
+                  configDraft.clearComment(f.path);
+                }
+              }}
+              tombstoned={configDraft.tombstones.has(f.path)}
+              onUndoTombstone={() => configDraft.unstageTombstone(f.path)}
               error={fieldErrors[f.path]}
               onDelete={showDelete ? () => handleDelete(f.path) : undefined}
               description={descriptionForPath(schema, f.path)}
@@ -449,38 +858,18 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
           button so post-save feedback lands where the eye already is. */}
       {entries.length > 0 && (
         <div
-          className="sticky bottom-0 left-0 right-0 -mx-6 px-6 py-3 border-t backdrop-blur z-10"
+          className={
+            inlineSaveBar
+              ? 'px-3 py-2 mt-2 rounded-md'
+              : 'sticky bottom-0 left-0 right-0 -mx-6 px-6 py-3 border-t backdrop-blur z-10'
+          }
           style={{
             borderColor: 'var(--pc-border)',
-            background: 'color-mix(in srgb, var(--pc-bg-base) 88%, transparent)',
+            background: inlineSaveBar
+              ? 'var(--pc-bg-elevated)'
+              : 'color-mix(in srgb, var(--pc-bg-base) 88%, transparent)',
           }}
         >
-          {/* Warnings echoed by the gateway after a successful save —
-              e.g. `providers.fallback` references a non-existent provider.
-              The save committed (no error), but the operator needs to act
-              on the warning before the config will work at runtime. */}
-          {warnings.length > 0 && (
-            <div
-              className="mb-2 rounded text-sm border px-3 py-2"
-              style={{
-                borderColor: 'var(--color-status-warning, #facc15)',
-                color: 'var(--color-status-warning, #facc15)',
-                background: 'color-mix(in srgb, var(--color-status-warning, #facc15) 10%, transparent)',
-              }}
-            >
-              <div className="font-medium mb-1">
-                ⚠ {warnings.length} warning{warnings.length === 1 ? '' : 's'}:
-              </div>
-              <ul className="list-disc pl-5 space-y-1">
-                {warnings.map((w) => (
-                  <li key={`${w.code}:${w.path}`}>
-                    <span className="font-mono text-xs opacity-80">[{w.code}]</span>{' '}
-                    {w.message}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
           <div className="flex items-center justify-between gap-3">
             <div className="flex-1 min-w-0 text-sm">
               {topError ? (
@@ -533,36 +922,142 @@ interface FieldRowProps {
   elementProps?: ObjectArrayPropMeta[] | null;
   /** Drift entry for this path (in-memory ≠ on-disk). `null` when no drift. */
   drift: DriftEntry | null;
+  /** `true` when the operator clicked the trash icon and the removal is
+   *  staged (not yet committed). The row renders strikethrough with an
+   *  Undo button replacing the input. */
+  tombstoned?: boolean;
+  /** Pulls the row out of tombstoned state. */
+  onUndoTombstone?: () => void;
 }
 
-function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps, drift }: FieldRowProps) {
+function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps, drift, tombstoned, onUndoTombstone }: FieldRowProps) {
   const renderer = rendererFor(entry);
+  const requirement = setupRequirement(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
-  const isProviderModelField = /^providers\.models\.[^.]+\.model$/.test(entry.path);
+  // Per-alias model field — `providers.models.<type>.<alias>.model`.
+  const isProviderModelField = /^providers\.models\.[^.]+\.[^.]+\.model$/.test(
+    entry.path,
+  );
+  // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
+  // the legacy snake form `skill_bundles.<alias>.directory`). When unset
+  // the runtime falls back to `<install>/shared/skills/<alias>/`; render
+  // that resolved default as a placeholder so operators see the path
+  // their bundle will actually use. Also gets a directory-picker button
+  // wired to `GET /api/browse` (scoped to `<install>/shared/`).
+  const skillBundleAlias = (() => {
+    const m = entry.path.match(/^skill[-_]bundles\.([^.]+)\.directory$/);
+    return m ? m[1] : null;
+  })();
+  // Any field that names a filesystem directory gets the shared/ picker.
+  // Match on the dotted-path leaf: `directory`, `dir`, or `*_dir` / `*-dir`.
+  // Secrets and `path` (overloaded for URL paths) deliberately excluded.
+  const isDirectoryField = (() => {
+    if (entry.is_secret) return false;
+    const leaf = entry.path.split('.').pop() ?? '';
+    return (
+      leaf === 'directory' ||
+      leaf === 'dir' ||
+      leaf.endsWith('-dir') ||
+      leaf.endsWith('_dir')
+    );
+  })();
+  const showPicker = skillBundleAlias !== null || isDirectoryField;
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  // Agent-form alias pickers. Each `agents.<alias>.<field>` row that
+  // references another section's aliases (channels, model_provider, etc.)
+  // renders as a picker over the live config rather than a free-text
+  // input. The `system_prompt` field gets a textarea.
+  const agentField = agentFieldKey(entry.path);
+  const peerGroupField = peerGroupFieldKey(entry.path);
+  // Schema path is kebab-case (matches prop_fields() emission).
+  const isAgentSystemPrompt = agentField === 'system-prompt';
+  const agentSingleAliasKind: keyof AgentOptionsResponse | null = agentField
+    ? (AGENT_SINGLE_ALIAS_FIELDS[agentField] ?? null)
+    : peerGroupField
+      ? (PEER_GROUP_SINGLE_ALIAS_FIELDS[peerGroupField] ?? null)
+      : null;
+  const agentMultiAliasKind: keyof AgentOptionsResponse | null = agentField
+    ? (AGENT_MULTI_ALIAS_FIELDS[agentField] ?? null)
+    : peerGroupField
+      ? (PEER_GROUP_MULTI_ALIAS_FIELDS[peerGroupField] ?? null)
+      : null;
+  const agentNeedsOptions =
+    agentSingleAliasKind !== null || agentMultiAliasKind !== null;
+  const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(null);
 
   useEffect(() => {
     if (!isProviderModelField) return;
-    const provider = entry.path.split('.')[2];
-    if (!provider) return;
-    const cached = modelsCache[provider];
+    const [, , provider, alias] = entry.path.split('.');
+    if (!provider || !alias) return;
+    const cacheKey = `${provider}.${alias}`;
+    const cached = modelsCache[cacheKey];
     if (cached) {
       setProviderModels(cached.models);
       setModelsFetchFailed(!cached.live && cached.models.length === 0);
       return;
     }
-    void getCatalogModels(provider)
+    void getCatalogModels(provider, alias)
       .then((r) => {
-        modelsCache[provider] = { models: r.models, live: r.live };
+        modelsCache[cacheKey] = { models: r.models, live: r.live, local: r.local };
         setProviderModels(r.models);
         setModelsFetchFailed(!r.live && r.models.length === 0);
       })
       .catch(() => {
-        modelsCache[provider] = { models: [], live: false };
+        modelsCache[cacheKey] = {
+          models: [],
+          live: false,
+          local: isLocalModelProviderName(provider),
+        };
         setProviderModels([]);
         setModelsFetchFailed(true);
       });
   }, [isProviderModelField, entry.path]);
+
+  // Refetch on every mount so newly-created channels / agents / bundles
+  // (added in a different section) surface without a page reload.
+  useEffect(() => {
+    if (!agentNeedsOptions) return;
+    let cancelled = false;
+    void loadAgentOptions()
+      .then((r) => {
+        if (!cancelled) setAgentOptions(r);
+      })
+      .catch(() => {
+        // Fail-open: leave options null so the field falls back to text.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentNeedsOptions]);
+
+  if (tombstoned) {
+    return (
+      <div className="px-4 py-3 flex items-center justify-between gap-3 opacity-70">
+        <div className="min-w-0 flex-1">
+          <code
+            className="text-xs font-mono line-through break-all"
+            style={{ color: 'var(--pc-text-muted)' }}
+          >
+            {entry.path}
+          </code>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--pc-text-muted)' }}>
+            Staged for removal. Commits on Save.
+          </p>
+        </div>
+        {onUndoTombstone && (
+          <button
+            type="button"
+            onClick={onUndoTombstone}
+            className="btn-secondary text-xs px-2 py-1 flex-shrink-0"
+          >
+            Undo
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="px-4 py-3">
@@ -575,6 +1070,34 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             title={entry.type_hint}
           >
             {entry.path}
+            {requirement && (
+              <span
+                className="ml-2 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide font-sans"
+                style={{
+                  color:
+                    requirement.tone === 'required'
+                      ? '#fca5a5'
+                      : requirement.tone === 'choice'
+                        ? '#67e8f9'
+                        : 'var(--pc-text-muted)',
+                  background:
+                    requirement.tone === 'required'
+                      ? 'rgba(239, 68, 68, 0.12)'
+                      : requirement.tone === 'choice'
+                        ? 'rgba(34, 211, 238, 0.10)'
+                        : 'var(--pc-bg-surface-subtle)',
+                  border: '1px solid',
+                  borderColor:
+                    requirement.tone === 'required'
+                      ? 'rgba(239, 68, 68, 0.24)'
+                      : requirement.tone === 'choice'
+                        ? 'rgba(34, 211, 238, 0.20)'
+                        : 'var(--pc-border)',
+                }}
+              >
+                {requirement.label}
+              </span>
+            )}
             {entry.is_secret && (
               <span
                 className="ml-2 text-xs font-sans"
@@ -608,15 +1131,11 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
 
       <div className="mt-2 space-y-1.5">
         {renderer === 'bool' ? (
-          <select
+          <BoolSwitch
             id={entry.path}
-            value={value || 'false'}
-            onChange={(e) => onChange(e.target.value)}
-            className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
-          >
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select>
+            value={value === 'true'}
+            onChange={(next) => onChange(next ? 'true' : 'false')}
+          />
         ) : renderer === 'select' ? (
           <select
             id={entry.path}
@@ -663,7 +1182,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             >
               Could not fetch model catalog for this provider. Type the
               identifier from your provider's docs (e.g.{' '}
-              <code>claude-sonnet-4-5-20251101</code>).
+              <code>{modelFallbackExample(entry.path)}</code>).
             </p>
           </>
         ) : isProviderModelField && providerModels === null ? (
@@ -684,6 +1203,56 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               Fetching available models from the provider's catalog…
             </p>
           </>
+        ) : isAgentSystemPrompt ? (
+          <textarea
+            id={entry.path}
+            rows={Math.max(4, Math.min(value.split('\n').length + 1, 14))}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
+            placeholder="Optional. Prefer placing prose in agents/<alias>/AGENTS.md."
+          />
+        ) : agentSingleAliasKind && agentOptions ? (
+          (agentOptions[agentSingleAliasKind] ?? []).length === 0 ? (
+            <AgentEmptyAliasFallback fieldKind={agentSingleAliasKind} />
+          ) : (
+            <div className="flex items-center gap-2">
+              <select
+                id={entry.path}
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                className="input-electric flex-1 px-3 py-2 text-sm appearance-none cursor-pointer"
+              >
+                <option value="">— (none)</option>
+                {(agentOptions[agentSingleAliasKind] ?? []).map((a) => (
+                  <option key={a} value={a}>
+                    {a}
+                  </option>
+                ))}
+              </select>
+              {value && (
+                <Link
+                  to={agentAliasJumpPath(agentSingleAliasKind, value)}
+                  title={`Edit ${value} in its source section`}
+                  className="btn-icon flex-shrink-0"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                </Link>
+              )}
+            </div>
+          )
+        ) : agentMultiAliasKind && agentOptions ? (
+          (agentOptions[agentMultiAliasKind] ?? []).length === 0 ? (
+            <AgentEmptyAliasFallback fieldKind={agentMultiAliasKind} />
+          ) : (
+            <ArrayFieldEditor
+              inputId={entry.path}
+              value={value}
+              onChange={onChange}
+              isOptional={isOptionalArray(entry.type_hint)}
+              suggestions={agentOptions[agentMultiAliasKind]}
+            />
+          )
         ) : renderer === 'array' ? (
           <ArrayFieldEditor
             inputId={entry.path}
@@ -706,6 +1275,45 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm"
           />
+        ) : showPicker ? (
+          <div className="relative">
+            <div className="flex items-center gap-2">
+              <input
+                id={entry.path}
+                type="text"
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                className="input-electric flex-1 px-3 py-2 text-sm"
+                placeholder={
+                  skillBundleAlias
+                    ? `shared/skills/${skillBundleAlias}/ (default — leave empty)`
+                    : 'shared/… (leave empty to use the schema default)'
+                }
+              />
+              <button
+                type="button"
+                onClick={() => setPickerOpen((open) => !open)}
+                className="btn-secondary inline-flex items-center gap-1.5 text-sm px-3 py-2 flex-shrink-0"
+                title="Browse shared/ for a directory"
+                aria-expanded={pickerOpen}
+              >
+                <FolderOpen className="h-4 w-4" />
+                Browse
+              </button>
+            </div>
+            {pickerOpen && (
+              <div className="absolute z-20 right-0 mt-2 w-[min(28rem,calc(100vw-3rem))]">
+                <DirectoryPicker
+                  value={value}
+                  onSelect={(path) => {
+                    onChange(path);
+                    setPickerOpen(false);
+                  }}
+                  onClose={() => setPickerOpen(false)}
+                />
+              </div>
+            )}
+          </div>
         ) : (
           <input
             id={entry.path}
@@ -747,6 +1355,10 @@ interface ArrayFieldEditorProps {
   value: string;
   onChange: (next: string) => void;
   isOptional: boolean;
+  /** When provided, each chip input gets an attached `<datalist>` so
+   *  users can pick from a known list of valid values (e.g. channel
+   *  aliases on an agent's `channels` field) instead of typing free text. */
+  suggestions?: string[];
 }
 
 // Per-row chip editor for `Vec<String>` / `Option<Vec<String>>` fields with
@@ -754,7 +1366,7 @@ interface ArrayFieldEditorProps {
 // JSON array string) so toggling preserves edits. Trim + drop-empty runs
 // at save time in `parseArrayDraft`, not on every keystroke — typing a
 // space inside a chip shouldn't truncate the entry.
-function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEditorProps) {
+function ArrayFieldEditor({ inputId, value, onChange, isOptional, suggestions }: ArrayFieldEditorProps) {
   const [mode, setMode] = useState<'rows' | 'text'>('rows');
   const rows = useMemo(() => parseArrayRows(value), [value]);
 
@@ -830,7 +1442,8 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
                     value={row}
                     onChange={(e) => setRow(i, e.target.value)}
                     className="input-electric flex-1 px-3 py-1.5 text-sm"
-                    placeholder="empty"
+                    placeholder={suggestions && suggestions.length > 0 ? 'pick from list' : 'empty'}
+                    list={suggestions ? `${inputId}-suggestions` : undefined}
                   />
                   <button
                     type="button"
@@ -843,6 +1456,13 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
                 </li>
               ))}
             </ul>
+          )}
+          {suggestions && (
+            <datalist id={`${inputId}-suggestions`}>
+              {suggestions.map((s) => (
+                <option key={s} value={s} />
+              ))}
+            </datalist>
           )}
           <button
             type="button"
@@ -1032,14 +1652,12 @@ function ObjectArrayField({
         </p>
       )}
       {meta.kind === 'bool' ? (
-        <select
-          value={display || 'false'}
-          onChange={(e) => onChange(e.target.value === 'true')}
-          className="input-electric w-full px-2 py-1 mt-1 text-sm appearance-none cursor-pointer"
-        >
-          <option value="true">true</option>
-          <option value="false">false</option>
-        </select>
+        <div className="mt-1">
+          <BoolSwitch
+            value={display === 'true'}
+            onChange={(next) => onChange(next)}
+          />
+        </div>
       ) : meta.kind === 'enum' && meta.enumVariants ? (
         <select
           value={display}
@@ -1306,4 +1924,3 @@ function formatDriftValue(value: unknown): string {
     return String(value);
   }
 }
-

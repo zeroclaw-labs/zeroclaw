@@ -1,4 +1,4 @@
-pub use zeroclaw_api::provider::*;
+pub use zeroclaw_api::model_provider::*;
 
 #[cfg(test)]
 mod tests {
@@ -17,15 +17,16 @@ mod tests {
     /// deterministic replays from the mock stream.
     const TEST_GREEDY_TEMPERATURE: f64 = 0.0;
 
-    struct CapabilityMockProvider;
+    struct CapabilityMockModelProvider;
 
     #[async_trait]
-    impl Provider for CapabilityMockProvider {
+    impl ModelProvider for CapabilityMockModelProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: true,
                 vision: true,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -37,6 +38,18 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".into())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CapabilityMockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapabilityMockModelProvider"
         }
     }
 
@@ -73,6 +86,7 @@ mod tests {
                 id: "1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -110,6 +124,7 @@ mod tests {
             id: "call_123".into(),
             name: "file_read".into(),
             arguments: r#"{"path":"test.txt"}"#.into(),
+            extra_content: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         assert!(json.contains("call_123"));
@@ -143,16 +158,19 @@ mod tests {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
         let caps2 = ProviderCapabilities {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
         let caps3 = ProviderCapabilities {
             native_tool_calling: false,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
 
         assert_eq!(caps1, caps2);
@@ -161,14 +179,14 @@ mod tests {
 
     #[test]
     fn supports_native_tools_reflects_capabilities_default_mapping() {
-        let provider = CapabilityMockProvider;
-        assert!(provider.supports_native_tools());
+        let model_provider = CapabilityMockModelProvider;
+        assert!(model_provider.supports_native_tools());
     }
 
     #[test]
     fn supports_vision_reflects_capabilities_default_mapping() {
-        let provider = CapabilityMockProvider;
-        assert!(provider.supports_vision());
+        let model_provider = CapabilityMockModelProvider;
+        assert!(model_provider.supports_vision());
     }
 
     #[test]
@@ -239,12 +257,12 @@ mod tests {
         assert!(instructions.contains("Available Tools"));
     }
 
-    struct MockProvider {
+    struct MockModelProvider {
         supports_native: bool,
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         fn supports_native_tools(&self) -> bool {
             self.supports_native
         }
@@ -259,10 +277,22 @@ mod tests {
             Ok("response".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockModelProvider"
+        }
+    }
 
     #[test]
     fn provider_convert_tools_default() {
-        let provider = MockProvider {
+        let model_provider = MockModelProvider {
             supports_native: false,
         };
 
@@ -272,7 +302,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let payload = provider.convert_tools(&tools);
+        let payload = model_provider.convert_tools(&tools);
         assert!(matches!(payload, ToolsPayload::PromptGuided { .. }));
 
         if let ToolsPayload::PromptGuided { instructions } = payload {
@@ -283,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_fallback() {
-        let provider = MockProvider {
+        let model_provider = MockModelProvider {
             supports_native: false,
         };
 
@@ -296,9 +326,10 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
-        let response = provider
+        let response = model_provider
             .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
             .await
             .unwrap();
@@ -307,28 +338,29 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_without_tools() {
-        let provider = MockProvider {
+        let model_provider = MockModelProvider {
             supports_native: true,
         };
 
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            thinking: None,
         };
 
-        let response = provider
+        let response = model_provider
             .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
             .await
             .unwrap();
         assert!(response.text.is_some());
     }
 
-    struct EchoSystemProvider {
+    struct EchoSystemModelProvider {
         supports_native: bool,
     }
 
     #[async_trait]
-    impl Provider for EchoSystemProvider {
+    impl ModelProvider for EchoSystemModelProvider {
         fn supports_native_tools(&self) -> bool {
             self.supports_native
         }
@@ -343,11 +375,23 @@ mod tests {
             Ok(system.unwrap_or_default().to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for EchoSystemModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EchoSystemModelProvider"
+        }
+    }
 
-    struct CustomConvertProvider;
+    struct CustomConvertModelProvider;
 
     #[async_trait]
-    impl Provider for CustomConvertProvider {
+    impl ModelProvider for CustomConvertModelProvider {
         fn supports_native_tools(&self) -> bool {
             false
         }
@@ -368,11 +412,23 @@ mod tests {
             Ok(system.unwrap_or_default().to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for CustomConvertModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CustomConvertModelProvider"
+        }
+    }
 
-    struct InvalidConvertProvider;
+    struct InvalidConvertModelProvider;
 
     #[async_trait]
-    impl Provider for InvalidConvertProvider {
+    impl ModelProvider for InvalidConvertModelProvider {
         fn supports_native_tools(&self) -> bool {
             false
         }
@@ -393,10 +449,22 @@ mod tests {
             Ok("should_not_reach".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for InvalidConvertModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "InvalidConvertModelProvider"
+        }
+    }
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_preserves_existing_system_not_first() {
-        let provider = EchoSystemProvider {
+        let model_provider = EchoSystemModelProvider {
             supports_native: false,
         };
 
@@ -412,9 +480,10 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            thinking: None,
         };
 
-        let response = provider
+        let response = model_provider
             .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
             .await
             .unwrap();
@@ -426,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_uses_convert_tools_override() {
-        let provider = CustomConvertProvider;
+        let model_provider = CustomConvertModelProvider;
 
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
@@ -437,9 +506,10 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
-        let response = provider
+        let response = model_provider
             .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
             .await
             .unwrap();
@@ -451,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_rejects_non_prompt_payload() {
-        let provider = InvalidConvertProvider;
+        let model_provider = InvalidConvertModelProvider;
 
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
@@ -462,9 +532,10 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
-        let err = provider
+        let err = model_provider
             .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
             .await
             .unwrap_err();
@@ -473,10 +544,10 @@ mod tests {
         assert!(message.contains("non-prompt-guided"));
     }
 
-    struct StreamingChunkOnlyProvider;
+    struct StreamingChunkOnlyModelProvider;
 
     #[async_trait]
-    impl Provider for StreamingChunkOnlyProvider {
+    impl ModelProvider for StreamingChunkOnlyModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -505,14 +576,27 @@ mod tests {
             .boxed()
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingChunkOnlyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StreamingChunkOnlyModelProvider"
+        }
+    }
 
     #[tokio::test]
     async fn provider_stream_chat_default_maps_legacy_chunks_to_events() {
-        let provider = StreamingChunkOnlyProvider;
-        let mut stream = provider.stream_chat(
+        let model_provider = StreamingChunkOnlyModelProvider;
+        let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking: None,
             },
             "model",
             Some(TEST_GREEDY_TEMPERATURE),

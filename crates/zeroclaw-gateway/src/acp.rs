@@ -13,8 +13,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
 use zeroclaw_channels::orchestrator::acp_server::{AcpServer, AcpServerConfig};
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
 
 const ACP_WS_PROTOCOL: &str = "zeroclaw.acp.v1";
 
@@ -59,12 +59,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (input_tx, input_rx) = mpsc::channel::<String>(256);
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
 
-    let config = state.config.lock().clone();
-    let server = Arc::new(AcpServer::new_with_writer(
-        config,
-        AcpServerConfig::default(),
-        output_tx,
-    ));
+    let config = state.config.read().clone();
+    let acp_config = AcpServerConfig {
+        max_sessions: config.acp.max_sessions,
+        session_timeout_secs: config.acp.session_timeout_secs,
+    };
+    let store = AcpSessionStore::new(&config.data_dir)
+        .map(Arc::new)
+        .inspect_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "Failed to open ACP session store"
+            );
+        })
+        .ok();
+    let server = if let Some(store) = store {
+        Arc::new(AcpServer::new_with_writer_and_store(
+            config, acp_config, output_tx, store,
+        ))
+    } else {
+        Arc::new(AcpServer::new_with_writer(config, acp_config, output_tx))
+    };
 
     let server_task = tokio::spawn(Arc::clone(&server).run_messages(input_rx));
 
@@ -89,12 +107,35 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     }
                 }
-                Err(e) => warn!("ACP WebSocket received non-UTF-8 binary frame: {e}"),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "ACP WebSocket received non-UTF-8 binary frame"
+                ),
             },
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Err(e) => {
-                warn!("ACP WebSocket receive error: {e}");
+                let msg = e.to_string();
+                if msg.contains("Connection reset without closing handshake")
+                    || msg.contains("Connection closed normally")
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "ACP WebSocket closed without handshake"
+                    );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "ACP WebSocket receive error"
+                    );
+                }
                 break;
             }
         }
@@ -103,10 +144,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     drop(input_tx);
 
     if let Err(e) = server_task.await {
-        warn!("ACP WebSocket server task panicked: {e}");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "ACP WebSocket server task panicked"
+        );
     }
     output_task.abort();
-    debug!("ACP WebSocket disconnected");
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "ACP WebSocket disconnected"
+    );
 }
 
 fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {

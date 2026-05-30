@@ -27,7 +27,7 @@ pub mod plugin_routes {
             }
         }
 
-        let config = state.config.lock();
+        let config = state.config.read();
         let plugins_enabled = config.plugins.enabled;
         let plugins_dir = config.plugins.plugins_dir.clone();
         drop(config);

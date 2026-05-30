@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -14,12 +15,26 @@ use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::media::MediaAttachment;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
     bot_token: String,
-    guild_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// Empty = listen across all guilds the bot is invited to.
+    guild_ids: Vec<String>,
+    /// Empty = watch every channel; non-empty = restrict the bot to listed
+    /// channel IDs (for both interaction and archive).
+    channel_ids: Vec<String>,
+    /// When set, every non-bot message that passes the channel filter is
+    /// archived to a sidecar SQLite memory backend (`discord.db`). The
+    /// `discord_search` tool reads from this when registered.
+    archive_memory: Option<std::sync::Arc<dyn zeroclaw_memory::Memory>>,
+    /// The alias key under `[channels.discord.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
@@ -29,6 +44,8 @@ pub struct DiscordChannel {
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    /// Workspace directory for saving downloaded inbound media attachments.
+    workspace_dir: Option<PathBuf>,
     /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
     stream_mode: zeroclaw_config::schema::StreamMode,
     /// Minimum interval (ms) between draft message edits (Partial mode only).
@@ -47,26 +64,69 @@ pub struct DiscordChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
+    /// Cached `channel_id -> is_thread` lookups. Populated lazily on first
+    /// inbound message from a channel via `GET /channels/{id}`. Thread type
+    /// is stable for the channel's lifetime so the cache lives as long as
+    /// the channel instance.
+    ///
+    /// Value is `Some(parent_id)` when the channel is a thread, `None`
+    /// when it is a regular (non-thread) channel.
+    thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    /// Ephemeral Discord gateway session state for Resume across reconnects.
+    gateway_session: Mutex<DiscordGatewaySession>,
 }
+
+#[derive(Clone, Debug, Default)]
+struct DiscordGatewaySession {
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    sequence: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscordListenerFatalError {
+    message: String,
+}
+
+impl DiscordListenerFatalError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DiscordListenerFatalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DiscordListenerFatalError {}
 
 impl DiscordChannel {
     pub fn new(
         bot_token: String,
-        guild_id: Option<String>,
-        allowed_users: Vec<String>,
+        guild_ids: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         listen_to_bots: bool,
         mention_only: bool,
     ) -> Self {
         Self {
             bot_token,
-            guild_id,
-            allowed_users,
+            guild_ids,
+            channel_ids: vec![],
+            archive_memory: None,
+            alias: alias.into(),
+            peer_resolver,
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            workspace_dir: None,
             stream_mode: zeroclaw_config::schema::StreamMode::Off,
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
@@ -76,6 +136,8 @@ impl DiscordChannel {
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
+            thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway_session: Mutex::new(DiscordGatewaySession::default()),
         }
     }
 
@@ -87,6 +149,12 @@ impl DiscordChannel {
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
+        self
+    }
+
+    /// Configure workspace directory for saving downloaded attachments.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
         self
     }
 
@@ -104,8 +172,12 @@ impl DiscordChannel {
                 self.transcription = Some(config);
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, voice transcription disabled: {e}"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "transcription manager init failed, voice transcription disabled"
                 );
             }
         }
@@ -131,6 +203,26 @@ impl DiscordChannel {
         self
     }
 
+    pub fn with_channel_ids(mut self, ids: Vec<String>) -> Self {
+        self.channel_ids = ids;
+        self
+    }
+
+    fn fatal_listener_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(DiscordListenerFatalError::new(message))
+    }
+
+    fn validate_gateway_preflight_response(
+        response: reqwest::Response,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(response.error_for_status()?)
+    }
+
+    pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
+        self.archive_memory = Some(mem);
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client(
             "channel.discord",
@@ -142,7 +234,8 @@ impl DiscordChannel {
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -150,18 +243,180 @@ impl DiscordChannel {
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+
+    /// Resolve whether `channel_id` is a Discord thread (ANNOUNCEMENT,
+    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Returns
+    /// `Some(parent_id)` when the channel is a thread, `None` otherwise.
+    /// Results are cached for the channel instance's lifetime: thread-ness
+    /// is stable for a given channel ID, so one lookup per ID per process.
+    /// Failures (network, 429, missing fields) return `None` without
+    /// caching so the next message retries.
+    async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
+        {
+            let cache = self.thread_channels.lock().await;
+            if let Some(value) = cache.get(channel_id) {
+                return value.clone();
+            }
+        }
+
+        // Only a successful API response is cached. A transient network blip
+        // or 429 must not poison the cache for the channel's lifetime; the
+        // next message should retry the lookup. Failure paths return `None`
+        // (the safe default) without writing to the cache. The whole request
+        // is wrapped in an explicit timeout so a hung Discord API call can
+        // never stall the listener; the shared channel HTTP client may not
+        // carry a request-level timeout.
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}");
+        let lookup = async {
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .send()
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "request failed"
+                    );
+                    anyhow::Error::msg(format!("request failed: {e}"))
+                })?;
+            if !resp.status().is_success() {
+                anyhow::bail!("non-success status {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "body parse failed"
+                );
+                anyhow::Error::msg(format!("body parse failed: {e}"))
+            })?;
+            let is_thread = body
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .map(is_thread_channel_type)
+                .unwrap_or(false);
+            Ok::<Option<String>, anyhow::Error>(if is_thread {
+                body.get("parent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            })
+        };
+        let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(
+                            ::serde_json::json!({"channel_id": channel_id, "error": format!("{}", e)})
+                        ),
+                    "channel lookup failed"
+                );
+                return None;
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
+                return None;
+            }
+        };
+
+        self.thread_channels
+            .lock()
+            .await
+            .insert(channel_id.to_string(), result.clone());
+        result
+    }
+
+    /// Apply the trust-boundary / delivery-failure emoji reactions to the
+    /// bot's just-sent message. Best-effort: reaction failures are debug
+    /// logged but never propagated. `message_id` being `None` (e.g. when
+    /// every chunk failed to post) skips the reaction step entirely.
+    async fn apply_failure_reactions(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        reactions: &[&'static str],
+    ) {
+        let Some(message_id) = message_id else {
+            return;
+        };
+        for emoji in reactions {
+            if let Err(e) = self.add_reaction(channel_id, message_id, emoji).await {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(
+                            ::serde_json::json!({"emoji": emoji, "error": format!("{}", e)})
+                        ),
+                    "failed to add failure reaction to outgoing message"
+                );
+            }
+        }
+    }
 }
 
-/// Process Discord message attachments and return a string to append to the
-/// agent message context.
+/// Whether a Discord channel type integer identifies a thread.
+/// Discord channel types `10` (ANNOUNCEMENT_THREAD), `11` (PUBLIC_THREAD),
+/// and `12` (PRIVATE_THREAD) per the Channel Types documentation.
+const fn is_thread_channel_type(channel_type: u64) -> bool {
+    matches!(channel_type, 10..=12)
+}
+
+/// Hard cap on `GET /channels/{id}` while resolving whether an inbound
+/// channel is a thread. Discord normally responds in under 200 ms; this
+/// is a safety bound so a hung request cannot stall the listener.
+const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pure channel-filter decision: does `msg_channel` pass the allowlist?
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// A channel passes when:
+/// 1. `channel_filter` is empty (accept all), OR
+/// 2. `msg_channel` is directly in `channel_filter`, OR
+/// 3. `thread_parent_id` is `Some(parent)` and `parent` is in `channel_filter`
+///    (thread whose parent forum/channel is allowed).
+fn channel_passes_filter(
+    channel_filter: &[String],
+    msg_channel: &str,
+    thread_parent_id: Option<&str>,
+) -> bool {
+    if channel_filter.is_empty() {
+        return true;
+    }
+    if channel_filter.iter().any(|c| c == msg_channel) {
+        return true;
+    }
+    if let Some(parent) = thread_parent_id {
+        return channel_filter.iter().any(|c| c == parent);
+    }
+    false
+}
+
+/// Process Discord message attachments in a single pass.
+///
+/// Returns the text block appended to the agent's prompt and the structured
+/// `MediaAttachment` list consumed by the media pipeline. Each attachment is
+/// downloaded at most once: text/* is inlined as text, audio is transcribed
+/// inline when a transcription manager is configured (otherwise it goes
+/// through the media pipeline), and image/video/document attachments are
+/// saved to the workspace and emitted as `[KIND:<path>]` markers plus a
+/// `MediaAttachment` for vision-capable providers.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    workspace_dir: Option<&Path>,
+    transcription_manager: Option<&super::transcription::TranscriptionManager>,
+) -> (String, Vec<MediaAttachment>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut media: Vec<MediaAttachment> = Vec::new();
+
     for att in attachments {
         let ct = att
             .get("content_type")
@@ -172,32 +427,182 @@ async fn process_attachments(
             .and_then(|v| v.as_str())
             .unwrap_or("file");
         let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
-            tracing::warn!(name, "discord: attachment has no url, skipping");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"name": name})),
+                "attachment has no url, skipping"
+            );
             continue;
         };
+
         if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
-                        parts.push(format!("[{name}]\n{text}"));
+                        text_parts.push(format!("[{name}]\n{text}"));
                     }
                 }
                 Ok(resp) => {
-                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "status": resp.status().to_string()})), "attachment fetch failed");
                 }
                 Err(e) => {
-                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"name": name, "error": format!("{}", e)})
+                            ),
+                        "attachment fetch error"
+                    );
                 }
             }
-        } else {
-            tracing::debug!(
-                name,
-                content_type = ct,
-                "discord: skipping unsupported attachment type"
+            continue;
+        }
+
+        let is_audio = is_discord_audio_attachment(ct, name);
+
+        // Audio with channel-level transcription configured: transcribe
+        // inline so the agent receives `[Voice] <transcript>` text rather
+        // than opaque bytes through the media pipeline.
+        if is_audio && let Some(manager) = transcription_manager {
+            let bytes = match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            };
+            match manager.transcribe(&bytes, name).await {
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "transcribed audio attachment {} ({} chars)",
+                                name,
+                                trimmed.len()
+                            )
+                        );
+                        text_parts.push(format!("[Voice] {trimmed}"));
+                    }
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"name": name, "error": format!("{}", e)})
+                            ),
+                        "voice transcription failed"
+                    );
+                }
+            }
+            continue;
+        }
+
+        let marker_kind = marker_kind_for(ct, is_audio);
+
+        let bytes = match download_attachment_bytes(client, url, name).await {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let marker_target = match workspace_dir {
+            Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
+                Ok(local_path) => local_path.display().to_string(),
+                Err(e) => {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_kind, "error": format!("{}", e)})), "attachment save failed, falling back to url");
+                    url.to_string()
+                }
+            },
+            None => url.to_string(),
+        };
+        text_parts.push(format!("[{marker_kind}:{marker_target}]"));
+
+        media.push(MediaAttachment {
+            file_name: name.to_string(),
+            data: bytes,
+            mime_type: if ct.is_empty() {
+                None
+            } else {
+                Some(ct.to_string())
+            },
+        });
+    }
+
+    (text_parts.join("\n---\n"), media)
+}
+
+/// Download an attachment URL into memory, with structured warn-logging on
+/// each failure mode. Returns `None` when the attachment should be skipped.
+async fn download_attachment_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(b) => Some(b.to_vec()),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"name": name, "error": format!("{}", e)})),
+                    "failed to read attachment bytes"
+                );
+                None
+            }
+        },
+        Ok(resp) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"name": name, "status": resp.status().to_string()})
+                    ),
+                "attachment download failed"
             );
+            None
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"name": name, "error": format!("{}", e)})),
+                "attachment fetch error"
+            );
+            None
         }
     }
-    parts.join("\n---\n")
+}
+
+async fn save_attachment_bytes_to_workspace(
+    workspace_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let save_dir = workspace_dir.join("discord_files");
+    tokio::fs::create_dir_all(&save_dir).await?;
+
+    let safe_name = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("attachment");
+    let local_name = format!("{}_{}", Uuid::new_v4(), safe_name);
+    let local_path = save_dir.join(local_name);
+
+    tokio::fs::write(&local_path, bytes).await?;
+    Ok(local_path)
 }
 
 /// Audio file extensions accepted for voice transcription.
@@ -216,70 +621,20 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
     false
 }
 
-/// Download and transcribe audio attachments from a Discord message.
-///
-/// Returns transcribed text blocks for any audio attachments found.
-/// Non-audio attachments and failures are silently skipped.
-async fn transcribe_discord_audio_attachments(
-    attachments: &[serde_json::Value],
-    client: &reqwest::Client,
-    manager: &super::transcription::TranscriptionManager,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for att in attachments {
-        let ct = att
-            .get("content_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let name = att
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("file");
-
-        if !is_discord_audio_attachment(ct, name) {
-            continue;
-        }
-
-        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        let audio_data = match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) => bytes.to_vec(),
-                Err(e) => {
-                    tracing::warn!(name, error = %e, "discord: failed to read audio attachment bytes");
-                    continue;
-                }
-            },
-            Ok(resp) => {
-                tracing::warn!(name, status = %resp.status(), "discord: audio attachment download failed");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "discord: audio attachment fetch error");
-                continue;
-            }
-        };
-
-        match manager.transcribe(&audio_data, name).await {
-            Ok(text) => {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    tracing::info!(
-                        "Discord: transcribed audio attachment {} ({} chars)",
-                        name,
-                        trimmed.len()
-                    );
-                    parts.push(format!("[Voice] {trimmed}"));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "discord: voice transcription failed");
-            }
-        }
+/// Map a Discord attachment's content type plus audio-detection result to
+/// the canonical outbound marker kind. Pulled out of `process_attachments`
+/// so the MIME-to-marker dispatch can be unit-tested without a live HTTP
+/// download.
+fn marker_kind_for(content_type: &str, is_audio: bool) -> &'static str {
+    if content_type.starts_with("image/") {
+        "IMAGE"
+    } else if is_audio {
+        "AUDIO"
+    } else if content_type.starts_with("video/") {
+        "VIDEO"
+    } else {
+        "DOCUMENT"
     }
-    parts.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,37 +720,266 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
     (cleaned.trim().to_string(), attachments)
 }
 
-fn classify_outgoing_attachments(
-    attachments: &[DiscordAttachment],
-) -> (Vec<PathBuf>, Vec<String>, Vec<String>) {
-    let mut local_files = Vec::new();
-    let mut remote_urls = Vec::new();
-    let mut unresolved_markers = Vec::new();
-
-    for attachment in attachments {
-        let target = attachment.target.trim();
-        if target.starts_with("https://") || target.starts_with("http://") {
-            remote_urls.push(target.to_string());
-            continue;
-        }
-
-        let path = Path::new(target);
-        if path.exists() && path.is_file() {
-            local_files.push(path.to_path_buf());
-            continue;
-        }
-
-        unresolved_markers.push(format!("[{}:{}]", attachment.kind.marker_name(), target));
-    }
-
-    (local_files, remote_urls, unresolved_markers)
+/// Resolved outbound attachment target after sandbox validation.
+#[derive(Debug)]
+enum DiscordMarkerTarget {
+    Local(PathBuf),
+    Http(String),
 }
 
-fn with_inline_attachment_urls(
-    content: &str,
-    remote_urls: &[String],
-    unresolved_markers: &[String],
-) -> String {
+/// Why a marker target was rejected. Drives the user-facing emoji reaction
+/// on the bot's outgoing message: `Refused` (trust-boundary rejection) maps
+/// to 🚫, `NotFound` (path didn't resolve on disk) maps to ⚠️. The
+/// distinction matters because a chatter should see at a glance that the
+/// bot deliberately declined a target rather than tried and failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordMarkerFailure {
+    /// Trust-boundary refusal: disallowed scheme, relative path, missing
+    /// workspace_dir, or canonicalised path outside the workspace.
+    Refused,
+    /// Path passed scheme/absolute/workspace checks but did not resolve
+    /// to anything on disk.
+    NotFound,
+}
+
+#[derive(Debug)]
+enum DiscordMarkerError {
+    Refused(anyhow::Error),
+    NotFound(anyhow::Error),
+}
+
+impl DiscordMarkerError {
+    fn kind(&self) -> DiscordMarkerFailure {
+        match self {
+            Self::Refused(_) => DiscordMarkerFailure::Refused,
+            Self::NotFound(_) => DiscordMarkerFailure::NotFound,
+        }
+    }
+}
+
+impl std::fmt::Display for DiscordMarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) | Self::NotFound(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Validate an outbound marker target against Discord's trust-boundary policy.
+///
+/// The orchestrator system prompt mandates absolute paths for media markers,
+/// and the workspace is the only directory the agent is authorised to
+/// expose to chatters:
+///
+/// * `http`/`https` URLs are accepted and inlined as links.
+/// * Any other URL scheme (`file:`, `data:`, custom `://`) is refused.
+/// * Local paths must be absolute. Relative paths are agent
+///   misconfiguration and dropped, not silently resolved against cwd.
+/// * Absolute paths are canonicalised and must resolve inside
+///   `workspace_dir`. Anything outside or any traversal escape is
+///   refused; a path that simply doesn't exist on disk returns
+///   `NotFound`, which the caller renders differently from a refusal.
+/// * When `workspace_dir` is not configured, no local path can be safely
+///   bounded, so all local targets are refused.
+fn validate_marker_target(
+    target: &str,
+    workspace_dir: Option<&Path>,
+) -> Result<DiscordMarkerTarget, DiscordMarkerError> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(DiscordMarkerTarget::Http(target.to_string()));
+    }
+    if target.contains("://") {
+        let scheme = target.split("://").next().unwrap_or("?");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "scheme": scheme,
+                    "target": target,
+                })),
+            "discord: marker target uses disallowed scheme"
+        );
+        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(format!(
+            "marker target uses disallowed scheme {scheme:?}; only http/https and absolute workspace paths are accepted"
+        ))));
+    }
+    if target.starts_with("data:") || target.starts_with("file:") {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"target": target})),
+            "discord: marker target uses disallowed data: or file: scheme"
+        );
+        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(
+            "marker target uses disallowed scheme; only http/https and absolute workspace paths are accepted",
+        )));
+    }
+
+    let target_path = Path::new(target);
+    if !target_path.is_absolute() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "target": target,
+                    "reason": "not_absolute",
+                })),
+            "discord: marker target is not absolute"
+        );
+        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(format!(
+            "marker target {target} is not an absolute path; the agent must emit absolute paths inside workspace_dir"
+        ))));
+    }
+
+    let workspace = workspace_dir.ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "target": target,
+                    "reason": "no_workspace_dir",
+                })),
+            "discord: marker target is local path but channel has no workspace_dir"
+        );
+        DiscordMarkerError::Refused(anyhow::Error::msg(format!(
+            "marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
+        )))
+    })?;
+    let workspace_canon = std::fs::canonicalize(workspace)
+        .with_context(|| format!("canonicalize workspace {}", workspace.display()))
+        .map_err(DiscordMarkerError::Refused)?;
+    let target_canon = match std::fs::canonicalize(target_path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "reason": "not_found",
+                    })),
+                "discord: marker target not found on disk"
+            );
+            return Err(DiscordMarkerError::NotFound(anyhow::Error::msg(format!(
+                "marker target {target} not found on disk"
+            ))));
+        }
+        Err(e) => {
+            return Err(DiscordMarkerError::Refused(
+                anyhow::Error::from(e).context(format!("canonicalize marker target {target}")),
+            ));
+        }
+    };
+
+    if !target_canon.starts_with(&workspace_canon) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "target": target,
+                    "target_canon": target_canon.display().to_string(),
+                    "workspace_canon": workspace_canon.display().to_string(),
+                    "reason": "outside_workspace",
+                })),
+            "discord: marker target escapes workspace_dir"
+        );
+        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(format!(
+            "marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
+            target_canon.display(),
+            workspace_canon.display(),
+        ))));
+    }
+    Ok(DiscordMarkerTarget::Local(target_canon))
+}
+
+fn classify_outgoing_attachments(
+    attachments: &[DiscordAttachment],
+    workspace_dir: Option<&Path>,
+) -> (
+    Vec<PathBuf>,
+    Vec<String>,
+    Vec<(String, DiscordMarkerFailure)>,
+) {
+    let mut local_files = Vec::new();
+    let mut remote_urls = Vec::new();
+    let mut failures = Vec::new();
+
+    for attachment in attachments {
+        match validate_marker_target(&attachment.target, workspace_dir) {
+            Ok(DiscordMarkerTarget::Local(path)) => local_files.push(path),
+            Ok(DiscordMarkerTarget::Http(url)) => remote_urls.push(url),
+            Err(e) => {
+                let kind_label = match e.kind() {
+                    DiscordMarkerFailure::Refused => "trust boundary",
+                    DiscordMarkerFailure::NotFound => "not found",
+                };
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
+                failures.push((attachment.target.clone(), e.kind()));
+            }
+        }
+    }
+
+    (local_files, remote_urls, failures)
+}
+
+/// Build the Matrix-style "(note: I couldn't deliver ...)" tail appended
+/// to the bot's reply when at least one marker was dropped. Returns
+/// `None` when the failure list is empty so callers can keep the body
+/// untouched.
+fn delivery_failure_note(failures: &[(String, DiscordMarkerFailure)]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    let targets: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
+    Some(if targets.len() == 1 {
+        format!("(note: I couldn't deliver the file at {}.)", targets[0])
+    } else {
+        format!(
+            "(note: I couldn't deliver these files: {}.)",
+            targets.join(", ")
+        )
+    })
+}
+
+/// Compose the final reply body with the delivery-failure note appended.
+/// When the marker-stripped content is empty the note replaces the body;
+/// otherwise the note follows the content separated by a blank line.
+fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
+    match note {
+        Some(note) if content.trim().is_empty() => note.to_string(),
+        Some(note) => format!("{content}\n\n{note}"),
+        None => content.to_string(),
+    }
+}
+
+/// Emoji reactions applied to the bot's own outgoing message based on which
+/// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
+/// ⚠️ signals a post-validation delivery failure. Both can fire on the
+/// same message when a batch mixes refusals and not-found targets.
+fn decide_failure_reactions(failures: &[(String, DiscordMarkerFailure)]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if failures
+        .iter()
+        .any(|(_, k)| matches!(k, DiscordMarkerFailure::Refused))
+    {
+        out.push("🚫");
+    }
+    if failures
+        .iter()
+        .any(|(_, k)| matches!(k, DiscordMarkerFailure::NotFound))
+    {
+        out.push("⚠️");
+    }
+    out
+}
+
+fn with_inline_attachment_urls(content: &str, remote_urls: &[String]) -> String {
     let mut lines = Vec::new();
     if !content.trim().is_empty() {
         lines.push(content.trim().to_string());
@@ -403,18 +987,17 @@ fn with_inline_attachment_urls(
     if !remote_urls.is_empty() {
         lines.extend(remote_urls.iter().cloned());
     }
-    if !unresolved_markers.is_empty() {
-        lines.extend(unresolved_markers.iter().cloned());
-    }
     lines.join("\n")
 }
 
+/// POST a plain-text message and return the new message's ID. Callers
+/// that don't need the ID (e.g. non-first chunks) can discard it.
 async fn send_discord_message_json(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
     content: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
     let body = json!({ "content": content });
 
@@ -434,26 +1017,39 @@ async fn send_discord_message_json(
         anyhow::bail!("Discord send message failed ({status}): {err}");
     }
 
-    Ok(())
+    extract_message_id(resp).await
 }
 
+/// POST a message with file attachments via multipart, returning the new
+/// message's ID. Callers that don't need the ID can discard it.
 async fn send_discord_message_with_files(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
     content: &str,
     files: &[PathBuf],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
     let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
 
     for (idx, path) in files.iter().enumerate() {
         let bytes = tokio::fs::read(path).await.map_err(|error| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "attachment_read",
+                        "error": format!("{}", error),
+                    })),
+                "discord: failed to read attachment"
+            );
+            anyhow::Error::msg(format!(
                 "Discord attachment read failed for '{}': {error}",
                 path.display()
-            )
+            ))
         })?;
         let filename = path
             .file_name()
@@ -482,41 +1078,24 @@ async fn send_discord_message_with_files(
         anyhow::bail!("Discord send message with files failed ({status}): {err}");
     }
 
-    Ok(())
+    extract_message_id(resp).await
 }
 
-/// Send a message and return the Discord message ID from the response.
-async fn send_discord_message_json_with_id(
-    client: &reqwest::Client,
-    bot_token: &str,
-    recipient: &str,
-    content: &str,
-) -> anyhow::Result<String> {
-    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = json!({ "content": content });
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord send message failed ({status}): {err}");
-    }
-
-    let resp_json: serde_json::Value = resp.json().await?;
-    resp_json
-        .get("id")
+async fn extract_message_id(resp: reqwest::Response) -> anyhow::Result<String> {
+    let body: serde_json::Value = resp.json().await?;
+    body.get("id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("Discord send response missing 'id' field"))
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": "id"})),
+                "discord: send response missing id field"
+            );
+            anyhow::Error::msg("Discord send response missing 'id' field")
+        })
 }
 
 /// Edit an existing Discord message via PATCH.
@@ -541,7 +1120,11 @@ async fn edit_discord_message(
         .await?;
 
     if resp.status().as_u16() == 429 {
-        tracing::debug!("Discord edit message rate-limited (429), skipping update");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "edit message rate-limited (429), skipping update"
+        );
         return Ok(());
     }
 
@@ -551,7 +1134,7 @@ async fn edit_discord_message(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord edit message failed ({status}): {err}");
+        anyhow::bail!("edit message failed ({status}): {err}");
     }
 
     Ok(())
@@ -576,7 +1159,11 @@ async fn delete_discord_message(
         .await?;
 
     if resp.status().as_u16() == 429 {
-        tracing::debug!("Discord delete message rate-limited (429), skipping");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "delete message rate-limited (429), skipping"
+        );
         return Ok(());
     }
 
@@ -586,7 +1173,7 @@ async fn delete_discord_message(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord delete message failed ({status}): {err}");
+        anyhow::bail!("delete message failed ({status}): {err}");
     }
 
     Ok(())
@@ -705,6 +1292,33 @@ fn split_message_for_discord_multi(content: &str, max_len: usize) -> Vec<String>
     }
 }
 
+/// Choose the chunks to deliver for an outbound Discord message.
+///
+/// `split_message_for_discord_multi` returns an empty vec for empty input
+/// (its paragraph splitter has no segments to emit); the non-multi
+/// splitter returns `vec![""]`. When MultiMessage stream mode hands
+/// `send()` a paragraph that collapses to empty text after marker strip,
+/// the chunk loop would iterate zero times and silently skip an attached
+/// file upload. Force a single empty chunk in exactly that case so the
+/// multipart POST fires.
+fn chunks_for_send(
+    content: &str,
+    stream_mode: zeroclaw_config::schema::StreamMode,
+    max_len: usize,
+    has_local_files: bool,
+) -> Vec<String> {
+    let mut chunks = match stream_mode {
+        zeroclaw_config::schema::StreamMode::MultiMessage => {
+            split_message_for_discord_multi(content, max_len)
+        }
+        _ => split_message_for_discord(content),
+    };
+    if chunks.is_empty() && has_local_files {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -757,28 +1371,25 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
-fn normalize_incoming_content(
+/// Decide whether an inbound Discord message passes the listener gate.
+/// Returns the cleaned text body when admitted, or `None` to drop the
+/// message. Attachment-only messages (empty `content` plus at least one
+/// attachment) are admitted as long as the mention requirement is
+/// satisfied; otherwise a Discord message that contained only an image,
+/// PDF, ZIP, video, or audio with no caption would never reach the
+/// media pipeline.
+fn admit_discord_message(
     content: &str,
+    has_attachments: bool,
     mention_only: bool,
     bot_user_id: &str,
 ) -> Option<String> {
-    if content.is_empty() {
-        return None;
-    }
-
     if mention_only && !contains_bot_mention(content, bot_user_id) {
         return None;
     }
 
-    let mut normalized = content.to_string();
-    if mention_only {
-        for tag in mention_tags(bot_user_id) {
-            normalized = normalized.replace(&tag, " ");
-        }
-    }
-
-    let normalized = normalized.trim().to_string();
-    if normalized.is_empty() {
+    let normalized = content.trim().to_string();
+    if normalized.is_empty() && !has_attachments {
         return None;
     }
 
@@ -823,88 +1434,91 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn is_fatal_gateway_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
+
+fn requires_new_session_close_code(code: u16) -> bool {
+    matches!(code, 4007 | 4009)
+}
+
+impl ::zeroclaw_api::attribution::Attributable for DiscordChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Discord,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for DiscordChannel {
     fn name(&self) -> &str {
         "discord"
     }
 
+    /// Discord bot tokens encode the bot's user ID in the first
+    /// segment (`base64(user_id).timestamp.hmac`); decode on demand
+    /// rather than caching since the result is deterministic and the
+    /// orchestrator only calls `self_handle` on the inbound path.
+    /// Returning the user ID engages the SDK self-loop guard against
+    /// gateway events the bot itself produced (typing indicators,
+    /// echoed message events from intent overlap, etc.).
+    fn self_handle(&self) -> Option<String> {
+        Self::bot_user_id_from_token(&self.bot_token)
+    }
+
+    /// Discord renders user mentions as `<@SNOWFLAKE>` (or
+    /// `<@!SNOWFLAKE>` with the legacy nickname prefix, which the API
+    /// normalizes to the bare form on inbound). Returns the bot's
+    /// snowflake wrapped in that exact form so the agent matches its
+    /// own mention without parsing the angle brackets itself.
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle().map(|id| format!("<@{id}>"))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
-        let (mut local_files, remote_urls, unresolved_markers) =
-            classify_outgoing_attachments(&parsed_attachments);
-
-        if !unresolved_markers.is_empty() {
-            tracing::warn!(
-                unresolved = ?unresolved_markers,
-                "discord: unresolved attachment markers were sent as plain text"
-            );
-        }
+        let (mut local_files, remote_urls, failures) =
+            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
 
         // Discord accepts max 10 files per message.
         if local_files.len() > 10 {
-            tracing::warn!(
-                count = local_files.len(),
-                "discord: truncating local attachment upload list to 10 files"
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"count": local_files.len()})),
+                "truncating local attachment upload list to 10 files"
             );
             local_files.truncate(10);
         }
 
-        let content =
-            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let note = delivery_failure_note(&failures);
+        let content = compose_body_with_failure_note(&body, note.as_deref());
+        let reactions = decide_failure_reactions(&failures);
 
-        // MultiMessage mode: split at paragraph boundaries and send each as a
-        // separate message with a configurable delay between them.
-        if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
-            let chunks = split_message_for_discord_multi(&content, DISCORD_MAX_MESSAGE_LENGTH);
-            let client = self.http_client();
-
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 && !local_files.is_empty() {
-                    send_discord_message_with_files(
-                        &client,
-                        &self.bot_token,
-                        &message.recipient,
-                        chunk,
-                        &local_files,
-                    )
-                    .await?;
-                } else {
-                    send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
-                        .await?;
-                }
-
-                if i < chunks.len() - 1 {
-                    // Check cancellation between chunks so interruption stops delivery.
-                    if message
-                        .cancellation_token
-                        .as_ref()
-                        .is_some_and(|t| t.is_cancelled())
-                    {
-                        tracing::debug!(
-                            "MultiMessage delivery interrupted after chunk {}/{}",
-                            i + 1,
-                            chunks.len()
-                        );
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        self.multi_message_delay_ms,
-                    ))
-                    .await;
-                }
-            }
-
-            return Ok(());
-        }
-
-        // Default / Partial fallback: single chunked message delivery.
-        let chunks = split_message_for_discord(&content);
         let client = self.http_client();
+        let chunks = chunks_for_send(
+            &content,
+            self.stream_mode,
+            DISCORD_MAX_MESSAGE_LENGTH,
+            !local_files.is_empty(),
+        );
+        let inter_chunk_delay_ms =
+            if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
+                self.multi_message_delay_ms
+            } else {
+                500
+            };
 
+        let mut first_message_id: Option<String> = None;
         for (i, chunk) in chunks.iter().enumerate() {
-            if i == 0 && !local_files.is_empty() {
+            let message_id = if i == 0 && !local_files.is_empty() {
                 send_discord_message_with_files(
                     &client,
                     &self.bot_token,
@@ -912,16 +1526,38 @@ impl Channel for DiscordChannel {
                     chunk,
                     &local_files,
                 )
-                .await?;
+                .await?
             } else {
                 send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
-                    .await?;
+                    .await?
+            };
+            if first_message_id.is_none() {
+                first_message_id = Some(message_id);
             }
 
             if i < chunks.len() - 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if message
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(|t| t.is_cancelled())
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Discord delivery interrupted after chunk {}/{}",
+                            i + 1,
+                            chunks.len()
+                        )
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(inter_chunk_delay_ms)).await;
             }
         }
+
+        self.apply_failure_reactions(&message.recipient, first_message_id.as_deref(), &reactions)
+            .await;
 
         Ok(())
     }
@@ -929,24 +1565,53 @@ impl Channel for DiscordChannel {
     #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
+        let mut had_ready = false;
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        let gw_resp = self
             .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
-            .await?
-            .json()
             .await?;
+        let gw_resp = Self::validate_gateway_preflight_response(gw_resp)?;
+        let gw_resp: serde_json::Value = gw_resp.json().await?;
 
-        let gw_url = gw_resp
+        if let Some(remaining) = gw_resp
+            .get("session_start_limit")
+            .and_then(|v| v.get("remaining"))
+            .and_then(serde_json::Value::as_u64)
+            && remaining == 0
+        {
+            return Err(Self::fatal_listener_error(
+                "discord gateway identify blocked: session_start_limit.remaining is 0",
+            ));
+        }
+
+        let fresh_gateway_url = gw_resp
             .get("url")
             .and_then(|u| u.as_str())
-            .unwrap_or("wss://gateway.discord.gg");
+            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?
+            .to_string();
+        let session_snapshot = self.gateway_session.lock().clone();
+        let can_resume =
+            session_snapshot.session_id.is_some() && session_snapshot.sequence.is_some();
+        let gw_url = if can_resume {
+            session_snapshot
+                .resume_gateway_url
+                .clone()
+                .unwrap_or_else(|| fresh_gateway_url.clone())
+        } else {
+            fresh_gateway_url.clone()
+        };
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
-        tracing::info!("Discord: connecting to gateway...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"resume": can_resume, "gateway_url": gw_url})),
+            "connecting to gateway..."
+        );
 
         let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
             &ws_url,
@@ -957,7 +1622,16 @@ impl Channel for DiscordChannel {
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
-        let hello = read.next().await.ok_or(anyhow::anyhow!("No hello"))??;
+        let hello = read.next().await.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"phase": "gateway_hello"})),
+                "discord: gateway closed before Hello"
+            );
+            anyhow::Error::msg("No hello")
+        })??;
         let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
         let heartbeat_interval = hello_data
             .get("d")
@@ -965,28 +1639,46 @@ impl Channel for DiscordChannel {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(41250);
 
-        // Send Identify (opcode 2)
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": self.bot_token,
-                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
-                "properties": {
-                    "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw"
+        let mut sequence = session_snapshot.sequence.unwrap_or(-1);
+
+        if can_resume {
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": self.bot_token,
+                    "session_id": session_snapshot.session_id,
+                    "seq": session_snapshot.sequence,
                 }
-            }
-        });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
-
-        tracing::info!("Discord: connected and identified");
-
-        // Track the last sequence number for heartbeats and resume.
-        // Only accessed in the select! loop below, so a plain i64 suffices.
-        let mut sequence: i64 = -1;
+            });
+            write.send(Message::Text(resume.to_string().into())).await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sequence": sequence})),
+                "sent Discord Resume"
+            );
+        } else {
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": self.bot_token,
+                    "intents": 37377,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "zeroclaw",
+                        "device": "zeroclaw"
+                    }
+                }
+            });
+            write
+                .send(Message::Text(identify.to_string().into()))
+                .await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "sent Discord Identify"
+            );
+        }
 
         // Spawn heartbeat timer — sends a tick signal, actual heartbeat
         // is assembled in the select! loop where `sequence` lives.
@@ -1002,7 +1694,9 @@ impl Channel for DiscordChannel {
             }
         });
 
-        let guild_filter = self.guild_id.clone();
+        let guild_filter = self.guild_ids.clone();
+        let channel_filter = self.channel_ids.clone();
+        let archive_memory = self.archive_memory.clone();
 
         // --- Stall watchdog --------------------------------------------------
         let watchdog = if self.stall_timeout_secs > 0 {
@@ -1017,7 +1711,12 @@ impl Channel for DiscordChannel {
         if let Some(ref wd) = watchdog {
             let stall_signal = stall_tx.clone();
             wd.start(move || {
-                tracing::warn!("Discord: stall watchdog fired — no events for configured timeout, triggering reconnect");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "stall watchdog fired — no events for configured timeout, triggering reconnect"
+                );
                 let _ = stall_signal.try_send(());
             })
             .await;
@@ -1029,7 +1728,7 @@ impl Channel for DiscordChannel {
         loop {
             tokio::select! {
                 _ = stall_rx.recv() => {
-                    tracing::info!("Discord: breaking listen loop due to stall watchdog");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "breaking listen loop due to stall watchdog");
                     break;
                 }
                 _ = hb_rx.recv() => {
@@ -1044,14 +1743,36 @@ impl Channel for DiscordChannel {
                         Some(Ok(Message::Text(t))) => t,
                         Some(Ok(Message::Ping(payload))) => {
                             if write.send(Message::Pong(payload)).await.is_err() {
-                                tracing::warn!("Discord: pong send failed, reconnecting");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "pong send failed, reconnecting");
                                 break;
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(frame))) => {
+                            if let Some(frame) = frame {
+                                let code = u16::from(frame.code);
+                                let reason = frame.reason.to_string();
+                                if requires_new_session_close_code(code) {
+                                    let mut session = self.gateway_session.lock();
+                                    session.session_id = None;
+                                    session.resume_gateway_url = None;
+                                    session.sequence = None;
+                                }
+                                if is_fatal_gateway_close_code(code) {
+                                    return Err(Self::fatal_listener_error(format!(
+                                        "discord gateway closed with fatal code {code}: {reason}"
+                                    )));
+                                }
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
+                            }
+                            break;
+                        }
+                        None => {
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "discord gateway stream ended; reconnecting");
+                            break;
+                        }
                         Some(Err(e)) => {
-                            tracing::warn!("Discord: websocket read error: {e}, reconnecting");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "had_ready": had_ready, "sequence": sequence})), "websocket read error, reconnecting");
                             break;
                         }
                         _ => continue,
@@ -1071,9 +1792,53 @@ impl Channel for DiscordChannel {
                     // Track sequence number from all dispatch events
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
                         sequence = s;
+                        self.gateway_session.lock().sequence = Some(s);
                     }
 
                     let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match event_type {
+                        "READY" => {
+                            had_ready = true;
+                            let session_id = event
+                                .get("d")
+                                .and_then(|d| d.get("session_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let resume_gateway_url = event
+                                .get("d")
+                                .and_then(|d| d.get("resume_gateway_url"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = session_id.clone();
+                                session.resume_gateway_url = resume_gateway_url;
+                                session.sequence = if sequence >= 0 { Some(sequence) } else { None };
+                            }
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence, "session_id_present": session_id.is_some()})
+                                ),
+                                "discord READY received"
+                            );
+                            continue;
+                        }
+                        "RESUMED" => {
+                            had_ready = true;
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence})
+                                ),
+                                "discord RESUMED received"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
 
                     match op {
                         // Op 1: Server requests an immediate heartbeat
@@ -1087,19 +1852,25 @@ impl Channel for DiscordChannel {
                         }
                         // Op 7: Reconnect
                         7 => {
-                            tracing::warn!("Discord: received Reconnect (op 7), closing for restart");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "received Reconnect (op 7), closing for restart");
                             break;
                         }
                         // Op 9: Invalid Session
                         9 => {
-                            tracing::warn!("Discord: received Invalid Session (op 9), closing for restart");
+                            let resumable = event.get("d").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            if !resumable {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = None;
+                                session.resume_gateway_url = None;
+                                session.sequence = None;
+                            }
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"resumable": resumable, "had_ready": had_ready, "sequence": sequence})), "received Invalid Session (op 9), closing for restart");
                             break;
                         }
                         _ => {}
                     }
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
-                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -1121,18 +1892,104 @@ impl Channel for DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"author_id": author_id})), "ignoring message from unauthorized user");
                         continue;
                     }
 
-                    // Guild filter
-                    if let Some(ref gid) = guild_filter {
+                    // Guild allowlist. Empty list = accept all guilds.
+                    // DMs have no guild_id, so they always pass through.
+                    if !guild_filter.is_empty() {
                         let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
-                        // DMs have no guild_id — let them through; for guild messages, enforce the filter
                         if let Some(g) = msg_guild
-                            && g != gid {
-                                continue;
+                            && !guild_filter.iter().any(|allowed| allowed == g)
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Channel allowlist. Empty = watch every channel.
+                    // Thread messages carry the thread's own channel_id, not the
+                    // parent's. When the direct match fails, look up the thread's
+                    // parent_id and accept if *that* is in the allowlist.
+                    if !channel_filter.is_empty() {
+                        let msg_channel = d
+                            .get("channel_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let parent_id = if !msg_channel.is_empty()
+                            && !channel_filter.iter().any(|c| c == msg_channel)
+                        {
+                            self.thread_parent(&self.http_client(), msg_channel).await
+                        } else {
+                            None
+                        };
+                        if !channel_passes_filter(
+                            &channel_filter,
+                            msg_channel,
+                            parent_id.as_deref(),
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    // Archive every non-bot message to discord.db when enabled.
+                    if let Some(ref archive_mem) = archive_memory {
+                        let archive_channel_id =
+                            d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+                        let is_dm_event = d.get("guild_id").is_none();
+                        let username = d
+                            .get("author")
+                            .and_then(|a| a.get("username"))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or(author_id);
+                        let content_raw =
+                            d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let archive_msg_id =
+                            d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        if !content_raw.is_empty() {
+                            let ts = chrono::Utc::now().to_rfc3339();
+                            let channel_display =
+                                if is_dm_event { "dm" } else { archive_channel_id };
+                            let atts = d
+                                .get("attachments")
+                                .and_then(|a| a.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            let mut mem_content = format!(
+                                "@{username} in #{channel_display} at {ts}: {content_raw}"
+                            );
+                            if !atts.is_empty() {
+                                mem_content.push_str(&format!(" [attachments: {atts}]"));
                             }
+                            let mem_key = if archive_msg_id.is_empty() {
+                                format!("discord_{}", Uuid::new_v4())
+                            } else {
+                                format!("discord_{archive_msg_id}")
+                            };
+                            let session = if archive_channel_id.is_empty() {
+                                None
+                            } else {
+                                Some(archive_channel_id)
+                            };
+                            if let Err(e) = archive_mem
+                                .store(
+                                    &mem_key,
+                                    &mem_content,
+                                    zeroclaw_memory::MemoryCategory::Custom(
+                                        "discord".to_string(),
+                                    ),
+                                    session,
+                                )
+                                .await
+                            {
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "archive store failed");
+                            }
+                        }
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -1141,41 +1998,29 @@ impl Channel for DiscordChannel {
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
                     let effective_mention_only = self.mention_only && !is_dm;
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
-                    else {
+                    let atts = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let has_attachments = !atts.is_empty();
+                    let Some(clean_content) = admit_discord_message(
+                        content,
+                        has_attachments,
+                        effective_mention_only,
+                        &bot_user_id,
+                    ) else {
                         continue;
                     };
 
-                    let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let client = self.http_client();
-                        let mut text_parts = process_attachments(&atts, &client).await;
-
-                        // Transcribe audio attachments when transcription is configured
-                        if let Some(ref transcription_manager) = self.transcription_manager {
-                            let voice_text = transcribe_discord_audio_attachments(
-                                &atts,
-                                &client,
-                                transcription_manager,
-                            )
-                            .await;
-                            if !voice_text.is_empty() {
-                                if text_parts.is_empty() {
-                                    text_parts = voice_text;
-                                } else {
-                                    text_parts = format!("{text_parts}
-            {voice_text}");
-                                }
-                            }
-                        }
-
-                        text_parts
-                    };
+                    let client = self.http_client();
+                    let (attachment_text, media_attachments) = process_attachments(
+                        &atts,
+                        &client,
+                        self.workspace_dir.as_deref(),
+                        self.transcription_manager.as_deref(),
+                    )
+                    .await;
                     let final_content = if attachment_text.is_empty() {
                         clean_content
                     } else {
@@ -1203,8 +2048,9 @@ impl Channel for DiscordChannel {
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
                             self.bot_token.clone(),
-                            self.guild_id.clone(),
-                            self.allowed_users.clone(),
+                            self.guild_ids.clone(),
+                            self.alias.clone(),
+                            Arc::clone(&self.peer_resolver),
                             self.listen_to_bots,
                             self.mention_only,
                         );
@@ -1220,12 +2066,31 @@ impl Channel for DiscordChannel {
                                 )
                                 .await
                             {
-                                tracing::debug!(
-                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
-                                );
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"reaction_message_id": reaction_message_id, "err": err.to_string()})), "failed to add ACK reaction for message");
                             }
                         });
                     }
+
+                    // Thread context decides `thread_ts` plus `interruption_scope_id`,
+                    // which the orchestrator uses as part of the conversation-history
+                    // key and the cancellation scope. When the lookup fails it falls
+                    // back to `None` and the failure is not cached, so the next
+                    // message in the same Discord thread will retry. The trade-off:
+                    // the first message after a transient lookup miss is keyed
+                    // without the thread suffix; once the cache warms, subsequent
+                    // messages are keyed with it. History for that thread can split
+                    // across two scopes until the warm-up completes. Acceptable
+                    // because the lookup is bounded by `THREAD_LOOKUP_TIMEOUT` and
+                    // the alternative (stalling the listener on a hung Discord call)
+                    // is worse.
+                    let thread_ts = if channel_id.is_empty() {
+                        None
+                    } else if self.thread_parent(&client, &channel_id).await.is_some()
+                    {
+                        Some(channel_id.clone())
+                    } else {
+                        None
+                    };
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -1241,13 +2106,15 @@ impl Channel for DiscordChannel {
                         },
                         content: final_content,
                         channel: "discord".to_string(),
+                        channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        thread_ts: None,
-                        interruption_scope_id: None,
-                    attachments: vec![],
+                        interruption_scope_id: thread_ts.clone(),
+                        thread_ts,
+                        attachments: media_attachments,
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -1333,7 +2200,7 @@ impl Channel for DiscordChannel {
                 };
 
                 let client = self.http_client();
-                let msg_id = send_discord_message_json_with_id(
+                let msg_id = send_discord_message_json(
                     &client,
                     &self.bot_token,
                     &message.recipient,
@@ -1412,7 +2279,15 @@ impl Channel for DiscordChannel {
                             .insert(recipient.to_string(), std::time::Instant::now());
                     }
                     Err(e) => {
-                        tracing::debug!("Discord draft update failed: {e}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "draft update failed"
+                        );
                     }
                 }
 
@@ -1481,7 +2356,15 @@ impl Channel for DiscordChannel {
                 if let Some(paragraph) = paragraph {
                     let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
                     if let Err(e) = self.send(&msg).await {
-                        tracing::debug!("Discord multi-message paragraph send failed: {e}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "multi-message paragraph send failed"
+                        );
                     }
                     if self.multi_message_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -1521,7 +2404,15 @@ impl Channel for DiscordChannel {
                 if !remaining.is_empty() {
                     let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
                     if let Err(e) = self.send(&msg).await {
-                        tracing::debug!("Discord multi-message final flush failed: {e}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "multi-message final flush failed"
+                        );
                     }
                 }
             }
@@ -1534,10 +2425,12 @@ impl Channel for DiscordChannel {
 
         let text = &crate::util::strip_tool_call_tags(text);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(text);
-        let (mut local_files, remote_urls, unresolved_markers) =
-            classify_outgoing_attachments(&parsed_attachments);
-        let content =
-            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let (mut local_files, remote_urls, failures) =
+            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
+        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let note = delivery_failure_note(&failures);
+        let content = compose_body_with_failure_note(&body, note.as_deref());
+        let reactions = decide_failure_reactions(&failures);
 
         let client = self.http_client();
 
@@ -1549,8 +2442,9 @@ impl Channel for DiscordChannel {
                 local_files.truncate(10);
             }
             let chunks = split_message_for_discord(&content);
+            let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
+                let new_id = if i == 0 {
                     send_discord_message_with_files(
                         &client,
                         &self.bot_token,
@@ -1558,14 +2452,19 @@ impl Channel for DiscordChannel {
                         chunk,
                         &local_files,
                     )
-                    .await?;
+                    .await?
                 } else {
-                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                };
+                if first_message_id.is_none() {
+                    first_message_id = Some(new_id);
                 }
                 if i < chunks.len() - 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
+            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
+                .await;
             return Ok(());
         }
 
@@ -1574,23 +2473,45 @@ impl Channel for DiscordChannel {
             let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
 
             let chunks = split_message_for_discord(&content);
+            let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                let new_id =
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                if first_message_id.is_none() {
+                    first_message_id = Some(new_id);
+                }
                 if i < chunks.len() - 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
+            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
+                .await;
             return Ok(());
         }
 
         // Path 3: simple case — edit in-place; fall back to delete + POST on failure.
-        if let Err(e) =
-            edit_discord_message(&client, &self.bot_token, recipient, message_id, &content).await
-        {
-            tracing::warn!("Discord finalize_draft edit failed: {e}; falling back to delete+send");
-            let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
-            send_discord_message_json(&client, &self.bot_token, recipient, &content).await?;
-        }
+        // The reaction target is the draft message_id when the edit lands;
+        // when the fallback fires it's the freshly posted message instead.
+        let reaction_target =
+            match edit_discord_message(&client, &self.bot_token, recipient, message_id, &content)
+                .await
+            {
+                Ok(()) => message_id.to_string(),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                        "Discord finalize_draft edit failed: ; falling back to delete+send"
+                    );
+                    let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id)
+                        .await;
+                    send_discord_message_json(&client, &self.bot_token, recipient, &content).await?
+                }
+            };
+        self.apply_failure_reactions(recipient, Some(&reaction_target), &reactions)
+            .await;
 
         Ok(())
     }
@@ -1609,7 +2530,12 @@ impl Channel for DiscordChannel {
         if let Err(e) =
             delete_discord_message(&client, &self.bot_token, recipient, message_id).await
         {
-            tracing::debug!("Discord cancel_draft delete failed: {e}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "cancel_draft delete failed"
+            );
         }
 
         Ok(())
@@ -1712,7 +2638,16 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         assert_eq!(ch.name(), "discord");
     }
 
@@ -1732,27 +2667,71 @@ mod tests {
     }
 
     #[test]
+    fn gateway_preflight_429_remains_retryable_http_error() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "1")
+                .body(reqwest::Body::from(""))
+                .expect("test response should build"),
+        );
+
+        let error = DiscordChannel::validate_gateway_preflight_response(response)
+            .expect_err("429 should remain an HTTP error");
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(
+            error.downcast_ref::<DiscordListenerFatalError>().is_none(),
+            "gateway preflight 429 must not be wrapped as fatal"
+        );
+        assert!(
+            !zeroclaw_providers::reliable::is_non_retryable(&error),
+            "gateway preflight 429 should stay on the supervisor retry path"
+        );
+    }
+
+    #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(!ch.is_user_allowed("12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn specific_allowlist_filters() {
+        let listen_to_bots = false;
+        let mention_only = false;
         let ch = DiscordChannel::new(
             "fake".into(),
-            None,
-            vec!["111".into(), "222".into()],
-            false,
-            false,
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into(), "222".into()]),
+            listen_to_bots,
+            mention_only,
         );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("222"));
@@ -1762,7 +2741,16 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into()]),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -1770,18 +2758,30 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into()]),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_with_wildcard_and_specific() {
+        let listen_to_bots = false;
+        let mention_only = false;
         let ch = DiscordChannel::new(
             "fake".into(),
-            None,
-            vec!["111".into(), "*".into()],
-            false,
-            false,
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into(), "*".into()]),
+            listen_to_bots,
+            mention_only,
         );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("anyone_else"));
@@ -1789,7 +2789,16 @@ mod tests {
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["ABC".into()]),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
@@ -1799,6 +2808,25 @@ mod tests {
     fn base64_decode_empty_string() {
         let decoded = base64_decode("");
         assert_eq!(decoded, Some(String::new()));
+    }
+
+    #[test]
+    fn fatal_gateway_close_codes_match_expected_discord_auth_and_intent_errors() {
+        for code in [4004_u16, 4010, 4011, 4012, 4013, 4014] {
+            assert!(
+                is_fatal_gateway_close_code(code),
+                "code {code} should be fatal"
+            );
+        }
+        assert!(!is_fatal_gateway_close_code(4007));
+        assert!(!is_fatal_gateway_close_code(4009));
+    }
+
+    #[test]
+    fn new_session_close_codes_match_invalidated_gateway_sessions() {
+        assert!(requires_new_session_close_code(4007));
+        assert!(requires_new_session_close_code(4009));
+        assert!(!requires_new_session_close_code(4004));
     }
 
     #[test]
@@ -1821,21 +2849,57 @@ mod tests {
     }
 
     #[test]
-    fn normalize_incoming_content_requires_mention_when_enabled() {
-        let cleaned = normalize_incoming_content("hello there", true, "12345");
+    fn admit_discord_message_requires_mention_when_enabled() {
+        let cleaned = admit_discord_message("hello there", false, true, "12345");
         assert!(cleaned.is_none());
     }
 
     #[test]
-    fn normalize_incoming_content_strips_mentions_and_trims() {
-        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
-        assert_eq!(cleaned.as_deref(), Some("run status"));
+    fn admit_discord_message_preserves_mention_in_body() {
+        let cleaned = admit_discord_message("  <@!12345> run status  ", false, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@!12345> run status"));
     }
 
     #[test]
-    fn normalize_incoming_content_rejects_empty_after_strip() {
-        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+    fn admit_discord_message_admits_caption_that_is_only_the_mention() {
+        let cleaned = admit_discord_message("<@12345>", false, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@12345>"));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_in_dm_is_admitted() {
+        // DM (effective_mention_only=false), empty text body, at least one
+        // attachment. Previously dropped at the empty-text gate; now passes
+        // through so process_attachments can run on the media.
+        let cleaned = admit_discord_message("", true, false, "12345");
+        assert_eq!(cleaned.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_with_mention_in_guild_is_admitted() {
+        // Guild channel with mention_only=true. Caption is the @mention tag
+        // and the message has a media attachment. Mention gate passes; the
+        // body keeps the mention text so downstream code (and the agent it
+        // routes to) can see who was addressed.
+        let cleaned = admit_discord_message("<@12345>", true, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@12345>"));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_without_mention_in_guild_is_rejected() {
+        // Guild channel with mention_only=true, attachment but no mention
+        // anywhere in the caption. The mention gate is orthogonal to
+        // attachment presence: no mention signal means drop.
+        let cleaned = admit_discord_message("", true, true, "12345");
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn admit_discord_message_drops_when_no_text_and_no_attachments() {
+        // Completely empty payload with attachments absent is always dropped,
+        // regardless of mention_only setting.
+        assert!(admit_discord_message("", false, false, "12345").is_none());
+        assert!(admit_discord_message("", false, true, "12345").is_none());
     }
 
     // mention_only DM-bypass tests
@@ -1847,7 +2911,7 @@ mod tests {
         let mention_only = true;
         let is_dm = true;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned = admit_discord_message("hello without mention", false, effective, "12345");
         assert_eq!(cleaned.as_deref(), Some("hello without mention"));
     }
 
@@ -1858,19 +2922,20 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned = admit_discord_message("hello without mention", false, effective, "12345");
         assert!(cleaned.is_none());
     }
 
     #[test]
-    fn mention_only_guild_message_with_mention_passes_and_strips() {
-        // Guild messages that do carry a @mention pass through and have the
-        // mention tag stripped, consistent with pre-existing behaviour.
+    fn mention_only_guild_message_with_mention_passes_through() {
+        // Guild messages that carry a @mention pass through the gate with
+        // the mention text preserved so downstream consumers (and the agent
+        // it routes to) can see who was addressed.
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345");
-        assert_eq!(cleaned.as_deref(), Some("run status"));
+        let cleaned = admit_discord_message("<@12345> run status", false, effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@12345> run status"));
     }
 
     // Message splitting tests
@@ -2028,14 +3093,32 @@ mod tests {
 
     #[test]
     fn typing_handles_start_empty() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let guard = ch.typing_handles.lock();
         assert!(guard.is_empty());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let _ = ch.start_typing("123456").await;
         let guard = ch.typing_handles.lock();
         assert!(guard.contains_key("123456"));
@@ -2043,7 +3126,16 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handles.lock();
@@ -2052,14 +3144,32 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
     async fn concurrent_typing_handles_are_independent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
         {
@@ -2286,20 +3396,84 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &client).await;
-        assert!(result.is_empty());
+        let (text, media) = process_attachments(&[], &client, None, None).await;
+        assert!(text.is_empty());
+        assert!(media.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_attachments_skips_unsupported_types() {
-        let client = reqwest::Client::new();
-        let attachments = vec![serde_json::json!({
-            "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
-            "filename": "doc.pdf",
-            "content_type": "application/pdf"
-        })];
-        let result = process_attachments(&attachments, &client).await;
-        assert!(result.is_empty());
+    #[test]
+    fn marker_kind_for_classifies_each_mime_family() {
+        assert_eq!(marker_kind_for("image/png", false), "IMAGE");
+        assert_eq!(marker_kind_for("image/jpeg", false), "IMAGE");
+        assert_eq!(marker_kind_for("video/mp4", false), "VIDEO");
+        assert_eq!(marker_kind_for("application/pdf", false), "DOCUMENT");
+        assert_eq!(marker_kind_for("application/zip", false), "DOCUMENT");
+        assert_eq!(marker_kind_for("", false), "DOCUMENT");
+    }
+
+    #[test]
+    fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
+        // Filename-detected audio with no content_type should still classify
+        // as AUDIO, matching the unified inbound pipeline.
+        assert_eq!(marker_kind_for("", true), "AUDIO");
+        assert_eq!(marker_kind_for("application/octet-stream", true), "AUDIO");
+    }
+
+    #[test]
+    fn marker_kind_for_prefers_image_over_audio_when_content_type_is_image() {
+        // Defensive: if a Discord attachment somehow tripped both heuristics,
+        // image MIME wins so vision-capable providers still receive image
+        // bytes through the MediaAttachment path.
+        assert_eq!(marker_kind_for("image/png", true), "IMAGE");
+    }
+
+    #[test]
+    fn is_thread_channel_type_matches_only_thread_types() {
+        // Thread types per Discord docs: 10/11/12.
+        assert!(is_thread_channel_type(10));
+        assert!(is_thread_channel_type(11));
+        assert!(is_thread_channel_type(12));
+        // Non-thread channel types must not be classified as threads.
+        for non_thread in [0u64, 1, 2, 3, 4, 5, 13, 14, 15, 16] {
+            assert!(
+                !is_thread_channel_type(non_thread),
+                "type {non_thread} must not classify as thread"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_filter_empty_accepts_everything() {
+        let filter: Vec<String> = vec![];
+        assert!(channel_passes_filter(&filter, "12345", None));
+        assert!(channel_passes_filter(&filter, "99999", Some("12345")));
+        assert!(channel_passes_filter(&filter, "", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match() {
+        let filter = vec!["111".to_string(), "222".to_string()];
+        assert!(channel_passes_filter(&filter, "111", None));
+        assert!(channel_passes_filter(&filter, "222", None));
+        assert!(!channel_passes_filter(&filter, "333", None));
+    }
+
+    #[test]
+    fn channel_filter_thread_parent_fallback() {
+        let filter = vec!["111".to_string()];
+        // Thread whose parent is in the allowlist — accepted.
+        assert!(channel_passes_filter(&filter, "999", Some("111")));
+        // Thread whose parent is NOT in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", Some("888")));
+        // Non-thread channel not in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match_skips_parent_check() {
+        let filter = vec!["111".to_string()];
+        // Direct match with a parent_id present — parent is irrelevant.
+        assert!(channel_passes_filter(&filter, "111", Some("999")));
     }
 
     #[test]
@@ -2325,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_outgoing_attachments_splits_local_remote_and_unresolved() {
+    fn classify_outgoing_attachments_keeps_workspace_locals_and_http() {
         let temp = tempfile::tempdir().expect("tempdir");
         let file_path = temp.path().join("image.png");
         std::fs::write(&file_path, b"fake").expect("write fixture");
@@ -2339,33 +3513,232 @@ mod tests {
                 kind: DiscordAttachmentKind::Image,
                 target: "https://example.com/remote.png".to_string(),
             },
+        ];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert_eq!(locals.len(), 1);
+        let canonical_file = std::fs::canonicalize(&file_path).expect("canonicalize fixture");
+        assert_eq!(locals[0], canonical_file);
+        assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_missing_absolute_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Video,
+            target: temp
+                .path()
+                .join("does-not-exist.mp4")
+                .to_string_lossy()
+                .to_string(),
+        }];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::NotFound);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_paths_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("escape.png");
+        std::fs::write(&outside_file, b"fake").expect("write fixture");
+
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: outside_file.to_string_lossy().to_string(),
+        }];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(workspace.path()));
+        assert!(
+            locals.is_empty(),
+            "absolute paths outside workspace must be refused"
+        );
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_relative_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Document,
+            target: "relative/report.pdf".to_string(),
+        }];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty(), "relative paths must be refused");
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_disallowed_schemes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: "file:///etc/hostname".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Document,
+                target: "data:text/plain;base64,aGk=".to_string(),
+            },
             DiscordAttachment {
                 kind: DiscordAttachmentKind::Video,
-                target: "/tmp/does-not-exist.mp4".to_string(),
+                target: "ftp://example.com/clip.mp4".to_string(),
             },
         ];
 
-        let (locals, remotes, unresolved) = classify_outgoing_attachments(&attachments);
-        assert_eq!(locals.len(), 1);
-        assert_eq!(locals[0], file_path);
-        assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 3);
+        for (_, kind) in &failures {
+            assert_eq!(*kind, DiscordMarkerFailure::Refused);
+        }
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_refuses_local_without_workspace() {
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: "/some/absolute/path.png".to_string(),
+        }];
+
+        let (locals, remotes, failures) = classify_outgoing_attachments(&attachments, None);
+        assert!(
+            locals.is_empty(),
+            "local paths must be refused without workspace_dir"
+        );
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_passes_http_without_workspace() {
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: "https://example.com/x.png".to_string(),
+        }];
+
+        let (locals, remotes, failures) = classify_outgoing_attachments(&attachments, None);
+        assert!(locals.is_empty());
+        assert_eq!(remotes, vec!["https://example.com/x.png".to_string()]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_appends_remote_urls_only() {
+        let content = "Done";
+        let remote_urls = vec!["https://example.com/a.png".to_string()];
+
+        let rendered = with_inline_attachment_urls(content, &remote_urls);
+        assert_eq!(rendered, "Done\nhttps://example.com/a.png");
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_keeps_content_when_no_urls() {
+        let rendered = with_inline_attachment_urls("Done", &[]);
+        assert_eq!(rendered, "Done");
+    }
+
+    #[test]
+    fn delivery_failure_note_is_none_when_no_failures() {
+        assert!(delivery_failure_note(&[]).is_none());
+    }
+
+    #[test]
+    fn delivery_failure_note_singular_for_one_failure() {
+        let note = delivery_failure_note(&[(
+            "/workspace/missing.png".to_string(),
+            DiscordMarkerFailure::NotFound,
+        )])
+        .expect("one failure should produce a note");
         assert_eq!(
-            unresolved,
-            vec!["[VIDEO:/tmp/does-not-exist.mp4]".to_string()]
+            note,
+            "(note: I couldn't deliver the file at /workspace/missing.png.)"
         );
     }
 
     #[test]
-    fn with_inline_attachment_urls_appends_urls_and_unresolved_markers() {
-        let content = "Done";
-        let remote_urls = vec!["https://example.com/a.png".to_string()];
-        let unresolved = vec!["[IMAGE:/tmp/missing.png]".to_string()];
-
-        let rendered = with_inline_attachment_urls(content, &remote_urls, &unresolved);
+    fn delivery_failure_note_plural_lists_targets_in_order() {
+        let note = delivery_failure_note(&[
+            ("a.png".to_string(), DiscordMarkerFailure::Refused),
+            ("b.pdf".to_string(), DiscordMarkerFailure::NotFound),
+            ("c.mp4".to_string(), DiscordMarkerFailure::Refused),
+        ])
+        .expect("multiple failures should produce a note");
         assert_eq!(
-            rendered,
-            "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
+            note,
+            "(note: I couldn't deliver these files: a.png, b.pdf, c.mp4.)"
         );
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_uses_note_alone_when_content_empty() {
+        let composed = compose_body_with_failure_note("", Some("(note: ...)"));
+        assert_eq!(composed, "(note: ...)");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_appends_note_to_existing_content() {
+        let composed = compose_body_with_failure_note("Hello.", Some("(note: ...)"));
+        assert_eq!(composed, "Hello.\n\n(note: ...)");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_returns_content_when_no_note() {
+        let composed = compose_body_with_failure_note("Hello.", None);
+        assert_eq!(composed, "Hello.");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_returns_empty_when_no_content_and_no_note() {
+        let composed = compose_body_with_failure_note("", None);
+        assert_eq!(composed, "");
+    }
+
+    #[test]
+    fn decide_failure_reactions_empty_for_no_failures() {
+        assert!(decide_failure_reactions(&[]).is_empty());
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_refused_only() {
+        let r = decide_failure_reactions(&[
+            ("a".to_string(), DiscordMarkerFailure::Refused),
+            ("b".to_string(), DiscordMarkerFailure::Refused),
+        ]);
+        assert_eq!(r, vec!["🚫"]);
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_not_found_only() {
+        let r = decide_failure_reactions(&[("a".to_string(), DiscordMarkerFailure::NotFound)]);
+        assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_both_when_mixed() {
+        let r = decide_failure_reactions(&[
+            ("a".to_string(), DiscordMarkerFailure::Refused),
+            ("b".to_string(), DiscordMarkerFailure::NotFound),
+        ]);
+        assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
     }
 
     // ── Streaming mode tests ──────────────────────────────────────────
@@ -2374,22 +3747,39 @@ mod tests {
     fn supports_draft_updates_respects_stream_mode() {
         use zeroclaw_config::schema::StreamMode;
 
-        let off = DiscordChannel::new("t".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let off = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         assert!(!off.supports_draft_updates());
 
-        let partial = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
-            StreamMode::Partial,
-            750,
-            800,
-        );
+        let partial = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::Partial, 750, 800);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
 
-        let multi = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
-            StreamMode::MultiMessage,
-            1000,
-            600,
-        );
+        let multi = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::MultiMessage, 1000, 600);
         assert!(multi.supports_draft_updates());
         assert_eq!(multi.multi_message_delay_ms, 600);
     }
@@ -2399,15 +3789,28 @@ mod tests {
         use zeroclaw_api::channel::SendMessage;
         use zeroclaw_config::schema::StreamMode;
 
-        let off = DiscordChannel::new("t".into(), None, vec![], false, false);
+        let listen_to_bots = false;
+        let mention_only = false;
+        let off = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let msg = SendMessage::new("hello", "123");
         assert!(off.send_draft(&msg).await.unwrap().is_none());
 
-        let multi = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
-            StreamMode::MultiMessage,
-            1000,
-            800,
-        );
+        let multi = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::MultiMessage, 1000, 800);
         // MultiMessage returns a synthetic ID so the draft_updater task runs.
         assert_eq!(
             multi.send_draft(&msg).await.unwrap().as_deref(),
@@ -2419,11 +3822,17 @@ mod tests {
     async fn update_draft_rate_limit_short_circuits() {
         use zeroclaw_config::schema::StreamMode;
 
-        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
-            StreamMode::Partial,
-            60_000,
-            800,
-        );
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::Partial, 60_000, 800);
 
         // Seed a recent edit time.
         ch.last_draft_edit
@@ -2439,11 +3848,17 @@ mod tests {
     async fn cancel_draft_cleans_up_tracking() {
         use zeroclaw_config::schema::StreamMode;
 
-        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
-            StreamMode::Partial,
-            1000,
-            800,
-        );
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::Partial, 1000, 800);
 
         ch.last_draft_edit
             .lock()
@@ -2510,20 +3925,70 @@ mod tests {
         assert!(chunks.is_empty());
     }
 
-    fn make_discord_channel() -> DiscordChannel {
-        DiscordChannel::new("token".into(), None, vec![], false, false)
+    // Regression lock for the marker-only paragraph in MultiMessage stream
+    // mode. Before the fix this produced an empty chunk vec and the chunk
+    // loop in send() iterated zero times, silently skipping the file upload.
+    #[test]
+    fn chunks_for_send_emits_empty_chunk_when_multi_message_paragraph_collapses_to_only_a_file() {
+        use zeroclaw_config::schema::StreamMode;
+        let chunks = chunks_for_send("", StreamMode::MultiMessage, 2000, true);
+        assert_eq!(chunks, vec![String::new()]);
+    }
+
+    #[test]
+    fn chunks_for_send_does_not_emit_empty_chunk_when_no_files_to_upload() {
+        use zeroclaw_config::schema::StreamMode;
+        let chunks = chunks_for_send("", StreamMode::MultiMessage, 2000, false);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunks_for_send_passes_through_non_empty_content() {
+        use zeroclaw_config::schema::StreamMode;
+        for mode in [
+            StreamMode::MultiMessage,
+            StreamMode::Partial,
+            StreamMode::Off,
+        ] {
+            for has_files in [true, false] {
+                let chunks = chunks_for_send("hello", mode, 2000, has_files);
+                assert_eq!(
+                    chunks,
+                    vec!["hello".to_string()],
+                    "mode={mode:?} has_files={has_files}"
+                );
+            }
+        }
     }
 
     #[test]
     fn pending_approvals_map_is_initially_empty() {
-        let ch = make_discord_channel();
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let map = ch.pending_approvals.try_lock().unwrap();
         assert!(map.is_empty());
     }
 
     #[test]
     fn approval_timeout_defaults_to_300_and_is_overridable() {
-        let ch = make_discord_channel();
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         assert_eq!(ch.approval_timeout_secs, 300);
         let ch = ch.with_approval_timeout_secs(60);
         assert_eq!(ch.approval_timeout_secs, 60);
@@ -2531,7 +3996,16 @@ mod tests {
 
     #[tokio::test]
     async fn pending_approval_oneshot_delivers_response() {
-        let ch = make_discord_channel();
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
         let (tx, rx) = oneshot::channel();
         ch.pending_approvals
             .lock()

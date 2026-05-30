@@ -16,7 +16,12 @@ const DEDUP_CAPACITY: usize = 10_000;
 pub struct MochatChannel {
     api_url: String,
     api_token: String,
-    allowed_users: Vec<String>,
+    /// The alias key under `[channels.mochat.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     poll_interval_secs: u64,
     /// Message deduplication set.
     dedup: Arc<RwLock<HashSet<String>>>,
@@ -26,16 +31,24 @@ impl MochatChannel {
     pub fn new(
         api_url: String,
         api_token: String,
-        allowed_users: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         poll_interval_secs: u64,
     ) -> Self {
         Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_token,
-            allowed_users,
+            alias: alias.into(),
+            peer_resolver,
             poll_interval_secs,
             dedup: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Return the alias under `[channels.mochat.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -43,7 +56,8 @@ impl MochatChannel {
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
     /// Check and insert message ID for deduplication.
@@ -67,6 +81,15 @@ impl MochatChannel {
 
         dedup.insert(msg_id.to_string());
         false
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MochatChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::MoChat)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -114,7 +137,11 @@ impl Channel for MochatChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        tracing::info!("Mochat: starting message poller");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "starting message poller"
+        );
 
         let poll_interval = std::time::Duration::from_secs(self.poll_interval_secs);
         let mut last_message_id: Option<String> = None;
@@ -137,7 +164,16 @@ impl Channel for MochatChannel {
                     let data: serde_json::Value = match resp.json().await {
                         Ok(d) => d,
                         Err(e) => {
-                            tracing::warn!("Mochat: failed to parse response: {e}");
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "failed to parse response"
+                            );
                             tokio::time::sleep(poll_interval).await;
                             continue;
                         }
@@ -167,8 +203,14 @@ impl Channel for MochatChannel {
                                 .unwrap_or("unknown");
 
                             if !self.is_user_allowed(sender) {
-                                tracing::debug!(
-                                    "Mochat: ignoring message from unauthorized user: {sender}"
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"sender": sender})),
+                                    "ignoring message from unauthorized user"
                                 );
                                 continue;
                             }
@@ -193,6 +235,7 @@ impl Channel for MochatChannel {
                                 reply_target: sender.to_string(),
                                 content: content.to_string(),
                                 channel: "mochat".to_string(),
+                                channel_alias: Some(self.alias.clone()),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -200,10 +243,19 @@ impl Channel for MochatChannel {
                                 thread_ts: None,
                                 interruption_scope_id: None,
                                 attachments: vec![],
+                                subject: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("Mochat: message channel closed");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                    "message channel closed"
+                                );
                                 return Ok(());
                             }
 
@@ -216,10 +268,16 @@ impl Channel for MochatChannel {
                 Ok(resp) => {
                     let status = resp.status();
                     let err = resp.text().await.unwrap_or_default();
-                    tracing::warn!("Mochat: poll request failed ({status}): {err}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "status": status.to_string()})), "poll request failed");
                 }
                 Err(e) => {
-                    tracing::warn!("Mochat: poll request error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "poll request error"
+                    );
                 }
             }
 
@@ -248,7 +306,13 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let ch = MochatChannel::new("https://mochat.example.com".into(), "tok".into(), vec![], 5);
+        let ch = MochatChannel::new(
+            "https://mochat.example.com".into(),
+            "tok".into(),
+            "mochat_test_alias",
+            Arc::new(Vec::new),
+            5,
+        );
         assert_eq!(ch.name(), "mochat");
     }
 
@@ -257,7 +321,8 @@ mod tests {
         let ch = MochatChannel::new(
             "https://mochat.example.com/".into(),
             "tok".into(),
-            vec![],
+            "mochat_test_alias",
+            Arc::new(Vec::new),
             5,
         );
         assert_eq!(ch.api_url, "https://mochat.example.com");
@@ -265,7 +330,13 @@ mod tests {
 
     #[test]
     fn test_user_allowed_wildcard() {
-        let ch = MochatChannel::new("https://m.test".into(), "tok".into(), vec!["*".into()], 5);
+        let ch = MochatChannel::new(
+            "https://m.test".into(),
+            "tok".into(),
+            "mochat_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            5,
+        );
         assert!(ch.is_user_allowed("anyone"));
     }
 
@@ -274,7 +345,8 @@ mod tests {
         let ch = MochatChannel::new(
             "https://m.test".into(),
             "tok".into(),
-            vec!["user123".into()],
+            "mochat_test_alias",
+            Arc::new(|| vec!["user123".into()]),
             5,
         );
         assert!(ch.is_user_allowed("user123"));
@@ -283,13 +355,25 @@ mod tests {
 
     #[test]
     fn test_user_denied_empty() {
-        let ch = MochatChannel::new("https://m.test".into(), "tok".into(), vec![], 5);
+        let ch = MochatChannel::new(
+            "https://m.test".into(),
+            "tok".into(),
+            "mochat_test_alias",
+            Arc::new(Vec::new),
+            5,
+        );
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[tokio::test]
     async fn test_dedup() {
-        let ch = MochatChannel::new("https://m.test".into(), "tok".into(), vec![], 5);
+        let ch = MochatChannel::new(
+            "https://m.test".into(),
+            "tok".into(),
+            "mochat_test_alias",
+            Arc::new(Vec::new),
+            5,
+        );
         assert!(!ch.is_duplicate("msg1").await);
         assert!(ch.is_duplicate("msg1").await);
         assert!(!ch.is_duplicate("msg2").await);
@@ -297,32 +381,73 @@ mod tests {
 
     #[tokio::test]
     async fn test_dedup_empty_id() {
-        let ch = MochatChannel::new("https://m.test".into(), "tok".into(), vec![], 5);
+        let ch = MochatChannel::new(
+            "https://m.test".into(),
+            "tok".into(),
+            "mochat_test_alias",
+            Arc::new(Vec::new),
+            5,
+        );
         assert!(!ch.is_duplicate("").await);
         assert!(!ch.is_duplicate("").await);
     }
 
     #[test]
-    fn test_config_serde() {
-        let toml_str = r#"
+    fn v2_allowed_users_fold_into_peer_groups() {
+        // V2 `[channels.mochat].allowed_users` migrates into a synthesized
+        // `[peer_groups.mochat_default]` block in V3, while the channel block
+        // itself survives under the bridge alias `default`.
+        let v2_toml = r#"
+schema_version = 2
+
+[channels.mochat]
+enabled = true
 api_url = "https://mochat.example.com"
 api_token = "secret"
 allowed_users = ["user1"]
 "#;
-        let config: zeroclaw_config::schema::MochatConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.api_url, "https://mochat.example.com");
-        assert_eq!(config.api_token, "secret");
-        assert_eq!(config.allowed_users, vec!["user1"]);
+        let cfg = zeroclaw_config::migration::migrate_to_current(v2_toml)
+            .expect("V2 mochat config migrates to V3");
+        let mochat = cfg
+            .channels
+            .mochat
+            .get("default")
+            .expect("V2 mochat folds under alias `default`");
+        assert_eq!(mochat.api_url, "https://mochat.example.com");
+        assert_eq!(mochat.api_token, "secret");
+
+        let group = cfg
+            .peer_groups
+            .get("mochat_default")
+            .expect("mochat allow-list synthesizes [peer_groups.mochat_default]");
+        assert_eq!(group.channel, "mochat");
+        let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
+        assert_eq!(peers, vec!["user1"]);
     }
 
     #[test]
-    fn test_config_serde_defaults() {
-        let toml_str = r#"
+    fn v2_no_allowed_users_synthesizes_no_peer_group() {
+        // V2 mochat without `allowed_users` migrates without synthesizing a
+        // peer group; `poll_interval_secs` default survives untouched.
+        let v2_toml = r#"
+schema_version = 2
+
+[channels.mochat]
+enabled = true
 api_url = "https://mochat.example.com"
 api_token = "secret"
 "#;
-        let config: zeroclaw_config::schema::MochatConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.allowed_users.is_empty());
-        assert_eq!(config.poll_interval_secs, 5);
+        let cfg = zeroclaw_config::migration::migrate_to_current(v2_toml)
+            .expect("V2 mochat config without allowed_users migrates");
+        assert!(
+            !cfg.peer_groups.contains_key("mochat_default"),
+            "no peer group synthesized when allowed_users is absent"
+        );
+        let mochat = cfg
+            .channels
+            .mochat
+            .get("default")
+            .expect("V2 mochat folds under alias `default`");
+        assert_eq!(mochat.poll_interval_secs, 5);
     }
 }

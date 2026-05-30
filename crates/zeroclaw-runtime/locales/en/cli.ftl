@@ -50,12 +50,63 @@ cli-channel-doctor-about = Run health checks for configured channels
 cli-channel-add-about = Add a new channel configuration
 cli-channel-remove-about = Remove a channel configuration
 cli-channel-send-about = Send a one-off message to a configured channel
+cli-wechat-pairing-required = 🔐 WeChat pairing required. One-time bind code: {$code}
+cli-wechat-send-bind-command = Send `{$command} <code>` from your WeChat.
+cli-wechat-qr-login = 📱 WeChat QR Login ({$attempt}/{$max})
+cli-wechat-scan-to-connect = Scan with WeChat to connect.
+cli-wechat-qr-url = QR URL: {$url}
+cli-wechat-qr-expired-giving-up = WeChat QR code expired {$max} times, giving up.
+cli-wechat-qr-fetch-failed = Failed to fetch WeChat QR code.
+cli-wechat-qr-fetch-status-failed = WeChat QR code fetch failed ({$status}): {$body}
+cli-wechat-missing-response-field = Missing {$field} in WeChat response.
+cli-wechat-scanned-confirm = 👀 Scanned! Confirm on your phone...
+cli-wechat-qr-expired-refreshing = ⏳ QR code expired, refreshing...
+cli-wechat-login-confirmed-missing-field = Login confirmed but {$field} missing.
+cli-wechat-connected = ✅ WeChat connected!
+cli-wechat-bound-success = ✅ WeChat account bound successfully. You can talk to ZeroClaw now.
+cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
 
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
 cli-skills-install-about = Install a new skill from a URL or local path
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
+cli-skills-install-start = Installing skill from: {$source}
+cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
+cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
+cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
+cli-skills-install-tier-official = Installing {$name} v{$version} — Official (zeroclaw-labs maintained)
+cli-skills-install-tier-community =
+    Installing {$name} v{$version} — Community submission
+    This skill is not audited by ZeroClaw. Review the skill content
+    and run `zeroclaw skills audit {$name}` before granting any
+    permissions or running it in production.
+
+cli-skills-add-scaffolded = Scaffolded skill {$target} at {$dir}
+
+cli-skills-bundle-add-prompt =
+    To create skill-bundle '{$alias}' with directory '{$dir}', run:
+      zeroclaw config map-key skill-bundles {$alias}
+      zeroclaw config set skill-bundles.{$alias}.directory {$dir}
+
+    (Direct bundle creation through `zeroclaw skills bundle add` would duplicate the config mutation surface.)
+
+cli-skills-bundle-remove-prompt =
+    To remove skill-bundle '{$alias}', run:
+      zeroclaw config map-key-delete skill-bundles {$alias}
+
+    (Removes the config entry; the bundle's directory on disk is left in place.)
+
+cli-skills-bundle-list-empty =
+    No skill bundles configured.
+      Create one: zeroclaw config set skill-bundles.default.directory shared/skills/default
+cli-skills-bundle-list-header = Skill bundles ({$count}):
+cli-skills-bundle-entry = {$alias} -> {$dir}
+cli-skills-bundle-include = include: {$values}
+cli-skills-bundle-exclude = exclude: {$values}
+cli-skills-bundle-show-no-skills = (no skills installed)
+cli-skills-bundle-show-skills-header = skills ({$count}):
+cli-skills-bundle-show-skill = {$name}: {$description}
 
 cli-cron-list-about = List all scheduled tasks
 cli-cron-add-about = Add a new recurring scheduled task
@@ -78,6 +129,7 @@ cli-memory-list-about = List memory entries with optional filters
 cli-memory-get-about = Get a specific memory entry by key
 cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
+cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
 
 cli-estop-status-about = Print current estop status
 cli-estop-resume-about = Resume from an engaged estop level
@@ -260,6 +312,12 @@ cli-self-test-long-about =
       zeroclaw self-test             # full suite
       zeroclaw self-test --quick     # quick checks only (no network)
 
+cli-skills-install-suggestion =
+    It looks like this request needs the `{$name}` skill, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.
 
@@ -280,3 +338,60 @@ cli-desktop-long-about =
     Examples:
       zeroclaw desktop              # launch the companion app
       zeroclaw desktop --install    # download and install it
+
+# Channel-side reply emitted when chat dispatch refuses because the
+# gateway has no model configured. Used by the gateway crate channel
+# webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).
+channel-needs-onboarding-reply = This agent isn't fully set up yet. The operator needs to complete onboarding before I can reply.
+
+channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.
+channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
+channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
+channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)
+
+channel-wecom-ws-stream-bootstrap = Working on it, please wait.
+channel-wecom-ws-stop-ack = Stopped the current message.
+channel-wecom-ws-voice-unavailable = I can't process voice messages right now {$emoji}
+channel-wecom-ws-unsupported-message = This message type is not supported yet.
+channel-wecom-ws-welcome = Hi, welcome to chat with me {$emoji}
+channel-wecom-ws-supplemental-message =
+    [Supplemental message]
+    {$extra}
+channel-wecom-ws-group-allowlist-missing =
+    The WeCom allowlist is not configured, so this bot is not accepting group messages.
+
+    Group chatid: {$chatid}
+    Sender userid: {$userid}
+
+    Add an allowed entry to {$allowed_groups_path} or {$allowed_users_path}. You can also temporarily set it to ["*"] for testing.
+channel-wecom-ws-group-access-denied =
+    This group is not allowed to use this bot.
+
+    Group chatid: {$chatid}
+    Sender userid: {$userid}
+
+    Ask an administrator to add this group to {$allowed_groups_path}, or add your userid to {$allowed_users_path}.
+channel-wecom-ws-dm-allowlist-missing =
+    The WeCom allowlist is not configured, so this bot is not accepting messages.
+
+    Your userid: {$userid}
+
+    Add an allowed entry to {$allowed_users_path}. You can also temporarily set it to ["*"] for testing.
+channel-wecom-ws-dm-access-denied =
+    You do not have permission to use this bot.
+
+    Your userid: {$userid}
+
+    Ask an administrator to add your userid to {$allowed_users_path}.
+
+# Onboarding — OpenAI auth picker
+onboard-openai-auth-note =
+    OpenAI authentication:
+    • API key — standard API access via platform.openai.com (sk-...)
+    • Codex subscription — uses your ChatGPT Plus/Pro account (no API key needed)
+onboard-openai-auth-prompt = Authentication
+onboard-openai-auth-api-key = API key
+onboard-openai-auth-codex = Codex subscription
+onboard-openai-codex-followup =
+    Codex subscription auth uses your ChatGPT account.
+    Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.

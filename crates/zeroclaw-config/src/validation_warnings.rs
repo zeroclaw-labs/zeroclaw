@@ -3,7 +3,7 @@
 //! at agent runtime because of a logical inconsistency the schema can't
 //! enforce structurally.
 //!
-//! The CLI surfaces these via `tracing::warn!` so operators see them on
+//! The CLI surfaces these via `zeroclaw_log::record!` so operators see them on
 //! stderr. The gateway HTTP API surfaces them via the `warnings` field on
 //! `PropResponse` / `PatchResponse` so dashboard callers see the same
 //! signal — closing the parity gap that previously left a dashboard user
@@ -18,16 +18,13 @@
 //!
 //! Adding a new warning: append the check to `Config::collect_warnings`
 //! in `schema.rs` and pick a stable `code`. `Config::validate` emits each
-//! collected warning via `tracing::warn!` so logs continue to show them.
+//! collected warning via `zeroclaw_log::record!` so logs continue to show them.
 
 use serde::{Deserialize, Serialize};
 
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
-/// - `dangling_provider_fallback` — `providers.fallback` references a key
-///   that does not exist in `providers.models`. Provider resolution will
-///   fail at runtime when the fallback is hit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
@@ -36,7 +33,7 @@ pub struct ValidationWarning {
     /// Human-readable description suitable for direct display.
     pub message: String,
     /// Dotted property path the warning concerns
-    /// (e.g. `"providers.fallback"`).
+    /// (e.g. `"agents.researcher.model_provider"`).
     pub path: String,
 }
 

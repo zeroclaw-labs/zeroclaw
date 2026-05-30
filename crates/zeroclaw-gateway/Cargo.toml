@@ -11,6 +11,7 @@ publish = false
 zeroclaw-api.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-infra.workspace = true
+zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-acp-server", "channel-email", "channel-telegram"] }
@@ -33,6 +34,9 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
+
+# Base64 encoding for binary file content in agent workspace `read` responses.
+base64 = "0.22"
 include_dir = { version = "0.7", optional = true }
 
 # Schemars JSON Schema generation for OPTIONS responses; matches the version
@@ -67,7 +71,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 toml = "1.0"
 toml_edit = "0.25"
-tracing = { version = "0.1", default-features = false }
 rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 

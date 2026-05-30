@@ -1,4 +1,4 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
@@ -10,12 +10,14 @@ use tokio::fs;
 ///   workspace/MEMORY.md          — curated long-term memory (core)
 ///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
 pub struct MarkdownMemory {
+    alias: String,
     workspace_dir: PathBuf,
 }
 
 impl MarkdownMemory {
-    pub fn new(workspace_dir: &Path) -> Self {
+    pub fn new(alias: &str, workspace_dir: &Path) -> Self {
         Self {
+            alias: alias.to_string(),
             workspace_dir: workspace_dir.to_path_buf(),
         }
     }
@@ -94,6 +96,8 @@ impl MarkdownMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 }
             })
             .collect()
@@ -167,11 +171,33 @@ impl Memory for MarkdownMemory {
         let since_dt = since
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid 'since' date (expected RFC 3339): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"field": "since", "error": format!("{}", e)})
+                        ),
+                    "recall window bound rejected"
+                );
+                anyhow::Error::msg(format!("invalid 'since' date (expected RFC 3339): {e}"))
+            })?;
         let until_dt = until
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid 'until' date (expected RFC 3339): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"field": "until", "error": format!("{}", e)})
+                        ),
+                    "recall window bound rejected"
+                );
+                anyhow::Error::msg(format!("invalid 'until' date (expected RFC 3339): {e}"))
+            })?;
         if let (Some(s), Some(u)) = (&since_dt, &until_dt)
             && s >= u
         {
@@ -179,8 +205,15 @@ impl Memory for MarkdownMemory {
         }
 
         let all = self.read_all_entries().await?;
-        let query_lower = query.to_lowercase();
-        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+        let keywords: Vec<String> = if is_recent_recall_query(query) {
+            Vec::new()
+        } else {
+            query
+                .to_lowercase()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
 
         let mut scored: Vec<MemoryEntry> = all
             .into_iter()
@@ -204,7 +237,7 @@ impl Memory for MarkdownMemory {
                 let content_lower = entry.content.to_lowercase();
                 let matched = keywords
                     .iter()
-                    .filter(|kw| content_lower.contains(**kw))
+                    .filter(|kw| content_lower.contains(kw.as_str()))
                     .count();
                 if matched > 0 {
                     #[allow(clippy::cast_precision_loss)]
@@ -255,6 +288,10 @@ impl Memory for MarkdownMemory {
         Ok(false)
     }
 
+    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let all = self.read_all_entries().await?;
         Ok(all.len())
@@ -262,6 +299,53 @@ impl Memory for MarkdownMemory {
 
     async fn health_check(&self) -> bool {
         self.workspace_dir.exists()
+    }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Markdown's per-agent attribution is the on-disk path: the
+        // backend writes into `<workspace_dir>/MEMORY.md` and the
+        // workspace_dir is owned by the agent that constructed this
+        // backend. The agent_id parameter is redundant and ignored at
+        // the trait boundary; cross-agent reads merge multiple
+        // MarkdownMemory instances at the `AgentScopedMarkdownMemory`
+        // wrapper layer.
+        self.store(key, content, category, session_id).await
+    }
+
+    async fn recall_for_agents(
+        &self,
+        _allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Same per-agent-path attribution model as `store_with_agent`:
+        // a single MarkdownMemory instance reads only its own
+        // workspace_dir. Cross-agent recall is composed by
+        // `AgentScopedMarkdownMemory`, which holds an own
+        // MarkdownMemory plus a Vec<(alias, MarkdownMemory)> peer set
+        // and unions their results with attribution.
+        self.recall(query, limit, session_id, since, until).await
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MarkdownMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Markdown)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -272,7 +356,7 @@ mod tests {
 
     fn temp_workspace() -> (TempDir, MarkdownMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = MarkdownMemory::new(tmp.path());
+        let mem = MarkdownMemory::new("markdown", tmp.path());
         (tmp, mem)
     }
 
@@ -345,6 +429,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_recall_star_query_returns_recent_entries() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("a", "first memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "second memory", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("*", 10, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.content.contains("first memory"))
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.content.contains("second memory"))
+        );
+    }
+
+    #[tokio::test]
     async fn markdown_count() {
         let (_tmp, mem) = temp_workspace();
         mem.store("a", "first", MemoryCategory::Core, None)
@@ -395,5 +503,39 @@ mod tests {
     async fn markdown_empty_count() {
         let (_tmp, mem) = temp_workspace();
         assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    // Markdown has no agents table and no UUID indirection. Rows return
+    // `agent_alias = agent_id = None`; the dashboard renders these as
+    // "unattributed". This locks that contract so a future change can't
+    // silently leak a synthesized UUID into `agent_alias` (the bug that
+    // bit the SQL backends before the JOIN landed).
+    #[tokio::test]
+    async fn markdown_entries_carry_no_agent_attribution() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "v", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("MEMORY.md:0").await.unwrap();
+        if let Some(entry) = entry {
+            assert!(
+                entry.agent_alias.is_none(),
+                "markdown rows must never claim an agent alias"
+            );
+            assert!(
+                entry.agent_id.is_none(),
+                "markdown rows must never claim a raw agent id either"
+            );
+        }
+        // list path must show the same shape regardless of how a row is
+        // surfaced (keyed lookup vs. enumeration).
+        let rows = mem.list(None, None).await.unwrap();
+        for row in rows {
+            assert!(
+                row.agent_alias.is_none(),
+                "list path must not synthesize aliases"
+            );
+            assert!(row.agent_id.is_none(), "list path must not synthesize ids");
+        }
     }
 }

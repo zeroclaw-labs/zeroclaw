@@ -8,6 +8,54 @@ Single reference for every label used on PRs and issues. Sources of truth:
 
 When definitions conflict, update the source file first, then sync this page.
 
+## Ownership boundaries
+
+Labels are portable metadata. They should answer what kind of work this is, what code area it touches, how risky it is to review, and whether stale policy or triage policy needs special handling.
+
+When Project board automation is added, use it as an automated planning board,
+not as a second PR review queue. The board should answer slower-moving planning
+questions: what is ready to pick up, who owns it, what tracker or milestone it
+belongs to, and what is blocked. Native GitHub PR state should continue to
+answer fast-moving review and merge questions.
+
+Keep the split based on update frequency:
+
+- Labels own durable classification: work type, scope/component, review risk, measured PR size, and stale exemption.
+- Project board fields are appropriate for issue planning stage, active owner, dependency state, and roadmap grouping when those fields are actively maintained.
+- Native GitHub PR state owns fast-changing review state: review decision, required checks, mergeability, conflicts, and stale approvals.
+
+The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
+
+## Canonical spelling
+
+Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `security:policy`, and similar labels. The size and risk families intentionally keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`.
+
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+
+## Cleanup protocol
+
+Label cleanup is a maintainer action, not a side effect of normal PR review.
+
+Use this sequence:
+
+1. Refresh live label usage before acting.
+2. Split candidates into zero-history deletes, zero-open duplicate deletes, migrate-first active labels, and policy holdbacks.
+3. For labels with open refs, add the canonical label to each open issue/PR, remove the legacy label, verify the legacy label has zero open refs, then delete it.
+4. Do not delete governance labels, stale-policy labels, contributor-tier labels, or default GitHub labels as part of module-label cleanup.
+
+Every live cleanup batch needs exact maintainer approval for the labels and issue/PR refs being changed.
+
+## Type labels
+
+Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
+
+| Label | Purpose |
+|---|---|
+| `type: ci` | CI, workflow, or repository automation work |
+| `type: dependencies` | Dependency or lockfile maintenance |
+| `type: docs` | Documentation-only or docs-primary work |
+| `type:rfc` | RFC issue or proposal; protected from stale closure |
+
 ## Path labels
 
 Applied automatically by `pr-path-labeler.yml` (the only labeling automation currently active). Globs live in `.github/labeler.yml`.
@@ -18,7 +66,7 @@ Applied automatically by `pr-path-labeler.yml` (the only labeling automation cur
 |---|---|
 | `docs` | `docs/**`, `**/*.md`, `**/*.mdx`, `LICENSE`, `.markdownlint-cli2.yaml` |
 | `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
-| `ci` | `.github/**`, `.githooks/**` |
+| `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
 | `agent` | `src/agent/**` |
 | `channel` | `src/channels/**` |
@@ -45,6 +93,8 @@ Applied automatically by `pr-path-labeler.yml` (the only labeling automation cur
 | `scripts` | `scripts/**` |
 | `dev` | `dev/**` |
 
+`ci` is scoped to GitHub automation/config files, not all `.github/**` paths. The root `.github/*.json` matcher is intentional for automation metadata (for example `.github/label-policy.json`), so files like `.github/assets/**`, `.github/ISSUE_TEMPLATE/**`, `.github/CODEOWNERS`, and `.github/pull_request_template.md` do not match `ci`.
+
 ### Per-channel labels
 
 Each channel gets a `channel:<name>` label in addition to the base `channel` label.
@@ -55,7 +105,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
 | `channel:dingtalk` | `dingtalk.rs` |
-| `channel:discord` | `discord.rs`, `discord_history.rs` |
+| `channel:discord` | `discord.rs` |
 | `channel:email` | `email_channel.rs`, `gmail_push.rs` |
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |
@@ -131,7 +181,7 @@ Based on effective changed line count, normalized for docs-only and lockfile-hea
 
 ## Risk labels
 
-Heuristic combining touched paths and change size. Currently applied **manually**.
+For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**.
 
 | Label | Meaning |
 |---|---|
@@ -157,12 +207,29 @@ Defined in `.github/label-policy.json`. Based on the author's merged PR count qu
 
 ## Status labels
 
-Track lifecycle state of RFCs and tracked work items. Applied manually.
+Track lifecycle state of RFCs and tracked work items. Applied manually unless a maintained workflow says otherwise.
 
 | Label | Description |
 |---|---|
-| `status:in-progress` | An open PR is actively targeting this issue |
-| `status:accepted` | RFC or work item ratified by the team |
+| `status:accepted` | RFC or work item ratified by the team. This does not exempt the issue from stale handling by itself. |
+| `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
+| `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
+| `status:stale` | No author activity for the stale window; may close if not refreshed |
+| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Use only when a maintainer comment, issue body, or tracker entry records why the issue should stay open. |
+
+## Resolution labels
+
+Resolution labels explain why an issue or PR is being closed or removed from the active queue. They are terminal outcomes, not lifecycle status labels, and should include enough comment context for a future maintainer to understand the decision.
+
+| Label | Purpose |
+|---|---|
+| `wontfix` | Valid request or report that the project is explicitly choosing not to pursue. Use a brief rationale; do not silently close. |
+| `invalid` | Not actionable as a bug, feature request, support item, RFC, or tracked project work. Explain the mismatch or missing requirement. |
+| `duplicate` | Same underlying issue as another tracked issue or PR. Link the canonical target before closing or redirecting discussion. |
+
+Do not create or apply proposed terminal labels such as `status:wont-do` or `status:wont-fix` until a maintainer-approved label migration packet defines the exact rename, alias, or deletion plan. The current live label for the board-level "Won't Do" concept is `wontfix`.
+
+Superseding is a replacement process, not currently a live label. Use [Superseding PRs](./superseding.md) for replacement rules and attribution requirements until a later approved migration packet creates or maps a superseding label.
 
 ## Triage labels
 
@@ -172,11 +239,18 @@ Applied manually — the auto-response automation that used to handle these was 
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `invalid` | Not a valid bug or feature request |
-| `duplicate` | Duplicate of an existing issue |
 | `stale-candidate` | Dormant PR or issue; candidate for closing |
-| `superseded` | Replaced by a newer PR |
-| `no-stale` | Exempt from stale automation; accepted but blocked work |
+
+## Community pickup labels
+
+Applied manually when maintainers want outside contribution.
+
+| Label | Purpose |
+|---|---|
+| `good first issue` | Small, self-contained, well-documented XS/S work that is safe for a new contributor and has acceptance criteria, relevant code or docs links, and a named mentor or contact |
+| `help wanted` | Actionable, unblocked work that maintainers want external help on and can review, usually low or medium likely issue risk |
+
+Do not use `help wanted` as a generic marker for "valid but unstaffed." If an issue is blocked, architecture-dependent, missing acceptance criteria, likely high-risk, or waiting on a policy decision, leave it without pickup labels until the blocker is resolved or a maintainer writes the missing scope.
 
 ## Maintenance triggers
 

@@ -1,61 +1,69 @@
 # Sandboxing
 
-The runtime executes tool invocations inside an OS-level sandbox when one is available. The sandbox restricts filesystem access to the workspace, limits network reachability, and removes access to the parent process's secrets.
+The runtime can wrap tool invocations in an OS-level sandbox that restricts filesystem access to the workspace and removes access to the parent process's secrets. This is distinct from the autonomy system and command allow-list: those are *policy* layers that decide whether a tool may run; the sandbox is a *mechanism* layer that confines what a running tool can reach if it does run.
 
-This is distinct from the autonomy system and command allow-lists. Those are *policy* layers that decide whether a tool may run; the sandbox is a *mechanism* layer that confines what a running tool can reach if it does run.
+Sandbox settings live on a risk profile. Each agent points at a risk profile via `agents.<alias>.risk_profile`; the agent's sandbox enable/backend are read from that profile.
+
+```toml
+[risk_profiles.assistant]
+sandbox_enabled = true
+sandbox_backend = "auto"     # "auto" | "landlock" | "firejail" | "bubblewrap" | "docker" | "sandbox-exec" | "none"
+firejail_args   = []          # extra args when sandbox_backend = "firejail"
+```
+
+`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
-ZeroClaw picks the best available backend at startup:
+`sandbox_backend = "auto"` picks the best available backend at startup:
 
 | Platform | Preferred order |
 |---|---|
 | Linux | Landlock (kernel 5.13+) → Bubblewrap → Firejail → Docker → none |
-| macOS | Seatbelt (native) → Docker → none |
+| macOS | Seatbelt (`sandbox-exec`, native) → Docker → none |
 | Windows | AppContainer (experimental) → Docker → none |
 | Any | Docker (if daemon reachable) → none |
 
-You can force a backend:
-
-```toml
-[security.sandbox]
-backend = "bubblewrap"        # or "landlock", "firejail", "docker", "seatbelt", "noop"
-```
-
-Set `backend = "noop"` to disable sandboxing entirely (part of [YOLO mode](../getting-started/yolo.md)).
+To force a specific backend, set `sandbox_backend` to one of the literal values listed above.
 
 ## What the sandbox confines
 
 ### Filesystem
 
-- **Read access** — restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths
-- **Write access** — restricted to the workspace and `/tmp`
-- **Forbidden paths** — `~/.ssh`, `~/.aws`, `~/.config` (except ZeroClaw's own), anything in `[autonomy] forbidden_paths`
+- **Read access** — restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
+- **Write access** — restricted to the workspace and `/tmp`.
+- **Forbidden paths** — anything listed in `[risk_profiles.<alias>].forbidden_paths`.
 
 ### Network
 
-By default, sandboxed tools have full network egress but no inbound listening.
+By default, sandboxed tools have full network egress but no inbound listening. Per-backend caveats:
 
-For tighter control:
+- Landlock does not control network — it is filesystem-only.
+- Bubblewrap and Firejail can block network when configured.
+- Docker container network mode follows `[runtime.docker].network` when `[runtime].kind = "docker"`.
 
-```toml
-[security.sandbox]
-network = "allowed-domains"
-allowed_domains = ["api.openai.com", "api.anthropic.com", "api.github.com"]
-```
-
-Or `network = "none"` to block network entirely (useful for pure-local tools).
+Tool-specific network gates (browser, HTTP, web_fetch) live on those tools' own config blocks (`[browser].allowed_domains`, `[http_request].allowed_domains`, `[web_fetch].allowed_domains`).
 
 ### Environment
 
-The sandbox passes through only the env vars listed in `[autonomy] shell_env_passthrough`. Inherited secrets do not reach sandboxed tools unless explicitly passed.
+The sandbox passes through only the env vars listed in `[risk_profiles.<alias>].shell_env_passthrough`. Inherited secrets do not reach sandboxed tools unless explicitly passed.
 
 ### Process limits
 
-- CPU: soft-limited to the ZeroClaw service's share
-- Memory: capped at `[security.sandbox] memory_limit_mb` (default unset — no cap)
-- Subprocesses: capped at `[security.sandbox] max_subprocesses` (default unset)
-- Wall time: tool-specific timeout (default 300 seconds for `shell`)
+Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].timeout_secs`, etc.). Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's runtime kind is set to `docker`:
+
+```toml
+[runtime]
+kind = "docker"
+
+[runtime.docker]
+image            = "alpine:3.20"
+network          = "none"
+memory_limit_mb  = 512
+cpu_limit        = 1.0
+read_only_rootfs = true
+mount_workspace  = true
+```
 
 ## Per-backend notes
 
@@ -65,15 +73,14 @@ The Linux-native path. Zero setup, kernel-enforced, very low overhead. Requires 
 
 Limitations:
 
-- No network confinement — Landlock only controls filesystem access
-- `forbidden_paths` enforced via path-based rules, not inode-based, so a clever symlink can sometimes escape (we resolve links before handing to Landlock to mitigate this)
+- No network confinement — Landlock only controls filesystem access.
+- `forbidden_paths` is enforced via path-based rules, not inode-based, so a clever symlink can sometimes escape (we resolve links before handing to Landlock to mitigate this).
 
 ### Bubblewrap (`bwrap`)
 
-User-namespace-based sandbox from Flatpak. Confines filesystem and can block network. Require `bubblewrap` installed.
+User-namespace-based sandbox from Flatpak. Confines filesystem and can block network. Requires `bubblewrap` installed.
 
 ```bash
-# install
 sudo apt install bubblewrap       # Debian/Ubuntu
 sudo pacman -S bubblewrap         # Arch
 sudo dnf install bubblewrap       # Fedora
@@ -87,49 +94,44 @@ SUID-based sandbox. Older but widely available.
 sudo apt install firejail
 ```
 
-Firejail's default profile is fairly permissive; we apply a custom profile bundled with ZeroClaw.
+Firejail's default profile is fairly permissive; ZeroClaw applies a custom profile. Pass extra args with `firejail_args` on the risk profile.
 
 ### Docker
 
-Works anywhere Docker does. Runs each tool invocation in an ephemeral container (the `zeroclawlabs/tool-runner` image).
+Works anywhere Docker does. The Docker runtime kind (`[runtime] kind = "docker"`) runs each shell invocation in an ephemeral container; see the `[runtime.docker]` block above for image and resource controls.
+
+```bash
+docker build -t zeroclaw-sandbox:local dev/sandbox/   # build the bundled toolkit image
+```
 
 ```toml
-[security.sandbox]
-backend = "docker"
-image = "zeroclawlabs/tool-runner:latest"
+[runtime]
+kind = "docker"
+
+[runtime.docker]
+image = "zeroclaw-sandbox:local"
 ```
 
 Pros: strong isolation, works on any OS. Cons: per-invocation container startup cost (100–500 ms). Best for production deployments where the overhead is acceptable.
 
 ### Seatbelt (macOS)
 
-Native macOS sandbox (`sandbox-exec`). Profiles are SBPL — we bundle one for tool runs. Works transparently on macOS 10.11+.
+Native macOS sandbox (`sandbox-exec`). Profiles are SBPL — ZeroClaw bundles one for tool runs. Works on macOS 10.11+.
 
-Limitation: some CLI tools (older versions of `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, check if the tool needs broader filesystem access and consider switching to Docker.
+Limitation: some CLI tools (older `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, the tool needs broader filesystem access — consider switching to Docker.
 
-### `noop`
+### `none`
 
 No sandboxing. Tools run with the full privileges of the ZeroClaw service user. This is what YOLO mode enables. Loud, obvious, intentional.
-
-## Interaction with the hardware subsystem
-
-Hardware tools (GPIO, I2C, SPI, USB) need device access that most sandboxes block by default. When hardware features are enabled, the sandbox profile is relaxed for specific device paths:
-
-```toml
-[security.sandbox]
-allow_devices = ["/dev/gpiochip0", "/dev/i2c-1", "/dev/spidev0.0", "/dev/ttyUSB0"]
-```
-
-Lock this down to only the devices your agent actually needs.
 
 ## Troubleshooting
 
 - **"Sandbox backend unavailable"** on startup — check `zeroclaw service status` and the journal; the auto-detect logs which backends it tried.
 - **Tools working on dev, failing in service** — the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
-- **Slow tool invocations** on Docker — first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull zeroclawlabs/tool-runner`.
+- **Slow tool invocations** on the Docker runtime — first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
 
 ## Code reference
 
 - Detection: `crates/zeroclaw-runtime/src/security/detect.rs`
 - Backends: `crates/zeroclaw-runtime/src/security/sandbox/` (one file per backend)
-- Config: `[security.sandbox]` block in `crates/zeroclaw-config/src/schema.rs`
+- Schema: `RiskProfileConfig` and `DockerRuntimeConfig` in `crates/zeroclaw-config/src/schema.rs`

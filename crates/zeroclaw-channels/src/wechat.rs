@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::Config;
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 const DEFAULT_API_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
@@ -73,6 +75,14 @@ type Aes128EcbDec = ecb::Decryptor<aes::Aes128>;
 
 fn long_poll_client_timeout(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms + 5_000)
+}
+
+fn wechat_cli_string(key: &str) -> String {
+    i18n::get_required_cli_string(key)
+}
+
+fn wechat_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    i18n::get_required_cli_string_with_args(key, args)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +302,16 @@ fn encrypt_aes_ecb(plaintext: &[u8], key: &[u8; 16]) -> anyhow::Result<Vec<u8>> 
     buffer[..plaintext.len()].copy_from_slice(plaintext);
     let encrypted = Aes128EcbEnc::new(&(*key).into())
         .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
-        .map_err(|e| anyhow::anyhow!("WeChat media encrypt failed: {e}"))?;
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "media encrypt failed"
+            );
+            anyhow::Error::msg(format!("media encrypt failed: {e}"))
+        })?;
     Ok(encrypted.to_vec())
 }
 
@@ -301,38 +320,106 @@ fn decrypt_aes_ecb(ciphertext: &[u8], key: &[u8; 16]) -> anyhow::Result<Vec<u8>>
     Aes128EcbDec::new(&(*key).into())
         .decrypt_padded_mut::<Pkcs7>(&mut buffer)
         .map(|decrypted| decrypted.to_vec())
-        .map_err(|e| anyhow::anyhow!("WeChat media decrypt failed: {e}"))
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "wechat: media decrypt failed"
+            );
+            anyhow::Error::msg(format!("media decrypt failed: {e}"))
+        })
 }
 
 fn parse_aes_key(raw: &str) -> anyhow::Result<[u8; 16]> {
     let raw = raw.trim();
     if raw.len() == 32 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let bytes = hex::decode(raw)
-            .map_err(|e| anyhow::anyhow!("WeChat media hex aes_key invalid: {e}"))?;
-        return <[u8; 16]>::try_from(bytes.as_slice())
-            .map_err(|_| anyhow::anyhow!("WeChat media hex aes_key must be 16 bytes"));
+        let bytes = hex::decode(raw).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "media hex aes_key invalid"
+            );
+            anyhow::Error::msg(format!("media hex aes_key invalid: {e}"))
+        })?;
+        return <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"key_kind": "hex", "expected_bytes": 16})),
+                "wechat: media hex aes_key has wrong byte length"
+            );
+            anyhow::Error::msg("media hex aes_key must be 16 bytes")
+        });
     }
 
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw)
-        .map_err(|e| anyhow::anyhow!("WeChat media base64 aes_key invalid: {e}"))?;
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "media base64 aes_key invalid"
+            );
+            anyhow::Error::msg(format!("media base64 aes_key invalid: {e}"))
+        })?;
 
     if decoded.len() == 16 {
-        return <[u8; 16]>::try_from(decoded.as_slice())
-            .map_err(|_| anyhow::anyhow!("WeChat media base64 aes_key must be 16 bytes"));
+        return <[u8; 16]>::try_from(decoded.as_slice()).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"key_kind": "base64", "expected_bytes": 16})),
+                "wechat: media base64 aes_key has wrong byte length"
+            );
+            anyhow::Error::msg("media base64 aes_key must be 16 bytes")
+        });
     }
 
     if decoded.len() == 32 && decoded.iter().all(u8::is_ascii_hexdigit) {
-        let hex_text = std::str::from_utf8(&decoded)
-            .map_err(|e| anyhow::anyhow!("WeChat media aes_key utf8 invalid: {e}"))?;
-        let bytes = hex::decode(hex_text)
-            .map_err(|e| anyhow::anyhow!("WeChat media nested hex aes_key invalid: {e}"))?;
-        return <[u8; 16]>::try_from(bytes.as_slice())
-            .map_err(|_| anyhow::anyhow!("WeChat media nested hex aes_key must be 16 bytes"));
+        let hex_text = std::str::from_utf8(&decoded).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "media aes_key utf8 invalid"
+            );
+            anyhow::Error::msg(format!("media aes_key utf8 invalid: {e}"))
+        })?;
+        let bytes = hex::decode(hex_text).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "media nested hex aes_key invalid"
+            );
+            anyhow::Error::msg(format!("media nested hex aes_key invalid: {e}"))
+        })?;
+        return <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"key_kind": "nested_hex", "expected_bytes": 16})
+                    ),
+                "wechat: media nested hex aes_key has wrong byte length"
+            );
+            anyhow::Error::msg("media nested hex aes_key must be 16 bytes")
+        });
     }
 
     anyhow::bail!(
-        "WeChat media aes_key must decode to 16 raw bytes or 32 hex chars, got {} bytes",
+        "media aes_key must decode to 16 raw bytes or 32 hex chars, got {} bytes",
         decoded.len()
     )
 }
@@ -345,7 +432,7 @@ fn https_base_url(
     let url = value.unwrap_or_else(|| default.to_string());
     let url = url.trim().trim_end_matches('/').to_string();
     if !url.starts_with("https://") {
-        anyhow::bail!("WeChat {field_name} must use https://, got {url}");
+        anyhow::bail!("{field_name} must use https://, got {url}");
     }
     Ok(url)
 }
@@ -360,8 +447,16 @@ pub struct WeChatChannel {
     api_base_url: String,
     /// CDN base URL.
     cdn_base_url: String,
-    /// Allowed WeChat user IDs. Empty = deny all, `"*"` = allow all.
-    allowed_users: Arc<RwLock<Vec<String>>>,
+    /// The alias key under `[channels.wechat.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Optional pairing-persist handle. `None` in tests; `Some` in the
+    /// long-running daemon, wired via `.with_persistence(config)`. RwLock so
+    /// concurrent peer reads from sibling channels don't serialize.
+    persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard for /bind flow.
     pairing: Option<PairingGuard>,
     /// HTTP client for API requests.
@@ -396,11 +491,13 @@ struct AccountData {
     saved_at: Option<String>,
 }
 
-/// Persistent sync cursor.
+/// Persistent sync cursor and context tokens.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SyncData {
     #[serde(default)]
     get_updates_buf: String,
+    #[serde(default)]
+    context_tokens: HashMap<String, String>,
 }
 
 /// Write bytes to a file with owner-only permissions (0o600) on Unix.
@@ -480,11 +577,19 @@ fn markdown_to_plain_text(text: &str) -> String {
 fn render_login_qr(code: &str) -> anyhow::Result<String> {
     let payload = code.trim();
     if payload.is_empty() {
-        anyhow::bail!("WeChat QR payload is empty");
+        anyhow::bail!("QR payload is empty");
     }
 
-    let qr = qrcode::QrCode::new(payload.as_bytes())
-        .map_err(|err| anyhow::anyhow!("Failed to encode WeChat QR payload: {err}"))?;
+    let qr = qrcode::QrCode::new(payload.as_bytes()).map_err(|err| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "Failed to encode WeChat QR payload"
+        );
+        anyhow::Error::msg(format!("Failed to encode WeChat QR payload: {err}"))
+    })?;
 
     Ok(qr
         .render::<qrcode::render::unicode::Dense1x2>()
@@ -555,7 +660,8 @@ fn extract_text_from_items(items: &[serde_json::Value]) -> String {
 
 impl WeChatChannel {
     pub fn new(
-        allowed_users: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         api_base_url: Option<String>,
         cdn_base_url: Option<String>,
         state_dir: Option<PathBuf>,
@@ -563,15 +669,25 @@ impl WeChatChannel {
         let api_base_url = https_base_url("api_base_url", api_base_url, DEFAULT_API_BASE_URL)?;
         let cdn_base_url = https_base_url("cdn_base_url", cdn_base_url, CDN_BASE_URL)?;
 
-        let pairing = if allowed_users.is_empty() {
+        let has_peers = !peer_resolver().is_empty();
+        let pairing = if has_peers {
+            None
+        } else {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
-                println!("  🔐 WeChat pairing required. One-time bind code: {code}");
-                println!("     Send `{WECHAT_BIND_COMMAND} <code>` from your WeChat.");
+                println!(
+                    "  {}",
+                    wechat_cli_string_with_args("cli-wechat-pairing-required", &[("code", &code)],)
+                );
+                println!(
+                    "     {}",
+                    wechat_cli_string_with_args(
+                        "cli-wechat-send-bind-command",
+                        &[("command", WECHAT_BIND_COMMAND)],
+                    )
+                );
             }
             Some(guard)
-        } else {
-            None
         };
 
         let state_dir = state_dir.unwrap_or_else(|| {
@@ -585,7 +701,9 @@ impl WeChatChannel {
             account_id: RwLock::new(None),
             api_base_url,
             cdn_base_url,
-            allowed_users: Arc::new(RwLock::new(allowed_users)),
+            alias: alias.into(),
+            peer_resolver,
+            persist: None,
             pairing,
             client: reqwest::Client::new(),
             context_tokens: Mutex::new(HashMap::new()),
@@ -606,6 +724,15 @@ impl WeChatChannel {
         self
     }
 
+    /// Wire the shared Config handle so `persist_allowed_identity` can
+    /// write a paired user into `peer_groups` and save. The long-running
+    /// daemon sets this from the orchestrator; tests and one-shot
+    /// callers leave it unset (pairing works at runtime, doesn't persist).
+    pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
+        self.persist = Some(config);
+        self
+    }
+
     /// Load persisted token and cursor from state_dir.
     fn load_persisted_state(&mut self) {
         let account_path = self.state_dir.join("account.json");
@@ -616,7 +743,11 @@ impl WeChatChannel {
                 && !token.is_empty()
             {
                 *self.bot_token.write().unwrap() = Some(token.clone());
-                tracing::info!("WeChat: loaded persisted bot token");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "loaded persisted bot token"
+                );
             }
             if let Some(ref id) = account.account_id {
                 *self.account_id.write().unwrap() = Some(id.clone());
@@ -626,17 +757,36 @@ impl WeChatChannel {
         let sync_path = self.state_dir.join("sync.json");
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
-            && !sync.get_updates_buf.is_empty()
         {
-            *self.cursor.lock() = sync.get_updates_buf;
-            tracing::info!("WeChat: loaded persisted sync cursor");
+            if !sync.get_updates_buf.is_empty() {
+                *self.cursor.lock() = sync.get_updates_buf;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "loaded persisted sync cursor"
+                );
+            }
+            if !sync.context_tokens.is_empty() {
+                *self.context_tokens.lock() = sync.context_tokens;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "loaded persisted context tokens"
+                );
+            }
         }
     }
 
     /// Save account data to disk.
     fn save_account_data(&self, token: &str, account_id: &str, user_id: Option<&str>) {
         if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
-            tracing::warn!("WeChat: failed to create state dir: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to create state dir"
+            );
             return;
         }
         let data = AccountData {
@@ -650,30 +800,61 @@ impl WeChatChannel {
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
-                    tracing::warn!("WeChat: failed to write account data: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "failed to write account data"
+                    );
                 }
             }
-            Err(e) => tracing::warn!("WeChat: failed to serialize account data: {e}"),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to serialize account data"
+            ),
         }
     }
 
     /// Save sync cursor to disk.
-    fn save_cursor(&self, cursor: &str) {
+    fn save_sync_data(&self) {
         if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
-            tracing::warn!("WeChat: failed to create state dir: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to create state dir"
+            );
             return;
         }
         let data = SyncData {
-            get_updates_buf: cursor.to_string(),
+            get_updates_buf: self.cursor.lock().clone(),
+            context_tokens: self.context_tokens.lock().clone(),
         };
         let path = self.state_dir.join("sync.json");
         match serde_json::to_string(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
-                    tracing::warn!("WeChat: failed to write sync data: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "failed to write sync data"
+                    );
                 }
             }
-            Err(e) => tracing::warn!("WeChat: failed to serialize sync data: {e}"),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to serialize sync data"
+            ),
         }
     }
 
@@ -689,6 +870,7 @@ impl WeChatChannel {
         self.context_tokens
             .lock()
             .insert(user_id.to_string(), token.to_string());
+        self.save_sync_data();
     }
 
     fn get_context_token(&self, user_id: &str) -> Option<String> {
@@ -696,21 +878,60 @@ impl WeChatChannel {
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users
-            .read()
-            .map(|users| users.iter().any(|u| u == "*" || u == user_id))
-            .unwrap_or(false)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
-    fn add_allowed_identity_runtime(&self, identity: &str) {
-        if identity.is_empty() {
-            return;
+    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let Some(config) = &self.persist else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"identity": identity})),
+                "paired identity not persisted (no persistence handle wired)"
+            );
+            return Ok(());
+        };
+        let normalized = identity.trim().to_string();
+        if normalized.is_empty() {
+            anyhow::bail!("Cannot persist empty WeChat identity");
         }
-        if let Ok(mut users) = self.allowed_users.write()
-            && !users.iter().any(|u| u == identity)
-        {
-            users.push(identity.to_string());
-        }
+        let group_name = format!("wechat_{}", self.alias);
+        let channel_ref = ChannelRef::new(format!("wechat.{}", self.alias));
+        let snapshot = {
+            let mut cfg = config.write();
+            if !cfg.channels.wechat.contains_key(&self.alias) {
+                anyhow::bail!(
+                    "Missing [channels.wechat.{}] section. Run `zeroclaw onboard --channels-only` first",
+                    self.alias
+                );
+            }
+            let group = cfg
+                .peer_groups
+                .entry(group_name)
+                .or_insert_with(|| PeerGroupConfig {
+                    channel: channel_ref.to_string(),
+                    ..PeerGroupConfig::default()
+                });
+            if group
+                .external_peers
+                .iter()
+                .any(|p| p.as_str() == normalized)
+            {
+                return Ok(());
+            }
+            group.external_peers.push(PeerUsername::new(normalized));
+            cfg.clone()
+        };
+        snapshot
+            .save()
+            .await
+            .context("Failed to persist WeChat peer to config.toml")?;
+        Ok(())
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -771,10 +992,15 @@ impl WeChatChannel {
                 (resolved.canonicalize(), workspace_dir.canonicalize())
             && !canonical.starts_with(&allowed)
         {
-            tracing::warn!(
-                "WeChat: attachment path {} escapes workspace {}, rejected",
-                canonical.display(),
-                allowed.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "attachment path {} escapes workspace {}, rejected",
+                    canonical.display(),
+                    allowed.display()
+                )
             );
             return PathBuf::from(format!(
                 "/nonexistent/blocked_path_traversal_{}",
@@ -825,7 +1051,7 @@ impl WeChatChannel {
         kind: WeChatAttachmentKind,
     ) -> anyhow::Result<WeChatMediaPayload> {
         if !url.starts_with("https://") {
-            anyhow::bail!("WeChat: refusing non-HTTPS attachment URL: {url}");
+            anyhow::bail!("refusing non-HTTPS attachment URL: {url}");
         }
         let resp = self
             .client
@@ -833,19 +1059,19 @@ impl WeChatChannel {
             .timeout(API_TIMEOUT)
             .send()
             .await
-            .with_context(|| format!("WeChat attachment download failed: {url}"))?;
+            .with_context(|| format!("attachment download failed: {url}"))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("WeChat attachment download failed ({status}): {body}");
+            anyhow::bail!("attachment download failed ({status}): {body}");
         }
 
         if let Some(len) = resp.content_length()
             && len > WECHAT_MEDIA_MAX_BYTES
         {
             anyhow::bail!(
-                "WeChat attachment Content-Length ({len} bytes) exceeds {} MB limit",
+                "attachment Content-Length ({len} bytes) exceeds {} MB limit",
                 WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
             );
         }
@@ -859,7 +1085,7 @@ impl WeChatChannel {
 
         if bytes.len() as u64 > WECHAT_MEDIA_MAX_BYTES {
             anyhow::bail!(
-                "WeChat attachment exceeds {} MB limit",
+                "attachment exceeds {} MB limit",
                 WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
             );
         }
@@ -883,7 +1109,7 @@ impl WeChatChannel {
 
         let path = self.resolve_local_attachment_path(target);
         if !path.exists() {
-            anyhow::bail!("WeChat attachment path not found: {}", path.display());
+            anyhow::bail!("attachment path not found: {}", path.display());
         }
 
         let file_name = sanitize_attachment_filename(
@@ -901,10 +1127,10 @@ impl WeChatChannel {
 
         let bytes = tokio::fs::read(&path)
             .await
-            .with_context(|| format!("WeChat attachment read failed: {}", path.display()))?;
+            .with_context(|| format!("attachment read failed: {}", path.display()))?;
         if bytes.len() as u64 > WECHAT_MEDIA_MAX_BYTES {
             anyhow::bail!(
-                "WeChat attachment exceeds {} MB limit",
+                "attachment exceeds {} MB limit",
                 WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
             );
         }
@@ -922,7 +1148,7 @@ impl WeChatChannel {
     ) -> anyhow::Result<String> {
         let token = self
             .get_token()
-            .context("WeChat: not logged in, cannot upload attachment")?;
+            .context("not logged in, cannot upload attachment")?;
         let body = serde_json::json!({
             "filekey": filekey,
             "media_type": kind.upload_media_type(),
@@ -947,7 +1173,7 @@ impl WeChatChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("WeChat getUploadUrl failed ({status}): {body}");
+            anyhow::bail!("getUploadUrl failed ({status}): {body}");
         }
 
         let data: serde_json::Value = resp.json().await?;
@@ -955,7 +1181,7 @@ impl WeChatChannel {
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .context("WeChat getUploadUrl returned no upload_param")
+            .context("getUploadUrl returned no upload_param")
     }
 
     async fn upload_to_cdn(
@@ -985,29 +1211,61 @@ impl WeChatChannel {
                         .and_then(|value| value.to_str().ok())
                         .filter(|value| !value.is_empty())
                         .map(str::to_string)
-                        .context("WeChat CDN upload missing x-encrypted-param header")?;
+                        .context("CDN upload missing x-encrypted-param header")?;
                     return Ok(encrypted_param);
                 }
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    let error = anyhow::anyhow!(
-                        "WeChat CDN upload failed on attempt {attempt} ({status}): {body}"
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "attempt": attempt,
+                                "status": status.as_u16(),
+                                "body": body,
+                                "phase": "cdn_upload",
+                            })),
+                        "wechat: CDN upload failed (non-success status)"
                     );
+                    let error = anyhow::Error::msg(format!(
+                        "CDN upload failed on attempt {attempt} ({status}): {body}"
+                    ));
                     if status.is_client_error() {
                         return Err(error);
                     }
                     last_error = Some(error);
                 }
                 Err(err) => {
-                    last_error = Some(anyhow::anyhow!(
-                        "WeChat CDN upload request failed on attempt {attempt}: {err}"
-                    ));
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "attempt": attempt,
+                                "phase": "cdn_upload",
+                                "error": format!("{}", err),
+                            })),
+                        "wechat: CDN upload request failed"
+                    );
+                    last_error = Some(anyhow::Error::msg(format!(
+                        "CDN upload request failed on attempt {attempt}: {err}"
+                    )));
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("WeChat CDN upload failed")))
+        Err(last_error.unwrap_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"phase": "cdn_upload"})),
+                "wechat: CDN upload exhausted retries"
+            );
+            anyhow::Error::msg("CDN upload failed")
+        }))
     }
 
     async fn upload_media_payload(
@@ -1170,13 +1428,13 @@ impl WeChatChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("WeChat attachment download failed ({status}): {body}");
+            anyhow::bail!("attachment download failed ({status}): {body}");
         }
 
         let bytes = resp.bytes().await?.to_vec();
         if bytes.len() as u64 > WECHAT_MEDIA_MAX_BYTES {
             anyhow::bail!(
-                "WeChat inbound attachment exceeds {} MB limit",
+                "inbound attachment exceeds {} MB limit",
                 WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
             );
         }
@@ -1200,22 +1458,39 @@ impl WeChatChannel {
         let bytes = match self.download_inbound_attachment(&spec).await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!("WeChat attachment download skipped: {err}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "attachment download skipped"
+                );
                 return None;
             }
         };
 
         let save_dir = workspace_dir.join("wechat_files");
         if let Err(err) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("Failed to create WeChat attachment dir: {err}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "Failed to create WeChat attachment dir"
+            );
             return None;
         }
 
         let local_path = save_dir.join(&spec.file_name);
         if let Err(err) = tokio::fs::write(&local_path, bytes).await {
-            tracing::warn!(
-                "Failed to save WeChat attachment to {}: {err}",
-                local_path.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Failed to save WeChat attachment to {}: {err}",
+                    local_path.display()
+                )
             );
             return None;
         }
@@ -1234,7 +1509,14 @@ impl WeChatChannel {
         loop {
             qr_refresh_count += 1;
             if qr_refresh_count > MAX_QR_REFRESH {
-                anyhow::bail!("WeChat: QR code expired {MAX_QR_REFRESH} times, giving up");
+                let max = MAX_QR_REFRESH.to_string();
+                anyhow::bail!(
+                    "{}",
+                    wechat_cli_string_with_args(
+                        "cli-wechat-qr-expired-giving-up",
+                        &[("max", &max)],
+                    )
+                );
             }
 
             // Fetch QR code
@@ -1245,19 +1527,30 @@ impl WeChatChannel {
                 .timeout(API_TIMEOUT)
                 .send()
                 .await
-                .context("Failed to fetch WeChat QR code")?;
+                .with_context(|| wechat_cli_string("cli-wechat-qr-fetch-failed"))?;
 
             if !resp.status().is_success() {
-                let status = resp.status();
+                let status = resp.status().to_string();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("WeChat QR code fetch failed ({status}): {body}");
+                anyhow::bail!(
+                    "{}",
+                    wechat_cli_string_with_args(
+                        "cli-wechat-qr-fetch-status-failed",
+                        &[("status", &status), ("body", &body)],
+                    )
+                );
             }
 
             let qr_data: serde_json::Value = resp.json().await?;
             let qrcode = qr_data
                 .get("qrcode")
                 .and_then(|v| v.as_str())
-                .context("Missing qrcode in response")?
+                .with_context(|| {
+                    wechat_cli_string_with_args(
+                        "cli-wechat-missing-response-field",
+                        &[("field", "qrcode")],
+                    )
+                })?
                 .to_string();
             let qrcode_img_url = qr_data
                 .get("qrcode_img_content")
@@ -1265,8 +1558,16 @@ impl WeChatChannel {
                 .unwrap_or("");
 
             // Display QR code
-            println!("\n  📱 WeChat QR Login ({qr_refresh_count}/{MAX_QR_REFRESH})");
-            println!("  Scan with WeChat to connect.\n");
+            let qr_attempt = qr_refresh_count.to_string();
+            let qr_max = MAX_QR_REFRESH.to_string();
+            println!(
+                "\n  {}",
+                wechat_cli_string_with_args(
+                    "cli-wechat-qr-login",
+                    &[("attempt", &qr_attempt), ("max", &qr_max)],
+                )
+            );
+            println!("  {}\n", wechat_cli_string("cli-wechat-scan-to-connect"));
             let qr_payload = if qrcode_img_url.is_empty() {
                 qrcode.as_str()
             } else {
@@ -1274,10 +1575,21 @@ impl WeChatChannel {
             };
             match render_login_qr(qr_payload) {
                 Ok(qr) => println!("{qr}"),
-                Err(err) => tracing::warn!("WeChat: failed to render terminal QR code: {err}"),
+                Err(err) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                        "failed to render terminal QR code"
+                    )
+                }
             }
             if !qrcode_img_url.is_empty() {
-                println!("  QR URL: {qrcode_img_url}");
+                println!(
+                    "  {}",
+                    wechat_cli_string_with_args("cli-wechat-qr-url", &[("url", qrcode_img_url)],)
+                );
             }
 
             // Poll for scan status
@@ -1306,7 +1618,15 @@ impl WeChatChannel {
                 let resp = match poll_result {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
-                        tracing::debug!("WeChat QR poll error: {e}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "QR poll error"
+                        );
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -1319,7 +1639,15 @@ impl WeChatChannel {
                 let status: serde_json::Value = match resp.json().await {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::debug!("WeChat QR poll parse error: {e}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "QR poll parse error"
+                        );
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -1334,35 +1662,56 @@ impl WeChatChannel {
                     "wait" => {}
                     "scaned" => {
                         if !scanned_printed {
-                            println!("  👀 Scanned! Confirm on your phone...");
+                            println!("  {}", wechat_cli_string("cli-wechat-scanned-confirm"));
                             scanned_printed = true;
                         }
                     }
                     "expired" => {
-                        println!("  ⏳ QR code expired, refreshing...");
+                        println!(
+                            "  {}",
+                            wechat_cli_string("cli-wechat-qr-expired-refreshing")
+                        );
                         break; // Will loop back and get a new QR code
                     }
                     "confirmed" => {
                         let bot_token = status
                             .get("bot_token")
                             .and_then(|v| v.as_str())
-                            .context("Login confirmed but bot_token missing")?
+                            .with_context(|| {
+                                wechat_cli_string_with_args(
+                                    "cli-wechat-login-confirmed-missing-field",
+                                    &[("field", "bot_token")],
+                                )
+                            })?
                             .to_string();
                         let account_id = status
                             .get("ilink_bot_id")
                             .and_then(|v| v.as_str())
-                            .context("Login confirmed but ilink_bot_id missing")?
+                            .with_context(|| {
+                                wechat_cli_string_with_args(
+                                    "cli-wechat-login-confirmed-missing-field",
+                                    &[("field", "ilink_bot_id")],
+                                )
+                            })?
                             .to_string();
                         let user_id = status
                             .get("ilink_user_id")
                             .and_then(|v| v.as_str())
                             .map(String::from);
 
-                        println!("  ✅ WeChat connected!");
+                        println!("  {}", wechat_cli_string("cli-wechat-connected"));
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
-                        tracing::debug!("WeChat QR status: {other}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"other": other})),
+                            "QR status"
+                        );
                     }
                 }
 
@@ -1379,7 +1728,11 @@ impl WeChatChannel {
             return Ok(());
         }
 
-        tracing::info!("WeChat: no persisted token, starting QR login...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "no persisted token, starting QR login..."
+        );
         let (token, account_id, user_id) = self.qr_login().await?;
 
         // Save to memory
@@ -1390,9 +1743,17 @@ impl WeChatChannel {
             *a = Some(account_id.clone());
         }
 
-        // If a user scanned, auto-add them to allowed list
-        if let Some(ref uid) = user_id {
-            self.add_allowed_identity_runtime(uid);
+        // If a user scanned, persist them as an allowed peer
+        if let Some(ref uid) = user_id
+            && let Err(e) = self.persist_allowed_identity(uid).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e), "uid": uid})),
+                "failed to persist scanned identity"
+            );
         }
 
         // Persist to disk
@@ -1407,9 +1768,7 @@ impl WeChatChannel {
         item_list: Vec<serde_json::Value>,
         context_token: Option<&str>,
     ) -> anyhow::Result<()> {
-        let token = self
-            .get_token()
-            .context("WeChat: not logged in, cannot send")?;
+        let token = self.get_token().context("not logged in, cannot send")?;
 
         let client_id = format!("zeroclaw-{}", uuid::Uuid::new_v4());
         let body = serde_json::json!({
@@ -1437,7 +1796,7 @@ impl WeChatChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("WeChat sendMessage failed ({status}): {err}");
+            anyhow::bail!("sendMessage failed ({status}): {err}");
         }
 
         Ok(())
@@ -1562,35 +1921,58 @@ impl WeChatChannel {
             if let Some(pairing) = self.pairing.as_ref() {
                 match pairing.try_pair(code, from_user_id).await {
                     Ok(Some(_token)) => {
-                        self.add_allowed_identity_runtime(from_user_id);
+                        if let Err(e) = self.persist_allowed_identity(from_user_id).await {
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"from_user_id": from_user_id, "e": e.to_string()})), "failed to persist bound identity");
+                        }
                         let ctx = self.get_context_token(from_user_id);
-                        let _ = self
-                            .send_text(
-                                from_user_id,
-                                "✅ WeChat account bound successfully. You can talk to ZeroClaw now.",
-                                ctx.as_deref(),
+                        let reply = wechat_cli_string("cli-wechat-bound-success");
+                        let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
                             )
-                            .await;
-                        tracing::info!("WeChat: user {from_user_id} bound via pairing code");
+                            .with_attrs(::serde_json::json!({"from_user_id": from_user_id})),
+                            "user bound via pairing code"
+                        );
                     }
                     Ok(None) => {
                         let ctx = self.get_context_token(from_user_id);
-                        let _ = self
-                            .send_text(
-                                from_user_id,
-                                "❌ Invalid bind code. Please try again.",
-                                ctx.as_deref(),
-                            )
-                            .await;
+                        let reply = wechat_cli_string("cli-wechat-invalid-bind-code");
+                        let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
                     }
                     Err(e) => {
-                        tracing::warn!("WeChat: pairing error: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "pairing error"
+                        );
                     }
                 }
             }
         } else {
-            tracing::debug!("WeChat: ignoring unauthorized message from {from_user_id}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"from_user_id": from_user_id})),
+                "ignoring unauthorized message from"
+            );
         }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WeChatChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Wechat)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1606,8 +1988,12 @@ impl Channel for WeChatChannel {
         let context_token = self.get_context_token(recipient);
 
         if context_token.is_none() {
-            tracing::warn!(
-                "WeChat: no context_token for {recipient}, message may fail to associate"
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"recipient": recipient})),
+                "no context_token for , message may fail to associate"
             );
         }
 
@@ -1639,7 +2025,11 @@ impl Channel for WeChatChannel {
         // Ensure we're logged in (QR scan if needed)
         self.ensure_logged_in().await?;
 
-        tracing::info!("WeChat channel listening for messages...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "channel listening for messages..."
+        );
 
         let mut cursor = self.cursor.lock().clone();
         let mut long_poll_timeout_ms = LONG_POLL_TIMEOUT_MS;
@@ -1649,9 +2039,23 @@ impl Channel for WeChatChannel {
             let token = match self.get_token() {
                 Some(t) => t,
                 None => {
-                    tracing::error!("WeChat: token lost, attempting re-login...");
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "token lost, attempting re-login..."
+                    );
                     if let Err(e) = self.ensure_logged_in().await {
-                        tracing::error!("WeChat: re-login failed: {e}");
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "re-login failed"
+                        );
                         tokio::time::sleep(BACKOFF_DELAY).await;
                         continue;
                     }
@@ -1685,9 +2089,7 @@ impl Channel for WeChatChannel {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
                     consecutive_failures += 1;
-                    tracing::warn!(
-                        "WeChat getUpdates error ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"consecutive_failures": consecutive_failures, "MAX_CONSECUTIVE_FAILURES": MAX_CONSECUTIVE_FAILURES, "e": e.to_string()})), "getUpdates error (/)");
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         consecutive_failures = 0;
                         tokio::time::sleep(BACKOFF_DELAY).await;
@@ -1698,7 +2100,11 @@ impl Channel for WeChatChannel {
                 }
                 Err(_) => {
                     // Client-side timeout — normal for long-poll, just retry
-                    tracing::debug!("WeChat getUpdates: client-side timeout, retrying");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "getUpdates: client-side timeout, retrying"
+                    );
                     continue;
                 }
             };
@@ -1707,7 +2113,13 @@ impl Channel for WeChatChannel {
                 Ok(v) => v,
                 Err(e) => {
                     consecutive_failures += 1;
-                    tracing::warn!("WeChat getUpdates parse error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "getUpdates parse error"
+                    );
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         consecutive_failures = 0;
                         tokio::time::sleep(BACKOFF_DELAY).await;
@@ -1725,18 +2137,34 @@ impl Channel for WeChatChannel {
 
             if is_error {
                 if errcode == SESSION_EXPIRED_ERRCODE || ret == SESSION_EXPIRED_ERRCODE {
-                    tracing::error!(
-                        "WeChat: session expired (errcode {SESSION_EXPIRED_ERRCODE}), pausing for {} min",
-                        SESSION_PAUSE_DURATION.as_secs() / 60
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &format!(
+                            "session expired (errcode {SESSION_EXPIRED_ERRCODE}), pausing for {} min",
+                            SESSION_PAUSE_DURATION.as_secs() / 60
+                        )
                     );
                     // Clear token so we re-login after pause
                     if let Ok(mut t) = self.bot_token.write() {
                         *t = None;
                     }
+                    self.context_tokens.lock().clear();
+                    self.save_sync_data();
                     tokio::time::sleep(SESSION_PAUSE_DURATION).await;
                     // Try to re-login
                     if let Err(e) = self.ensure_logged_in().await {
-                        tracing::error!("WeChat: re-login after session expiry failed: {e}");
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "re-login after session expiry failed"
+                        );
                     }
                     consecutive_failures = 0;
                     continue;
@@ -1744,9 +2172,7 @@ impl Channel for WeChatChannel {
 
                 consecutive_failures += 1;
                 let errmsg = data.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
-                tracing::warn!(
-                    "WeChat getUpdates failed: ret={ret} errcode={errcode} errmsg={errmsg} ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"ret": ret, "errcode": errcode, "errmsg": errmsg, "consecutive_failures": consecutive_failures, "MAX_CONSECUTIVE_FAILURES": MAX_CONSECUTIVE_FAILURES})), "getUpdates failed: ret= errcode= errmsg= (/)");
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     consecutive_failures = 0;
                     tokio::time::sleep(BACKOFF_DELAY).await;
@@ -1766,7 +2192,7 @@ impl Channel for WeChatChannel {
             {
                 cursor = new_cursor.to_string();
                 *self.cursor.lock() = cursor.clone();
-                self.save_cursor(&cursor);
+                self.save_sync_data();
             }
 
             if let Some(next_timeout) = data
@@ -1841,14 +2267,20 @@ impl Channel for WeChatChannel {
                     reply_target: from_user_id.to_string(),
                     content,
                     channel: "wechat".to_string(),
+                    channel_alias: Some(self.alias.clone()),
                     timestamp,
                     thread_ts: None,
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 };
 
                 if tx.send(channel_msg).await.is_err() {
-                    tracing::info!("WeChat: channel receiver dropped, stopping");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "channel receiver dropped, stopping"
+                    );
                     return Ok(());
                 }
             }
@@ -1941,7 +2373,8 @@ mod tests {
     #[test]
     fn wechat_channel_name() {
         let ch = WeChatChannel::new(
-            vec!["*".into()],
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
             None,
             None,
             Some("/tmp/test-wechat".into()),
@@ -1953,7 +2386,8 @@ mod tests {
     #[test]
     fn wechat_channel_rejects_http_api_base_url() {
         let result = WeChatChannel::new(
-            vec!["*".into()],
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
             Some("http://ilink.example.test".into()),
             None,
             Some("/tmp/test-wechat".into()),
@@ -1967,7 +2401,8 @@ mod tests {
     #[test]
     fn wechat_channel_rejects_http_cdn_base_url() {
         let result = WeChatChannel::new(
-            vec!["*".into()],
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
             None,
             Some("http://cdn.example.test".into()),
             Some("/tmp/test-wechat".into()),
@@ -2026,7 +2461,8 @@ mod tests {
     #[test]
     fn is_user_allowed_wildcard() {
         let ch = WeChatChannel::new(
-            vec!["*".into()],
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
             None,
             None,
             Some("/tmp/test-wechat".into()),
@@ -2038,7 +2474,8 @@ mod tests {
     #[test]
     fn is_user_allowed_specific() {
         let ch = WeChatChannel::new(
-            vec!["user1@im.wechat".into()],
+            "wechat_test_alias",
+            Arc::new(|| vec!["user1@im.wechat".into()]),
             None,
             None,
             Some("/tmp/test-wechat".into()),
@@ -2046,6 +2483,21 @@ mod tests {
         .unwrap();
         assert!(ch.is_user_allowed("user1@im.wechat"));
         assert!(!ch.is_user_allowed("user2@im.wechat"));
+    }
+
+    #[tokio::test]
+    async fn persist_allowed_identity_without_handle_warns_and_returns_ok() {
+        let ch = WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(Vec::new),
+            None,
+            None,
+            Some("/tmp/test-wechat".into()),
+        )
+        .unwrap();
+        // No `.with_persistence(...)` wired — should not panic, returns Ok(()).
+        let result = ch.persist_allowed_identity("user_xyz@im.wechat").await;
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2185,5 +2637,197 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or("");
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn sync_data_round_trip_preserves_context_tokens() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let mut context_tokens = HashMap::new();
+        context_tokens.insert("user123".to_string(), "token_abc".to_string());
+        context_tokens.insert("user456".to_string(), "token_xyz".to_string());
+
+        let original_data = SyncData {
+            get_updates_buf: "cursor_value".to_string(),
+            context_tokens: context_tokens.clone(),
+        };
+
+        let sync_path = state_dir.join("sync.json");
+        let json = serde_json::to_string(&original_data).unwrap();
+        write_private(&sync_path, json.as_bytes()).unwrap();
+
+        let loaded_json = std::fs::read_to_string(&sync_path).unwrap();
+        let loaded_data: SyncData = serde_json::from_str(&loaded_json).unwrap();
+
+        assert_eq!(loaded_data.get_updates_buf, "cursor_value");
+        assert_eq!(loaded_data.context_tokens.len(), 2);
+        assert_eq!(
+            loaded_data.context_tokens.get("user123"),
+            Some(&"token_abc".to_string())
+        );
+        assert_eq!(
+            loaded_data.context_tokens.get("user456"),
+            Some(&"token_xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn sync_data_backward_compatible_with_missing_context_tokens() {
+        let old_json = r#"{"get_updates_buf":"old_cursor"}"#;
+        let data: SyncData = serde_json::from_str(old_json).unwrap();
+
+        assert_eq!(data.get_updates_buf, "old_cursor");
+        assert!(data.context_tokens.is_empty());
+    }
+
+    #[test]
+    fn context_tokens_survive_channel_restart() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        {
+            let ch = WeChatChannel::new(
+                "test",
+                Arc::new(|| vec!["*".to_string()]),
+                None,
+                None,
+                Some(state_dir.clone()),
+            )
+            .unwrap();
+            ch.set_context_token("acct1:userA", "tok_A");
+            ch.set_context_token("acct1:userB", "tok_B");
+            *ch.cursor.lock() = "cursor_123".to_string();
+            ch.save_sync_data();
+        }
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ch2.get_context_token("acct1:userA"),
+            Some("tok_A".to_string())
+        );
+        assert_eq!(
+            ch2.get_context_token("acct1:userB"),
+            Some("tok_B".to_string())
+        );
+        assert_eq!(ch2.get_context_token("nonexistent"), None);
+        assert_eq!(*ch2.cursor.lock(), "cursor_123");
+    }
+
+    #[test]
+    fn set_context_token_persists_immediately() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        ch.set_context_token("acct:user1", "immediate_tok");
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            ch2.get_context_token("acct:user1"),
+            Some("immediate_tok".to_string())
+        );
+    }
+
+    #[test]
+    fn save_sync_data_preserves_context_tokens() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        ch.set_context_token("acct:user1", "my_token");
+        *ch.cursor.lock() = "new_cursor_value".to_string();
+        ch.save_sync_data();
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(*ch2.cursor.lock(), "new_cursor_value");
+        assert_eq!(
+            ch2.get_context_token("acct:user1"),
+            Some("my_token".to_string())
+        );
+    }
+
+    #[test]
+    fn load_from_empty_state_dir_produces_defaults() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+
+        assert_eq!(ch.get_context_token("anything"), None);
+        assert_eq!(*ch.cursor.lock(), "");
+    }
+
+    #[test]
+    fn context_token_overwrite_persists_latest() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        ch.set_context_token("acct:user1", "old_token");
+        ch.set_context_token("acct:user1", "new_token");
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            ch2.get_context_token("acct:user1"),
+            Some("new_token".to_string())
+        );
     }
 }

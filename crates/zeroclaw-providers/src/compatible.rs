@@ -1,11 +1,11 @@
-//! Generic OpenAI-compatible provider.
+//! Generic OpenAI-compatible model_provider.
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
 use crate::multimodal;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult, TokenUsage,
+    ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult, TokenUsage,
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
@@ -16,25 +16,27 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 
-/// A provider that speaks the OpenAI-compatible chat completions API.
+/// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
 #[allow(clippy::struct_excessive_bools)]
-pub struct OpenAiCompatibleProvider {
+#[derive(Clone)]
+pub struct OpenAiCompatibleModelProvider {
+    /// `[providers.models.<alias>]` key this provider was constructed
+    /// under. Used by the `Attributable` impl so log emissions carry the
+    /// real composite (`<type>.<alias>`) instead of the bare type.
+    pub alias: String,
     pub name: String,
     pub base_url: String,
     pub credential: Option<String>,
     pub auth_header: AuthStyle,
     supports_vision: bool,
-    /// When false, do not fall back to /v1/responses on chat completions 404.
-    /// GLM/Zhipu does not support the responses API.
-    supports_responses_fallback: bool,
     user_agent: Option<String>,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
-    /// Required for providers that reject `role: system` (e.g. MiniMax).
+    /// Required for model_providers that reject `role: system` (e.g. MiniMax).
     merge_system_into_user: bool,
-    /// Whether this provider supports OpenAI-style native tool calling.
+    /// Whether this model_provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
@@ -48,20 +50,39 @@ pub struct OpenAiCompatibleProvider {
     api_path: Option<String>,
     /// Maximum output tokens to include in API requests.
     max_tokens: Option<u32>,
+    /// models.dev catalog key for this model_provider (e.g. "xai").
+    /// When set, `list_models` fetches from the models.dev catalog.
+    models_dev_key: Option<String>,
+    /// OpenRouter vendor prefix for this model_provider (e.g. "x-ai", "tencent").
+    /// When set and the models.dev fallback returns no list, `list_models`
+    /// filters OpenRouter's `/api/v1/models` for entries under this prefix
+    /// and returns the slug list. Last-resort catalog source for providers
+    /// that aren't in models.dev.
+    openrouter_vendor_prefix: Option<String>,
+    /// Apply the conservative tool-schema sanitizer when the served model
+    /// is one whose runtime rejects standard OpenAI-style tool schemas
+    /// (today: gemma-4 family on llama.cpp, where the empty-properties /
+    /// non-string `default` quirks crash the tool-call parser). The check
+    /// runs at tool conversion time against the runtime model id.
+    local_model_tool_sanitize: bool,
+    /// Some OpenAI-compatible local servers, such as Ollama, expose `/models`
+    /// without authentication. Keep the default credential-gated for hosted
+    /// providers so missing credentials still fall through to catalog sources.
+    unauthenticated_model_listing: bool,
 }
 
-/// How the provider expects the API key to be sent.
+/// How the model_provider expects the API key to be sent.
 #[derive(Debug, Clone)]
 pub enum AuthStyle {
     /// `Authorization: Bearer <key>`
     Bearer,
-    /// `x-api-key: <key>` (used by some Chinese providers)
+    /// `x-api-key: <key>` (used by some Chinese model_providers)
     XApiKey,
     /// Custom header name
     Custom(String),
     /// Zhipu/GLM JWT auth: the credential is `id.secret`, and a short-lived
     /// JWT (HMAC-SHA256, 3.5 min expiry) is generated per request.
-    /// Used by Z.AI and GLM providers.
+    /// Used by Z.AI and GLM model_providers.
     ZhipuJwt,
 }
 
@@ -121,19 +142,42 @@ fn apply_auth_to_request(
     }
 }
 
-impl OpenAiCompatibleProvider {
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
+    let mut ids: Vec<String> = body
+        .data
+        .into_iter()
+        .map(|e| e.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids
+}
+
+impl OpenAiCompatibleModelProvider {
     pub fn new(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, true, None, false,
+            alias, name, base_url, credential, auth_style, false, None, false,
         )
     }
 
     pub fn new_with_vision(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -141,35 +185,23 @@ impl OpenAiCompatibleProvider {
         supports_vision: bool,
     ) -> Self {
         Self::new_with_options(
+            alias,
             name,
             base_url,
             credential,
             auth_style,
             supports_vision,
-            true,
             None,
             false,
         )
     }
 
-    /// Same as `new` but skips the /v1/responses fallback on 404.
-    /// Use for providers (e.g. GLM) that only support chat completions.
-    pub fn new_no_responses_fallback(
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-    ) -> Self {
-        Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, false,
-        )
-    }
-
-    /// Create a provider with a custom User-Agent header.
+    /// Create a model_provider with a custom User-Agent header.
     ///
-    /// Some providers (for example Kimi Code) require a specific User-Agent
+    /// Some model_providers (for example Kimi Code) require a specific User-Agent
     /// for request routing and policy enforcement.
     pub fn new_with_user_agent(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -177,18 +209,19 @@ impl OpenAiCompatibleProvider {
         user_agent: &str,
     ) -> Self {
         Self::new_with_options(
+            alias,
             name,
             base_url,
             credential,
             auth_style,
             false,
-            true,
             Some(user_agent),
             false,
         )
     }
 
     pub fn new_with_user_agent_and_vision(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -197,47 +230,48 @@ impl OpenAiCompatibleProvider {
         supports_vision: bool,
     ) -> Self {
         Self::new_with_options(
+            alias,
             name,
             base_url,
             credential,
             auth_style,
             supports_vision,
-            true,
             Some(user_agent),
             false,
         )
     }
 
-    /// For providers that do not support `role: system` (e.g. MiniMax).
+    /// For model_providers that do not support `role: system` (e.g. MiniMax).
     /// System prompt content is prepended to the first user message instead.
     pub fn new_merge_system_into_user(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, true,
+            alias, name, base_url, credential, auth_style, false, None, true,
         )
     }
 
     fn new_with_options(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
         supports_vision: bool,
-        supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
     ) -> Self {
         Self {
+            alias: alias.to_string(),
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_vision,
-            supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
@@ -246,7 +280,26 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
+            models_dev_key: None,
+            openrouter_vendor_prefix: None,
+            local_model_tool_sanitize: false,
+            unauthenticated_model_listing: false,
         }
+    }
+    /// Opt this provider into per-model conservative tool-schema sanitization.
+    /// Today the only trigger is the gemma-4 family on llama.cpp, where the
+    /// upstream tool-call parser rejects empty-properties / non-string
+    /// `default` values. The check runs at convert-time against the runtime
+    /// model id (not against the family) so the same provider instance
+    /// happily serves llama, qwen, etc. without sanitization.
+    pub fn with_local_model_tool_sanitize(mut self) -> Self {
+        self.local_model_tool_sanitize = true;
+        self
+    }
+
+    pub fn with_unauthenticated_model_listing(mut self) -> Self {
+        self.unauthenticated_model_listing = true;
+        self
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
@@ -283,7 +336,7 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    /// Set a custom API path suffix for this provider.
+    /// Set a custom API path suffix for this model_provider.
     /// When set, replaces the default `/chat/completions` path.
     pub fn with_api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
@@ -296,32 +349,60 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    /// Collect all `system` role messages, concatenate their content,
-    /// and prepend to the first `user` message. Drop all system messages.
-    /// Used for providers (e.g. MiniMax) that reject `role: system`.
+    /// Set the models.dev catalog key for this model_provider.
+    /// When set, `list_models` returns the catalog's model list for that key.
+    pub fn with_models_dev_key(mut self, key: &str) -> Self {
+        self.models_dev_key = Some(key.to_string());
+        self
+    }
+
+    /// Set the OpenRouter vendor prefix for this model_provider (e.g. `"x-ai"`,
+    /// `"tencent"`, `"rekaai"`). `list_models` falls back to this catalog when
+    /// neither a credential nor a working `models.dev` entry is available.
+    pub fn with_openrouter_vendor_prefix(mut self, prefix: &str) -> Self {
+        self.openrouter_vendor_prefix = Some(prefix.to_string());
+        self
+    }
+
+    /// Collect all `system` role messages and keep them in a provider-safe
+    /// shape. Strict OpenAI-compatible endpoints accept a leading system
+    /// message but reject system messages later in the history.
     fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
-        if !merge {
+        let mut saw_system = false;
+        let mut system_content = String::new();
+        let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+
+        for message in messages {
+            if message.role == "system" {
+                saw_system = true;
+                if !message.content.is_empty() {
+                    if !system_content.is_empty() {
+                        system_content.push_str("\n\n");
+                    }
+                    system_content.push_str(&message.content);
+                }
+            } else {
+                result.push(message.clone());
+            }
+        }
+
+        if !saw_system {
             return messages.to_vec();
         }
-        let system_content: String = messages
-            .iter()
-            .filter(|m| m.role == "system")
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
 
         if system_content.is_empty() {
-            return messages.to_vec();
+            return result;
         }
 
-        let mut result: Vec<ChatMessage> = messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .cloned()
-            .collect();
+        if !merge {
+            result.insert(0, ChatMessage::system(system_content));
+            return result;
+        }
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
-            first_user.content = format!("{system_content}\n\n{}", first_user.content);
+            if !system_content.is_empty() {
+                first_user.content = format!("{system_content}\n\n{}", first_user.content);
+            }
         } else {
             // No user message found: insert a synthetic user message with system content
             result.insert(0, ChatMessage::user(&system_content));
@@ -351,7 +432,16 @@ impl OpenAiCompatibleProvider {
                         headers.insert(name, val);
                     }
                     _ => {
-                        tracing::warn!(header = key, "Skipping invalid extra header name or value");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"header": key})),
+                            "Skipping invalid extra header name or value"
+                        );
                     }
                 }
             }
@@ -362,26 +452,105 @@ impl OpenAiCompatibleProvider {
                 .default_headers(headers);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
-                "provider.compatible",
+                "model_provider.compatible",
             );
 
             return builder.build().unwrap_or_else(|error| {
-                tracing::warn!(
-                    "Failed to build proxied timeout client with custom headers: {error}"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
+                    "Failed to build proxied timeout client with custom headers: "
                 );
                 Client::new()
             });
         }
 
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.compatible",
+            "model_provider.compatible",
             timeout,
             10,
         )
     }
 
+    /// HTTP client for streaming SSE connections — connect timeout only, no total timeout.
+    /// reqwest's total timeout kills long-running streams mid-response; streaming paths must
+    /// use this client instead of http_client().
+    fn streaming_http_client(&self) -> Client {
+        let has_user_agent = self.user_agent.is_some();
+        let has_extra_headers = !self.extra_headers.is_empty();
+
+        if has_user_agent || has_extra_headers {
+            let mut headers = HeaderMap::new();
+            if let Some(ua) = self.user_agent.as_deref()
+                && let Ok(value) = HeaderValue::from_str(ua)
+            {
+                headers.insert(USER_AGENT, value);
+            }
+            for (key, value) in &self.extra_headers {
+                match (
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    (Ok(name), Ok(val)) => {
+                        headers.insert(name, val);
+                    }
+                    _ => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"header": key})),
+                            "Skipping invalid extra header name or value"
+                        );
+                    }
+                }
+            }
+
+            let builder = Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .default_headers(headers);
+            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                builder,
+                "provider.compatible",
+            );
+            return builder.build().unwrap_or_else(|error| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
+                    "Failed to build proxied streaming client with custom headers: "
+                );
+                Client::new()
+            });
+        }
+
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
+        builder.build().unwrap_or_else(|error| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
+                "Failed to build proxied streaming client: "
+            );
+            Client::new()
+        })
+    }
+
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
-    /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
+    /// This allows custom model_providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
         // If a custom api_path is configured, use it directly.
@@ -409,23 +578,6 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn path_ends_with(&self, suffix: &str) -> bool {
-        if let Ok(url) = reqwest::Url::parse(&self.base_url) {
-            return url.path().trim_end_matches('/').ends_with(suffix);
-        }
-
-        self.base_url.trim_end_matches('/').ends_with(suffix)
-    }
-
-    fn has_explicit_api_path(&self) -> bool {
-        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
-            return false;
-        };
-
-        let path = url.path().trim_end_matches('/');
-        !path.is_empty() && path != "/"
-    }
-
     fn requires_tool_stream(&self) -> bool {
         let host_requires_tool_stream = reqwest::Url::parse(&self.base_url)
             .ok()
@@ -443,49 +595,6 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Build the full URL for responses API, detecting if base_url already includes the path.
-    fn responses_url(&self) -> String {
-        if self.path_ends_with("/responses") {
-            return self.base_url.clone();
-        }
-
-        let normalized_base = self.base_url.trim_end_matches('/');
-
-        // If chat endpoint is explicitly configured, derive sibling responses endpoint.
-        if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
-            return format!("{prefix}/responses");
-        }
-
-        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
-        // append responses directly to avoid duplicate /v1 segments.
-        if self.has_explicit_api_path() {
-            format!("{normalized_base}/responses")
-        } else {
-            format!("{normalized_base}/v1/responses")
-        }
-    }
-
-    #[allow(dead_code)]
-    fn tool_specs_to_openai_format(
-        tools: &[zeroclaw_api::tool::ToolSpec],
-    ) -> Vec<serde_json::Value> {
-        tools
-            .iter()
-            .map(|tool| {
-                let params =
-                    zeroclaw_api::schema::SchemaCleanr::clean_for_openai(tool.parameters.clone());
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": params
-                    }
-                })
-            })
-            .collect()
-    }
-
     /// Returns true if the given model requires system messages to be merged
     /// into the first user message because its prompt template cannot handle
     /// the `system` role reliably (e.g. DeepSeek V3.2 Jinja rendering errors).
@@ -499,17 +608,28 @@ impl OpenAiCompatibleProvider {
     }
 
     /// Whether system messages should be flattened into the first user message,
-    /// either because the provider was configured that way or the model requires it.
+    /// either because the model_provider was configured that way or the model requires it.
     fn effective_merge_system(&self, model: &str) -> bool {
         self.merge_system_into_user || Self::model_requires_system_merge(model)
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
-        let id = model.rsplit('/').next().unwrap_or(model);
-        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
-        supports_reasoning_effort
-            .then(|| self.reasoning_effort.clone())
-            .flatten()
+        let effort = self.reasoning_effort.as_ref()?;
+        let id = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .to_ascii_lowercase();
+        let is_openai_reasoning_model = id == "o1"
+            || id.starts_with("o1-")
+            || id == "o3"
+            || id.starts_with("o3-")
+            || id == "o4"
+            || id.starts_with("o4-")
+            || id.starts_with("gpt-5");
+        let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
+
+        (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
     }
 }
 
@@ -521,6 +641,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
@@ -530,6 +652,15 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+/// OpenAI-compatible `stream_options.include_usage` toggle.
+/// When set with streaming, providers emit a final SSE chunk carrying usage
+/// counts (prompt_tokens / completion_tokens) so the agent can populate cost
+/// records and the WebSocket done frame for streaming responses.
+#[derive(Debug, Serialize, Clone, Copy)]
+struct StreamOptionsBody {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -602,15 +733,50 @@ fn strip_think_tags(s: &str) -> String {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(from = "RawResponseMessage")]
 struct ResponseMessage {
-    #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
+    ///
+    /// OpenRouter and vLLM (>= v0.16.0) emit reasoning under `reasoning`
+    /// rather than `reasoning_content`. Both keys are accepted on deserialization
+    /// via `RawResponseMessage`; when both appear in the same payload, the
+    /// canonical `reasoning_content` wins. See #6584.
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Intermediate shape for `ResponseMessage` that accepts both
+/// `reasoning_content` (canonical) and `reasoning` (OpenRouter / vLLM alias)
+/// as distinct fields. `#[serde(alias)]` cannot be used here because serde
+/// rejects payloads carrying both keys as a duplicate-field error before any
+/// precedence rule can run. By naming the two keys to separate destination
+/// fields we let the precedence rule live in `From<RawResponseMessage>`. See
+/// #6584 and review feedback on PR #6615.
+#[derive(Debug, Deserialize)]
+struct RawResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl From<RawResponseMessage> for ResponseMessage {
+    fn from(raw: RawResponseMessage) -> Self {
+        // Canonical field wins when both are present; the alias fills in only
+        // when the canonical name is absent or null.
+        let reasoning_content = raw.reasoning_content.or(raw.reasoning);
+        ResponseMessage {
+            content: raw.content,
+            reasoning_content,
+            tool_calls: raw.tool_calls,
+        }
+    }
 }
 
 impl ResponseMessage {
@@ -659,7 +825,7 @@ struct ToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     function: Option<Function>,
 
-    // Compatibility: Some providers (e.g., older GLM) may use 'name' directly
+    // Compatibility: Some model_providers (e.g., older GLM) may use 'name' directly
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -672,10 +838,14 @@ struct ToolCall {
         skip_serializing_if = "Option::is_none"
     )]
     parameters: Option<serde_json::Value>,
+
+    /// See [`zeroclaw_api::ToolCall::extra_content`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 impl ToolCall {
-    /// Extract function name with fallback logic for various provider formats
+    /// Extract function name with fallback logic for various model_provider formats
     fn function_name(&self) -> Option<String> {
         // Standard OpenAI format: tool_calls[].function.name
         if let Some(ref func) = self.function
@@ -699,7 +869,7 @@ impl ToolCall {
         if let Some(ref args) = self.arguments {
             return Some(args.clone());
         }
-        // Compatibility: Some providers return parameters as object instead of string
+        // Compatibility: Some model_providers return parameters as object instead of string
         if let Some(ref params) = self.parameters {
             return serde_json::to_string(params).ok();
         }
@@ -722,6 +892,13 @@ struct NativeChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Mirrors `ApiChatRequest::stream_options`. Without this, tool-enabled
+    /// streaming requests omit `stream_options.include_usage` and OpenAI-
+    /// compatible providers never send the final `usage` SSE event — leaving
+    /// `/ws/chat` with no token-usage signal whenever native tools are active
+    /// (which is the normal gateway path). / #6159.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -743,84 +920,10 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
-    /// Raw reasoning content from thinking models; pass-through for providers
+    /// Raw reasoning content from thinking models; pass-through for model_providers
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesRequest {
-    model: String,
-    input: Vec<ResponsesInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesInput {
-    role: String,
-    content: ResponsesInputContent,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum ResponsesInputContent {
-    Text(String),
-    Parts(Vec<ResponsesInputPart>),
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesInputPart {
-    #[serde(rename = "type")]
-    kind: String,
-    text: String,
-}
-
-impl ResponsesInput {
-    fn user_text(content: String) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: ResponsesInputContent::Text(content),
-            kind: None,
-        }
-    }
-
-    fn assistant_output_text(content: String) -> Self {
-        Self {
-            role: "assistant".to_string(),
-            content: ResponsesInputContent::Parts(vec![ResponsesInputPart {
-                kind: "output_text".to_string(),
-                text: content,
-            }]),
-            kind: Some("message".to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesResponse {
-    #[serde(default)]
-    output: Vec<ResponsesOutput>,
-    #[serde(default)]
-    output_text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesOutput {
-    #[serde(default)]
-    content: Vec<ResponsesContent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesContent {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    text: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -832,6 +935,10 @@ struct ResponsesContent {
 struct StreamChunkResponse {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Final-chunk usage counts. Populated only when the request includes
+    /// `stream_options.include_usage: true` and the provider supports it.
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -842,16 +949,48 @@ struct StreamChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct StreamDelta {
-    #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may stream output via `reasoning_content`.
-    #[serde(default)]
+    /// OpenRouter and vLLM (>= v0.16.0) emit reasoning deltas under
+    /// `reasoning`. Both keys are accepted via `RawStreamDelta`; when both
+    /// appear in the same delta, the canonical `reasoning_content` wins. See
+    /// #6584 and review feedback on PR #6615.
     reasoning_content: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+/// Intermediate shape for `StreamDelta` — same rationale as
+/// `RawResponseMessage`: serde rejects payloads that carry both
+/// `reasoning_content` and `reasoning` when they target one field via
+/// `#[serde(alias)]`, so the two keys must deserialize into separate fields
+/// and a precedence rule must merge them.
+#[derive(Debug, Deserialize, Default)]
+struct RawStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+impl<'de> Deserialize<'de> for StreamDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawStreamDelta::deserialize(deserializer)?;
+        Ok(StreamDelta {
+            content: raw.content,
+            reasoning_content: raw.reasoning_content.or(raw.reasoning),
+            tool_calls: raw.tool_calls,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -862,11 +1001,13 @@ struct StreamToolCallDelta {
     id: Option<String>,
     #[serde(default)]
     function: Option<StreamFunctionDelta>,
-    // Compatibility: some providers stream name/arguments at top-level.
+    // Compatibility: some model_providers stream name/arguments at top-level.
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -882,6 +1023,7 @@ struct StreamToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    extra_content: Option<serde_json::Value>,
 }
 
 impl StreamToolCallAccumulator {
@@ -909,9 +1051,18 @@ impl StreamToolCallAccumulator {
         {
             self.arguments.push_str(arguments_delta);
         }
+
+        // Last-write-wins: signature is opaque and delivered once per call.
+        if let Some(extra) = delta.extra_content.as_ref() {
+            self.extra_content = Some(extra.clone());
+        }
     }
 
-    fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
+    fn into_provider_tool_call(
+        self,
+        targets_mistral_tool_call_contract: bool,
+        used_tool_call_ids: &mut std::collections::HashSet<String>,
+    ) -> Option<ProviderToolCall> {
         let name = self.name?;
         let arguments = if self.arguments.trim().is_empty() {
             "{}".to_string()
@@ -922,18 +1073,25 @@ impl StreamToolCallAccumulator {
         {
             arguments
         } else {
-            tracing::warn!(
-                function = %name,
-                arguments = %arguments,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"function": name, "arguments": arguments})),
                 "Invalid JSON in streamed native tool-call arguments, using empty object"
             );
             "{}".to_string()
         };
 
         Some(ProviderToolCall {
-            id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            id: reserve_tool_call_id_for_contract(
+                targets_mistral_tool_call_contract,
+                self.id,
+                used_tool_call_ids,
+            ),
             name,
             arguments: normalized_arguments,
+            extra_content: self.extra_content,
         })
     }
 }
@@ -968,7 +1126,11 @@ fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
 
     if let Some(ts) = obj.get("x_tool_start") {
         let Some(name) = ts.get("name").and_then(|v| v.as_str()) else {
-            tracing::debug!("proxy x_tool_start event missing required 'name' field");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "proxy x_tool_start event missing required 'name' field"
+            );
             return None;
         };
         let name = name.to_string();
@@ -1016,7 +1178,72 @@ fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
         .cloned()
 }
 
-/// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
+fn is_valid_mistral_tool_call_id(id: &str) -> bool {
+    id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn reserve_tool_call_id_for_contract(
+    targets_mistral_tool_call_contract: bool,
+    raw_id: Option<String>,
+    used_ids: &mut std::collections::HashSet<String>,
+) -> String {
+    if !targets_mistral_tool_call_contract {
+        let id = raw_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if used_ids.insert(id.clone()) {
+            return id;
+        }
+
+        loop {
+            let candidate = uuid::Uuid::new_v4().to_string();
+            if used_ids.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(id) = raw_id.as_deref()
+        && is_valid_mistral_tool_call_id(id)
+        && used_ids.insert(id.to_string())
+    {
+        return id.to_string();
+    }
+
+    let mut candidate = raw_id
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(9)
+        .collect::<String>();
+
+    if candidate.len() < 9 {
+        candidate.extend(
+            uuid::Uuid::new_v4()
+                .as_simple()
+                .to_string()
+                .chars()
+                .take(9 - candidate.len()),
+        );
+    }
+
+    if used_ids.insert(candidate.clone()) {
+        return candidate;
+    }
+
+    loop {
+        let generated = uuid::Uuid::new_v4()
+            .as_simple()
+            .to_string()
+            .chars()
+            .take(9)
+            .collect::<String>();
+        if used_ids.insert(generated.clone()) {
+            return generated;
+        }
+    }
+}
+
+/// Parse SSE (Server-Sent Events) stream from OpenAI-compatible model_providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
 ///
 /// Returns a `StreamChunk` that distinguishes content from reasoning:
@@ -1057,7 +1284,9 @@ fn sse_bytes_to_chunks(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                let _ = tx
+                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .await;
                 return;
             }
         }
@@ -1119,7 +1348,9 @@ fn sse_bytes_to_chunks(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             }
@@ -1139,17 +1370,28 @@ pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+    sse_bytes_to_events_for_contract(response, count_tokens, false)
+}
+
+fn sse_bytes_to_events_for_contract(
+    response: reqwest::Response,
+    count_tokens: bool,
+    targets_mistral_tool_call_contract: bool,
+) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
     tokio::spawn(async move {
         let mut buffer = String::new();
         let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
+        let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                let _ = tx
+                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .await;
                 return;
             }
         }
@@ -1249,12 +1491,25 @@ pub(crate) fn sse_bytes_to_events(
                             }
                         }
 
+                        if let Some(usage) = chunk.usage.as_ref() {
+                            let token_usage = zeroclaw_api::model_provider::TokenUsage {
+                                input_tokens: usage.prompt_tokens,
+                                output_tokens: usage.completion_tokens,
+                                cached_input_tokens: None,
+                            };
+                            if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
+                                return;
+                            }
+                        }
+
                         if should_emit_tool_calls && !emitted_tool_calls {
                             emitted_tool_calls = true;
-                            for tool_call in tool_calls
-                                .drain(..)
-                                .filter_map(StreamToolCallAccumulator::into_provider_tool_call)
-                            {
+                            for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
+                                tool_call.into_provider_tool_call(
+                                    targets_mistral_tool_call_contract,
+                                    &mut used_tool_call_ids,
+                                )
+                            }) {
                                 if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
                                     return;
                                 }
@@ -1263,17 +1518,21 @@ pub(crate) fn sse_bytes_to_events(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             }
         }
 
         if !emitted_tool_calls {
-            for tool_call in tool_calls
-                .drain(..)
-                .filter_map(StreamToolCallAccumulator::into_provider_tool_call)
-            {
+            for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
+                tool_call.into_provider_tool_call(
+                    targets_mistral_tool_call_contract,
+                    &mut used_tool_call_ids,
+                )
+            }) {
                 if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
                     return;
                 }
@@ -1289,150 +1548,32 @@ pub(crate) fn sse_bytes_to_events(
     .boxed()
 }
 
-fn first_nonempty(text: Option<&str>) -> Option<String> {
-    text.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
+    serde_json::from_str(body).map_err(|_| {
+        let sanitized = super::sanitize_api_error(body);
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": name,
+                    "body": &sanitized,
+                })),
+            "compatible: unexpected chat-completions payload"
+        );
+        anyhow::Error::msg(format!(
+            "{name} API returned an unexpected chat-completions payload; body={sanitized}"
+        ))
     })
 }
 
-fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<ResponsesInput>) {
-    let mut instructions_parts = Vec::new();
-    let mut input = Vec::new();
-
-    for message in messages {
-        if message.content.trim().is_empty() {
-            continue;
-        }
-
-        if message.role == "system" {
-            instructions_parts.push(message.content.clone());
-            continue;
-        }
-
-        let input_item = match message.role.as_str() {
-            // llama.cpp Responses parser expects assistant history items in
-            // "output_message" shape (`type=message`, `output_text` parts).
-            "assistant" | "tool" => ResponsesInput::assistant_output_text(message.content.clone()),
-            _ => ResponsesInput::user_text(message.content.clone()),
-        };
-        input.push(input_item);
-    }
-
-    let instructions = if instructions_parts.is_empty() {
-        None
-    } else {
-        Some(instructions_parts.join("\n\n"))
-    };
-
-    (instructions, input)
-}
-
-fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
-    if let Some(text) = first_nonempty(response.output_text.as_deref()) {
-        return Some(text);
-    }
-
-    for item in &response.output {
-        for content in &item.content {
-            if content.kind.as_deref() == Some("output_text")
-                && let Some(text) = first_nonempty(content.text.as_deref())
-            {
-                return Some(text);
-            }
-        }
-    }
-
-    for item in &response.output {
-        for content in &item.content {
-            if let Some(text) = first_nonempty(content.text.as_deref()) {
-                return Some(text);
-            }
-        }
-    }
-
-    None
-}
-
-fn compact_sanitized_body_snippet(body: &str) -> String {
-    super::sanitize_api_error(body)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn parse_chat_response_body(provider_name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str::<ApiChatResponse>(body).map_err(|error| {
-        let snippet = compact_sanitized_body_snippet(body);
-        anyhow::anyhow!(
-            "{provider_name} API returned an unexpected chat-completions payload: {error}; body={snippet}"
-        )
-    })
-}
-
-fn parse_responses_response_body(
-    provider_name: &str,
-    body: &str,
-) -> anyhow::Result<ResponsesResponse> {
-    serde_json::from_str::<ResponsesResponse>(body).map_err(|error| {
-        let snippet = compact_sanitized_body_snippet(body);
-        anyhow::anyhow!(
-            "{provider_name} Responses API returned an unexpected payload: {error}; body={snippet}"
-        )
-    })
-}
-
-impl OpenAiCompatibleProvider {
+impl OpenAiCompatibleModelProvider {
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
         credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
         apply_auth_to_request(req, &self.auth_header, credential)
-    }
-
-    async fn chat_via_responses(
-        &self,
-        credential: Option<&str>,
-        messages: &[ChatMessage],
-        model: &str,
-    ) -> anyhow::Result<String> {
-        let (instructions, input) = build_responses_prompt(messages);
-        if input.is_empty() {
-            anyhow::bail!(
-                "{} Responses API fallback requires at least one non-system message",
-                self.name
-            );
-        }
-
-        let request = ResponsesRequest {
-            model: model.to_string(),
-            input,
-            instructions,
-            stream: Some(false),
-        };
-
-        let url = self.responses_url();
-
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("{} Responses API error: {error}", self.name);
-        }
-
-        let body = response.text().await?;
-        let responses = parse_responses_response_body(&self.name, &body)?;
-
-        extract_responses_text(responses)
-            .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 
     fn convert_tool_specs(
@@ -1456,6 +1597,96 @@ impl OpenAiCompatibleProvider {
                 })
                 .collect()
         })
+    }
+
+    /// Wrap [`Self::convert_tool_specs`] with the per-model conservative
+    /// sanitizer when the provider opted in via
+    /// [`Self::with_local_model_tool_sanitize`] AND the runtime model id
+    /// matches a known-troubled family (today: gemma-4 on llama.cpp; also
+    /// the empty-model case where the operator hasn't named one).
+    fn convert_tool_specs_for_model(
+        &self,
+        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+        model: &str,
+    ) -> Option<Vec<serde_json::Value>> {
+        let converted = Self::convert_tool_specs(tools)?;
+        if !self.local_model_tool_sanitize || !Self::should_sanitize_local_tool_schema(model) {
+            return Some(converted);
+        }
+        Some(
+            converted
+                .into_iter()
+                .map(|mut tool| {
+                    let Some(raw_parameters) = tool.get("parameters").cloned() else {
+                        return tool;
+                    };
+                    let cleaned = zeroclaw_api::schema::SchemaCleanr::clean(
+                        raw_parameters,
+                        zeroclaw_api::schema::CleaningStrategy::Conservative,
+                    );
+                    if let Some(obj) = tool.as_object_mut() {
+                        obj.insert("parameters".to_string(), cleaned);
+                    }
+                    tool
+                })
+                .collect(),
+        )
+    }
+
+    fn should_sanitize_local_tool_schema(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        model.is_empty() || lower.contains("gemma-4") || lower.contains("gemma4")
+    }
+
+    fn build_native_tool_chat_request(
+        &self,
+        effective_messages: &[ChatMessage],
+        tools: Option<Vec<serde_json::Value>>,
+        model: &str,
+        temperature: f64,
+        allow_user_image_parts: bool,
+    ) -> NativeChatRequest {
+        let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
+        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            temperature,
+            stream: Some(false),
+            // Non-streaming path; `usage` is on the final response body, not
+            // gated on `stream_options.include_usage`.
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self.tool_stream_for_tools(has_tool_entries),
+            tools,
+            tool_choice,
+            max_tokens: self.max_tokens,
+        }
+    }
+
+    /// Normalize local file paths and remote URLs inside `[IMAGE:…]` markers
+    /// to base64 data URIs before any message reaches the upstream provider.
+    ///
+    /// OpenAI-compatible backends (vLLM, llama.cpp server, LM Studio, etc.) run
+    /// on a different host than zeroclaw in typical deployments, so a marker
+    /// containing a host-local file path (e.g. `[IMAGE:/home/u/.../photo.jpg]`)
+    /// would otherwise reach `to_message_content`, be promoted to a
+    /// `MessagePart::ImageUrl`, and arrive at the backend as
+    /// `image_url.url = "/home/u/.../photo.jpg"` (strict servers reject this:
+    /// vLLM 0.20+ returns `"The URL must be either a HTTP, data or file URL."`).
+    /// See issue #6399.
+    ///
+    /// The agent loop normalizes messages once before calling `chat`, but
+    /// auxiliary paths (delegate sub-agents, context compression, plain
+    /// `chat_with_system` callers) do not. Normalizing at the provider
+    /// boundary makes the contract uniform regardless of caller.
+    async fn normalize_messages_for_upstream(
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let prepared = multimodal::prepare_messages_for_provider(messages, &config).await?;
+        Ok(prepared.messages)
     }
 
     fn to_message_content(
@@ -1490,9 +1721,14 @@ impl OpenAiCompatibleProvider {
     }
 
     fn convert_messages_for_native(
+        &self,
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
     ) -> Vec<NativeMessage> {
+        let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
+        let mut used_tool_call_ids = std::collections::HashSet::new();
+        let mut tool_call_id_map = std::collections::HashMap::new();
+
         messages
             .iter()
             .map(|message| {
@@ -1505,7 +1741,15 @@ impl OpenAiCompatibleProvider {
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tc| ToolCall {
-                            id: Some(tc.id),
+                            id: Some({
+                                let normalized_id = reserve_tool_call_id_for_contract(
+                                    targets_mistral_tool_call_contract,
+                                    Some(tc.id.clone()),
+                                    &mut used_tool_call_ids,
+                                );
+                                tool_call_id_map.insert(tc.id, normalized_id.clone());
+                                normalized_id
+                            }),
                             kind: Some("function".to_string()),
                             function: Some(Function {
                                 name: Some(tc.name),
@@ -1514,6 +1758,9 @@ impl OpenAiCompatibleProvider {
                             name: None,
                             arguments: None,
                             parameters: None,
+                            // Round-trip extra_content (e.g. Gemini
+                            // thoughtSignature) — dropping it here was the bug.
+                            extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
 
@@ -1522,8 +1769,11 @@ impl OpenAiCompatibleProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
+                    // Accept both `reasoning_content` (canonical) and
+                    // `reasoning` (OpenRouter / vLLM >= v0.16.0). See #6584.
                     let reasoning_content = value
                         .get("reasoning_content")
+                        .or_else(|| value.get("reasoning"))
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
 
@@ -1574,7 +1824,17 @@ impl OpenAiCompatibleProvider {
                     let tool_call_id = value
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                        .map(|raw_id| {
+                            tool_call_id_map.get(raw_id).cloned().unwrap_or_else(|| {
+                                let normalized_id = reserve_tool_call_id_for_contract(
+                                    targets_mistral_tool_call_contract,
+                                    Some(raw_id.to_string()),
+                                    &mut used_tool_call_ids,
+                                );
+                                tool_call_id_map.insert(raw_id.to_string(), normalized_id.clone());
+                                normalized_id
+                            })
+                        });
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
@@ -1605,14 +1865,14 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
-    /// Strip native tool-calling constructs from messages for providers that
+    /// Strip native tool-calling constructs from messages for model_providers that
     /// do not support native tool calling (e.g. MiniMax).
     ///
     /// Conversation history may contain tool-role messages and assistant
     /// messages with `tool_calls` JSON from previous sessions or from
-    /// provider switches.  Sending these to a non-native-tool provider
+    /// model_provider switches.  Sending these to a non-native-tool model_provider
     /// causes hard API errors like MiniMax's
-    /// "tool result's tool id not found" (#5743).
+    /// "tool result's tool id not found".
     ///
     /// - **tool-role messages** are dropped entirely.
     /// - **assistant messages with `tool_calls`** are converted to plain
@@ -1653,7 +1913,7 @@ impl OpenAiCompatibleProvider {
         // messages in a row. Providers targeted by the `native_tool_calling =
         // false` path (Anthropic upstream, MiniMax, and other OpenAI-compat
         // wrappers) reject consecutive same-role messages with HTTP 400, so we
-        // merge them here. See #5825.
+        // merge them here.
         let mut coalesced: Vec<ChatMessage> = Vec::with_capacity(messages.len());
         for msg in intermediate {
             match coalesced.last_mut() {
@@ -1681,7 +1941,7 @@ impl OpenAiCompatibleProvider {
             return messages.to_vec();
         }
 
-        let instructions = zeroclaw_api::provider::build_tool_instructions_text(tools);
+        let instructions = zeroclaw_api::model_provider::build_tool_instructions_text(tools);
         let mut modified_messages = messages.to_vec();
 
         if let Some(system_message) = modified_messages.iter_mut().find(|m| m.role == "system") {
@@ -1696,9 +1956,33 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
-    fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+    fn targets_mistral_tool_call_contract(&self) -> bool {
+        if self.name.eq_ignore_ascii_case("mistral") {
+            return true;
+        }
+
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
+            .is_some_and(|host| host == "mistral.ai" || host.ends_with(".mistral.ai"))
+    }
+
+    fn reserve_tool_call_id(
+        &self,
+        raw_id: Option<String>,
+        used_ids: &mut std::collections::HashSet<String>,
+    ) -> String {
+        reserve_tool_call_id_for_contract(
+            self.targets_mistral_tool_call_contract(),
+            raw_id,
+            used_ids,
+        )
+    }
+
+    fn parse_native_response(&self, message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
+        let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -1706,21 +1990,27 @@ impl OpenAiCompatibleProvider {
             .filter_map(|tc| {
                 let name = tc.function_name()?;
                 let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments =
-                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
-                        arguments
-                    } else {
-                        tracing::warn!(
-                            function = %name,
-                            arguments = %arguments,
-                            "Invalid JSON in native tool-call arguments, using empty object"
-                        );
-                        "{}".to_string()
-                    };
+                let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments)
+                    .is_ok()
+                {
+                    arguments
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"function": name, "arguments": arguments})
+                            ),
+                        "Invalid JSON in native tool-call arguments, using empty object"
+                    );
+                    "{}".to_string()
+                };
                 Some(ProviderToolCall {
-                    id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
                     name,
                     arguments: normalized_arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -1758,12 +2048,85 @@ impl OpenAiCompatibleProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiCompatibleProvider {
-    fn capabilities(&self) -> zeroclaw_api::provider::ProviderCapabilities {
-        zeroclaw_api::provider::ProviderCapabilities {
+impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+        zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
             prompt_caching: false,
+            extended_thinking: false,
+        }
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // When a credential is present, hit the model_provider's native /models endpoint
+        // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
+        // servers that explicitly allow unauthenticated listing use the same
+        // path without an Authorization header.
+        let list_credential = self.credential.as_deref();
+        if list_credential.is_some() || self.unauthenticated_model_listing {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), list_credential)
+                .send()
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": &self.name,
+                                "url": &url,
+                                "phase": "model_list_request",
+                                "error": super::format_error_chain(&e),
+                            })),
+                        "compatible: model list request failed"
+                    );
+                    anyhow::Error::msg(format!(
+                        "{} model list request failed: {url}: {e}",
+                        self.name
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "phase": "model_list_parse",
+                            "error": super::format_error_chain(&e),
+                        })),
+                    "compatible: model list returned invalid JSON"
+                );
+                anyhow::Error::msg(format!(
+                    "{} model list returned invalid JSON: {e}",
+                    self.name
+                ))
+            })?;
+            return Ok(normalize_model_ids(body));
+        }
+        // No credential — try models.dev first, then OpenRouter as a
+        // last-resort fallback for vendors that aren't in models.dev.
+        if let Some(key) = &self.models_dev_key {
+            match crate::models_dev::list_models_for(key).await {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                Ok(_) => {} // empty → fall through to openrouter
+                Err(e) => {
+                    if self.openrouter_vendor_prefix.is_none() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        match &self.openrouter_vendor_prefix {
+            Some(prefix) => crate::openrouter_catalog::list_models_for_vendor(prefix).await,
+            None => anyhow::bail!("live model listing is not supported for this model_provider"),
         }
     }
 
@@ -1777,13 +2140,27 @@ impl Provider for OpenAiCompatibleProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
+        // Normalize image markers (e.g. local file paths from channel
+        // attachments) into base64 data URIs before this message reaches the
+        // upstream provider — see issue #6399.
+        let user_msg = ChatMessage {
+            role: "user".to_string(),
+            content: message.to_string(),
+        };
+        let normalized_user =
+            Self::normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
+                .await?
+                .pop()
+                .unwrap_or(user_msg);
+        let normalized_message = normalized_user.content;
+
         let merge = self.effective_merge_system(model);
         let mut messages = Vec::new();
 
         if merge {
             let content = match system_prompt {
-                Some(sys) => format!("{sys}\n\n{message}"),
-                None => message.to_string(),
+                Some(sys) => format!("{sys}\n\n{normalized_message}"),
+                None => normalized_message,
             };
             messages.push(Message {
                 role: "user".to_string(),
@@ -1798,7 +2175,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", message, true),
+                content: Self::to_message_content("user", &normalized_message, true),
             });
         }
 
@@ -1807,6 +2184,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -1816,13 +2194,6 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
 
-        let mut fallback_messages = Vec::new();
-        if let Some(system_prompt) = system_prompt {
-            fallback_messages.push(ChatMessage::system(system_prompt));
-        }
-        fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = Self::flatten_system_messages(&fallback_messages, merge);
-
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -1830,19 +2201,6 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
                 return Err(chat_error.into());
             }
         };
@@ -1851,19 +2209,6 @@ impl Provider for OpenAiCompatibleProvider {
             let status = response.status();
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
-
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &fallback_messages, model)
-                    .await
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
@@ -1875,19 +2220,28 @@ impl Provider for OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
                 if c.message.tool_calls.is_some()
-                    && c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|t: &Vec<_>| !t.is_empty())
                 {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.effective_content())
                 } else {
-                    // No tool calls, return content (with reasoning_content fallback)
                     c.message.effective_content()
                 }
             })
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })
     }
 
     async fn chat_with_history(
@@ -1899,9 +2253,10 @@ impl Provider for OpenAiCompatibleProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
+        let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(messages, merge);
-        // Strip native tool constructs for non-native-tool providers (#5743).
+        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        // Strip native tool constructs for non-native-tool model_providers.
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
@@ -1916,6 +2271,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -1930,40 +2286,10 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-
-            // Mirror chat_with_system: 404 may mean this provider uses the Responses API
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &effective_messages, model)
-                    .await
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
             return Err(super::api_error(&self.name, response).await);
         }
 
@@ -1975,19 +2301,28 @@ impl Provider for OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
                 if c.message.tool_calls.is_some()
-                    && c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|t: &Vec<_>| !t.is_empty())
                 {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.effective_content())
                 } else {
-                    // No tool calls, return content (with reasoning_content fallback)
                     c.message.effective_content()
                 }
             })
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })
     }
 
     async fn chat_with_tools(
@@ -2000,36 +2335,26 @@ impl Provider for OpenAiCompatibleProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
+        let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(messages, merge);
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(false),
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
-            tools: if tools.is_empty() {
-                None
-            } else {
-                Some(tools.to_vec())
-            },
-            tool_choice: if tools.is_empty() {
-                None
-            } else {
-                Some("auto".to_string())
-            },
-            max_tokens: self.max_tokens,
+        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            self.strip_native_tool_messages(&effective_messages)
         };
+        let tools = if tools.is_empty() {
+            None
+        } else {
+            Some(tools.to_vec())
+        };
+        let request = self.build_native_tool_chat_request(
+            &effective_messages,
+            tools,
+            model,
+            temperature,
+            !merge,
+        );
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2039,9 +2364,14 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(
-                    "{} native tool call transport failed: {error}; falling back to history path",
-                    self.name
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "{} native tool call transport failed: {error}; falling back to history path",
+                        self.name
+                    )
                 );
                 let text = self
                     .chat_with_history(messages, model, Some(temperature))
@@ -2066,14 +2396,20 @@ impl Provider for OpenAiCompatibleProvider {
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
         });
-        let choice = chat_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+        let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                "compatible: empty choices in response"
+            );
+            anyhow::Error::msg(format!("No response from {}", self.name))
+        })?;
 
         let text = choice.message.effective_content_optional();
         let reasoning_content = choice.message.reasoning_content;
+        let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = choice
             .message
             .tool_calls
@@ -2084,9 +2420,10 @@ impl Provider for OpenAiCompatibleProvider {
                 let name = function.name?;
                 let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
                 Some(ProviderToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
+                    id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
                     name,
                     arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -2108,22 +2445,25 @@ impl Provider for OpenAiCompatibleProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
+        let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
         let merge = self.effective_merge_system(model);
-        let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = Self::flatten_system_messages(request.messages, merge);
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages_for_native(&effective_messages, !merge),
-            temperature,
-            stream: Some(false),
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: self
-                .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-            max_tokens: self.max_tokens,
+        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            self.strip_native_tool_messages(&effective_messages)
         };
+
+        // When wire_api = "responses", route all turns through the responses API.
+
+        let tools = self.convert_tool_specs_for_model(request.tools, model);
+        let native_request = self.build_native_tool_chat_request(
+            &effective_messages,
+            tools,
+            model,
+            temperature,
+            !merge,
+        );
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2135,28 +2475,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -2178,24 +2497,6 @@ impl Provider for OpenAiCompatibleProvider {
                 });
             }
 
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &effective_messages, model)
-                    .await
-                    .map(|text| ProviderChatResponse {
-                        text: Some(text),
-                        tool_calls: vec![],
-                        usage: None,
-                        reasoning_content: None,
-                    })
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
@@ -2210,9 +2511,18 @@ impl Provider for OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .map(|choice| choice.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })?;
 
-        let mut result = Self::parse_native_response(message);
+        let mut result = self.parse_native_response(message);
         result.usage = usage;
         Ok(result)
     }
@@ -2226,6 +2536,7 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
+        // The responses API always supports streaming tool events.
         self.native_tool_calling
     }
 
@@ -2241,80 +2552,108 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let temperature = temperature.unwrap_or(self.default_temperature());
-        let credential = self.credential.clone();
-
-        let merge = self.effective_merge_system(model);
-        let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
-        let effective_messages = Self::flatten_system_messages(request.messages, merge);
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-
-        let tools = Self::convert_tool_specs(request.tools);
-        let payload = if has_tools {
-            serde_json::to_value(NativeChatRequest {
-                model: model.to_string(),
-                messages: Self::convert_messages_for_native(&effective_messages, !merge),
-                temperature,
-                reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled {
-                    self.tool_stream_for_tools(true)
-                } else {
-                    None
-                },
-                stream: Some(options.enabled),
-                tools: tools.clone(),
-                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-                max_tokens: self.max_tokens,
-            })
-        } else {
-            let messages = effective_messages
-                .iter()
-                .map(|message| Message {
-                    role: message.role.clone(),
-                    content: Self::to_message_content(&message.role, &message.content, !merge),
-                })
-                .collect();
-
-            serde_json::to_value(ApiChatRequest {
-                model: model.to_string(),
-                messages,
-                temperature,
-                reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled {
-                    self.tool_stream_for_tools(false)
-                } else {
-                    None
-                },
-                stream: Some(options.enabled),
-                tools: None,
-                tool_choice: None,
-                max_tokens: self.max_tokens,
-            })
-        };
-
-        let payload = match payload {
-            Ok(payload) => payload,
-            Err(error) => {
-                return stream::once(async move { Err(StreamError::Json(error)) }).boxed();
-            }
-        };
-
-        let url = self.chat_completions_url();
-        let client = self.http_client();
-        let auth_header = self.auth_header.clone();
+        let provider = self.clone();
+        let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
+        let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
+            request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
+        let model = model.to_string();
         let count_tokens = options.count_tokens;
+        let options_enabled = options.enabled;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         tokio::spawn(async move {
-            let mut req_builder = client.post(&url).json(&payload);
+            let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
+                Ok(n) => n,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
+            let merge = provider.effective_merge_system(&model);
+            let has_tools = tools_owned.as_ref().is_some_and(|tools| !tools.is_empty());
+            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let effective_messages = provider.strip_native_tool_messages(&effective_messages);
+            let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
+
+            let payload_result = if has_tools {
+                serde_json::to_value(NativeChatRequest {
+                    model: model.clone(),
+                    messages: provider.convert_messages_for_native(&effective_messages, !merge),
+                    temperature,
+                    reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    tool_stream: if options_enabled {
+                        provider.tool_stream_for_tools(true)
+                    } else {
+                        None
+                    },
+                    stream: Some(options_enabled),
+                    // Mirror the no-tools path: opt the streaming response into a
+                    // final `usage` event so `/ws/chat` can record token usage
+                    // even when native tools are active.
+                    stream_options: options_enabled.then_some(StreamOptionsBody {
+                        include_usage: true,
+                    }),
+                    tools: tools.clone(),
+                    tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                    max_tokens: provider.max_tokens,
+                })
+            } else {
+                let messages = effective_messages
+                    .iter()
+                    .map(|message| Message {
+                        role: message.role.clone(),
+                        content: Self::to_message_content(&message.role, &message.content, !merge),
+                    })
+                    .collect();
+
+                serde_json::to_value(ApiChatRequest {
+                    model: model.clone(),
+                    messages,
+                    temperature,
+                    reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    tool_stream: if options_enabled {
+                        provider.tool_stream_for_tools(false)
+                    } else {
+                        None
+                    },
+                    stream: Some(options_enabled),
+                    stream_options: options_enabled.then_some(StreamOptionsBody {
+                        include_usage: true,
+                    }),
+                    tools: None,
+                    tool_choice: None,
+                    max_tokens: provider.max_tokens,
+                })
+            };
+
+            let payload = match payload_result {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Json(error))).await;
+                    return;
+                }
+            };
+
+            let url = provider.chat_completions_url();
+            let client = provider.streaming_http_client();
+            let auth_header = provider.auth_header.clone();
+            let credential = provider.credential.clone();
+            let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
+
+            let mut req_builder = client.post(&url).json(&payload);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2326,12 +2665,19 @@ impl Provider for OpenAiCompatibleProvider {
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{}: {}",
+                        status, error
+                    ))))
                     .await;
                 return;
             }
 
-            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            let mut event_stream = sse_bytes_to_events_for_contract(
+                response,
+                count_tokens,
+                targets_mistral_tool_call_contract,
+            );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
                     break;
@@ -2354,52 +2700,83 @@ impl Provider for OpenAiCompatibleProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let temperature = temperature.unwrap_or(self.default_temperature());
-        let credential = self.credential.clone();
-
-        let merge = self.effective_merge_system(model);
-        let mut messages = Vec::new();
-        if merge {
-            let content = match system_prompt {
-                Some(sys) => format!("{sys}\n\n{message}"),
-                None => message.to_string(),
-            };
-            messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
-            });
-        } else {
-            if let Some(sys) = system_prompt {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: MessageContent::Text(sys.to_string()),
-                });
-            }
-            messages.push(Message {
-                role: "user".to_string(),
-                content: Self::to_message_content("user", message, !merge),
-            });
-        }
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-            stream: Some(options.enabled),
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: None,
-            tools: None,
-            tool_choice: None,
-            max_tokens: self.max_tokens,
-        };
-
-        let url = self.chat_completions_url();
-        let client = self.http_client();
-        let auth_header = self.auth_header.clone();
+        let provider = self.clone();
+        let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
+        let message_owned = message.to_string();
+        let model = model.to_string();
+        let count_tokens = options.count_tokens;
+        let options_enabled = options.enabled;
 
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         tokio::spawn(async move {
+            // Normalize image markers in the user-supplied message before
+            // forwarding upstream — see issue #6399 for the OpenAI-compatible
+            // remote-vs-local file path problem.
+            let user_msg = ChatMessage {
+                role: "user".to_string(),
+                content: message_owned,
+            };
+            let normalized_user = match Self::normalize_messages_for_upstream(std::slice::from_ref(
+                &user_msg,
+            ))
+            .await
+            {
+                Ok(mut msgs) => msgs.pop().unwrap_or(user_msg),
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let normalized_message_content = normalized_user.content;
+
+            let merge = provider.effective_merge_system(&model);
+            let mut messages = Vec::new();
+            if merge {
+                let content = match system_prompt_owned.as_deref() {
+                    Some(sys) => format!("{sys}\n\n{normalized_message_content}"),
+                    None => normalized_message_content,
+                };
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: Self::to_message_content("user", &content, !merge),
+                });
+            } else {
+                if let Some(sys) = system_prompt_owned {
+                    messages.push(Message {
+                        role: "system".to_string(),
+                        content: MessageContent::Text(sys),
+                    });
+                }
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: Self::to_message_content("user", &normalized_message_content, !merge),
+                });
+            }
+
+            let request = ApiChatRequest {
+                model: model.clone(),
+                messages,
+                temperature,
+                stream: Some(options_enabled),
+                stream_options: options_enabled.then_some(StreamOptionsBody {
+                    include_usage: true,
+                }),
+                reasoning_effort: provider.reasoning_effort_for_model(&model),
+                tool_stream: None,
+                tools: None,
+                tool_choice: None,
+                max_tokens: provider.max_tokens,
+            };
+
+            let url = provider.chat_completions_url();
+            let client = provider.streaming_http_client();
+            let auth_header = provider.auth_header.clone();
+            let credential = provider.credential.clone();
+
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
 
@@ -2413,7 +2790,9 @@ impl Provider for OpenAiCompatibleProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2426,13 +2805,16 @@ impl Provider for OpenAiCompatibleProvider {
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{}: {}",
+                        status, error
+                    ))))
                     .await;
                 return;
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -2455,38 +2837,56 @@ impl Provider for OpenAiCompatibleProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let temperature = temperature.unwrap_or(self.default_temperature());
-        let credential = self.credential.clone();
-
-        let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(messages, merge);
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(options.enabled),
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: None,
-            tools: None,
-            tool_choice: None,
-            max_tokens: self.max_tokens,
-        };
-
-        let url = self.chat_completions_url();
-        let client = self.http_client();
-        let auth_header = self.auth_header.clone();
+        let provider = self.clone();
+        let messages_owned: Vec<ChatMessage> = messages.to_vec();
+        let model = model.to_string();
+        let count_tokens = options.count_tokens;
+        let options_enabled = options.enabled;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         tokio::spawn(async move {
+            let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
+                Ok(n) => n,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
+
+            let merge = provider.effective_merge_system(&model);
+            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let effective_messages = provider.strip_native_tool_messages(&effective_messages);
+            let api_messages: Vec<Message> = effective_messages
+                .iter()
+                .map(|m| Message {
+                    role: m.role.clone(),
+                    content: Self::to_message_content(&m.role, &m.content, !merge),
+                })
+                .collect();
+
+            let request = ApiChatRequest {
+                model: model.clone(),
+                messages: api_messages,
+                temperature,
+                stream: Some(options_enabled),
+                stream_options: options_enabled.then_some(StreamOptionsBody {
+                    include_usage: true,
+                }),
+                reasoning_effort: provider.reasoning_effort_for_model(&model),
+                tool_stream: None,
+                tools: None,
+                tool_choice: None,
+                max_tokens: provider.max_tokens,
+            };
+
+            let url = provider.chat_completions_url();
+            let client = provider.streaming_http_client();
+            let auth_header = provider.auth_header.clone();
+            let credential = provider.credential.clone();
+
             let mut req_builder = client.post(&url).json(&request);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -2494,7 +2894,9 @@ impl Provider for OpenAiCompatibleProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2506,12 +2908,15 @@ impl Provider for OpenAiCompatibleProvider {
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{}: {}",
+                        status, error
+                    ))))
                     .await;
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -2526,9 +2931,8 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit the chat completions URL with a GET to establish the connection pool.
-        // The server will likely return 405 Method Not Allowed, which is fine -
-        // the goal is TLS handshake and HTTP/2 negotiation.
+        // Hit the appropriate URL with a GET to prime the connection pool.
+        // The server will likely return 405 Method Not Allowed, which is fine.
         let url = self.chat_completions_url();
         let _ = self
             .apply_auth_header(self.http_client().get(&url), self.credential.as_deref())
@@ -2538,17 +2942,34 @@ impl Provider for OpenAiCompatibleProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenAiCompatibleModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Plugin,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
-        OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    fn make_model_provider(
+        name: &str,
+        url: &str,
+        key: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::new("test", name, url, key, AuthStyle::Bearer)
     }
 
     #[test]
     fn creates_with_key() {
-        let p = make_provider(
+        let p = make_model_provider(
             "venice",
             "https://api.venice.ai",
             Some("venice-test-credential"),
@@ -2560,19 +2981,19 @@ mod tests {
 
     #[test]
     fn creates_without_key() {
-        let p = make_provider("test", "https://example.com", None);
+        let p = make_model_provider("test", "https://example.com", None);
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn strips_trailing_slash() {
-        let p = make_provider("test", "https://example.com/", None);
+        let p = make_model_provider("test", "https://example.com/", None);
         assert_eq!(p.base_url, "https://example.com");
     }
 
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
-        let p = make_provider("Local", "http://127.0.0.1:1", None);
+        let p = make_model_provider("Local", "http://127.0.0.1:1", None);
         let result = p
             .chat_with_system(None, "hello", "default", Some(0.7))
             .await;
@@ -2582,6 +3003,82 @@ mod tests {
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn native_chat_request_with_tools_includes_stream_options() {
+        // Regression: tool-enabled streaming requests must opt the response
+        // into a final `usage` SSE event, otherwise OpenAI-compatible providers
+        // never report token counts on the `/ws/chat` path (the gateway's
+        // primary path uses native tools). See Audacity88's #6159 review.
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![NativeMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }],
+            temperature: 0.7,
+            stream: Some(true),
+            stream_options: Some(StreamOptionsBody {
+                include_usage: true,
+            }),
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: Some(vec![serde_json::json!({"name": "echo"})]),
+            tool_choice: Some("auto".to_string()),
+            max_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("stream_options")
+                .and_then(|v| v.get("include_usage"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "tool-enabled streaming request must serialize stream_options.include_usage=true; \
+             without it OpenAI-compatible providers omit the final usage event"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_omits_stream_options_when_none() {
+        // Non-streaming path (e.g. classic `chat()` call) does not need
+        // `stream_options.include_usage` because the final response carries
+        // `usage` directly. The field must be skipped in serialization.
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("stream_options").is_none(),
+            "non-streaming NativeChatRequest must not emit a stream_options key"
+        );
+    }
+
+    #[test]
+    fn normalize_model_ids_trims_filters_and_sorts() {
+        let body = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": " zeta-model "},
+                {"id": ""},
+                {"id": "alpha-model"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(normalize_model_ids(body), vec!["alpha-model", "zeta-model"]);
     }
 
     #[test]
@@ -2600,6 +3097,7 @@ mod tests {
             ],
             temperature: 0.4,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
             tools: None,
@@ -2645,20 +3143,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_responses_response_body_reports_sanitized_snippet() {
-        let body = r#"{"output_text":123,"api_key":"sk-another-secret"}"#;
-        let err = parse_responses_response_body("custom", body).expect_err("payload should fail");
-        let msg = err.to_string();
-
-        assert!(msg.contains("custom Responses API returned an unexpected payload"));
-        assert!(msg.contains("body="));
-        assert!(msg.contains("[REDACTED]"));
-        assert!(!msg.contains("sk-another-secret"));
-    }
-
-    #[test]
     fn x_api_key_auth_style() {
-        let p = OpenAiCompatibleProvider::new(
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "moonshot",
             "https://api.moonshot.cn",
             Some("ms-key"),
@@ -2669,7 +3156,8 @@ mod tests {
 
     #[test]
     fn custom_auth_style() {
-        let p = OpenAiCompatibleProvider::new(
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "custom",
             "https://api.example.com",
             Some("key"),
@@ -2742,7 +3230,8 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_auth_style_applies_correctly() {
-        let p = OpenAiCompatibleProvider::new(
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "Z.AI",
             "https://api.z.ai/api/coding/paas/v4",
             Some("testid.testsecret"),
@@ -2753,18 +3242,18 @@ mod tests {
 
     #[tokio::test]
     async fn all_compatible_providers_attempt_request_without_key() {
-        let providers = vec![
-            make_provider("Venice", "http://127.0.0.1:1", None),
-            make_provider("Moonshot", "http://127.0.0.1:1", None),
-            make_provider("GLM", "http://127.0.0.1:1", None),
-            make_provider("MiniMax", "http://127.0.0.1:1", None),
-            make_provider("Groq", "http://127.0.0.1:1", None),
-            make_provider("Mistral", "http://127.0.0.1:1", None),
-            make_provider("xAI", "http://127.0.0.1:1", None),
-            make_provider("Astrai", "http://127.0.0.1:1", None),
+        let model_providers = vec![
+            make_model_provider("Venice", "http://127.0.0.1:1", None),
+            make_model_provider("Moonshot", "http://127.0.0.1:1", None),
+            make_model_provider("GLM", "http://127.0.0.1:1", None),
+            make_model_provider("MiniMax", "http://127.0.0.1:1", None),
+            make_model_provider("Groq", "http://127.0.0.1:1", None),
+            make_model_provider("Mistral", "http://127.0.0.1:1", None),
+            make_model_provider("xAI", "http://127.0.0.1:1", None),
+            make_model_provider("Astrai", "http://127.0.0.1:1", None),
         ];
 
-        for p in providers {
+        for p in model_providers {
             let result = p.chat_with_system(None, "test", "model", Some(0.7)).await;
             assert!(result.is_err(), "{} should fail (unreachable host)", p.name);
             let err_msg = result.unwrap_err().to_string();
@@ -2774,112 +3263,6 @@ mod tests {
                 p.name
             );
         }
-    }
-
-    #[test]
-    fn responses_extracts_top_level_output_text() {
-        let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            extract_responses_text(response).as_deref(),
-            Some("Hello from top-level")
-        );
-    }
-
-    #[test]
-    fn responses_extracts_nested_output_text() {
-        let json =
-            r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            extract_responses_text(response).as_deref(),
-            Some("Hello from nested")
-        );
-    }
-
-    #[test]
-    fn responses_extracts_any_text_as_fallback() {
-        let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            extract_responses_text(response).as_deref(),
-            Some("Fallback text")
-        );
-    }
-
-    #[test]
-    fn build_responses_prompt_preserves_multi_turn_history() {
-        let messages = vec![
-            ChatMessage::system("policy"),
-            ChatMessage::user("step 1"),
-            ChatMessage::assistant("ack 1"),
-            ChatMessage::tool("{\"result\":\"ok\"}"),
-            ChatMessage::user("step 2"),
-        ];
-
-        let (instructions, input) = build_responses_prompt(&messages);
-
-        assert_eq!(instructions.as_deref(), Some("policy"));
-        assert_eq!(input.len(), 4);
-
-        let serialized: Vec<serde_json::Value> = input
-            .iter()
-            .map(|item| serde_json::to_value(item).expect("responses input item serializes"))
-            .collect();
-        assert_eq!(
-            serialized[0],
-            serde_json::json!({
-                "role": "user",
-                "content": "step 1"
-            })
-        );
-        assert_eq!(
-            serialized[1],
-            serde_json::json!({
-                "role": "assistant",
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "text": "ack 1"
-                }]
-            })
-        );
-        assert_eq!(
-            serialized[2],
-            serde_json::json!({
-                "role": "assistant",
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "text": "{\"result\":\"ok\"}"
-                }]
-            })
-        );
-        assert_eq!(
-            serialized[3],
-            serde_json::json!({
-                "role": "user",
-                "content": "step 2"
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_via_responses_requires_non_system_message() {
-        let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
-        let err = provider
-            .chat_via_responses(
-                Some("test-key"),
-                &[ChatMessage::system("policy")],
-                "gpt-test",
-            )
-            .await
-            .expect_err("system-only fallback payload should fail");
-
-        assert!(
-            err.to_string()
-                .contains("requires at least one non-system message")
-        );
     }
 
     #[test]
@@ -2932,8 +3315,8 @@ mod tests {
 
     #[test]
     fn chat_completions_url_standard_openai() {
-        // Standard OpenAI-compatible providers get /chat/completions appended
-        let p = make_provider("openai", "https://api.openai.com/v1", None);
+        // Standard OpenAI-compatible model_providers get /chat/completions appended
+        let p = make_model_provider("openai", "https://api.openai.com/v1", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://api.openai.com/v1/chat/completions"
@@ -2943,7 +3326,7 @@ mod tests {
     #[test]
     fn chat_completions_url_trailing_slash() {
         // Trailing slash is stripped, then /chat/completions appended
-        let p = make_provider("test", "https://api.example.com/v1/", None);
+        let p = make_model_provider("test", "https://api.example.com/v1/", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://api.example.com/v1/chat/completions"
@@ -2953,7 +3336,7 @@ mod tests {
     #[test]
     fn chat_completions_url_volcengine_ark() {
         // VolcEngine ARK uses custom path - should use as-is
-        let p = make_provider(
+        let p = make_model_provider(
             "volcengine",
             "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
             None,
@@ -2966,8 +3349,8 @@ mod tests {
 
     #[test]
     fn chat_completions_url_custom_full_endpoint() {
-        // Custom provider with full endpoint path
-        let p = make_provider(
+        // Custom model_provider with full endpoint path
+        let p = make_model_provider(
             "custom",
             "https://my-api.example.com/v2/llm/chat/completions",
             None,
@@ -2980,7 +3363,7 @@ mod tests {
 
     #[test]
     fn chat_completions_url_requires_exact_suffix_match() {
-        let p = make_provider(
+        let p = make_model_provider(
             "custom",
             "https://my-api.example.com/v2/llm/chat/completions-proxy",
             None,
@@ -2992,71 +3375,9 @@ mod tests {
     }
 
     #[test]
-    fn responses_url_standard() {
-        // Standard providers get /v1/responses appended
-        let p = make_provider("test", "https://api.example.com", None);
-        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
-    }
-
-    #[test]
-    fn responses_url_custom_full_endpoint() {
-        // Custom provider with full responses endpoint
-        let p = make_provider(
-            "custom",
-            "https://my-api.example.com/api/v2/responses",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://my-api.example.com/api/v2/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_requires_exact_suffix_match() {
-        let p = make_provider(
-            "custom",
-            "https://my-api.example.com/api/v2/responses-proxy",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://my-api.example.com/api/v2/responses-proxy/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_derives_from_chat_endpoint() {
-        let p = make_provider(
-            "custom",
-            "https://my-api.example.com/api/v2/chat/completions",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://my-api.example.com/api/v2/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_base_with_v1_no_duplicate() {
-        let p = make_provider("test", "https://api.example.com/v1", None);
-        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
-    }
-
-    #[test]
-    fn responses_url_non_v1_api_path_uses_raw_suffix() {
-        let p = make_provider("test", "https://api.example.com/api/coding/v3", None);
-        assert_eq!(
-            p.responses_url(),
-            "https://api.example.com/api/coding/v3/responses"
-        );
-    }
-
-    #[test]
     fn chat_completions_url_without_v1() {
-        // Provider configured without /v1 in base URL
-        let p = make_provider("test", "https://api.example.com", None);
+        // ModelProvider configured without /v1 in base URL
+        let p = make_model_provider("test", "https://api.example.com", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://api.example.com/chat/completions"
@@ -3065,8 +3386,8 @@ mod tests {
 
     #[test]
     fn chat_completions_url_base_with_v1() {
-        // Provider configured with /v1 in base URL
-        let p = make_provider("test", "https://api.example.com/v1", None);
+        // ModelProvider configured with /v1 in base URL
+        let p = make_model_provider("test", "https://api.example.com/v1", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://api.example.com/v1/chat/completions"
@@ -3074,13 +3395,13 @@ mod tests {
     }
 
     // ----------------------------------------------------------
-    // Provider-specific endpoint tests (Issue #167)
+    // ModelProvider-specific endpoint tests (Issue #167)
     // ----------------------------------------------------------
 
     #[test]
     fn chat_completions_url_zai() {
         // Z.AI uses /api/paas/v4 base path
-        let p = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
+        let p = make_model_provider("zai", "https://api.z.ai/api/paas/v4", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://api.z.ai/api/paas/v4/chat/completions"
@@ -3090,7 +3411,7 @@ mod tests {
     #[test]
     fn chat_completions_url_minimax() {
         // MiniMax OpenAI-compatible endpoint requires /v1 base path.
-        let p = make_provider("minimax", "https://api.minimaxi.com/v1", None);
+        let p = make_model_provider("minimax", "https://api.minimaxi.com/v1", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://api.minimaxi.com/v1/chat/completions"
@@ -3100,7 +3421,7 @@ mod tests {
     #[test]
     fn chat_completions_url_glm() {
         // GLM (BigModel) uses /api/paas/v4 base path
-        let p = make_provider("glm", "https://open.bigmodel.cn/api/paas/v4", None);
+        let p = make_model_provider("glm", "https://open.bigmodel.cn/api/paas/v4", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://open.bigmodel.cn/api/paas/v4/chat/completions"
@@ -3110,7 +3431,7 @@ mod tests {
     #[test]
     fn chat_completions_url_opencode() {
         // OpenCode Zen uses /zen/v1 base path
-        let p = make_provider("opencode", "https://opencode.ai/zen/v1", None);
+        let p = make_model_provider("opencode", "https://opencode.ai/zen/v1", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://opencode.ai/zen/v1/chat/completions"
@@ -3120,7 +3441,7 @@ mod tests {
     #[test]
     fn chat_completions_url_opencode_go() {
         // OpenCode Go uses /zen/go/v1 base path
-        let p = make_provider("opencode-go", "https://opencode.ai/zen/go/v1", None);
+        let p = make_model_provider("opencode-go", "https://opencode.ai/zen/go/v1", None);
         assert_eq!(
             p.chat_completions_url(),
             "https://opencode.ai/zen/go/v1/chat/completions"
@@ -3129,6 +3450,7 @@ mod tests {
 
     #[test]
     fn parse_native_response_preserves_tool_call_id() {
+        let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
             content: None,
             tool_calls: Some(vec![ToolCall {
@@ -3141,14 +3463,141 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
             reasoning_content: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = provider.parse_native_response(message);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_native_response_mistral_normalizes_invalid_tool_call_id() {
+        let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
+        let message = ResponseMessage {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("xvL0p9bZ41j2X0O3Q1y9vL0p9bZ41j2X".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+                extra_content: None,
+            }]),
+            reasoning_content: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let id = &parsed.tool_calls[0].id;
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn parse_native_response_mistral_generates_valid_id_when_missing() {
+        let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
+        let message = ResponseMessage {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: None,
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+                extra_content: None,
+            }]),
+            reasoning_content: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let id = &parsed.tool_calls[0].id;
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn parse_native_response_custom_mistral_endpoint_normalizes_tool_call_id() {
+        let provider = make_model_provider("Custom", "https://api.mistral.ai/v1", None);
+        let message = ResponseMessage {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("xvL0p9bZ41j2X0O3Q1y9vL0p9bZ41j2X".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+                extra_content: None,
+            }]),
+            reasoning_content: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let id = &parsed.tool_calls[0].id;
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn parse_native_response_mistral_avoids_id_collision_after_normalization() {
+        let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
+        let message = ResponseMessage {
+            content: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: Some("ABCDEFGHI123".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some("shell".to_string()),
+                        arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                    extra_content: None,
+                },
+                ToolCall {
+                    id: Some("ABCDEFGHIxyz".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(Function {
+                        name: Some("echo".to_string()),
+                        arguments: Some(r#"{"text":"ok"}"#.to_string()),
+                    }),
+                    name: None,
+                    arguments: None,
+                    parameters: None,
+                    extra_content: None,
+                },
+            ]),
+            reasoning_content: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(parsed.tool_calls.len(), 2);
+        let id0 = &parsed.tool_calls[0].id;
+        let id1 = &parsed.tool_calls[1].id;
+        assert_eq!(id0.len(), 9);
+        assert_eq!(id1.len(), 9);
+        assert!(id0.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(id1.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(id0, id1);
     }
 
     #[test]
@@ -3157,7 +3606,8 @@ mod tests {
             r#"{"tool_call_id":"call_abc","content":"done"}"#,
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
@@ -3168,12 +3618,69 @@ mod tests {
     }
 
     #[test]
+    fn native_chat_request_mistral_serializes_matching_valid_tool_call_ids() {
+        let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
+        let invalid_id = "chatcmpl-tool-abc";
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": invalid_id,
+                "name": "shell",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            }]
+        });
+        let messages = vec![
+            ChatMessage::assistant(history_json.to_string()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": invalid_id,
+                    "content": "done"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let req = NativeChatRequest {
+            model: "mistral-large-latest".to_string(),
+            messages: provider.convert_messages_for_native(&messages, true),
+            temperature: 0.7,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object"}
+                }
+            })]),
+            tool_choice: Some("auto".to_string()),
+            max_tokens: None,
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        let assistant_id = value["messages"][0]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("assistant tool call id should serialize");
+        let tool_id = value["messages"][1]["tool_call_id"]
+            .as_str()
+            .expect("tool result id should serialize");
+
+        assert_ne!(assistant_id, invalid_id);
+        assert!(is_valid_mistral_tool_call_id(assistant_id));
+        assert_eq!(assistant_id, tool_id);
+    }
+
+    #[test]
     fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
         let input = vec![ChatMessage::user(
             "System primer [IMAGE:data:image/png;base64,abcd] user turn",
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
         assert!(matches!(
@@ -3193,7 +3700,7 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, true);
+        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -3211,7 +3718,7 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, true);
+        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -3227,12 +3734,14 @@ mod tests {
 
     #[test]
     fn native_tool_schema_unsupported_detection_is_precise() {
-        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
-            reqwest::StatusCode::BAD_REQUEST,
-            "unknown parameter: tools"
-        ));
         assert!(
-            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::BAD_REQUEST,
+                "unknown parameter: tools"
+            )
+        );
+        assert!(
+            !OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
                 reqwest::StatusCode::UNAUTHORIZED,
                 "unknown parameter: tools"
             )
@@ -3241,10 +3750,12 @@ mod tests {
 
     #[test]
     fn native_tool_schema_unsupported_detects_groq_tool_validation_error() {
-        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall={\"limit\":5}' which was not in request"}}"#
-        ));
+        assert!(
+            OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall={\"limit\":5}' which was not in request"}}"#
+            )
+        );
     }
 
     #[test]
@@ -3262,8 +3773,10 @@ mod tests {
             }),
         }];
 
-        let output =
-            OpenAiCompatibleProvider::with_prompt_guided_tool_instructions(&input, Some(&tools));
+        let output = OpenAiCompatibleModelProvider::with_prompt_guided_tool_instructions(
+            &input,
+            Some(&tools),
+        );
         assert!(!output.is_empty());
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
@@ -3271,25 +3784,53 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
-        let provider = make_provider("test", "https://example.com", None)
+    fn reasoning_effort_only_applies_to_openai_and_selected_codex_models() {
+        let model_provider = make_model_provider("test", "https://example.com", None)
             .with_reasoning_effort(Some("high".to_string()));
 
         assert_eq!(
-            provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            model_provider.reasoning_effort_for_model("o1-preview"),
             Some("high".to_string())
         );
         assert_eq!(
-            provider.reasoning_effort_for_model("openai/gpt-5"),
+            model_provider.reasoning_effort_for_model("openai/o3-mini"),
             Some("high".to_string())
         );
-        assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("o4-mini"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("openai/gpt-5"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-4-codex"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("llama-3-codex"),
+            None,
+            "generic codex-like model names must not receive OpenAI-only reasoning_effort",
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("llama-3.3-70b"),
+            None
+        );
     }
 
     #[tokio::test]
     async fn warmup_without_key_attempts_connection() {
-        let provider = make_provider("test", "http://127.0.0.1:1", None);
-        let result = provider.warmup().await;
+        let model_provider = make_model_provider("test", "http://127.0.0.1:1", None);
+        let result = model_provider.warmup().await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3304,36 +3845,38 @@ mod tests {
 
     #[test]
     fn capabilities_reports_native_tool_calling() {
-        let p = make_provider("test", "https://example.com", None);
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        let p = make_model_provider("test", "https://example.com", None);
+        let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(!caps.vision);
     }
 
     #[test]
     fn capabilities_reports_vision_for_qwen_compatible_provider() {
-        let p = OpenAiCompatibleProvider::new_with_vision(
+        let p = OpenAiCompatibleModelProvider::new_with_vision(
+            "test",
             "Qwen",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Some("k"),
             AuthStyle::Bearer,
             true,
         );
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
     }
 
     #[test]
     fn minimax_provider_supports_native_tool_calling_with_system_merge() {
-        let p = OpenAiCompatibleProvider::new(
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
         )
         .with_merge_system_into_user();
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(
             caps.native_tool_calling,
             "MiniMax should preserve native tool calling when system messages are merged"
@@ -3342,7 +3885,7 @@ mod tests {
     }
 
     /// Regression test for #5743: native tool messages must be stripped for
-    /// providers that don't support native tool calling (e.g. MiniMax).
+    /// model_providers that don't support native tool calling (e.g. MiniMax).
     #[test]
     fn strip_native_tool_messages_removes_tool_and_tool_calls() {
         let messages = vec![
@@ -3357,7 +3900,8 @@ mod tests {
             ChatMessage::assistant("Here are the results about cats"),
             ChatMessage::user("thanks"),
         ];
-        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -3403,7 +3947,8 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
             ChatMessage::assistant("Done"),
         ];
-        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -3426,7 +3971,8 @@ mod tests {
             ChatMessage::assistant("hi there"),
             ChatMessage::user("bye"),
         ];
-        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -3440,7 +3986,7 @@ mod tests {
         }
     }
 
-    /// Confirm that `strip_native_tool_messages` is a no-op when the provider
+    /// Confirm that `strip_native_tool_messages` is a no-op when the model_provider
     /// has `native_tool_calling = true` — tool-role and assistant-with-tool-calls
     /// messages must pass through unchanged.
     #[test]
@@ -3456,15 +4002,16 @@ mod tests {
             ),
             ChatMessage::assistant("Here are the results about cats"),
         ];
-        let p = OpenAiCompatibleProvider::new(
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "NativeToolProvider",
             "https://api.example.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
         assert!(
-            <OpenAiCompatibleProvider as Provider>::capabilities(&p).native_tool_calling,
-            "provider must have native_tool_calling enabled for this test"
+            <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p).native_tool_calling,
+            "model_provider must have native_tool_calling enabled for this test"
         );
         let result = p.strip_native_tool_messages(&messages);
         assert_eq!(result.len(), messages.len());
@@ -3476,14 +4023,15 @@ mod tests {
 
     #[test]
     fn user_agent_constructor_keeps_native_tool_calling_enabled() {
-        let p = OpenAiCompatibleProvider::new_with_user_agent(
+        let p = OpenAiCompatibleModelProvider::new_with_user_agent(
+            "test",
             "TestProvider",
             "https://example.com",
             Some("k"),
             AuthStyle::Bearer,
             "zeroclaw-test/1.0",
         );
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(!caps.vision);
         assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/1.0"));
@@ -3491,38 +4039,25 @@ mod tests {
 
     #[test]
     fn user_agent_and_vision_constructor_preserves_capability_flags() {
-        let p = OpenAiCompatibleProvider::new_with_user_agent_and_vision(
-            "VisionProvider",
+        let p = OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+            "test",
+            "VisionModelProvider",
             "https://example.com",
             Some("k"),
             AuthStyle::Bearer,
             "zeroclaw-test/vision",
             true,
         );
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
         assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/vision"));
     }
 
     #[test]
-    fn no_responses_fallback_constructor_keeps_native_tool_calling_enabled() {
-        let p = OpenAiCompatibleProvider::new_no_responses_fallback(
-            "FallbackProvider",
-            "https://example.com",
-            Some("k"),
-            AuthStyle::Bearer,
-        );
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
-        assert!(caps.native_tool_calling);
-        assert!(!caps.vision);
-        assert!(p.user_agent.is_none());
-    }
-
-    #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
             "user", content, true,
         ))
         .unwrap();
@@ -3539,7 +4074,7 @@ mod tests {
     #[test]
     fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
         let content = "Policy [IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
             "user", content, false,
         ))
         .unwrap();
@@ -3548,7 +4083,7 @@ mod tests {
 
     #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
-        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
             "system",
             "You are a helpful assistant.",
             true,
@@ -3557,24 +4092,45 @@ mod tests {
         assert_eq!(value, serde_json::json!("You are a helpful assistant."));
     }
 
-    #[test]
-    fn tool_specs_convert_to_openai_format() {
-        let specs = vec![zeroclaw_api::tool::ToolSpec {
-            name: "shell".to_string(),
-            description: "Run shell command".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"]
-            }),
-        }];
+    #[tokio::test]
+    async fn normalize_messages_for_upstream_rewrites_local_image_path_to_data_uri() {
+        // Regression for #6399: bare local paths inside `[IMAGE:...]` markers
+        // must be base64-encoded at the provider boundary so strict upstreams
+        // (vLLM 0.20+) never see `image_url.url = "/home/.../photo.png"`.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("pixel.png");
+        // 1x1 transparent PNG.
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&path, png).expect("write pixel.png");
+        let path_str = path.to_string_lossy().into_owned();
 
-        let tools = OpenAiCompatibleProvider::tool_specs_to_openai_format(&specs);
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["function"]["name"], "shell");
-        assert_eq!(tools[0]["function"]["description"], "Run shell command");
-        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "command");
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: format!("Caption please [IMAGE:{}]", path_str),
+        };
+
+        let normalized = OpenAiCompatibleModelProvider::normalize_messages_for_upstream(
+            std::slice::from_ref(&msg),
+        )
+        .await
+        .expect("normalize ok");
+
+        assert_eq!(normalized.len(), 1);
+        let content = &normalized[0].content;
+        assert!(
+            content.contains("[IMAGE:data:image/png;base64,"),
+            "expected base64 data URI in normalized content, got: {content}"
+        );
+        assert!(
+            !content.contains(&path_str),
+            "raw local path must not leak to upstream, got: {content}"
+        );
     }
 
     #[test]
@@ -3601,6 +4157,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
             tools: Some(tools),
@@ -3615,7 +4172,7 @@ mod tests {
 
     #[test]
     fn zai_tool_requests_enable_tool_stream() {
-        let provider = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
+        let model_provider = make_model_provider("zai", "https://api.z.ai/api/paas/v4", None);
         let req = ApiChatRequest {
             model: "glm-5".to_string(),
             messages: vec![Message {
@@ -3624,8 +4181,9 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
-            tool_stream: provider.tool_stream_for_tools(true),
+            tool_stream: model_provider.tool_stream_for_tools(true),
             tools: Some(vec![serde_json::json!({
                 "type": "function",
                 "function": {
@@ -3649,7 +4207,7 @@ mod tests {
 
     #[test]
     fn non_zai_tool_requests_omit_tool_stream() {
-        let provider = make_provider("test", "https://api.example.com/v1", None);
+        let model_provider = make_model_provider("test", "https://api.example.com/v1", None);
         let req = ApiChatRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
@@ -3658,8 +4216,9 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
-            tool_stream: provider.tool_stream_for_tools(true),
+            tool_stream: model_provider.tool_stream_for_tools(true),
             tools: Some(vec![serde_json::json!({
                 "type": "function",
                 "function": {
@@ -3683,16 +4242,17 @@ mod tests {
 
     #[test]
     fn non_zai_provider_omits_tool_stream_regardless_of_streaming() {
-        let provider = make_provider("custom", "https://proxy.example.com/v1", None);
-        // tool_stream_for_tools should return None for non-Z.AI providers
-        assert_eq!(provider.tool_stream_for_tools(true), None);
-        assert_eq!(provider.tool_stream_for_tools(false), None);
+        let model_provider = make_model_provider("custom", "https://proxy.example.com/v1", None);
+        // tool_stream_for_tools should return None for non-Z.AI model_providers
+        assert_eq!(model_provider.tool_stream_for_tools(true), None);
+        assert_eq!(model_provider.tool_stream_for_tools(false), None);
     }
 
     #[test]
     fn z_ai_host_enables_tool_stream_for_custom_profiles() {
-        let provider = make_provider("custom", "https://api.z.ai/api/coding/paas/v4", None);
-        assert_eq!(provider.tool_stream_for_tools(true), Some(true));
+        let model_provider =
+            make_model_provider("custom", "https://api.z.ai/api/coding/paas/v4", None);
+        assert_eq!(model_provider.tool_stream_for_tools(true), Some(true));
     }
 
     #[test]
@@ -3775,7 +4335,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_without_key_attempts_request() {
-        let p = make_provider("TestProvider", "http://127.0.0.1:1", None);
+        let p = make_model_provider("TestProvider", "http://127.0.0.1:1", None);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -3801,6 +4361,55 @@ mod tests {
     }
 
     #[test]
+    fn chat_with_tools_request_preserves_reasoning_content_in_history() {
+        let p = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        let history_json = serde_json::json!({
+            "content": "I will inspect the workspace.",
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "Need to inspect the current files before answering."
+        });
+        let messages = vec![
+            ChatMessage::assistant(history_json.to_string()),
+            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"src\nCargo.toml"}"#),
+            ChatMessage::user("continue"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {}
+            }
+        })];
+
+        let request = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "deepseek-v4-flash",
+            0.7,
+            true,
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        let first_message = &value["messages"][0];
+
+        assert_eq!(first_message["role"], "assistant");
+        assert_eq!(
+            first_message["reasoning_content"],
+            "Need to inspect the current files before answering."
+        );
+        assert!(
+            first_message["tool_calls"].is_array(),
+            "assistant tool-call history must stay native in chat_with_tools requests"
+        );
+        assert_eq!(value["tools"][0]["function"]["name"], "shell");
+        assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
     fn response_with_no_tool_calls_has_empty_vec() {
         let json = r#"{"choices":[{"message":{"content":"Just text, no tools."}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -3819,7 +4428,7 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, true);
+        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -3832,13 +4441,57 @@ mod tests {
     }
 
     #[test]
+    fn flatten_system_messages_keeps_system_only_at_start_without_user_merge() {
+        let messages = vec![
+            ChatMessage::system("System A"),
+            ChatMessage::user("User turn"),
+            ChatMessage::assistant("Assistant turn"),
+            ChatMessage::system("System B"),
+            ChatMessage::user("Follow-up"),
+        ];
+
+        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert_eq!(
+            flattened
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
+        );
+        assert_eq!(
+            flattened
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
+            1
+        );
+        assert!(flattened[0].content.contains("System A"));
+        assert!(flattened[0].content.contains("System B"));
+    }
+
+    #[test]
+    fn flatten_system_messages_drops_empty_system_messages() {
+        let messages = vec![
+            ChatMessage::system(""),
+            ChatMessage::user("User turn"),
+            ChatMessage::system(""),
+        ];
+
+        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(flattened[0].role, "user");
+        assert_eq!(flattened[0].content, "User turn");
+    }
+
+    #[test]
     fn flatten_system_messages_inserts_synthetic_user_when_no_user_exists() {
         let messages = vec![
             ChatMessage::assistant("Assistant only"),
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, true);
+        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
@@ -3968,6 +4621,115 @@ mod tests {
         assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
+    // Regression for #6584. OpenRouter and vLLM (>= v0.16.0) emit reasoning
+    // under `reasoning` rather than `reasoning_content`. Both fields must
+    // be accepted on deserialization.
+    #[test]
+    fn parse_sse_line_accepts_reasoning_alias() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning":"thinking via vllm..."}}]}"#;
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking via vllm..."));
+    }
+
+    #[test]
+    fn parse_sse_line_with_empty_content_and_reasoning_alias() {
+        let line = r#"data: {"choices":[{"delta":{"content":"","reasoning":"vllm thought"}}]}"#;
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("vllm thought"));
+    }
+
+    #[test]
+    fn response_message_accepts_reasoning_alias_on_non_stream_path() {
+        // Non-stream OpenAI Chat Completions response, vLLM/OpenRouter shape.
+        let json = r#"{"content":null,"reasoning":"chain-of-thought via vllm","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_none());
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("chain-of-thought via vllm"),
+            "the `reasoning` alias must populate the canonical reasoning_content field",
+        );
+        // effective_content should also surface the reasoning when content is missing.
+        assert_eq!(msg.effective_content(), "chain-of-thought via vllm");
+    }
+
+    #[test]
+    fn response_message_canonical_reasoning_content_still_works() {
+        // Existing providers continue to populate reasoning_content directly.
+        let json = r#"{"content":null,"reasoning_content":"canonical thought","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("canonical thought"));
+    }
+
+    // Review feedback on PR #6615 (Audacity88): when a payload carries BOTH
+    // `reasoning_content` and `reasoning`, the previous `#[serde(alias)]`
+    // version raised `duplicate field reasoning_content` at the deserializer.
+    // The replacement `#[serde(from = "RawResponseMessage")]` shape must
+    // accept the payload AND apply the documented precedence rule: canonical
+    // `reasoning_content` wins, `reasoning` is dropped.
+    #[test]
+    fn response_message_with_both_keys_prefers_canonical_reasoning_content() {
+        let json = r#"{"content":null,"reasoning_content":"canonical","reasoning":"alias","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json)
+            .expect("payload with both reasoning_content and reasoning must deserialize");
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("canonical"),
+            "canonical reasoning_content must win when both fields are present",
+        );
+    }
+
+    #[test]
+    fn response_message_with_only_alias_populates_canonical_field() {
+        // Sanity: when only the alias is present, it still flows into the
+        // canonical reasoning_content field.
+        let json = r#"{"content":null,"reasoning":"alias only","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("alias only"));
+    }
+
+    #[test]
+    fn stream_delta_with_both_keys_prefers_canonical_reasoning_content() {
+        // The streaming-SSE shape used the same `#[serde(alias)]` and had the
+        // same duplicate-field error mode. Pin the precedence here too.
+        let chunk = r#"data: {"choices":[{"delta":{"reasoning_content":"canonical","reasoning":"alias"}}]}"#;
+        let result = parse_sse_line(chunk)
+            .expect("parse must succeed")
+            .expect("non-empty chunk");
+        assert_eq!(result.reasoning.as_deref(), Some("canonical"));
+    }
+
+    // The round-trip path at to_native_messages reconstructs reasoning_content
+    // from session-stored assistant-with-tool-calls JSON. Both names must work.
+    #[test]
+    fn round_trip_reasoning_extraction_accepts_alias() {
+        fn extract_reasoning(value: &serde_json::Value) -> Option<String> {
+            value
+                .get("reasoning_content")
+                .or_else(|| value.get("reasoning"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        }
+        let canonical: serde_json::Value =
+            serde_json::from_str(r#"{"reasoning_content":"canonical","tool_calls":[]}"#).unwrap();
+        let alias: serde_json::Value =
+            serde_json::from_str(r#"{"reasoning":"vllm","tool_calls":[]}"#).unwrap();
+        let neither: serde_json::Value = serde_json::from_str(r#"{"tool_calls":[]}"#).unwrap();
+        let both: serde_json::Value = serde_json::from_str(
+            r#"{"reasoning_content":"canonical","reasoning":"alias","tool_calls":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_reasoning(&canonical).as_deref(), Some("canonical"));
+        assert_eq!(extract_reasoning(&alias).as_deref(), Some("vllm"));
+        assert_eq!(extract_reasoning(&neither), None);
+        // When both are present, the canonical name wins — preserves existing
+        // behavior for providers that emit `reasoning_content` plus a stray
+        // `reasoning` field.
+        assert_eq!(extract_reasoning(&both).as_deref(), Some("canonical"));
+    }
+
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
@@ -4011,6 +4773,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
         acc.apply_delta(&StreamToolCallDelta {
             index: Some(0),
@@ -4021,14 +4784,41 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
 
+        let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_call = acc
-            .into_provider_tool_call()
+            .into_provider_tool_call(false, &mut used_tool_call_ids)
             .expect("accumulator should emit tool call");
         assert_eq!(tool_call.id, "call_1");
         assert_eq!(tool_call.name, "shell");
         assert_eq!(tool_call.arguments, r#"{"command":"date"}"#);
+    }
+
+    #[test]
+    fn stream_tool_call_accumulator_mistral_normalizes_invalid_id() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.apply_delta(&StreamToolCallDelta {
+            index: Some(0),
+            id: Some("chatcmpl-tool-abc".to_string()),
+            function: Some(StreamFunctionDelta {
+                name: Some("shell".to_string()),
+                arguments: Some(r#"{"command":"date"}"#.to_string()),
+            }),
+            name: None,
+            arguments: None,
+            extra_content: None,
+        });
+
+        let mut used_tool_call_ids = std::collections::HashSet::new();
+        let tool_call = acc
+            .into_provider_tool_call(true, &mut used_tool_call_ids)
+            .expect("accumulator should emit tool call");
+
+        assert_eq!(tool_call.id.len(), 9);
+        assert!(tool_call.id.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(tool_call.id, "chatcmpl-tool-abc");
     }
 
     #[test]
@@ -4056,6 +4846,7 @@ mod tests {
 
     #[test]
     fn parse_native_response_captures_reasoning_content() {
+        let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
             content: Some("answer".to_string()),
             reasoning_content: Some("thinking step".to_string()),
@@ -4069,10 +4860,11 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = provider.parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
@@ -4080,13 +4872,14 @@ mod tests {
 
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
+        let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
             content: Some("hello".to_string()),
             reasoning_content: None,
             tool_calls: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = provider.parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
     }
@@ -4105,7 +4898,8 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");
         assert_eq!(
@@ -4128,7 +4922,8 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }
@@ -4257,19 +5052,19 @@ mod tests {
 
     #[test]
     fn default_timeout_is_120s() {
-        let p = make_provider("test", "https://example.com", None);
+        let p = make_model_provider("test", "https://example.com", None);
         assert_eq!(p.timeout_secs, 120);
     }
 
     #[test]
     fn with_timeout_secs_overrides_default() {
-        let p = make_provider("test", "https://example.com", None).with_timeout_secs(300);
+        let p = make_model_provider("test", "https://example.com", None).with_timeout_secs(300);
         assert_eq!(p.timeout_secs, 300);
     }
 
     #[test]
     fn extra_headers_default_empty() {
-        let p = make_provider("test", "https://example.com", None);
+        let p = make_model_provider("test", "https://example.com", None);
         assert!(p.extra_headers.is_empty());
     }
 
@@ -4281,7 +5076,8 @@ mod tests {
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p = make_provider("test", "https://example.com", None).with_extra_headers(headers);
+        let p =
+            make_model_provider("test", "https://example.com", None).with_extra_headers(headers);
         assert_eq!(p.extra_headers.len(), 2);
         assert_eq!(p.extra_headers.get("X-Title").unwrap(), "zeroclaw");
         assert_eq!(
@@ -4295,14 +5091,15 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
         headers.insert("User-Agent".to_string(), "TestAgent/1.0".to_string());
-        let p = make_provider("test", "https://example.com", None).with_extra_headers(headers);
+        let p =
+            make_model_provider("test", "https://example.com", None).with_extra_headers(headers);
         // Should not panic
         let _client = p.http_client();
     }
 
     #[test]
     fn http_client_without_extra_headers_or_user_agent() {
-        let p = make_provider("test", "https://example.com", None);
+        let p = make_model_provider("test", "https://example.com", None);
         // Should use the cached proxy client path
         let _client = p.http_client();
     }
@@ -4311,7 +5108,8 @@ mod tests {
     fn extra_headers_combined_with_user_agent() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
-        let p = OpenAiCompatibleProvider::new_with_user_agent(
+        let p = OpenAiCompatibleModelProvider::new_with_user_agent(
+            "test",
             "test",
             "https://example.com",
             None,
@@ -4327,7 +5125,7 @@ mod tests {
 
     #[test]
     fn tool_call_none_fields_omitted_from_json() {
-        // Ensures providers like Mistral that reject extra fields (e.g. "name": null)
+        // Ensures model_providers like Mistral that reject extra fields (e.g. "name": null)
         // don't receive them when the ToolCall compat fields are None.
         let tc = ToolCall {
             id: Some("call_1".to_string()),
@@ -4339,6 +5137,7 @@ mod tests {
             name: None,
             arguments: None,
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert!(!json.as_object().unwrap().contains_key("name"));
@@ -4360,6 +5159,7 @@ mod tests {
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["name"], "shell");
@@ -4450,7 +5250,7 @@ mod tests {
     /// When `native_tool_calling = false`, the filter pass rewrites
     /// `assistant{tool_calls, content="I'll search"}` into `assistant("I'll
     /// search")` and drops the following `tool{result}`. That leaves two
-    /// adjacent assistant messages in the output, which providers targeted
+    /// adjacent assistant messages in the output, which model_providers targeted
     /// by this path (Anthropic upstream, MiniMax, other OpenAI-compat
     /// wrappers) reject with HTTP 400.
     #[test]
@@ -4463,7 +5263,8 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found 10 results"}"#),
             ChatMessage::assistant("Here are the results about cats"),
         ];
-        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -4503,7 +5304,8 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found"}"#),
             ChatMessage::assistant("Here are the results"),
         ];
-        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),

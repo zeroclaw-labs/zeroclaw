@@ -4,7 +4,11 @@ use super::serial::SerialTransport;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(HardwareCapabilitiesTool, ToolKind::Plugin);
 
 /// Tool: query device capabilities (GPIO pins, LED pin) from firmware.
 pub struct HardwareCapabilitiesTool {

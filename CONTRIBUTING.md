@@ -31,7 +31,7 @@ All PRs target **`master`**. PRs targeting `main` will be rejected.
 3. **Fork → branch → change → test → PR.** PRs target `master`. Use `feat/*` or `fix/*` branch names.
 4. **Open a draft PR early** if you get stuck and ask questions in the description.
 
-For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**.
+For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**. For non-trivial architecture, workflow, config, security, or agent-assisted changes, use the **[Architecture and contribution map](docs/book/src/contributing/architecture-map.md)** to find the right foundation and architecture context before implementing.
 
 ## Development setup
 
@@ -59,7 +59,6 @@ Pre-push hook opt-ins (set the env var to enable for one push):
 | Variable | Effect |
 |---|---|
 | `ZEROCLAW_STRICT_LINT=1` | Strict lint pass on the full repo |
-| `ZEROCLAW_STRICT_DELTA_LINT=1` | Strict lint on changed Rust lines only |
 | `ZEROCLAW_DOCS_LINT=1` | Markdown gate on changed lines |
 | `ZEROCLAW_DOCS_LINKS=1` | Link check on added links only |
 
@@ -77,10 +76,19 @@ ZeroClaw supports layered secret management for local development.
 **API key resolution order:**
 
 1. Explicit key passed from config or CLI.
-2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …).
-3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`).
+2. `ZEROCLAW_<lowercase_dotted_path>` env-var override (lands on the in-memory `Config` at load time; see below).
 
-Provider/model overrides via `ZEROCLAW_PROVIDER`, `PROVIDER`, `ZEROCLAW_MODEL`. See `.env.example` for the supported list.
+Set credentials in your config file (`~/.zeroclaw/config.toml` by default; custom workspaces override the path) under `[providers.models.<type>.<alias>]`, or inject at runtime via the V0.8.0 schema-mirror grammar:
+
+```sh
+ZEROCLAW_providers__models__anthropic__default__api_key=sk-ant-...
+ZEROCLAW_providers__models__openrouter__prod_v2__model=anthropic/claude-sonnet-4-6
+ZEROCLAW_gateway__request_timeout_secs=120
+```
+
+The lowercase tail mirrors the dotted TOML path 1:1; each `__` (double underscore) is a path separator (`.` in TOML) and each single `_` is either a snake-case joiner inside a field name (`api_key` → `api-key`) or a literal char inside an alias key (`prod_v2`). Aliases are `[a-z0-9][a-z0-9_]{0,62}` — lowercase letters, digits, and single underscores; no leading underscore, no hyphen, no uppercase. Bootstrap variables (`ZEROCLAW_WORKSPACE`, `ZEROCLAW_CONFIG_DIR`) keep their UPPERCASE form; the case rule disambiguates them from the schema-mirror surface.
+
+V0.8.0 eradicated every per-provider env-var fallback (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, …), the generic `ZEROCLAW_API_KEY` / `API_KEY`, and the legacy `ZEROCLAW_PROVIDER` / `PROVIDER` / `ZEROCLAW_MODEL` dispatchers. Legacy names have no runtime effect — they're silently ignored. See `docs/book/src/reference/env-vars.md` for the migration table and the `💉` visibility behavior.
 
 **Never commit:** `.env`, API keys / tokens / passwords / OAuth tokens / webhook signing secrets, `~/.zeroclaw/.secret_key`, or any personal identifier in tests or fixtures. The full content discipline is in **[Privacy & PII](docs/book/src/contributing/privacy.md)**.
 
@@ -106,6 +114,7 @@ The book is the source of truth for everything contributor-facing. Quick links:
 | Topic | Page |
 |---|---|
 | The full contribution flow | [How to contribute](docs/book/src/contributing/how-to.md) |
+| What to read before architecture-sensitive changes | [Architecture and contribution map](docs/book/src/contributing/architecture-map.md) |
 | Communication channels | [Communication](docs/book/src/contributing/communication.md) |
 | Filing an RFC | [RFC process](docs/book/src/contributing/rfcs.md) |
 | Privacy & PII rules | [Privacy](docs/book/src/contributing/privacy.md) |
@@ -124,7 +133,7 @@ For maintainer-facing content (PR workflow, reviewer playbook, release runbook, 
 - **Template is mandatory.** Complete every section in `.github/pull_request_template.md`.
 - **Validation evidence is required** — actual command output, not "CI will check."
 - **Privacy and identity discipline is a merge gate.** Never commit real names, emails, tokens, or PII.
-- **Co-authoring with AI is welcome.** Use the `Co-Authored-By` trailer where AI tools materially contributed.
+- **AI-assisted collaboration is welcome.** Do not add bot/AI attribution trailers or generated tool footers to PR bodies or commit-message tails. Human `Co-authored-by` trailers remain appropriate for incorporated contributor work when they follow the superseding and privacy rules.
 - **Squash-merge with conventional commits** is the merge style.
 
 ## Reporting

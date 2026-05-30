@@ -23,14 +23,14 @@ impl Observer for VerboseObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::LlmRequest {
-                provider,
+                model_provider,
                 model,
                 messages_count,
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
-                    "> Send (provider={}, model={}, messages={})",
-                    provider, model, messages_count
+                    "> Send (model_provider={}, model={}, messages={})",
+                    model_provider, model, messages_count
                 );
             }
             ObserverEvent::LlmResponse {
@@ -46,6 +46,7 @@ impl Observer for VerboseObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
@@ -83,12 +84,12 @@ mod tests {
     fn verbose_events_do_not_panic() {
         let obs = VerboseObserver::new();
         obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude".into(),
             messages_count: 3,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude".into(),
             duration: Duration::from_millis(12),
             success: true,
@@ -98,31 +99,17 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(2),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
-    }
-
-    #[test]
-    fn verbose_hand_events_do_not_panic() {
-        let obs = VerboseObserver::new();
-        obs.record_event(&ObserverEvent::HandStarted {
-            hand_name: "review".into(),
-        });
-        obs.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 1500,
-            findings_count: 3,
-        });
-        obs.record_event(&ObserverEvent::HandFailed {
-            hand_name: "review".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-        });
     }
 }

@@ -22,11 +22,15 @@
 - [Overview](./architecture/overview.md)
 - [Request lifecycle](./architecture/request-lifecycle.md)
 - [Crates](./architecture/crates.md)
+- [Logging](./architecture/logging.md)
+- [Multi-agent runtime](./architecture/multi-agent.md)
+- [SubAgents](./architecture/subagents.md)
 
 # Reference
 
 - [CLI](./reference/cli.md)
 - [Config](./reference/config.md)
+- [Environment variables](./reference/env-vars.md)
 - [API (rustdoc)](./api.md)
 - [Gateway HTTP API](./gateway/api.md)
 
@@ -35,7 +39,7 @@
 - [Overview](./providers/overview.md)
 - [Configuration](./providers/configuration.md)
 - [Streaming](./providers/streaming.md)
-- [Fallback & routing](./providers/fallback-and-routing.md)
+- [Routing](./providers/routing.md)
 - [Provider catalog](./providers/catalog.md)
 - [Custom providers](./providers/custom.md)
 
@@ -46,6 +50,8 @@
 - [Mattermost](./channels/mattermost.md)
 - [LINE](./channels/line.md)
 - [Nextcloud Talk](./channels/nextcloud-talk.md)
+- [Signal](./channels/signal.md)
+- [WhatsApp](./channels/whatsapp.md)
 - [Other chat platforms](./channels/chat-others.md)
 - [Social (Bluesky, Nostr, Twitter, Reddit)](./channels/social.md)
 - [Email](./channels/email.md)
@@ -58,6 +64,8 @@
 - [Overview](./tools/overview.md)
 - [MCP (Model Context Protocol)](./tools/mcp.md)
 - [Browser automation](./tools/browser.md)
+- [Skills](./tools/skills.md)
+- [Python skills](./tools/python-skills.md)
 
 # Security
 
@@ -71,6 +79,7 @@
 - [Overview](./ops/overview.md)
 - [Service & daemon](./ops/service.md)
 - [Logs & observability](./ops/observability.md)
+- [Cost tracking](./ops/cost-tracking.md)
 - [Troubleshooting](./ops/troubleshooting.md)
 - [Network deployment](./ops/network-deployment.md)
 
@@ -83,6 +92,7 @@
 - [STM32 Nucleo](./hardware/nucleo-setup.md)
 - [Android](./hardware/android-setup.md)
 - [Aardvark](./hardware/aardvark.md)
+- [Raspberry Pi](./hardware/raspberry-pi-setup.md)
 
 # SOP (Standard Operating Procedures)
 
@@ -112,11 +122,13 @@
 # Contributing
 
 - [How to contribute](./contributing/how-to.md)
+- [Architecture and contribution map](./contributing/architecture-map.md)
 - [RFC process](./contributing/rfcs.md)
 - [Communication](./contributing/communication.md)
 - [Privacy & PII discipline](./contributing/privacy.md)
 - [Testing](./contributing/testing.md)
 - [PR review protocol](./contributing/pr-review-protocol.md)
+- [Multi-agent setup](./contributing/multi-agent-setup.md)
 - [Contributor License Agreement](./contributing/cla.md)
 
 # Maintainers

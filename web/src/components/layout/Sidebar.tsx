@@ -2,9 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
-  Brain,
   Clock,
-  DollarSign,
   LayoutDashboard,
   MessageSquare,
   Monitor,
@@ -14,6 +12,8 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { useEffect, useState } from 'react';
+import { getStatus } from '@/lib/api';
 
 interface NavItem {
   to: string;
@@ -23,13 +23,11 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
-  { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
+  { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
   { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
-  { to: '/memory', icon: Brain, labelKey: 'nav.memory' },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
-  { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
@@ -198,6 +196,14 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
 }
 
 function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'desktop' | 'mobile' }) {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getStatus()
+      .then((s) => { if (s.version) setVersion(s.version); })
+      .catch(() => { /* silently ignore */ });
+  }, []);
+
   if (layout === 'mobile') {
     return (
       <div
@@ -205,6 +211,11 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
       >
         ZeroClaw Gateway
+        {version && (
+          <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
+            v{version}
+          </div>
+        )}
       </div>
     );
   }
@@ -223,6 +234,11 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
       }}
     >
       {!collapsed && 'ZeroClaw Gateway'}
+      {!collapsed && version && (
+        <div style={{ marginTop: '2px', fontSize: '9px', textTransform: 'none', letterSpacing: 'normal' }}>
+          v{version}
+        </div>
+      )}
     </div>
   );
 }
