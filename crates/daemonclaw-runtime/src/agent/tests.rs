@@ -1310,3 +1310,337 @@ async fn run_single_delegates_to_turn() {
         "Expected non-empty response from run_single"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Spine-contract tests: [20] TurnCompleteAction, [11] concurrency barriers
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod spine_contract {
+    use super::*;
+    use crate::agent::loop_::{run_tool_call_loop, append_receipt_footer};
+    use crate::hooks::{HookHandler, HookRunner, TurnCompleteAction};
+    use daemonclaw_api::agent::TurnResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── Hook that returns a scripted TurnCompleteAction ──────────────
+
+    struct ScriptedTurnHook {
+        action: TurnCompleteAction,
+    }
+
+    #[async_trait]
+    impl HookHandler for ScriptedTurnHook {
+        fn name(&self) -> &str {
+            "scripted_turn_hook"
+        }
+
+        async fn on_turn_complete(&self, _result: &TurnResult) -> TurnCompleteAction {
+            self.action.clone()
+        }
+    }
+
+    fn make_hooks(action: TurnCompleteAction) -> HookRunner {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(ScriptedTurnHook { action }));
+        runner
+    }
+
+    fn default_multimodal() -> daemonclaw_config::schema::MultimodalConfig {
+        daemonclaw_config::schema::MultimodalConfig::default()
+    }
+
+    // ── [20] Stop halts the loop ────────────────────────────────────
+    //
+    // Production call site: loop_.rs line 1662-1668
+    // The Stop arm returns Ok(...) immediately after fire_turn_complete.
+    // Because the hook fires inside `if tool_calls.is_empty()`, which is
+    // already the exit path, Stop and Continue both return — the difference
+    // is that Stop skips fire_extract_post_turn. We test that the loop
+    // exits cleanly with Stop and returns the accumulated text, AND that
+    // if we switch the hook to PreventStop, the loop does NOT exit on the
+    // first final response (proving the action is actually read).
+    #[tokio::test]
+    async fn hook_stop_exits_loop_and_prevent_stop_forces_continuation() {
+        // Provider returns a final text response (no tool calls).
+        let provider = ScriptedProvider::new(vec![
+            ChatResponse {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("second answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let observer = NoopObserver {};
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let multimodal = default_multimodal();
+
+        // With Stop: loop should return after first response.
+        let hooks_stop = make_hooks(TurnCompleteAction::Stop);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("question"),
+        ];
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, Some(&hooks_stop),
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        assert!(
+            result.contains("first answer"),
+            "Stop should return the first response, got: {result}"
+        );
+        // Provider should have been called exactly once.
+        assert_eq!(provider.request_count(), 1, "Stop should exit after one LLM call");
+
+        // With PreventStop: loop should continue past the first final
+        // response and make additional LLM calls (bounded by MAX_HOOK_CONTINUATIONS=5).
+        let provider2 = ScriptedProvider::new(vec![
+            ChatResponse {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("second answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let hooks_prevent = make_hooks(TurnCompleteAction::PreventStop);
+        let mut history2 = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("question"),
+        ];
+        let result2 = run_tool_call_loop(
+            &provider2, &mut history2, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, Some(&hooks_prevent),
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // PreventStop should have forced more than 1 call before the
+        // continuation budget (5) is exhausted and the loop exits.
+        assert!(
+            provider2.request_count() >= 2,
+            "PreventStop should force at least 2 LLM calls, got {}",
+            provider2.request_count()
+        );
+    }
+
+    // ── [20] InjectError injects message and continues ──────────────
+    //
+    // Production call site: loop_.rs line 1675-1678
+    // InjectError pushes a user message with "[Hook error] <msg>" and
+    // continues the loop. We verify the error appears in history and
+    // the loop makes another LLM call rather than exiting.
+    #[tokio::test]
+    async fn hook_inject_error_lands_in_history_and_loop_continues() {
+        let provider = ScriptedProvider::new(vec![
+            // First: final response → triggers InjectError hook → loop continues
+            ChatResponse {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            // Second: final response after the injected error → loop exits normally
+            ChatResponse {
+                text: Some("recovered".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let observer = NoopObserver {};
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let multimodal = default_multimodal();
+
+        let hooks = make_hooks(TurnCompleteAction::InjectError(
+            "test_sentinel_error_42".into(),
+        ));
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("question"),
+        ];
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, Some(&hooks),
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // The hook fires on every final response and injects an error,
+        // causing the loop to continue. The continuation budget (5) eventually
+        // exhausts and the loop exits. We assert:
+        //
+        // 1. The injected error message appeared in history.
+        let has_injected = history
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("test_sentinel_error_42"));
+        assert!(
+            has_injected,
+            "InjectError should place '[Hook error] test_sentinel_error_42' in history"
+        );
+
+        // 2. The provider was called more than once (loop continued, didn't
+        //    exit on first final response like Stop would).
+        assert!(
+            provider.request_count() >= 2,
+            "InjectError should cause the loop to continue, got {} calls",
+            provider.request_count()
+        );
+
+        // 3. Distinguish from Stop: with Stop the provider is called exactly once.
+        //    With InjectError it must be called multiple times.
+        assert!(
+            provider.request_count() > 1,
+            "InjectError must differ from Stop (which calls provider exactly once)"
+        );
+    }
+
+    // ── [11] Exclusive tool forms a barrier ──────────────────────────
+    //
+    // Production call site: loop_.rs line 1975-1993
+    // partition_tool_calls groups consecutive safe tools into parallel
+    // batches; non-safe tools form single-item serial barriers.
+    // execute_tools_batched processes batches in order.
+    //
+    // We test by having 3 tools called in one iteration: safe_a, exclusive,
+    // safe_b. The exclusive tool should NOT run concurrently with either
+    // safe tool. We verify by recording wall-clock overlap.
+
+    struct TimestampTool {
+        tool_name: String,
+        safe: bool,
+        log: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>>,
+    }
+
+    #[async_trait]
+    impl Tool for TimestampTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+        fn description(&self) -> &str {
+            "Records execution timestamps"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
+            self.safe
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            let start = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let end = std::time::Instant::now();
+            self.log.lock().unwrap().push((
+                self.tool_name.clone(),
+                start,
+                end,
+            ));
+            Ok(ToolResult {
+                success: true,
+                output: format!("{} done", self.tool_name),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn exclusive_tool_does_not_overlap_with_safe_tools() {
+        use crate::agent::tool_execution::{partition_tool_calls, execute_tools_batched};
+        use crate::agent::loop_::ParsedToolCall;
+
+        let log: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(TimestampTool {
+                tool_name: "safe_a".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+            Box::new(TimestampTool {
+                tool_name: "exclusive".into(),
+                safe: false,
+                log: Arc::clone(&log),
+            }),
+            Box::new(TimestampTool {
+                tool_name: "safe_b".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+        ];
+
+        let calls = vec![
+            ParsedToolCall {
+                name: "safe_a".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("c1".into()),
+            },
+            ParsedToolCall {
+                name: "exclusive".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("c2".into()),
+            },
+            ParsedToolCall {
+                name: "safe_b".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("c3".into()),
+            },
+        ];
+
+        let batches = partition_tool_calls(&calls, &tools, None);
+
+        // Verify partitioning: safe_a alone, exclusive alone, safe_b alone.
+        // (safe_a and safe_b are not consecutive — exclusive sits between them)
+        assert_eq!(batches.len(), 3, "3 tools with exclusive in the middle should produce 3 batches");
+        assert!(batches[0].concurrent, "first batch (safe_a) should be concurrent-capable");
+        assert!(!batches[1].concurrent, "second batch (exclusive) should be serial");
+        assert!(batches[2].concurrent, "third batch (safe_b) should be concurrent-capable");
+
+        let observer = NoopObserver {};
+        let outcomes = execute_tools_batched(
+            &calls, &batches, &tools, None, &observer, None, None,
+        ).await.unwrap();
+
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|o| o.success));
+
+        // Verify no temporal overlap between exclusive and either safe tool.
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries.len(), 3, "all 3 tools should have executed");
+
+        let exclusive_entry = entries.iter().find(|(n, _, _)| n == "exclusive").unwrap();
+        for (name, start, end) in &entries {
+            if name == "exclusive" {
+                continue;
+            }
+            let overlaps = *start < exclusive_entry.2 && *end > exclusive_entry.1;
+            assert!(
+                !overlaps,
+                "Tool '{name}' ({}ms..{}ms) overlapped with exclusive ({}ms..{}ms)",
+                start.duration_since(entries[0].1).as_millis(),
+                end.duration_since(entries[0].1).as_millis(),
+                exclusive_entry.1.duration_since(entries[0].1).as_millis(),
+                exclusive_entry.2.duration_since(entries[0].1).as_millis(),
+            );
+        }
+    }
+}

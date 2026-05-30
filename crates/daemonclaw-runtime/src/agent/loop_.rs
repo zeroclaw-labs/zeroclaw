@@ -919,6 +919,8 @@ pub async fn run_tool_call_loop(
         crate::agent::context_pipeline::ContextPipeline::default_preemptive();
     let retry_policy = crate::agent::retry::RetryPolicy::default();
     let mut consecutive_retries: u32 = 0;
+    let mut hook_continuation_count: u32 = 0;
+    const MAX_HOOK_CONTINUATIONS: u32 = 5;
 
     // Preflight: if history already exceeds the model's context window on
     // entry (e.g. after a model switch to a smaller window), compact now.
@@ -1668,11 +1670,20 @@ pub async fn run_tool_call_loop(
                         ));
                     }
                     crate::hooks::TurnCompleteAction::PreventStop => {
-                        // Hook wants another iteration — don't return yet.
+                        hook_continuation_count += 1;
+                        if hook_continuation_count > MAX_HOOK_CONTINUATIONS {
+                            tracing::warn!("Hook PreventStop exhausted continuation budget, exiting");
+                            break;
+                        }
                         history.push(ChatMessage::assistant(response_text.clone()));
                         continue;
                     }
                     crate::hooks::TurnCompleteAction::InjectError(msg) => {
+                        hook_continuation_count += 1;
+                        if hook_continuation_count > MAX_HOOK_CONTINUATIONS {
+                            tracing::warn!("Hook InjectError exhausted continuation budget, exiting");
+                            break;
+                        }
                         history.push(ChatMessage::assistant(response_text.clone()));
                         history.push(ChatMessage::user(format!("[Hook error] {msg}")));
                         continue;
