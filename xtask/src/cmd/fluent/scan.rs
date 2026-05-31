@@ -3,13 +3,13 @@ use crate::util::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(catalog: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
 
     // Collect all en keys across every catalogue root.
     let mut en_keys: HashSet<String> = HashSet::new();
     let mut found_en = false;
-    for locales_dir in fluent_catalog_roots(&root) {
+    for locales_dir in fluent_catalog_roots_for(&root, catalog)? {
         let en_dir = locales_dir.join("en");
         if !en_dir.exists() {
             continue;

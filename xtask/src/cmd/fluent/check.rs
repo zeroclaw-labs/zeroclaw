@@ -2,13 +2,13 @@ use crate::cmd::fluent::catalog::message_ids;
 use crate::util::*;
 use std::path::Path;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(catalog: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
 
     let mut error_count = 0;
     let mut checked_any = false;
 
-    for locales_dir in fluent_catalog_roots(&root) {
+    for locales_dir in fluent_catalog_roots_for(&root, catalog)? {
         if !locales_dir.exists() {
             continue;
         }

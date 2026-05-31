@@ -7,7 +7,7 @@ ZeroClaw has two independent translation layers:
 | **App strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
 | **Docs** | gettext (`.po`) | Everything in this mdBook |
 
-They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<type>.<alias>]` and pass `--provider <type>` to the fill commands.
+They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<kind>.<alias>]` and pass `--model-provider <alias>` to the fill commands. Any configured alias is choosable — a bare alias (`--model-provider lineation`), or a `kind.alias` qualifier (`--model-provider anthropic.lineation`) when the same alias exists under more than one kind. The resolver reads `uri`, `model`, and `api_key` straight from the matched entry; a missing `uri` or `model` is a hard error, not a guessed default.
 
 Local models via [Ollama](https://ollama.com) are a first-class option — no API keys required, no per-call cost. A hosted provider is also fine for release-grade quality. Translation is a local operation. Run `cargo mdbook sync` for dedicated translation-cache PRs, release translation passes, and new locales; routine English docs PRs may defer broad generated `.po` churn to a focused follow-up.
 
@@ -18,9 +18,11 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 ```toml
 # Local via Ollama — free, runs on your machine
 [providers.models.ollama.local]
-uri   = "http://localhost:11434"
+uri   = "http://localhost:11434/v1/chat/completions"
 model = "qwen3.6:35b-a3b" # Current preferred model
 ```
+
+`uri` is the full endpoint URL. If it already ends in `/chat/completions` it is used verbatim; a bare base (`http://localhost:11434`) has `/v1/chat/completions` appended. A hosted alias works the same way — point `uri` at the provider's OpenAI-compatible completions endpoint and set `api_key`.
 
 ## Building the docs locally
 
@@ -30,16 +32,18 @@ model = "qwen3.6:35b-a3b" # Current preferred model
 
 App strings live in `crates/zeroclaw-runtime/locales/`. English is the source of truth and is embedded at compile time. Non-English locales are loaded from `~/.zeroclaw/workspace/locales/` at runtime.
 
-> The `apps/zerocode` TUI maintains an independent Fluent catalogue (`apps/zerocode/locales/`) — see [zerocode strings](#zerocode-strings-fluent-independent) below. `cargo fluent` operates on the runtime catalogue only.
+> The `apps/zerocode` TUI maintains an independent Fluent catalogue (`apps/zerocode/locales/`) — see [zerocode strings](#zerocode-strings-fluent-independent) below. `cargo fluent` walks **both** catalogue roots (runtime + zerocode), so every subcommand below covers zerocode automatically.
 
 ```bash
-cargo fluent stats                                          # coverage per locale
-cargo fluent check                                          # validate .ftl syntax
-cargo fluent fill --locale ja --provider ollama             # fill missing keys (default batch 50)
-cargo fluent fill --locale ja --provider ollama --batch 1   # one-at-a-time (use when a file has long entries that truncate at batch 50, e.g. tools.ftl)
-cargo fluent fill --locale ja --provider ollama --force     # retranslate everything
-cargo fluent scan                                           # find stale or missing keys vs Rust source
+cargo fluent stats                                                 # coverage per locale, per catalogue
+cargo fluent check                                                 # validate .ftl syntax across both catalogues
+cargo fluent fill --locale ja --model-provider lineation           # fill missing keys (default batch 50)
+cargo fluent fill --locale ja --model-provider lineation --batch 1 # one-at-a-time (use when a file has long entries that truncate at batch 50, e.g. tools.ftl)
+cargo fluent fill --locale ja --model-provider lineation --force   # retranslate everything
+cargo fluent scan                                                  # find stale or missing keys vs Rust source
 ```
+
+`fill` generates `<locale>/<domain>.ftl` for **every** catalogue root that has an `en/` directory — the runtime's `cli.ftl`/`tools.ftl` and zerocode's `zerocode.ftl` are all produced in one run. `--model-provider` accepts any alias configured under `[providers.models.<kind>.<alias>]`; if the alias is ambiguous across kinds the error lists the qualified `kind.alias` forms to pick from.
 
 Each batch is written to disk before the next API call, so a mid-run failure only loses the in-flight batch. Re-running skips keys that already exist in the target `.ftl`, so resume is automatic — no `--force` needed.
 
@@ -87,7 +91,7 @@ Locale comes from a top-level `locale` field in `zerocode-config.toml`. When uns
 
 ### Filling translations
 
-`cargo fluent` does **not** currently know about `apps/zerocode/locales/`. The runtime tool is hard-coded to `crates/zeroclaw-runtime/locales/`. Until that is taught about a second catalogue, translation passes for zerocode are manual: copy `en/zerocode.ftl` to `<locale>/zerocode.ftl`, translate values in place, drop the file in any of the disk-search paths listed above, and run zerocode with `--config-dir` pointing at the override.
+`cargo fluent` walks the zerocode catalogue alongside the runtime one, so no manual step is needed. Running `cargo fluent fill --locale <code> --model-provider <alias>` generates `apps/zerocode/locales/<code>/zerocode.ftl` in the same pass that fills the runtime catalogue. `cargo fluent check` and `cargo fluent stats` likewise report zerocode; `scan` indexes `apps/` so `zc-` key references resolve against zerocode's source. The generated `<code>/zerocode.ftl` is embedded in-tree at compile time, or can be dropped into any of the disk-search paths above for testing with `--config-dir`.
 
 ## Filling doc translations (gettext)
 

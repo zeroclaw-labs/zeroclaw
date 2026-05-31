@@ -118,11 +118,46 @@ pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
 /// Catalogue roots that `cargo fluent` walks. Each root holds `<locale>/`
 /// subdirectories of `.ftl` files. The runtime catalogue is the primary
 /// source; zerocode ships an independent catalogue under the same layout.
-pub fn fluent_catalog_roots(root: &Path) -> Vec<PathBuf> {
+/// Named Fluent catalogue roots. Each root holds `<locale>/` subdirectories of
+/// `.ftl` files. The runtime catalogue is the primary source; zerocode ships an
+/// independent catalogue under the same layout. The name is the `--catalog`
+/// selector value.
+pub fn fluent_catalog_roots_named(root: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
-        root.join("crates/zeroclaw-runtime/locales"),
-        root.join("apps/zerocode/locales"),
+        ("runtime", root.join("crates/zeroclaw-runtime/locales")),
+        ("zerocode", root.join("apps/zerocode/locales")),
     ]
+}
+
+/// Catalogue roots filtered by an optional `--catalog` name. `None` returns all
+/// roots; an unknown name is an error listing the valid choices.
+pub fn fluent_catalog_roots_for(
+    root: &Path,
+    catalog: Option<&str>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let all = fluent_catalog_roots_named(root);
+    match catalog {
+        None => Ok(all.into_iter().map(|(_, p)| p).collect()),
+        Some(name) => {
+            if let Some((_, path)) = all.iter().find(|(n, _)| *n == name) {
+                Ok(vec![path.clone()])
+            } else {
+                let choices = all
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("unknown --catalog '{name}'; valid choices: {choices}")
+            }
+        }
+    }
+}
+
+pub fn fluent_catalog_roots(root: &Path) -> Vec<PathBuf> {
+    fluent_catalog_roots_named(root)
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect()
 }
 
 pub fn fluent_locales_dir(root: &Path) -> PathBuf {
@@ -161,51 +196,73 @@ pub fn ftl_files_in(locale_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-pub struct ProviderConfig {
-    pub base_url: String,
-    pub model: Option<String>,
-    pub api_key: Option<String>,
-}
-
-/// Read a `[providers.models.<name>]` entry from ~/.zeroclaw/config.toml.
-pub fn read_model_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
+/// Build a ready-to-use `ModelProvider` for a configured alias, loading the
+/// typed `Config` from `config_dir` (mirrors `zeroclaw --config-dir`; defaults
+/// to ~/.zeroclaw then ~/.config/zeroclaw). The provider stack resolves the
+/// family endpoint, auth header, wire protocol, and decrypts secrets — this
+/// tool hand-rolls none of it. Returns the provider plus the resolved model id.
+pub fn build_model_provider(
+    provider_name: &str,
+    config_dir: Option<&str>,
+) -> anyhow::Result<(Box<dyn zeroclaw_api::model_provider::ModelProvider>, String)> {
     let home =
         std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
-    let candidates = [
-        format!("{home}/.zeroclaw/config.toml"),
-        format!("{home}/.config/zeroclaw/config.toml"),
-    ];
-    let raw = candidates
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
+    let dir_candidates: Vec<std::path::PathBuf> = match config_dir {
+        Some(d) => vec![std::path::PathBuf::from(d)],
+        None => vec![
+            std::path::PathBuf::from(format!("{home}/.zeroclaw")),
+            std::path::PathBuf::from(format!("{home}/.config/zeroclaw")),
+        ],
+    };
+    let dir = dir_candidates
+        .into_iter()
+        .find(|d| d.join("config.toml").is_file())
         .ok_or_else(|| {
-            anyhow::Error::msg("config.toml not found (tried ~/.zeroclaw/config.toml)")
+            anyhow::Error::msg(
+                "config.toml not found (looked under --config-dir / ~/.zeroclaw / ~/.config/zeroclaw)",
+            )
         })?;
 
-    let table: toml::Table = raw.parse()?;
-    let model_provider = table
-        .get("model_providers")
-        .and_then(|v| v.get("models"))
-        .and_then(|v| v.get(provider_name))
-        .ok_or_else(|| {
-            anyhow::Error::msg("[providers.models.{provider_name}] not found in config.toml")
-        })?;
+    let raw = std::fs::read_to_string(dir.join("config.toml"))?;
+    let mut config: zeroclaw_config::schema::Config = toml::from_str(&raw)?;
 
-    Ok(ProviderConfig {
-        base_url: model_provider
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:11434")
-            .to_string(),
-        model: model_provider
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        api_key: model_provider
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-    })
+    // Decrypt secrets through the canonical store (same path the daemon uses).
+    let store = zeroclaw_config::secrets::SecretStore::new(&dir, config.secrets.encrypt);
+    config.decrypt_secrets(&store)?;
+
+    // Resolve bare-or-dotted name to a concrete `kind.alias` + its model + key.
+    let (kind, alias, model, api_key) = {
+        let (k, a, cfg) = config
+            .providers
+            .models
+            .find_by_name(provider_name)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "model-provider '{provider_name}' not found (or ambiguous) under \
+                     [providers.models.<kind>.<alias>] in config.toml"
+                ))
+            })?;
+        let model = cfg.model.clone().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model-provider '{provider_name}' has no `model` set under its \
+                 [providers.models.<kind>.<alias>] entry"
+            ))
+        })?;
+        (k, a, model, cfg.api_key.clone())
+    };
+    let dotted = format!("{kind}.{alias}");
+
+    let options = zeroclaw_providers::provider_runtime_options_for_alias(&config, kind, &alias);
+    let provider = zeroclaw_providers::create_resilient_model_provider_from_ref(
+        &config,
+        &dotted,
+        api_key.as_deref(),
+        None,
+        &config.reliability,
+        &options,
+    )?;
+
+    Ok((provider, model))
 }
 
 pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -221,3 +278,4 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
     }
     Ok(())
 }
+

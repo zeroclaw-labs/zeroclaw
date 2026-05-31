@@ -3135,10 +3135,11 @@ version = "0.8.0-beta-2"
 dependencies = [
  "anyhow",
  "clap",
- "reqwest 0.12.28",
  "serde_json",
  "tokio",
  "toml 0.8.23",
+ "xtask",
+ "zeroclaw-api",
 ]
 
 [[package]]
@@ -12777,7 +12778,10 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tower-http",
+ "zeroclaw-api",
+ "zeroclaw-config",
  "zeroclaw-gateway",
+ "zeroclaw-providers",
 ]
 
 [[package]]

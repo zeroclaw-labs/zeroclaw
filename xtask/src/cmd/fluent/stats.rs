@@ -1,10 +1,10 @@
 use crate::cmd::fluent::catalog::message_ids_from_file;
 use crate::util::*;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(catalog: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
 
-    for locales_dir in fluent_catalog_roots(&root) {
+    for locales_dir in fluent_catalog_roots_for(&root, catalog)? {
         let en_dir = locales_dir.join("en");
         if !en_dir.exists() {
             continue;
