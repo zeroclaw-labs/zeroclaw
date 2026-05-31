@@ -334,6 +334,7 @@ struct InterruptOnNewMessageConfig {
     discord: bool,
     mattermost: bool,
     matrix: bool,
+    whatsapp: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -344,8 +345,40 @@ impl InterruptOnNewMessageConfig {
             "discord" => self.discord,
             "mattermost" => self.mattermost,
             "matrix" => self.matrix,
+            "whatsapp" => self.whatsapp,
             _ => false,
         }
+    }
+}
+
+fn interrupt_on_new_message_config(
+    channels: &zeroclaw_config::schema::ChannelsConfig,
+) -> InterruptOnNewMessageConfig {
+    InterruptOnNewMessageConfig {
+        telegram: channels
+            .telegram
+            .get("default")
+            .is_some_and(|tg| tg.interrupt_on_new_message),
+        slack: channels
+            .slack
+            .get("default")
+            .is_some_and(|sl| sl.interrupt_on_new_message),
+        discord: channels
+            .discord
+            .get("default")
+            .is_some_and(|dc| dc.interrupt_on_new_message),
+        mattermost: channels
+            .mattermost
+            .get("default")
+            .is_some_and(|mm| mm.interrupt_on_new_message),
+        matrix: channels
+            .matrix
+            .get("default")
+            .is_some_and(|mx| mx.interrupt_on_new_message),
+        whatsapp: channels
+            .whatsapp
+            .get("default")
+            .is_some_and(|wa| wa.interrupt_on_new_message),
     }
 }
 
@@ -8195,31 +8228,7 @@ pub async fn start_channels(
         provider_cache_seed.insert(provider_name.clone(), Arc::clone(&model_provider));
         let message_timeout_secs =
             effective_channel_message_timeout_secs(config.channels.message_timeout_secs);
-        let interrupt_on_new_message = config
-            .channels
-            .telegram
-            .get("default")
-            .is_some_and(|tg| tg.interrupt_on_new_message);
-        let interrupt_on_new_message_slack = config
-            .channels
-            .slack
-            .get("default")
-            .is_some_and(|sl| sl.interrupt_on_new_message);
-        let interrupt_on_new_message_discord = config
-            .channels
-            .discord
-            .get("default")
-            .is_some_and(|dc| dc.interrupt_on_new_message);
-        let interrupt_on_new_message_mattermost = config
-            .channels
-            .mattermost
-            .get("default")
-            .is_some_and(|mm| mm.interrupt_on_new_message);
-        let interrupt_on_new_message_matrix = config
-            .channels
-            .matrix
-            .get("default")
-            .is_some_and(|mx| mx.interrupt_on_new_message);
+        let interrupt_on_new_message = interrupt_on_new_message_config(&config.channels);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&channels_by_name),
@@ -8249,13 +8258,7 @@ pub async fn start_channels(
             provider_runtime_options,
             workspace_dir: Arc::new(config.data_dir.clone()),
             message_timeout_secs,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: interrupt_on_new_message,
-                slack: interrupt_on_new_message_slack,
-                discord: interrupt_on_new_message_discord,
-                mattermost: interrupt_on_new_message_mattermost,
-                matrix: interrupt_on_new_message_matrix,
-            },
+            interrupt_on_new_message,
             multimodal: config.multimodal.clone(),
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
@@ -9033,6 +9036,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -9708,6 +9712,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -9840,6 +9845,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -9929,6 +9935,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -10036,6 +10043,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -10186,6 +10194,11 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct WhatsAppRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for TelegramRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -10242,6 +10255,47 @@ mod tests {
     impl Channel for SlackRecordingChannel {
         fn name(&self) -> &str {
             "slack"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for WhatsAppRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WhatsAppRecordingChannel {
+        fn name(&self) -> &str {
+            "whatsapp"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -10383,6 +10437,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -11006,6 +11061,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -11111,6 +11167,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -11217,6 +11274,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             // Full autonomy + auto-approve mock_price so the loop actually
@@ -11362,6 +11420,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             // Match the enabled-test setup so the tool actually runs; the
@@ -11478,6 +11537,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::Full,
@@ -11609,6 +11669,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -11723,6 +11784,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -11822,6 +11884,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -11934,6 +11997,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12072,6 +12136,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12408,6 +12473,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12502,6 +12568,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12606,6 +12673,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12969,6 +13037,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13102,6 +13171,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13245,6 +13315,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -13342,6 +13413,149 @@ timeout_secs = 5
     }
 
     #[tokio::test]
+    async fn message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context() {
+        let channel_impl = Arc::new(WhatsAppRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let mut channel_config = zeroclaw_config::schema::ChannelsConfig::default();
+        channel_config.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            default_model_provider: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = tokio::spawn(async move {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "15555550123".to_string(),
+                reply_target: "15555550123".to_string(),
+                content: "first WhatsApp question".to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some("default".to_string()),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "15555550123".to_string(),
+                reply_target: "15555550123".to_string(),
+                content: "second WhatsApp question".to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some("default".to_string()),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("15555550123:"));
+        assert!(sent_messages[0].contains("response-2"));
+        drop(sent_messages);
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        let second_call = &calls[1];
+        assert!(second_call.iter().any(|(role, content)| {
+            role == "user" && content.contains("first WhatsApp question")
+        }));
+        assert!(second_call.iter().any(|(role, content)| {
+            role == "user" && content.contains("second WhatsApp question")
+        }));
+        assert!(
+            !second_call.iter().any(|(role, _)| role == "assistant"),
+            "cancelled turn should not persist an assistant response"
+        );
+    }
+
+    #[tokio::test]
     async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -13385,6 +13599,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13503,6 +13718,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13602,6 +13818,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -14777,6 +14994,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -14934,6 +15152,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -15133,6 +15352,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -15259,6 +15479,7 @@ timeout_secs = 5
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16258,6 +16479,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16364,6 +16586,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16506,6 +16729,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             hooks: None,
@@ -16696,6 +16920,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16837,6 +17062,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16970,6 +17196,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -17123,6 +17350,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -17337,6 +17565,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: true,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -17349,6 +17578,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -17361,8 +17591,40 @@ This is an example JSON object for profile settings."#;
             discord: true,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_enabled_for_whatsapp() {
+        let cfg = InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: true,
+        };
+        assert!(cfg.enabled_for_channel("whatsapp"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_config_reads_whatsapp_default_alias() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(cfg.enabled_for_channel("whatsapp"));
+        assert!(!cfg.enabled_for_channel("telegram"));
     }
 
     #[test]
@@ -17373,6 +17635,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -17478,6 +17741,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),

@@ -9,6 +9,14 @@ ZeroClaw supports two WhatsApp backends under the same `channels.whatsapp` confi
 
 Do not configure both selectors in the same channel unless you intentionally want Cloud API mode to win for backward compatibility.
 
+## Shared options
+
+These options apply to both Cloud API mode and Web mode:
+
+| Field | Values | Effect |
+|---|---|---|
+| `interrupt_on_new_message` | `true`, `false` | Cancels an in-flight response from the same sender/chat when a newer WhatsApp message arrives |
+
 ## Cloud API mode
 
 Cloud API mode is the Meta Business Platform integration. It requires a Meta Business account, a WhatsApp Business app, a phone number ID, a verify token, and an access token. It is the right mode for business deployments that receive messages through Meta webhooks.
@@ -36,6 +44,7 @@ mode = "personal"
 dm_policy = "allowlist"
 group_policy = "allowlist"
 mention_only = true
+interrupt_on_new_message = true
 
 [agents.assistant]
 enabled = true
