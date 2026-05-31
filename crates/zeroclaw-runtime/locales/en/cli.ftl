@@ -395,3 +395,16 @@ onboard-openai-auth-codex = Codex subscription
 onboard-openai-codex-followup =
     Codex subscription auth uses your ChatGPT account.
     Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.
+
+# Diagnostics emitted by `zeroclaw doctor` and `zeroclaw self-test` for
+# `gateway.web_dist_dir` values that rely on shell-style expansion the
+# gateway never performs (a leading `~` or any `$VAR` / `${VAR}`).
+# Issue #6079; companion runtime check in
+# `crates/zeroclaw-runtime/src/doctor/mod.rs` and `src/commands/self_test.rs`.
+cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
+cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
+cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
+cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)

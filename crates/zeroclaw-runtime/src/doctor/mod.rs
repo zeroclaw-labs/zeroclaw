@@ -693,31 +693,37 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 /// find the bundled assets — surface that here at `zeroclaw doctor` time
 /// instead of at runtime. Parallel check lives in
 /// `src/commands/self_test.rs::check_web_dist_dir`.
+///
+/// User-facing message goes through Fluent
+/// (`cli-doctor-web-dist-dir-expansion-warning`) per AGENTS.md §
+/// Localization — no bare Rust literals for CLI output. Reason phrases
+/// are Fluent keys too (`cli-web-dist-dir-reason-{tilde,dollar}`).
 fn check_web_dist_dir(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
     match config.gateway.web_dist_dir.as_deref() {
         None => {}
-        Some(value) => match web_dist_dir_expansion_issue(value) {
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
             None => {}
-            Some(reason) => items.push(DiagItem::warn(
-                cat,
-                format!(
-                    "gateway.web_dist_dir = \"{value}\" — {reason}; gateway.web_dist_dir is \
-                     read verbatim, so expand the value yourself (e.g. an absolute path)"
-                ),
-            )),
+            Some(reason_key) => {
+                let reason = crate::i18n::get_required_cli_string(reason_key);
+                let message = crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-web-dist-dir-expansion-warning",
+                    &[("path", value), ("reason", reason.as_str())],
+                );
+                items.push(DiagItem::warn(cat, message));
+            }
         },
     }
 }
 
-/// Return a human-readable explanation when `value` looks like it expects
+/// Return the Fluent reason key when `value` looks like it expects
 /// shell expansion the gateway will not perform. `None` means the value
 /// is a literal path that the gateway can resolve as-is.
-fn web_dist_dir_expansion_issue(value: &str) -> Option<&'static str> {
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     if value.starts_with('~') {
-        Some("starts with `~` which is not expanded")
+        Some("cli-web-dist-dir-reason-tilde")
     } else if value.contains('$') {
-        Some("contains `$` which is not expanded")
+        Some("cli-web-dist-dir-reason-dollar")
     } else {
         None
     }
@@ -1383,18 +1389,26 @@ mod tests {
 
     #[test]
     fn diagnose_flags_web_dist_dir_with_tilde() {
+        // Asserts the localized Fluent message resolves and inlines the path +
+        // the tilde reason — the diagnostic now goes through Fluent per
+        // AGENTS.md (#6961 Round 3).
         let mut config = Config::default();
         config.gateway.web_dist_dir = Some("~/web-dist".to_string());
 
+        let expected_reason = crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-web-dist-dir-expansion-warning",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+
         let results = diagnose(&config);
-        let hit = results.iter().find(|item| {
-            item.category == "config"
-                && item.message.contains("gateway.web_dist_dir")
-                && item.message.contains("~/web-dist")
-        });
+        let hit = results
+            .iter()
+            .find(|item| item.category == "config" && item.message == expected_message);
         assert!(
             hit.is_some(),
-            "doctor should flag web_dist_dir = \"~/web-dist\" as a Warn"
+            "doctor should flag web_dist_dir = \"~/web-dist\" with the localized warning; \
+             expected message: {expected_message:?}; got: {results:?}"
         );
         assert_eq!(hit.unwrap().severity, Severity::Warn);
     }
@@ -1404,12 +1418,20 @@ mod tests {
         let mut config = Config::default();
         config.gateway.web_dist_dir = Some("$HOME/web-dist".to_string());
 
+        let expected_reason =
+            crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-dollar");
+        let expected_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-web-dist-dir-expansion-warning",
+            &[
+                ("path", "$HOME/web-dist"),
+                ("reason", expected_reason.as_str()),
+            ],
+        );
+
         let results = diagnose(&config);
-        let hit = results.iter().find(|item| {
-            item.category == "config"
-                && item.message.contains("gateway.web_dist_dir")
-                && item.message.contains("$HOME/web-dist")
-        });
+        let hit = results
+            .iter()
+            .find(|item| item.category == "config" && item.message == expected_message);
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().severity, Severity::Warn);
     }
@@ -1429,12 +1451,21 @@ mod tests {
     }
 
     #[test]
-    fn web_dist_dir_expansion_issue_detects_tilde_and_env() {
-        assert!(web_dist_dir_expansion_issue("~/web-dist").is_some());
-        assert!(web_dist_dir_expansion_issue("$HOME/web-dist").is_some());
-        assert!(web_dist_dir_expansion_issue("${HOME}/web-dist").is_some());
-        assert!(web_dist_dir_expansion_issue("/srv/zeroclaw/web-dist").is_none());
-        assert!(web_dist_dir_expansion_issue("./dist").is_none());
+    fn web_dist_dir_expansion_reason_key_detects_tilde_and_env() {
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
     }
 
     #[test]

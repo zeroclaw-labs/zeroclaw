@@ -254,30 +254,66 @@ fn check_version() -> CheckResult {
 /// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
 /// find the bundled assets — surface that here at `zeroclaw self-test`
 /// time instead of at runtime.
+///
+/// User-facing strings (check name + detail) go through Fluent
+/// (`cli-self-test-web-dist-dir-*` keys) per AGENTS.md § Localization —
+/// no bare Rust literals for CLI output. The check `name` field is
+/// `&'static str`, so we resolve the Fluent string once into a leaked
+/// static at first call. Reason phrases are Fluent keys too
+/// (`cli-web-dist-dir-reason-{tilde,dollar}`).
 fn check_web_dist_dir(config: &crate::config::Config) -> CheckResult {
+    let name = web_dist_dir_check_name();
     match config.gateway.web_dist_dir.as_deref() {
-        None => CheckResult::pass("web_dist_dir", "not set (using auto-detect)"),
-        Some(value) => match web_dist_dir_expansion_issue(value) {
-            None => CheckResult::pass("web_dist_dir", format!("{value} (literal path)")),
-            Some(reason) => CheckResult::fail(
-                "web_dist_dir",
-                format!(
-                    "WARNING: {value} — {reason}; gateway.web_dist_dir is read \
-                     verbatim, so expand the value yourself (e.g. an absolute path)"
+        None => CheckResult::pass(
+            name,
+            zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-self-test-web-dist-dir-pass-unset",
+            ),
+        ),
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
+            None => CheckResult::pass(
+                name,
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-self-test-web-dist-dir-pass-literal",
+                    &[("path", value)],
                 ),
             ),
+            Some(reason_key) => {
+                let reason = zeroclaw_runtime::i18n::get_required_cli_string(reason_key);
+                CheckResult::fail(
+                    name,
+                    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-self-test-web-dist-dir-fail-expansion",
+                        &[("path", value), ("reason", reason.as_str())],
+                    ),
+                )
+            }
         },
     }
 }
 
-/// Return a human-readable explanation when `value` looks like it expects
+/// Resolve the localized check name once and cache it as a `&'static str`
+/// (CheckResult::name is `&'static str` to stay copyable across the table
+/// renderer). Falls back to the bare identifier if the Fluent string is
+/// missing (mirrors the `missing_cli_string` warn-log behavior).
+fn web_dist_dir_check_name() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<&'static str> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let resolved =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        Box::leak(resolved.into_boxed_str())
+    })
+}
+
+/// Return the Fluent reason key when `value` looks like it expects
 /// shell expansion the gateway will not perform. `None` means the value
 /// is a literal path that the gateway can resolve as-is.
-fn web_dist_dir_expansion_issue(value: &str) -> Option<&'static str> {
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     if value.starts_with('~') {
-        Some("starts with `~` which is not expanded")
+        Some("cli-web-dist-dir-reason-tilde")
     } else if value.contains('$') {
-        Some("contains `$` which is not expanded")
+        Some("cli-web-dist-dir-reason-dollar")
     } else {
         None
     }
@@ -391,24 +427,91 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_issue};
+    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
 
     #[test]
-    fn web_dist_dir_with_tilde_is_flagged() {
+    fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
         // Issue #6079: `~/web-dist` is read verbatim and silently fails.
-        assert!(web_dist_dir_expansion_issue("~/web-dist").is_some());
-        assert!(web_dist_dir_expansion_issue("~").is_some());
+        // #6961 Round 3: predicate now returns Fluent key, not bare phrase.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
     }
 
     #[test]
-    fn web_dist_dir_with_env_var_is_flagged() {
+    fn web_dist_dir_with_env_var_resolves_to_dollar_reason_key() {
         // Issue #6079: `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
-        assert!(web_dist_dir_expansion_issue("$HOME/web-dist").is_some());
-        assert!(web_dist_dir_expansion_issue("${HOME}/web-dist").is_some());
-        assert!(web_dist_dir_expansion_issue("/srv/$USER/dist").is_some());
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("/srv/$USER/dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
         // Absolute and relative literal paths must NOT be flagged.
-        assert!(web_dist_dir_expansion_issue("/srv/zeroclaw/web-dist").is_none());
-        assert!(web_dist_dir_expansion_issue("./dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_fail_for_tilde() {
+        // #6961 Round 3: the failure detail goes through Fluent
+        // (cli-self-test-web-dist-dir-fail-expansion) — assert the
+        // resolved English string contains the inlined path + reason.
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(!result.passed, "tilde path must fail the check");
+
+        let expected_reason =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-fail-expansion",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+        assert_eq!(result.detail, expected_detail);
+
+        let expected_name =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        assert_eq!(result.name, expected_name.as_str());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_for_literal() {
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-pass-literal",
+            &[("path", "/srv/zeroclaw/web-dist")],
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_when_unset() {
+        let config = crate::config::Config::default();
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string(
+            "cli-self-test-web-dist-dir-pass-unset",
+        );
+        assert_eq!(result.detail, expected_detail);
     }
 
     #[test]
