@@ -52,9 +52,16 @@ fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
             continue;
         };
         let display = path.display().to_string();
-        for (idx, raw) in src.lines().enumerate() {
+        let src_lines: Vec<&str> = src.lines().collect();
+        for (idx, raw) in src_lines.iter().enumerate() {
             let line = raw.trim_start();
+            // Exemption may be on the flagged line itself, or — for multi-line
+            // attribute/string literals where a trailing comment would corrupt
+            // the string — on the immediately preceding line.
             if line.contains("// i18n-exempt:") {
+                continue;
+            }
+            if idx > 0 && src_lines[idx - 1].contains("// i18n-exempt:") {
                 continue;
             }
             if is_hardcoded_help(line) || is_bare_print_literal(line) {
@@ -96,35 +103,37 @@ fn is_bare_print_literal(line: &str) -> bool {
 }
 
 /// Does the leading string literal on this fragment contain any alphabetic
-/// character? Pure punctuation/escape separators (`"\n"`, `"==="`) do not.
+/// character *outside* `{...}` format placeholders? Pure punctuation/escape
+/// separators (`"\n"`, `"==="`, `" — "`) and placeholder-only strings
+/// (`"{error:#}"`, `"{} — {}"`) do not — they carry no translatable prose.
 fn literal_has_letters(arg: &str) -> bool {
-    // Take from the first quote to a reasonable end; cheap heuristic on the line.
-    let bytes = arg.as_bytes();
-    let mut i = 0;
-    // skip optional raw-string prefix
-    if arg.starts_with('r') {
-        i = 1;
-        while i < bytes.len() && bytes[i] == b'#' {
-            i += 1;
+    // Locate the opening quote (after an optional raw-string `r`/`r#…#` prefix).
+    let mut chars = arg.chars().peekable();
+    if chars.peek() == Some(&'r') {
+        chars.next();
+        while chars.peek() == Some(&'#') {
+            chars.next();
         }
     }
-    if i >= bytes.len() || bytes[i] != b'"' {
+    if chars.next() != Some('"') {
         return false;
     }
-    i += 1;
     let mut escaped = false;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    let mut brace_depth = 0usize;
+    for c in chars {
         if escaped {
             escaped = false;
         } else if c == '\\' {
             escaped = true;
         } else if c == '"' {
             break;
-        } else if c.is_alphabetic() {
+        } else if c == '{' {
+            brace_depth += 1;
+        } else if c == '}' {
+            brace_depth = brace_depth.saturating_sub(1);
+        } else if brace_depth == 0 && c.is_alphabetic() {
             return true;
         }
-        i += 1;
     }
     false
 }

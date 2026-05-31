@@ -9,6 +9,34 @@ use console::style;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_runtime::i18n;
 
+/// Resolve a `cli-*` Fluent key for memory CLI output. Under `agent-runtime`
+/// (default, and what CI/release build) this routes through Fluent; without it
+/// the runtime i18n crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
+fn mt(key: &str, fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        i18n::get_required_cli_string(key)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
+/// `mt` with `{$name}` arguments.
+#[allow(unused_variables)]
+fn mt_args(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        i18n::get_required_cli_string_with_args(key, args)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
 /// Handle `zeroclaw memory <subcommand>` CLI commands.
 pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
     match command {
@@ -52,7 +80,11 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
 
 async fn handle_reindex(config: &Config) -> Result<()> {
     let mem = create_memory_with_embedder(config)?;
-    println!("{} Reindexing memory backend...", style("→").cyan());
+    println!(
+        "{} {}",
+        style("→").cyan(),
+        mt("cli-memory-reindexing", "Reindexing memory backend...")
+    );
     let count = mem.reindex().await?;
     if count == 0 {
         println!(
@@ -97,7 +129,7 @@ async fn handle_list(
     let entries = mem.list(cat.as_ref(), session.as_deref()).await?;
 
     if entries.is_empty() {
-        println!("No memory entries found.");
+        println!("{}", mt("cli-memory-none", "No memory entries found."));
         return Ok(());
     }
 
@@ -105,7 +137,17 @@ async fn handle_list(
     let page: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
 
     if page.is_empty() {
-        println!("No entries at offset {offset} (total: {total}).");
+        println!(
+            "{}",
+            mt_args(
+                "cli-memory-none-at-offset",
+                &[
+                    ("offset", &offset.to_string()),
+                    ("total", &total.to_string())
+                ],
+                "No entries at offset"
+            )
+        );
         return Ok(());
     }
 
@@ -125,7 +167,14 @@ async fn handle_list(
     }
 
     if offset + page.len() < total {
-        println!("\n  Use --offset {} to see the next page.", offset + limit);
+        println!(
+            "\n{}",
+            mt_args(
+                "cli-memory-next-page",
+                &[("offset", &(offset + limit).to_string())],
+                "Use --offset to see the next page"
+            )
+        );
     }
 
     Ok(())
@@ -145,10 +194,24 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
     let matches: Vec<_> = all.iter().filter(|e| e.key.starts_with(key)).collect();
 
     match matches.len() {
-        0 => println!("No memory entry found for key: {key}"),
+        0 => println!(
+            "{}",
+            mt_args(
+                "cli-memory-key-not-found",
+                &[("key", key)],
+                "No memory entry found for key"
+            )
+        ),
         1 => print_entry(matches[0]),
         n => {
-            println!("Prefix '{key}' matched {n} entries:\n");
+            println!(
+                "{}\n",
+                mt_args(
+                    "cli-memory-prefix-matched",
+                    &[("key", key), ("n", &n.to_string())],
+                    "Prefix matched entries"
+                )
+            );
             for entry in matches {
                 println!(
                     "- {} [{}]",
@@ -156,7 +219,13 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
                     entry.category
                 );
             }
-            println!("\nSpecify a longer prefix to narrow the match.");
+            println!(
+                "\n{}",
+                mt(
+                    "cli-memory-narrow-prefix",
+                    "Specify a longer prefix to narrow the match."
+                )
+            );
         }
     }
 
@@ -164,11 +233,35 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
 }
 
 fn print_entry(entry: &super::traits::MemoryEntry) {
-    println!("Key:       {}", style(&entry.key).white().bold());
-    println!("Category:  {}", entry.category);
-    println!("Timestamp: {}", entry.timestamp);
+    println!(
+        "{}",
+        mt_args(
+            "cli-memory-key",
+            &[("value", &style(&entry.key).white().bold().to_string())],
+            "Key"
+        )
+    );
+    println!(
+        "{}",
+        mt_args(
+            "cli-memory-category",
+            &[("value", &entry.category.to_string())],
+            "Category"
+        )
+    );
+    println!(
+        "{}",
+        mt_args(
+            "cli-memory-timestamp",
+            &[("value", &entry.timestamp.to_string())],
+            "Timestamp"
+        )
+    );
     if let Some(sid) = &entry.session_id {
-        println!("Session:   {sid}");
+        println!(
+            "{}",
+            mt_args("cli-memory-session", &[("value", sid)], "Session")
+        );
     }
     println!("\n{}", entry.content);
 }
@@ -178,8 +271,15 @@ async fn handle_stats(config: &Config) -> Result<()> {
     let healthy = mem.health_check().await;
     let total = mem.count().await.unwrap_or(0);
 
-    println!("Memory Statistics:\n");
-    println!("  Backend:  {}", style(mem.name()).white().bold());
+    println!("{}\n", mt("cli-memory-stats-header", "Memory Statistics:"));
+    println!(
+        "{}",
+        mt_args(
+            "cli-memory-backend",
+            &[("value", &style(mem.name()).white().bold().to_string())],
+            "Backend"
+        )
+    );
     println!(
         "  Health:   {}",
         if healthy {
@@ -188,7 +288,14 @@ async fn handle_stats(config: &Config) -> Result<()> {
             style("unhealthy").yellow().bold().to_string()
         }
     );
-    println!("  Total:    {total}");
+    println!(
+        "{}",
+        mt_args(
+            "cli-memory-total",
+            &[("value", &total.to_string())],
+            "Total"
+        )
+    );
 
     let all = mem.list(None, None).await.unwrap_or_default();
     if !all.is_empty() {
@@ -197,7 +304,7 @@ async fn handle_stats(config: &Config) -> Result<()> {
             *counts.entry(entry.category.to_string()).or_default() += 1;
         }
 
-        println!("\n  By category:");
+        println!("\n{}", mt("cli-memory-by-category", "  By category:"));
         let mut sorted: Vec<_> = counts.into_iter().collect();
         sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         for (cat, count) in sorted {
@@ -250,12 +357,19 @@ async fn handle_clear(
     let entries = mem.list(cat.as_ref(), None).await?;
 
     if entries.is_empty() {
-        println!("No entries to clear.");
+        println!("{}", mt("cli-memory-none-to-clear", "No entries to clear."));
         return Ok(());
     }
 
     let scope = category.as_deref().unwrap_or("all categories");
-    println!("Found {} entries in '{scope}'.", entries.len());
+    println!(
+        "{}",
+        mt_args(
+            "cli-memory-found-in-scope",
+            &[("count", &entries.len().to_string()), ("scope", scope)],
+            "Found entries"
+        )
+    );
 
     if !yes {
         let confirmed = dialoguer::Confirm::new()
@@ -263,7 +377,7 @@ async fn handle_clear(
             .default(false)
             .interact()?;
         if !confirmed {
-            println!("Aborted.");
+            println!("{}", mt("cli-memory-aborted", "Aborted."));
             return Ok(());
         }
     }
@@ -294,12 +408,26 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
         let matches: Vec<_> = all.iter().filter(|e| e.key.starts_with(key)).collect();
         match matches.len() {
             0 => {
-                println!("No memory entry found for key: {key}");
+                println!(
+                    "{}",
+                    mt_args(
+                        "cli-memory-key-not-found",
+                        &[("key", key)],
+                        "No memory entry found for key"
+                    )
+                );
                 return Ok(());
             }
             1 => matches[0].key.clone(),
             n => {
-                println!("Prefix '{key}' matched {n} entries:\n");
+                println!(
+                    "{}\n",
+                    mt_args(
+                        "cli-memory-prefix-matched",
+                        &[("key", key), ("n", &n.to_string())],
+                        "Prefix matched entries"
+                    )
+                );
                 for entry in matches {
                     println!(
                         "- {} [{}]",
@@ -307,7 +435,13 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
                         entry.category
                     );
                 }
-                println!("\nSpecify a longer prefix to narrow the match.");
+                println!(
+                    "\n{}",
+                    mt(
+                        "cli-memory-narrow-prefix",
+                        "Specify a longer prefix to narrow the match."
+                    )
+                );
                 return Ok(());
             }
         }
@@ -319,13 +453,17 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
             .default(false)
             .interact()?;
         if !confirmed {
-            println!("Aborted.");
+            println!("{}", mt("cli-memory-aborted", "Aborted."));
             return Ok(());
         }
     }
 
     if mem.forget(&target).await? {
-        println!("{} Deleted key: {target}", style("✓").green().bold());
+        println!(
+            "{} {}",
+            style("✓").green().bold(),
+            mt_args("cli-memory-deleted-key", &[("key", &target)], "Deleted key")
+        );
     }
 
     Ok(())

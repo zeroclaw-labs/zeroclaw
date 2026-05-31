@@ -43,6 +43,34 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+/// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
+/// i18n catalogue under `agent-runtime` (default + CI/release); without that
+/// feature the runtime crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
+fn t(key: &str, fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string(key)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
+/// `t` with `{$name}` arguments.
+#[allow(unused_variables)]
+fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
 /// `apply_comments`. Best-effort — silently bails on parse errors so a
@@ -154,8 +182,14 @@ fn print_no_command_help(cmd: clap::Command) -> Result<()> {
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        println!("No command provided.");
-        println!("Try `zeroclaw quickstart` to create your first agent.");
+        println!("{}", t("cli-no-command", "No command provided."));
+        println!(
+            "{}",
+            t(
+                "cli-try-quickstart",
+                "Try `zeroclaw quickstart` to create your first agent."
+            )
+        );
     }
     println!();
 
@@ -172,7 +206,7 @@ fn print_no_command_help(cmd: clap::Command) -> Result<()> {
 #[cfg(windows)]
 fn pause_after_no_command_help() {
     println!();
-    print!("Press Enter to exit...");
+    print!("{}", t("cli-press-enter", "Press Enter to exit..."));
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
@@ -297,6 +331,7 @@ enum EstopLevelArg {
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
 #[command(version)]
+// i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -425,6 +460,7 @@ enum Commands {
     },
 
     /// Start the AI agent loop
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Start the AI agent loop.
 
@@ -468,6 +504,7 @@ Examples:
     },
 
     /// Start/manage the gateway server (webhooks, websockets)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manage the gateway server (webhooks, websockets).
 
@@ -484,6 +521,7 @@ Examples:
     },
 
     /// Start ACP (Agent Control Protocol) server over stdio
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Start the ACP server (JSON-RPC 2.0 over stdio).
 
@@ -507,6 +545,7 @@ Examples:
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Start the long-running autonomous daemon.
 
@@ -588,6 +627,7 @@ Examples:
     },
 
     /// Configure and manage scheduled tasks
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Configure and manage scheduled tasks.
 
@@ -625,6 +665,7 @@ Examples:
     Providers,
 
     /// Manage channels (telegram, discord, slack)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manage communication channels.
 
@@ -657,6 +698,7 @@ Examples:
     },
 
     /// Browse the shared workspace one directory at a time
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 List children of a directory under <install>/shared/. Paths are relative \
 to the shared workspace root; `..` traversal that escapes the root is \
@@ -692,6 +734,7 @@ Examples:
     },
 
     /// Discover and introspect USB hardware
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Discover and introspect USB hardware.
 
@@ -709,6 +752,7 @@ Examples:
     },
 
     /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manage hardware peripherals.
 
@@ -728,6 +772,7 @@ Examples:
     },
 
     /// Manage agent memory (list, get, stats, clear)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manage agent memory entries.
 
@@ -747,6 +792,7 @@ Examples:
     },
 
     /// Manage configuration
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manage ZeroClaw configuration.
 
@@ -776,6 +822,7 @@ Property path tab completion is included automatically in `zeroclaw completions 
     },
 
     /// Check for and apply updates
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Check for and apply ZeroClaw updates.
 
@@ -805,6 +852,7 @@ Examples:
     },
 
     /// Run diagnostic self-tests
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Run diagnostic self-tests to verify the ZeroClaw installation.
 
@@ -822,6 +870,7 @@ Examples:
     },
 
     /// Generate shell completion script to stdout
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
 
@@ -850,6 +899,7 @@ Examples (Windows PowerShell):
     MarkdownSchema,
 
     /// Launch or install the companion desktop app
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Launch the ZeroClaw companion desktop app.
 
@@ -1151,7 +1201,13 @@ async fn run_quickstart_cli(
     }
 
     println!();
-    println!("Quickstart — create one working agent end-to-end.");
+    println!(
+        "{}",
+        t(
+            "cli-quickstart-title",
+            "Quickstart — create one working agent end-to-end."
+        )
+    );
     println!();
 
     loop {
@@ -1276,12 +1332,24 @@ async fn run_quickstart_cli(
 
         match action {
             Action::Quit => {
-                println!("Quickstart cancelled. No config written.");
+                println!(
+                    "{}",
+                    t(
+                        "cli-quickstart-cancelled",
+                        "Quickstart cancelled. No config written."
+                    )
+                );
                 return Ok(());
             }
             Action::Create => {
                 if !create_enabled {
-                    println!("  Not all selectors are filled yet.");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-quickstart-incomplete",
+                            "  Not all selectors are filled yet."
+                        )
+                    );
                     continue;
                 }
                 break;
@@ -1586,7 +1654,13 @@ async fn run_quickstart_cli(
                             continue;
                         }
                         if channel_types.is_empty() {
-                            println!("  No channel types are compiled into this binary.");
+                            println!(
+                                "{}",
+                                t(
+                                    "cli-no-channels-compiled",
+                                    "  No channel types are compiled into this binary."
+                                )
+                            );
                             continue;
                         }
                         let labels: Vec<String> = channel_types
@@ -2003,21 +2077,34 @@ async fn run_quickstart_cli(
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
         Ok(applied) => {
             println!();
-            println!("Quickstart complete. Created agent `{}`.", applied.alias);
+            println!(
+                "{}",
+                ta(
+                    "cli-quickstart-complete",
+                    &[("alias", &applied.alias)],
+                    "Quickstart complete."
+                )
+            );
             println!();
-            println!("Next steps:");
+            println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
                 "  zeroclaw agent {}  # chat with this agent in your terminal",
                 applied.alias
             );
             if which_zerocode_on_path() {
-                println!("  zerocode                   # launch the TUI");
+                println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
         }
         Err(errs) => {
             eprintln!();
-            eprintln!("Your agent was not created — and nothing on disk was changed.");
+            eprintln!(
+                "{}",
+                t(
+                    "cli-agent-not-created",
+                    "Your agent was not created — and nothing on disk was changed."
+                )
+            );
             eprintln!(
                 "Your existing config is untouched. Fix the following and run quickstart again:"
             );
@@ -2567,7 +2654,14 @@ async fn main() -> Result<()> {
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
     #[cfg(feature = "agent-runtime")]
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        eprintln!("Warning: Failed to install default crypto model_provider: {e:?}");
+        eprintln!(
+            "{}",
+            ta(
+                "cli-warn-crypto-provider",
+                &[("err", &format!("{e:?}"))],
+                "Warning: Failed to install default crypto provider"
+            )
+        );
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -2708,7 +2802,13 @@ async fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
-        eprintln!("`zeroclaw onboard` is deprecated — use `zeroclaw quickstart`.");
+        eprintln!(
+            "{}",
+            t(
+                "cli-onboard-deprecated",
+                "`zeroclaw onboard` is deprecated — use `zeroclaw quickstart`."
+            )
+        );
         return Ok(());
     }
 
@@ -2726,8 +2826,17 @@ async fn main() -> Result<()> {
         let (_validator, enrollment_uri) =
             security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
         if let Some(uri) = enrollment_uri {
-            println!("Initialized OTP secret for ZeroClaw.");
-            println!("Enrollment URI: {uri}");
+            println!(
+                "{}",
+                t(
+                    "cli-otp-initialized",
+                    "Initialized OTP secret for ZeroClaw."
+                )
+            );
+            println!(
+                "{}",
+                ta("cli-otp-enrollment-uri", &[("uri", &uri)], "Enrollment URI")
+            );
         }
     }
 
@@ -3047,14 +3156,30 @@ async fn main() -> Result<()> {
                         .await
                     {
                         Ok(Some(code)) => {
-                            println!("🔐 Gateway pairing is enabled.");
+                            println!(
+                                "{}",
+                                t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
+                            );
                             println!();
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
                             println!("  └──────────────┘");
                             println!();
-                            println!("  Use this one-time code to pair a new device:");
-                            println!("    POST /pair with header X-Pairing-Code: {code}");
+                            println!(
+                                "{}",
+                                t(
+                                    "cli-pairing-use-code",
+                                    "  Use this one-time code to pair a new device:"
+                                )
+                            );
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-pairing-post",
+                                    &[("code", &code)],
+                                    "POST /pair with header X-Pairing-Code"
+                                )
+                            );
                         }
                         Ok(None) => {
                             if config.gateway.require_pairing {
@@ -3064,9 +3189,21 @@ async fn main() -> Result<()> {
                                 println!(
                                     "   The gateway may already be paired, or the code has been used."
                                 );
-                                println!("   Restart the gateway to generate a new pairing code.");
+                                println!(
+                                    "{}",
+                                    t(
+                                        "cli-pairing-restart",
+                                        "   Restart the gateway to generate a new pairing code."
+                                    )
+                                );
                             } else {
-                                println!("⚠️  Gateway pairing is disabled in config.");
+                                println!(
+                                    "{}",
+                                    t(
+                                        "cli-pairing-disabled",
+                                        "⚠️  Gateway pairing is disabled in config."
+                                    )
+                                );
                                 println!(
                                     "   All requests will be accepted without authentication."
                                 );
@@ -3079,10 +3216,19 @@ async fn main() -> Result<()> {
                             println!(
                                 "❌ Failed to fetch pairing code from gateway at {host}:{port}"
                             );
-                            println!("   Error: {e}");
+                            println!(
+                                "{}",
+                                ta("cli-error-label", &[("err", &e.to_string())], "Error")
+                            );
                             println!();
-                            println!("   Is the gateway running? Start it with:");
-                            println!("     zeroclaw gateway start");
+                            println!(
+                                "{}",
+                                t(
+                                    "cli-gateway-running-q",
+                                    "   Is the gateway running? Start it with:"
+                                )
+                            );
+                            println!("     zeroclaw gateway start"); // i18n-exempt: literal command/identifier example
                         }
                     }
                     Ok(())
@@ -3372,28 +3518,76 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            println!("🦀 ZeroClaw Status");
+            println!("{}", t("cli-status-title", "🦀 ZeroClaw Status"));
             println!();
-            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
-            println!("Workspace:   {}", config.data_dir.display());
-            println!("Config:      {}", config.config_path.display());
+            println!(
+                "{}",
+                ta(
+                    "cli-status-version",
+                    &[("v", env!("CARGO_PKG_VERSION"))],
+                    "Version"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-status-workspace",
+                    &[("v", &config.data_dir.display().to_string())],
+                    "Workspace"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-status-config",
+                    &[("v", &config.config_path.display().to_string())],
+                    "Config"
+                )
+            );
             println!();
             let mut shown_provider = false;
             for (family, alias, entry) in config.providers.models.iter_entries() {
                 let model = entry.model.as_deref().unwrap_or("(none)");
                 if shown_provider {
-                    println!("   ModelProvider:      {family}.{alias}");
-                    println!("   Model:         {model}");
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-status-provider-indent",
+                            &[("family", family), ("alias", alias)],
+                            "ModelProvider"
+                        )
+                    );
+                    println!("{}", ta("cli-status-model", &[("model", model)], "Model"));
                 } else {
-                    println!("🤖 ModelProvider:      {family}.{alias}");
-                    println!("   Model:         {model}");
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-status-provider",
+                            &[("family", family), ("alias", alias)],
+                            "ModelProvider"
+                        )
+                    );
+                    println!("{}", ta("cli-status-model", &[("model", model)], "Model"));
                     shown_provider = true;
                 }
             }
             if !shown_provider {
-                println!("🤖 ModelProvider:      (none configured)");
+                println!(
+                    "{}",
+                    t(
+                        "cli-status-provider-none",
+                        "🤖 ModelProvider:      (none configured)"
+                    )
+                );
             }
-            println!("📊 Observability:  {}", config.observability.backend);
+            println!(
+                "{}",
+                ta(
+                    "cli-status-observability",
+                    &[("v", &config.observability.backend.to_string())],
+                    "Observability"
+                )
+            );
             println!(
                 "🧾 Trace storage:  {} ({})",
                 config.observability.log_persistence, config.observability.log_persistence_path
@@ -3408,7 +3602,13 @@ async fn main() -> Result<()> {
                 .collect();
             agent_aliases.sort();
             if agent_aliases.is_empty() {
-                println!("🛡️  Agents:        (none configured)");
+                println!(
+                    "{}",
+                    t(
+                        "cli-status-agents-none",
+                        "🛡️  Agents:        (none configured)"
+                    )
+                );
             } else {
                 let summary: Vec<String> = agent_aliases
                     .iter()
@@ -3417,13 +3617,29 @@ async fn main() -> Result<()> {
                         None => format!("{alias}=<no risk_profile>"),
                     })
                     .collect();
-                println!("🛡️  Agents:        {}", summary.join(", "));
+                println!(
+                    "{}",
+                    ta("cli-status-agents", &[("v", &summary.join(", "))], "Agents")
+                );
             }
-            println!("⚙️  Runtime:       {}", config.runtime.kind);
+            println!(
+                "{}",
+                ta(
+                    "cli-status-runtime",
+                    &[("v", &config.runtime.kind.to_string())],
+                    "Runtime"
+                )
+            );
             if service::is_running() {
-                println!("🟢 Service:       running");
+                println!(
+                    "{}",
+                    t("cli-status-service-running", "🟢 Service:       running")
+                );
             } else {
-                println!("🔴 Service:       stopped");
+                println!(
+                    "{}",
+                    t("cli-status-service-stopped", "🔴 Service:       stopped")
+                );
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             println!(
@@ -3444,11 +3660,28 @@ async fn main() -> Result<()> {
             // Per-agent security: each enabled agent's risk profile.
             for alias in &agent_aliases {
                 let Some(profile) = config.risk_profile_for_agent(alias) else {
-                    println!("Security ({alias}): <no risk_profile>");
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-status-security-noprofile",
+                            &[("alias", alias)],
+                            "Security: no risk_profile"
+                        )
+                    );
                     continue;
                 };
-                println!("Security ({alias}):");
-                println!("  Workspace only:    {}", profile.workspace_only);
+                println!(
+                    "{}",
+                    ta("cli-status-security", &[("alias", alias)], "Security")
+                );
+                println!(
+                    "{}",
+                    ta(
+                        "cli-status-workspace-only",
+                        &[("v", &profile.workspace_only.to_string())],
+                        "Workspace only"
+                    )
+                );
                 println!(
                     "  Allowed roots:     {}",
                     if profile.allowed_roots.is_empty() {
@@ -3464,7 +3697,14 @@ async fn main() -> Result<()> {
                 let actions_cap = config
                     .runtime_profile_for_agent(alias)
                     .map_or(0, |r| r.max_actions_per_hour);
-                println!("  Max actions/hour:  {actions_cap}");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-status-max-actions",
+                        &[("v", &actions_cap.to_string())],
+                        "Max actions/hour"
+                    )
+                );
             }
             println!(
                 "  Cost tracking:     {}",
@@ -3474,8 +3714,22 @@ async fn main() -> Result<()> {
                     "disabled"
                 }
             );
-            println!("  Max cost/day:      ${:.2}", config.cost.daily_limit_usd);
-            println!("  Max cost/month:    ${:.2}", config.cost.monthly_limit_usd);
+            println!(
+                "{}",
+                ta(
+                    "cli-status-max-cost-day",
+                    &[("v", &format!("{:.2}", config.cost.daily_limit_usd))],
+                    "Max cost/day"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-status-max-cost-month",
+                    &[("v", &format!("{:.2}", config.cost.monthly_limit_usd))],
+                    "Max cost/month"
+                )
+            );
             if config.cost.enabled {
                 match cost::CostTracker::new(config.cost.clone(), &config.data_dir) {
                     Ok(tracker) => match tracker.get_summary() {
@@ -3490,19 +3744,47 @@ async fn main() -> Result<()> {
                             );
                         }
                         Err(e) => {
-                            eprintln!("  ⚠ Could not load cost usage: {e}");
+                            eprintln!(
+                                "{}",
+                                ta(
+                                    "cli-warn-cost-usage",
+                                    &[("err", &e.to_string())],
+                                    "Could not load cost usage"
+                                )
+                            );
                         }
                     },
                     Err(e) => {
-                        eprintln!("  ⚠ Could not init cost tracker: {e}");
+                        eprintln!(
+                            "{}",
+                            ta(
+                                "cli-warn-cost-tracker",
+                                &[("err", &e.to_string())],
+                                "Could not init cost tracker"
+                            )
+                        );
                     }
                 }
             }
-            println!("  OTP enabled:       {}", config.security.otp.enabled);
-            println!("  E-stop enabled:    {}", config.security.estop.enabled);
+            println!(
+                "{}",
+                ta(
+                    "cli-status-otp",
+                    &[("v", &config.security.otp.enabled.to_string())],
+                    "OTP enabled"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-status-estop",
+                    &[("v", &config.security.estop.enabled.to_string())],
+                    "E-stop enabled"
+                )
+            );
             println!();
-            println!("Channels:");
-            println!("  CLI:      ✅ always");
+            println!("{}", t("cli-status-channels", "Channels:"));
+            println!("{}", t("cli-status-cli-always", "  CLI:      ✅ always"));
             for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
                 println!(
                     "  {:9} {}",
@@ -3515,7 +3797,7 @@ async fn main() -> Result<()> {
                 );
             }
             println!();
-            println!("Peripherals:");
+            println!("{}", t("cli-status-peripherals", "Peripherals:"));
             println!(
                 "  Enabled:   {}",
                 if config.peripherals.enabled {
@@ -3524,7 +3806,14 @@ async fn main() -> Result<()> {
                     "no"
                 }
             );
-            println!("  Boards:    {}", config.peripherals.boards.len());
+            println!(
+                "{}",
+                ta(
+                    "cli-status-boards",
+                    &[("v", &config.peripherals.boards.len().to_string())],
+                    "Boards"
+                )
+            );
 
             Ok(())
         }
@@ -3559,7 +3848,7 @@ async fn main() -> Result<()> {
                 "Supported model model_providers ({} total):\n",
                 model_providers.len()
             );
-            println!("  ID (use in config)  DESCRIPTION");
+            println!("  ID (use in config)  DESCRIPTION"); // i18n-exempt: literal command/identifier example
             println!("  ─────────────────── ───────────");
             for p in &model_providers {
                 let is_configured = configured_types.contains(p.name);
@@ -3650,20 +3939,38 @@ async fn main() -> Result<()> {
             let download_url = "https://www.zeroclawlabs.ai/download";
 
             if do_install {
-                println!("Download the ZeroClaw companion app:");
+                println!(
+                    "{}",
+                    t(
+                        "cli-desktop-download",
+                        "Download the ZeroClaw companion app:"
+                    )
+                );
                 println!();
                 #[cfg(target_os = "macos")]
                 {
-                    println!("  macOS:  {download_url}");
+                    println!("  macOS:  {download_url}"); // i18n-exempt: literal command/identifier example
                     println!();
-                    println!("Or install via Homebrew (coming soon):");
-                    println!("  brew install --cask zeroclaw");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-desktop-homebrew",
+                            "Or install via Homebrew (coming soon):"
+                        )
+                    );
+                    println!("  brew install --cask zeroclaw"); // i18n-exempt: literal command/identifier example
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    println!("  Linux:  {download_url}");
+                    println!("  Linux:  {download_url}"); // i18n-exempt: literal command/identifier example
                     println!();
-                    println!("  Download the .deb or .AppImage for your architecture.");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-desktop-linux-pkg",
+                            "  Download the .deb or .AppImage for your architecture."
+                        )
+                    );
                 }
                 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
@@ -3758,20 +4065,51 @@ async fn main() -> Result<()> {
 
             match desktop_bin {
                 Some(bin) => {
-                    println!("Launching ZeroClaw companion app...");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-desktop-launching",
+                            "Launching ZeroClaw companion app..."
+                        )
+                    );
                     let _child = std::process::Command::new(&bin)
                         .spawn()
                         .with_context(|| format!("Failed to launch {}", bin.display()))?;
                     Ok(())
                 }
                 None => {
-                    println!("ZeroClaw companion app is not installed.");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-desktop-not-installed",
+                            "ZeroClaw companion app is not installed."
+                        )
+                    );
                     println!();
-                    println!("  Download it at: {download_url}");
-                    println!("  Or run: zeroclaw desktop --install");
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-desktop-download-at",
+                            &[("url", download_url)],
+                            "Download it at"
+                        )
+                    );
+                    println!("  Or run: zeroclaw desktop --install"); // i18n-exempt: literal command
                     println!();
-                    println!("The companion app is a lightweight menu bar app that");
-                    println!("connects to the same gateway as the CLI.");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-desktop-blurb1",
+                            "The companion app is a lightweight menu bar app that"
+                        )
+                    );
+                    println!(
+                        "{}",
+                        t(
+                            "cli-desktop-blurb2",
+                            "connects to the same gateway as the CLI."
+                        )
+                    );
                     std::process::exit(1);
                 }
             }
@@ -3790,7 +4128,14 @@ async fn main() -> Result<()> {
                         info.current_version, info.latest_version
                     );
                 } else {
-                    println!("Already up to date (v{}).", info.current_version);
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-update-already-current",
+                            &[("version", &info.current_version)],
+                            "Already up to date"
+                        )
+                    );
                 }
                 Ok(())
             } else {
@@ -3849,7 +4194,13 @@ async fn main() -> Result<()> {
             }
             ConfigCommands::List { filter, secrets } => {
                 let entries = config.prop_fields();
-                println!("Legend: \u{1f489} env-overridden  \u{1f512} secret");
+                println!(
+                    "{}",
+                    t(
+                        "cli-config-legend",
+                        "Legend: \u{1f489} env-overridden  \u{1f512} secret"
+                    )
+                );
                 println!();
                 let mut current_category = "";
                 for entry in &entries {
@@ -3901,9 +4252,23 @@ async fn main() -> Result<()> {
                             }))?
                         );
                     } else if populated {
-                        println!("{path} is set (encrypted secret \u{2014} value not displayed)");
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-config-secret-set",
+                                &[("path", &path)],
+                                "is set (encrypted secret, value not displayed)"
+                            )
+                        );
                     } else {
-                        println!("{path} is not set (encrypted secret)");
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-config-secret-unset",
+                                &[("path", &path)],
+                                "is not set (encrypted secret)"
+                            )
+                        );
                     }
                 } else {
                     match config.get_prop(&path) {
@@ -4088,7 +4453,10 @@ async fn main() -> Result<()> {
                     };
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else {
-                    println!("{path} updated.");
+                    println!(
+                        "{}",
+                        ta("cli-config-updated", &[("path", &path)], "updated")
+                    );
                 }
                 Ok(())
             }
@@ -4109,7 +4477,13 @@ async fn main() -> Result<()> {
                     let envelope = serde_json::json!({"initialized": initialized});
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else if initialized.is_empty() {
-                    println!("All sections already configured.");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-config-all-configured",
+                            "All sections already configured."
+                        )
+                    );
                 } else {
                     println!(
                         "Initialized {} section(s) with defaults:",
@@ -4118,7 +4492,13 @@ async fn main() -> Result<()> {
                     for name in &initialized {
                         println!("  {name}");
                     }
-                    println!("\nRun `zeroclaw config list` to review, then set required fields.");
+                    println!(
+                        "\n{}",
+                        t(
+                            "cli-config-review-hint",
+                            "Run `zeroclaw config list` to review, then set required fields."
+                        )
+                    );
                 }
                 Ok(())
             }
@@ -4134,7 +4514,14 @@ async fn main() -> Result<()> {
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
-                            println!("Backed up to {}", report.backup_path.display());
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-config-backed-up",
+                                    &[("path", &report.backup_path.display().to_string())],
+                                    "Backed up to"
+                                )
+                            );
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
@@ -4149,7 +4536,13 @@ async fn main() -> Result<()> {
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
-                            println!("Config already at current schema version.");
+                            println!(
+                                "{}",
+                                t(
+                                    "cli-config-schema-current",
+                                    "Config already at current schema version."
+                                )
+                            );
                         }
                     }
                 }
@@ -4449,7 +4842,14 @@ async fn main() -> Result<()> {
                     let body = serde_json::json!({"saved": true, "results": results});
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 } else {
-                    println!("Applied {} operation(s):", results.len());
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-config-applied-ops",
+                            &[("count", &results.len().to_string())],
+                            "Applied operations"
+                        )
+                    );
                     for entry in &results {
                         let op = entry.get("op").and_then(|v| v.as_str()).unwrap_or("?");
                         let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("?");
@@ -4533,9 +4933,9 @@ async fn main() -> Result<()> {
                 let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
-                    println!("No plugins installed.");
+                    println!("{}", t("cli-plugins-none", "No plugins installed."));
                 } else {
-                    println!("Installed plugins:");
+                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
                     for p in &plugins {
                         println!(
                             "  {} v{} — {}",
@@ -4550,31 +4950,82 @@ async fn main() -> Result<()> {
             PluginCommands::Install { source } => {
                 let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 host.install(&source)?;
-                println!("Plugin installed from {source}");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-plugin-installed-from",
+                        &[("source", &source)],
+                        "Plugin installed"
+                    )
+                );
                 Ok(())
             }
             PluginCommands::Remove { name } => {
                 let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 host.remove(&name)?;
-                println!("Plugin '{name}' removed.");
+                println!(
+                    "{}",
+                    ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
+                );
                 Ok(())
             }
             PluginCommands::Info { name } => {
                 let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
-                        println!("Plugin: {} v{}", info.name, info.version);
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-name-version",
+                                &[("name", &info.name), ("version", &info.version)],
+                                "Plugin"
+                            )
+                        );
                         if let Some(desc) = &info.description {
-                            println!("Description: {desc}");
+                            println!(
+                                "{}",
+                                ta("cli-plugin-description", &[("desc", desc)], "Description")
+                            );
                         }
-                        println!("Capabilities: {:?}", info.capabilities);
-                        println!("Permissions: {:?}", info.permissions);
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-capabilities",
+                                &[("v", &format!("{:?}", info.capabilities))],
+                                "Capabilities"
+                            )
+                        );
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-permissions",
+                                &[("v", &format!("{:?}", info.permissions))],
+                                "Permissions"
+                            )
+                        );
                         match &info.wasm_path {
-                            Some(path) => println!("WASM: {}", path.display()),
-                            None => println!("WASM: (skill-only plugin)"),
+                            Some(path) => println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-wasm",
+                                    &[("path", &path.display().to_string())],
+                                    "WASM"
+                                )
+                            ),
+                            None => println!(
+                                "{}",
+                                t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")
+                            ),
                         }
                     }
-                    None => println!("Plugin '{name}' not found."),
+                    None => println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-not-found",
+                            &[("name", &name)],
+                            "Plugin not found"
+                        )
+                    ),
                 }
                 Ok(())
             }
@@ -4631,8 +5082,17 @@ fn handle_estop_command(
                 let (validator, enrollment_uri) =
                     security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
                 if let Some(uri) = enrollment_uri {
-                    println!("Initialized OTP secret for ZeroClaw.");
-                    println!("Enrollment URI: {uri}");
+                    println!(
+                        "{}",
+                        t(
+                            "cli-otp-initialized",
+                            "Initialized OTP secret for ZeroClaw."
+                        )
+                    );
+                    println!(
+                        "{}",
+                        ta("cli-otp-enrollment-uri", &[("uri", &uri)], "Enrollment URI")
+                    );
                 }
                 Some(validator)
             } else {
@@ -4640,14 +5100,14 @@ fn handle_estop_command(
             };
 
             manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
-            println!("Estop resume completed.");
+            println!("{}", t("cli-estop-resume-done", "Estop resume completed."));
             print_estop_status(&manager.status());
             Ok(())
         }
         None => {
             let engage_level = build_engage_level(level, domains, tools)?;
             manager.engage(engage_level)?;
-            println!("Estop engaged.");
+            println!("{}", t("cli-estop-engaged", "Estop engaged."));
             print_estop_status(&manager.status());
             Ok(())
         }
@@ -4720,7 +5180,7 @@ fn build_resume_selector(
 
 #[cfg(feature = "agent-runtime")]
 fn print_estop_status(state: &security::EstopState) {
-    println!("Estop status:");
+    println!("{}", t("cli-estop-status", "Estop status:"));
     println!(
         "  engaged:        {}",
         if state.is_engaged() { "yes" } else { "no" }
@@ -4738,17 +5198,41 @@ fn print_estop_status(state: &security::EstopState) {
         }
     );
     if state.blocked_domains.is_empty() {
-        println!("  domain_blocks:  (none)");
+        println!(
+            "{}",
+            t("cli-estop-domains-none", "  domain_blocks:  (none)")
+        );
     } else {
-        println!("  domain_blocks:  {}", state.blocked_domains.join(", "));
+        println!(
+            "{}",
+            ta(
+                "cli-estop-domains",
+                &[("v", &state.blocked_domains.join(", "))],
+                "domain_blocks"
+            )
+        );
     }
     if state.frozen_tools.is_empty() {
-        println!("  tool_freeze:    (none)");
+        println!("{}", t("cli-estop-tools-none", "  tool_freeze:    (none)"));
     } else {
-        println!("  tool_freeze:    {}", state.frozen_tools.join(", "));
+        println!(
+            "{}",
+            ta(
+                "cli-estop-tools",
+                &[("v", &state.frozen_tools.join(", "))],
+                "tool_freeze"
+            )
+        );
     }
     if let Some(updated_at) = &state.updated_at {
-        println!("  updated_at:     {updated_at}");
+        println!(
+            "{}",
+            ta(
+                "cli-estop-updated-at",
+                &[("v", &updated_at.to_string())],
+                "updated_at"
+            )
+        );
     }
 }
 
@@ -5085,8 +5569,18 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             auth_service
                 .store_model_provider_token(&model_provider, &profile, &token, metadata, true)
                 .await?;
-            println!("Saved profile {profile}");
-            println!("Active profile for {model_provider}: {profile}");
+            println!(
+                "{}",
+                ta("cli-auth-saved", &[("profile", &profile)], "Saved profile")
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-auth-active-for",
+                    &[("provider", &model_provider), ("profile", &profile)],
+                    "Active profile"
+                )
+            );
             Ok(())
         }
 
@@ -5110,8 +5604,18 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             auth_service
                 .store_model_provider_token(&model_provider, &profile, &token, metadata, true)
                 .await?;
-            println!("Saved profile {profile}");
-            println!("Active profile for {model_provider}: {profile}");
+            println!(
+                "{}",
+                ta("cli-auth-saved", &[("profile", &profile)], "Saved profile")
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-auth-active-for",
+                    &[("provider", &model_provider), ("profile", &profile)],
+                    "Active profile"
+                )
+            );
             Ok(())
         }
 
@@ -5132,7 +5636,14 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 .await?;
             match status {
                 auth::RefreshStatus::Refreshed { profile } => {
-                    println!("✓ Token refresh OK (profile {profile})");
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-auth-refresh-ok",
+                            &[("profile", &profile)],
+                            "Token refresh OK"
+                        )
+                    );
                     Ok(())
                 }
                 auth::RefreshStatus::NoProfile => {
@@ -5152,9 +5663,23 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 .remove_profile(&model_provider, &profile)
                 .await?;
             if removed {
-                println!("Removed auth profile {model_provider}:{profile}");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-auth-removed",
+                        &[("provider", &model_provider), ("profile", &profile)],
+                        "Removed auth profile"
+                    )
+                );
             } else {
-                println!("Auth profile not found: {model_provider}:{profile}");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-auth-not-found",
+                        &[("provider", &model_provider), ("profile", &profile)],
+                        "Auth profile not found"
+                    )
+                );
             }
             Ok(())
         }
@@ -5167,14 +5692,21 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             auth_service
                 .set_active_profile(&model_provider, &profile)
                 .await?;
-            println!("Active profile for {model_provider}: {profile}");
+            println!(
+                "{}",
+                ta(
+                    "cli-auth-active-for",
+                    &[("provider", &model_provider), ("profile", &profile)],
+                    "Active profile"
+                )
+            );
             Ok(())
         }
 
         AuthCommands::List => {
             let data = auth_service.load_profiles().await?;
             if data.profiles.is_empty() {
-                println!("No auth profiles configured.");
+                println!("{}", t("cli-auth-none", "No auth profiles configured."));
                 return Ok(());
             }
 
@@ -5193,7 +5725,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
         AuthCommands::Status => {
             let data = auth_service.load_profiles().await?;
             if data.profiles.is_empty() {
-                println!("No auth profiles configured.");
+                println!("{}", t("cli-auth-none", "No auth profiles configured."));
                 return Ok(());
             }
 
@@ -5214,7 +5746,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             }
 
             println!();
-            println!("Active profiles:");
+            println!("{}", t("cli-auth-active", "Active profiles:"));
             for (model_provider, profile_id) in &data.active_profiles {
                 println!("  {model_provider}: {profile_id}");
             }

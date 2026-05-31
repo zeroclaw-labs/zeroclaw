@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::path::Path;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 /// Result of a single diagnostic check.
 pub struct CheckResult {
@@ -92,9 +93,24 @@ pub fn print_results(results: &[CheckResult]) {
     }
     println!();
     if failed == 0 {
-        println!("  \x1b[32mAll {total} checks passed.\x1b[0m");
+        println!(
+            "  \x1b[32m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-all-passed",
+                &[("total", &total.to_string())]
+            )
+        );
     } else {
-        println!("  \x1b[31m{failed}/{total} checks failed.\x1b[0m");
+        println!(
+            "  \x1b[31m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-some-failed",
+                &[
+                    ("failed", &failed.to_string()),
+                    ("total", &total.to_string())
+                ],
+            )
+        );
     }
     println!();
 }
