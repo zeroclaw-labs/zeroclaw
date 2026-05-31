@@ -21,6 +21,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': '日志',
     'nav.doctor': '诊断',
     'nav.canvas': '画布',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': '仪表盘',
@@ -414,7 +415,42 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logs',
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
     'nav.onboard': 'Onboard',
+
+    // ACP Console
+    'acp.title': 'ACP Console',
+    'acp.subtitle': 'Browser client for the gateway ACP endpoint.',
+    'acp.reconnect': 'Reconnect',
+    'acp.transcript': 'Session transcript',
+    'acp.empty_transcript': 'Start a prompt to compare ACP streaming with the gateway chat path.',
+    'acp.prompt_placeholder': 'Send a prompt through ACP...',
+    'acp.send': 'Send',
+    'acp.cancel': 'Cancel',
+    'acp.cancelling': 'Cancelling',
+    'acp.permissions': 'Permissions',
+    'acp.permissions_empty': 'No pending approvals.',
+    'acp.dismiss': 'Dismiss',
+    'acp.protocol_log': 'Protocol log',
+    'acp.protocol_waiting': 'Waiting for ACP frames.',
+    'acp.agent.loading': 'Loading agents...',
+    'acp.agent.none_configured': 'No agents configured',
+    'acp.agent.none_enabled': 'No enabled agents configured',
+    'acp.agent.server_default': 'Server default',
+    'acp.agent.disabled': 'disabled',
+    'acp.status.server': 'ACP Server',
+    'acp.status.agent': 'Agent',
+    'acp.status.session': 'Session',
+    'acp.status.workspace': 'Workspace',
+    'acp.status.creating': 'Creating...',
+    'acp.status.not_ready': 'Not ready',
+    'acp.status.gateway_default': 'Gateway default',
+    'acp.error.no_agents': 'No agents are configured yet. Create an agent before using ACP.',
+    'acp.error.no_enabled_agents': 'No enabled agents are configured yet. Enable an agent before using ACP.',
+    'acp.error.load_agents': 'Failed to load agents',
+    'acp.error.init_failed': 'Failed to initialize ACP session',
+    'acp.error.prompt_failed': 'ACP prompt failed',
+    'acp.error.websocket': 'ACP WebSocket error',
 
     // Dashboard
     'dashboard.title': 'Dashboard',
@@ -818,6 +854,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Kayıtlar',
     'nav.doctor': 'Doktor',
     'nav.canvas': 'Tuval',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Kontrol Paneli',
@@ -1185,6 +1222,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'السجلات',
     'nav.doctor': 'التشخيص',
     'nav.canvas': 'اللوحة',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'لوحة التحكم',
@@ -1540,6 +1578,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'লগ',
     'nav.doctor': 'ডক্টর',
     'nav.canvas': 'ক্যানভাস',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'ড্যাশবোর্ড',
@@ -1895,6 +1934,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Protokoly',
     'nav.doctor': 'Diagnostika',
     'nav.canvas': 'Plátno',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Přehled',
@@ -2250,6 +2290,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logfiler',
     'nav.doctor': 'Diagnostik',
     'nav.canvas': 'Lærred',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Dashboard',
@@ -2605,6 +2646,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Protokolle',
     'nav.doctor': 'Diagnose',
     'nav.canvas': 'Leinwand',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Dashboard',
@@ -2960,6 +3002,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Αρχεία καταγραφής',
     'nav.doctor': 'Διαγνωστικά',
     'nav.canvas': 'Καμβάς',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Πίνακας ελέγχου',
@@ -3315,6 +3358,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Registros',
     'nav.doctor': 'Diagnóstico',
     'nav.canvas': 'Lienzo',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Panel de control',
@@ -3670,6 +3714,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Lokit',
     'nav.doctor': 'Diagnostiikka',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Hallintapaneeli',
@@ -4025,6 +4070,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Journaux',
     'nav.doctor': 'Diagnostic',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Tableau de bord',
@@ -4394,6 +4440,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'יומנים',
     'nav.doctor': 'אבחון',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'לוח בקרה',
@@ -4749,6 +4796,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'लॉग',
     'nav.doctor': 'डॉक्टर',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'डैशबोर्ड',
@@ -5104,6 +5152,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Naplók',
     'nav.doctor': 'Diagnosztika',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Vezérlőpult',
@@ -5459,6 +5508,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Log',
     'nav.doctor': 'Dokter',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Dasbor',
@@ -5814,6 +5864,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Log',
     'nav.doctor': 'Diagnostica',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Pannello di controllo',
@@ -6169,6 +6220,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'ログ',
     'nav.doctor': '診断',
     'nav.canvas': 'キャンバス',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'ダッシュボード',
@@ -6538,6 +6590,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': '로그',
     'nav.doctor': '진단',
     'nav.canvas': '캔버스',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': '대시보드',
@@ -6893,6 +6946,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logger',
     'nav.doctor': 'Diagnose',
     'nav.canvas': 'Lerret',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Dashbord',
@@ -7248,6 +7302,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logboeken',
     'nav.doctor': 'Diagnose',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Dashboard',
@@ -7603,6 +7658,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logi',
     'nav.doctor': 'Diagnostyka',
     'nav.canvas': 'Płótno',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Panel',
@@ -7958,6 +8014,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logs',
     'nav.doctor': 'Diagnóstico',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Painel',
@@ -8313,6 +8370,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Jurnale',
     'nav.doctor': 'Diagnosticare',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Panou de control',
@@ -8668,6 +8726,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Журналы',
     'nav.doctor': 'Диагностика',
     'nav.canvas': 'Холст',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Панель управления',
@@ -9037,6 +9096,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Loggar',
     'nav.doctor': 'Diagnostik',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Instrumentpanel',
@@ -9392,6 +9452,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'บันทึก',
     'nav.doctor': 'วินิจฉัย',
     'nav.canvas': 'แคนวาส',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'แดชบอร์ด',
@@ -9747,6 +9808,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Mga Log',
     'nav.doctor': 'Diagnostiko',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Dashboard',
@@ -10102,6 +10164,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Журнали',
     'nav.doctor': 'Діагностика',
     'nav.canvas': 'Полотно',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Панель керування',
@@ -10457,6 +10520,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'لاگز',
     'nav.doctor': 'تشخیص',
     'nav.canvas': 'کینوس',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'ڈیش بورڈ',
@@ -10812,6 +10876,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Nhật ký',
     'nav.doctor': 'Chẩn đoán',
     'nav.canvas': 'Canvas',
+    'nav.acp': 'ACP',
 
     // Dashboard
     'dashboard.title': 'Bảng điều khiển',

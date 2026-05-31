@@ -15,6 +15,8 @@ const routeTitles: Record<string, string> = {
   '/config': 'nav.config',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
+  '/canvas': 'nav.canvas',
+  '/acp-console': 'nav.acp',
   '/onboard': 'nav.onboard',
 };
 
