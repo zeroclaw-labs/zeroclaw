@@ -38,11 +38,17 @@ fn estimate_tokens(messages: &[ChatMessage]) -> usize {
 fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> {
     let len = messages.len();
     let mut protected = vec![false; len];
+    // Protect system messages.
     for (i, msg) in messages.iter().enumerate() {
         if msg.role == "system" {
             protected[i] = true;
         }
     }
+    // Protect the first user message (the session's "original ask").
+    if let Some(first_user) = messages.iter().position(|m| m.role == "user") {
+        protected[first_user] = true;
+    }
+    // Protect the most recent N messages.
     let recent_start = len.saturating_sub(keep_recent);
     for p in protected.iter_mut().skip(recent_start) {
         *p = true;

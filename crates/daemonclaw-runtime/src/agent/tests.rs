@@ -2125,4 +2125,82 @@ mod spine_contract {
             assistant_messages.iter().map(|m| m.content.len()).collect::<Vec<_>>()
         );
     }
+
+    /// Regression: the first user message (original ask) must survive all
+    /// trimming and pruning stages, even when large tool results push the
+    /// conversation past the token/message budget.
+    #[test]
+    fn first_user_message_survives_aggressive_trimming() {
+        use crate::agent::history::{emergency_history_trim, trim_history};
+        use crate::agent::history_pruner::{prune_history, HistoryPrunerConfig};
+        use daemonclaw_providers::ChatMessage;
+
+        let original_ask = "Research quantum computing applications in drug discovery and \
+            report your findings with citations. Focus on molecular simulation, \
+            protein folding, and combinatorial optimization for lead compounds.";
+
+        // Simulate a short conversation with large tool results — the exact
+        // shape that triggered the live bug (handful of turns, oversized
+        // tool results inflating token count).
+        let mut history = vec![
+            ChatMessage::system("You are a helpful research assistant."),
+            ChatMessage::user(original_ask),
+        ];
+
+        // Add 20 assistant+tool pairs with large results to blow past budget.
+        for i in 0..20 {
+            let tool_json = format!(
+                r#"{{"content":"searching","tool_calls":[{{"id":"t{i}","name":"web_search","arguments":"{{}}"}}]}}"#
+            );
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: tool_json,
+            });
+            let result = format!(
+                r#"{{"tool_call_id":"t{i}","content":"{}"}}"#,
+                "x".repeat(3000)
+            );
+            history.push(ChatMessage {
+                role: "tool".to_string(),
+                content: result,
+            });
+        }
+        history.push(ChatMessage::assistant("Here's what I found...".to_string()));
+
+        // 43 messages total: system + user + 20*(assistant+tool) + final assistant.
+        assert_eq!(history.len(), 43);
+
+        // Test 1: trim_history with aggressive limit.
+        let mut trimmed = history.clone();
+        trim_history(&mut trimmed, 10);
+        assert!(
+            trimmed.iter().any(|m| m.content == original_ask),
+            "trim_history must preserve the first user message (original ask)"
+        );
+
+        // Test 2: emergency_history_trim (drops 1/3 of messages).
+        let mut emergency = history.clone();
+        let dropped = emergency_history_trim(&mut emergency, 4);
+        assert!(dropped > 0, "emergency trim should have dropped messages");
+        assert!(
+            emergency.iter().any(|m| m.content == original_ask),
+            "emergency_history_trim must preserve the first user message"
+        );
+
+        // Test 3: prune_history with very tight token budget.
+        let mut pruned = history.clone();
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 200,
+            keep_recent: 4,
+            collapse_tool_results: true,
+        };
+        prune_history(&mut pruned, &config);
+        assert!(
+            pruned.iter().any(|m| m.content == original_ask),
+            "prune_history must preserve the first user message even under \
+             extreme token pressure. Remaining roles: {:?}",
+            pruned.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
 }

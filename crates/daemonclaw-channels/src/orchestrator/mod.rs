@@ -1161,25 +1161,30 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
 /// Proactively trim conversation turns so that the total estimated character
 /// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
-/// turns first, but always preserves the most recent turn (the current user
-/// message).  Returns the number of turns dropped.
+/// turns first, but always preserves the first user message (session's
+/// original ask) and the most recent turn (the current user message).
+/// Returns the number of turns dropped.
 fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
     if total_chars <= budget || turns.len() <= 1 {
         return 0;
     }
 
+    // Protect index 0 when it's the first user message (original ask).
+    let protect_first_user = turns.first().is_some_and(|m| m.role == "user");
+    let start = if protect_first_user { 1 } else { 0 };
+
     let mut excess = total_chars.saturating_sub(budget);
     let mut drop_count = 0;
 
-    // Walk from the oldest turn forward, but never drop the very last turn.
-    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
-        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
+    // Walk from the oldest droppable turn forward, but never drop the very last turn.
+    while excess > 0 && (start + drop_count) < turns.len().saturating_sub(1) {
+        excess = excess.saturating_sub(turns[start + drop_count].content.chars().count());
         drop_count += 1;
     }
 
     if drop_count > 0 {
-        turns.drain(..drop_count);
+        turns.drain(start..start + drop_count);
     }
     drop_count
 }
@@ -1209,8 +1214,13 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
+    // Trim to cap, but protect the first user message (the session's
+    // "original ask") from removal — it defines the conversation's intent
+    // and must remain recoverable.
+    let protect_first_user = turns.first().is_some_and(|m| m.role == "user");
+    let remove_start = if protect_first_user { 1 } else { 0 };
+    while turns.len() > max_history && remove_start < turns.len().saturating_sub(1) {
+        turns.remove(remove_start);
     }
 }
 

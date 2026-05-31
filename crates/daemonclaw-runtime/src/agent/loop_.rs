@@ -6874,8 +6874,11 @@ mod tests {
         // System prompt preserved
         assert_eq!(history[0].role, "system");
         assert_eq!(history[0].content, "system prompt");
-        // Trimmed to limit
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
+        // First user message (original ask) preserved
+        assert_eq!(history[1].role, "user");
+        assert_eq!(history[1].content, "msg 0");
+        // Trimmed to limit + system + protected first user
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 2); // +1 system +1 first user
         // Most recent messages preserved
         let last = &history[history.len() - 1];
         assert_eq!(
@@ -7145,13 +7148,16 @@ mod tests {
 
     #[test]
     fn trim_history_with_no_system_prompt() {
-        // Recovery: History without system prompt should trim correctly
+        // Recovery: History without system prompt should trim correctly.
+        // The first user message (original ask) is protected.
         let mut history = vec![];
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
         trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
+        // max_history + 1 protected first user message
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1);
+        assert_eq!(history[0].content, "msg 0"); // original ask preserved
     }
 
     #[test]
@@ -7410,9 +7416,12 @@ Let me check the result."#;
             ChatMessage::assistant("new reply"),
         ];
         trim_history(&mut history, 2);
-        assert_eq!(history.len(), 3); // system + 2 kept
+        // system + first user (protected) + 2 kept = 4
+        assert_eq!(history.len(), 4);
         assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "new msg");
+        assert_eq!(history[1].content, "old msg"); // first user protected
+        assert_eq!(history[2].content, "new msg");
+        assert_eq!(history[3].content, "new reply");
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
