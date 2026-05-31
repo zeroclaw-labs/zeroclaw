@@ -131,14 +131,22 @@ impl Tool for EmailSearchTool {
         if let Some(s) = subject_filter {
             criteria_parts.push(format!("SUBJECT \"{}\"", s));
         }
-        if let Some(d) = since
-            && let Some(imap_date) = to_imap_date(d)
-        {
+        if let Some(d) = since {
+            let imap_date = to_imap_date(d).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "invalid since date {:?}: expected YYYY-MM-DD with a valid day (1–31)",
+                    d
+                ))
+            })?;
             criteria_parts.push(format!("SINCE {}", imap_date));
         }
-        if let Some(d) = before
-            && let Some(imap_date) = to_imap_date(d)
-        {
+        if let Some(d) = before {
+            let imap_date = to_imap_date(d).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "invalid before date {:?}: expected YYYY-MM-DD with a valid day (1–31)",
+                    d
+                ))
+            })?;
             criteria_parts.push(format!("BEFORE {}", imap_date));
         }
 
@@ -248,6 +256,11 @@ pub fn to_imap_date(s: &str) -> Option<String> {
     if parts.len() != 3 {
         return None;
     }
+    // Year: exactly 4 ASCII decimal digits (e.g. "2026").
+    let year = parts[0];
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let month = match parts[1] {
         "01" => "Jan",
         "02" => "Feb",
@@ -263,8 +276,17 @@ pub fn to_imap_date(s: &str) -> Option<String> {
         "12" => "Dec",
         _ => return None,
     };
-    let day = parts[2].trim_start_matches('0');
-    Some(format!("{}-{}-{}", day, month, parts[0]))
+    // Day: 1–2 ASCII decimal digits, value 1–31. IMAP date-text is unquoted
+    // so a non-numeric or out-of-range value would corrupt the SEARCH command.
+    let day_str = parts[2];
+    if day_str.is_empty() || day_str.len() > 2 || !day_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let day: u32 = day_str.parse().ok()?;
+    if day == 0 || day > 31 {
+        return None;
+    }
+    Some(format!("{}-{}-{}", day, month, year))
 }
 
 /// Allowlist-validates an agent-supplied IMAP SEARCH filter value. The search
@@ -289,7 +311,7 @@ fn validate_search_filter(field: &str, value: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_search_filter;
+    use super::{to_imap_date, validate_search_filter};
 
     #[test]
     fn validate_search_filter_accepts_addresses_and_keywords() {
@@ -310,5 +332,33 @@ mod tests {
             assert!(err.contains("invalid character"), "got: {err}");
             assert!(err.contains("subject"), "field name in message: {err}");
         }
+    }
+
+    #[test]
+    fn to_imap_date_converts_valid_dates() {
+        assert_eq!(to_imap_date("2026-05-31"), Some("31-May-2026".into()));
+        assert_eq!(to_imap_date("2026-01-01"), Some("1-Jan-2026".into()));
+        assert_eq!(to_imap_date("2024-12-09"), Some("9-Dec-2024".into()));
+    }
+
+    #[test]
+    fn to_imap_date_rejects_invalid_year() {
+        assert_eq!(to_imap_date("26-05-31"), None); // 2-digit year
+        assert_eq!(to_imap_date("abcd-05-01"), None); // non-numeric year
+        assert_eq!(to_imap_date("-05-01"), None); // empty year
+    }
+
+    #[test]
+    fn to_imap_date_rejects_invalid_day() {
+        assert_eq!(to_imap_date("2026-05-00"), None); // day zero
+        assert_eq!(to_imap_date("2026-05-32"), None); // day out of range
+        assert_eq!(to_imap_date("2026-05-xx"), None); // non-numeric day
+        assert_eq!(to_imap_date("2026-05-"), None); // empty day
+    }
+
+    #[test]
+    fn to_imap_date_rejects_invalid_month() {
+        assert_eq!(to_imap_date("2026-00-01"), None);
+        assert_eq!(to_imap_date("2026-13-01"), None);
     }
 }
