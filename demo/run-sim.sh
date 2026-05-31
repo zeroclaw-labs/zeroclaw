@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Docker-packaged path (requires 60-80+ GB allocated to Docker Desktop).
+# For low-storage machines (MacBook Air etc.), use ./demo/run-sim-host.sh instead.
+#
 # Start the simulator container (runs esp32_sim as default CMD).
 # Frontend will be reachable at http://127.0.0.1:8080
 set -euo pipefail

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Docker-packaged path.
+# For low-storage machines use ./demo/run-agent-host.sh instead.
+#
 # Open an interactive ZeroClaw chat inside the running demo container.
 # Requires: simulator container already up (see ./demo/run-sim.sh).
 set -euo pipefail
