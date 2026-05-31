@@ -308,7 +308,10 @@ impl ZerocodePane {
                     theme::error_style(),
                 )
             } else {
-                (crate::i18n::t("zc-zerocode-locale-loading"), theme::dim_style())
+                (
+                    crate::i18n::t("zc-zerocode-locale-loading"),
+                    theme::dim_style(),
+                )
             };
             items.push(ListItem::new(Line::from(Span::styled(msg, style))));
         }

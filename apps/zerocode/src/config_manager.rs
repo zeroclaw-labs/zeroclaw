@@ -384,9 +384,14 @@ impl<'a> App<'a> {
             }
         }
 
-        // The zerocode pane owns its own mouse handling.
+        // The zerocode pane owns its own mouse handling. Drain the locale
+        // sync afterward so a mouse-driven "Download locale file" (or a
+        // click into the Locale tab) triggers the lazy list/fetch RPC the
+        // same way the key path does — otherwise the request is queued and
+        // never sent, leaving the tab stuck on "loading locales…".
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
+            self.sync_zerocode_locales().await;
             return Ok(());
         }
 
