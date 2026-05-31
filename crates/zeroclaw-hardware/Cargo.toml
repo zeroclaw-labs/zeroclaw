@@ -47,3 +47,12 @@ probe = ["dep:probe-rs"]
 # Note: this feature is normally used together with the `hardware` feature
 # (i.e. `--features "hardware,dev-sim"`).
 dev-sim = []
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[[example]]
+name = "esp32_sim"
+required-features = ["hardware", "dev-sim"]
