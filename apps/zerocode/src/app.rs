@@ -83,6 +83,27 @@ impl Mode {
     }
 }
 
+async fn switch_mode(
+    mode: &mut Mode,
+    next: Mode,
+    conn_state: &ConnectionState,
+    quickstart: &mut quickstart_pane::QuickstartPane,
+    acp_pane: &mut acp::Acp,
+    chat_pane: &mut chat::Chat,
+) {
+    if *mode == Mode::Quickstart && next != Mode::Quickstart {
+        quickstart.dismiss_beacon().await;
+    }
+    if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+        match next {
+            Mode::Acp => acp_pane.refresh_if_inactive().await,
+            Mode::Chat => chat_pane.refresh_if_inactive().await,
+            _ => {}
+        }
+    }
+    *mode = next;
+}
+
 // ── Top-level entry point ────────────────────────────────────────
 
 /// Run the TUI event loop. Returns `true` if the daemon disconnected
@@ -326,10 +347,15 @@ pub async fn run(
                     _ => None,
                 };
                 if let Some(next) = switch_to {
-                    if mode == Mode::Quickstart && next != Mode::Quickstart {
-                        quickstart.dismiss_beacon().await;
-                    }
-                    mode = next;
+                    switch_mode(
+                        &mut mode,
+                        next,
+                        &conn_state,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -377,10 +403,15 @@ pub async fn run(
                         mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
                     {
                         let next = MODES[(n - 1) as usize];
-                        if mode == Mode::Quickstart && next != Mode::Quickstart {
-                            quickstart.dismiss_beacon().await;
-                        }
-                        mode = next;
+                        switch_mode(
+                            &mut mode,
+                            next,
+                            &conn_state,
+                            &mut quickstart,
+                            &mut acp_pane,
+                            &mut chat_pane,
+                        )
+                        .await;
                         continue;
                     }
                 }

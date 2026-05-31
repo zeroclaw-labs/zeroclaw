@@ -951,7 +951,9 @@ impl<'a> Dashboard<'a> {
             let inner = block.inner(area);
             frame.render_widget(block, area);
             frame.render_widget(
-                Paragraph::new(Span::styled(err.clone(), theme::warn_style())),
+                Paragraph::new(err.as_str())
+                    .style(theme::warn_style())
+                    .wrap(Wrap { trim: true }),
                 inner,
             );
             return;
