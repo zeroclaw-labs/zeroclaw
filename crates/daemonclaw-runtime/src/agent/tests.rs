@@ -1714,6 +1714,76 @@ mod spine_contract {
         );
     }
 
+    // ── [4] Context collapse: reversibility proven ─────────────────
+    //
+    // Collapse must be reversible: project() produces a summary view,
+    // but expand_region() restores the originals on the next project().
+    // This distinguishes collapse from lossy compaction.
+    #[test]
+    fn context_collapse_is_reversible() {
+        use crate::agent::context_collapse::ContextCollapser;
+
+        let history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("question 1"),
+            ChatMessage::assistant("answer 1"),
+            ChatMessage::user("question 2"),
+            ChatMessage::assistant("answer 2"),
+            ChatMessage::user("question 3"),
+            ChatMessage::assistant("answer 3 — the latest"),
+        ];
+        let original_len = history.len();
+
+        let mut collapser = ContextCollapser::new(2); // protect last 2
+
+        // Collapse messages 1..5 (the middle conversation, not system or tail)
+        collapser.collapse_region(1, 5, "Summary of Q1+A1+Q2+A2".into(), 100);
+
+        // Project: should have system + [COLLAPSED] + question3 + answer3
+        let projected = collapser.project(&history);
+        assert!(
+            projected.len() < original_len,
+            "projected should be shorter than original ({} vs {})",
+            projected.len(), original_len,
+        );
+        assert_eq!(projected[0].role, "system");
+        assert!(
+            projected[1].content.contains("[COLLAPSED"),
+            "second message should be collapse summary, got: {}",
+            projected[1].content,
+        );
+        assert!(
+            projected[1].content.contains("Summary of Q1+A1+Q2+A2"),
+            "collapse summary should contain the provided text",
+        );
+        // Protected tail preserved
+        assert!(projected.last().unwrap().content.contains("answer 3"));
+
+        // Verify original history is UNCHANGED
+        assert_eq!(history.len(), original_len);
+        assert_eq!(history[1].content, "question 1");
+        assert_eq!(history[4].content, "answer 2");
+
+        // Expand: remove the collapse, project again
+        collapser.expand_region(1);
+        let restored = collapser.project(&history);
+        assert_eq!(
+            restored.len(), original_len,
+            "after expand, projection should equal original length"
+        );
+        for (i, (orig, rest)) in history.iter().zip(restored.iter()).enumerate() {
+            assert_eq!(
+                orig.content, rest.content,
+                "message {i} should be identical after expand: '{}' vs '{}'",
+                orig.content, rest.content,
+            );
+            assert_eq!(
+                orig.role, rest.role,
+                "message {i} role should match after expand",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn exclusive_tool_does_not_overlap_with_safe_tools() {
         use crate::agent::tool_execution::{partition_tool_calls, execute_tools_batched};

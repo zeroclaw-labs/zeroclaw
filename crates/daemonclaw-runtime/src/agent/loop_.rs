@@ -1077,8 +1077,51 @@ pub async fn run_tool_call_loop(
                 (provider, provider_name, model)
             };
 
+        // ── Context collapse (reversible projection) ──────────────
+        // After the pipeline's destructive stages, if history still exceeds
+        // the budget, produce a collapsed projection for the LLM call.
+        // The raw history is NOT mutated — collapse is read-only.
+        let collapse_protect = 6;
+        let collapsed_view: Option<Vec<ChatMessage>> = {
+            let estimated = estimate_history_tokens(history);
+            if estimated > effective_budget && history.len() > collapse_protect + 2 {
+                let mut collapser =
+                    crate::agent::context_collapse::ContextCollapser::new(collapse_protect);
+                let collapse_end = history.len().saturating_sub(collapse_protect);
+                let collapse_start = if history.first().is_some_and(|m| m.role == "system") {
+                    1
+                } else {
+                    0
+                };
+                if collapse_start < collapse_end {
+                    let mut summary = String::new();
+                    for msg in &history[collapse_start..collapse_end] {
+                        let preview = if msg.content.len() > 100 {
+                            &msg.content[..100]
+                        } else {
+                            &msg.content
+                        };
+                        use std::fmt::Write as _;
+                        let _ = writeln!(summary, "- [{}] {}", msg.role, preview);
+                    }
+                    let tokens_saved = estimate_history_tokens(&history[collapse_start..collapse_end]);
+                    collapser.collapse_region(collapse_start, collapse_end, summary, tokens_saved);
+                    Some(collapser.project(history))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let messages_for_provider: &[ChatMessage] = match &collapsed_view {
+            Some(projected) => projected,
+            None => history,
+        };
+
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(messages_for_provider, multimodal_config)
+                .await?;
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
