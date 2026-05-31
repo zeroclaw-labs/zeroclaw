@@ -476,6 +476,17 @@ pub struct Config {
     #[nested]
     pub file_upload: FileUploadConfig,
 
+    /// Standalone multi-file bundle upload tool configuration
+    /// (`[file_upload_bundle]`).
+    #[serde(default)]
+    #[nested]
+    pub file_upload_bundle: FileUploadBundleConfig,
+
+    /// Standalone file download tool configuration (`[file_download]`).
+    #[serde(default)]
+    #[nested]
+    pub file_download: FileDownloadConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     #[nested]
@@ -2869,6 +2880,10 @@ pub struct AliasedAgentConfig {
     #[nested]
     #[serde(default)]
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
+    /// Reply-intent precheck configuration for channel messages.
+    #[nested]
+    #[serde(default)]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
     /// Enable context-aware tool filtering (only surface relevant tools per iteration).
     #[serde(default)]
     pub context_aware_tools: bool,
@@ -2959,6 +2974,7 @@ impl Default for AliasedAgentConfig {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
@@ -3874,8 +3890,15 @@ pub struct TtsProviderConfig {
     pub language_code: Option<String>,
     /// Path to backend binary (edge-tts subprocess; piper local server).
     pub binary_path: Option<String>,
-    /// Endpoint URI for HTTP-based backends (piper local server). Renamed
-    /// from `api_url` for parity with `ModelProviderConfig.uri`.
+    /// Audio response format sent to the TTS backend (e.g. `"opus"`, `"mp3"`,
+    /// `"wav"`). Defaults to `"opus"` for the OpenAI family. Override to
+    /// `"wav"` for Orpheus-class models (e.g. `canopylabs/orpheus-v1-english`
+    /// on Groq) or `"mp3"` for broader compatibility.
+    pub response_format: Option<String>,
+    /// Endpoint URI for HTTP-based backends. Overrides the family default
+    /// when pointing at a compatible third-party API (Groq, Azure, self-hosted
+    /// proxies). Set to the **full** URL — there is no separate path-suffix
+    /// field. Renamed from `api_url` for parity with `ModelProviderConfig.uri`.
     #[serde(alias = "api_url")]
     pub uri: Option<String>,
 }
@@ -6917,6 +6940,162 @@ impl Default for FileUploadConfig {
             field_name: default_file_upload_field_name(),
             max_file_size_bytes: default_file_upload_max_size_bytes(),
             timeout_secs: default_file_upload_timeout_secs(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+// ── File Upload Bundle ──────────────────────────────────────────
+
+/// Standalone multi-file bundle upload tool configuration
+/// (`[file_upload_bundle]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_upload_bundle`
+/// tool that POSTs N files from the agent's local filesystem to the
+/// configured endpoint as a single `multipart/form-data` request. The LLM
+/// provides only file paths; the host reads the bytes.
+///
+/// When `url` is `None` or empty, the tool is not registered.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "file-upload-bundle"]
+pub struct FileUploadBundleConfig {
+    /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// HTTP method. Only `POST` (default) and `PUT` are accepted.
+    #[serde(default = "default_file_upload_bundle_method")]
+    pub method: String,
+
+    /// Multipart form-field name reused across every file part. Default: `file`.
+    #[serde(default = "default_file_upload_bundle_field_name")]
+    pub field_name: String,
+
+    /// Maximum per-file size in bytes. Default: 10 MiB.
+    #[serde(default = "default_file_upload_bundle_max_file_size_bytes")]
+    pub max_file_size_bytes: u64,
+
+    /// Maximum cumulative size across every file in one call. Default: 32 MiB.
+    #[serde(default = "default_file_upload_bundle_max_total_size_bytes")]
+    pub max_total_size_bytes: u64,
+
+    /// Maximum number of files per call. Default: 16.
+    #[serde(default = "default_file_upload_bundle_max_files")]
+    pub max_files: u32,
+
+    /// Request timeout in seconds. Default: 120.
+    #[serde(default = "default_file_upload_bundle_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Maximum response body bytes to read from the upload endpoint.
+    /// Prevents unbounded memory use from a malicious or verbose receiver.
+    /// Default: 4096 (4 KiB).
+    #[serde(default = "default_file_upload_bundle_max_response_body_bytes")]
+    pub max_response_body_bytes: usize,
+
+    /// Static HTTP headers attached to every upload request.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_file_upload_bundle_method() -> String {
+    "POST".into()
+}
+
+fn default_file_upload_bundle_field_name() -> String {
+    "file".into()
+}
+
+fn default_file_upload_bundle_max_file_size_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_file_upload_bundle_max_total_size_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+fn default_file_upload_bundle_max_files() -> u32 {
+    16
+}
+
+fn default_file_upload_bundle_timeout_secs() -> u64 {
+    120
+}
+
+fn default_file_upload_bundle_max_response_body_bytes() -> usize {
+    4 * 1024
+}
+
+impl Default for FileUploadBundleConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            method: default_file_upload_bundle_method(),
+            field_name: default_file_upload_bundle_field_name(),
+            max_file_size_bytes: default_file_upload_bundle_max_file_size_bytes(),
+            max_total_size_bytes: default_file_upload_bundle_max_total_size_bytes(),
+            max_files: default_file_upload_bundle_max_files(),
+            timeout_secs: default_file_upload_bundle_timeout_secs(),
+            max_response_body_bytes: default_file_upload_bundle_max_response_body_bytes(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+// ── File Download ───────────────────────────────────────────────
+
+/// Standalone file download tool configuration (`[file_download]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_download` tool
+/// that GETs a file from the configured endpoint and writes it to the agent's
+/// workspace filesystem. The LLM supplies only a document identifier and a
+/// workspace-relative destination path; the endpoint URL comes solely from this
+/// config and is never model-controlled. Response bytes are streamed to disk
+/// and never loaded into model context.
+///
+/// When `url` is `None` or empty, the tool is not registered.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "file-download"]
+pub struct FileDownloadConfig {
+    /// Download endpoint URL. Tool is disabled when this is `None` or empty.
+    /// The file to fetch is selected by the `document_id` query parameter.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Maximum download size in bytes. Enforced while streaming: the transfer
+    /// is aborted and the partial file removed once this ceiling is exceeded,
+    /// so an oversized or unbounded body never fully buffers in memory or lands
+    /// on disk. Default: 25 MiB.
+    #[serde(default = "default_file_download_max_size_bytes")]
+    pub max_file_size_bytes: u64,
+
+    /// Request timeout in seconds. Default: 120.
+    #[serde(default = "default_file_download_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Static HTTP headers attached to every download request — typically an
+    /// `Authorization: Bearer …` token for the upstream endpoint. Same shape as
+    /// `[mcp.servers.*.headers]`.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_file_download_max_size_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+fn default_file_download_timeout_secs() -> u64 {
+    120
+}
+
+impl Default for FileDownloadConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_file_size_bytes: default_file_download_max_size_bytes(),
+            timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
         }
     }
@@ -10389,6 +10568,12 @@ pub struct TelegramConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -10473,6 +10658,12 @@ pub struct DiscordConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -10557,6 +10748,12 @@ pub struct SlackConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -10646,6 +10843,12 @@ pub struct MattermostConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -10822,6 +11025,12 @@ pub struct MatrixConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -10876,6 +11085,12 @@ pub struct SignalConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -11017,6 +11232,12 @@ pub struct WhatsAppConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -11366,6 +11587,12 @@ pub struct IrcConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for IrcConfig {
@@ -11445,6 +11672,12 @@ pub struct LarkConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -13012,6 +13245,8 @@ impl Default for Config {
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
+            file_upload_bundle: FileUploadBundleConfig::default(),
+            file_download: FileDownloadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -14921,6 +15156,14 @@ impl Config {
                 );
             }
 
+            if agent.precheck.timeout_secs == 0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{alias}.precheck.timeout_secs"),
+                    "agents.{alias}.precheck.timeout_secs must be greater than 0",
+                );
+            }
+
             // workspace.access: keys must point at OTHER agents, never
             // self, and every target must be a configured agent.
             for (target, mode) in &agent.workspace.access {
@@ -16370,6 +16613,7 @@ auto_save = true
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
                         excluded_tools: vec![],
+                        default_target: None,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -16454,6 +16698,8 @@ auto_save = true
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
+            file_upload_bundle: FileUploadBundleConfig::default(),
+            file_download: FileDownloadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -17052,6 +17298,8 @@ default_temperature = 0.7
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
+            file_upload_bundle: FileUploadBundleConfig::default(),
+            file_download: FileDownloadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -17146,6 +17394,7 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -17394,6 +17643,7 @@ default_temperature = 0.7
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -17430,6 +17680,7 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17455,6 +17706,7 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17511,6 +17763,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -17544,6 +17797,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -17593,6 +17847,7 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -17617,6 +17872,7 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -17673,6 +17929,7 @@ allowed_users = ["@u:matrix.org"]
                     reply_in_thread: true,
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
+                    default_target: None,
                 },
             )]),
             signal: HashMap::new(),
@@ -17948,6 +18205,7 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -17978,6 +18236,7 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -18031,6 +18290,7 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -18058,6 +18318,7 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -18097,6 +18358,7 @@ allowed_numbers = ["+1", "+2"]
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
+                    default_target: None,
                 },
             )]),
             linq: HashMap::new(),
@@ -19191,6 +19453,7 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         config.save().await.unwrap();
@@ -19659,6 +19922,7 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -19683,6 +19947,7 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -20085,6 +20350,7 @@ require_otp_to_resume = true
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -20927,6 +21193,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -20959,6 +21226,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -20984,6 +21252,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -21010,6 +21279,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -21047,6 +21317,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -21079,6 +21350,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -21120,6 +21392,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         config
@@ -21170,6 +21443,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
 
         // Encrypt
@@ -21207,6 +21481,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21240,6 +21515,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21268,6 +21544,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         }
     }
 
@@ -22149,10 +22426,22 @@ allowed_users = []
             "agent nested history-pruning fields should be emitted under the agent alias"
         );
         assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "agents.bob.precheck.enabled"),
+            "agent nested precheck fields should be emitted under the agent alias"
+        );
+        assert!(
             !fields
                 .iter()
                 .any(|field| field.name.starts_with("agents.bob.agent.history-pruning")),
             "agent nested fields must not leak the legacy global agent prefix"
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|field| field.name.starts_with("agents.bob.agent.precheck")),
+            "agent nested precheck fields must not leak the legacy global agent prefix"
         );
 
         config
@@ -22163,6 +22452,16 @@ allowed_users = []
                 .get_prop("agents.bob.history-pruning.enabled")
                 .expect("get_prop should accept the emitted per-agent nested path"),
             "true"
+        );
+
+        config
+            .set_prop("agents.bob.precheck.enabled", "false")
+            .expect("set_prop should accept the emitted per-agent precheck path");
+        assert_eq!(
+            config
+                .get_prop("agents.bob.precheck.enabled")
+                .expect("get_prop should accept the emitted per-agent precheck path"),
+            "false"
         );
     }
 
@@ -22328,6 +22627,34 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn validate_accepts_per_agent_precheck_controls() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.precheck.enabled = false;
+        alpha.precheck.timeout_secs = 5;
+
+        config
+            .validate()
+            .expect("precheck enabled/timeout controls should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_per_agent_precheck_zero_timeout() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.precheck.timeout_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero precheck timeout must fail validation")
+            .to_string();
+        assert!(
+            err.contains("agents.alpha.precheck.timeout_secs"),
+            "expected precheck timeout field path, got: {err}"
+        );
     }
 
     #[test]

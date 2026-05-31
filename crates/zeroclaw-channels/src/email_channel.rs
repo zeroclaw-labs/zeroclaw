@@ -596,17 +596,17 @@ impl EmailChannel {
             }
 
             let msg = ChannelMessage {
-                id: email.msg_id,
-                reply_target: email.sender.clone(),
-                sender: email.sender,
-                content: email.content,
-                channel: "email".to_string(),
                 channel_alias: Some(self.alias.clone()),
-                timestamp: email.timestamp,
-                thread_ts: None,
-                interruption_scope_id: None,
                 attachments: email.attachments,
                 subject: Some(email.subject),
+                ..ChannelMessage::new(
+                    email.msg_id,
+                    email.sender.clone(),
+                    email.sender,
+                    email.content,
+                    "email",
+                    email.timestamp,
+                )
             };
 
             if tx.send(msg).await.is_err() {

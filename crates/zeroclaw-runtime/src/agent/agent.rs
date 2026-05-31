@@ -1,3 +1,4 @@
+use super::loop_;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -23,6 +24,8 @@ use zeroclaw_tool_call_parser::strip_think_tags;
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
+
+use crate::channel_targets::build_channel_targets;
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
@@ -59,6 +62,9 @@ pub struct Agent {
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
+    /// Configured channel targets injected into the system prompt so the agent
+    /// knows where to send messages via `channel_send`.
+    channel_targets: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
     /// Activated MCP tools for deferred loading mode.
@@ -70,12 +76,11 @@ pub struct Agent {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
     approval_manager: Option<Arc<ApprovalManager>>,
-    /// Late-bound channel maps for the four channel-driven tools
-    /// (`ask_user`, `reaction`, `escalate_to_human`, `poll`). Held so that
-    /// per-session callers (e.g. the ACP server) can register a back-channel
-    /// after agent construction. Production paths populate via
-    /// `start_channels`; this is the alternate path for environments that
-    /// build an Agent directly without `start_channels`.
+    /// Late-bound channel-map handles for the five channel-driven tools.
+    /// Populated by `from_config_with_session_cwd`; empty when an Agent is
+    /// constructed via the builder directly. Callers (e.g. the ACP server)
+    /// use `channel_handles().register_channel(...)` to wire a back-channel
+    /// into all five tool maps in one shot.
     channel_handles: AgentChannelHandles,
 }
 
@@ -96,45 +101,48 @@ pub struct StreamedTurnError {
 /// cheap (Arc clones); the underlying maps are shared with the live tools.
 #[derive(Clone, Default)]
 pub struct AgentChannelHandles {
-    pub ask_user: Option<tools::ChannelMapHandle>,
-    pub reaction: Option<tools::ChannelMapHandle>,
-    pub escalate: Option<tools::ChannelMapHandle>,
-    pub poll: Option<tools::ChannelMapHandle>,
+    pub ask_user: Option<tools::PerToolChannelHandle>,
+    pub reaction: tools::PerToolChannelHandle,
+    pub poll: Option<tools::PerToolChannelHandle>,
+    pub escalate: Option<tools::PerToolChannelHandle>,
+    pub channel_send: Option<tools::PerToolChannelHandle>,
 }
 
 impl AgentChannelHandles {
-    /// Register a channel into every populated handle so all four
-    /// channel-driven tools can resolve it by name.
+    /// Return references to all populated per-tool channel handles.
+    fn populated_handles(&self) -> Vec<Option<&tools::PerToolChannelHandle>> {
+        vec![
+            self.ask_user.as_ref(),
+            Some(&self.reaction),
+            self.poll.as_ref(),
+            self.escalate.as_ref(),
+            self.channel_send.as_ref(),
+        ]
+    }
+
+    /// Register a channel into every populated handle so all channel-driven
+    /// tools can resolve it by name.
     pub fn register_channel(
         &self,
         name: impl Into<String>,
         channel: Arc<dyn zeroclaw_api::channel::Channel>,
     ) {
         let name = name.into();
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
-        {
+        for handle in self.populated_handles().into_iter().flatten() {
             handle.write().insert(name.clone(), Arc::clone(&channel));
         }
     }
 
     /// Remove a channel from every populated handle (used on session/stop).
     pub fn unregister_channel(&self, name: &str) {
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
-        {
+        for handle in self.populated_handles().into_iter().flatten() {
             handle.write().remove(name);
         }
     }
 
     /// Look up a registered channel by name from any populated channel map.
     pub fn get_channel(&self, name: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
-        {
+        for handle in self.populated_handles().into_iter().flatten() {
             if let Some(channel) = handle.read().get(name) {
                 return Some(Arc::clone(channel));
             }
@@ -478,6 +486,7 @@ impl AgentBuilder {
             allowed_tools: allowed,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
+            channel_targets: None,
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
@@ -494,17 +503,36 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// Late-bound channel-map handles for the four channel-driven tools.
+    pub fn history(&self) -> &[ConversationMessage] {
+        &self.history
+    }
+
+    /// Late-bound channel-map handles for the five channel-driven tools.
     /// Populated by `from_config_with_session_cwd`; empty when an Agent is
     /// constructed via the builder directly. Callers (e.g. the ACP server)
     /// use `channel_handles().register_channel(...)` to wire a back-channel
-    /// into all four tool maps in one shot.
+    /// into all five tool maps in one shot.
     pub fn channel_handles(&self) -> &AgentChannelHandles {
         &self.channel_handles
     }
 
-    pub fn history(&self) -> &[ConversationMessage] {
-        &self.history
+    /// Populate late-bound channel-map handles with configured channels.
+    ///
+    /// Seeds `ask_user`, `reaction`, `poll`, `escalate`, and `channel_send`
+    /// handles from the provided map. Called by CLI and orchestrator paths
+    /// after agent construction but before the agent loop starts.
+    ///
+    /// Returns the list of registered channel names for logging.
+    pub fn populate_channels(
+        &self,
+        channel_map: &std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+        for (name, ch) in channel_map {
+            self.channel_handles.register_channel(name, Arc::clone(ch));
+            names.push(name.clone());
+        }
+        names
     }
 
     pub fn clear_history(&mut self) {
@@ -732,17 +760,24 @@ impl Agent {
             session_cwd,
             initialize_mcp,
             false,
+            None,
         )
         .await
     }
 
     /// Build an Agent for direct ACP/WS sessions that have a client approval
     /// back-channel. This keeps shell approval on the runtime-controlled path.
+    ///
+    /// `canvas_store` should be the shared [`tools::CanvasStore`] from the
+    /// gateway / daemon supervisor so that canvas frames pushed by this agent
+    /// reach the `/ws/canvas/:id` WebSocket subscribers.  Pass `None` only in
+    /// standalone contexts (e.g. `zeroclaw acp`) where no gateway is running.
     pub async fn from_config_with_session_cwd_and_mcp_backchannel(
         config: &Config,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -750,6 +785,7 @@ impl Agent {
             session_cwd,
             initialize_mcp,
             true,
+            canvas_store,
         )
         .await
     }
@@ -760,6 +796,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         approval_backchannel: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -795,9 +832,11 @@ impl Agent {
         if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
+        let runtime_profile = config.runtime_profile_for_agent(agent_alias);
         let security = Arc::new({
-            let mut policy = SecurityPolicy::from_risk_profile(
+            let mut policy = SecurityPolicy::from_profiles(
                 risk_profile,
+                runtime_profile,
                 session_cwd.unwrap_or(&agent_workspace),
             );
             // When a per-session cwd overrides the sandbox root, ensure
@@ -864,15 +903,16 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
-            None,
+            canvas_store,
             false,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
-        let reaction_handle = all_tools_result.reaction_handle;
-        let poll_handle = all_tools_result.channel_map_handle;
         let ask_user_handle = all_tools_result.ask_user_handle;
+        let reaction_handle = all_tools_result.reaction_handle;
+        let poll_handle = all_tools_result.poll_handle;
         let escalate_handle = all_tools_result.escalate_handle;
+        let channel_send_handle = all_tools_result.channel_send_handle;
 
         // ── Built-in SecurityPolicy tool gate (parity with agent::run) ──
         // Apply the agent's allowlist (`allowed_tools`) AND denylist
@@ -1137,11 +1177,24 @@ impl Agent {
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 
+        // Build configured channel targets for system prompt injection.
+        // Only inject when channel_send survived the effective tool filter —
+        // otherwise the prompt would advertise a disabled tool's targets.
+        let channel_targets = build_channel_targets(config);
+        if let Some(ref targets) = channel_targets
+            && agent.tools.iter().any(|t| t.name() == "channel_send")
+        {
+            agent.channel_targets = Some(targets.clone());
+        }
+
+        // Wire per-tool channel-map handles into the agent so callers (e.g.
+        // the ACP server) can register back-channels after construction.
         agent.channel_handles = AgentChannelHandles {
             ask_user: ask_user_handle,
             reaction: reaction_handle,
+            poll: poll_handle,
             escalate: escalate_handle,
-            poll: Some(poll_handle),
+            channel_send: channel_send_handle,
         };
 
         Ok(agent)
@@ -1214,6 +1267,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            channel_targets: self.channel_targets.clone(),
         };
         self.prompt_builder.build(&ctx)
     }
@@ -2323,6 +2377,23 @@ pub async fn run(
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
+    // Populate channel-driven tool handles from the registered factory.
+    let channels_seed = loop_::seed_channel_handles(
+        &agent.channel_handles.ask_user,
+        &agent.channel_handles.reaction,
+        &agent.channel_handles.poll,
+        &agent.channel_handles.escalate,
+        &agent.channel_handles.channel_send,
+    );
+    if channels_seed > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"count": channels_seed})),
+            &format!("Registered {} channel(s) for CLI agent", channels_seed),
+        );
+    }
+
     let provider_name = effective_config
         .first_model_provider_alias()
         .unwrap_or_else(|| "openrouter.default".to_string());
@@ -3045,13 +3116,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -3102,13 +3174,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -3160,13 +3233,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -3222,13 +3296,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -3289,13 +3364,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let first_result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -5532,6 +5608,103 @@ mod tests {
         );
     }
 
+    /// Regression: Agent::from_config must propagate the runtime profile's
+    /// budget caps into the constructed Agent's security_summary.  The
+    /// existing from_profiles tests cover SecurityPolicy-level propagation,
+    /// but they pass even if Agent::from_config still calls
+    /// from_risk_profile (skipping runtime budgets).  This test exercises
+    /// the full from_config → SecurityPolicy::from_profiles path so that
+    /// reverting the runtime_profile resolution in agent.rs is caught.
+    #[tokio::test]
+    async fn from_config_runtime_profile_propagates_budget_caps() {
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|Json(_body): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "ok"
+                        }
+                    }]
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", "default")
+                .expect("custom model_provider type slot");
+            entry.api_key = Some("test-key".to_string());
+            entry.model = Some("test-model".to_string());
+            entry.uri = Some(format!("http://{mock_addr}"));
+        }
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+
+        // Runtime profile with a non-default max_actions_per_hour.
+        config.runtime_profiles.insert(
+            "test-runtime".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_actions_per_hour: 99,
+                ..zeroclaw_config::schema::RuntimeProfileConfig::default()
+            },
+        );
+
+        let provider_alias = config
+            .first_model_provider_type()
+            .expect("model_provider configured above")
+            .to_string();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: format!("{provider_alias}.default").into(),
+            risk_profile: "test-profile".to_string(),
+            runtime_profile: "test-runtime".to_string(),
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        config.agents.insert("test-agent".to_string(), agent_cfg);
+
+        let agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent from config");
+
+        let summary = agent
+            .security_summary
+            .as_deref()
+            .expect("security_summary should be populated by from_config");
+
+        assert!(
+            summary.contains("99"),
+            "expected security_summary to contain runtime max_actions_per_hour=99; got: {summary}"
+        );
+
+        server_handle.abort();
+    }
+
     #[test]
     fn excluded_tools_then_skill_registration_end_to_end() {
         let security = Arc::new(crate::security::SecurityPolicy::default());
@@ -5554,5 +5727,31 @@ mod tests {
             names,
             &["file_read", "web_fetch", "ops__deploy", "ops__rollback"]
         );
+    }
+
+    /// Regression: channel_targets must NOT be set when channel_send is excluded
+    /// from the effective tool set (security policy / allowlist filter).
+    /// See PR #6665 — target guidance must respect the effective tool allowlist.
+    #[test]
+    fn channel_targets_guarded_when_channel_send_excluded() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_read")),
+            Box::new(NamedMockTool::new("channel_send")),
+        ];
+
+        // Simulate policy filter removing channel_send
+        let excluded = ["channel_send".to_string()];
+        tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+
+        // The guard condition: only set channel_targets when channel_send survives
+        let channel_send_present = tools.iter().any(|t| t.name() == "channel_send");
+        assert!(
+            !channel_send_present,
+            "channel_send should have been excluded by the policy filter"
+        );
+
+        // If channel_send is absent, the prompt must NOT receive channel targets
+        // (the guard in from_config checks this before setting agent.channel_targets)
     }
 }

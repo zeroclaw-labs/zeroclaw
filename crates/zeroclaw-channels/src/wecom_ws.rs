@@ -678,17 +678,16 @@ impl WeComWsChannel {
             );
             let _ = tx
                 .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: "/new".to_string(),
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
+                    ..ChannelMessage::new(
+                        parsed.msg_id.clone(),
+                        parsed.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        "/new",
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
             return;
@@ -703,17 +702,15 @@ impl WeComWsChannel {
                 .await;
             let _ = tx
                 .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: "/stop".to_string(),
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
+                    ..ChannelMessage::new(
+                        parsed.msg_id.clone(),
+                        parsed.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        "/stop",
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
             return;
@@ -728,17 +725,16 @@ impl WeComWsChannel {
             );
             let _ = tx
                 .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: runtime_command,
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
+                    ..ChannelMessage::new(
+                        parsed.msg_id.clone(),
+                        parsed.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        runtime_command,
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
             return;
@@ -813,17 +809,16 @@ impl WeComWsChannel {
 
             let _ = tx
                 .send(ChannelMessage {
-                    id: inbound.msg_id.clone(),
-                    sender: inbound.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: composed,
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(channel_self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
+                    ..ChannelMessage::new(
+                        inbound.msg_id.clone(),
+                        inbound.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        composed,
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
         });
@@ -3357,19 +3352,14 @@ mod tests {
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
 
         let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
-        tx.send(ChannelMessage {
-            id: "prefill-clear".to_string(),
-            sender: "tester".to_string(),
-            reply_target: "user--zeroclaw_user".to_string(),
-            content: "prefill".to_string(),
-            channel: "wecom_ws".to_string(),
-            channel_alias: None,
-            timestamp: bytes_timestamp_now(),
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: Vec::new(),
-            subject: None,
-        })
+        tx.send(ChannelMessage::new(
+            "prefill-clear",
+            "tester",
+            "user--zeroclaw_user",
+            "prefill",
+            "wecom_ws",
+            bytes_timestamp_now(),
+        ))
         .await
         .unwrap();
 
