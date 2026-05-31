@@ -16,7 +16,14 @@ use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Pin mapping for the smart-room demo board.
-/// Output devices use gpio_write; the motion sensor uses gpio_read.
+///
+/// This mapping is intentionally hardcoded for the specific ESP32 demo board
+/// used in the hackathon vignette. If the physical wiring on a board changes,
+/// both this table and the firmware must be kept in sync.
+///
+/// For dynamic discovery of named devices, prefer the `pin_devices` map
+/// returned by the `hardware_capabilities` tool (see the companion PR that
+/// surfaces this field).
 fn output_pin(device: &str) -> Option<u8> {
     match device {
         "reading_lamp" | "lamp" | "reading lamp" => Some(12),
