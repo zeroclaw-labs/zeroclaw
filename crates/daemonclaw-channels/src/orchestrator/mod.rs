@@ -1161,25 +1161,30 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
 /// Proactively trim conversation turns so that the total estimated character
 /// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
-/// turns first, but always preserves the most recent turn (the current user
-/// message).  Returns the number of turns dropped.
+/// turns first, but always preserves the first user message (session's
+/// original ask) and the most recent turn (the current user message).
+/// Returns the number of turns dropped.
 fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
     if total_chars <= budget || turns.len() <= 1 {
         return 0;
     }
 
+    // Protect index 0 when it's the first user message (original ask).
+    let protect_first_user = turns.first().is_some_and(|m| m.role == "user");
+    let start = if protect_first_user { 1 } else { 0 };
+
     let mut excess = total_chars.saturating_sub(budget);
     let mut drop_count = 0;
 
-    // Walk from the oldest turn forward, but never drop the very last turn.
-    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
-        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
+    // Walk from the oldest droppable turn forward, but never drop the very last turn.
+    while excess > 0 && (start + drop_count) < turns.len().saturating_sub(1) {
+        excess = excess.saturating_sub(turns[start + drop_count].content.chars().count());
         drop_count += 1;
     }
 
     if drop_count > 0 {
-        turns.drain(..drop_count);
+        turns.drain(start..start + drop_count);
     }
     drop_count
 }
@@ -1209,8 +1214,13 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
+    // Trim to cap, but protect the first user message (the session's
+    // "original ask") from removal — it defines the conversation's intent
+    // and must remain recoverable.
+    let protect_first_user = turns.first().is_some_and(|m| m.role == "user");
+    let remove_start = if protect_first_user { 1 } else { 0 };
+    while turns.len() > max_history && remove_start < turns.len().saturating_sub(1) {
+        turns.remove(remove_start);
     }
 }
 
@@ -2774,7 +2784,7 @@ async fn process_channel_message(
     // and preserving key decisions through LLM-driven summarization.
     {
         let cc_config = ctx.prompt_config.agent.context_compression.clone();
-        let compressor = daemonclaw_runtime::agent::context_compressor::ContextCompressor::new(
+        let mut compressor = daemonclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
             ctx.context_token_budget,
         )
@@ -3034,7 +3044,7 @@ async fn process_channel_message(
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
-                        ctx.tools_registry.as_ref(),
+                        &ctx.tools_registry,
                         notify_observer.as_ref() as &dyn Observer,
                         route.provider.as_str(),
                         route.model.as_str(),
@@ -5793,19 +5803,16 @@ mod tests {
     }
 
     #[test]
-    fn channel_message_timeout_budget_scales_with_tool_iterations() {
-        assert_eq!(channel_message_timeout_budget_secs(300, 1), 300);
-        assert_eq!(channel_message_timeout_budget_secs(300, 2), 600);
-        assert_eq!(channel_message_timeout_budget_secs(300, 3), 900);
+    fn channel_message_timeout_budget_scales_with_cap() {
+        assert_eq!(channel_message_timeout_budget_secs_with_cap(300, 1), 300);
+        assert_eq!(channel_message_timeout_budget_secs_with_cap(300, 2), 600);
+        assert_eq!(channel_message_timeout_budget_secs_with_cap(300, 4), 1200);
     }
 
     #[test]
-    fn channel_message_timeout_budget_uses_safe_defaults_and_cap() {
-        // 0 iterations falls back to 1x timeout budget.
-        assert_eq!(channel_message_timeout_budget_secs(300, 0), 300);
-        // Large iteration counts are capped to avoid runaway waits.
+    fn channel_message_timeout_budget_default_cap() {
         assert_eq!(
-            channel_message_timeout_budget_secs(300, 10),
+            channel_message_timeout_budget_secs(300),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
     }
@@ -5813,15 +5820,11 @@ mod tests {
     #[test]
     fn channel_message_timeout_budget_with_custom_scale_cap() {
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 8, 8),
+            channel_message_timeout_budget_secs_with_cap(300, 8),
             300 * 8
         );
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 20, 8),
-            300 * 8
-        );
-        assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 10, 1),
+            channel_message_timeout_budget_secs_with_cap(300, 1),
             300
         );
     }
@@ -5839,16 +5842,12 @@ mod tests {
     fn pacing_message_timeout_scale_max_overrides_default_cap() {
         // Custom cap of 8 scales budget proportionally
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 10, 8),
+            channel_message_timeout_budget_secs_with_cap(300, 8),
             300 * 8
         );
         // Default cap produces the standard behavior
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(
-                300,
-                10,
-                CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
-            ),
+            channel_message_timeout_budget_secs_with_cap(300, CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
     }

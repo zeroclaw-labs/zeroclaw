@@ -566,7 +566,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -584,7 +584,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,

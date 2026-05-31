@@ -13,7 +13,6 @@ allow_public_bind = true
 require_pairing = false
 
 [agent]
-max_tool_iterations = 50
 max_tool_result_chars = 50000
 max_context_tokens = 32000
 

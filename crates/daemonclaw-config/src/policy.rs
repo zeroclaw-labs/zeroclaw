@@ -174,6 +174,7 @@ pub struct SecurityPolicy {
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub allow_background_commands: bool,
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
     pub tracker: PerSenderTracker,
@@ -304,6 +305,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            allow_background_commands: false,
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
             tracker: PerSenderTracker::new(),
@@ -1191,9 +1193,11 @@ impl SecurityPolicy {
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
         // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
         // flagged as background chaining.
-        let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
-            return false;
+        if !self.allow_background_commands {
+            let ampersand_check = strip_fd_merge_redirects(command);
+            if contains_unquoted_single_ampersand(&ampersand_check) {
+                return false;
+            }
         }
 
         // Split on unquoted command separators and validate each sub-command.
@@ -1680,6 +1684,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            allow_background_commands: autonomy_config.allow_background_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: PerSenderTracker::new(),
@@ -2532,6 +2537,26 @@ mod tests {
         assert!(!p.is_command_allowed("ls & rm -rf /"));
         assert!(!p.is_command_allowed("ls&rm -rf /"));
         assert!(!p.is_command_allowed("echo ok & python3 -c 'print(1)'"));
+    }
+
+    #[test]
+    fn allow_background_commands_true_permits_single_ampersand() {
+        let p = SecurityPolicy {
+            allow_background_commands: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("ls &"));
+        assert!(p.is_command_allowed("echo done &"));
+    }
+
+    #[test]
+    fn allow_background_commands_false_blocks_single_ampersand() {
+        let p = SecurityPolicy {
+            allow_background_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("ls &"));
+        assert!(!p.is_command_allowed("echo done &"));
     }
 
     #[test]

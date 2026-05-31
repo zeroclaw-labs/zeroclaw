@@ -135,20 +135,23 @@ impl HookHandler for SkillPatcherHook {
         -110
     }
 
-    async fn on_turn_complete(&self, result: &TurnResult) {
+    async fn on_turn_complete(&self, result: &TurnResult) -> crate::hooks::traits::TurnCompleteAction {
+        use crate::hooks::traits::TurnCompleteAction;
+        let cont = TurnCompleteAction::Continue;
+
         let skill_name = match &result.active_skill {
             Some(name) => name.clone(),
-            None => return,
+            None => return cont,
         };
 
         let skill = match self.store.get_agent(&skill_name) {
             Ok(Some(s)) => s,
-            _ => return,
+            _ => return cont,
         };
 
         if skill.meta().pinned {
             tracing::debug!(target: "skill_patcher", name = %skill_name, "skill is pinned, skipping deviation check");
-            return;
+            return cont;
         }
 
         let deviation_prompt = Self::build_deviation_prompt(result, &skill.body);
@@ -160,7 +163,7 @@ impl HookHandler for SkillPatcherHook {
         .await
         {
             Some(r) => r,
-            None => return,
+            None => return cont,
         };
 
         let classification = Self::parse_deviation(&deviation_response);
@@ -172,7 +175,7 @@ impl HookHandler for SkillPatcherHook {
         );
 
         if classification != DeviationClass::Deviated {
-            return;
+            return cont;
         }
 
         let patch_prompt = Self::build_patch_prompt(result, &skill.body);
@@ -184,12 +187,12 @@ impl HookHandler for SkillPatcherHook {
         .await
         {
             Some(r) => r,
-            None => return,
+            None => return cont,
         };
 
         let new_body = new_body.trim().to_string();
         if new_body.is_empty() {
-            return;
+            return cont;
         }
 
         let mut updated_fm = skill.frontmatter.clone();
@@ -214,6 +217,7 @@ impl HookHandler for SkillPatcherHook {
                 tracing::warn!(target: "skill_patcher", name = %skill_name, "failed to patch skill: {e}");
             }
         }
+        cont
     }
 }
 

@@ -120,7 +120,11 @@ pub struct ContextCompressor {
     config: ContextCompressionConfig,
     context_window: usize,
     memory: Option<Arc<dyn Memory>>,
+    compression_savings: Vec<f64>,
 }
+
+const ANTI_THRASH_WINDOW: usize = 2;
+const ANTI_THRASH_MIN_SAVINGS: f64 = 0.10;
 
 impl ContextCompressor {
     pub fn new(config: ContextCompressionConfig, context_window: usize) -> Self {
@@ -128,6 +132,7 @@ impl ContextCompressor {
             config,
             context_window,
             memory: None,
+            compression_savings: Vec::new(),
         }
     }
 
@@ -187,7 +192,7 @@ impl ContextCompressor {
 
     /// Main entry point. Compresses history in-place if over threshold.
     pub async fn compress_if_needed(
-        &self,
+        &mut self,
         history: &mut Vec<ChatMessage>,
         provider: &dyn Provider,
         model: &str,
@@ -245,11 +250,42 @@ impl ContextCompressor {
             }
         }
 
+        // Anti-thrashing: skip LLM compression if recent passes were ineffective.
+        if self.compression_savings.len() >= ANTI_THRASH_WINDOW
+            && self.compression_savings[self.compression_savings.len() - ANTI_THRASH_WINDOW..]
+                .iter()
+                .all(|&s| s < ANTI_THRASH_MIN_SAVINGS)
+        {
+            tracing::info!(
+                recent_savings = ?&self.compression_savings[self.compression_savings.len() - ANTI_THRASH_WINDOW..],
+                "Skipping LLM compression — recent passes saved <{:.0}% each",
+                ANTI_THRASH_MIN_SAVINGS * 100.0
+            );
+            let tokens_after = estimate_tokens(history);
+            return Ok(CompressionResult {
+                compressed: false,
+                tokens_before,
+                tokens_after,
+                passes_used: 0,
+            });
+        }
+
         let mut passes_used = 0;
         for _ in 0..self.config.max_passes {
+            let before_pass = estimate_tokens(history);
             let did_compress = self.compress_once(history, provider, model).await?;
             if did_compress {
                 passes_used += 1;
+                let after_pass = estimate_tokens(history);
+                let savings_ratio = if before_pass > 0 {
+                    (before_pass.saturating_sub(after_pass)) as f64 / before_pass as f64
+                } else {
+                    0.0
+                };
+                self.compression_savings.push(savings_ratio);
+                if self.compression_savings.len() > 10 {
+                    self.compression_savings.remove(0);
+                }
             }
             if estimate_tokens(history) <= threshold || !did_compress {
                 break;
@@ -389,11 +425,16 @@ impl ContextCompressor {
             }
         }
 
-        // Splice: head + [SUMMARY] + tail
+        // Splice: head + [SUMMARY] + auto-continue + tail
         let summary_msg = ChatMessage::assistant(format!(
             "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
         ));
-        history.splice(start..end, std::iter::once(summary_msg));
+        let continue_msg = ChatMessage::user(
+            "[System: context was compacted. Continue where you left off — \
+             do not repeat completed work.]"
+                .to_string(),
+        );
+        history.splice(start..end, [summary_msg, continue_msg]);
 
         // Repair orphaned tool pairs
         repair_tool_pairs(history);
@@ -566,7 +607,7 @@ mod tests {
             _system_prompt: Option<&str>,
             message: &str,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
         ) -> Result<String> {
             self.seen_messages.lock().push(message.to_string());
             Ok("summary".to_string())
@@ -576,7 +617,7 @@ mod tests {
             &self,
             _request: daemonclaw_api::provider::ChatRequest<'_>,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
         ) -> Result<daemonclaw_api::provider::ChatResponse> {
             unreachable!("context compressor uses chat_with_system")
         }
@@ -835,7 +876,7 @@ mod tests {
             threshold_ratio: 0.01,
             ..Default::default()
         };
-        let compressor = ContextCompressor::new(config, 64);
+        let mut compressor = ContextCompressor::new(config, 64);
         let provider = CaptureSummarizerProvider {
             supports_vision: false,
             seen_messages: Mutex::new(Vec::new()),

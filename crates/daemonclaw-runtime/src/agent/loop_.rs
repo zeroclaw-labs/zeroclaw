@@ -431,8 +431,8 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub use super::tool_execution::{
-    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
+    ToolBatch, ToolExecutionOutcome, execute_tools_batched, execute_tools_parallel,
+    execute_tools_sequential, partition_tool_calls, should_execute_tools_in_parallel,
 };
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -540,8 +540,8 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 }
 
 #[derive(Debug, Default)]
-struct StreamedChatOutcome {
-    response_text: String,
+pub(crate) struct StreamedChatOutcome {
+    pub(crate) response_text: String,
     /// Accumulated reasoning/thinking content from streaming deltas.
     ///
     /// Captured separately from `response_text` so it can be threaded into
@@ -550,12 +550,12 @@ struct StreamedChatOutcome {
     /// DeepSeek V4 that reject follow-up requests when the assistant's
     /// prior `reasoning_content` is missing from replayed tool-call turns
     /// (see issue #6059).
-    reasoning_content: String,
-    tool_calls: Vec<ToolCall>,
-    forwarded_live_deltas: bool,
+    pub(crate) reasoning_content: String,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) forwarded_live_deltas: bool,
 }
 
-async fn consume_provider_streaming_response(
+pub(crate) async fn consume_provider_streaming_response(
     provider: &dyn Provider,
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
@@ -563,6 +563,7 @@ async fn consume_provider_streaming_response(
     temperature: f64,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    mut streaming_executor: Option<&mut crate::agent::streaming_executor::StreamingToolExecutor>,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = provider.stream_chat(
         ChatRequest {
@@ -596,7 +597,11 @@ async fn consume_provider_streaming_response(
         match event {
             StreamEvent::Final => break,
             StreamEvent::ToolCall(tool_call) => {
-                outcome.tool_calls.push(tool_call);
+                if let Some(ref mut executor) = streaming_executor {
+                    executor.add_tool(tool_call);
+                } else {
+                    outcome.tool_calls.push(tool_call);
+                }
                 suppress_forwarding = true;
             }
             StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
@@ -669,7 +674,7 @@ async fn consume_provider_streaming_response(
 pub async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: &Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -856,7 +861,7 @@ pub fn append_receipt_footer(
 pub async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: &Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -910,6 +915,45 @@ pub async fn run_tool_call_loop(
     let mut turn_tool_records: Vec<daemonclaw_api::agent::ToolCallRecord> = Vec::new();
     let mut turn_active_skill: Option<String> = None;
 
+    let context_pipeline =
+        crate::agent::context_pipeline::ContextPipeline::default_preemptive();
+    let retry_policy = crate::agent::retry::RetryPolicy::default();
+    let mut consecutive_retries: u32 = 0;
+    let mut hook_continuation_count: u32 = 0;
+    let max_hook_continuations: u32 = pacing
+        .max_hook_continuations
+        .unwrap_or(5);
+
+    // Preflight: if history already exceeds the model's context window on
+    // entry (e.g. after a model switch to a smaller window), compact now.
+    {
+        let preflight_budget = if context_token_budget == 0 {
+            daemonclaw_providers::model_limits::resolve_context_window(
+                provider.context_window_for_model(model),
+                model,
+            )
+        } else {
+            context_token_budget
+        };
+        let estimated = estimate_history_tokens(history);
+        if estimated > preflight_budget {
+            tracing::info!(
+                estimated,
+                budget = preflight_budget,
+                "Preflight: history exceeds model context, compacting before loop entry"
+            );
+            context_pipeline.run(
+                history,
+                &crate::agent::context_pipeline::PipelineContext {
+                    token_budget: preflight_budget,
+                    iteration: 0,
+                    model,
+                    state_dir: None,
+                },
+            );
+        }
+    }
+
     for iteration in 0usize.. {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -930,9 +974,7 @@ pub async fn run_tool_call_loop(
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Preemptive context management: trim history before it overflows.
-        // When context_token_budget is 0 ("unlimited"), resolve the real limit
-        // from the provider or the static model table.
+        // Preemptive context management via ordered pipeline (cheap→expensive).
         let effective_budget = if context_token_budget == 0 {
             daemonclaw_providers::model_limits::resolve_context_window(
                 provider.context_window_for_model(model),
@@ -941,47 +983,15 @@ pub async fn run_tool_call_loop(
         } else {
             context_token_budget
         };
-        {
-            let estimated = estimate_history_tokens(history);
-            if estimated > effective_budget {
-                tracing::info!(
-                    estimated,
-                    budget = effective_budget,
-                    iteration = iteration + 1,
-                    "Preemptive context trim: estimated tokens exceed budget"
-                );
-                let chars_saved = fast_trim_tool_results(history, 4);
-                if chars_saved > 0 {
-                    tracing::info!(chars_saved, "Preemptive fast-trim applied");
-                }
-                let recheck = estimate_history_tokens(history);
-                if recheck > effective_budget {
-                    let stats = crate::agent::history_pruner::prune_history(
-                        history,
-                        &crate::agent::history_pruner::HistoryPrunerConfig {
-                            enabled: true,
-                            max_tokens: effective_budget,
-                            keep_recent: 4,
-                            collapse_tool_results: true,
-                        },
-                    );
-                    if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
-                        tracing::info!(
-                            collapsed = stats.collapsed_pairs,
-                            dropped = stats.dropped_messages,
-                            "Preemptive history prune applied"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Remove orphaned tool-role messages whose assistant (tool_calls)
-        // counterpart was dropped by proactive trimming, context compression,
-        // or session history reloading.  Without this, providers like MiniMax
-        // reject the request with "tool result's tool id not found" (bug #5743).
-        crate::agent::history_pruner::remove_orphaned_tool_messages(history);
-        normalize_system_messages(history);
+        context_pipeline.run(
+            history,
+            &crate::agent::context_pipeline::PipelineContext {
+                token_budget: effective_budget,
+                iteration,
+                model,
+                state_dir: None,
+            },
+        );
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -1067,8 +1077,51 @@ pub async fn run_tool_call_loop(
                 (provider, provider_name, model)
             };
 
+        // ── Context collapse (reversible projection) ──────────────
+        // After the pipeline's destructive stages, if history still exceeds
+        // the budget, produce a collapsed projection for the LLM call.
+        // The raw history is NOT mutated — collapse is read-only.
+        let collapse_protect = 6;
+        let collapsed_view: Option<Vec<ChatMessage>> = {
+            let estimated = estimate_history_tokens(history);
+            if estimated > effective_budget && history.len() > collapse_protect + 2 {
+                let mut collapser =
+                    crate::agent::context_collapse::ContextCollapser::new(collapse_protect);
+                let collapse_end = history.len().saturating_sub(collapse_protect);
+                let collapse_start = if history.first().is_some_and(|m| m.role == "system") {
+                    1
+                } else {
+                    0
+                };
+                if collapse_start < collapse_end {
+                    let mut summary = String::new();
+                    for msg in &history[collapse_start..collapse_end] {
+                        let preview = if msg.content.len() > 100 {
+                            &msg.content[..100]
+                        } else {
+                            &msg.content
+                        };
+                        use std::fmt::Write as _;
+                        let _ = writeln!(summary, "- [{}] {}", msg.role, preview);
+                    }
+                    let tokens_saved = estimate_history_tokens(&history[collapse_start..collapse_end]);
+                    collapser.collapse_region(collapse_start, collapse_end, summary, tokens_saved);
+                    Some(collapser.project(history))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let messages_for_provider: &[ChatMessage] = match &collapsed_view {
+            Some(projected) => projected,
+            None => history,
+        };
+
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(messages_for_provider, multimodal_config)
+                .await?;
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -1139,8 +1192,18 @@ pub async fn run_tool_call_loop(
             iteration + 1,
         );
         let mut streamed_live_deltas = false;
+        let mut streaming_tool_results: Option<
+            Vec<(daemonclaw_providers::ToolCall, ToolExecutionOutcome)>,
+        > = None;
 
         let chat_result = if should_consume_provider_stream {
+            let mut streaming_executor =
+                crate::agent::streaming_executor::StreamingToolExecutor::new(
+                    Arc::clone(tools_registry),
+                    Arc::new(crate::observability::NoopObserver {}),
+                    cancellation_token.clone(),
+                    None,
+                );
             match consume_provider_streaming_response(
                 active_provider,
                 &prepared_messages.messages,
@@ -1149,6 +1212,7 @@ pub async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
+                Some(&mut streaming_executor),
             )
             .await
             {
@@ -1159,12 +1223,30 @@ pub async fn run_tool_call_loop(
                     } else {
                         Some(streamed.reasoning_content)
                     };
-                    Ok(daemonclaw_providers::ChatResponse {
-                        text: Some(streamed.response_text),
-                        tool_calls: streamed.tool_calls,
-                        usage: None,
-                        reasoning_content,
-                    })
+                    // If the streaming executor dispatched tools mid-stream,
+                    // collect their results now. The tool_calls in the
+                    // ChatResponse will be empty (executor consumed them).
+                    if streaming_executor.has_tools() {
+                        let finished = streaming_executor.finish().await;
+                        let mut calls_for_response = Vec::new();
+                        for (call, _) in &finished {
+                            calls_for_response.push(call.clone());
+                        }
+                        streaming_tool_results = Some(finished);
+                        Ok(daemonclaw_providers::ChatResponse {
+                            text: Some(streamed.response_text),
+                            tool_calls: calls_for_response,
+                            usage: None,
+                            reasoning_content,
+                        })
+                    } else {
+                        Ok(daemonclaw_providers::ChatResponse {
+                            text: Some(streamed.response_text),
+                            tool_calls: streamed.tool_calls,
+                            usage: None,
+                            reasoning_content,
+                        })
+                    }
                 }
                 Err(stream_err) => {
                     tracing::warn!(
@@ -1293,7 +1375,8 @@ pub async fn run_tool_call_loop(
                         + usage.output_tokens.unwrap_or(0);
                 }
 
-                let response_text = resp.text_or_empty().to_string();
+                let response_text =
+                    crate::agent::retry::sanitize_response(&resp.text_or_empty());
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the provider returned no native calls —
@@ -1415,8 +1498,44 @@ pub async fn run_tool_call_loop(
                     }),
                 );
 
+                // Classify error for retry decisions
+                let error_class = crate::agent::retry::classify_error(&e);
+
+                // Transient errors: retry with backoff
+                if retry_policy.should_retry(error_class)
+                    && consecutive_retries < retry_policy.max_retries
+                {
+                    consecutive_retries += 1;
+                    let delay = crate::agent::retry::parse_retry_after(&e)
+                        .unwrap_or_else(|| retry_policy.delay_for_attempt(consecutive_retries));
+                    tracing::warn!(
+                        error_class = ?error_class,
+                        attempt = consecutive_retries,
+                        delay_ms = delay.as_millis(),
+                        iteration = iteration + 1,
+                        "Transient LLM error, retrying after backoff"
+                    );
+                    runtime_trace::record_event(
+                        "llm_retry",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(&format!("{error_class:?}: retry {consecutive_retries}")),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "attempt": consecutive_retries,
+                            "delay_ms": delay.as_millis() as u64,
+                            "error_class": format!("{error_class:?}"),
+                        }),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
                 // Context overflow recovery: trim history and retry
-                if daemonclaw_providers::reliable::is_context_window_exceeded(&e) {
+                if matches!(error_class, crate::agent::retry::ErrorClass::ContextOverflow) {
                     tracing::warn!(
                         iteration = iteration + 1,
                         "Context window exceeded, attempting in-loop recovery"
@@ -1439,6 +1558,24 @@ pub async fn run_tool_call_loop(
                         continue;
                     }
 
+                    // Step 3: reactive compact — run full pipeline aggressively
+                    let freed = context_pipeline.run(
+                        history,
+                        &crate::agent::context_pipeline::PipelineContext {
+                            token_budget: effective_budget / 2,
+                            iteration,
+                            model,
+                            state_dir: None,
+                        },
+                    );
+                    if freed > 0 {
+                        tracing::info!(
+                            tokens_freed = freed,
+                            "Context recovery: reactive compact freed tokens, retrying"
+                        );
+                        continue;
+                    }
+
                     // Nothing left to trim — truly unrecoverable
                     tracing::error!("Context overflow unrecoverable: no trimmable messages");
                 }
@@ -1446,6 +1583,9 @@ pub async fn run_tool_call_loop(
                 return Err(e);
             }
         };
+
+        // Reset retry counter on successful LLM call.
+        consecutive_retries = 0;
 
         // ── Token budget enforcement ────────────────────────────
         if max_turn_tokens > 0 && cumulative_tokens >= max_turn_tokens {
@@ -1492,6 +1632,58 @@ pub async fn run_tool_call_loop(
             }
         }
 
+        // ── Empty response retry ────────────────────────────────────
+        // If the LLM returned nothing (no text, no tool calls), retry up to 3x.
+        if tool_calls.is_empty()
+            && response_text.trim().is_empty()
+            && consecutive_retries < 3
+        {
+            consecutive_retries += 1;
+            tracing::warn!(
+                attempt = consecutive_retries,
+                iteration = iteration + 1,
+                "Empty LLM response, retrying"
+            );
+            continue;
+        }
+
+        // ── Truncated response continuation ─────────────────────────
+        // If response has no tool calls and appears truncated (long text
+        // ending mid-sentence), inject a continuation prompt and retry.
+        // Guard: skip if the response is a repetition of already-accumulated
+        // text (model echoed its prior output after a tool-call iteration).
+        let trimmed_response = response_text.trim();
+        let trimmed_accumulated = accumulated_display_text.trim();
+        let is_repetition_of_accumulated = !trimmed_accumulated.is_empty()
+            && trimmed_response.len() >= 200
+            && (trimmed_accumulated.contains(trimmed_response)
+                || {
+                    let prefix_match = trimmed_response.starts_with(trimmed_accumulated);
+                    let novel_len =
+                        trimmed_response.len().saturating_sub(trimmed_accumulated.len());
+                    prefix_match && novel_len < 100 && novel_len * 10 < trimmed_response.len()
+                });
+        if tool_calls.is_empty()
+            && consecutive_retries < 3
+            && response_text.len() > 500
+            && !response_text.trim_end().ends_with(|c: char| ".!?\u{3002}\u{300d}\u{3011}\n".contains(c))
+            && !response_text.trim_end().ends_with(|c: char| c.is_ascii_punctuation())
+            && !is_repetition_of_accumulated
+        {
+            tracing::info!(
+                response_len = response_text.len(),
+                iteration = iteration + 1,
+                "Response appears truncated, requesting continuation"
+            );
+            history.push(ChatMessage::assistant(response_text.clone()));
+            history.push(ChatMessage::user(
+                "[System: your previous response was cut off. Resume directly from where you stopped — do not repeat.]".to_string()
+            ));
+            accumulated_display_text.push_str(&display_text);
+            consecutive_retries += 1;
+            continue;
+        }
+
         if tool_calls.is_empty() {
             runtime_trace::record_event(
                 "turn_final_response",
@@ -1507,12 +1699,22 @@ pub async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            accumulated_display_text.push_str(&display_text);
+            // Skip accumulation if the model repeated text already in the buffer.
+            if !is_repetition_of_accumulated {
+                accumulated_display_text.push_str(&display_text);
+            } else {
+                tracing::info!(
+                    iteration = iteration + 1,
+                    "Suppressed repeated response text already present in accumulated output"
+                );
+            }
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
             // When streamed live, the channel already received the deltas.
+            // Skip forwarding if this is a repetition (already delivered).
             if let Some(ref tx) = on_delta
                 && !response_streamed_live
+                && !is_repetition_of_accumulated
             {
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
@@ -1537,7 +1739,12 @@ pub async fn run_tool_call_loop(
                 }
             }
 
-            history.push(ChatMessage::assistant(response_text.clone()));
+            // Skip history push when the response is a verbatim echo of what's
+            // already in history from a prior iteration (prevents model seeing its
+            // own text doubled in context, which amplifies repetition).
+            if !is_repetition_of_accumulated {
+                history.push(ChatMessage::assistant(response_text.clone()));
+            }
 
             // Fire post-turn hooks (skill autogen, dialectic, skill patcher)
             if let Some(hooks) = hooks {
@@ -1557,7 +1764,72 @@ pub async fn run_tool_call_loop(
                     final_response: display_text.clone(),
                     turn_number,
                 };
-                hooks.fire_turn_complete(&turn_result).await;
+                let action = hooks.fire_turn_complete(&turn_result).await;
+                match action {
+                    crate::hooks::TurnCompleteAction::Stop => {
+                        return Ok(append_receipt_footer(
+                            accumulated_display_text,
+                            collected_receipts,
+                        ));
+                    }
+                    crate::hooks::TurnCompleteAction::PreventStop => {
+                        hook_continuation_count += 1;
+                        if hook_continuation_count > max_hook_continuations {
+                            tracing::warn!(
+                                count = hook_continuation_count,
+                                "Hook PreventStop exhausted continuation budget, halting"
+                            );
+                            runtime_trace::record_event(
+                                "hook_continuation_budget_exhausted",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(false),
+                                Some("PreventStop exhausted continuation budget"),
+                                serde_json::json!({
+                                    "action": "PreventStop",
+                                    "count": hook_continuation_count,
+                                    "max": max_hook_continuations,
+                                }),
+                            );
+                            break;
+                        }
+                        history.push(ChatMessage::assistant(response_text.clone()));
+                        continue;
+                    }
+                    crate::hooks::TurnCompleteAction::InjectError(msg) => {
+                        hook_continuation_count += 1;
+                        if hook_continuation_count > max_hook_continuations {
+                            tracing::warn!(
+                                count = hook_continuation_count,
+                                "Hook InjectError exhausted continuation budget, halting"
+                            );
+                            runtime_trace::record_event(
+                                "hook_continuation_budget_exhausted",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(false),
+                                Some("InjectError exhausted continuation budget"),
+                                serde_json::json!({
+                                    "action": "InjectError",
+                                    "count": hook_continuation_count,
+                                    "max": max_hook_continuations,
+                                    "message": msg,
+                                }),
+                            );
+                            break;
+                        }
+                        history.push(ChatMessage::assistant(response_text.clone()));
+                        history.push(ChatMessage::user(format!("[Hook error] {msg}")));
+                        continue;
+                    }
+                    crate::hooks::TurnCompleteAction::Continue => {}
+                }
+                // Background post-turn extraction (non-blocking)
+                hooks.fire_extract_post_turn(&turn_result).await;
             }
 
             return Ok(append_receipt_footer(
@@ -1565,6 +1837,9 @@ pub async fn run_tool_call_loop(
                 collected_receipts,
             ));
         }
+
+        // Tool calls present — legitimate continuation resets the hook-thrash counter.
+        hook_continuation_count = 0;
 
         // Accumulate text from this iteration (tool calls present, loop continues).
         accumulated_display_text.push_str(&display_text);
@@ -1587,15 +1862,42 @@ pub async fn run_tool_call_loop(
             }
         }
 
-        // Execute tool calls and build results. `individual_results` tracks per-call output so
-        // native-mode history can emit one role=tool message per tool call with the correct ID.
+        // Execute tool calls and build results.
         //
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
+        // When streaming_tool_results is Some, tools already executed mid-stream
+        // via the StreamingToolExecutor — use those results directly. Otherwise,
+        // dispatch tools via the normal batched/sequential path.
         let mut tool_results = String::new();
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
+
+        let mut detection_relevant_output = String::new();
+
+        if let Some(streamed_results) = streaming_tool_results.take() {
+            for (idx, (call, outcome)) in streamed_results.into_iter().enumerate() {
+                let tool_call_id = tool_calls
+                    .get(idx)
+                    .and_then(|tc| tc.tool_call_id.clone());
+                let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+                individual_results.push((tool_call_id.clone(), result_output.clone()));
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                    call.name, result_output
+                );
+                detection_relevant_output.push_str(&outcome.output);
+                turn_tool_records.push(daemonclaw_api::agent::ToolCallRecord {
+                    name: call.name.clone(),
+                    arguments: serde_json::from_str(&call.arguments)
+                        .unwrap_or(serde_json::Value::Null),
+                    result: outcome.output.clone(),
+                    success: outcome.success,
+                    duration: outcome.duration,
+                });
+                ordered_results[idx] = Some((call.name, tool_call_id, outcome));
+            }
+        } else {
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
@@ -1850,8 +2152,14 @@ pub async fn run_tool_call_loop(
         }
 
         let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
+            let batches = partition_tool_calls(
                 &executable_calls,
+                tools_registry,
+                activated_tools,
+            );
+            execute_tools_batched(
+                &executable_calls,
+                &batches,
                 tools_registry,
                 activated_tools,
                 observer,
@@ -1927,7 +2235,6 @@ pub async fn run_tool_call_loop(
 
         // Collect tool results and build per-tool output for loop detection.
         // Only non-ignored tool outputs contribute to the identical-output hash.
-        let mut detection_relevant_output = String::new();
         // Use enumerate *before* filter_map so result_index stays aligned with
         // tool_calls even when some ordered_results entries are None.
         for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
@@ -2017,6 +2324,7 @@ pub async fn run_tool_call_loop(
                 tool_name, result_output
             );
         }
+        } // end streaming_tool_results else
 
         // ── Time-gated loop detection ──────────────────────────
         // When pacing.loop_detection_min_elapsed_secs is set, identical-output
@@ -2062,6 +2370,41 @@ pub async fn run_tool_call_loop(
                     "Agent loop aborted: identical tool output detected {} consecutive times",
                     consecutive_identical_outputs
                 );
+            }
+        }
+
+        // ── Diminishing returns + idle detection ──────────────────
+        {
+            let all_failed = turn_tool_records
+                .iter()
+                .all(|r| !r.success);
+            let output_tokens = detection_relevant_output.len() as u64 / 4;
+            match loop_detector.record_output_tokens(output_tokens) {
+                crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                    anyhow::bail!("Agent loop aborted: {msg}");
+                }
+                _ => {}
+            }
+            match loop_detector.record_idle_iteration(all_failed) {
+                crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                    anyhow::bail!("Agent loop aborted: {msg}");
+                }
+                _ => {}
+            }
+        }
+
+        // ── Between-turn hook injection ──────────────────────────
+        if let Some(hooks) = hooks {
+            let injected = hooks.fire_between_turns(iteration).await;
+            if !injected.is_empty() {
+                tracing::debug!(
+                    count = injected.len(),
+                    "Between-turn hook injected {} message(s)",
+                    injected.len()
+                );
+                for msg in injected {
+                    history.push(msg);
+                }
             }
         }
 
@@ -2599,6 +2942,10 @@ pub async fn run(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
+
+    // Freeze the mutable tool registry into shared ownership. All mutations
+    // (skill registration, peripheral extension, MCP wiring) must be done above.
+    let tools_registry = Arc::new(tools_registry);
 
     // Append deferred MCP tool names so the LLM knows what is available
     if !deferred_section.is_empty() {
@@ -3265,7 +3612,7 @@ pub async fn run(
 
             // Context compression before hard trimming to preserve long-context signal.
             {
-                let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                let mut compressor = crate::agent::context_compressor::ContextCompressor::new(
                     config.agent.context_compression.clone(),
                     config.agent.max_context_tokens,
                 )
@@ -3587,6 +3934,7 @@ pub async fn process_message(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
+    let tools_registry = Arc::new(tools_registry);
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
         system_prompt.push_str(&deferred_section);
@@ -4800,7 +5148,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
@@ -4852,7 +5200,7 @@ mod tests {
             "[IMAGE:data:image/png;base64,{oversized_payload}]"
         ))];
 
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
             max_images: 4,
@@ -4910,7 +5258,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
@@ -4961,7 +5309,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
@@ -5013,7 +5361,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5069,7 +5417,7 @@ mod tests {
         let provider = ScriptedProvider::from_text_responses(vec!["hello world"]);
 
         let mut history = vec![ChatMessage::user("just text, no images".to_string())];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5127,7 +5475,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         // vision_provider set but vision_model is None — the code should
@@ -5188,7 +5536,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "empty marker [IMAGE:] should be ignored".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5244,7 +5592,7 @@ mod tests {
             "two images [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/png;base64,bQ==]"
                 .to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5366,7 +5714,7 @@ mod tests {
 
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
             Box::new(DelayTool::new(
                 "delay_a",
                 200,
@@ -5379,7 +5727,7 @@ mod tests {
                 Arc::clone(&active),
                 Arc::clone(&max_active),
             )),
-        ];
+        ]);
 
         let approval_cfg = daemonclaw_config::schema::AutonomyConfig {
             level: crate::security::AutonomyLevel::Full,
@@ -5462,10 +5810,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingArgsTool::new(
             "cron_add",
             Arc::clone(&recorded_args),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5534,10 +5882,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingArgsTool::new(
             "cron_add",
             Arc::clone(&recorded_args),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5601,10 +5949,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5679,9 +6027,9 @@ mod tests {
         });
         let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::new());
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
             crate::tools::shell::ShellTool::new(security, runtime),
-        )];
+        )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5750,10 +6098,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5834,7 +6182,7 @@ mod tests {
 
         let count_invocations = Arc::new(AtomicUsize::new(0));
         let other_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
             Box::new(CountingTool::new(
                 "count_tool",
                 Arc::clone(&count_invocations),
@@ -5843,7 +6191,7 @@ mod tests {
                 "other_tool",
                 Arc::clone(&other_invocations),
             )),
-        ];
+        ]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5905,10 +6253,10 @@ mod tests {
         .with_native_tool_support();
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5995,10 +6343,10 @@ mod tests {
         };
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6067,7 +6415,7 @@ mod tests {
     async fn run_tool_call_loop_consumes_provider_stream_for_final_response() {
         let provider =
             StreamingScriptedProvider::from_text_responses(vec!["streamed final answer"]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("say hi"),
@@ -6135,10 +6483,10 @@ mod tests {
             "done",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run tool calls"),
@@ -6213,10 +6561,10 @@ mod tests {
             NativeStreamTurn::Text("done".to_string()),
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run native tools"),
@@ -6303,7 +6651,7 @@ mod tests {
             "default-model".to_string(),
         );
 
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("say hi"),
@@ -6397,7 +6745,7 @@ mod tests {
                 .unwrap()
                 .activate("pixel__get_api_health".into(), activated_tool);
 
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
             let mut history = vec![
                 ChatMessage::system("test-system"),
                 ChatMessage::user("use the activated MCP tool"),
@@ -6526,8 +6874,11 @@ mod tests {
         // System prompt preserved
         assert_eq!(history[0].role, "system");
         assert_eq!(history[0].content, "system prompt");
-        // Trimmed to limit
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
+        // First user message (original ask) preserved
+        assert_eq!(history[1].role, "user");
+        assert_eq!(history[1].content, "msg 0");
+        // Trimmed to limit + system + protected first user
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 2); // +1 system +1 first user
         // Most recent messages preserved
         let last = &history[history.len() - 1];
         assert_eq!(
@@ -6797,13 +7148,16 @@ mod tests {
 
     #[test]
     fn trim_history_with_no_system_prompt() {
-        // Recovery: History without system prompt should trim correctly
+        // Recovery: History without system prompt should trim correctly.
+        // The first user message (original ask) is protected.
         let mut history = vec![];
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
         trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
+        // max_history + 1 protected first user message
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1);
+        assert_eq!(history[0].content, "msg 0"); // original ask preserved
     }
 
     #[test]
@@ -7062,9 +7416,12 @@ Let me check the result."#;
             ChatMessage::assistant("new reply"),
         ];
         trim_history(&mut history, 2);
-        assert_eq!(history.len(), 3); // system + 2 kept
+        // system + first user (protected) + 2 kept = 4
+        assert_eq!(history.len(), 4);
         assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "new msg");
+        assert_eq!(history[1].content, "old msg"); // first user protected
+        assert_eq!(history[2].content, "new msg");
+        assert_eq!(history[3].content, "new reply");
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
@@ -7311,6 +7668,7 @@ Let me check the result."#;
             0.2,
             None,
             None,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -7340,7 +7698,7 @@ Let me check the result."#;
                 _system_prompt: Option<&str>,
                 _message: &str,
                 _model: &str,
-                _temperature: Option<f64>,
+                _temperature: f64,
             ) -> anyhow::Result<String> {
                 anyhow::bail!("not used in this test")
             }
@@ -7349,7 +7707,7 @@ Let me check the result."#;
                 &self,
                 _request: ChatRequest<'_>,
                 _model: &str,
-                _temperature: Option<f64>,
+                _temperature: f64,
             ) -> anyhow::Result<ChatResponse> {
                 anyhow::bail!("not used in this test")
             }
@@ -7362,7 +7720,7 @@ Let me check the result."#;
                 &self,
                 _request: ChatRequest<'_>,
                 _model: &str,
-                _temperature: Option<f64>,
+                _temperature: f64,
                 _options: StreamOptions,
             ) -> futures_util::stream::BoxStream<
                 'static,
@@ -7389,6 +7747,7 @@ Let me check the result."#;
             None,
             "deepseek-v4-flash",
             0.2,
+            None,
             None,
             None,
         )
@@ -7557,10 +7916,10 @@ Let me check the result."#;
             "I could not execute that command.",
         ]);
 
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(FailingTool::new(
             "failing_shell",
             "Command not allowed by security policy: rm -rf /",
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7728,6 +8087,7 @@ Let me check the result."#;
             Arc::new(cost_config.prices.clone()),
         );
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let empty_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -7735,7 +8095,7 @@ Let me check the result."#;
                 run_tool_call_loop(
                     &provider,
                     &mut history,
-                    &[],
+                    &empty_tools,
                     &observer,
                     "mock-provider",
                     "mock-model",
@@ -7816,6 +8176,7 @@ Let me check the result."#;
             )])),
         );
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let empty_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -7823,7 +8184,7 @@ Let me check the result."#;
                 run_tool_call_loop(
                     &provider,
                     &mut history,
-                    &[],
+                    &empty_tools,
                     &observer,
                     "mock-provider",
                     "mock-model",
@@ -7880,11 +8241,12 @@ Let me check the result."#;
         };
         let observer = NoopObserver;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let empty_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &[],
+            &empty_tools,
             &observer,
             "mock-provider",
             "mock-model",

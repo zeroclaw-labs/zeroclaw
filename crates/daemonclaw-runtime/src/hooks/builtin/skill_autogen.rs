@@ -146,13 +146,13 @@ impl HookHandler for SkillAutogenHook {
         -100
     }
 
-    async fn on_turn_complete(&self, result: &TurnResult) {
+    async fn on_turn_complete(&self, result: &TurnResult) -> crate::hooks::traits::TurnCompleteAction {
         if result.tool_call_count < self.min_tool_calls {
-            return;
+            return crate::hooks::traits::TurnCompleteAction::Continue;
         }
 
         if result.active_skill.is_some() {
-            return;
+            return crate::hooks::traits::TurnCompleteAction::Continue;
         }
 
         let prompt = Self::build_prompt(result);
@@ -161,25 +161,25 @@ impl HookHandler for SkillAutogenHook {
             .await
         {
             Some(r) => r,
-            None => return,
+            None => return crate::hooks::traits::TurnCompleteAction::Continue,
         };
 
         let (name, description, body) = match Self::parse_response(&response) {
             Some(parsed) => parsed,
             None => {
                 tracing::debug!(target: "skill_autogen", "LLM decided no skill needed or response unparseable");
-                return;
+                return crate::hooks::traits::TurnCompleteAction::Continue;
             }
         };
 
         if crate::skills::types::validate_skill_name(&name).is_err() {
             tracing::warn!(target: "skill_autogen", name = %name, "LLM proposed invalid skill name");
-            return;
+            return crate::hooks::traits::TurnCompleteAction::Continue;
         }
 
         if self.store.get(&name).ok().flatten().is_some() {
             tracing::debug!(target: "skill_autogen", name = %name, "skill already exists, skipping autogen");
-            return;
+            return crate::hooks::traits::TurnCompleteAction::Continue;
         }
 
         let frontmatter = AgentSkillFrontmatter {
@@ -204,6 +204,7 @@ impl HookHandler for SkillAutogenHook {
                 tracing::warn!(target: "skill_autogen", name = %name, "failed to create skill: {e}");
             }
         }
+        crate::hooks::traits::TurnCompleteAction::Continue
     }
 }
 

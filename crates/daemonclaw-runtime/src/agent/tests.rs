@@ -1310,3 +1310,897 @@ async fn run_single_delegates_to_turn() {
         "Expected non-empty response from run_single"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Spine-contract tests: [20] TurnCompleteAction, [11] concurrency barriers
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod spine_contract {
+    use super::*;
+    use crate::agent::loop_::{run_tool_call_loop};
+    use crate::hooks::{HookHandler, HookRunner, TurnCompleteAction};
+    use daemonclaw_api::agent::TurnResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // ── Hook that returns a scripted TurnCompleteAction ──────────────
+
+    struct ScriptedTurnHook {
+        action: TurnCompleteAction,
+    }
+
+    #[async_trait]
+    impl HookHandler for ScriptedTurnHook {
+        fn name(&self) -> &str {
+            "scripted_turn_hook"
+        }
+
+        async fn on_turn_complete(&self, _result: &TurnResult) -> TurnCompleteAction {
+            self.action.clone()
+        }
+    }
+
+    fn make_hooks(action: TurnCompleteAction) -> HookRunner {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(ScriptedTurnHook { action }));
+        runner
+    }
+
+    fn default_multimodal() -> daemonclaw_config::schema::MultimodalConfig {
+        daemonclaw_config::schema::MultimodalConfig::default()
+    }
+
+    // ── [20] Stop halts the loop ────────────────────────────────────
+    //
+    // Production call site: loop_.rs line 1662-1668
+    // The Stop arm returns Ok(...) immediately after fire_turn_complete.
+    // Because the hook fires inside `if tool_calls.is_empty()`, which is
+    // already the exit path, Stop and Continue both return — the difference
+    // is that Stop skips fire_extract_post_turn. We test that the loop
+    // exits cleanly with Stop and returns the accumulated text, AND that
+    // if we switch the hook to PreventStop, the loop does NOT exit on the
+    // first final response (proving the action is actually read).
+    #[tokio::test]
+    async fn hook_stop_exits_loop_and_prevent_stop_forces_continuation() {
+        // Provider returns a final text response (no tool calls).
+        let provider = ScriptedProvider::new(vec![
+            ChatResponse {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("second answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let observer = NoopObserver {};
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
+        let multimodal = default_multimodal();
+
+        // With Stop: loop should return after first response.
+        let hooks_stop = make_hooks(TurnCompleteAction::Stop);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("question"),
+        ];
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, Some(&hooks_stop),
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        assert!(
+            result.contains("first answer"),
+            "Stop should return the first response, got: {result}"
+        );
+        // Provider should have been called exactly once.
+        assert_eq!(provider.request_count(), 1, "Stop should exit after one LLM call");
+
+        // With PreventStop: loop should continue past the first final
+        // response and make additional LLM calls (bounded by MAX_HOOK_CONTINUATIONS=5).
+        let provider2 = ScriptedProvider::new(vec![
+            ChatResponse {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("second answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let hooks_prevent = make_hooks(TurnCompleteAction::PreventStop);
+        let mut history2 = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("question"),
+        ];
+        let result2 = run_tool_call_loop(
+            &provider2, &mut history2, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, Some(&hooks_prevent),
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // PreventStop should have forced more than 1 call before the
+        // continuation budget (5) is exhausted and the loop exits.
+        assert!(
+            provider2.request_count() >= 2,
+            "PreventStop should force at least 2 LLM calls, got {}",
+            provider2.request_count()
+        );
+    }
+
+    // ── [20] InjectError injects message and continues ──────────────
+    //
+    // Production call site: loop_.rs line 1675-1678
+    // InjectError pushes a user message with "[Hook error] <msg>" and
+    // continues the loop. We verify the error appears in history and
+    // the loop makes another LLM call rather than exiting.
+    #[tokio::test]
+    async fn hook_inject_error_lands_in_history_and_loop_continues() {
+        let provider = ScriptedProvider::new(vec![
+            // First: final response → triggers InjectError hook → loop continues
+            ChatResponse {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            // Second: final response after the injected error → loop exits normally
+            ChatResponse {
+                text: Some("recovered".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let observer = NoopObserver {};
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
+        let multimodal = default_multimodal();
+
+        let hooks = make_hooks(TurnCompleteAction::InjectError(
+            "test_sentinel_error_42".into(),
+        ));
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("question"),
+        ];
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, Some(&hooks),
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // The hook fires on every final response and injects an error,
+        // causing the loop to continue. The continuation budget (5) eventually
+        // exhausts and the loop exits. We assert:
+        //
+        // 1. The injected error message appeared in history.
+        let has_injected = history
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("test_sentinel_error_42"));
+        assert!(
+            has_injected,
+            "InjectError should place '[Hook error] test_sentinel_error_42' in history"
+        );
+
+        // 2. The provider was called more than once (loop continued, didn't
+        //    exit on first final response like Stop would).
+        assert!(
+            provider.request_count() >= 2,
+            "InjectError should cause the loop to continue, got {} calls",
+            provider.request_count()
+        );
+
+        // 3. Distinguish from Stop: with Stop the provider is called exactly once.
+        //    With InjectError it must be called multiple times.
+        assert!(
+            provider.request_count() > 1,
+            "InjectError must differ from Stop (which calls provider exactly once)"
+        );
+    }
+
+    // ── [11] Exclusive tool forms a barrier ──────────────────────────
+    //
+    // Production call site: loop_.rs line 1975-1993
+    // partition_tool_calls groups consecutive safe tools into parallel
+    // batches; non-safe tools form single-item serial barriers.
+    // execute_tools_batched processes batches in order.
+    //
+    // We test by having 3 tools called in one iteration: safe_a, exclusive,
+    // safe_b. The exclusive tool should NOT run concurrently with either
+    // safe tool. We verify by recording wall-clock overlap.
+
+    struct TimestampTool {
+        tool_name: String,
+        safe: bool,
+        log: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>>,
+    }
+
+    #[async_trait]
+    impl Tool for TimestampTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+        fn description(&self) -> &str {
+            "Records execution timestamps"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
+            self.safe
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            let start = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let end = std::time::Instant::now();
+            self.log.lock().unwrap().push((
+                self.tool_name.clone(),
+                start,
+                end,
+            ));
+            Ok(ToolResult {
+                success: true,
+                output: format!("{} done", self.tool_name),
+                error: None,
+            })
+        }
+    }
+
+    // ── [10] End-to-end: stream → executor → mid-stream dispatch ──────
+    //
+    // Drives a mock stream through consume_provider_streaming_response with
+    // Some(executor). The stream emits ToolCall(tool_a), delays 80ms, then
+    // emits ToolCall(tool_b). tool_a (50ms execution) must start during the
+    // 80ms delay — proving dispatch happens on arrival from the stream, not
+    // after the stream completes.
+    //
+    // Production call site: loop_.rs line 1164-1172, where
+    // consume_provider_streaming_response receives Some(&mut streaming_executor).
+    // All production callers (run(), orchestrator, delegate) go through
+    // run_tool_call_loop which constructs the executor at line 1157-1162 and
+    // passes Some at line 1172.
+    #[tokio::test]
+    async fn streaming_dispatch_starts_tool_before_stream_finishes() {
+        use crate::agent::loop_::consume_provider_streaming_response;
+        use crate::agent::streaming_executor::StreamingToolExecutor;
+        use daemonclaw_providers::traits::{
+            ChatRequest, StreamChunk, StreamEvent, StreamOptions,
+        };
+        use futures_util::stream::StreamExt;
+
+        let log: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(TimestampTool {
+                tool_name: "tool_a".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+            Box::new(TimestampTool {
+                tool_name: "tool_b".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+        ];
+        let tools_arc = Arc::new(tools);
+
+        // Mock provider that streams: ToolCall(tool_a) → 80ms delay → ToolCall(tool_b) → Final
+        struct DelayedToolStream;
+
+        #[async_trait]
+        impl Provider for DelayedToolStream {
+            async fn chat_with_system(
+                &self, _: Option<&str>, _: &str, _: &str, _: f64,
+            ) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn chat(
+                &self, _: ChatRequest<'_>, _: &str, _: f64,
+            ) -> anyhow::Result<daemonclaw_providers::ChatResponse> {
+                unreachable!()
+            }
+            fn supports_streaming(&self) -> bool { true }
+            fn supports_streaming_tool_events(&self) -> bool { true }
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                daemonclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move {
+                    let _ = tx.send(Ok(StreamEvent::ToolCall(daemonclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "tool_a".into(),
+                        arguments: "{}".into(),
+                    }))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    let _ = tx.send(Ok(StreamEvent::ToolCall(daemonclaw_providers::ToolCall {
+                        id: "tc2".into(),
+                        name: "tool_b".into(),
+                        arguments: "{}".into(),
+                    }))).await;
+                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                });
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+            }
+        }
+
+        let provider = DelayedToolStream;
+        let messages = vec![ChatMessage::user("run both tools")];
+        let observer_arc: Arc<dyn crate::observability::Observer> =
+            Arc::new(crate::observability::NoopObserver {});
+
+        let mut executor = StreamingToolExecutor::new(
+            Arc::clone(&tools_arc),
+            observer_arc,
+            None,
+            None,
+        );
+
+        let before_stream = std::time::Instant::now();
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "test-model",
+            0.0,
+            None,
+            None,
+            Some(&mut executor),
+        )
+        .await
+        .expect("streaming should succeed");
+
+        // Stream is done. tool_calls should be empty (executor consumed them).
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "executor should have consumed all tool calls from the stream"
+        );
+
+        // Collect executor results.
+        assert!(executor.has_tools(), "executor should have tools");
+        let results = executor.finish().await;
+        assert_eq!(results.len(), 2, "both tools should have executed");
+        assert!(results.iter().all(|(_, o)| o.success));
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries.len(), 2);
+
+        let tool_a = entries.iter().find(|(n, _, _)| n == "tool_a").unwrap();
+        let tool_b = entries.iter().find(|(n, _, _)| n == "tool_b").unwrap();
+
+        // tool_a (50ms execution) must have started during the 80ms delay
+        // before tool_b arrived from the stream.
+        // tool_b's StreamEvent::ToolCall was emitted at ~before_stream + 80ms.
+        let tool_b_stream_arrival = before_stream + std::time::Duration::from_millis(80);
+
+        assert!(
+            tool_a.1 < tool_b_stream_arrival,
+            "tool_a must start before tool_b arrives from the stream. \
+             tool_a started at +{}ms, tool_b arrived at +80ms",
+            tool_a.1.duration_since(before_stream).as_millis(),
+        );
+
+        // Also confirm tool_a didn't wait for tool_b — its start should be
+        // well before the 80ms mark (within the first few ms after stream start).
+        assert!(
+            tool_a.1.duration_since(before_stream).as_millis() < 30,
+            "tool_a should start within 30ms of stream start, got {}ms",
+            tool_a.1.duration_since(before_stream).as_millis(),
+        );
+    }
+
+    // ── [4] Context collapse: reversibility proven ─────────────────
+    //
+    // Collapse must be reversible: project() produces a summary view,
+    // but expand_region() restores the originals on the next project().
+    // This distinguishes collapse from lossy compaction.
+    #[test]
+    fn context_collapse_is_reversible() {
+        use crate::agent::context_collapse::ContextCollapser;
+
+        let history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("question 1"),
+            ChatMessage::assistant("answer 1"),
+            ChatMessage::user("question 2"),
+            ChatMessage::assistant("answer 2"),
+            ChatMessage::user("question 3"),
+            ChatMessage::assistant("answer 3 — the latest"),
+        ];
+        let original_len = history.len();
+
+        let mut collapser = ContextCollapser::new(2); // protect last 2
+
+        // Collapse messages 1..5 (the middle conversation, not system or tail)
+        collapser.collapse_region(1, 5, "Summary of Q1+A1+Q2+A2".into(), 100);
+
+        // Project: should have system + [COLLAPSED] + question3 + answer3
+        let projected = collapser.project(&history);
+        assert!(
+            projected.len() < original_len,
+            "projected should be shorter than original ({} vs {})",
+            projected.len(), original_len,
+        );
+        assert_eq!(projected[0].role, "system");
+        assert!(
+            projected[1].content.contains("[COLLAPSED"),
+            "second message should be collapse summary, got: {}",
+            projected[1].content,
+        );
+        assert!(
+            projected[1].content.contains("Summary of Q1+A1+Q2+A2"),
+            "collapse summary should contain the provided text",
+        );
+        // Protected tail preserved
+        assert!(projected.last().unwrap().content.contains("answer 3"));
+
+        // Verify original history is UNCHANGED
+        assert_eq!(history.len(), original_len);
+        assert_eq!(history[1].content, "question 1");
+        assert_eq!(history[4].content, "answer 2");
+
+        // Expand: remove the collapse, project again
+        collapser.expand_region(1);
+        let restored = collapser.project(&history);
+        assert_eq!(
+            restored.len(), original_len,
+            "after expand, projection should equal original length"
+        );
+        for (i, (orig, rest)) in history.iter().zip(restored.iter()).enumerate() {
+            assert_eq!(
+                orig.content, rest.content,
+                "message {i} should be identical after expand: '{}' vs '{}'",
+                orig.content, rest.content,
+            );
+            assert_eq!(
+                orig.role, rest.role,
+                "message {i} role should match after expand",
+            );
+        }
+    }
+
+    // ── [4] Context collapse: reversibility under mutation ────────
+    //
+    // The production path: collapse → loop pushes a new turn to raw history
+    // → next iteration computes collapse fresh. This test proves the
+    // "computed fresh each iteration" claim holds when raw history is
+    // mutated between project() calls.
+    #[test]
+    fn context_collapse_reversible_across_mutations() {
+        use crate::agent::context_collapse::ContextCollapser;
+
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("question 1"),
+            ChatMessage::assistant("answer 1"),
+            ChatMessage::user("question 2"),
+            ChatMessage::assistant("answer 2"),
+        ];
+
+        // Iteration 1: collapse messages 1..3
+        let mut collapser1 = ContextCollapser::new(2);
+        collapser1.collapse_region(1, 3, "Summary of Q1+A1".into(), 50);
+        let projected1 = collapser1.project(&history);
+        assert_eq!(projected1.len(), 4); // system + [COLLAPSED] + Q2 + A2
+        assert!(projected1[1].content.contains("[COLLAPSED"));
+
+        // Simulate loop mutation: push a new turn (as run_tool_call_loop does)
+        history.push(ChatMessage::user("question 3"));
+        history.push(ChatMessage::assistant("answer 3"));
+        // Raw history now has 7 messages. The old collapser's region (1..3)
+        // still refers to valid indices because we only appended.
+
+        // Iteration 2: compute collapse fresh over the mutated history.
+        // This is what the production loop does — new collapser each iteration.
+        let mut collapser2 = ContextCollapser::new(2);
+        // Collapse a larger region now that history grew
+        collapser2.collapse_region(1, 5, "Summary of Q1+A1+Q2+A2".into(), 100);
+        let projected2 = collapser2.project(&history);
+        // system + [COLLAPSED] + Q3 + A3
+        assert_eq!(projected2.len(), 4);
+        assert!(projected2[1].content.contains("Summary of Q1+A1+Q2+A2"));
+        assert_eq!(projected2[2].content, "question 3");
+        assert_eq!(projected2[3].content, "answer 3");
+
+        // Expand: originals still intact in raw history
+        collapser2.expand_region(1);
+        let restored = collapser2.project(&history);
+        assert_eq!(restored.len(), history.len());
+        for (i, (orig, rest)) in history.iter().zip(restored.iter()).enumerate() {
+            assert_eq!(
+                orig.content, rest.content,
+                "message {i} should be identical after expand across mutations"
+            );
+        }
+
+        // Also verify the raw history was never modified by any projection
+        assert_eq!(history[1].content, "question 1");
+        assert_eq!(history[2].content, "answer 1");
+        assert_eq!(history[3].content, "question 2");
+        assert_eq!(history[4].content, "answer 2");
+        assert_eq!(history[5].content, "question 3");
+        assert_eq!(history[6].content, "answer 3");
+    }
+
+    #[tokio::test]
+    async fn exclusive_tool_does_not_overlap_with_safe_tools() {
+        use crate::agent::tool_execution::{partition_tool_calls, execute_tools_batched};
+        use crate::agent::loop_::ParsedToolCall;
+
+        let log: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(TimestampTool {
+                tool_name: "safe_a".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+            Box::new(TimestampTool {
+                tool_name: "exclusive".into(),
+                safe: false,
+                log: Arc::clone(&log),
+            }),
+            Box::new(TimestampTool {
+                tool_name: "safe_b".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+        ];
+
+        let calls = vec![
+            ParsedToolCall {
+                name: "safe_a".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("c1".into()),
+            },
+            ParsedToolCall {
+                name: "exclusive".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("c2".into()),
+            },
+            ParsedToolCall {
+                name: "safe_b".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("c3".into()),
+            },
+        ];
+
+        let batches = partition_tool_calls(&calls, &tools, None);
+
+        // Verify partitioning: safe_a alone, exclusive alone, safe_b alone.
+        // (safe_a and safe_b are not consecutive — exclusive sits between them)
+        assert_eq!(batches.len(), 3, "3 tools with exclusive in the middle should produce 3 batches");
+        assert!(batches[0].concurrent, "first batch (safe_a) should be concurrent-capable");
+        assert!(!batches[1].concurrent, "second batch (exclusive) should be serial");
+        assert!(batches[2].concurrent, "third batch (safe_b) should be concurrent-capable");
+
+        let observer = NoopObserver {};
+        let outcomes = execute_tools_batched(
+            &calls, &batches, &tools, None, &observer, None, None,
+        ).await.unwrap();
+
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|o| o.success));
+
+        // Verify no temporal overlap between exclusive and either safe tool.
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries.len(), 3, "all 3 tools should have executed");
+
+        let exclusive_entry = entries.iter().find(|(n, _, _)| n == "exclusive").unwrap();
+        for (name, start, end) in &entries {
+            if name == "exclusive" {
+                continue;
+            }
+            let overlaps = *start < exclusive_entry.2 && *end > exclusive_entry.1;
+            assert!(
+                !overlaps,
+                "Tool '{name}' ({}ms..{}ms) overlapped with exclusive ({}ms..{}ms)",
+                start.duration_since(entries[0].1).as_millis(),
+                end.duration_since(entries[0].1).as_millis(),
+                exclusive_entry.1.duration_since(entries[0].1).as_millis(),
+                exclusive_entry.2.duration_since(entries[0].1).as_millis(),
+            );
+        }
+    }
+
+    // ── Model-echo deduplication: response repeated after tool-call iteration ──
+    //
+    // Reproduces the live v0.7.8 bug: iteration 1 returns text + tool call,
+    // iteration 2 echoes the same text (model repetition) with no tool calls.
+    // Without the fix, the truncation detector fires (text ends with emoji,
+    // not in the punctuation set) and accumulated_display_text doubles.
+    // With the fix, the repetition is detected and suppressed.
+    #[tokio::test]
+    async fn model_echo_after_tool_call_does_not_duplicate_output() {
+        // Response must be >500 chars (truncation check floor) and >200 chars
+        // (repetition guard floor) to exercise the bug path.
+        let response_text = "Here is my full analysis of the upgrade. \
+            The history management overhaul is a big deal — that graduated \
+            trimming with collapsible summaries fixes the exact brittle behavior \
+            we identified in the analysis. No more all-or-nothing context management. \
+            The multi-tool pipelining is smart too. The old behavior of waiting for \
+            the full model response before executing any tools was dead time. \
+            Provider selection works. Loop detection replaces fixed caps. \
+            Content tagging for external results is solid defense-in-depth. \
+            Ready to test whenever you are \u{1F980}";
+
+        let provider = ScriptedProvider::new(vec![
+            // Iteration 1: text + tool call
+            ChatResponse {
+                text: Some(response_text.into()),
+                tool_calls: vec![daemonclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"message": "stored"}"#.into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            // Iteration 2: model echoes the exact same text, no tool calls
+            ChatResponse {
+                text: Some(response_text.into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+
+        let observer = NoopObserver {};
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(EchoTool) as Box<dyn Tool>,
+        ]);
+        let multimodal = default_multimodal();
+
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("tell me about the upgrade"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, None,
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // The response text should appear exactly once, not doubled.
+        let occurrences = result.matches("Provider selection works").count();
+        assert_eq!(
+            occurrences, 1,
+            "Response text should appear exactly once, got {occurrences}. \
+             Full result ({} chars): {result}",
+            result.len()
+        );
+
+        // The text should still be present (not suppressed entirely).
+        assert!(
+            result.contains("Ready to test"),
+            "Response should contain the original text"
+        );
+
+        // History surface: the echoed text should NOT appear in history twice.
+        // Iteration 1 pushes an assistant message (text + tool call) at line 2402.
+        // Iteration 2's echo should be suppressed from history by the repetition guard.
+        let assistant_messages: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        let history_occurrences = assistant_messages
+            .iter()
+            .filter(|m| m.content.contains("Provider selection works"))
+            .count();
+        assert_eq!(
+            history_occurrences, 1,
+            "Echoed text should appear in history exactly once (from iteration 1), \
+             got {history_occurrences}. Assistant messages: {:?}",
+            assistant_messages.iter().map(|m| m.content.len()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Restate-then-continue: guard must NOT suppress novel content ────
+    //
+    // Model restates the prior accumulated text as a prefix, then appends
+    // substantial new content. The repetition guard must let this through —
+    // both the new content and the prefix must survive to delivery and history.
+    // Without the novel-tail check, starts_with would flag this as repetition
+    // and silently drop the entire response including the new content.
+    #[tokio::test]
+    async fn restate_then_continue_preserves_novel_tail() {
+        let prefix_text = "Here is my full analysis of the upgrade. \
+            The history management overhaul is a big deal — that graduated \
+            trimming with collapsible summaries fixes the exact brittle behavior \
+            we identified in the analysis. No more all-or-nothing context management. \
+            The multi-tool pipelining is smart too. The old behavior of waiting for \
+            the full model response before executing any tools was dead time. \
+            Provider selection works. Loop detection replaces fixed caps. \
+            Content tagging for external results is solid defense-in-depth. \
+            Ready to test whenever you are \u{1F980}";
+
+        // Iteration 2 restates the prefix, then adds substantial new analysis.
+        let novel_content = "\n\nNow that I think about it further, there are \
+            three additional considerations worth flagging. First, the provider \
+            fallback chain should be tested under real latency conditions — the \
+            jittered backoff looks correct on paper but edge cases around \
+            simultaneous rate-limit responses from multiple providers could \
+            surface ordering issues. Second, the context collapser needs \
+            verification that the protect_last_n parameter actually prevents \
+            the most recent exchange from being collapsed during aggressive \
+            compaction. Third, we should validate that the streaming executor \
+            correctly handles a tool that panics mid-execution without poisoning \
+            the entire turn. These are all testable in isolation.";
+
+        let full_response = format!("{prefix_text}{novel_content}");
+
+        let provider = ScriptedProvider::new(vec![
+            // Iteration 1: prefix text + tool call
+            ChatResponse {
+                text: Some(prefix_text.into()),
+                tool_calls: vec![daemonclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"message": "noted"}"#.into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            // Iteration 2: restates prefix + adds substantial novel content
+            ChatResponse {
+                text: Some(full_response.clone()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+
+        let observer = NoopObserver {};
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(EchoTool) as Box<dyn Tool>,
+        ]);
+        let multimodal = default_multimodal();
+
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("analyze the upgrade"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, None,
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // The novel content must survive to delivery.
+        assert!(
+            result.contains("provider fallback chain"),
+            "Novel content must survive to delivery. Result ({} chars): {}",
+            result.len(), &result[..result.len().min(200)]
+        );
+        assert!(
+            result.contains("protect_last_n parameter"),
+            "Novel content (second point) must survive"
+        );
+
+        // The novel content must also land in history.
+        let assistant_messages: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        let has_novel_in_history = assistant_messages
+            .iter()
+            .any(|m| m.content.contains("provider fallback chain"));
+        assert!(
+            has_novel_in_history,
+            "Novel content must be in history. Assistant message lengths: {:?}",
+            assistant_messages.iter().map(|m| m.content.len()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: the first user message (original ask) must survive all
+    /// trimming and pruning stages, even when large tool results push the
+    /// conversation past the token/message budget.
+    #[test]
+    fn first_user_message_survives_aggressive_trimming() {
+        use crate::agent::history::{emergency_history_trim, trim_history};
+        use crate::agent::history_pruner::{prune_history, HistoryPrunerConfig};
+        use daemonclaw_providers::ChatMessage;
+
+        let original_ask = "Research quantum computing applications in drug discovery and \
+            report your findings with citations. Focus on molecular simulation, \
+            protein folding, and combinatorial optimization for lead compounds.";
+
+        // Simulate a short conversation with large tool results — the exact
+        // shape that triggered the live bug (handful of turns, oversized
+        // tool results inflating token count).
+        let mut history = vec![
+            ChatMessage::system("You are a helpful research assistant."),
+            ChatMessage::user(original_ask),
+        ];
+
+        // Add 20 assistant+tool pairs with large results to blow past budget.
+        for i in 0..20 {
+            let tool_json = format!(
+                r#"{{"content":"searching","tool_calls":[{{"id":"t{i}","name":"web_search","arguments":"{{}}"}}]}}"#
+            );
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: tool_json,
+            });
+            let result = format!(
+                r#"{{"tool_call_id":"t{i}","content":"{}"}}"#,
+                "x".repeat(3000)
+            );
+            history.push(ChatMessage {
+                role: "tool".to_string(),
+                content: result,
+            });
+        }
+        history.push(ChatMessage::assistant("Here's what I found...".to_string()));
+
+        // 43 messages total: system + user + 20*(assistant+tool) + final assistant.
+        assert_eq!(history.len(), 43);
+
+        // Test 1: trim_history with aggressive limit.
+        let mut trimmed = history.clone();
+        trim_history(&mut trimmed, 10);
+        assert!(
+            trimmed.iter().any(|m| m.content == original_ask),
+            "trim_history must preserve the first user message (original ask)"
+        );
+
+        // Test 2: emergency_history_trim (drops 1/3 of messages).
+        let mut emergency = history.clone();
+        let dropped = emergency_history_trim(&mut emergency, 4);
+        assert!(dropped > 0, "emergency trim should have dropped messages");
+        assert!(
+            emergency.iter().any(|m| m.content == original_ask),
+            "emergency_history_trim must preserve the first user message"
+        );
+
+        // Test 3: prune_history with very tight token budget.
+        let mut pruned = history.clone();
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 200,
+            keep_recent: 4,
+            collapse_tool_results: true,
+        };
+        prune_history(&mut pruned, &config);
+        assert!(
+            pruned.iter().any(|m| m.content == original_ask),
+            "prune_history must preserve the first user message even under \
+             extreme token pressure. Remaining roles: {:?}",
+            pruned.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+}

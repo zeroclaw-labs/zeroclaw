@@ -2,7 +2,9 @@
 pub mod agent;
 pub mod classifier;
 pub mod context_analyzer;
+pub mod context_collapse;
 pub mod context_compressor;
+pub mod context_pipeline;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;
@@ -13,6 +15,8 @@ pub mod loop_detector;
 pub mod memory_loader;
 pub mod personality;
 pub mod prompt;
+pub mod retry;
+pub mod streaming_executor;
 pub mod system_prompt;
 pub mod thinking;
 pub mod tool_execution;

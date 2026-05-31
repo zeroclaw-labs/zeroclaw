@@ -99,6 +99,7 @@ pub fn fast_trim_tool_results(
 /// Emergency: drop oldest non-system, non-recent messages from history.
 /// Tool groups (assistant + consecutive tool messages) are dropped
 /// atomically to preserve tool_use/tool_result pairing. See #4810.
+/// Protects the first user message (original ask) from removal.
 /// Returns number of messages dropped.
 pub fn emergency_history_trim(
     history: &mut Vec<daemonclaw_providers::ChatMessage>,
@@ -107,8 +108,13 @@ pub fn emergency_history_trim(
     let mut dropped = 0;
     let target_drop = history.len() / 3;
     let mut i = 0;
+    // Find the first user message — it defines the session intent.
+    let first_user_idx = history.iter().position(|m| m.role == "user");
     while dropped < target_drop && i < history.len().saturating_sub(keep_recent) {
         if history[i].role == "system" {
+            i += 1;
+        } else if Some(i) == first_user_idx {
+            // Protect the original ask from removal.
             i += 1;
         } else if history[i].role == "assistant" {
             // Count following tool messages — drop as atomic group
@@ -187,7 +193,8 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
 }
 
 /// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
+/// Preserves the system prompt (first message if role=system), the first
+/// user message (the session's "original ask"), and the most recent messages.
 pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().is_some_and(|m| m.role == "system");
@@ -202,8 +209,19 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     }
 
     let start = if has_system { 1 } else { 0 };
+    // Protect the first user message (original ask) from removal.
+    let has_first_user = history.get(start).is_some_and(|m| m.role == "user");
+    let drain_start = if has_first_user { start + 1 } else { start };
+
     let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let drainable = history.len().saturating_sub(drain_start);
+    // Never drain into the protected tail (keep `max_history` recent messages).
+    let protected_tail_start = history.len().saturating_sub(max_history);
+    let drain_end = drain_start + to_remove.min(protected_tail_start.saturating_sub(drain_start));
+    if drain_end > drain_start && drain_end <= history.len() {
+        history.drain(drain_start..drain_end);
+    }
+    let _ = drainable; // suppress unused warning
     remove_orphaned_tool_messages(history);
     normalize_system_messages(history);
 }

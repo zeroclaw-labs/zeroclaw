@@ -9,7 +9,6 @@ use daemonclaw_config::policy::SecurityPolicy;
 use daemonclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
 
 pub struct ModelRoutingConfigTool {
     config: Arc<Config>,
@@ -274,7 +273,6 @@ impl ModelRoutingConfigTool {
                     "max_depth": agent.max_depth,
                     "agentic": agent.agentic,
                     "allowed_tools": agent.allowed_tools,
-                    "max_iterations": agent.max_iterations,
                 }),
             );
         }
@@ -722,7 +720,6 @@ impl ModelRoutingConfigTool {
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
-        let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
 
         let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
@@ -746,7 +743,6 @@ impl ModelRoutingConfigTool {
                 max_depth: DEFAULT_AGENT_MAX_DEPTH,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -785,12 +781,6 @@ impl ModelRoutingConfigTool {
             MaybeSet::Unset => {}
         }
 
-        match max_iterations_update {
-            MaybeSet::Set(value) => next_agent.max_iterations = value,
-            MaybeSet::Null => next_agent.max_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
-            MaybeSet::Unset => {}
-        }
-
         if let Some(agentic) = agentic_update {
             next_agent.agentic = agentic;
         }
@@ -801,10 +791,6 @@ impl ModelRoutingConfigTool {
 
         if next_agent.max_depth == 0 {
             anyhow::bail!("'max_depth' must be greater than 0");
-        }
-
-        if next_agent.max_iterations == 0 {
-            anyhow::bail!("'max_iterations' must be greater than 0");
         }
 
         if next_agent.agentic && next_agent.allowed_tools.is_empty() {
@@ -956,11 +942,6 @@ impl Tool for ModelRoutingConfigTool {
                         {"type": "array", "items": {"type": "string"}}
                     ]
                 },
-                "max_iterations": {
-                    "type": ["integer", "null"],
-                    "minimum": 1,
-                    "description": "Maximum tool-call iterations for agentic delegate mode"
-                }
             },
             "additionalProperties": false
         })
@@ -1150,8 +1131,7 @@ mod tests {
                 "provider": "openai",
                 "model": "gpt-5.3-codex",
                 "agentic": true,
-                "allowed_tools": ["file_read", "file_write", "shell"],
-                "max_iterations": 6
+                "allowed_tools": ["file_read", "file_write", "shell"]
             }))
             .await
             .unwrap();

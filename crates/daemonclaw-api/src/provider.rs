@@ -60,6 +60,18 @@ pub struct TokenUsage {
     pub cached_input_tokens: Option<u64>,
 }
 
+/// Why the LLM stopped generating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FinishReason {
+    /// Normal completion (end_turn, stop token).
+    #[default]
+    Stop,
+    /// Hit the maximum output token limit — response is truncated.
+    MaxTokens,
+    /// Stopped to make tool calls.
+    ToolUse,
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -388,6 +400,7 @@ pub trait Provider: Send + Sync {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+
             });
         }
 

@@ -100,7 +100,14 @@ pub async fn execute_one_tool(
                 } else {
                     &r.output
                 };
-                let output = scrub_credentials(normalized_output);
+                let scrubbed = scrub_credentials(normalized_output);
+                let output = if tool.is_untrusted_source() {
+                    format!(
+                        "<untrusted_tool_result source=\"{call_name}\">\n{scrubbed}\n</untrusted_tool_result>"
+                    )
+                } else {
+                    scrubbed
+                };
                 let receipt = receipt_generator.map(|receipt_gen| {
                     receipt_gen.generate_now(call_name, &call_arguments, &output)
                 });
@@ -168,6 +175,133 @@ pub fn should_execute_tools_in_parallel(
     }
 
     true
+}
+
+// ── Batch partitioning (concurrency-safety aware) ───────────────────────
+
+/// A batch of tool calls that can be executed together.
+pub struct ToolBatch {
+    /// Indices into the original tool_calls slice.
+    pub indices: Vec<usize>,
+    /// Whether this batch can run concurrently.
+    pub concurrent: bool,
+}
+
+/// Partition tool calls into batches: consecutive concurrency-safe tools form
+/// parallel batches, non-safe tools form single-item serial barriers.
+pub fn partition_tool_calls(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Vec<ToolBatch> {
+    let mut batches: Vec<ToolBatch> = Vec::new();
+
+    for (idx, call) in tool_calls.iter().enumerate() {
+        let is_safe = lookup_concurrency_safety(
+            &call.name,
+            &call.arguments,
+            tools_registry,
+            activated_tools,
+        );
+
+        if is_safe {
+            if let Some(last) = batches.last_mut()
+                && last.concurrent
+            {
+                last.indices.push(idx);
+            } else {
+                batches.push(ToolBatch {
+                    indices: vec![idx],
+                    concurrent: true,
+                });
+            }
+        } else {
+            batches.push(ToolBatch {
+                indices: vec![idx],
+                concurrent: false,
+            });
+        }
+    }
+
+    batches
+}
+
+fn lookup_concurrency_safety(
+    name: &str,
+    args: &serde_json::Value,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+) -> bool {
+    // tool_search is never safe to parallelize (activates tools mid-batch).
+    if name == "tool_search" {
+        return false;
+    }
+    if let Some(tool) = find_tool(tools_registry, name) {
+        return tool.is_concurrency_safe(args);
+    }
+    if let Some(at) = activated_tools
+        && let Some(arc) = at.lock().unwrap().get_resolved(name)
+    {
+        return arc.is_concurrency_safe(args);
+    }
+    false
+}
+
+/// Execute tool calls using batch partitioning: parallel batches run
+/// concurrently, serial barriers run one at a time. Batches execute in order.
+pub async fn execute_tools_batched(
+    tool_calls: &[ParsedToolCall],
+    batches: &[ToolBatch],
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+) -> Result<Vec<ToolExecutionOutcome>> {
+    let mut results: Vec<Option<ToolExecutionOutcome>> =
+        (0..tool_calls.len()).map(|_| None).collect();
+
+    for batch in batches {
+        if batch.concurrent && batch.indices.len() > 1 {
+            let futures: Vec<_> = batch
+                .indices
+                .iter()
+                .map(|&idx| {
+                    let call = &tool_calls[idx];
+                    execute_one_tool(
+                        &call.name,
+                        call.arguments.clone(),
+                        tools_registry,
+                        activated_tools,
+                        observer,
+                        cancellation_token,
+                        receipt_generator,
+                    )
+                })
+                .collect();
+            let batch_results = futures_util::future::join_all(futures).await;
+            for (&idx, result) in batch.indices.iter().zip(batch_results.into_iter()) {
+                results[idx] = Some(result?);
+            }
+        } else {
+            for &idx in &batch.indices {
+                let call = &tool_calls[idx];
+                let outcome = execute_one_tool(
+                    &call.name,
+                    call.arguments.clone(),
+                    tools_registry,
+                    activated_tools,
+                    observer,
+                    cancellation_token,
+                    receipt_generator,
+                )
+                .await?;
+                results[idx] = Some(outcome);
+            }
+        }
+    }
+
+    Ok(results.into_iter().map(|r| r.unwrap()).collect())
 }
 
 // ── Parallel execution ───────────────────────────────────────────────────

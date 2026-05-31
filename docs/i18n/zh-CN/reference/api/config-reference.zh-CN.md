@@ -81,7 +81,6 @@ Authorization = \"Bearer <your-token>\"
 | 键 | 默认值 | 用途 |
 |---|---|---|
 | `compact_context` | `true` | 为 true 时：bootstrap_max_chars=6000，rag_chunk_limit=2。适用于 13B 或更小的模型 |
-| `max_tool_iterations` | `10` | 跨 CLI、网关和渠道的每条用户消息的最大工具调用循环轮次 |
 | `max_history_messages` | `50` | 每个会话保留的最大对话历史消息数 |
 | `parallel_tools` | `false` | 在单次迭代中启用并行工具执行 |
 | `tool_dispatcher` | `auto` | 工具调度策略 |
@@ -89,8 +88,6 @@ Authorization = \"Bearer <your-token>\"
 
 注意事项：
 
-- 设置 `max_tool_iterations = 0` 会回退到安全默认值 `10`。
-- 如果渠道消息超过此值，运行时返回：`Agent exceeded maximum tool iterations (<value>)`。
 - 在 CLI、网关和渠道工具循环中，当待处理调用不需要审批门控时，多个独立工具调用默认会并发执行；结果顺序保持稳定。
 - `parallel_tools` 适用于 `Agent::turn()` API 表面。它不控制 CLI、网关或渠道处理程序使用的运行时循环。
 - `tool_call_dedup_exempt` 接受精确工具名称数组。此处列出的工具允许在同一轮次中使用相同参数多次调用，绕过重复数据删除检查。示例：`tool_call_dedup_exempt = [\"browser\"]`。
@@ -155,7 +152,6 @@ gated_domain_categories = [\"banking\"]
 | `max_depth` | `3` | 嵌套委托的最大递归深度 |
 | `agentic` | `false` | 为子代理启用多轮工具调用循环模式 |
 | `allowed_tools` | `[]` | 代理模式的工具白名单 |
-| `max_iterations` | `10` | 代理模式的最大工具调用迭代次数 |
 
 注意事项：
 
@@ -171,7 +167,6 @@ system_prompt = \"You are a research assistant.\"
 max_depth = 2
 agentic = true
 allowed_tools = [\"web_search\", \"http_request\", \"file_read\"]
-max_iterations = 8
 
 [agents.coder]
 provider = \"ollama\"
@@ -529,7 +524,7 @@ priority = 5
 注意事项：
 
 - 默认的 `300s` 针对设备上的 LLM（Ollama）进行了优化，这些 LLM 比云 API 慢。
-- 运行时超时预算为 `message_timeout_secs * scale`，其中 `scale = min(max_tool_iterations, 4)`，最小值为 `1`。
+- 运行时超时预算为 `message_timeout_secs * message_timeout_scale_max`（默认上限为 `4`）。
 - 这种缩放避免了第一个 LLM 轮次慢/重试但后续工具循环轮次仍需完成时的错误超时。
 - 如果使用云 API（OpenAI、Anthropic 等），可以将其减少到 `60` 或更低。
 - 低于 `30` 的值会被钳制到 `30`，以避免立即超时波动。

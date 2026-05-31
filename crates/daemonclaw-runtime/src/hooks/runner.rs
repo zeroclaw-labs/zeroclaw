@@ -123,13 +123,59 @@ impl HookRunner {
         join_all(futs).await;
     }
 
-    pub async fn fire_turn_complete(&self, result: &TurnResult) {
+    pub async fn fire_turn_complete(
+        &self,
+        result: &TurnResult,
+    ) -> super::traits::TurnCompleteAction {
+        use super::traits::TurnCompleteAction;
+
         let futs: Vec<_> = self
             .handlers
             .iter()
             .map(|h| h.on_turn_complete(result))
             .collect();
+        let actions = join_all(futs).await;
+
+        let mut final_action = TurnCompleteAction::Continue;
+        for action in actions {
+            match action {
+                TurnCompleteAction::Continue => {}
+                TurnCompleteAction::Stop => return TurnCompleteAction::Stop,
+                TurnCompleteAction::InjectError(_) => {
+                    final_action = action;
+                }
+                TurnCompleteAction::PreventStop => {
+                    if matches!(final_action, TurnCompleteAction::Continue) {
+                        final_action = TurnCompleteAction::PreventStop;
+                    }
+                }
+            }
+        }
+        final_action
+    }
+
+    /// Fire background post-turn extraction hooks. Non-blocking — callers
+    /// can spawn this in a detached task if they don't want to await.
+    pub async fn fire_extract_post_turn(&self, result: &TurnResult) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.extract_post_turn(result))
+            .collect();
         join_all(futs).await;
+    }
+
+    pub async fn fire_between_turns(
+        &self,
+        iteration: usize,
+    ) -> Vec<daemonclaw_providers::ChatMessage> {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.between_turns(iteration))
+            .collect();
+        let results = join_all(futs).await;
+        results.into_iter().flatten().collect()
     }
 
     // ---------------------------------------------------------------

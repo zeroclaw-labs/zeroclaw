@@ -2315,7 +2315,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -2324,7 +2324,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
         ) -> Result<daemonclaw_providers::ChatResponse> {
             Ok(daemonclaw_providers::ChatResponse {
                 text: Some("done".into()),
@@ -2342,7 +2342,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
             _options: daemonclaw_providers::traits::StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -2415,7 +2415,7 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        agent.turn_streamed("hi", event_tx, None).await.unwrap();
+        agent.turn_streamed("hi", event_tx).await.unwrap();
 
         let history = agent.history();
         for window in history.windows(2) {
