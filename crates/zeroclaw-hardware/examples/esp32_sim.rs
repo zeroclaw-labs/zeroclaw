@@ -141,7 +141,9 @@ async fn main() -> Result<()> {
     // Optional first CLI argument to override the bind address (addresses review suggestion).
     // Default is still 0.0.0.0:8080 for Docker demo convenience.
     // Usage: cargo run --example esp32_sim --features "hardware dev-sim" -- 127.0.0.1:8080
-    let bind_addr = std::env::args().nth(1).unwrap_or_else(|| HTTP_BIND.to_string());
+    let bind_addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| HTTP_BIND.to_string());
     let http_bind = bind_addr.as_str();
 
     // 1. Spawn socat to create the pty pair with named symlinks.
