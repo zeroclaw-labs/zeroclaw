@@ -162,13 +162,15 @@ them in the env var if you set the value that way:
 export ZEROCLAW_gateway__web_dist_dir="$HOME/zeroclaw/web/dist"   # shell expands $HOME
 ```
 
-Once companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961)
-lands, `zeroclaw doctor` will surface this misconfig with a Warn-severity
-diagnostic — the targeted "looks like an unexpanded `~` —
+Companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961) adds
+the targeted "looks like an unexpanded `~` / `$VAR` —
 [`shellexpand`](https://crates.io/crates/shellexpand) it before writing this
 value" check tracked in
-[issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079). Until
-that PR merges, the same check is available via `zeroclaw self-test`.
+[issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079) to both
+`zeroclaw doctor` and `zeroclaw self-test` as a Warn-severity diagnostic.
+Neither command surfaces it on current `master` — until #6961 lands, expand
+`~` / `$VAR` yourself before writing `gateway.web_dist_dir` (for example
+write `/home/alice/zeroclaw/web/dist` instead of `~/zeroclaw/web/dist`).
 
 ### Relative paths resolve against CWD, not the config file
 
