@@ -13,8 +13,8 @@ Runs entirely inside a Docker container — nothing executes on the host.
    │  ┌───────────────┐    ┌────────────────────┐ │
    │  │ esp32_sim     │    │ zeroclaw (chat)    │ │
    │  │ • socat       │    │ • MiniMax M2.7     │ │
-   │  │ • HTTP :8080  │    │ • hardware tools   │ │
-   │  │ • WS /ws      │    │   (gpio_*, only)   │ │
+   │  │ • HTTP :8080  │    │ • smartroom tools  │ │
+   │  │ • WS /ws      │    │   (set_device etc) │ │
    │  │ • pty master ─┼────┼─► pty slave        │ │
    │  └───────────────┘    └────────────────────┘ │
    │           shared /tmp + /dev/pts             │
@@ -27,11 +27,10 @@ and `/dev/pts` namespace (necessary for pty handoff).
 
 ## Why a container
 
-The agent's tool surface is constrained in `zeroclaw.toml` — only `gpio_write`
-and `gpio_read` are exposed; shell, browser, web search, file write, MCP, and
-HTTP-request tools are explicitly off. The container provides defence in depth:
-even if the agent finds a way to side-step config, it can't escape the
-container's filesystem or process namespace.
+The agent's tool surface is heavily constrained (see `zeroclaw.toml.example`):
+only the smartroom tools (`set_device` / `read_device`) plus raw `gpio_*` and
+`hardware_capabilities` are available. All other surfaces (shell, browser,
+web search, MCP, etc.) are disabled. The container provides defence in depth.
 
 ## Prerequisites
 
@@ -134,3 +133,34 @@ pre-flip pins via the manual buttons in the browser to keep the demo flowing.
 
 **Container build fails on `cargo build`** — bump Docker Desktop's memory to 8GB+
 in Settings → Resources. The hardware-feature build needs ~3GB peak.
+
+**Agent doesn't see the smartroom tools** — make sure the mounted config has
+`board = "esp32-sim"` (or `"esp32"`) under `[peripherals.boards]`. The smartroom
+tools are only registered for those board types.
+
+## Quick start (recommended)
+
+```bash
+# 1. Copy and fill env (needed for the model)
+cp demo/.env.template demo/.env
+$EDITOR demo/.env
+
+# 2. Start the simulator + visualizer
+./demo/run-sim.sh
+
+# 3. In another terminal, start an interactive agent session
+./demo/run-zeroclaw.sh
+
+# 4. Paste the system primer from demo/PROMPTS.md, then try natural language:
+#    "It's getting dark and chilly. I'm settling in to read for an hour."
+```
+
+The browser visualizer is at http://127.0.0.1:8080.
+
+## Notes
+
+- All shell scripts in `demo/` are intentionally English-only (demo material).
+- This harness exercises the full peripheral + dev-sim + smartroom path from the
+  split PRs. It is not intended as a production template.
+- For the original Telegram end-to-end path, see `run-daemon.sh` and configure
+  a channel in the mounted config (advanced).

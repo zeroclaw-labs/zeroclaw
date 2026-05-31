@@ -27,5 +27,8 @@ done
 echo "Starting zeroclaw daemon inside the demo container..."
 echo "This enables the Telegram channel (if configured) alongside the simulator."
 echo "Press Ctrl-C to stop the daemon. The simulator will keep running."
+echo
+echo "Note: shell scripts in demo/ are English-only (demo harness)."
+echo
 exec docker compose exec zeroclaw \
   zeroclaw daemon --config-dir /app/data/config "$@"

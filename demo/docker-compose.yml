@@ -12,14 +12,18 @@ services:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-zeroclaw=info,zeroclaw_hardware=info,esp32_sim=info}"
     volumes:
-      # Mount the example config. Copy to zeroclaw.toml locally if you want to edit.
+      # Mount the demo config (constrained hardware-only surface).
       - ./zeroclaw.toml.example:/app/data/config/config.toml:ro
     # The simulator (esp32_sim) is the default process.
-    # This harness is part of the split/port of the original #6148 bundle.
-    # Full end-to-end requires the small PRs for dev-sim, esp32_sim, and smartroom tools.
+    # This harness completes the split of the original #6148 bundle.
+    # It depends on the three focused PRs:
+    #   - dev-sim serial allowlist
+    #   - smartroom named-device tools (set_device / read_device)
+    #   - esp32_sim example + visualizer
     #
-    # To interact:
+    # Quick interaction:
     #     ./demo/run-sim.sh
-    #     ./demo/run-zeroclaw.sh --agent demo "turn on the reading lamp"
+    #     ./demo/run-zeroclaw.sh
     #
-    # The command should flow: agent → smartroom tool → simulator → visualizer update.
+    # Then paste the primer from demo/PROMPTS.md and use natural language.
+    # Flow: agent → smartroom tools → pty → simulator → WebSocket → browser SVG.

@@ -15,7 +15,9 @@ fi
 
 echo "Starting ESP32 Smart Room demo container..."
 echo "  - Simulator + WebSocket frontend on http://127.0.0.1:8080"
-echo "  - Use ./demo/run-zeroclaw.sh to talk to the agent"
+echo "  - Use ./demo/run-zeroclaw.sh (in another terminal) to talk to the agent"
+echo
+echo "Note: shell scripts in demo/ are English-only (demo harness)."
 echo
 
 exec docker compose up

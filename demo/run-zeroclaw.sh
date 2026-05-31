@@ -24,8 +24,11 @@ for i in {1..40}; do
 done
 
 echo "Starting interactive agent session inside the demo container..."
-echo "Agent has ONLY the smartroom tools (set_device / read_device) on the simulated ESP32."
-echo "Try: turn on the reading lamp, turn off the heater, is the fan on?"
+echo "Agent has the smartroom tools (set_device / read_device) + gpio fallbacks."
+echo "Try natural language after pasting the primer from demo/PROMPTS.md:"
+echo "  'It's getting dark and chilly. I'm settling in to read for an hour.'"
+echo
+echo "Note: shell scripts in demo/ are English-only (demo harness)."
 echo
 
 exec docker compose exec zeroclaw \
