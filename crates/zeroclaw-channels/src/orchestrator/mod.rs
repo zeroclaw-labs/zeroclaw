@@ -4093,7 +4093,8 @@ async fn process_channel_message_body(
             crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
                 .ok()
                 .map(|m| {
-                    m.with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
+                    m.with_typed_providers(&ctx.prompt_config.providers.transcription)
+                        .with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
                 });
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
