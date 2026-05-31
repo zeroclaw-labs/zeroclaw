@@ -1784,6 +1784,69 @@ mod spine_contract {
         }
     }
 
+    // ── [4] Context collapse: reversibility under mutation ────────
+    //
+    // The production path: collapse → loop pushes a new turn to raw history
+    // → next iteration computes collapse fresh. This test proves the
+    // "computed fresh each iteration" claim holds when raw history is
+    // mutated between project() calls.
+    #[test]
+    fn context_collapse_reversible_across_mutations() {
+        use crate::agent::context_collapse::ContextCollapser;
+
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("question 1"),
+            ChatMessage::assistant("answer 1"),
+            ChatMessage::user("question 2"),
+            ChatMessage::assistant("answer 2"),
+        ];
+
+        // Iteration 1: collapse messages 1..3
+        let mut collapser1 = ContextCollapser::new(2);
+        collapser1.collapse_region(1, 3, "Summary of Q1+A1".into(), 50);
+        let projected1 = collapser1.project(&history);
+        assert_eq!(projected1.len(), 4); // system + [COLLAPSED] + Q2 + A2
+        assert!(projected1[1].content.contains("[COLLAPSED"));
+
+        // Simulate loop mutation: push a new turn (as run_tool_call_loop does)
+        history.push(ChatMessage::user("question 3"));
+        history.push(ChatMessage::assistant("answer 3"));
+        // Raw history now has 7 messages. The old collapser's region (1..3)
+        // still refers to valid indices because we only appended.
+
+        // Iteration 2: compute collapse fresh over the mutated history.
+        // This is what the production loop does — new collapser each iteration.
+        let mut collapser2 = ContextCollapser::new(2);
+        // Collapse a larger region now that history grew
+        collapser2.collapse_region(1, 5, "Summary of Q1+A1+Q2+A2".into(), 100);
+        let projected2 = collapser2.project(&history);
+        // system + [COLLAPSED] + Q3 + A3
+        assert_eq!(projected2.len(), 4);
+        assert!(projected2[1].content.contains("Summary of Q1+A1+Q2+A2"));
+        assert_eq!(projected2[2].content, "question 3");
+        assert_eq!(projected2[3].content, "answer 3");
+
+        // Expand: originals still intact in raw history
+        collapser2.expand_region(1);
+        let restored = collapser2.project(&history);
+        assert_eq!(restored.len(), history.len());
+        for (i, (orig, rest)) in history.iter().zip(restored.iter()).enumerate() {
+            assert_eq!(
+                orig.content, rest.content,
+                "message {i} should be identical after expand across mutations"
+            );
+        }
+
+        // Also verify the raw history was never modified by any projection
+        assert_eq!(history[1].content, "question 1");
+        assert_eq!(history[2].content, "answer 1");
+        assert_eq!(history[3].content, "question 2");
+        assert_eq!(history[4].content, "answer 2");
+        assert_eq!(history[5].content, "question 3");
+        assert_eq!(history[6].content, "answer 3");
+    }
+
     #[tokio::test]
     async fn exclusive_tool_does_not_overlap_with_safe_tools() {
         use crate::agent::tool_execution::{partition_tool_calls, execute_tools_batched};
