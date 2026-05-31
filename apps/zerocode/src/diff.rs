@@ -267,11 +267,28 @@ fn plain_line_spans(text: &str, bg: Color, fg: Color) -> Vec<Vec<Span<'static>>>
 ///
 /// `lang` is an optional file extension (e.g. `"rs"`, `"py"`) used for
 /// syntax highlighting. Pass `None` to get plain colored diffs.
-pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+///
+/// `start_line` is the 1-based line number where `old` begins in the
+/// underlying file. The gutter is offset so the displayed numbers match
+/// the file on disk. Callers without a known file location (or write
+/// diffs that always begin at line 1) should pass `1`.
+pub fn diff_lines(
+    old: &str,
+    new: &str,
+    lang: Option<&str>,
+    start_line: usize,
+) -> Vec<Line<'static>> {
+    let start_line = start_line.max(1);
     let diff = TextDiff::from_lines(old, new);
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let width = gutter_width(old.lines().count().max(new.lines().count()));
+    let max_lineno = start_line.saturating_add(
+        old.lines()
+            .count()
+            .max(new.lines().count())
+            .saturating_sub(1),
+    );
+    let width = gutter_width(max_lineno);
 
     // Pre-highlight both sides in full so multi-line token state is correct.
     let (del_hl, add_hl) = match lang.and_then(ext_to_language) {
@@ -303,7 +320,7 @@ pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>
                             });
                         let lineno = change
                             .old_index()
-                            .map(|n| gutter(n + 1, width))
+                            .map(|n| gutter(n + start_line, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         let mut spans = vec![Span::styled(
                             lineno + "- ",
@@ -325,7 +342,7 @@ pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>
                             });
                         let lineno = change
                             .new_index()
-                            .map(|n| gutter(n + 1, width))
+                            .map(|n| gutter(n + start_line, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         let mut spans = vec![Span::styled(
                             lineno + "+ ",
@@ -340,7 +357,7 @@ pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>
                     ChangeTag::Equal => {
                         let lineno = change
                             .old_index()
-                            .map(|n| gutter(n + 1, width))
+                            .map(|n| gutter(n + start_line, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         Line::from(Span::styled(
                             format!("{lineno}  {text}"),
@@ -416,7 +433,7 @@ mod tests {
 
     #[test]
     fn diff_produces_add_and_delete_lines() {
-        let lines = diff_lines("foo\nbar\n", "foo\nbaz\n", None);
+        let lines = diff_lines("foo\nbar\n", "foo\nbaz\n", None, 1);
         let rendered: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -435,7 +452,7 @@ mod tests {
 
     #[test]
     fn diff_no_changes_returns_placeholder() {
-        let lines = diff_lines("same\n", "same\n", None);
+        let lines = diff_lines("same\n", "same\n", None, 1);
         let all: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -459,8 +476,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_gutter_reflects_start_line_offset() {
+        let lines = diff_lines("foo\n", "bar\n", None, 437);
+        let del_line = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .first()
+                    .map(|s| s.content.as_ref().ends_with("- "))
+                    .unwrap_or(false)
+            })
+            .expect("should have a delete line");
+        let gutter_text = del_line.spans.first().unwrap().content.as_ref();
+        assert!(
+            gutter_text.contains("437"),
+            "gutter should show file-absolute line 437, got: {gutter_text:?}"
+        );
+    }
+
+    #[test]
     fn diff_delete_line_has_red_bg() {
-        let lines = diff_lines("old line\n", "new line\n", None);
+        let lines = diff_lines("old line\n", "new line\n", None, 1);
         let del_line = lines
             .iter()
             .find(|l| {
@@ -475,7 +511,7 @@ mod tests {
 
     #[test]
     fn diff_insert_line_has_green_bg() {
-        let lines = diff_lines("old line\n", "new line\n", None);
+        let lines = diff_lines("old line\n", "new line\n", None, 1);
         let ins_line = lines
             .iter()
             .find(|l| {
@@ -492,7 +528,7 @@ mod tests {
     fn diff_rust_syntax_highlighting_applies() {
         let old = "fn foo() {}\n";
         let new = "fn bar() {}\n";
-        let lines = diff_lines(old, new, Some("rs"));
+        let lines = diff_lines(old, new, Some("rs"), 1);
         // With syntax highlighting, the delete and insert lines should have
         // multiple spans (keyword, space, identifier, …) rather than one.
         let del = lines
@@ -515,7 +551,7 @@ mod tests {
     fn test_diff_lines_shows_left_aligned_line_numbers() {
         let old = "line one\nline two\n";
         let new = "line one\nline three\n";
-        let lines = diff_lines(old, new, None);
+        let lines = diff_lines(old, new, None, 1);
         let first = lines
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.contains("three")))
@@ -538,7 +574,7 @@ mod tests {
         let old: String = (1..=12).map(|n| format!("line {n}\n")).collect();
         let mut new = old.clone();
         new.push_str("line 13 added\n");
-        let lines = diff_lines(&old, &new, None);
+        let lines = diff_lines(&old, &new, None, 1);
 
         let bar_cols: Vec<usize> = lines
             .iter()

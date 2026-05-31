@@ -1284,8 +1284,17 @@ fn render_tool_entry(
                 .and_then(|v| v.get("new_string"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
             let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::diff_lines(old, new, ext));
+            let start_line = path
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|content| {
+                    content
+                        .find(old)
+                        .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
+                })
+                .unwrap_or(1);
+            lines.extend(diff::diff_lines(old, new, ext, start_line));
         }
         "file_write" => {
             let input = parsed.as_ref();
@@ -2970,7 +2979,6 @@ mod tests {
         assert_eq!(pa.request_id, "req-1");
         assert_eq!(pa.tool_name, "shell");
     }
-
 
     #[test]
     fn thought_chunk_visible_before_commit() {
