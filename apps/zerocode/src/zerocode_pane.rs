@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -24,9 +25,10 @@ enum Focus {
     Theme,
     Presets,
     Bindings,
+    Locale,
 }
 
-const FOCI: [Focus; 3] = [Focus::Theme, Focus::Presets, Focus::Bindings];
+const FOCI: [Focus; 4] = [Focus::Theme, Focus::Presets, Focus::Bindings, Focus::Locale];
 
 impl Focus {
     fn fluent_key(self) -> &'static str {
@@ -34,6 +36,7 @@ impl Focus {
             Self::Theme => "zc-zerocode-tab-theme",
             Self::Presets => "zc-zerocode-tab-presets",
             Self::Bindings => "zc-zerocode-tab-bindings",
+            Self::Locale => "zc-zerocode-tab-locale",
         }
     }
 }
@@ -67,6 +70,17 @@ pub(crate) struct ZerocodePane {
     rows: Vec<BindingRow>,
     binding_cursor: usize,
     capture: Option<Capture>,
+    // Locale: registry from the daemon (locales/list), fed by config_manager.
+    locales: Vec<crate::client::LocaleOption>,
+    locale_cursor: usize,
+    /// Selected locale persisted to zerocode-config.toml (the active one).
+    active_locale: Option<String>,
+    /// Free-entry fallback buffer (a locale not in the registry list).
+    locale_input: String,
+    locale_input_active: bool,
+    /// Set when the user requests "Download locale file"; config_manager (which
+    /// holds the RpcClient) drains this, performs the async fetch, and writes.
+    pending_fetch: Option<String>,
     status: Option<String>,
     last_area: Rect,
     focus_area: Rect,
@@ -95,6 +109,14 @@ impl ZerocodePane {
             rows: Vec::new(),
             binding_cursor: 0,
             capture: None,
+            locales: Vec::new(),
+            locale_cursor: 0,
+            active_locale: config::ensure_and_load(config_dir)
+                .ok()
+                .and_then(|c| c.resolve_locale()),
+            locale_input: String::new(),
+            locale_input_active: false,
+            pending_fetch: None,
             status: None,
             last_area: Rect::default(),
             focus_area: Rect::default(),
@@ -140,6 +162,7 @@ impl ZerocodePane {
             Focus::Theme => self.draw_theme(frame, cols[1]),
             Focus::Presets => self.draw_presets(frame, cols[1]),
             Focus::Bindings => self.draw_bindings(frame, cols[1]),
+            Focus::Locale => self.draw_locale(frame, cols[1]),
         }
 
         if self.capture.is_some() {
@@ -244,6 +267,177 @@ impl ZerocodePane {
         );
     }
 
+    /// Total selectable rows on the Locale tab: one per registry locale, plus a
+    /// free-entry row, plus the download action row.
+    fn locale_row_count(&self) -> usize {
+        self.locales.len() + 2
+    }
+
+    fn locale_free_row(&self) -> usize {
+        self.locales.len()
+    }
+
+    fn locale_download_row(&self) -> usize {
+        self.locales.len() + 1
+    }
+
+    fn draw_locale(&self, frame: &mut Frame, area: Rect) {
+        let active = self.active_locale.as_deref();
+        let mut items: Vec<ListItem> = self
+            .locales
+            .iter()
+            .map(|o| {
+                let mark = if active == Some(o.code.as_str()) {
+                    "● "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(mark.to_string(), theme::accent_style()),
+                    Span::styled(format!("{:<8}", o.code), theme::dim_style()),
+                    Span::styled(o.label.clone(), theme::body_style()),
+                ]))
+            })
+            .collect();
+
+        // Free-entry fallback row.
+        let free_label = if self.locale_input_active {
+            format!("  other: {}_", self.locale_input)
+        } else if self.locales.is_empty() {
+            crate::i18n::t("zc-zerocode-locale-loading")
+        } else {
+            crate::i18n::t("zc-zerocode-locale-other")
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            free_label,
+            theme::body_style(),
+        ))));
+
+        // Download action row.
+        items.push(ListItem::new(Line::from(Span::styled(
+            crate::i18n::t("zc-zerocode-locale-download"),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        ))));
+
+        let mut state = ListState::default();
+        state.select(Some(self.locale_cursor.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(" Locale (Enter to select / download) "))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            area,
+            &mut state,
+        );
+    }
+
+    // ── RPC bridge (config_manager holds the RpcClient) ──────────
+
+    /// Feed the locale registry fetched via `locales/list`.
+    pub(crate) fn set_locales(&mut self, locales: Vec<crate::client::LocaleOption>) {
+        self.locales = locales;
+        if self.locale_cursor >= self.locale_row_count() {
+            self.locale_cursor = self.locale_row_count().saturating_sub(1);
+        }
+    }
+
+    /// True if the Locale tab is focused and the registry hasn't loaded yet —
+    /// config_manager uses this to know when to call `locales/list`.
+    pub(crate) fn locale_needs_list(&self) -> bool {
+        self.focus == Focus::Locale && self.locales.is_empty()
+    }
+
+    /// Drain a pending "download locale file" request (the locale code).
+    pub(crate) fn take_pending_fetch(&mut self) -> Option<String> {
+        self.pending_fetch.take()
+    }
+
+    /// Write fetched catalogue bytes into this config dir's FTL store and report.
+    pub(crate) fn apply_fetched(
+        &mut self,
+        locale: &str,
+        catalogs: &[crate::client::FetchedCatalog],
+        skipped: &[String],
+    ) {
+        let dir = self.config_dir.join("data").join("ftl").join(locale);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = Some(format!("locale write failed: {e}"));
+            return;
+        }
+        let mut written = 0;
+        for cat in catalogs {
+            if std::fs::write(dir.join(&cat.filename), &cat.content).is_ok() {
+                written += 1;
+            }
+        }
+        self.status = Some(crate::i18n::t_args(
+            "zc-zerocode-locale-downloaded",
+            &[
+                ("count", &written.to_string()),
+                ("locale", locale),
+                ("skipped", &skipped.join(", ")),
+            ],
+        ));
+    }
+
+    /// Surface a failed `locales/fetch` (network/daemon error) to the user
+    /// without crashing or orphaning the request.
+    pub(crate) fn report_fetch_error(&mut self, locale: &str, err: &str) {
+        self.status = Some(crate::i18n::t_args(
+            "zc-zerocode-locale-fetch-failed",
+            &[("locale", locale), ("err", err)],
+        ));
+    }
+
+    fn select_locale_row(&mut self) {
+        let cursor = self.locale_cursor;
+        if cursor < self.locales.len() {
+            // Persist the chosen registry locale.
+            let code = self.locales[cursor].code.clone();
+            self.set_active_locale(&code);
+        } else if cursor == self.locale_free_row() {
+            if self.locale_input_active {
+                let code = self.locale_input.trim().to_string();
+                self.locale_input_active = false;
+                if !code.is_empty() {
+                    self.set_active_locale(&code);
+                }
+            } else {
+                self.locale_input_active = true;
+                self.locale_input.clear();
+            }
+        } else if cursor == self.locale_download_row() {
+            // Queue a fetch for the active (or selected) locale.
+            let target = self
+                .active_locale
+                .clone()
+                .or_else(|| self.locales.first().map(|o| o.code.clone()));
+            match target {
+                Some(code) => {
+                    self.pending_fetch = Some(code.clone());
+                    self.status = Some(crate::i18n::t_args(
+                        "zc-zerocode-locale-fetching",
+                        &[("locale", &code)],
+                    ));
+                }
+                None => self.status = Some(crate::i18n::t("zc-zerocode-locale-pick-first")),
+            }
+        }
+    }
+
+    fn set_active_locale(&mut self, code: &str) {
+        match config::persist_locale(&self.config_dir, code) {
+            Ok(()) => {
+                self.active_locale = Some(code.to_string());
+                self.status = Some(crate::i18n::t_args(
+                    "zc-zerocode-locale-set",
+                    &[("locale", code)],
+                ));
+            }
+            Err(e) => self.status = Some(format!("locale save failed: {e}")),
+        }
+    }
+
     fn draw_capture_modal(&self, frame: &mut Frame, area: Rect) {
         use ratatui::layout::{Constraint, Direction, Layout};
         let Some(cap) = &self.capture else { return };
@@ -308,6 +502,26 @@ impl ZerocodePane {
             self.handle_capture_key(key);
             return;
         }
+        // Free-entry locale text input grabs raw chars.
+        if self.focus == Focus::Locale && self.locale_input_active {
+            use crossterm::event::KeyCode;
+            match key.code {
+                KeyCode::Char(c) => {
+                    self.locale_input.push(c);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.locale_input.pop();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.locale_input_active = false;
+                    self.locale_input.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
             Some(ConfigTabAction::Up) => self.move_cursor(-1),
@@ -333,6 +547,7 @@ impl ZerocodePane {
             Focus::Theme => (&mut self.theme_cursor, self.themes.len()),
             Focus::Presets => (&mut self.preset_cursor, self.presets.len()),
             Focus::Bindings => (&mut self.binding_cursor, self.rows.len()),
+            Focus::Locale => (&mut self.locale_cursor, self.locales.len() + 2),
         };
         if len == 0 {
             return;
@@ -353,6 +568,7 @@ impl ZerocodePane {
                     });
                 }
             }
+            Focus::Locale => self.select_locale_row(),
         }
     }
 
@@ -487,6 +703,9 @@ impl ZerocodePane {
                     crate::i18n::t("zc-zerocode-help-reset-default"),
                 ));
             }
+            Focus::Locale => {
+                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-locale")));
+            }
         }
         entries.push(E::spacer());
         entries.push(E::new(
@@ -554,6 +773,7 @@ impl ZerocodePane {
             Focus::Theme => self.themes.len(),
             Focus::Presets => self.presets.len(),
             Focus::Bindings => self.rows.len(),
+            Focus::Locale => self.locales.len() + 2,
         }
     }
 
@@ -567,6 +787,7 @@ impl ZerocodePane {
             Focus::Theme => self.theme_cursor = idx,
             Focus::Presets => self.preset_cursor = idx,
             Focus::Bindings => self.binding_cursor = idx,
+            Focus::Locale => self.locale_cursor = idx,
         }
     }
 }

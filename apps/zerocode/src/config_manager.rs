@@ -335,6 +335,24 @@ impl<'a> App<'a> {
 
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_key(key);
+            // Lazily load the locale registry the first time the Locale tab is
+            // shown (RPC lives here, not in the sync pane).
+            if self.zerocode.locale_needs_list()
+                && let Ok(locales) = self.rpc.locales_list().await
+            {
+                self.zerocode.set_locales(locales);
+            }
+            // Drain a "download locale file" request: fetch over RPC, then have
+            // the pane write the bytes into its own config dir. Errors surface
+            // to the pane status — no crash, no orphaned request.
+            if let Some(locale) = self.zerocode.take_pending_fetch() {
+                match self.rpc.locales_fetch(&locale, &[]).await {
+                    Ok(res) => self
+                        .zerocode
+                        .apply_fetched(&locale, &res.catalogs, &res.skipped),
+                    Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
+                }
+            }
             return Ok(false);
         }
 

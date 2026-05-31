@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod fs;
 pub mod git;
 pub mod local;
+pub mod locales;
 pub mod session;
 pub mod transport;
 pub mod tui_identity;

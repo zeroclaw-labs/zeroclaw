@@ -931,6 +931,39 @@ Examples:
         #[command(subcommand)]
         plugin_command: PluginCommands,
     },
+
+    /// Fetch translated locale files (FTL) from upstream
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
+repository and install them under <config-dir>/data/ftl/<locale>/, where the \
+runtime and zerocode loaders read them.
+
+Pass a single locale. By default every catalogue is fetched; restrict with \
+--catalog (comma-separated): cli, tools, zerocode.
+
+Examples:
+  zeroclaw locales fetch ja
+  zeroclaw locales fetch fr --catalog cli,tools
+  zeroclaw locales fetch zh-CN --catalog zerocode")]
+    Locales {
+        #[command(subcommand)]
+        locales_command: LocalesCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LocalesCommands {
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    /// Download translated FTL files for a locale from upstream
+    Fetch {
+        /// Locale code to fetch (e.g. `ja`, `fr`, `zh-CN`).
+        locale: String,
+        /// Comma-separated catalogues to fetch: cli, tools, zerocode.
+        /// Omit to fetch all of them.
+        #[arg(long)]
+        catalog: Option<String>,
+    },
 }
 
 // `zeroclaw onboard <section>` parses its positional subcommand into
@@ -2646,6 +2679,153 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
     cmd
 }
 
+/// Validate a locale code against the embedded `locales.toml` registry (the
+/// build's known locales, available in-memory — no file read, no network), so a
+/// fetch can never be coerced to a path/host outside the known set. Also
+/// enforces a strict syntactic allowlist as a belt-and-suspenders guard against
+/// path traversal.
+fn validated_locale(locale: &str) -> Result<String> {
+    let ok_shape = !locale.is_empty()
+        && locale.len() <= 16
+        && locale
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !ok_shape {
+        bail!("invalid locale code '{locale}'");
+    }
+    let known = zeroclaw_runtime::i18n::available_locales();
+    if !known.iter().any(|o| o.code == locale) {
+        let codes: Vec<&str> = known.iter().map(|o| o.code.as_str()).collect();
+        bail!(
+            "locale '{locale}' is not in the locales.toml registry; known: {}",
+            codes.join(", ")
+        );
+    }
+    Ok(locale.to_string())
+}
+
+/// Fetch translated FTL catalogues for `locale` from upstream and install them
+/// under `<config-dir>/data/ftl/<locale>/`. `catalog` is an optional
+/// comma-separated subset of {cli, tools, zerocode}; `None` fetches all.
+///
+/// Security: `locale` is validated against the upstream `locales.toml` registry
+/// and a strict syntactic allowlist; the destination path is built from
+/// `ftl_locale_dir` and canonicalized to confirm it stays under the data dir,
+/// so neither the locale nor catalog can drive a write outside the FTL store.
+async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
+    let locale = validated_locale(locale)?;
+
+    let selected: Vec<&(&str, &str, &str)> = match catalog {
+        None => zeroclaw_config::schema::FTL_CATALOGS.iter().collect(),
+        Some(list) => {
+            let names: Vec<&str> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut out = Vec::new();
+            for name in &names {
+                match zeroclaw_config::schema::FTL_CATALOGS
+                    .iter()
+                    .find(|(n, _, _)| n == name)
+                {
+                    Some(entry) => out.push(entry),
+                    None => {
+                        let valid = zeroclaw_config::schema::FTL_CATALOGS
+                            .iter()
+                            .map(|(n, _, _)| *n)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        bail!("unknown catalog '{name}'; valid: {valid}");
+                    }
+                }
+            }
+            out
+        }
+    };
+
+    let dest = zeroclaw_config::schema::ftl_locale_dir(&locale)?;
+    std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
+    // Confinement check: the resolved dest must live under the data-dir FTL root.
+    let ftl_root = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dest.clone());
+    let canon_dest = std::fs::canonicalize(&dest).unwrap_or_else(|_| dest.clone());
+    let canon_root = std::fs::canonicalize(&ftl_root).unwrap_or(ftl_root);
+    if !canon_dest.starts_with(&canon_root) {
+        bail!("refusing to write outside the FTL data directory");
+    }
+
+    // Prefer the tag matching this binary; fall back to master.
+    let version = env!("CARGO_PKG_VERSION");
+    let refs = [format!("v{version}"), "master".to_string()];
+    let client = reqwest::Client::new();
+    let mut fetched = 0u32;
+
+    for (name, path_tmpl, out_name) in selected {
+        let repo_path = path_tmpl.replace("{locale}", &locale);
+        let mut body: Option<String> = None;
+        for git_ref in &refs {
+            let url = format!(
+                "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/{git_ref}/{repo_path}"
+            );
+            let resp = client.get(&url).send().await?;
+            if resp.status().is_success() {
+                body = Some(resp.text().await?);
+                break;
+            }
+        }
+        match body {
+            Some(content) => {
+                let out_path = dest.join(out_name);
+                std::fs::write(&out_path, content)
+                    .with_context(|| format!("writing {}", out_path.display()))?;
+                println!(
+                    "{}",
+                    ta(
+                        "cli-locales-fetched",
+                        &[("name", name), ("path", &out_path.display().to_string())],
+                        "fetched catalogue",
+                    )
+                );
+                fetched += 1;
+            }
+            None => {
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-locales-skipped",
+                        &[
+                            ("name", name),
+                            ("path", &repo_path),
+                            ("refs", &refs.join(", "))
+                        ],
+                        "skipped: not on upstream",
+                    )
+                );
+            }
+        }
+    }
+
+    if fetched == 0 {
+        bail!("no catalogues fetched for locale '{locale}'");
+    }
+    println!(
+        "{}",
+        ta(
+            "cli-locales-installed",
+            &[
+                ("count", &fetched.to_string()),
+                ("locale", &locale),
+                ("dir", &dest.display().to_string())
+            ],
+            "Installed catalogues",
+        )
+    );
+    Ok(())
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -4113,6 +4293,12 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::Locales { locales_command } => {
+            let LocalesCommands::Fetch { locale, catalog } = locales_command;
+            fetch_locales(&locale, catalog.as_deref()).await?;
+            return Ok(());
         }
 
         Commands::Update {

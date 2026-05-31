@@ -64,6 +64,9 @@ pub mod method {
     pub const CONFIG_TEMPLATES: &str = "config/templates";
     pub const CONFIG_SECTIONS: &str = "config/sections";
     pub const CONFIG_CATALOG_MODELS: &str = "config/catalog-models";
+    // Locales
+    pub const LOCALES_LIST: &str = "locales/list";
+    pub const LOCALES_FETCH: &str = "locales/fetch";
     // Personality
     pub const PERSONALITY_LIST: &str = "personality/list";
     pub const PERSONALITY_GET: &str = "personality/get";
@@ -759,6 +762,29 @@ impl RpcClient {
             .await
     }
 
+    /// List the build's available locales (embedded `locales.toml` registry).
+    pub async fn locales_list(&self) -> Result<Vec<LocaleOption>> {
+        let r: LocalesListResult = self
+            .call(method::LOCALES_LIST, serde_json::json!({}))
+            .await?;
+        Ok(r.locales)
+    }
+
+    /// Fetch translated FTL catalogue bytes for `locale` from upstream. The
+    /// daemon validates the locale/catalog and returns file contents; the
+    /// caller writes them locally.
+    pub async fn locales_fetch(
+        &self,
+        locale: &str,
+        catalog: &[String],
+    ) -> Result<LocalesFetchResult> {
+        self.call(
+            method::LOCALES_FETCH,
+            serde_json::json!({ "locale": locale, "catalog": catalog }),
+        )
+        .await
+    }
+
     pub async fn config_sections(&self) -> Result<Vec<ConfigSectionEntry>> {
         let result: ConfigSectionsResult = self
             .call(method::CONFIG_SECTIONS, serde_json::json!({}))
@@ -1233,6 +1259,35 @@ pub struct ConfigDeleteResult {}
 pub struct ConfigReloadResult {
     #[allow(dead_code)]
     pub reloading: bool,
+}
+
+/// One selectable locale (`locales/list`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LocaleOption {
+    pub code: String,
+    pub label: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalesListResult {
+    pub locales: Vec<LocaleOption>,
+}
+
+/// One fetched catalogue's bytes (`locales/fetch`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FetchedCatalog {
+    #[allow(dead_code)]
+    pub name: String,
+    pub filename: String,
+    pub content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalesFetchResult {
+    #[allow(dead_code)]
+    pub locale: String,
+    pub catalogs: Vec<FetchedCatalog>,
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

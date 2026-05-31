@@ -127,6 +127,10 @@ pub enum Method {
     FileAttach,
     FsListDir,
 
+    // Locales
+    LocalesList,
+    LocalesFetch,
+
     // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
     QuickstartState,
     QuickstartFields,
@@ -212,6 +216,9 @@ impl Method {
         // Files
         (Method::FileAttach, "file/attach"),
         (Method::FsListDir, "fs/list_dir"),
+        // Locales
+        (Method::LocalesList, "locales/list"),
+        (Method::LocalesFetch, "locales/fetch"),
         // Quickstart
         (Method::QuickstartState, "quickstart/state"),
         (Method::QuickstartFields, "quickstart/fields"),
@@ -481,6 +488,12 @@ impl RpcDispatcher {
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
             Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
+
+            // Locales
+            Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
+            Method::LocalesFetch => {
+                super::locales::handle_locales_fetch(&req.params, self.tui_id()).await
+            }
 
             // Quickstart
             Method::QuickstartState => self.handle_quickstart_state(),

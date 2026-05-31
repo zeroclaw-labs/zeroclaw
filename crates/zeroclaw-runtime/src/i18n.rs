@@ -12,6 +12,48 @@ static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
+/// The canonical locale registry, embedded from repo-root `locales.toml` at
+/// compile time. Parsed once into a `'static` list so callers (e.g. the RPC
+/// `locales/list` handler) get a long-lived reference with no runtime file I/O.
+static AVAILABLE_LOCALES: OnceLock<Vec<LocaleOption>> = OnceLock::new();
+
+const LOCALES_TOML: &str = include_str!("../../../locales.toml");
+
+/// One selectable locale: its `code` (e.g. `ja`) and display `label`
+/// (e.g. `日本語`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleOption {
+    pub code: String,
+    pub label: String,
+}
+
+/// Locales the build knows about, from the embedded `locales.toml`. Cheap:
+/// parsed once, then returns a borrow of the cached `'static` vector.
+pub fn available_locales() -> &'static [LocaleOption] {
+    AVAILABLE_LOCALES
+        .get_or_init(|| {
+            let table: toml::Value =
+                toml::from_str(LOCALES_TOML).expect("embedded locales.toml is valid TOML");
+            table
+                .get("locale")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let code = e.get("code").and_then(|v| v.as_str())?;
+                            let label = e.get("label").and_then(|v| v.as_str())?;
+                            Some(LocaleOption {
+                                code: code.to_string(),
+                                label: label.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
 struct CliFtlSources {
     locale: String,
     disk: Option<String>,

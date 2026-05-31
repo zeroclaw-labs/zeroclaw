@@ -252,6 +252,52 @@ impl RpcOutbound {
     }
 }
 
+// ── Locale RPC types ─────────────────────────────────────────────
+
+/// One selectable locale from the build's embedded `locales.toml` registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocaleOption {
+    pub code: String,
+    pub label: String,
+}
+
+/// Response for `locales/list` — the in-memory locale registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalesListResponse {
+    pub locales: Vec<LocaleOption>,
+}
+
+/// Request payload for `locales/fetch`. `catalog` restricts which catalogues
+/// are downloaded; `None`/empty means all. The daemon validates `locale`
+/// against the embedded registry and `catalog` against the fixed catalog set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalesFetchRequest {
+    pub locale: String,
+    #[serde(default)]
+    pub catalog: Vec<String>,
+}
+
+/// One fetched catalogue's bytes, returned over the wire so the client writes
+/// them into its own config dir (keeping the write in the caller's permission
+/// scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchedCatalog {
+    pub name: String,
+    /// Output filename (e.g. `cli.ftl`).
+    pub filename: String,
+    /// The FTL file contents.
+    pub content: String,
+}
+
+/// Response for `locales/fetch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalesFetchResponse {
+    pub locale: String,
+    pub catalogs: Vec<FetchedCatalog>,
+    /// Catalogue names that had no file on upstream and were skipped.
+    pub skipped: Vec<String>,
+}
+
 // ── Filesystem RPC types ─────────────────────────────────────────
 
 /// Request payload for `fs.list_dir`.

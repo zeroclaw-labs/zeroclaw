@@ -13529,6 +13529,29 @@ pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
     Ok(default_config_dir()?.join("data").join("ftl").join(locale))
 }
 
+/// The FTL catalogues that `zeroclaw locales fetch` / the daemon's
+/// `locales/fetch` RPC can download, as `(name, upstream-path-template,
+/// output-filename)`. `{locale}` is substituted per request. This is the single
+/// source of truth — a caller supplies only a catalog *name* matched against
+/// this table, never a path.
+pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
+    (
+        "cli",
+        "crates/zeroclaw-runtime/locales/{locale}/cli.ftl",
+        "cli.ftl",
+    ),
+    (
+        "tools",
+        "crates/zeroclaw-runtime/locales/{locale}/tools.ftl",
+        "tools.ftl",
+    ),
+    (
+        "zerocode",
+        "apps/zerocode/locales/{locale}/zerocode.ftl",
+        "zerocode.ftl",
+    ),
+];
+
 /// Build a default path string by joining `relative` onto the resolved
 /// platform config dir. The form sees the resolved absolute path
 /// (`/home/<user>/.zeroclaw/<relative>` on Linux,

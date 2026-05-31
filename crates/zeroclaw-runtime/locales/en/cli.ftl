@@ -583,6 +583,11 @@ cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
 
+# ── locales fetch ──
+cli-locales-fetched = {"  "}fetched {$name} -> {$path}
+cli-locales-skipped = {"  "}skipped {$name}: not on upstream ({$path}; tried {$refs})
+cli-locales-installed = Installed {$count} catalogue(s) for '{$locale}' under {$dir}
+
 # ── browse (zeroclaw browse) ──
 cli-browse-header = {$path} ({$count} entries)
 cli-browse-empty = (empty)
