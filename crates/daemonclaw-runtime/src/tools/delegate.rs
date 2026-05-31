@@ -1154,7 +1154,7 @@ impl DelegateTool {
             run_tool_call_loop(
                 provider,
                 &mut history,
-                &sub_tools,
+                &Arc::new(sub_tools),
                 &noop_observer,
                 &agent_config.provider,
                 &agent_config.model,

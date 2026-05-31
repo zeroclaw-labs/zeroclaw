@@ -3034,7 +3034,7 @@ async fn process_channel_message(
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
-                        ctx.tools_registry.as_ref(),
+                        &ctx.tools_registry,
                         notify_observer.as_ref() as &dyn Observer,
                         route.provider.as_str(),
                         route.model.as_str(),

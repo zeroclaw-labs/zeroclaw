@@ -540,8 +540,8 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 }
 
 #[derive(Debug, Default)]
-struct StreamedChatOutcome {
-    response_text: String,
+pub(crate) struct StreamedChatOutcome {
+    pub(crate) response_text: String,
     /// Accumulated reasoning/thinking content from streaming deltas.
     ///
     /// Captured separately from `response_text` so it can be threaded into
@@ -550,12 +550,12 @@ struct StreamedChatOutcome {
     /// DeepSeek V4 that reject follow-up requests when the assistant's
     /// prior `reasoning_content` is missing from replayed tool-call turns
     /// (see issue #6059).
-    reasoning_content: String,
-    tool_calls: Vec<ToolCall>,
-    forwarded_live_deltas: bool,
+    pub(crate) reasoning_content: String,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) forwarded_live_deltas: bool,
 }
 
-async fn consume_provider_streaming_response(
+pub(crate) async fn consume_provider_streaming_response(
     provider: &dyn Provider,
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
@@ -674,7 +674,7 @@ async fn consume_provider_streaming_response(
 pub async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: &Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -861,7 +861,7 @@ pub fn append_receipt_footer(
 pub async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: &Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -1149,8 +1149,18 @@ pub async fn run_tool_call_loop(
             iteration + 1,
         );
         let mut streamed_live_deltas = false;
+        let mut streaming_tool_results: Option<
+            Vec<(daemonclaw_providers::ToolCall, ToolExecutionOutcome)>,
+        > = None;
 
         let chat_result = if should_consume_provider_stream {
+            let mut streaming_executor =
+                crate::agent::streaming_executor::StreamingToolExecutor::new(
+                    Arc::clone(tools_registry),
+                    Arc::new(crate::observability::NoopObserver {}),
+                    cancellation_token.clone(),
+                    None,
+                );
             match consume_provider_streaming_response(
                 active_provider,
                 &prepared_messages.messages,
@@ -1159,7 +1169,7 @@ pub async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
-                None,
+                Some(&mut streaming_executor),
             )
             .await
             {
@@ -1170,12 +1180,30 @@ pub async fn run_tool_call_loop(
                     } else {
                         Some(streamed.reasoning_content)
                     };
-                    Ok(daemonclaw_providers::ChatResponse {
-                        text: Some(streamed.response_text),
-                        tool_calls: streamed.tool_calls,
-                        usage: None,
-                        reasoning_content,
-                    })
+                    // If the streaming executor dispatched tools mid-stream,
+                    // collect their results now. The tool_calls in the
+                    // ChatResponse will be empty (executor consumed them).
+                    if streaming_executor.has_tools() {
+                        let finished = streaming_executor.finish().await;
+                        let mut calls_for_response = Vec::new();
+                        for (call, _) in &finished {
+                            calls_for_response.push(call.clone());
+                        }
+                        streaming_tool_results = Some(finished);
+                        Ok(daemonclaw_providers::ChatResponse {
+                            text: Some(streamed.response_text),
+                            tool_calls: calls_for_response,
+                            usage: None,
+                            reasoning_content,
+                        })
+                    } else {
+                        Ok(daemonclaw_providers::ChatResponse {
+                            text: Some(streamed.response_text),
+                            tool_calls: streamed.tool_calls,
+                            usage: None,
+                            reasoning_content,
+                        })
+                    }
                 }
                 Err(stream_err) => {
                     tracing::warn!(
@@ -1761,15 +1789,42 @@ pub async fn run_tool_call_loop(
             }
         }
 
-        // Execute tool calls and build results. `individual_results` tracks per-call output so
-        // native-mode history can emit one role=tool message per tool call with the correct ID.
+        // Execute tool calls and build results.
         //
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
+        // When streaming_tool_results is Some, tools already executed mid-stream
+        // via the StreamingToolExecutor — use those results directly. Otherwise,
+        // dispatch tools via the normal batched/sequential path.
         let mut tool_results = String::new();
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
+
+        let mut detection_relevant_output = String::new();
+
+        if let Some(streamed_results) = streaming_tool_results.take() {
+            for (idx, (call, outcome)) in streamed_results.into_iter().enumerate() {
+                let tool_call_id = tool_calls
+                    .get(idx)
+                    .and_then(|tc| tc.tool_call_id.clone());
+                let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+                individual_results.push((tool_call_id.clone(), result_output.clone()));
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                    call.name, result_output
+                );
+                detection_relevant_output.push_str(&outcome.output);
+                turn_tool_records.push(daemonclaw_api::agent::ToolCallRecord {
+                    name: call.name.clone(),
+                    arguments: serde_json::from_str(&call.arguments)
+                        .unwrap_or(serde_json::Value::Null),
+                    result: outcome.output.clone(),
+                    success: outcome.success,
+                    duration: outcome.duration,
+                });
+                ordered_results[idx] = Some((call.name, tool_call_id, outcome));
+            }
+        } else {
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
@@ -2107,7 +2162,6 @@ pub async fn run_tool_call_loop(
 
         // Collect tool results and build per-tool output for loop detection.
         // Only non-ignored tool outputs contribute to the identical-output hash.
-        let mut detection_relevant_output = String::new();
         // Use enumerate *before* filter_map so result_index stays aligned with
         // tool_calls even when some ordered_results entries are None.
         for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
@@ -2197,6 +2251,7 @@ pub async fn run_tool_call_loop(
                 tool_name, result_output
             );
         }
+        } // end streaming_tool_results else
 
         // ── Time-gated loop detection ──────────────────────────
         // When pacing.loop_detection_min_elapsed_secs is set, identical-output
@@ -2814,6 +2869,10 @@ pub async fn run(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
+
+    // Freeze the mutable tool registry into shared ownership. All mutations
+    // (skill registration, peripheral extension, MCP wiring) must be done above.
+    let tools_registry = Arc::new(tools_registry);
 
     // Append deferred MCP tool names so the LLM knows what is available
     if !deferred_section.is_empty() {
@@ -3802,6 +3861,7 @@ pub async fn process_message(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
+    let tools_registry = Arc::new(tools_registry);
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
         system_prompt.push_str(&deferred_section);
@@ -5015,7 +5075,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
@@ -5067,7 +5127,7 @@ mod tests {
             "[IMAGE:data:image/png;base64,{oversized_payload}]"
         ))];
 
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
             max_images: 4,
@@ -5125,7 +5185,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
@@ -5176,7 +5236,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
@@ -5228,7 +5288,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5284,7 +5344,7 @@ mod tests {
         let provider = ScriptedProvider::from_text_responses(vec!["hello world"]);
 
         let mut history = vec![ChatMessage::user("just text, no images".to_string())];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5342,7 +5402,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         // vision_provider set but vision_model is None — the code should
@@ -5403,7 +5463,7 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "empty marker [IMAGE:] should be ignored".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5459,7 +5519,7 @@ mod tests {
             "two images [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/png;base64,bQ==]"
                 .to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = daemonclaw_config::schema::MultimodalConfig {
@@ -5581,7 +5641,7 @@ mod tests {
 
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
             Box::new(DelayTool::new(
                 "delay_a",
                 200,
@@ -5594,7 +5654,7 @@ mod tests {
                 Arc::clone(&active),
                 Arc::clone(&max_active),
             )),
-        ];
+        ]);
 
         let approval_cfg = daemonclaw_config::schema::AutonomyConfig {
             level: crate::security::AutonomyLevel::Full,
@@ -5677,10 +5737,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingArgsTool::new(
             "cron_add",
             Arc::clone(&recorded_args),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5749,10 +5809,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingArgsTool::new(
             "cron_add",
             Arc::clone(&recorded_args),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5816,10 +5876,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5894,9 +5954,9 @@ mod tests {
         });
         let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::new());
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
             crate::tools::shell::ShellTool::new(security, runtime),
-        )];
+        )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5965,10 +6025,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6049,7 +6109,7 @@ mod tests {
 
         let count_invocations = Arc::new(AtomicUsize::new(0));
         let other_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
             Box::new(CountingTool::new(
                 "count_tool",
                 Arc::clone(&count_invocations),
@@ -6058,7 +6118,7 @@ mod tests {
                 "other_tool",
                 Arc::clone(&other_invocations),
             )),
-        ];
+        ]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6120,10 +6180,10 @@ mod tests {
         .with_native_tool_support();
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6210,10 +6270,10 @@ mod tests {
         };
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6282,7 +6342,7 @@ mod tests {
     async fn run_tool_call_loop_consumes_provider_stream_for_final_response() {
         let provider =
             StreamingScriptedProvider::from_text_responses(vec!["streamed final answer"]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("say hi"),
@@ -6350,10 +6410,10 @@ mod tests {
             "done",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run tool calls"),
@@ -6428,10 +6488,10 @@ mod tests {
             NativeStreamTurn::Text("done".to_string()),
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingTool::new(
             "count_tool",
             Arc::clone(&invocations),
-        ))];
+        ))]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run native tools"),
@@ -6518,7 +6578,7 @@ mod tests {
             "default-model".to_string(),
         );
 
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("say hi"),
@@ -6612,7 +6672,7 @@ mod tests {
                 .unwrap()
                 .activate("pixel__get_api_health".into(), activated_tool);
 
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
             let mut history = vec![
                 ChatMessage::system("test-system"),
                 ChatMessage::user("use the activated MCP tool"),
@@ -7774,10 +7834,10 @@ Let me check the result."#;
             "I could not execute that command.",
         ]);
 
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(FailingTool::new(
             "failing_shell",
             "Command not allowed by security policy: rm -rf /",
-        ))];
+        ))]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7945,6 +8005,7 @@ Let me check the result."#;
             Arc::new(cost_config.prices.clone()),
         );
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let empty_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -7952,7 +8013,7 @@ Let me check the result."#;
                 run_tool_call_loop(
                     &provider,
                     &mut history,
-                    &[],
+                    &empty_tools,
                     &observer,
                     "mock-provider",
                     "mock-model",
@@ -8033,6 +8094,7 @@ Let me check the result."#;
             )])),
         );
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let empty_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -8040,7 +8102,7 @@ Let me check the result."#;
                 run_tool_call_loop(
                     &provider,
                     &mut history,
-                    &[],
+                    &empty_tools,
                     &observer,
                     "mock-provider",
                     "mock-model",
@@ -8097,11 +8159,12 @@ Let me check the result."#;
         };
         let observer = NoopObserver;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let empty_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &[],
+            &empty_tools,
             &observer,
             "mock-provider",
             "mock-model",

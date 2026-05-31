@@ -1317,10 +1317,11 @@ async fn run_single_delegates_to_turn() {
 
 mod spine_contract {
     use super::*;
-    use crate::agent::loop_::{run_tool_call_loop, append_receipt_footer};
+    use crate::agent::loop_::{run_tool_call_loop};
     use crate::hooks::{HookHandler, HookRunner, TurnCompleteAction};
     use daemonclaw_api::agent::TurnResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     // ── Hook that returns a scripted TurnCompleteAction ──────────────
 
@@ -1377,7 +1378,7 @@ mod spine_contract {
             },
         ]);
         let observer = NoopObserver {};
-        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
         let multimodal = default_multimodal();
 
         // With Stop: loop should return after first response.
@@ -1466,7 +1467,7 @@ mod spine_contract {
             },
         ]);
         let observer = NoopObserver {};
-        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
         let multimodal = default_multimodal();
 
         let hooks = make_hooks(TurnCompleteAction::InjectError(
@@ -1560,6 +1561,157 @@ mod spine_contract {
                 error: None,
             })
         }
+    }
+
+    // ── [10] End-to-end: stream → executor → mid-stream dispatch ──────
+    //
+    // Drives a mock stream through consume_provider_streaming_response with
+    // Some(executor). The stream emits ToolCall(tool_a), delays 80ms, then
+    // emits ToolCall(tool_b). tool_a (50ms execution) must start during the
+    // 80ms delay — proving dispatch happens on arrival from the stream, not
+    // after the stream completes.
+    //
+    // Production call site: loop_.rs line 1164-1172, where
+    // consume_provider_streaming_response receives Some(&mut streaming_executor).
+    // All production callers (run(), orchestrator, delegate) go through
+    // run_tool_call_loop which constructs the executor at line 1157-1162 and
+    // passes Some at line 1172.
+    #[tokio::test]
+    async fn streaming_dispatch_starts_tool_before_stream_finishes() {
+        use crate::agent::loop_::consume_provider_streaming_response;
+        use crate::agent::streaming_executor::StreamingToolExecutor;
+        use daemonclaw_providers::traits::{
+            ChatRequest, StreamChunk, StreamEvent, StreamOptions,
+        };
+        use futures_util::stream::StreamExt;
+
+        let log: Arc<Mutex<Vec<(String, std::time::Instant, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(TimestampTool {
+                tool_name: "tool_a".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+            Box::new(TimestampTool {
+                tool_name: "tool_b".into(),
+                safe: true,
+                log: Arc::clone(&log),
+            }),
+        ];
+        let tools_arc = Arc::new(tools);
+
+        // Mock provider that streams: ToolCall(tool_a) → 80ms delay → ToolCall(tool_b) → Final
+        struct DelayedToolStream;
+
+        #[async_trait]
+        impl Provider for DelayedToolStream {
+            async fn chat_with_system(
+                &self, _: Option<&str>, _: &str, _: &str, _: f64,
+            ) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn chat(
+                &self, _: ChatRequest<'_>, _: &str, _: f64,
+            ) -> anyhow::Result<daemonclaw_providers::ChatResponse> {
+                unreachable!()
+            }
+            fn supports_streaming(&self) -> bool { true }
+            fn supports_streaming_tool_events(&self) -> bool { true }
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                daemonclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move {
+                    let _ = tx.send(Ok(StreamEvent::ToolCall(daemonclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "tool_a".into(),
+                        arguments: "{}".into(),
+                    }))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    let _ = tx.send(Ok(StreamEvent::ToolCall(daemonclaw_providers::ToolCall {
+                        id: "tc2".into(),
+                        name: "tool_b".into(),
+                        arguments: "{}".into(),
+                    }))).await;
+                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                });
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+            }
+        }
+
+        let provider = DelayedToolStream;
+        let messages = vec![ChatMessage::user("run both tools")];
+        let observer_arc: Arc<dyn crate::observability::Observer> =
+            Arc::new(crate::observability::NoopObserver {});
+
+        let mut executor = StreamingToolExecutor::new(
+            Arc::clone(&tools_arc),
+            observer_arc,
+            None,
+            None,
+        );
+
+        let before_stream = std::time::Instant::now();
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "test-model",
+            0.0,
+            None,
+            None,
+            Some(&mut executor),
+        )
+        .await
+        .expect("streaming should succeed");
+
+        // Stream is done. tool_calls should be empty (executor consumed them).
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "executor should have consumed all tool calls from the stream"
+        );
+
+        // Collect executor results.
+        assert!(executor.has_tools(), "executor should have tools");
+        let results = executor.finish().await;
+        assert_eq!(results.len(), 2, "both tools should have executed");
+        assert!(results.iter().all(|(_, o)| o.success));
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries.len(), 2);
+
+        let tool_a = entries.iter().find(|(n, _, _)| n == "tool_a").unwrap();
+        let tool_b = entries.iter().find(|(n, _, _)| n == "tool_b").unwrap();
+
+        // tool_a (50ms execution) must have started during the 80ms delay
+        // before tool_b arrived from the stream.
+        // tool_b's StreamEvent::ToolCall was emitted at ~before_stream + 80ms.
+        let tool_b_stream_arrival = before_stream + std::time::Duration::from_millis(80);
+
+        assert!(
+            tool_a.1 < tool_b_stream_arrival,
+            "tool_a must start before tool_b arrives from the stream. \
+             tool_a started at +{}ms, tool_b arrived at +80ms",
+            tool_a.1.duration_since(before_stream).as_millis(),
+        );
+
+        // Also confirm tool_a didn't wait for tool_b — its start should be
+        // well before the 80ms mark (within the first few ms after stream start).
+        assert!(
+            tool_a.1.duration_since(before_stream).as_millis() < 30,
+            "tool_a should start within 30ms of stream start, got {}ms",
+            tool_a.1.duration_since(before_stream).as_millis(),
+        );
     }
 
     #[tokio::test]
