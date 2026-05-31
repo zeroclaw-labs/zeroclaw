@@ -84,6 +84,24 @@ The channel binds to `0.0.0.0` directly. To expose it on the public internet:
 
 Always pair public exposure with `secret`. An unauthenticated webhook listener is an open ingress to the agent.
 
+## Outbound sends
+
+Webhook channels can also POST/PUT *outbound* messages to a configured `send_url` — used when the agent replies through the channel rather than only receiving inbound events. Outbound delivery is configured under the singular `[channels.webhook]` prefix (a separate schema surface from the inbound `[channels.webhooks.<name>]` blocks above; reconciling that shape difference in this page is tracked separately):
+
+```toml
+[channels.webhook]
+send_url = "https://example.com/callback"
+send_method = "POST"        # or "PUT"; default: "POST"
+auth_header = "Bearer ..."  # optional Authorization header
+
+# Retry tunables (all optional):
+max_retries = 3             # default: 3; set to 0 to disable retries
+retry_base_delay_ms = 500   # exponential-backoff base; default: 500
+retry_max_delay_ms = 30000  # per-wait cap; default: 30000 (30s)
+```
+
+Outbound sends retry transient failures — network errors, HTTP `429`, and HTTP `5xx` — with exponential backoff (±25% jitter) capped by `retry_max_delay_ms`. Non-`429` `4xx` responses fail immediately without retrying. When the server returns a `Retry-After` header on `429` or `503`, that value is honored and also clamped by `retry_max_delay_ms`. Setting `max_retries = 0` preserves the prior fire-and-forget behavior byte-for-byte.
+
 ## Code
 
 - Channel: `crates/zeroclaw-channels/src/webhook.rs`

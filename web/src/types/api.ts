@@ -185,6 +185,17 @@ export interface Session {
   channel_id: string | null;
 }
 
+export type ChannelReadinessState = 'ready' | 'missing' | 'unknown';
+
+export interface ChannelReadiness {
+  enabled: ChannelReadinessState;
+  bound_to_agent: ChannelReadinessState;
+  authenticated: ChannelReadinessState;
+  listening: ChannelReadinessState;
+  requirements: string[];
+  notes: string[];
+}
+
 export interface ChannelDetail {
   /** Composite `<type>.<alias>` identifier (v0.8.0). */
   name: string;
@@ -196,10 +207,11 @@ export interface ChannelDetail {
    * when the block is orphaned. */
   owning_agent: string | null;
   enabled: boolean;
-  status: 'active' | 'inactive' | 'error';
+  status: 'active' | 'inactive' | 'error' | 'unknown';
   message_count: number;
   last_message_at: string | null;
   health: 'healthy' | 'degraded' | 'down';
+  readiness?: ChannelReadiness;
 }
 
 export interface SSEEvent {

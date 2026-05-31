@@ -204,7 +204,7 @@ impl BrowserTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         session_name: Option<String>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::new_with_backend(
             security,
             allowed_domains,
@@ -229,10 +229,10 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
-            allowed_domains: normalize_domains(allowed_domains),
+            allowed_domains: normalize_allowed_domains(allowed_domains)?,
             session_name,
             backend,
             headed,
@@ -242,7 +242,7 @@ impl BrowserTool {
             computer_use,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
-        }
+        })
     }
 
     /// Check if agent-browser CLI is available
@@ -2191,12 +2191,66 @@ fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
     message.contains("webdriver") && (message.contains("timed out") || message.contains("timeout"))
 }
 
-fn normalize_domains(domains: Vec<String>) -> Vec<String> {
-    domains
+fn normalize_allowed_domains(domains: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut rejected = Vec::new();
+    let mut normalized = domains
         .into_iter()
-        .map(|d| d.trim().to_lowercase())
-        .filter(|d| !d.is_empty())
-        .collect()
+        .filter_map(|d| {
+            normalize_domain(&d).or_else(|| {
+                rejected.push(d.clone());
+                None
+            })
+        })
+        .collect::<Vec<_>>();
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "Invalid browser.allowed_domains entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
+            rejected.join(", ")
+        );
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let input = raw.trim();
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
+        (true, true) => &input[1..input.len() - 1],
+        (false, false) => input,
+        _ => return None,
+    };
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string().to_lowercase());
+    }
+
+    let parsed = reqwest::Url::parse(input)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
+        .ok()?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+
+    let host = parsed.host_str()?;
+    let trimmed = host.trim();
+    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => return None,
+    };
+    let normalized = host_no_brackets
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized.to_lowercase())
 }
 
 fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
@@ -2375,14 +2429,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_domains_works() {
+    fn normalize_allowed_domains_works() {
         let domains = vec![
             "  Example.COM  ".into(),
             "docs.example.com".into(),
-            String::new(),
+            "example.com".into(),
         ];
-        let normalized = normalize_domains(domains);
-        assert_eq!(normalized, vec!["example.com", "docs.example.com"]);
+        let normalized = normalize_allowed_domains(domains).unwrap();
+        assert_eq!(normalized, vec!["docs.example.com", "example.com"]);
+    }
+
+    #[test]
+    fn normalize_allowed_domains_rejects_invalid() {
+        let err =
+            normalize_allowed_domains(vec!["".into(), "  ".into(), "user@example.com".into()])
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid browser.allowed_domains entry")
+        );
+    }
+
+    #[test]
+    fn normalize_domain_rejects_unmatched_brackets() {
+        assert!(normalize_domain("[::1").is_none());
+        assert!(normalize_domain("::1]").is_none());
+        assert!(normalize_domain("[127.0.0.1").is_none());
+        assert!(normalize_domain("127.0.0.1]").is_none());
     }
 
     #[test]
@@ -2463,7 +2536,7 @@ mod tests {
     #[test]
     fn validate_url_blocks_ipv6_ssrf() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
         assert!(
@@ -2523,7 +2596,7 @@ mod tests {
     #[test]
     fn browser_tool_default_backend_is_agent_browser() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::AgentBrowser
@@ -2534,7 +2607,7 @@ mod tests {
     fn agent_browser_command_inherits_headed_env_by_default() {
         let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         let cmd = tool.agent_browser_command();
 
         assert_eq!(
@@ -2560,7 +2633,8 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+        )
+        .unwrap();
         let cmd = tool.agent_browser_command();
 
         assert_eq!(
@@ -2586,7 +2660,8 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+        )
+        .unwrap();
         let cmd = tool.agent_browser_command();
 
         assert_eq!(
@@ -2612,7 +2687,8 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
 
@@ -2629,7 +2705,8 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::ComputerUse
@@ -2652,7 +2729,8 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert!(tool.computer_use_endpoint_url().is_err());
     }
@@ -2674,7 +2752,8 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert!(tool.computer_use_endpoint_url().is_ok());
     }
@@ -2696,7 +2775,8 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert!(
             tool.validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
@@ -2715,14 +2795,14 @@ mod tests {
     #[test]
     fn browser_tool_name() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         assert_eq!(tool.name(), "browser");
     }
 
     #[test]
     fn browser_tool_validates_url() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
 
         // Valid
         assert!(tool.validate_url("https://example.com").is_ok());
@@ -2745,7 +2825,7 @@ mod tests {
     #[test]
     fn browser_tool_empty_allowlist_blocks() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec![], None);
+        let tool = BrowserTool::new(security, vec![], None).unwrap();
         assert!(tool.validate_url("https://example.com").is_err());
     }
 
