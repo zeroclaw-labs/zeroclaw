@@ -10028,6 +10028,11 @@ impl ChannelsConfig {
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
+                name: "Twilio",
+                desc: "SMS via Twilio Programmable Messaging",
+                configured: self.twilio.is_some(),
+            },
+            ChannelInfo {
                 name: "WATI",
                 desc: "WhatsApp via WATI Business API",
                 configured: !self.wati.is_empty(),

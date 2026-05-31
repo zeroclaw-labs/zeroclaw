@@ -2675,23 +2675,11 @@ async fn handle_twilio_sms_webhook(
         );
     };
 
-    // Parse the form-urlencoded body into a sorted map (BTreeMap so signature
-    // recomputation walks keys in the order Twilio expects).
-    let parsed: Vec<(String, String)> = match serde_urlencoded::from_bytes(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(serde_json::json!({"error": "Invalid form body"})).to_string(),
-            );
-        }
-    };
-    let form_params: BTreeMap<String, String> = parsed.into_iter().collect();
-
     // Reconstruct the URL Twilio used. Trust X-Forwarded-Host / X-Forwarded-Proto
     // when present (set by tunnels and reverse proxies); otherwise fall back
     // to the Host header and assume HTTPS (Twilio always sends over HTTPS).
+    // Include path_prefix when configured so the signed URL matches the
+    // public route Twilio actually hit.
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -2715,7 +2703,37 @@ async fn handle_twilio_sms_webhook(
             Json(serde_json::json!({"error": "Missing Host header"})).to_string(),
         );
     }
-    let full_url = format!("{scheme}://{host}/twilio/sms");
+    let prefix = if state.path_prefix.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", state.path_prefix.trim_matches('/'))
+    };
+    let full_url = format!("{scheme}://{host}{prefix}/twilio/sms");
+
+    // ── Security: Verify X-Twilio-Signature before any further processing ──
+    // Parse the form body into a sorted BTreeMap for signature verification.
+    // Twilio's HMAC-SHA1 scheme requires the sorted params; we parse first
+    // but do NOT distinguish parse failures from signature failures — both
+    // return the same 401 to avoid leaking payload-validity info to
+    // unauthenticated callers.
+    let parsed: Vec<(String, String)> = match serde_urlencoded::from_bytes(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"channel": "twilio"})),
+                "Twilio webhook signature verification failed (signature: missing)"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(serde_json::json!({"error": "Invalid signature"})).to_string(),
+            );
+        }
+    };
+    let form_params: BTreeMap<String, String> = parsed.into_iter().collect();
 
     let signature = headers
         .get("x-twilio-signature")
@@ -5434,5 +5452,174 @@ mod tests {
             reply.to_lowercase().contains("onboarding"),
             "channel reply must mention onboarding so users know what's missing: {reply:?}"
         );
+    }
+
+    /// Twilio webhook rejects requests with an invalid HMAC-SHA1 signature.
+    #[tokio::test]
+    async fn twilio_webhook_rejects_invalid_signature() {
+        let twilio = Arc::new(zeroclaw_channels::twilio::TwilioChannel::new(
+            "ACtest".into(),
+            "auth-token-12345".into(),
+            "+15555550100".into(),
+            vec!["*".into()],
+        ));
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            twilio: Some(twilio),
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        headers.insert("x-twilio-signature", HeaderValue::from_static("badsignature=="));
+
+        let body = Bytes::from("From=%2B15555550199&Body=hello&MessageSid=SM123");
+        let response = Box::pin(handle_twilio_sms_webhook(
+            State(state),
+            headers,
+            body,
+        ))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Twilio webhook verifies signature against a URL that includes
+    /// `path_prefix` when one is set. Without the prefix, a valid
+    /// signature would be rejected with 401.
+    #[tokio::test]
+    async fn twilio_webhook_includes_path_prefix_in_signed_url() {
+        let auth_token = "test-token-for-prefix";
+        let twilio = Arc::new(zeroclaw_channels::twilio::TwilioChannel::new(
+            "ACtest".into(),
+            auth_token.into(),
+            "+15555550100".into(),
+            vec!["*".into()],
+        ));
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: true,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            twilio: Some(twilio.clone()),
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: "myprefix".into(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        // Compute the expected signature over the prefixed URL using the
+        // channel's own verification logic (avoids pulling sha1 into gateway).
+        use std::collections::BTreeMap;
+        let url = "https://example.com/myprefix/twilio/sms";
+        let params: BTreeMap<String, String> = vec![
+            ("Body".into(), "hello".into()),
+            ("From".into(), "+15555550199".into()),
+            ("MessageSid".into(), "SMprefix".into()),
+        ]
+        .into_iter()
+        .collect();
+        // Compute HMAC-SHA1 signature over the prefixed URL. The gateway
+        // test depends on `sha1` via dev-dependencies.
+        let signature = {
+            use hmac::{Hmac, Mac};
+            type HmacSha1 = Hmac<sha1::Sha1>;
+            let mut data = url.as_bytes().to_vec();
+            for (k, v) in &params {
+                data.extend_from_slice(k.as_bytes());
+                data.extend_from_slice(v.as_bytes());
+            }
+            let mut mac = HmacSha1::new_from_slice(auth_token.as_bytes()).unwrap();
+            mac.update(&data);
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, mac.finalize().into_bytes())
+        };
+
+        let body = Bytes::from(serde_urlencoded::to_string(&params).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        headers.insert("x-twilio-signature", HeaderValue::from_str(&signature).unwrap());
+
+        let response = Box::pin(handle_twilio_sms_webhook(
+            State(state),
+            headers,
+            body,
+        ))
+        .await
+        .into_response();
+        // Should NOT be 401 — the prefixed URL signature must be accepted.
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "signature should verify with path_prefix");
     }
 }

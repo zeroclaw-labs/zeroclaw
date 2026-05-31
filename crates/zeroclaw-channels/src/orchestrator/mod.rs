@@ -5669,26 +5669,23 @@ fn build_channel_by_id(
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
+        #[cfg(feature = "channel-twilio")]
         "twilio" => {
-            #[cfg(feature = "channel-twilio")]
-            {
-                let tw = config
-                    .channels
-                    .twilio
-                    .as_ref()
-                    .context("Twilio channel is not configured")?;
-                let twilio = TwilioChannel::new(
-                    tw.account_sid.clone(),
-                    tw.auth_token.clone(),
-                    tw.from_number.clone(),
-                    tw.allowed_numbers.clone(),
-                );
-                Ok(Arc::new(twilio))
-            }
-            #[cfg(not(feature = "channel-twilio"))]
-            {
-                anyhow::bail!("Twilio channel requires the `channel-twilio` feature");
-            }
+            let tw = config
+                .channels
+                .twilio
+                .as_ref()
+                .context("Twilio channel is not configured")?;
+            Ok(Arc::new(TwilioChannel::new(
+                tw.account_sid.clone(),
+                tw.auth_token.clone(),
+                tw.from_number.clone(),
+                tw.allowed_numbers.clone(),
+            )))
+        }
+        #[cfg(not(feature = "channel-twilio"))]
+        "twilio" => {
+            anyhow::bail!("Twilio channel requires the `channel-twilio` feature");
         }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \

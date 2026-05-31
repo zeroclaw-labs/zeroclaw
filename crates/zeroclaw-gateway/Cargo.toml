@@ -76,6 +76,7 @@ rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
+sha1 = "0.10"
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
