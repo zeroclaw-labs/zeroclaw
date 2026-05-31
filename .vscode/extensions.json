@@ -4,8 +4,10 @@
     "vadimcn.vscode-lldb",
     "serayuzgur.crates",
     "bungcip.better-toml",
+    "usernamehw.errorlens",
     "eamodio.gitlens",
     "tamasfe.even-better-toml",
+    "dbaeumer.vscode-eslint",
     "oderwat.indent-rainbow",
     "ryanluker.vscode-coverage-gutters"
   ]

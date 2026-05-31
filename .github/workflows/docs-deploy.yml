@@ -45,6 +45,11 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+            # Validate: must be 'master' or a semver tag like v0.7.5 / v0.8.0-beta-1.
+            if ! [[ "$TAG" =~ ^(master|v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?)$ ]]; then
+              echo "::error::Invalid tag input '${TAG}'. Must be 'master' or match v<major>.<minor>.<patch>[-<pre>]."
+              exit 1
+            fi
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
@@ -123,13 +128,18 @@ jobs:
           REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           CLONE_DIR=$(mktemp -d)
           echo "Cloning gh-pages into ${CLONE_DIR}"
-          if git ls-remote --exit-code origin gh-pages >/dev/null 2>&1; then
+          if git ls-remote --exit-code origin gh-pages > /dev/null 2>&1; then
             git clone --depth 1 --branch gh-pages "$REPO" "$CLONE_DIR"
           else
-            git clone --depth 1 "$REPO" "$CLONE_DIR" || true
-            cd "$CLONE_DIR"
-            git checkout --orphan gh-pages || git switch --orphan gh-pages || true
-            cd - >/dev/null
+            # gh-pages does not exist yet — bootstrap an orphan branch.
+            git clone --depth 1 "$REPO" "$CLONE_DIR"
+            pushd "$CLONE_DIR" > /dev/null
+            if ! git switch --orphan gh-pages 2>/dev/null; then
+              # Fallback for older Git versions (< 2.23).
+              git checkout --orphan gh-pages || { echo "::error::Failed to create orphan gh-pages branch"; exit 1; }
+            fi
+            git rm -rf . > /dev/null 2>&1 || true
+            popd > /dev/null
           fi
 
           # Copy built tag docs into gh-pages under '<tag>/'
@@ -151,7 +161,12 @@ jobs:
           fi
 
           # Generate versions.json by scanning gh-pages root for version directories
-          pushd "$CLONE_DIR" >/dev/null
+          pushd "$CLONE_DIR" > /dev/null
+
+          # Persist custom domain — must be present on every push to gh-pages
+          # or GitHub Pages will remove it (re-introduced fix from #6142).
+          echo "docs.zeroclawlabs.ai" > CNAME
+
           python3 "${GITHUB_WORKSPACE}/.github/scripts/generate-versions.py" > versions.json
 
           # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
