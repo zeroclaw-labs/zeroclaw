@@ -23,6 +23,7 @@ pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
 pub mod escalate;
+pub mod file_download;
 pub mod file_edit;
 pub mod file_upload;
 pub mod file_upload_bundle;

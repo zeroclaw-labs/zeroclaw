@@ -63,6 +63,7 @@ pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
+pub use zeroclaw_tools::file_download::FileDownloadTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
@@ -979,6 +980,19 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(FileUploadBundleTool::new(
             security.clone(),
             root_config.file_upload_bundle.clone(),
+        )));
+    }
+
+    // File download tool — enabled iff [file_download].url is set
+    if root_config
+        .file_download
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        tool_arcs.push(Arc::new(FileDownloadTool::new(
+            security.clone(),
+            root_config.file_download.clone(),
         )));
     }
 

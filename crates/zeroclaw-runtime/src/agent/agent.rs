@@ -832,9 +832,11 @@ impl Agent {
         if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
+        let runtime_profile = config.runtime_profile_for_agent(agent_alias);
         let security = Arc::new({
-            let mut policy = SecurityPolicy::from_risk_profile(
+            let mut policy = SecurityPolicy::from_profiles(
                 risk_profile,
+                runtime_profile,
                 session_cwd.unwrap_or(&agent_workspace),
             );
             // When a per-session cwd overrides the sandbox root, ensure
@@ -5481,6 +5483,103 @@ mod tests {
             has_assistant,
             "new_msgs must include the assistant reply even after trim; got: {new_msgs:?}"
         );
+    }
+
+    /// Regression: Agent::from_config must propagate the runtime profile's
+    /// budget caps into the constructed Agent's security_summary.  The
+    /// existing from_profiles tests cover SecurityPolicy-level propagation,
+    /// but they pass even if Agent::from_config still calls
+    /// from_risk_profile (skipping runtime budgets).  This test exercises
+    /// the full from_config → SecurityPolicy::from_profiles path so that
+    /// reverting the runtime_profile resolution in agent.rs is caught.
+    #[tokio::test]
+    async fn from_config_runtime_profile_propagates_budget_caps() {
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|Json(_body): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "ok"
+                        }
+                    }]
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", "default")
+                .expect("custom model_provider type slot");
+            entry.api_key = Some("test-key".to_string());
+            entry.model = Some("test-model".to_string());
+            entry.uri = Some(format!("http://{mock_addr}"));
+        }
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+
+        // Runtime profile with a non-default max_actions_per_hour.
+        config.runtime_profiles.insert(
+            "test-runtime".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_actions_per_hour: 99,
+                ..zeroclaw_config::schema::RuntimeProfileConfig::default()
+            },
+        );
+
+        let provider_alias = config
+            .first_model_provider_type()
+            .expect("model_provider configured above")
+            .to_string();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: format!("{provider_alias}.default").into(),
+            risk_profile: "test-profile".to_string(),
+            runtime_profile: "test-runtime".to_string(),
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        config.agents.insert("test-agent".to_string(), agent_cfg);
+
+        let agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent from config");
+
+        let summary = agent
+            .security_summary
+            .as_deref()
+            .expect("security_summary should be populated by from_config");
+
+        assert!(
+            summary.contains("99"),
+            "expected security_summary to contain runtime max_actions_per_hour=99; got: {summary}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]
