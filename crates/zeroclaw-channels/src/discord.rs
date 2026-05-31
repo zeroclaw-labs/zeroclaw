@@ -16,6 +16,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_runtime::i18n;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -901,11 +902,7 @@ fn validate_marker_target(
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
     workspace_dir: Option<&Path>,
-) -> (
-    Vec<PathBuf>,
-    Vec<String>,
-    Vec<(String, DiscordMarkerFailure)>,
-) {
+) -> (Vec<PathBuf>, Vec<String>, Vec<DiscordMarkerFailure>) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
     let mut failures = Vec::new();
@@ -920,7 +917,7 @@ fn classify_outgoing_attachments(
                     DiscordMarkerFailure::NotFound => "not found",
                 };
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
-                failures.push((attachment.target.clone(), e.kind()));
+                failures.push(e.kind());
             }
         }
     }
@@ -928,23 +925,23 @@ fn classify_outgoing_attachments(
     (local_files, remote_urls, failures)
 }
 
-/// Build the Matrix-style "(note: I couldn't deliver ...)" tail appended
-/// to the bot's reply when at least one marker was dropped. Returns
-/// `None` when the failure list is empty so callers can keep the body
-/// untouched.
-fn delivery_failure_note(failures: &[(String, DiscordMarkerFailure)]) -> Option<String> {
+/// Build the count-only delivery failure tail appended to the bot's reply
+/// when at least one marker was dropped. Returns `None` when the failure
+/// list is empty so callers can keep the body untouched.
+fn delivery_failure_note(failures: &[DiscordMarkerFailure]) -> Option<String> {
     if failures.is_empty() {
         return None;
     }
-    let targets: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
-    Some(if targets.len() == 1 {
-        format!("(note: I couldn't deliver the file at {}.)", targets[0])
+    let count = failures.len().to_string();
+    let key = if failures.len() == 1 {
+        "channel-discord-delivery-failure-note-one"
     } else {
-        format!(
-            "(note: I couldn't deliver these files: {}.)",
-            targets.join(", ")
-        )
-    })
+        "channel-discord-delivery-failure-note-many"
+    };
+    Some(i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
 }
 
 /// Compose the final reply body with the delivery-failure note appended.
@@ -962,17 +959,17 @@ fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
 /// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
 /// ⚠️ signals a post-validation delivery failure. Both can fire on the
 /// same message when a batch mixes refusals and not-found targets.
-fn decide_failure_reactions(failures: &[(String, DiscordMarkerFailure)]) -> Vec<&'static str> {
+fn decide_failure_reactions(failures: &[DiscordMarkerFailure]) -> Vec<&'static str> {
     let mut out = Vec::new();
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::Refused))
+        .any(|k| matches!(k, DiscordMarkerFailure::Refused))
     {
         out.push("🚫");
     }
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::NotFound))
+        .any(|k| matches!(k, DiscordMarkerFailure::NotFound))
     {
         out.push("⚠️");
     }
@@ -3541,7 +3538,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::NotFound);
+        assert_eq!(failures[0], DiscordMarkerFailure::NotFound);
     }
 
     #[test]
@@ -3564,7 +3561,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3580,7 +3577,7 @@ mod tests {
         assert!(locals.is_empty(), "relative paths must be refused");
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3606,7 +3603,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 3);
-        for (_, kind) in &failures {
+        for kind in &failures {
             assert_eq!(*kind, DiscordMarkerFailure::Refused);
         }
     }
@@ -3625,7 +3622,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3663,28 +3660,43 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[(
-            "/workspace/missing.png".to_string(),
-            DiscordMarkerFailure::NotFound,
-        )])
-        .expect("one failure should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver the file at /workspace/missing.png.)"
+        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
+            .expect("one failure should produce a note");
+        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        assert!(
+            !note.contains("/workspace/missing.png"),
+            "user-facing failure note must not echo local marker targets"
         );
     }
 
     #[test]
-    fn delivery_failure_note_plural_lists_targets_in_order() {
+    fn delivery_failure_note_plural_redacts_targets() {
         let note = delivery_failure_note(&[
-            ("a.png".to_string(), DiscordMarkerFailure::Refused),
-            ("b.pdf".to_string(), DiscordMarkerFailure::NotFound),
-            ("c.mp4".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
+            DiscordMarkerFailure::Refused,
         ])
         .expect("multiple failures should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver these files: a.png, b.pdf, c.mp4.)"
+        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        assert!(
+            !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
+            "user-facing failure note must not echo failed marker targets"
+        );
+    }
+
+    #[test]
+    fn composed_delivery_failure_note_redacts_parsed_marker_target() {
+        let content = "Done\n[IMAGE: /workspace/missing.png]";
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(content);
+        let (_locals, _remotes, failures) =
+            classify_outgoing_attachments(&parsed_attachments, None);
+        let note = delivery_failure_note(&failures);
+        let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
+
+        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        assert!(
+            !composed.contains("/workspace/missing.png"),
+            "composed outbound body must not echo failed marker targets"
         );
     }
 
@@ -3720,23 +3732,23 @@ mod tests {
     #[test]
     fn decide_failure_reactions_emits_refused_only() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::Refused,
         ]);
         assert_eq!(r, vec!["🚫"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_not_found_only() {
-        let r = decide_failure_reactions(&[("a".to_string(), DiscordMarkerFailure::NotFound)]);
+        let r = decide_failure_reactions(&[DiscordMarkerFailure::NotFound]);
         assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_both_when_mixed() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::NotFound),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
         ]);
         assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
     }
