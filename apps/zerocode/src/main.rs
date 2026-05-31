@@ -161,7 +161,7 @@ async fn run() -> anyhow::Result<()> {
     let resolved_locale = loaded_config
         .resolve_locale()
         .unwrap_or_else(i18n::detect_locale);
-    i18n::init(&resolved_locale);
+    i18n::init(&resolved_locale, &local_config_dir);
 
     // Apply persisted keybinding overrides into the keymap. A bad table
     // fails loud (same posture as an unknown theme) rather than silently

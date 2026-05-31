@@ -326,33 +326,18 @@ impl<'a> App<'a> {
         // editor or the zerocode pane, so there is no shadowing.
         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
             self.cycle_section(1);
+            self.sync_zerocode_locales().await;
             return Ok(false);
         }
         if key.code == KeyCode::BackTab {
             self.cycle_section(-1);
+            self.sync_zerocode_locales().await;
             return Ok(false);
         }
 
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_key(key);
-            // Lazily load the locale registry the first time the Locale tab is
-            // shown (RPC lives here, not in the sync pane).
-            if self.zerocode.locale_needs_list()
-                && let Ok(locales) = self.rpc.locales_list().await
-            {
-                self.zerocode.set_locales(locales);
-            }
-            // Drain a "download locale file" request: fetch over RPC, then have
-            // the pane write the bytes into its own config dir. Errors surface
-            // to the pane status — no crash, no orphaned request.
-            if let Some(locale) = self.zerocode.take_pending_fetch() {
-                match self.rpc.locales_fetch(&locale, &[]).await {
-                    Ok(res) => self
-                        .zerocode
-                        .apply_fetched(&locale, &res.catalogs, &res.skipped),
-                    Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
-                }
-            }
+            self.sync_zerocode_locales().await;
             return Ok(false);
         }
 
@@ -806,6 +791,29 @@ impl<'a> App<'a> {
             self.type_alias_counts.push(count);
         }
         Ok(())
+    }
+
+    /// Bridge the sync zerocode pane to the async RPC client: lazily load the
+    /// locale registry when the Locale tab needs it, and drain a queued
+    /// "download locale file" request. Errors surface to the pane status line —
+    /// no crash, no orphaned request.
+    async fn sync_zerocode_locales(&mut self) {
+        if self.section != ConfigSection::Zerocode {
+            return;
+        }
+        if self.zerocode.locale_needs_list()
+            && let Ok(locales) = self.rpc.locales_list().await
+        {
+            self.zerocode.set_locales(locales);
+        }
+        if let Some(locale) = self.zerocode.take_pending_fetch() {
+            match self.rpc.locales_fetch(&locale, &[]).await {
+                Ok(res) => self
+                    .zerocode
+                    .apply_fetched(&locale, &res.catalogs, &res.skipped),
+                Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
+            }
+        }
     }
 
     async fn load_aliases(&mut self, map_path: &str) -> Result<()> {

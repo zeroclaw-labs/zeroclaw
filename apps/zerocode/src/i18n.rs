@@ -7,6 +7,7 @@ use unic_langid::LanguageIdentifier;
 static STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 static REPORTED_MISSING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 const EN_FTL: &str = include_str!("../locales/en/zerocode.ftl");
@@ -16,7 +17,12 @@ struct FtlSources {
     disk: Option<String>,
 }
 
-pub fn init(locale: &str) {
+/// Initialise i18n with the active locale and the resolved client config dir.
+/// The config dir is where downloaded locale FTL is read from (and where the
+/// Locale pane writes it), so passing it explicitly keeps the read and write
+/// paths consistent with a `--config-dir` flag — no env-var coupling.
+pub fn init(locale: &str, config_dir: &std::path::Path) {
+    let _ = CONFIG_DIR.set(config_dir.to_path_buf());
     let locale = LOCALE.get_or_init(|| normalize_locale(locale));
     STRINGS.get_or_init(|| load_strings(locale));
     FTL_SOURCES.get_or_init(|| load_ftl_sources(locale));
@@ -118,9 +124,14 @@ fn load_ftl_from_disk(locale: &str) -> Option<String> {
     None
 }
 
-/// Resolve the ZeroClaw config directory the same way the backend does:
-/// `ZEROCLAW_CONFIG_DIR` if set, else `~/.zeroclaw`.
+/// Resolve the ZeroClaw config directory with the same precedence as
+/// `client::resolve_config_dir`: the `--config-dir` flag (passed to `init` and
+/// cached in `CONFIG_DIR`) first, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`.
+/// This keeps the FTL read path aligned with the flag the rest of zerocode uses.
 fn config_dir() -> PathBuf {
+    if let Some(dir) = CONFIG_DIR.get() {
+        return dir.clone();
+    }
     if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
