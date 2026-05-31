@@ -108,7 +108,7 @@ zc-dashboard-tab-health = Health
 zc-dashboard-tab-cost = Cost
 zc-dashboard-tab-cron = Cron
 
-zc-dashboard-memory-not-configured = Memory subsystem not configured
+zc-dashboard-memory-not-configured = Memory is not configured yet. Use Quickstart or Config to add a memory backend, or ignore this tab until you need persistent memory.
 zc-dashboard-search-action-apply = apply
 zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
@@ -265,7 +265,7 @@ zc-quickstart-save-and-close = Save & close
 zc-chat-pane-chat = Chat
 zc-chat-pane-acp = ACP
 
-zc-chat-no-agents = No enabled agents. Configure an agent in the Config tab.
+zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
 

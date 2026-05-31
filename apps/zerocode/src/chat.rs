@@ -92,6 +92,10 @@ pub(crate) struct Chat {
     pane_kind: PaneKind,
 }
 
+fn should_retry_on_entry(phase: &ChatPhase) -> bool {
+    matches!(phase, ChatPhase::Error(_))
+}
+
 impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
@@ -174,6 +178,17 @@ impl Chat {
     /// user into the freshly-created agent's chat.
     pub(crate) async fn focus_agent(&mut self, agent_alias: &str) {
         self.pick_or_start_session(agent_alias).await;
+    }
+
+    /// Re-check stale setup errors when the user returns to a chat-style pane.
+    ///
+    /// Manual setup can happen in Config while Chat is parked on a stale
+    /// "no agents" error. Quickstart uses `focus_agent()` directly after
+    /// creation, but manual Config setup needs this small refresh hook.
+    pub(crate) async fn refresh_if_inactive(&mut self) {
+        if should_retry_on_entry(&self.phase) {
+            let _ = self.init().await;
+        }
     }
 
     /// Start the session, optionally with a caller-supplied `cwd`.
@@ -2952,6 +2967,52 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[tokio::test]
+    async fn chat_entry_refresh_reloads_agents_from_error_phase() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("No enabled agents yet.".to_string());
+
+        let refresh = tokio::spawn(async move {
+            chat.refresh_if_inactive().await;
+            chat
+        });
+
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("refresh should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+
+        let id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
+                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                ]
+            })),
+            None,
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), refresh)
+            .await
+            .expect("refresh should finish after agents/status response")
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, loading, ..
+        } = chat.phase
+        else {
+            panic!("refresh should leave stale error state");
+        };
+        assert_eq!(agents, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(!loading);
     }
 
     #[tokio::test]

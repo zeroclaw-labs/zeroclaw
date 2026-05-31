@@ -22,6 +22,10 @@ impl Acp {
         self.inner.init().await
     }
 
+    pub(crate) async fn refresh_if_inactive(&mut self) {
+        self.inner.refresh_if_inactive().await;
+    }
+
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.inner.draw(frame, area);
     }
