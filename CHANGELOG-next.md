@@ -17,6 +17,37 @@ v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. O
 
 ## What's New
 
+### Added
+
+- **agents**: Added `[agents.<alias>].classifier_provider` (`ModelProviderRef`)
+  to route the reply-intent classifier (`classify_channel_reply_intent`) to a
+  separate, cheaper provider/model than the main answering model. Empty (default)
+  preserves pre-release behavior: the classifier reuses the main agent's
+  `model_provider`. Non-empty values must reference a configured
+  `[providers.models.<type>.<alias>]` entry (validated at config-load fail-loud
+  through the same `typed_provider_refs` check that covers `tts_provider` and
+  `transcription_provider`). ACP channels skip the classifier entirely and
+  are unaffected.
+
+  Example: route classification through a free fast model while answering
+  with the premium model:
+
+      [providers.models.custom.default]
+      api_key  = "..."
+      model    = "qwen3.6-plus"
+      uri      = "https://coding.dashscope.aliyuncs.com/v1"
+      wire_api = "chat_completions"
+
+      [providers.models.custom.kimi-k2-5]    # alias may NOT contain '.';
+      api_key  = "..."                       # write 'kimi-k2-5' not 'kimi-k2.5'
+      model    = "kimi-k2.5"                 # the model string CAN contain '.'
+      uri      = "https://coding.dashscope.aliyuncs.com/v1"
+      wire_api = "chat_completions"
+
+      [agents.default]
+      model_provider      = "custom.default"
+      classifier_provider = "custom.kimi-k2-5"
+
 ### Multi-Agent & Runtime
 
 The multi-agent epic (#6272) is the spine of this release:

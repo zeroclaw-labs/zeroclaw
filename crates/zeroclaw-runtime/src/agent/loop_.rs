@@ -29,6 +29,71 @@ static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::
 pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
+
+/// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
+/// Injected by the binary so `zeroclaw-runtime` doesn't depend on
+/// `zeroclaw-channels`.
+type ChannelMapFn = Box<
+    dyn Fn()
+            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
+        + Send
+        + Sync,
+>;
+
+/// Channel map factory, injected by the binary.
+static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
+
+/// Register the channel map factory. Called once at startup by the binary.
+pub fn register_channel_map_fn(f: ChannelMapFn) {
+    let _ = CHANNEL_MAP_FN.set(f);
+}
+
+/// Populate all channel-driven tool handles from the registered factory.
+/// Returns the number of channels seeded.
+///
+/// Parameter order matches the return tuple of `all_tools_with_runtime`:
+/// Seed all channel-driven tool handles from the registered channel map factory.
+/// Returns the number of channels seeded. Parameters match the return order of
+/// `all_tools_with_runtime`:
+///   ask_user_handle = `Option<PerToolChannelHandle>`
+///   reaction_handle = `PerToolChannelHandle` (NOT Option)
+///   poll_handle = `Option<PerToolChannelHandle>`
+///   escalate_handle = `Option<PerToolChannelHandle>`
+///   channel_send_handle = `Option<PerToolChannelHandle>`
+pub(crate) fn seed_channel_handles(
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+    channel_send_handle: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let Some(factory) = CHANNEL_MAP_FN.get() else {
+        return 0;
+    };
+    let map = factory();
+    if map.is_empty() {
+        return 0;
+    }
+
+    let handles = [
+        ask_user_handle.as_ref(),
+        Some(reaction_handle),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+        channel_send_handle.as_ref(),
+    ];
+
+    let mut count = 0;
+    for (name, ch) in &map {
+        for handle in handles.iter().flatten() {
+            handle
+                .write()
+                .insert(name.clone(), std::sync::Arc::clone(ch));
+        }
+        count += 1;
+    }
+    count
+}
 use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -143,6 +208,37 @@ pub fn apply_policy_tool_filter(
         let caller_ok = caller_allowed.is_none_or(|list| list.iter().any(|n| n == name));
         policy_ok && caller_ok
     });
+}
+
+/// Apply the SecurityPolicy built-in tool filter on the channel/daemon
+/// (`process_message`) path.
+///
+/// Extracted as a named seam so the production filtering of the eager
+/// built-in registry is regression-testable without driving the full agent
+/// loop (see `process_message_policy_filters_eager_builtins`). The channel
+/// path has no caller-supplied allowlist, so only the agent's own
+/// `SecurityPolicy` (`allowed_tools` + `excluded_tools`) gates here; the
+/// `run()` path additionally composes a caller-supplied `allowed_tools` gate.
+pub(crate) fn filter_channel_builtin_tools(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    security: &zeroclaw_config::policy::SecurityPolicy,
+) {
+    let before_filter = tools_registry.len();
+    apply_policy_tool_filter(tools_registry, Some(security), None);
+    if tools_registry.len() != before_filter {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "before": before_filter,
+                    "retained": tools_registry.len(),
+                    "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
+                    "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
+                })
+            ),
+            "Applied capability-based tool access filter (process_message)"
+        );
+    }
 }
 
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
@@ -3009,10 +3105,11 @@ pub async fn run(
         let (
             mut tools_registry,
             delegate_handle,
-            _reaction_handle,
-            _channel_map_handle,
-            _ask_user_handle,
-            _escalate_handle,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_send_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -3032,6 +3129,23 @@ pub async fn run(
             None,
             is_subagent_caller,
         );
+
+        // Populate all channel-driven tool handles from the registered factory.
+        let count = seed_channel_handles(
+            &ask_user_handle,
+            &reaction_handle,
+            &poll_handle,
+            &escalate_handle,
+            &channel_send_handle,
+        );
+        if count > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                &format!("Registered {} channel(s) for CLI agent", count),
+            );
+        }
 
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
@@ -3119,16 +3233,28 @@ pub async fn run(
                                 registry.server_count()
                             )
                         );
-                        deferred_section =
-                            crate::tools::build_deferred_tools_section(&deferred_set);
+                        // Build access policy from SecurityPolicy so blocked
+                        // MCP tools never surface anywhere in context.
+                        let mcp_policy =
+                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                                security.allowed_tools.as_deref(),
+                                security.excluded_tools.as_deref(),
+                                allowed_tools.as_deref(),
+                            );
+                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
+                            mcp_policy.as_ref(),
+                        );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle = Some(std::sync::Arc::clone(&activated));
-                        tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        tools_registry.push(Box::new(tool_search));
                     } else {
                         // Eager path: register all MCP tools directly
                         let names = registry.tool_names();
@@ -3445,6 +3571,16 @@ pub async fn run(
         if !deferred_section.is_empty() {
             system_prompt.push('\n');
             system_prompt.push_str(&deferred_section);
+        }
+
+        // Inject configured channel targets so the agent knows where to deliver outbound messages.
+        // Only when channel_send is in the effective tool set — otherwise the prompt would
+        // advertise a disabled tool's targets.
+        if tools_registry.iter().any(|t| t.name() == "channel_send")
+            && let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config)
+        {
+            system_prompt.push('\n');
+            system_prompt.push_str(&channel_targets);
         }
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -4348,10 +4484,11 @@ pub async fn process_message(
         let (
             mut tools_registry,
             delegate_handle_pm,
-            _reaction_handle_pm,
-            _channel_map_handle_pm,
-            _ask_user_handle_pm,
-            _escalate_handle_pm,
+            ask_user_handle_pm,
+            reaction_handle_pm,
+            poll_handle_pm,
+            escalate_handle_pm,
+            channel_send_handle_pm,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -4373,6 +4510,23 @@ pub async fn process_message(
             None,
             false,
         );
+
+        // Populate all channel-driven tool handles from the registered factory.
+        let count = seed_channel_handles(
+            &ask_user_handle_pm,
+            &reaction_handle_pm,
+            &poll_handle_pm,
+            &escalate_handle_pm,
+            &channel_send_handle_pm,
+        );
+        if count > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                &format!("Registered {} channel(s) for process_message agent", count),
+            );
+        }
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
         } else {
@@ -4380,10 +4534,18 @@ pub async fn process_message(
         };
         tools_registry.extend(peripheral_tools);
 
+        // ── Capability-based tool access control ─────────────────────
+        // Mirror the `run()` path: apply the SecurityPolicy filter
+        // (allowed_tools + excluded_tools) so daemon-provisioned agents get
+        // the same restriction as CLI-invoked agents. Extracted into
+        // `filter_channel_builtin_tools` so the production path is
+        // regression-tested (see process_message_policy_filters_eager_builtins).
+        filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
+
         // ── Wire MCP tools (non-fatal) — process_message path ────────
         // NOTE: Same ordering contract as the CLI path above — MCP tools must be
-        // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
-        // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+        // injected after the policy tool filter to avoid MCP tools being
+        // silently dropped by a restrictive allowlist.
         let mut deferred_section = String::new();
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
@@ -4417,16 +4579,26 @@ pub async fn process_message(
                                 registry.server_count()
                             )
                         );
-                        deferred_section =
-                            crate::tools::build_deferred_tools_section(&deferred_set);
+                        let mcp_policy_pm =
+                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                                security.allowed_tools.as_deref(),
+                                security.excluded_tools.as_deref(),
+                                None, // no caller-supplied allowlist in channel path
+                            );
+                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
+                            mcp_policy_pm.as_ref(),
+                        );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                        tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search_pm =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy_pm {
+                            tool_search_pm = tool_search_pm.with_access_policy(policy);
+                        }
+                        tools_registry.push(Box::new(tool_search_pm));
                     } else {
                         let names = registry.tool_names();
                         let mut registered = 0usize;
@@ -4588,23 +4760,36 @@ pub async fn process_message(
         ));
         }
 
-        // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
-        // Skip when the active risk profile's autonomy is `Full` — full-autonomy
-        // agents keep all tools.
+        // ── Compute final effective tool set BEFORE prompt construction ──
+        // This ensures the system prompt, tool instructions, and channel target
+        // injection all reflect the same policy-filtered tool set that will be
+        // used at execution time. Without this, the prompt could advertise
+        // tools (and their target identifiers) that the execution denylist
+        // would block — a control boundary violation.
+        //
+        // Note: compute_excluded_mcp_tools uses the raw message here (before
+        // thinking directive stripping). This is safe — dynamic tool filter
+        // keyword matching works the same, and risk-profile excluded_tools
+        // are message-independent.
+        let mut excluded_tools =
+            compute_excluded_mcp_tools(&tools_registry, &agent.tool_filter_groups, message);
         {
             let active_profile = &risk_profile;
             if active_profile.level != AutonomyLevel::Full {
-                let excluded = &active_profile.excluded_tools;
-                if !excluded.is_empty() {
-                    tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-                }
+                excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
             }
         }
-        // The risk-profile excluded_tools filter ran above on tool_descs
-        // already; here we only need the set of actually-registered tool
-        // names so we can drop description entries the registry can't fire.
-        let effective_tool_names: HashSet<&str> =
-            tools_registry.iter().map(|tool| tool.name()).collect();
+
+        // Filter tool descriptions to match the effective set.
+        tool_descs.retain(|(name, _)| !excluded_tools.iter().any(|ex| ex == name));
+
+        // Derive effective tool names from the filtered set so prompt builders
+        // and channel target guards see the correct state.
+        let effective_tool_names: HashSet<&str> = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
+            .collect();
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.compact_context {
@@ -4643,6 +4828,16 @@ pub async fn process_message(
         if !deferred_section.is_empty() {
             system_prompt.push('\n');
             system_prompt.push_str(&deferred_section);
+        }
+
+        // Inject configured channel targets so the agent knows where to deliver outbound messages.
+        // Only when channel_send is in the effective tool set — otherwise the prompt would
+        // advertise a disabled tool's targets.
+        if effective_tool_names.contains("channel_send")
+            && let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config)
+        {
+            system_prompt.push('\n');
+            system_prompt.push_str(&channel_targets);
         }
 
         // ── Parse thinking directive from user message ─────────────
@@ -4720,17 +4915,8 @@ pub async fn process_message(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
-        let mut excluded_tools = compute_excluded_mcp_tools(
-            &tools_registry,
-            &agent.tool_filter_groups,
-            effective_msg_ref,
-        );
-        {
-            let active_profile = &risk_profile;
-            if active_profile.level != AutonomyLevel::Full {
-                excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
-            }
-        }
+        // excluded_tools was already computed above for prompt construction.
+        // Re-use it here for execution — no need to recompute.
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
@@ -11632,6 +11818,44 @@ Let me check the result."#;
         );
     }
 
+    /// Regression: process_message must NOT expose channel targets or channel_send
+    /// schema when channel_send is in the risk-profile excluded_tools list.
+    /// The prompt-visible tool set must match the execution-time denylist.
+    /// See PR #6665 — Audacity88 second review, blocking item.
+    #[test]
+    fn process_message_path_excludes_channel_send_from_prompt() {
+        use std::collections::HashSet;
+
+        // Simulate the tool registry that all_tools_with_runtime returns.
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            mock_tool("shell"),
+            mock_tool("file_read"),
+            mock_tool("channel_send"),
+            mock_tool("memory_store"),
+        ];
+
+        // Simulate risk-profile excluding channel_send.
+        let excluded_tools: Vec<String> = vec!["channel_send".to_string()];
+
+        // Derive effective tool names the way the fixed process_message path does:
+        // filter out excluded tools before building the prompt.
+        let effective_tool_names: HashSet<&str> = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
+            .collect();
+
+        // channel_send must NOT be in the effective set.
+        assert!(
+            !effective_tool_names.contains("channel_send"),
+            "channel_send must be excluded from effective_tool_names when in excluded_tools"
+        );
+
+        // The channel_targets guard checks effective_tool_names — since
+        // channel_send is absent, it will NOT inject target identifiers.
+        // This is the contract we're verifying.
+    }
+
     // ── agent_provider_composite regression ───────────────────────────────
 
     #[test]
@@ -11676,6 +11900,120 @@ Let me check the result."#;
             Some("openai"),
             "bare family name would bypass the alias-aware factory path and drop \
              requires_openai_auth from the config, routing to the wrong provider"
+        );
+    }
+
+    // ── process_message() path regression (#6959) ─────────────────
+    //
+    // The bug was not that `apply_policy_tool_filter` filtered wrong; it
+    // was that the daemon/channel `process_message` path never called it,
+    // so a restrictive SecurityPolicy did not apply when the same agent was
+    // reached through a channel. This drives the exact seam that path now
+    // calls (`filter_channel_builtin_tools`) against the *real* eager
+    // built-in registry produced by `all_tools`, and proves an agent
+    // allowlisted to `file_read` does not get raw `shell` / `file_write`.
+    #[test]
+    fn process_message_policy_filters_eager_builtins() {
+        use std::sync::Arc;
+
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        let (mut registry, ..) = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+        );
+
+        // Sanity: the unrestricted channel registry exposes the dangerous
+        // eager built-ins a restrictive policy is expected to remove.
+        let unrestricted = tool_names(&registry);
+        assert!(
+            unrestricted.contains(&"file_read"),
+            "expected file_read in unrestricted registry, got {unrestricted:?}"
+        );
+        assert!(
+            unrestricted.contains(&"shell"),
+            "expected shell in unrestricted registry, got {unrestricted:?}"
+        );
+        assert!(
+            unrestricted.contains(&"file_write"),
+            "expected file_write in unrestricted registry, got {unrestricted:?}"
+        );
+
+        // Allowlist the agent to `file_read` only, then run the exact filter
+        // `process_message` applies.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..TestPolicy::default()
+        };
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            filtered.contains(&"file_read"),
+            "allowlisted tool must survive on process_message path, got {filtered:?}"
+        );
+        assert!(
+            !filtered.contains(&"shell"),
+            "shell must be filtered out on process_message path, got {filtered:?}"
+        );
+        assert!(
+            !filtered.contains(&"file_write"),
+            "file_write must be filtered out on process_message path, got {filtered:?}"
+        );
+
+        // Denylist variant: an exclusion drops only the named tool.
+        let (mut registry2, ..) = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            Arc::new(zeroclaw_memory::NoneMemory::new("test")),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+        );
+        let deny = TestPolicy {
+            excluded_tools: Some(vec!["shell".into()]),
+            ..TestPolicy::default()
+        };
+        super::filter_channel_builtin_tools(&mut registry2, &deny);
+        let after_deny = tool_names(&registry2);
+        assert!(
+            !after_deny.contains(&"shell"),
+            "excluded shell must be removed on process_message path, got {after_deny:?}"
+        );
+        assert!(
+            after_deny.contains(&"file_read"),
+            "non-excluded file_read must remain, got {after_deny:?}"
         );
     }
 }

@@ -18,6 +18,7 @@ use crate::browser_delegate::BrowserDelegateTool;
 use crate::browser_open::BrowserOpenTool;
 use crate::calculator::CalculatorTool;
 use crate::canvas::CanvasTool;
+use crate::channel_send::ChannelSendTool;
 use crate::claude_code::ClaudeCodeTool;
 use crate::claude_code_runner::ClaudeCodeRunnerTool;
 use crate::cloud_ops::CloudOpsTool;
@@ -76,6 +77,7 @@ use crate::web_fetch::WebFetchTool;
 use crate::web_search_tool::WebSearchTool;
 
 tool_attribution!(AskUserTool, ToolKind::Wait);
+tool_attribution!(ChannelSendTool, ToolKind::Plugin);
 tool_attribution!(BackupTool, ToolKind::Plugin);
 tool_attribution!(BrowserTool, ToolKind::Plugin);
 tool_attribution!(BrowserDelegateTool, ToolKind::Plugin);

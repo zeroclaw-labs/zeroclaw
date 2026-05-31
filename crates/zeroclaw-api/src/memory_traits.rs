@@ -428,6 +428,27 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 }
 
+/// High-level memory lifecycle policy.
+/// Implemented by strategy objects that wrap one or more `Memory` backends.
+#[async_trait]
+pub trait MemoryStrategy: Send + Sync {
+    /// Load and format relevant memory context for a conversation turn.
+    async fn load_context(&self, query: &str, session_id: Option<&str>) -> anyhow::Result<String>;
+
+    /// Consolidate a conversation turn into long-term memory.
+    async fn consolidate_turn(
+        &self,
+        user_message: &str,
+        assistant_response: &str,
+        provider: &dyn crate::model_provider::ModelProvider,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<()>;
+
+    /// Run memory governance (cleanup, archiving, background consolidation).
+    async fn run_governance(&self) -> anyhow::Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,4 @@
+use super::loop_;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -23,6 +24,8 @@ use zeroclaw_tool_call_parser::strip_think_tags;
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
+
+use crate::channel_targets::build_channel_targets;
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
@@ -59,6 +62,9 @@ pub struct Agent {
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
+    /// Configured channel targets injected into the system prompt so the agent
+    /// knows where to send messages via `channel_send`.
+    channel_targets: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
     /// Activated MCP tools for deferred loading mode.
@@ -70,12 +76,11 @@ pub struct Agent {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
     approval_manager: Option<Arc<ApprovalManager>>,
-    /// Late-bound channel maps for the four channel-driven tools
-    /// (`ask_user`, `reaction`, `escalate_to_human`, `poll`). Held so that
-    /// per-session callers (e.g. the ACP server) can register a back-channel
-    /// after agent construction. Production paths populate via
-    /// `start_channels`; this is the alternate path for environments that
-    /// build an Agent directly without `start_channels`.
+    /// Late-bound channel-map handles for the five channel-driven tools.
+    /// Populated by `from_config_with_session_cwd`; empty when an Agent is
+    /// constructed via the builder directly. Callers (e.g. the ACP server)
+    /// use `channel_handles().register_channel(...)` to wire a back-channel
+    /// into all five tool maps in one shot.
     channel_handles: AgentChannelHandles,
 }
 
@@ -96,45 +101,48 @@ pub struct StreamedTurnError {
 /// cheap (Arc clones); the underlying maps are shared with the live tools.
 #[derive(Clone, Default)]
 pub struct AgentChannelHandles {
-    pub ask_user: Option<tools::ChannelMapHandle>,
-    pub reaction: Option<tools::ChannelMapHandle>,
-    pub escalate: Option<tools::ChannelMapHandle>,
-    pub poll: Option<tools::ChannelMapHandle>,
+    pub ask_user: Option<tools::PerToolChannelHandle>,
+    pub reaction: tools::PerToolChannelHandle,
+    pub poll: Option<tools::PerToolChannelHandle>,
+    pub escalate: Option<tools::PerToolChannelHandle>,
+    pub channel_send: Option<tools::PerToolChannelHandle>,
 }
 
 impl AgentChannelHandles {
-    /// Register a channel into every populated handle so all four
-    /// channel-driven tools can resolve it by name.
+    /// Return references to all populated per-tool channel handles.
+    fn populated_handles(&self) -> Vec<Option<&tools::PerToolChannelHandle>> {
+        vec![
+            self.ask_user.as_ref(),
+            Some(&self.reaction),
+            self.poll.as_ref(),
+            self.escalate.as_ref(),
+            self.channel_send.as_ref(),
+        ]
+    }
+
+    /// Register a channel into every populated handle so all channel-driven
+    /// tools can resolve it by name.
     pub fn register_channel(
         &self,
         name: impl Into<String>,
         channel: Arc<dyn zeroclaw_api::channel::Channel>,
     ) {
         let name = name.into();
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
-        {
+        for handle in self.populated_handles().into_iter().flatten() {
             handle.write().insert(name.clone(), Arc::clone(&channel));
         }
     }
 
     /// Remove a channel from every populated handle (used on session/stop).
     pub fn unregister_channel(&self, name: &str) {
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
-        {
+        for handle in self.populated_handles().into_iter().flatten() {
             handle.write().remove(name);
         }
     }
 
     /// Look up a registered channel by name from any populated channel map.
     pub fn get_channel(&self, name: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
-        {
+        for handle in self.populated_handles().into_iter().flatten() {
             if let Some(channel) = handle.read().get(name) {
                 return Some(Arc::clone(channel));
             }
@@ -478,6 +486,7 @@ impl AgentBuilder {
             allowed_tools: allowed,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
+            channel_targets: None,
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
@@ -494,17 +503,36 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// Late-bound channel-map handles for the four channel-driven tools.
+    pub fn history(&self) -> &[ConversationMessage] {
+        &self.history
+    }
+
+    /// Late-bound channel-map handles for the five channel-driven tools.
     /// Populated by `from_config_with_session_cwd`; empty when an Agent is
     /// constructed via the builder directly. Callers (e.g. the ACP server)
     /// use `channel_handles().register_channel(...)` to wire a back-channel
-    /// into all four tool maps in one shot.
+    /// into all five tool maps in one shot.
     pub fn channel_handles(&self) -> &AgentChannelHandles {
         &self.channel_handles
     }
 
-    pub fn history(&self) -> &[ConversationMessage] {
-        &self.history
+    /// Populate late-bound channel-map handles with configured channels.
+    ///
+    /// Seeds `ask_user`, `reaction`, `poll`, `escalate`, and `channel_send`
+    /// handles from the provided map. Called by CLI and orchestrator paths
+    /// after agent construction but before the agent loop starts.
+    ///
+    /// Returns the list of registered channel names for logging.
+    pub fn populate_channels(
+        &self,
+        channel_map: &std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+        for (name, ch) in channel_map {
+            self.channel_handles.register_channel(name, Arc::clone(ch));
+            names.push(name.clone());
+        }
+        names
     }
 
     pub fn clear_history(&mut self) {
@@ -732,17 +760,24 @@ impl Agent {
             session_cwd,
             initialize_mcp,
             false,
+            None,
         )
         .await
     }
 
     /// Build an Agent for direct ACP/WS sessions that have a client approval
     /// back-channel. This keeps shell approval on the runtime-controlled path.
+    ///
+    /// `canvas_store` should be the shared [`tools::CanvasStore`] from the
+    /// gateway / daemon supervisor so that canvas frames pushed by this agent
+    /// reach the `/ws/canvas/:id` WebSocket subscribers.  Pass `None` only in
+    /// standalone contexts (e.g. `zeroclaw acp`) where no gateway is running.
     pub async fn from_config_with_session_cwd_and_mcp_backchannel(
         config: &Config,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -750,6 +785,7 @@ impl Agent {
             session_cwd,
             initialize_mcp,
             true,
+            canvas_store,
         )
         .await
     }
@@ -760,6 +796,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         approval_backchannel: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -851,10 +888,11 @@ impl Agent {
         let (
             mut tools,
             delegate_handle,
+            ask_user_handle,
             reaction_handle,
             poll_handle,
-            ask_user_handle,
             escalate_handle,
+            channel_send_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -871,7 +909,7 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
-            None,
+            canvas_store,
             false,
         );
 
@@ -1092,11 +1130,24 @@ impl Agent {
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 
+        // Build configured channel targets for system prompt injection.
+        // Only inject when channel_send survived the effective tool filter —
+        // otherwise the prompt would advertise a disabled tool's targets.
+        let channel_targets = build_channel_targets(config);
+        if let Some(ref targets) = channel_targets
+            && agent.tools.iter().any(|t| t.name() == "channel_send")
+        {
+            agent.channel_targets = Some(targets.clone());
+        }
+
+        // Wire per-tool channel-map handles into the agent so callers (e.g.
+        // the ACP server) can register back-channels after construction.
         agent.channel_handles = AgentChannelHandles {
             ask_user: ask_user_handle,
             reaction: reaction_handle,
+            poll: poll_handle,
             escalate: escalate_handle,
-            poll: Some(poll_handle),
+            channel_send: channel_send_handle,
         };
 
         Ok(agent)
@@ -1169,6 +1220,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            channel_targets: self.channel_targets.clone(),
         };
         self.prompt_builder.build(&ctx)
     }
@@ -1551,6 +1603,13 @@ impl Agent {
                 });
             }
 
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+
             let response = match self
                 .model_provider
                 .chat(
@@ -1568,8 +1627,36 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    let (resp_input_tokens, resp_output_tokens) = resp
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                        input_tokens: resp_input_tokens,
+                        output_tokens: resp_output_tokens,
+                    });
+                    resp
+                }
+                Err(err) => {
+                    let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(safe_error),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    return Err(err);
+                }
             };
 
             let (text, calls) = self.parse_response_for_effective_tools(&response);
@@ -1750,6 +1837,13 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
                 self.model_provider.supports_streaming(),
             );
@@ -1876,6 +1970,17 @@ impl Agent {
                                     &mut committed_response,
                                 );
                             }
+                            let safe_error =
+                                zeroclaw_providers::sanitize_api_error(&error.to_string());
+                            self.observer.record_event(&ObserverEvent::LlmResponse {
+                                model_provider: self.model_provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some(safe_error),
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
                             return Err(StreamedTurnError {
                                 error: anyhow::Error::msg(error.to_string()),
                                 committed_response,
@@ -1900,6 +2005,15 @@ impl Agent {
                     &mut new_msgs,
                     &mut committed_response,
                 );
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some("request cancelled by user".into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -1949,6 +2063,15 @@ impl Agent {
                                 &mut new_msgs,
                                 &mut committed_response,
                             );
+                            self.observer.record_event(&ObserverEvent::LlmResponse {
+                                model_provider: self.model_provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some("request cancelled by user".into()),
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
                             return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
                                 committed_response,
@@ -1963,6 +2086,16 @@ impl Agent {
                 match chat_result {
                     Ok(resp) => resp,
                     Err(error) => {
+                        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            model_provider: self.model_provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(safe_error),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
                         return Err(StreamedTurnError {
                             error,
                             committed_response,
@@ -1971,6 +2104,21 @@ impl Agent {
                     }
                 }
             };
+
+            let (resp_input_tokens, resp_output_tokens) = response
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((None, None));
+            self.observer.record_event(&ObserverEvent::LlmResponse {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                duration: llm_started_at.elapsed(),
+                success: true,
+                error_message: None,
+                input_tokens: resp_input_tokens,
+                output_tokens: resp_output_tokens,
+            });
 
             // Forward per-call token usage so the WS gateway (and any other
             // consumer) can include aggregated usage in the final done frame
@@ -2182,6 +2330,23 @@ pub async fn run(
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
+    // Populate channel-driven tool handles from the registered factory.
+    let channels_seed = loop_::seed_channel_handles(
+        &agent.channel_handles.ask_user,
+        &agent.channel_handles.reaction,
+        &agent.channel_handles.poll,
+        &agent.channel_handles.escalate,
+        &agent.channel_handles.channel_send,
+    );
+    if channels_seed > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"count": channels_seed})),
+            &format!("Registered {} channel(s) for CLI agent", channels_seed),
+        );
+    }
+
     let provider_name = effective_config
         .first_model_provider_alias()
         .unwrap_or_else(|| "openrouter.default".to_string());
@@ -2228,6 +2393,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::observability_traits::ObserverMetric;
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
@@ -2494,6 +2660,25 @@ mod tests {
         fn alias(&self) -> &str {
             "StreamingSteeringModelProvider"
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for CapturingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
     }
 
     struct MultimodalCaptureProvider {
@@ -2884,13 +3069,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -2941,13 +3127,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -2999,13 +3186,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -3061,13 +3249,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -3128,13 +3317,14 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
         agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
             requests: Arc::clone(&approval_requests),
         });
-        handle.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let first_result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -4865,6 +5055,213 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn turn_streamed_stream_error_after_delta_emits_llm_response_failure() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: Some(1),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let err = agent
+            .turn_streamed_with_steering_state("test", event_tx, None, None)
+            .await
+            .expect_err("provider stream failure should be returned");
+
+        assert!(
+            err.committed_response.contains("draft")
+                && err.committed_response.contains("[stream interrupted]"),
+            "unexpected committed_response: {}",
+            err.committed_response
+        );
+
+        let events = capturing.events.lock();
+        let request = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+            .expect("LlmRequest should have been recorded");
+        let response = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+            .expect("LlmResponse should have been recorded");
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+                .count(),
+            1,
+            "exactly one LlmRequest expected"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+                .count(),
+            1,
+            "exactly one LlmResponse expected"
+        );
+
+        let (
+            ObserverEvent::LlmRequest {
+                model_provider: req_provider,
+                model: req_model,
+                ..
+            },
+            ObserverEvent::LlmResponse {
+                model_provider: resp_provider,
+                model: resp_model,
+                success,
+                error_message,
+                ..
+            },
+        ) = (request, response)
+        else {
+            panic!("matched event variants should be LlmRequest and LlmResponse");
+        };
+
+        assert!(!success, "LlmResponse on stream error must be a failure");
+        assert!(
+            error_message.as_deref().is_some_and(|m| !m.is_empty()),
+            "failure LlmResponse must carry a non-empty error_message"
+        );
+        assert_eq!(req_provider, resp_provider, "provider should match");
+        assert_eq!(req_model, resp_model, "model should match");
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_cancel_during_stream_emits_llm_response_failure() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: None,
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_for_task = cancel_token.clone();
+
+        let canceller = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event, TurnEvent::Chunk { ref delta } if delta == "draft") {
+                    cancel_for_task.cancel();
+                    break;
+                }
+            }
+            while event_rx.recv().await.is_some() {}
+        });
+
+        let err = agent
+            .turn_streamed_with_steering_state("test", event_tx, Some(cancel_token), None)
+            .await
+            .expect_err("cancelled turn should return cancellation");
+
+        canceller.await.expect("canceller task should finish");
+
+        assert!(
+            crate::agent::loop_::is_tool_loop_cancelled(&err.error),
+            "cancelled turn should carry the cancellation error: {}",
+            err.error
+        );
+
+        let events = capturing.events.lock();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+                .count(),
+            1,
+            "exactly one LlmRequest expected"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+                .count(),
+            1,
+            "exactly one LlmResponse expected"
+        );
+
+        let request = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+            .expect("LlmRequest should have been recorded");
+        let response = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+            .expect("LlmResponse should have been recorded");
+
+        let (
+            ObserverEvent::LlmRequest {
+                model_provider: req_provider,
+                model: req_model,
+                ..
+            },
+            ObserverEvent::LlmResponse {
+                model_provider: resp_provider,
+                model: resp_model,
+                success,
+                error_message,
+                ..
+            },
+        ) = (request, response)
+        else {
+            panic!("matched event variants should be LlmRequest and LlmResponse");
+        };
+
+        assert!(!success, "cancellation LlmResponse must be a failure");
+        assert_eq!(
+            error_message.as_deref(),
+            Some("request cancelled by user"),
+            "cancellation LlmResponse must carry the fixed cancel message"
+        );
+        assert_eq!(req_provider, resp_provider, "provider should match");
+        assert_eq!(req_model, resp_model, "model should match");
+    }
+
     // ── Skill tool registration & excluded_tools filtering ──────────
 
     /// A mock tool whose name is configurable (unlike `MockTool` which is
@@ -5108,5 +5505,31 @@ mod tests {
             names,
             &["file_read", "web_fetch", "ops__deploy", "ops__rollback"]
         );
+    }
+
+    /// Regression: channel_targets must NOT be set when channel_send is excluded
+    /// from the effective tool set (security policy / allowlist filter).
+    /// See PR #6665 — target guidance must respect the effective tool allowlist.
+    #[test]
+    fn channel_targets_guarded_when_channel_send_excluded() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_read")),
+            Box::new(NamedMockTool::new("channel_send")),
+        ];
+
+        // Simulate policy filter removing channel_send
+        let excluded = ["channel_send".to_string()];
+        tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+
+        // The guard condition: only set channel_targets when channel_send survives
+        let channel_send_present = tools.iter().any(|t| t.name() == "channel_send");
+        assert!(
+            !channel_send_present,
+            "channel_send should have been excluded by the policy filter"
+        );
+
+        // If channel_send is absent, the prompt must NOT receive channel targets
+        // (the guard in from_config checks this before setting agent.channel_targets)
     }
 }

@@ -1493,6 +1493,7 @@ impl DelegateTool {
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            channel_targets: None,
         };
 
         let builder = SystemPromptBuilder::default()

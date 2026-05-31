@@ -7,9 +7,7 @@
 
 use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -28,17 +26,16 @@ pub struct EscalateToHumanTool {
 }
 
 impl EscalateToHumanTool {
-    pub fn new(security: Arc<SecurityPolicy>, alert_channels: Vec<String>) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        alert_channels: Vec<String>,
+        channel_map: ChannelMapHandle,
+    ) -> Self {
         Self {
             security,
-            channel_map: Arc::new(RwLock::new(HashMap::new())),
+            channel_map,
             alert_channels,
         }
-    }
-
-    /// Return the shared handle so callers can populate it after channel init.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channel_map)
     }
 
     /// Format the escalation message with urgency prefix.
@@ -324,6 +321,8 @@ impl Tool for EscalateToHumanTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
 
     /// A stub channel that records sent messages but never produces incoming messages.
     struct SilentChannel {
@@ -434,7 +433,11 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -447,7 +450,11 @@ mod tests {
 
     #[test]
     fn test_tool_metadata() {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -457,7 +464,11 @@ mod tests {
 
     #[test]
     fn test_parameters_schema() {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());

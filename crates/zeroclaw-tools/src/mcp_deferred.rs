@@ -232,6 +232,13 @@ impl Default for ActivatedToolSet {
 /// consuming context window on full schemas. Includes an instruction
 /// block that tells the LLM to call `tool_search` to activate them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
+    build_deferred_tools_section_filtered(deferred, None)
+}
+
+pub fn build_deferred_tools_section_filtered(
+    deferred: &DeferredMcpToolSet,
+    policy: Option<&crate::tool_search::ToolAccessPolicy>,
+) -> String {
     if deferred.is_empty() {
         return String::new();
     }
@@ -245,13 +252,23 @@ pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
          become callable for the rest of the conversation.\n\n",
     );
     out.push_str("<available-deferred-tools>\n");
+    let mut count = 0;
     for stub in &deferred.stubs {
+        if let Some(p) = policy
+            && !p.is_tool_allowed(&stub.prefixed_name)
+        {
+            continue;
+        }
         out.push_str(&stub.prefixed_name);
         out.push_str(" - ");
         out.push_str(&stub.description);
         out.push('\n');
+        count += 1;
     }
     out.push_str("</available-deferred-tools>\n");
+    if count == 0 {
+        return String::new();
+    }
     out
 }
 

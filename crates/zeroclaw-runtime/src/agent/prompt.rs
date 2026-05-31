@@ -36,6 +36,9 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// Pre-rendered channel target section injected so the agent knows
+    /// where to deliver outbound messages via `channel_send`.
+    pub channel_targets: Option<String>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -61,6 +64,7 @@ impl SystemPromptBuilder {
                 Box::new(WorkspaceSection),
                 Box::new(RuntimeSection),
                 Box::new(ChannelMediaSection),
+                Box::new(ChannelTargetsSection),
             ],
         }
     }
@@ -93,6 +97,10 @@ pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
+
+/// Injects configured channel targets into the system prompt so the agent
+/// knows where to deliver outbound messages via `channel_send`.
+pub struct ChannelTargetsSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -309,6 +317,20 @@ impl PromptSection for ChannelMediaSection {
     }
 }
 
+impl PromptSection for ChannelTargetsSection {
+    fn name(&self) -> &str {
+        "channel_targets"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(ctx
+            .channel_targets
+            .as_deref()
+            .unwrap_or_default()
+            .to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +398,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let section = IdentitySection;
@@ -409,6 +432,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -432,6 +456,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -455,6 +480,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -501,6 +527,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -545,6 +572,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -575,6 +603,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -618,6 +647,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -654,6 +684,7 @@ mod tests {
 
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -691,6 +722,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -720,6 +752,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -757,6 +790,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();

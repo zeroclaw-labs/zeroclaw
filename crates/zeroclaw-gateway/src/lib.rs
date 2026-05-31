@@ -635,10 +635,11 @@ pub async fn run_gateway(
             let (
                 tools_registry_raw,
                 delegate_handle_gw,
-                _reaction_handle_gw,
-                _channel_map_handle,
-                _ask_user_handle_gw,
-                _escalate_handle_gw,
+                ask_user_handle_gw,
+                reaction_handle_gw,
+                poll_handle_gw,
+                escalate_handle_gw,
+                channel_send_handle_gw,
             ) = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
@@ -660,6 +661,31 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
             );
+            // Wire channel-driven tool handles so the dashboard agent can
+            // deliver messages to configured channels (same pattern as
+            // orchestrator::start_channels).
+            // reaction_handle_gw is PerToolChannelHandle (not Option);
+            // register_channels_for_tools expects &Option for all handles.
+            let reaction_handle_gw_opt = Some(reaction_handle_gw);
+            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
+                &config,
+                &ask_user_handle_gw,
+                &reaction_handle_gw_opt,
+                &poll_handle_gw,
+                &escalate_handle_gw,
+                &channel_send_handle_gw,
+            );
+            if !channel_names.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                    &format!(
+                        "Registered {} channel(s) for dashboard agent",
+                        channel_names.len()
+                    ),
+                );
+            }
             (tools_registry_raw, delegate_handle_gw)
         }
         (Some(_), None) => {

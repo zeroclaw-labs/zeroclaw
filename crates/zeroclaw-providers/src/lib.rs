@@ -593,6 +593,9 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
 #[derive(Debug, Clone)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
+    /// Explicit provider implementation from `[providers.models.<family>.<alias>].kind`.
+    /// When unset, provider resolution falls back to the configured family.
+    pub provider_kind: Option<String>,
     pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
@@ -634,6 +637,7 @@ impl Default for ModelProviderRuntimeOptions {
     fn default() -> Self {
         Self {
             auth_profile_override: None,
+            provider_kind: None,
             provider_api_url: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
@@ -693,6 +697,13 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
 
     ModelProviderRuntimeOptions {
         auth_profile_override: None,
+        provider_kind: entry.and_then(|e| {
+            e.kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        }),
         provider_api_url: entry.and_then(|e| e.uri.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
@@ -775,7 +786,8 @@ pub fn provider_runtime_options_for_alias(
 
 /// Options to use when building a provider from a name that may be either
 /// a bare family or a dotted alias. Dotted names yield alias-resolved
-/// options; bare names return `fallback` unchanged.
+/// options; bare names inherit only provider-agnostic settings from
+/// `fallback`.
 pub fn options_for_provider_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -783,7 +795,12 @@ pub fn options_for_provider_ref(
 ) -> ModelProviderRuntimeOptions {
     match name.split_once('.') {
         Some((family, alias)) => provider_runtime_options_for_alias(config, family, alias),
-        None => fallback.clone(),
+        None => {
+            let mut options = fallback.clone();
+            options.provider_kind = None;
+            options.provider_api_url = None;
+            options
+        }
     }
 }
 
@@ -1185,12 +1202,19 @@ fn create_model_provider_inner(
     let legacy_kimi_code = is_legacy_kimi_code_alias(split_name);
     let api_url = api_url.or(split_url);
     let name = canonicalize_v2_model_provider_name(split_name);
+    let provider_kind = options
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(canonicalize_v2_model_provider_name)
+        .unwrap_or(name);
 
     // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
     // V3 dispatches via `requires_openai_auth = true` on the typed alias, but
     // factory callers that pass the legacy spelling expect a working
     // construction here.
-    if matches!(name, "openai-codex" | "openai_codex" | "codex") {
+    if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
         return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
             alias, options, api_key,
         )?));
@@ -1200,23 +1224,24 @@ fn create_model_provider_inner(
     // is not linked to the original sensitive-named source. Qwen OAuth
     // alias detection moved into `QwenModelProviderConfig::create_provider`
     // — the per-family impl owns its own credential-resolution logic.
-    let resolved_credential = resolve_model_provider_credential(name, api_key)
+    let resolved_credential = resolve_model_provider_credential(provider_kind, api_key)
         .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
 
     // Pre-flight: catch obvious API-key / model_provider mismatches early.
     if let Some(key_value) = key {
-        let is_custom = name.starts_with("custom:") || name.starts_with("anthropic-custom:");
+        let is_custom =
+            provider_kind.starts_with("custom:") || provider_kind.starts_with("anthropic-custom:");
         let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
         if !is_custom
             && !has_custom_url
-            && let Some(likely_model_provider) = check_api_key_prefix(name, key_value)
+            && let Some(likely_model_provider) = check_api_key_prefix(provider_kind, key_value)
         {
             let visible = &key_value[..key_value.len().min(8)];
             anyhow::bail!(
                 "API key prefix mismatch: key \"{visible}...\" looks like a \
-                     {likely_model_provider} key, but model_provider \"{name}\" is selected. \
+                     {likely_model_provider} key, but model_provider \"{provider_kind}\" is selected. \
                      Set the correct provider-specific env var or use `-p {likely_model_provider}`."
             );
         }
@@ -1261,7 +1286,7 @@ fn create_model_provider_inner(
         ));
     }
 
-    factory::dispatch_family_factory(config, name, alias, key, resolved_url, options)
+    factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
 }
 
 /// Wrap the primary model_provider in a retry/backoff harness, threading auth runtime options.
@@ -2447,6 +2472,120 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active model_provider entry to runtime options"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_provider_kind() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("http://primary.example/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
+        assert_eq!(
+            options.provider_api_url.as_deref(),
+            Some("http://primary.example/v1")
+        );
+    }
+
+    #[test]
+    fn route_provider_options_clear_primary_only_state_for_bare_routes() {
+        let inherited = ModelProviderRuntimeOptions {
+            provider_kind: Some("openai-compatible".to_string()),
+            provider_api_url: Some("http://primary.example/v1".to_string()),
+            ..Default::default()
+        };
+        let config = zeroclaw_config::schema::Config::default();
+
+        let route_options = options_for_provider_ref(&config, "openrouter", &inherited);
+
+        assert_eq!(route_options.provider_kind, None);
+        assert_eq!(route_options.provider_api_url, None);
+    }
+
+    #[test]
+    fn routed_bare_provider_does_not_inherit_primary_endpoint() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("http://primary.example/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        assert_eq!(
+            options.provider_api_url.as_deref(),
+            Some("http://primary.example/v1")
+        );
+
+        let route_options = options_for_provider_ref(&config, "openrouter", &options);
+
+        assert_eq!(route_options.provider_kind, None);
+        assert_eq!(route_options.provider_api_url, None);
+    }
+
+    #[test]
+    fn routed_primary_alias_kind_does_not_leak_to_canonical_route_provider() {
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+            OpenRouterModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("http://primary.example/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openrouter.insert(
+            "route".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig::default(),
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
+
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "openai.primary",
+            Some("sk-test"),
+            None,
+            &config.reliability,
+            &[ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "openrouter.route".to_string(),
+                model: "openrouter/auto".to_string(),
+                api_key: None,
+            }],
+            "gpt-test",
+            &options,
+        )
+        .expect("primary alias kind should build without poisoning route provider kind");
+
+        assert!(
+            provider.supports_vision(),
+            "primary openai-compatible provider should remain the router default"
         );
     }
 
