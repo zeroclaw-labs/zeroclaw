@@ -138,6 +138,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
          - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
     );
 
+    // ── 0c. Runtime identity ────────────────────────────────────
+    let _ = writeln!(
+        prompt,
+        "You are DaemonClaw v{}.\n",
+        env!("CARGO_PKG_VERSION")
+    );
+
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
