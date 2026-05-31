@@ -1650,10 +1650,20 @@ pub async fn run_tool_call_loop(
         // ── Truncated response continuation ─────────────────────────
         // If response has no tool calls and appears truncated (long text
         // ending mid-sentence), inject a continuation prompt and retry.
+        // Guard: skip if the response is a repetition of already-accumulated
+        // text (model echoed its prior output after a tool-call iteration).
+        let trimmed_response = response_text.trim();
+        let trimmed_accumulated = accumulated_display_text.trim();
+        let is_repetition_of_accumulated = !trimmed_accumulated.is_empty()
+            && trimmed_response.len() >= 200
+            && (trimmed_accumulated.contains(trimmed_response)
+                || trimmed_response.starts_with(trimmed_accumulated));
         if tool_calls.is_empty()
             && consecutive_retries < 3
             && response_text.len() > 500
-            && !response_text.trim_end().ends_with(|c: char| ".!?」】\n".contains(c))
+            && !response_text.trim_end().ends_with(|c: char| ".!?\u{3002}\u{300d}\u{3011}\n".contains(c))
+            && !response_text.trim_end().ends_with(|c: char| c.is_ascii_punctuation())
+            && !is_repetition_of_accumulated
         {
             tracing::info!(
                 response_len = response_text.len(),
@@ -1684,12 +1694,22 @@ pub async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            accumulated_display_text.push_str(&display_text);
+            // Skip accumulation if the model repeated text already in the buffer.
+            if !is_repetition_of_accumulated {
+                accumulated_display_text.push_str(&display_text);
+            } else {
+                tracing::info!(
+                    iteration = iteration + 1,
+                    "Suppressed repeated response text already present in accumulated output"
+                );
+            }
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
             // When streamed live, the channel already received the deltas.
+            // Skip forwarding if this is a repetition (already delivered).
             if let Some(ref tx) = on_delta
                 && !response_streamed_live
+                && !is_repetition_of_accumulated
             {
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
@@ -1714,7 +1734,12 @@ pub async fn run_tool_call_loop(
                 }
             }
 
-            history.push(ChatMessage::assistant(response_text.clone()));
+            // Skip history push when the response is a verbatim echo of what's
+            // already in history from a prior iteration (prevents model seeing its
+            // own text doubled in context, which amplifies repetition).
+            if !is_repetition_of_accumulated {
+                history.push(ChatMessage::assistant(response_text.clone()));
+            }
 
             // Fire post-turn hooks (skill autogen, dialectic, skill patcher)
             if let Some(hooks) = hooks {

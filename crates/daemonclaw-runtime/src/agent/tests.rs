@@ -1928,4 +1928,100 @@ mod spine_contract {
             );
         }
     }
+
+    // ── Model-echo deduplication: response repeated after tool-call iteration ──
+    //
+    // Reproduces the live v0.7.8 bug: iteration 1 returns text + tool call,
+    // iteration 2 echoes the same text (model repetition) with no tool calls.
+    // Without the fix, the truncation detector fires (text ends with emoji,
+    // not in the punctuation set) and accumulated_display_text doubles.
+    // With the fix, the repetition is detected and suppressed.
+    #[tokio::test]
+    async fn model_echo_after_tool_call_does_not_duplicate_output() {
+        // Response must be >500 chars (truncation check floor) and >200 chars
+        // (repetition guard floor) to exercise the bug path.
+        let response_text = "Here is my full analysis of the upgrade. \
+            The history management overhaul is a big deal — that graduated \
+            trimming with collapsible summaries fixes the exact brittle behavior \
+            we identified in the analysis. No more all-or-nothing context management. \
+            The multi-tool pipelining is smart too. The old behavior of waiting for \
+            the full model response before executing any tools was dead time. \
+            Provider selection works. Loop detection replaces fixed caps. \
+            Content tagging for external results is solid defense-in-depth. \
+            Ready to test whenever you are \u{1F980}";
+
+        let provider = ScriptedProvider::new(vec![
+            // Iteration 1: text + tool call
+            ChatResponse {
+                text: Some(response_text.into()),
+                tool_calls: vec![daemonclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"message": "stored"}"#.into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            // Iteration 2: model echoes the exact same text, no tool calls
+            ChatResponse {
+                text: Some(response_text.into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+
+        let observer = NoopObserver {};
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(EchoTool) as Box<dyn Tool>,
+        ]);
+        let multimodal = default_multimodal();
+
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("tell me about the upgrade"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, None,
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // The response text should appear exactly once, not doubled.
+        let occurrences = result.matches("Provider selection works").count();
+        assert_eq!(
+            occurrences, 1,
+            "Response text should appear exactly once, got {occurrences}. \
+             Full result ({} chars): {result}",
+            result.len()
+        );
+
+        // The text should still be present (not suppressed entirely).
+        assert!(
+            result.contains("Ready to test"),
+            "Response should contain the original text"
+        );
+
+        // History surface: the echoed text should NOT appear in history twice.
+        // Iteration 1 pushes an assistant message (text + tool call) at line 2402.
+        // Iteration 2's echo should be suppressed from history by the repetition guard.
+        let assistant_messages: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        let history_occurrences = assistant_messages
+            .iter()
+            .filter(|m| m.content.contains("Provider selection works"))
+            .count();
+        assert_eq!(
+            history_occurrences, 1,
+            "Echoed text should appear in history exactly once (from iteration 1), \
+             got {history_occurrences}. Assistant messages: {:?}",
+            assistant_messages.iter().map(|m| m.content.len()).collect::<Vec<_>>()
+        );
+    }
 }
