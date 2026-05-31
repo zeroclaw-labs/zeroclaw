@@ -30,6 +30,11 @@ pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
     /// Synthesize `text` using the given `voice`, returning raw audio bytes.
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
 
+    /// The audio container/codec of the bytes returned by `synthesize`
+    /// (e.g. `"opus"`, `"wav"`, `"mp3"`). Used by `TtsManager::synthesize_opus`
+    /// to decide whether transcoding is necessary — only `"opus"` skips it.
+    fn output_format(&self) -> &str;
+
     /// Voices supported by this model_provider.
     fn supported_voices(&self) -> Vec<String>;
 
@@ -103,6 +108,10 @@ impl OpenAiTtsProvider {
 impl TtsProvider for OpenAiTtsProvider {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn output_format(&self) -> &str {
+        &self.response_format
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
@@ -205,6 +214,9 @@ impl ElevenLabsTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for ElevenLabsTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
     fn name(&self) -> &str {
         "elevenlabs"
     }
@@ -312,6 +324,10 @@ impl GoogleTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for GoogleTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
+
     fn name(&self) -> &str {
         "google"
     }
@@ -426,6 +442,10 @@ impl EdgeTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for EdgeTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
+
     fn name(&self) -> &str {
         "edge"
     }
@@ -518,6 +538,10 @@ impl PiperTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for PiperTtsProvider {
+    fn output_format(&self) -> &str {
+        "wav"
+    }
+
     fn name(&self) -> &str {
         "piper"
     }
@@ -570,6 +594,69 @@ impl TtsProvider for PiperTtsProvider {
 }
 
 // ── TtsManager ───────────────────────────────────────────────────
+
+/// Transcode raw audio bytes to OGG/Opus via an `ffmpeg` subprocess.
+///
+/// Pipes `audio` into ffmpeg's stdin and reads OGG/Opus from stdout.
+/// stdin and stdout are driven concurrently to avoid buffer-deadlocks on
+/// large inputs. Requires `ffmpeg` with `libopus` support installed.
+async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "ogg",
+            "-acodec",
+            "libopus",
+            "-b:a",
+            "32k",
+            "-vbr",
+            "on",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context(
+            "failed to spawn ffmpeg — ensure ffmpeg with libopus support is installed \
+             (e.g. `sudo dnf install ffmpeg` / `sudo apt install ffmpeg`)",
+        )?;
+
+    let mut stdin = child.stdin.take().expect("stdin configured above");
+
+    // Drive stdin and wait concurrently: if ffmpeg fills its stdout pipe
+    // before we finish writing stdin, sequential operation would deadlock.
+    let (write_result, output) = tokio::join!(
+        async move {
+            stdin.write_all(&audio).await?;
+            stdin.shutdown().await
+        },
+        child.wait_with_output()
+    );
+
+    write_result.context("failed to write audio to ffmpeg stdin")?;
+    let output = output.context("ffmpeg process error")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ffmpeg transcode to opus failed: {stderr}");
+    }
+
+    anyhow::ensure!(
+        !output.stdout.is_empty(),
+        "ffmpeg produced empty output — check that libopus is available"
+    );
+
+    Ok(output.stdout)
+}
 
 /// Central manager for per-agent TTS synthesis.
 ///
@@ -667,6 +754,25 @@ impl TtsManager {
             default_voice: config.tts.default_voice.clone(),
             max_text_length,
         })
+    }
+
+    /// Synthesize `text` and return OGG/Opus audio suitable for Telegram
+    /// `sendVoice` and WhatsApp PTT voice notes. If the active provider
+    /// already outputs Opus (e.g. OpenAI with `response_format = "opus"`),
+    /// the bytes pass through unchanged; otherwise they are transcoded via an
+    /// `ffmpeg` subprocess. Requires `ffmpeg` with `libopus` support installed.
+    pub async fn synthesize_opus(&self, text: &str) -> Result<Vec<u8>> {
+        let audio = self.synthesize(text).await?;
+        let provider_alias = self.agent_tts_provider.as_str();
+        let format = self
+            .tts_providers
+            .get(provider_alias)
+            .map(|p| p.output_format())
+            .unwrap_or("unknown");
+        if format == "opus" {
+            return Ok(audio);
+        }
+        transcode_to_opus(audio).await
     }
 
     /// Synthesize text using the runtime-active agent's resolved

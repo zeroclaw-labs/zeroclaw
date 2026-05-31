@@ -997,7 +997,7 @@ impl TelegramChannel {
         text: &str,
         tts_manager: &crate::tts::TtsManager,
     ) -> anyhow::Result<()> {
-        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
         ::zeroclaw_log::record!(
             INFO,
@@ -1019,7 +1019,7 @@ impl TelegramChannel {
                 "voice",
                 reqwest::multipart::Part::bytes(audio_bytes)
                     .file_name("voice.ogg")
-                    .mime_str("audio/ogg")?,
+                    .mime_str("audio/ogg; codecs=opus")?,
             );
 
         if let Some(tid) = thread_id {

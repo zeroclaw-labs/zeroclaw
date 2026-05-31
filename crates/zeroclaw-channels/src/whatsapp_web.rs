@@ -614,7 +614,7 @@ impl WhatsAppWebChannel {
         text: &str,
         tts_manager: &super::tts::TtsManager,
     ) -> Result<()> {
-        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
         ::zeroclaw_log::record!(
             INFO,
@@ -652,7 +652,7 @@ impl WhatsAppWebChannel {
             )
         );
 
-        // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
+        // Estimate duration from file size: Opus at ~32 kbps → bytes / 4000 ≈ seconds
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
