@@ -41,3 +41,6 @@ default = []
 hardware = ["dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
 peripheral-rpi = ["rppal"]
 probe = ["dep:probe-rs"]
+# Extends the serial peripheral allow-list with `/tmp/zc-sim-*` for hardware-free
+# local testing (paired with the `esp32_sim` example). Off by default; opt-in.
+dev-sim = []

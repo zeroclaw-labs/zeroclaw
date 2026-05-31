@@ -328,6 +328,10 @@ observability-prometheus = [
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
+# Forwards `zeroclaw-hardware/dev-sim`: extends the serial allow-list with
+# `/tmp/zc-sim-*` for hardware-free simulation. Off by default; opt-in for the
+# simulator and demo.
+dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
