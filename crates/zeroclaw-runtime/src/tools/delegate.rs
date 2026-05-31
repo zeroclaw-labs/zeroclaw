@@ -1674,6 +1674,7 @@ impl DelegateTool {
                 None,
                 &zeroclaw_config::schema::PacingConfig::default(),
                 agent_config.resolved.strict_tool_parsing,
+                agent_config.resolved.parallel_tools,
                 0,    // max_tool_result_chars: inherit from parent config in future
                 0,    // context_token_budget: 0 = disabled for subagents
                 None, // shared_budget: TODO thread from parent in future

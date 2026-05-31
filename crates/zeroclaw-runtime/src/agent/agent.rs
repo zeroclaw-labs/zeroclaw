@@ -2639,26 +2639,27 @@ impl Agent {
             new_msgs.push(tool_call_msg.clone());
             self.history.push(tool_call_msg);
 
-            // Notify about each tool call
-            for call in &calls {
-                let call_id = call.tool_call_id.as_ref().unwrap().clone();
-                Self::send_turn_event(
-                    &event_tx,
-                    cancel_token.as_ref(),
-                    TurnEvent::ToolCall {
-                        id: call_id,
-                        name: call.name.clone(),
-                        args: call.arguments.clone(),
-                    },
-                )
-                .await;
-            }
+            // When parallel execution is disabled, the turn must look and behave
+            // serially end to end: emit a tool-call start event, run that one
+            // call, emit its result, then move to the next. Emitting every
+            // start event up front and only then executing makes a multi-call
+            // turn appear as a simultaneous batch in the front end and floods
+            // the ACP/RPC channel — large batches have overrun the IPC and
+            // crashed the TUI. Parallel mode keeps the batched dispatch so
+            // concurrent execution can overlap.
+            let serial_dispatch =
+                !self.config.resolved.parallel_tools || self.approval_manager.is_some();
 
-            let results = if let Some(ref token) = cancel_token {
-                tokio::select! {
-                    biased;
-                    () = token.cancelled() => {
-                        self.synthesize_cancelled_tool_results(&response.tool_calls, &mut new_msgs);
+            let results = if serial_dispatch {
+                let mut serial_results: Vec<ToolExecutionResult> = Vec::with_capacity(calls.len());
+                for (idx, call) in calls.iter().enumerate() {
+                    if let Some(ref token) = cancel_token
+                        && token.is_cancelled()
+                    {
+                        self.synthesize_cancelled_tool_results(
+                            &response.tool_calls,
+                            &mut new_msgs,
+                        );
                         self.append_streamed_assistant_message_to_history(
                             "[interrupted by user]".to_string(),
                             &mut new_msgs,
@@ -2670,26 +2671,116 @@ impl Agent {
                             new_messages: new_msgs,
                         });
                     }
-                    results = self.execute_tools(&calls) => results,
-                }
-            } else {
-                self.execute_tools(&calls).await
-            };
 
-            // Notify about each tool result
-            for result in &results {
-                let result_id = result.tool_call_id.as_ref().unwrap().clone();
-                Self::send_turn_event(
-                    &event_tx,
-                    cancel_token.as_ref(),
-                    TurnEvent::ToolResult {
-                        id: result_id,
-                        name: result.name.clone(),
-                        output: result.output.clone(),
-                    },
-                )
-                .await;
-            }
+                    let call_id = call.tool_call_id.as_ref().unwrap().clone();
+                    Self::send_turn_event(
+                        &event_tx,
+                        cancel_token.as_ref(),
+                        TurnEvent::ToolCall {
+                            id: call_id,
+                            name: call.name.clone(),
+                            args: call.arguments.clone(),
+                        },
+                    )
+                    .await;
+
+                    let single = std::slice::from_ref(call);
+                    let result = if let Some(ref token) = cancel_token {
+                        tokio::select! {
+                            biased;
+                            () = token.cancelled() => {
+                                self.synthesize_cancelled_tool_results(
+                                    &response.tool_calls[idx..],
+                                    &mut new_msgs,
+                                );
+                                self.append_streamed_assistant_message_to_history(
+                                    "[interrupted by user]".to_string(),
+                                    &mut new_msgs,
+                                    &mut committed_response,
+                                );
+                                return Err(StreamedTurnError {
+                                    error: crate::agent::loop_::ToolLoopCancelled.into(),
+                                    committed_response,
+                                    new_messages: new_msgs,
+                                });
+                            }
+                            mut r = self.execute_tools(single) => r.pop().expect("one call yields one result"),
+                        }
+                    } else {
+                        self.execute_tools(single)
+                            .await
+                            .pop()
+                            .expect("one call yields one result")
+                    };
+
+                    let result_id = result.tool_call_id.as_ref().unwrap().clone();
+                    Self::send_turn_event(
+                        &event_tx,
+                        cancel_token.as_ref(),
+                        TurnEvent::ToolResult {
+                            id: result_id,
+                            name: result.name.clone(),
+                            output: result.output.clone(),
+                        },
+                    )
+                    .await;
+
+                    serial_results.push(result);
+                }
+                serial_results
+            } else {
+                for call in &calls {
+                    let call_id = call.tool_call_id.as_ref().unwrap().clone();
+                    Self::send_turn_event(
+                        &event_tx,
+                        cancel_token.as_ref(),
+                        TurnEvent::ToolCall {
+                            id: call_id,
+                            name: call.name.clone(),
+                            args: call.arguments.clone(),
+                        },
+                    )
+                    .await;
+                }
+
+                let results = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            self.synthesize_cancelled_tool_results(&response.tool_calls, &mut new_msgs);
+                            self.append_streamed_assistant_message_to_history(
+                                "[interrupted by user]".to_string(),
+                                &mut new_msgs,
+                                &mut committed_response,
+                            );
+                            return Err(StreamedTurnError {
+                                error: crate::agent::loop_::ToolLoopCancelled.into(),
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
+                        results = self.execute_tools(&calls) => results,
+                    }
+                } else {
+                    self.execute_tools(&calls).await
+                };
+
+                for result in &results {
+                    let result_id = result.tool_call_id.as_ref().unwrap().clone();
+                    Self::send_turn_event(
+                        &event_tx,
+                        cancel_token.as_ref(),
+                        TurnEvent::ToolResult {
+                            id: result_id,
+                            name: result.name.clone(),
+                            output: result.output.clone(),
+                        },
+                    )
+                    .await;
+                }
+
+                results
+            };
 
             let formatted = self.tool_dispatcher.format_results(&results);
             new_msgs.push(formatted.clone());
@@ -4553,6 +4644,177 @@ mod tests {
             call_id
         );
     }
+
+    /// Provider that emits TWO native tool calls in a single assistant turn,
+    /// then finishes. Used to verify serial dispatch ordering.
+    struct TwoToolCallStreamModelProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for TwoToolCallStreamModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                        zeroclaw_providers::ToolCall {
+                            id: "00000000-0000-0000-0000-000000000001".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                        zeroclaw_providers::ToolCall {
+                            id: "00000000-0000-0000-0000-000000000002".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "stream-done".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for TwoToolCallStreamModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TwoToolCallStreamModelProvider"
+        }
+    }
+
+    /// With parallel_tools disabled (the default) and no approval manager, a
+    /// turn carrying multiple tool calls must dispatch them strictly serially:
+    /// each ToolCall start event is immediately followed by its own ToolResult
+    /// before the next call's start event. The pre-fix code emitted all start
+    /// events up front, then all results — which floods the front-end IPC on a
+    /// large multi-call turn. Order is the contract this test pins.
+    #[tokio::test]
+    async fn turn_streamed_dispatches_multiple_tools_serially_when_parallel_disabled() {
+        let model_provider = Box::new(TwoToolCallStreamModelProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Default resolved config has parallel_tools = false; this is the
+        // serial path under test.
+        assert!(
+            !agent.config.resolved.parallel_tools,
+            "test precondition: parallel_tools must be disabled"
+        );
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (response, _) = agent
+            .turn_streamed("use echo twice", event_tx, None)
+            .await
+            .unwrap();
+        assert_eq!(response, "stream-done");
+
+        // Reduce events to the call/result sequence, tagged by id.
+        let mut seq: Vec<(&'static str, String)> = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                TurnEvent::ToolCall { id, .. } => seq.push(("call", id)),
+                TurnEvent::ToolResult { id, .. } => seq.push(("result", id)),
+                _ => {}
+            }
+        }
+
+        let id1 = "00000000-0000-0000-0000-000000000001";
+        let id2 = "00000000-0000-0000-0000-000000000002";
+        assert_eq!(
+            seq,
+            vec![
+                ("call", id1.to_string()),
+                ("result", id1.to_string()),
+                ("call", id2.to_string()),
+                ("result", id2.to_string()),
+            ],
+            "serial dispatch must interleave call->result per tool, not batch all \
+             starts then all results; got {seq:?}"
+        );
+    }
+
 
     struct PreExecutedToolModelProvider;
 

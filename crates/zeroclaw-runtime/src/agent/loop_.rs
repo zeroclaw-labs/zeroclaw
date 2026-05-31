@@ -1164,6 +1164,7 @@ pub async fn agent_turn(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     strict_tool_parsing: bool,
+    parallel_tools: bool,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -1189,6 +1190,7 @@ pub async fn agent_turn(
         model_switch_callback,
         &zeroclaw_config::schema::PacingConfig::default(),
         strict_tool_parsing,
+        parallel_tools,
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
@@ -1332,6 +1334,7 @@ pub async fn run_tool_call_loop(
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
     strict_tool_parsing: bool,
+    parallel_tools: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -2182,7 +2185,8 @@ pub async fn run_tool_call_loop(
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
-        let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
+        let allow_parallel_execution =
+            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
 
@@ -3790,6 +3794,7 @@ pub async fn run(
                                 Some(model_switch_callback.clone()),
                                 &config.pacing,
                                 agent.resolved.strict_tool_parsing,
+                                agent.resolved.parallel_tools,
                                 agent.resolved.max_tool_result_chars,
                                 agent.resolved.max_context_tokens,
                                 None, // shared_budget
@@ -4194,6 +4199,7 @@ pub async fn run(
                                     Some(model_switch_callback.clone()),
                                     &config.pacing,
                                     agent.resolved.strict_tool_parsing,
+                                    agent.resolved.parallel_tools,
                                     agent.resolved.max_tool_result_chars,
                                     agent.resolved.max_context_tokens,
                                     None, // shared_budget
@@ -4948,6 +4954,7 @@ pub async fn process_message(
                     activated_handle_pm.as_ref(),
                     None,
                     agent.resolved.strict_tool_parsing,
+                    agent.resolved.parallel_tools,
                     None, // channel: process_message path has no channel ref
                 ),
             )
@@ -6345,6 +6352,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6402,6 +6410,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6463,6 +6472,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6515,6 +6525,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6574,6 +6585,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6634,6 +6646,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6694,6 +6707,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6753,6 +6767,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6811,6 +6826,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6953,6 +6969,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7034,6 +7051,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7107,6 +7125,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7175,6 +7194,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7256,6 +7276,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7327,6 +7348,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7418,6 +7440,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7483,6 +7506,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7552,6 +7576,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7616,6 +7641,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7678,6 +7704,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7743,6 +7770,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7805,6 +7833,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7866,6 +7895,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7919,6 +7949,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7973,6 +8004,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8027,6 +8059,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8083,6 +8116,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8144,6 +8178,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8217,6 +8252,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8273,6 +8309,7 @@ Done."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8332,6 +8369,7 @@ Done."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8389,6 +8427,7 @@ Done."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8447,6 +8486,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8562,6 +8602,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8628,6 +8669,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8698,6 +8740,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8788,6 +8831,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8857,6 +8901,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8929,6 +8974,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -9796,6 +9842,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -9888,6 +9935,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -9978,6 +10026,7 @@ This is an example, not an invocation."#;
                 Some(&activated),
                 None,
                 false,
+                false, // parallel_tools
                 None, // channel
             )
             .await
@@ -10043,6 +10092,7 @@ This is an example, not an invocation."#;
                 Some(&activated),
                 None,
                 true,
+                false, // parallel_tools
                 None, // channel
             )
             .await
@@ -11333,6 +11383,7 @@ Let me check the result."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -11490,6 +11541,7 @@ Let me check the result."#;
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
                     false,
+                    false, // parallel_tools
                     0,
                     0,
                     None,
@@ -11547,6 +11599,7 @@ Let me check the result."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -11642,6 +11695,7 @@ Let me check the result."#;
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
                     false,
+                    false, // parallel_tools
                     0,
                     0,
                     None,
@@ -11704,6 +11758,7 @@ Let me check the result."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
