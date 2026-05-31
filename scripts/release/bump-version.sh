@@ -106,27 +106,10 @@ elif [[ -f "$ROOT_LOCK" ]]; then
   echo "  skip: cargo not on PATH; Cargo.lock not refreshed"
 fi
 
-# ── Marketplace: Dokploy ───────────────────────────────────────────
-echo "Marketplace templates..."
-bump "marketplace/dokploy/meta-entry.json" \
-  '"version": "[0-9]+\.[0-9]+\.[0-9]+"' \
-  "\"version\": \"${VERSION}\""
-
-bump "marketplace/dokploy/blueprints/zeroclaw/docker-compose.yml" \
-  'ghcr\.io/zeroclaw-labs/zeroclaw:[0-9]+\.[0-9]+\.[0-9]+' \
-  "ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}"
-
-# ── Marketplace: EasyPanel ─────────────────────────────────────────
-bump "marketplace/easypanel/meta.yaml" \
-  'ghcr\.io/zeroclaw-labs/zeroclaw:[0-9]+\.[0-9]+\.[0-9]+' \
-  "ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}"
-
 # ── Workflow description examples ──────────────────────────────────
 echo "Workflow descriptions..."
 for wf in \
-  .github/workflows/sync-marketplace-templates.yml \
-  .github/workflows/discord-release.yml \
-  marketplace/sync-marketplace-templates.yml; do
+  .github/workflows/discord-release.yml; do
   bump "$wf" \
     '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+\)' \
     "(e.g. v${VERSION})"
