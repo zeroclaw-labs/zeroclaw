@@ -1359,15 +1359,16 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
-                                // We store the chat JID (reply_target) since that's what send() receives.
+                                // Key by final reply_target (post-LID resolution): send() checks
+                                // message.recipient, which is the resolved phone JID for LID DMs.
                                 let content = if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.insert(chat.clone());
+                                        vs.insert(reply_target.clone());
                                     }
                                     format!("[Voice] {vt}")
                                 } else {
                                     if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&chat);
+                                        vs.remove(&reply_target);
                                     }
                                     let text = msg.text_content().unwrap_or("");
                                     text.trim().to_string()
@@ -2091,6 +2092,33 @@ mod tests {
         let (target, converted) = WhatsAppWebChannel::resolve_deliverable_reply_target(chat, &[]);
         assert!(!converted);
         assert_eq!(target, chat);
+    }
+
+    /// Regression: inbound voice tracking must use the resolved `reply_target`
+    /// (phone JID), not the original LID `chat`, because `send()` looks up
+    /// `voice_chats` with `message.recipient` (= `reply_target`).
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_dm_voice_tracking_key_matches_send_recipient() {
+        let chat_lid = "76188559093817@lid";
+        let (reply_target, converted) = WhatsAppWebChannel::resolve_deliverable_reply_target(
+            chat_lid,
+            &["+15551234567".to_string()],
+        );
+        assert!(converted);
+        assert_ne!(chat_lid, reply_target);
+
+        let mut voice_chats = std::collections::HashSet::new();
+        voice_chats.insert(reply_target.clone());
+        let message_recipient = reply_target.clone();
+        assert!(
+            voice_chats.contains(&message_recipient),
+            "voice_chats must be keyed by resolved reply_target for send() lookup"
+        );
+        assert!(
+            !voice_chats.contains(chat_lid),
+            "original LID chat JID must not be the voice_chats key after LID→phone resolution"
+        );
     }
 
     // ── lid_rejection_diagnostic: scoped LID warning ────
