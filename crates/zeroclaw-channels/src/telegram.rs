@@ -5563,10 +5563,14 @@ mod tests {
 
     #[test]
     fn truncate_telegram_command_description_multibyte_within_char_limit() {
-        // 31 chars but >100 bytes in UTF-8 — must be returned unchanged without trailing '…'
+        // Must contain multibyte chars so that byte length > char length.
+        // The truncation logic must use char count, not byte length.
         let desc = "Show current weather 🌤️🌧️⛈️🌨️🌩️🌪️🌊💨🌡️🌬️";
         assert!(desc.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
-        assert!(desc.len() > TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert!(
+            desc.len() > desc.chars().count(),
+            "test string must contain multibyte characters"
+        );
         let result = truncate_telegram_command_description(desc);
         assert!(
             !result.ends_with('…'),
