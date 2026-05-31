@@ -115,14 +115,27 @@ pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Catalogue roots that `cargo fluent` walks. Each root holds `<locale>/`
+/// subdirectories of `.ftl` files. The runtime catalogue is the primary
+/// source; zerocode ships an independent catalogue under the same layout.
+pub fn fluent_catalog_roots(root: &Path) -> Vec<PathBuf> {
+    vec![
+        root.join("crates/zeroclaw-runtime/locales"),
+        root.join("apps/zerocode/locales"),
+    ]
+}
+
 pub fn fluent_locales_dir(root: &Path) -> PathBuf {
     root.join("crates/zeroclaw-runtime/locales")
 }
 
-pub fn fluent_locales(root: &Path) -> anyhow::Result<Vec<String>> {
-    let dir = fluent_locales_dir(root);
+/// Locale codes present in a single catalogue root (its `<locale>/` subdirs).
+pub fn fluent_locales_in(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut out = vec![];
-    for entry in std::fs::read_dir(&dir)? {
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             out.push(entry.file_name().to_string_lossy().into_owned());
@@ -130,6 +143,10 @@ pub fn fluent_locales(root: &Path) -> anyhow::Result<Vec<String>> {
     }
     out.sort();
     Ok(out)
+}
+
+pub fn fluent_locales(root: &Path) -> anyhow::Result<Vec<String>> {
+    fluent_locales_in(&fluent_locales_dir(root))
 }
 
 pub fn ftl_files_in(locale_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {

@@ -355,7 +355,7 @@ channel-wecom-ws-voice-unavailable = I can't process voice messages right now {$
 channel-wecom-ws-unsupported-message = This message type is not supported yet.
 channel-wecom-ws-welcome = Hi, welcome to chat with me {$emoji}
 channel-wecom-ws-supplemental-message =
-    [Supplemental message]
+    {"["}Supplemental message]
     {$extra}
 channel-wecom-ws-group-allowlist-missing =
     The WeCom allowlist is not configured, so this bot is not accepting group messages.

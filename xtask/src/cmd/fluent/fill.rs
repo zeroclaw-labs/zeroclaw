@@ -27,12 +27,6 @@ pub fn run(
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = repo_root();
-    let locales_dir = fluent_locales_dir(&root);
-    let en_dir = locales_dir.join("en");
-
-    if !en_dir.exists() {
-        anyhow::bail!("English locale dir not found: {}", en_dir.display());
-    }
 
     let targets: Vec<String> = match locale {
         Some(l) => vec![l.to_string()],
@@ -47,23 +41,36 @@ pub fn run(
     let backend = resolve_backend(provider_name)?;
     let batch_size = batch.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
 
-    for target_locale in &targets {
-        let target_dir = locales_dir.join(target_locale);
-        std::fs::create_dir_all(&target_dir)?;
-
-        for ftl_path in ftl_files_in(&en_dir)? {
-            let filename = ftl_path.file_name().unwrap();
-            let target_ftl = target_dir.join(filename);
-
-            fill_ftl_file(
-                &ftl_path,
-                &target_ftl,
-                target_locale,
-                force,
-                &backend,
-                batch_size,
-            )?;
+    let mut filled_any = false;
+    for locales_dir in fluent_catalog_roots(&root) {
+        let en_dir = locales_dir.join("en");
+        if !en_dir.exists() {
+            continue;
         }
+        filled_any = true;
+
+        for target_locale in &targets {
+            let target_dir = locales_dir.join(target_locale);
+            std::fs::create_dir_all(&target_dir)?;
+
+            for ftl_path in ftl_files_in(&en_dir)? {
+                let filename = ftl_path.file_name().unwrap();
+                let target_ftl = target_dir.join(filename);
+
+                fill_ftl_file(
+                    &ftl_path,
+                    &target_ftl,
+                    target_locale,
+                    force,
+                    &backend,
+                    batch_size,
+                )?;
+            }
+        }
+    }
+
+    if !filled_any {
+        anyhow::bail!("no fluent catalogue roots with an en/ dir found");
     }
 
     Ok(())

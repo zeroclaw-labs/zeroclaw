@@ -56,12 +56,12 @@ cp crates/zeroclaw-runtime/locales/ja/cli.ftl ~/.zeroclaw/workspace/locales/ja/c
 
 | Where | What |
 |---|---|
-| `apps/zerocode/locales/en.ftl` | Source of truth, embedded at compile time |
-| `apps/zerocode/locales/<locale>.ftl` | Other locales, embedded if present in-tree |
-| `$ZEROCODE_LOCALE_DIR/<locale>.ftl` | Explicit override, useful for testing translations |
-| `<config-dir>/zerocode/locales/<locale>.ftl` | Per-user catalogue override |
-| `~/.zeroclaw/zerocode/locales/<locale>.ftl` | Alternate per-user location |
-| `<install-prefix>/share/zerocode/locales/<locale>.ftl` | System install path |
+| `apps/zerocode/locales/en/zerocode.ftl` | Source of truth, embedded at compile time |
+| `apps/zerocode/locales/<locale>/zerocode.ftl` | Other locales, embedded if present in-tree |
+| `$ZEROCODE_LOCALE_DIR/<locale>/zerocode.ftl` | Explicit override, useful for testing translations |
+| `<config-dir>/zerocode/locales/<locale>/zerocode.ftl` | Per-user catalogue override |
+| `~/.zeroclaw/zerocode/locales/<locale>/zerocode.ftl` | Alternate per-user location |
+| `<install-prefix>/share/zerocode/locales/<locale>/zerocode.ftl` | System install path |
 
 ### Key namespace
 
@@ -81,13 +81,13 @@ Locale comes from a top-level `locale` field in `zerocode-config.toml`. When uns
 
 ### Adding strings
 
-1. Add the key + English value to `apps/zerocode/locales/en.ftl`. Group keys by source file with a section comment so the catalogue stays scannable.
+1. Add the key + English value to `apps/zerocode/locales/en/zerocode.ftl`. Group keys by source file with a section comment so the catalogue stays scannable.
 2. Replace the literal in the source with `crate::i18n::t("zc-…")`. For enum→label `match` arms, return the key constant (`&'static str`) from a `fluent_key()` method and call `t()` at the render site — never `match` on a string.
 3. `cargo check -p zerocode` and the `i18n` unit tests (`cargo test -p zerocode i18n`) catch missing keys at compile/test time. Missing keys at runtime render as `{zc-key-name}` and emit a one-shot stderr warning.
 
 ### Filling translations
 
-`cargo fluent` does **not** currently know about `apps/zerocode/locales/`. The runtime tool is hard-coded to `crates/zeroclaw-runtime/locales/`. Until that is taught about a second catalogue, translation passes for zerocode are manual: copy `en.ftl` to `<locale>.ftl`, translate values in place, drop the file in any of the disk-search paths listed above, and run zerocode with `--config-dir` pointing at the override.
+`cargo fluent` does **not** currently know about `apps/zerocode/locales/`. The runtime tool is hard-coded to `crates/zeroclaw-runtime/locales/`. Until that is taught about a second catalogue, translation passes for zerocode are manual: copy `en/zerocode.ftl` to `<locale>/zerocode.ftl`, translate values in place, drop the file in any of the disk-search paths listed above, and run zerocode with `--config-dir` pointing at the override.
 
 ## Filling doc translations (gettext)
 
@@ -130,7 +130,7 @@ Maintainers should accept the routine English docs exception documented in [Buil
    cargo mdbook sync --locale <code> --provider ollama
    ```
 
-4. For zerocode parity, copy `apps/zerocode/locales/en.ftl` to `apps/zerocode/locales/<code>.ftl` and translate the values by hand. `cargo fluent` does not yet operate on the zerocode catalogue; the file can be dropped into any of the disk-search paths or embedded in-tree once translated.
+4. For zerocode parity, copy `apps/zerocode/locales/en/zerocode.ftl` to `apps/zerocode/locales/<code>/zerocode.ftl` and translate the values by hand. `cargo fluent` does not yet operate on the zerocode catalogue; the file can be dropped into any of the disk-search paths or embedded in-tree once translated.
 
 Everything else — `lang-switcher.js`, CI deploy target list, `cargo mdbook locales` output — reads from `locales.toml` automatically.
 

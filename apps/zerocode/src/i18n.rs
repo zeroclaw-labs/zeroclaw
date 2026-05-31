@@ -9,7 +9,7 @@ static FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 static REPORTED_MISSING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-const EN_FTL: &str = include_str!("../locales/en.ftl");
+const EN_FTL: &str = include_str!("../locales/en/zerocode.ftl");
 
 struct FtlSources {
     locale: String,
@@ -97,7 +97,7 @@ fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String
 }
 
 fn load_ftl_from_disk(locale: &str) -> Option<String> {
-    let filename = format!("{locale}.ftl");
+    let filename = format!("{locale}/zerocode.ftl");
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(explicit) = std::env::var("ZEROCODE_LOCALE_DIR") {
         candidates.push(PathBuf::from(explicit).join(&filename));

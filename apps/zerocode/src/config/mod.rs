@@ -52,9 +52,9 @@ impl Default for ThemeSection {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ZerocodeConfig {
-    #[serde(default)]
+    #[serde(default = "default_locale")]
     pub locale: Option<String>,
     #[serde(default)]
     pub theme: ThemeSection,
@@ -62,6 +62,20 @@ pub(crate) struct ZerocodeConfig {
     /// entries fall back to compile-time defaults.
     #[serde(default)]
     keybindings: HashMap<String, ChordSpec>,
+}
+
+impl Default for ZerocodeConfig {
+    fn default() -> Self {
+        Self {
+            locale: default_locale(),
+            theme: ThemeSection::default(),
+            keybindings: HashMap::new(),
+        }
+    }
+}
+
+fn default_locale() -> Option<String> {
+    Some("en".to_string())
 }
 
 fn default_theme() -> String {
@@ -191,6 +205,17 @@ pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
     write_document(&path, &doc)
 }
 
+/// Persist the top-level `locale` key, leaving every other section intact.
+pub(crate) fn persist_locale(config_dir: &Path, locale: &str) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    doc.insert(
+        "locale".to_string(),
+        toml::Value::String(locale.to_string()),
+    );
+    write_document(&path, &doc)
+}
+
 /// Overwrite the `[keybindings]` section from a resolved override table
 /// (preset pick). Sparse: only overridden actions are written; everything
 /// else falls back to compile-time defaults on next load. Only the
@@ -300,6 +325,50 @@ mod tests {
         let c = ZerocodeConfig::default();
         assert_eq!(c.theme.name, theme::DEFAULT_THEME_NAME);
         assert!(c.resolve_theme().is_ok());
+    }
+
+    #[test]
+    fn default_config_emits_locale() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            body.contains("locale = \"en\""),
+            "default config must surface the locale prop on disk; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn resolve_locale_trims_and_blanks_fall_back() {
+        let c = ZerocodeConfig {
+            locale: Some("  fr  ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(c.resolve_locale().as_deref(), Some("fr"));
+        let blank = ZerocodeConfig {
+            locale: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(blank.resolve_locale(), None);
+    }
+
+    #[test]
+    fn set_prop_locale_roundtrip() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "locale", "ja").unwrap();
+        assert_eq!(c.locale.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn persist_locale_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "locale = \"en\"\n\n[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        persist_locale(dir.path(), "fr").unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
     }
 
     #[test]
