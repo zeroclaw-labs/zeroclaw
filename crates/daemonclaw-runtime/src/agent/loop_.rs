@@ -1657,7 +1657,12 @@ pub async fn run_tool_call_loop(
         let is_repetition_of_accumulated = !trimmed_accumulated.is_empty()
             && trimmed_response.len() >= 200
             && (trimmed_accumulated.contains(trimmed_response)
-                || trimmed_response.starts_with(trimmed_accumulated));
+                || {
+                    let prefix_match = trimmed_response.starts_with(trimmed_accumulated);
+                    let novel_len =
+                        trimmed_response.len().saturating_sub(trimmed_accumulated.len());
+                    prefix_match && novel_len < 100 && novel_len * 10 < trimmed_response.len()
+                });
         if tool_calls.is_empty()
             && consecutive_retries < 3
             && response_text.len() > 500

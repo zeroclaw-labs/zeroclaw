@@ -2024,4 +2024,105 @@ mod spine_contract {
             assistant_messages.iter().map(|m| m.content.len()).collect::<Vec<_>>()
         );
     }
+
+    // ── Restate-then-continue: guard must NOT suppress novel content ────
+    //
+    // Model restates the prior accumulated text as a prefix, then appends
+    // substantial new content. The repetition guard must let this through —
+    // both the new content and the prefix must survive to delivery and history.
+    // Without the novel-tail check, starts_with would flag this as repetition
+    // and silently drop the entire response including the new content.
+    #[tokio::test]
+    async fn restate_then_continue_preserves_novel_tail() {
+        let prefix_text = "Here is my full analysis of the upgrade. \
+            The history management overhaul is a big deal — that graduated \
+            trimming with collapsible summaries fixes the exact brittle behavior \
+            we identified in the analysis. No more all-or-nothing context management. \
+            The multi-tool pipelining is smart too. The old behavior of waiting for \
+            the full model response before executing any tools was dead time. \
+            Provider selection works. Loop detection replaces fixed caps. \
+            Content tagging for external results is solid defense-in-depth. \
+            Ready to test whenever you are \u{1F980}";
+
+        // Iteration 2 restates the prefix, then adds substantial new analysis.
+        let novel_content = "\n\nNow that I think about it further, there are \
+            three additional considerations worth flagging. First, the provider \
+            fallback chain should be tested under real latency conditions — the \
+            jittered backoff looks correct on paper but edge cases around \
+            simultaneous rate-limit responses from multiple providers could \
+            surface ordering issues. Second, the context collapser needs \
+            verification that the protect_last_n parameter actually prevents \
+            the most recent exchange from being collapsed during aggressive \
+            compaction. Third, we should validate that the streaming executor \
+            correctly handles a tool that panics mid-execution without poisoning \
+            the entire turn. These are all testable in isolation.";
+
+        let full_response = format!("{prefix_text}{novel_content}");
+
+        let provider = ScriptedProvider::new(vec![
+            // Iteration 1: prefix text + tool call
+            ChatResponse {
+                text: Some(prefix_text.into()),
+                tool_calls: vec![daemonclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"message": "noted"}"#.into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            // Iteration 2: restates prefix + adds substantial novel content
+            ChatResponse {
+                text: Some(full_response.clone()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+
+        let observer = NoopObserver {};
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(EchoTool) as Box<dyn Tool>,
+        ]);
+        let multimodal = default_multimodal();
+
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("analyze the upgrade"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock", "mock-model", 0.0, true, None, "test", None,
+            &multimodal, 0, None, None, None,
+            &[], &[], None, None,
+            &daemonclaw_config::schema::PacingConfig::default(),
+            0, 0, None, None, None, None,
+        ).await.unwrap();
+
+        // The novel content must survive to delivery.
+        assert!(
+            result.contains("provider fallback chain"),
+            "Novel content must survive to delivery. Result ({} chars): {}",
+            result.len(), &result[..result.len().min(200)]
+        );
+        assert!(
+            result.contains("protect_last_n parameter"),
+            "Novel content (second point) must survive"
+        );
+
+        // The novel content must also land in history.
+        let assistant_messages: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        let has_novel_in_history = assistant_messages
+            .iter()
+            .any(|m| m.content.contains("provider fallback chain"));
+        assert!(
+            has_novel_in_history,
+            "Novel content must be in history. Assistant message lengths: {:?}",
+            assistant_messages.iter().map(|m| m.content.len()).collect::<Vec<_>>()
+        );
+    }
 }
