@@ -1839,7 +1839,10 @@ mod session_method_tests {
         let task =
             tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
 
-        let line = write_rx.recv().await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_new must send a wire request; a hang here wedges the TTY")
+            .unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(req["method"], "session/new");
         assert_eq!(req["params"]["agent_alias"], "my-agent");
@@ -1852,7 +1855,11 @@ mod session_method_tests {
             None,
         );
 
-        let result = task.await.unwrap().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_new must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
         assert_eq!(result.session_id, "s42");
     }
 
@@ -1863,14 +1870,21 @@ mod session_method_tests {
 
         let task = tokio::spawn(async move { client.session_cancel("s1").await });
 
-        let line = write_rx.recv().await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_cancel must send a wire request; a hang here wedges the TTY")
+            .unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(req["method"], "session/cancel");
         assert_eq!(req["params"]["session_id"], "s1");
 
         let id = req["id"].as_str().unwrap().to_string();
         rpc.dispatch_response(&id, Some(json!({"session_id":"s1","cancelled":true})), None);
-        task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_cancel must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1884,7 +1898,10 @@ mod session_method_tests {
                 .await
         });
 
-        let line = write_rx.recv().await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_approve must send a wire request; a hang here wedges the TTY")
+            .unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(req["method"], "session/approve");
         assert_eq!(req["params"]["decision"], "allow_once");
@@ -1896,7 +1913,11 @@ mod session_method_tests {
             Some(json!({"session_id":"s1","request_id":"req-1","acknowledged":true})),
             None,
         );
-        task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_approve must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
     }
 }
 
