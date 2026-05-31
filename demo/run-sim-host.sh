@@ -15,6 +15,16 @@ if ! command -v socat >/dev/null 2>&1; then
   exit 1
 fi
 
+# Ensure .env exists and is not empty
+if [[ ! -s demo/.env ]]; then
+  echo "demo/.env is missing or empty."
+  echo "Run these first:"
+  echo "  cp demo/.env.template demo/.env"
+  echo "  nano demo/.env     # or: code demo/.env   or: vim demo/.env"
+  echo "Fill in MINIMAX_API_KEY (or OPENROUTER_API_KEY), then re-run this script."
+  exit 1
+fi
+
 # Make sure a config exists for the agent later
 mkdir -p demo/data/config
 cp -n demo/zeroclaw.toml.example demo/data/config/config.toml 2>/dev/null || true

@@ -39,7 +39,8 @@ If you cannot allocate 60-80+ GB to Docker Desktop, test the vignette directly o
 ```bash
 # 1. One-time setup
 cp demo/.env.template demo/.env
-$EDITOR demo/.env          # put your MINIMAX_API_KEY
+nano demo/.env          # easiest on Mac. Use: code demo/.env  or  vim demo/.env
+                        # At minimum, set:  MINIMAX_API_KEY="your-real-key"
 
 # 2. Install socat if missing (required by the simulator)
 brew install socat
@@ -48,12 +49,12 @@ brew install socat
 mkdir -p demo/data/config
 cp -n demo/zeroclaw.toml.example demo/data/config/config.toml || true
 
-# 4. Run the simulator + visualizer (in terminal 1)
+# 4. Terminal 1 – start simulator + visualizer
 ./demo/run-sim-host.sh
 
-# Wait for "frontend ready: http://127.0.0.1:8080", then open it.
+# Wait for "frontend ready: http://127.0.0.1:8080", then open the URL.
 
-# 5. In another terminal, run the agent (terminal 2)
+# 5. Terminal 2 – start the agent
 ./demo/run-agent-host.sh
 ```
 
