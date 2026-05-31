@@ -73,6 +73,9 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// Providers config for resolving per-provider credentials and default models
+    /// when the delegate call specifies a provider override.
+    providers_config: Option<Arc<daemonclaw_config::providers::ProvidersConfig>>,
 }
 
 impl DelegateTool {
@@ -107,6 +110,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            providers_config: None,
         }
     }
 
@@ -147,6 +151,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            providers_config: None,
         }
     }
 
@@ -198,6 +203,14 @@ impl DelegateTool {
     /// Attach memory for namespace isolation on delegate agents.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    pub fn with_providers_config(
+        mut self,
+        providers_config: Arc<daemonclaw_config::providers::ProvidersConfig>,
+    ) -> Self {
+        self.providers_config = Some(providers_config);
         self
     }
 
@@ -276,6 +289,14 @@ impl Tool for DelegateTool {
                     "minLength": 1,
                     "description": "The task/prompt to send to the sub-agent"
                 },
+                "provider": {
+                    "type": "string",
+                    "description": "Override provider for this delegation (must be a configured provider with credentials). When set, 'agent' is optional — a transient subagent is constructed on the named provider."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Override model for this delegation. When omitted with a provider override, the provider's configured default model is used."
+                },
                 "context": {
                     "type": "string",
                     "description": "Optional context to prepend (e.g. relevant code, prior findings)"
@@ -332,19 +353,26 @@ impl Tool for DelegateTool {
         }
 
         // --- Single-agent delegation (synchronous or background) ---
+        let provider_override = args
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
         let agent_name = args
             .get("agent")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("Missing 'agent' parameter"))?;
+            .filter(|s| !s.is_empty());
 
-        if agent_name.is_empty() {
+        if provider_override.is_none() && agent_name.is_none() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("'agent' parameter must not be empty".into()),
+                error: Some("Either 'agent' or 'provider' must be specified".into()),
             });
         }
+        let agent_name = agent_name.unwrap_or("_transient");
 
         let prompt = args
             .get("prompt")
@@ -375,6 +403,57 @@ impl Tool for DelegateTool {
 }
 
 impl DelegateTool {
+    /// Resolve a transient DelegateAgentConfig from a provider override.
+    /// Pure function — no I/O, no provider construction, fully testable offline.
+    ///
+    /// Credential order: provider_config.api_key → fallback_credential.
+    /// Model order: explicit model arg → provider_config.model → Err.
+    #[allow(clippy::result_large_err)]
+    fn resolve_provider_override(
+        provider_name: &str,
+        model_arg: Option<&str>,
+        providers_config: &daemonclaw_config::providers::ProvidersConfig,
+        fallback_credential: &Option<String>,
+    ) -> Result<DelegateAgentConfig, String> {
+        let provider_entry = providers_config.models.get(provider_name).ok_or_else(|| {
+            let available: Vec<&str> = providers_config.models.keys().map(String::as_str).collect();
+            format!(
+                "Provider '{provider_name}' is not configured. Available providers: {}",
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )
+        })?;
+
+        let resolved_model = match model_arg.filter(|s| !s.is_empty()) {
+            Some(m) => m.to_string(),
+            None => match &provider_entry.model {
+                Some(m) if !m.is_empty() => m.clone(),
+                _ => {
+                    return Err(format!(
+                        "Provider '{provider_name}' requested but no model specified \
+                         and no default model configured for this provider"
+                    ));
+                }
+            },
+        };
+
+        let resolved_credential = provider_entry
+            .api_key
+            .clone()
+            .or_else(|| fallback_credential.clone());
+
+        Ok(DelegateAgentConfig {
+            provider: provider_name.to_string(),
+            model: resolved_model,
+            api_key: resolved_credential,
+            max_depth: 3,
+            ..DelegateAgentConfig::default()
+        })
+    }
+
     /// Original synchronous delegation path (extracted for reuse).
     async fn execute_sync(
         &self,
@@ -388,28 +467,73 @@ impl DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
-        // Look up agent config
-        let agent_config = match self.agents.get(agent_name) {
-            Some(cfg) => cfg,
-            None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Unknown agent '{agent_name}'. Available agents: {}",
-                        if available.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    )),
-                });
+        // Resolve agent config: either from named agents or from a provider override.
+        let provider_override = args
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let transient_config;
+        let agent_config: &DelegateAgentConfig = if let Some(provider_name) = provider_override {
+            let providers = match &self.providers_config {
+                Some(pc) => pc,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Provider override requires providers config (not available in this context)"
+                                .into(),
+                        ),
+                    });
+                }
+            };
+            let model_arg = args
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::trim);
+            match Self::resolve_provider_override(
+                provider_name,
+                model_arg,
+                providers,
+                &self.fallback_credential,
+            ) {
+                Ok(config) => {
+                    transient_config = config;
+                    &transient_config
+                }
+                Err(msg) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(msg),
+                    });
+                }
+            }
+        } else {
+            match self.agents.get(agent_name) {
+                Some(cfg) => cfg,
+                None => {
+                    let available: Vec<&str> =
+                        self.agents.keys().map(|s: &String| s.as_str()).collect();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Unknown agent '{agent_name}'. Available agents: {}",
+                            if available.is_empty() {
+                                "(none configured)".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        )),
+                    });
+                }
             }
         };
 
-        // Check recursion depth (immutable — set at construction, incremented for sub-agents)
+        // Check recursion depth
         if self.depth >= agent_config.max_depth {
             return Ok(ToolResult {
                 success: false,
@@ -655,6 +779,7 @@ impl DelegateTool {
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
                 memory: None,
+                providers_config: None,
             };
 
             let args_inner = json!({
@@ -813,6 +938,7 @@ impl DelegateTool {
                     workspace_dir,
                     cancellation_token,
                     memory: None,
+                    providers_config: None,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1508,10 +1634,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_agent_param() {
+    async fn missing_agent_and_provider_param() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
-        let result = tool.execute(json!({"prompt": "test"})).await;
-        assert!(result.is_err());
+        let result = tool.execute(json!({"prompt": "test"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("Either 'agent' or 'provider'"));
     }
 
     #[tokio::test]
@@ -1596,14 +1726,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_agent_rejected() {
+    async fn blank_agent_no_provider_rejected() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
             .execute(json!({"agent": "  ", "prompt": "test"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("must not be empty"));
+        assert!(result
+            .error
+            .unwrap()
+            .contains("Either 'agent' or 'provider'"));
     }
 
     #[tokio::test]
@@ -2921,5 +3054,169 @@ mod tests {
         assert!(result.error.unwrap().contains("Invalid task_id"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // ── Provider override tests ─────────────────────────────────────────
+
+    fn make_providers_config(
+        name: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Arc<daemonclaw_config::providers::ProvidersConfig> {
+        use daemonclaw_config::schema::ModelProviderConfig;
+        let mut models = HashMap::new();
+        models.insert(
+            name.to_string(),
+            ModelProviderConfig {
+                api_key: Some(api_key.to_string()),
+                model: Some(model.to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        Arc::new(daemonclaw_config::providers::ProvidersConfig {
+            fallback: None,
+            models,
+            model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
+        })
+    }
+
+    // ── Deterministic offline tests for resolve_provider_override ──────
+    // These test the pure resolution function directly — no network, no
+    // provider construction, no API calls.
+
+    #[test]
+    fn resolve_picks_config_key_over_fallback() {
+        let providers = make_providers_config(
+            "gemini",
+            "gemini-config-secret-key",
+            "gemini-2.5-flash",
+        );
+        let fallback = Some("wrong-fallback-key".to_string());
+
+        let config = DelegateTool::resolve_provider_override(
+            "gemini",
+            None, // no model arg — should use default
+            &providers,
+            &fallback,
+        )
+        .expect("resolution should succeed");
+
+        assert_eq!(config.provider, "gemini");
+        assert_eq!(
+            config.api_key.as_deref(),
+            Some("gemini-config-secret-key"),
+            "must pick the provider's own config key, not the fallback"
+        );
+        assert_eq!(
+            config.model, "gemini-2.5-flash",
+            "must resolve the provider's default model when no model arg"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_shared_key_when_provider_has_none() {
+        use daemonclaw_config::schema::ModelProviderConfig;
+        let mut models = HashMap::new();
+        models.insert(
+            "ollama".to_string(),
+            ModelProviderConfig {
+                api_key: None, // no provider-specific key
+                model: Some("llama3".into()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        let providers = Arc::new(daemonclaw_config::providers::ProvidersConfig {
+            fallback: None,
+            models,
+            model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
+        });
+        let fallback = Some("shared-key".to_string());
+
+        let config = DelegateTool::resolve_provider_override(
+            "ollama",
+            None,
+            &providers,
+            &fallback,
+        )
+        .expect("resolution should succeed");
+
+        assert_eq!(
+            config.api_key.as_deref(),
+            Some("shared-key"),
+            "should fall back to shared key when provider has no key"
+        );
+    }
+
+    #[test]
+    fn resolve_explicit_model_overrides_default() {
+        let providers = make_providers_config(
+            "gemini",
+            "key",
+            "gemini-2.5-flash",
+        );
+
+        let config = DelegateTool::resolve_provider_override(
+            "gemini",
+            Some("gemini-2.5-pro"), // explicit model override
+            &providers,
+            &None,
+        )
+        .expect("resolution should succeed");
+
+        assert_eq!(
+            config.model, "gemini-2.5-pro",
+            "explicit model arg must override default"
+        );
+    }
+
+    #[test]
+    fn resolve_errors_on_unconfigured_provider() {
+        let providers = make_providers_config("gemini", "key", "model");
+
+        let err = DelegateTool::resolve_provider_override(
+            "nonexistent",
+            None,
+            &providers,
+            &None,
+        )
+        .expect_err("should fail for unconfigured provider");
+
+        assert!(err.contains("not configured"), "got: {err}");
+        assert!(err.contains("nonexistent"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_errors_on_missing_model_with_no_default() {
+        use daemonclaw_config::schema::ModelProviderConfig;
+        let mut models = HashMap::new();
+        models.insert(
+            "bare".to_string(),
+            ModelProviderConfig {
+                api_key: Some("key".into()),
+                model: None,
+                ..ModelProviderConfig::default()
+            },
+        );
+        let providers = Arc::new(daemonclaw_config::providers::ProvidersConfig {
+            fallback: None,
+            models,
+            model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
+        });
+
+        let err = DelegateTool::resolve_provider_override(
+            "bare",
+            None,
+            &providers,
+            &None,
+        )
+        .expect_err("should fail when no model available");
+
+        assert!(
+            err.contains("no model specified") || err.contains("no default model"),
+            "got: {err}"
+        );
     }
 }
