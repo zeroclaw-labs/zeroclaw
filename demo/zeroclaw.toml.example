@@ -35,13 +35,15 @@ temperature = 0.3
 max_tokens = 1024
 
 # ─── Hardware peripherals ──────────────────────────────────────────────────
-# Only the smartroom tools on the simulated ESP32 board.
+# Simulated ESP32 board via the esp32_sim example (dev-sim path).
+# This brings in the high-level smart-room tools (set_device / read_device)
+# that map friendly names → pins, plus the lower-level gpio_* tools.
 
 [peripherals]
 enabled = true
 
 [[peripherals.boards]]
-board = "esp32"
+board = "esp32-sim"
 transport = "serial"
 path = "/tmp/zc-sim-esp32"
 baud = 115200
@@ -68,7 +70,11 @@ enabled = false
 # ─── Safety ────────────────────────────────────────────────────────────────
 [autonomy]
 max_actions_per_hour = 60
-auto_approve = ["set_device", "read_device", "gpio_write", "gpio_read", "hardware_capabilities"]
+# Smart-room named devices + raw gpio fallbacks + capabilities
+auto_approve = [
+    "set_device", "read_device",
+    "gpio_write", "gpio_read", "hardware_capabilities"
+]
 
 # ─── Agent (required for current CLI) ──────────────────────────────────────
 [agents.demo]

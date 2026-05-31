@@ -4,54 +4,50 @@ Paste these in order during the live demo.
 
 ## 1. System primer (paste FIRST, before any other prompt)
 
-> You are controlling a simulated ESP32 microcontroller wired into a smart room. The chip exposes these GPIO pins through the `gpio_write` and `gpio_read` tools:
+> You are controlling a simulated ESP32 microcontroller wired into a smart room.
+> You have access to high-level smart-room tools:
 >
-> | Pin | Device           | Direction |
-> |-----|------------------|-----------|
-> | 12  | reading lamp     | output    |
-> | 13  | overhead light   | output    |
-> | 14  | space heater     | output    |
-> | 2   | fan / status LED | output    |
-> | 5   | motion sensor    | input     |
+> - `set_device(device="reading_lamp", state="on"|"off")` — controls lights, heater, fan by friendly name
+> - `read_device(device="motion_sensor")` — reads sensors
+>
+> Available devices for set_device: reading_lamp, overhead_light, heater, fan.
+> Use read_device for the motion_sensor.
 >
 > Rules of engagement:
-> - **Always actuate via tool calls.** Do not describe what you would do — call `gpio_write` and `gpio_read` directly.
-> - For output pins, `value: 1` means on, `value: 0` means off.
-> - Before changing the room, read the motion sensor (pin 5) once to confirm presence.
-> - After all tool calls complete, write ONE sentence summarizing what you did.
->
-> Acknowledge by reading the motion sensor.
+> - **Always use the smart-room tools** (`set_device` / `read_device`) when the user asks about lights, comfort, or presence.
+> - Do NOT guess pin numbers or call raw gpio_write unless the user explicitly asks for low-level control.
+> - Before changing the room, read the motion sensor once to confirm presence.
+> - After tool calls, write ONE short sentence summarizing the physical changes.
 
-Expected response: a single `gpio_read(pin=5)` tool call, then a one-liner like "Motion sensor reads 1 — presence confirmed."
+Expected response: a `read_device(device="motion_sensor")` call, then a one-liner.
 
 ## 2. Demo turn — the headline
 
 > It's getting dark and chilly. I'm settling in to read for an hour.
 
 Expected tool calls (any order):
-- `gpio_write(pin=12, value=1)` → reading lamp on
-- `gpio_write(pin=14, value=1)` → heater on
-- `gpio_write(pin=13, value=0)` → overhead off (already off, but explicit)
-- summary line
+- `read_device(device="motion_sensor")`
+- `set_device(device="reading_lamp", state="on")`
+- `set_device(device="heater", state="on")`
+- `set_device(device="overhead_light", state="off")`
+- summary sentence
 
 ## 3. Demo turn — the contrast
 
 > Going to bed now.
 
 Expected:
-- `gpio_write(pin=12, value=0)`
-- `gpio_write(pin=14, value=0)`
-- `gpio_write(pin=2, value=0)` (fan off)
+- `read_device(device="motion_sensor")`
+- `set_device(device="reading_lamp", state="off")`
+- `set_device(device="heater", state="off")`
+- `set_device(device="fan", state="off")`
 - summary
 
 ## 4. Improv (only if 30+ sec on the clock)
 
 > Make it dramatic for movie night.
 
-Loose expected:
-- overhead off, lamp dim/off (set to 0)
-- fan/LED on (ambient light)
-- heater on for cozy
+Use the smart-room tools to create atmosphere (cozy lighting, fan for "air", etc.).
 
 ## Manual fallback
 

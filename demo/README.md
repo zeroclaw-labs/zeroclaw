@@ -102,20 +102,26 @@ docker builder prune
 ```
 demo/
 ├── README.md            ← this file
-├── Dockerfile           ← builder + runtime stages
-├── docker-compose.yml   ← service def, port mapping, env, volume mounts
-├── zeroclaw.toml        ← daemon config (constrained tools, MiniMax + OpenRouter)
-├── .env.template        ← env-var template (copy to .env, fill in keys)
-├── .gitignore           ← ignores .env, data/, *.log
-├── run-sim.sh           ← wrapper for `docker compose up`
-└── run-zeroclaw.sh      ← wrapper for `docker compose exec zeroclaw zeroclaw agent`
-
-crates/zeroclaw-hardware/examples/
-├── esp32_sim.rs                  ← simulator binary source (~280 LOC)
-└── esp32_sim_frontend.html       ← static frontend (embedded into binary)
-
-PLAN.md                  ← full hackathon plan + risk register
+├── Dockerfile           ← multi-stage build (esp32_sim + zeroclaw)
+├── docker-compose.yml   ← simulator + agent services sharing /tmp
+├── zeroclaw.toml.example ← constrained hardware-only config
+├── .env.template        ← copy to .env
+├── .gitignore
+├── run-sim.sh           ← `docker compose up`
+├── run-zeroclaw.sh      ← interactive agent inside container
+└── run-daemon.sh        ← optional full daemon + Telegram path
 ```
+
+The simulator binary and visualizer live in:
+`crates/zeroclaw-hardware/examples/esp32_sim.{rs,html}`
+
+This demo harness depends on three focused changes extracted from the original
+large contribution:
+- dev-sim serial allowlist
+- smartroom named-device tools (set_device / read_device)
+- esp32_sim example + WebSocket frontend
+
+See the individual PRs for those pieces.
 
 ## Troubleshooting
 

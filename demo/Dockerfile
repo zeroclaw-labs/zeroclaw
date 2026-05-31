@@ -1,13 +1,12 @@
-# ZeroClaw ESP32 Smart Room demo container (adapted from original #6148 bundle).
+# ZeroClaw ESP32 Smart Room demo container.
 #
-# This harness depends on the split PRs for:
-# - dev-sim feature (for /tmp/zc-sim-* paths)
-# - esp32_sim example
-# - smartroom named-device tools
+# Full stack:
+# - esp32_sim (axum + socat pty + WebSocket SVG visualizer)
+# - ZeroClaw agent with hardware + dev-sim features
+# - Uses smartroom tools (set_device / read_device) when board = "esp32-sim"
 #
-# Both the simulator and the agent live inside one container so they share
-# /tmp and /dev/pts. The simulator is the default process; interact via
-# ./demo/run-zeroclaw.sh or docker compose exec.
+# The simulator and agent share /tmp so the pty at /tmp/zc-sim-esp32 is visible
+# to both. Simulator runs by default on :8080; use run-zeroclaw.sh for the agent.
 
 # ─── Stage 1: build ────────────────────────────────────────────────────────
 # Rust 1.91 (matches the workspace's actual feature usage — let-chains, etc.;
@@ -32,8 +31,8 @@ RUN mkdir -p apps/tauri/src \
 
 # Debug builds (no --release) — faster compile, fine for a demo.
 # Build the simulator example first, then the main binary.
-# We use the dev-sim feature so the simulator can use /tmp/zc-sim-* paths.
-# BuildKit cache mounts keep things fast across rebuilds.
+# Requires the dev-sim feature (from the split) so /tmp/zc-sim-* paths are allowed.
+# BuildKit cache mounts keep rebuilds fast.
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target-debug,target=/build/target,sharing=locked \
