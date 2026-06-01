@@ -59,7 +59,7 @@ Sync all other version references:
 bash scripts/release/bump-version.sh X.Y.Z
 ```
 
-This updates README badges, the Tauri config, marketplace templates, and
+This updates README badges, the Tauri config, and
 workflow description examples. Commit everything together:
 
 ```text

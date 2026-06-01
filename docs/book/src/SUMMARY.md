@@ -33,6 +33,7 @@
 - [Environment variables](./reference/env-vars.md)
 - [API (rustdoc)](./api.md)
 - [Gateway HTTP API](./gateway/api.md)
+- [Web dashboard (web_dist_dir)](./gateway/web-dashboard.md)
 
 # Model Providers
 

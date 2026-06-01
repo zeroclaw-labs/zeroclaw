@@ -1705,6 +1705,12 @@ async fn main() -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
+            // Register channel map factory for late-bound tool handle population.
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
+                let config_clone = config.clone();
+                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+            }));
+
             Box::pin(agent::run(
                 config,
                 &agent_alias,
