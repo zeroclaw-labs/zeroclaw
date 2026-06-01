@@ -46,7 +46,17 @@ def semver_key(tag: str):
     return (2, 0, 0, 0, 0, tag)
 
 
+def _parse_version(tag: str):
+    m = _SEMVER_RE.match(tag)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
 def main():
+    min_version_env = os.environ.get('DOCS_MIN_VERSION', '')
+    min_parsed = _parse_version(min_version_env) if min_version_env else None
+
     # Find all version-like directories (v0.7.5, master, stable, v0.8.0-beta-1, etc.)
     version_pattern = re.compile(
         r'^(master|stable|v\d+\.\d+\.\d+(-[a-z0-9.-]+)?)$', re.IGNORECASE
@@ -54,6 +64,10 @@ def main():
     dirs = []
     for d in os.listdir('.'):
         if os.path.isdir(d) and d != '.git' and version_pattern.match(d):
+            if min_parsed and d not in ('master', 'stable'):
+                d_parsed = _parse_version(d)
+                if d_parsed and d_parsed < min_parsed:
+                    continue  # below floor
             dirs.append(d)
 
     # master first, stable second, then tagged versions newest -> oldest.
@@ -73,7 +87,7 @@ def main():
         else:
             label = tag
 
-        versions.append({'tag': tag, 'label': label, 'url': f'/{tag}/'})
+        versions.append({'tag': tag, 'label': label})
 
     # If 'stable' exists, use it; otherwise find the latest stable version (no pre-release)
     if not stable_tag:

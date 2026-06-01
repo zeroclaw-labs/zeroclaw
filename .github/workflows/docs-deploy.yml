@@ -8,6 +8,9 @@ name: Deploy mdBook docs to Pages
 # (see docs/book/src/maintainers/docs-and-translations.md) and committed to
 # the repo — this workflow does not call any translation provider.
 
+env:
+  DOCS_MIN_VERSION: v0.7.5
+
 on:
   push:
     branches: [master]
@@ -55,6 +58,16 @@ jobs:
           else
             TAG="master"
           fi
+
+          # Enforce version floor (skip for master)
+          if [[ "$TAG" =~ ^v ]]; then
+            OLDEST=$(printf '%s\n' "$TAG" "$DOCS_MIN_VERSION" | sort -V | head -n1)
+            if [ "$OLDEST" = "$TAG" ] && [ "$TAG" != "$DOCS_MIN_VERSION" ]; then
+              echo "::error::Tag '${TAG}' is below minimum deployable version '${DOCS_MIN_VERSION}'."
+              exit 1
+            fi
+          fi
+
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
           echo "Building docs for TAG=$TAG"
 
@@ -189,6 +202,16 @@ jobs:
           echo "docs.zeroclawlabs.ai" > CNAME
 
           SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
+          
+          # Sync shared chrome — new xtask produces book/_shared/
+          if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
+            mkdir -p "$CLONE_DIR/_shared"
+            rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
+          else
+            # Old-tag fallback: extract chrome from the deployed version content
+            python3 "${SCRIPTS}/extract-shared-chrome.py" "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
+          fi
+
           python3 "${SCRIPTS}/generate-versions.py" > versions.json
 
           # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/

@@ -146,8 +146,10 @@ async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
     use axum::Router;
     use tower_http::services::ServeDir;
 
-    let app =
-        Router::new().fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
+    let shared_dir = dir.parent().unwrap().join("_shared");
+    let app = Router::new()
+        .nest_service("/_shared", ServeDir::new(&shared_dir))
+        .fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
     axum::serve(listener, app).await?;
     Ok(())
