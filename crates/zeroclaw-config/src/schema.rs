@@ -186,6 +186,12 @@ pub struct Config {
     #[nested]
     pub scheduler: SchedulerConfig,
 
+    /// Agent evaluation harness (`[eval]`) — surfaced via `zeroclaw eval`.
+    /// Distinct from `[agent.eval]`, which is the in-loop response-quality scorer.
+    #[serde(default)]
+    #[nested]
+    pub eval: crate::scattered_types::EvalHarnessConfig,
+
     /// Pacing controls for slow/local LLM workloads (`[pacing]`).
     #[serde(default)]
     #[nested]
@@ -13609,6 +13615,7 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),

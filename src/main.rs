@@ -4452,9 +4452,7 @@ async fn main() -> Result<()> {
                 mode,
                 format,
             } => {
-                // Phase 0: suite dir defaults to `evals`. A `[eval]` config section
-                // is wired in a follow-up iteration on this branch.
-                let suite_dir = suite.unwrap_or_else(|| "evals".to_string());
+                let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode = mode.parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, &format);
