@@ -263,6 +263,8 @@ mod verifiable_intent;
 // the agent-runtime modules above do.
 #[cfg(feature = "x0-extended")]
 mod conscience;
+#[cfg(feature = "x0-extended")]
+mod continuity;
 // conscience::cosmic_bridge expects `crate::cosmic` to resolve, so the
 // bin needs the cosmic module visible too (even though it's mostly
 // no-op without x0-broken-legacy's gated sub-modules).
@@ -1360,6 +1362,13 @@ async fn main() -> Result<()> {
     //   Plans/glimmering-mixing-moore-v2.md Slice A
     #[cfg(feature = "x0-extended")]
     crate::conscience::register_hook_factory();
+
+    // Install the continuity hook factory so every Agent built after this
+    // point loads/persists learned preferences when config.continuity.enabled
+    // is true. Same registry + idempotency semantics as the conscience hook.
+    //   src/continuity/hook.rs (HookHandler implementation)
+    #[cfg(feature = "x0-extended")]
+    crate::continuity::register_hook_factory();
 
     let cmd = apply_i18n_to_command(Cli::command());
 

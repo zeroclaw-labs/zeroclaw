@@ -865,6 +865,34 @@ impl Default for LifeConfig {
     }
 }
 
+// ── Continuity Config ───────────────────────────────────────────
+
+/// Cross-session continuity persistence (learned preferences + narrative).
+///
+/// When `enabled = true`, the continuity hook loads the agent's persisted
+/// `PreferenceModel`/`NarrativeStore` from `<data_dir>/continuity/` at
+/// construction, injects the learned preferences into every LLM call,
+/// extracts tool-usage preferences after each successful tool call, and
+/// saves the updated model back to disk. Default is OFF — opt-in for a
+/// soak window, mirroring the conscience gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct ContinuityConfig {
+    pub enabled: bool,
+    /// Maximum narrative episodes retained in the rolling store.
+    pub max_episodes: usize,
+}
+
+impl Default for ContinuityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_episodes: 100,
+        }
+    }
+}
+
 // ── Conscience Config ───────────────────────────────────────────
 
 /// Pre-action ethical/normative gate (PR-2 wiring).

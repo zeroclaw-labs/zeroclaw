@@ -1670,6 +1670,31 @@ pub async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
+        // Modifying hook before the LLM call: hooks may adjust the message
+        // history (e.g. continuity injects learned preferences as a leading
+        // system message). A cancelling hook aborts the turn with its reason.
+        if let Some(hooks) = hooks {
+            match hooks
+                .run_before_llm_call(std::mem::take(history), model.to_string())
+                .await
+            {
+                crate::hooks::HookResult::Continue((new_history, _new_model)) => {
+                    *history = new_history;
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
+                        "LLM call cancelled by hook"
+                    );
+                    return Err(anyhow::Error::msg(format!(
+                        "LLM call cancelled by hook: {reason}"
+                    )));
+                }
+            }
+        }
+
         // Fire void hook before LLM call
         if let Some(hooks) = hooks {
             hooks.fire_llm_input(history, model).await;

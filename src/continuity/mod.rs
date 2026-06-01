@@ -1,6 +1,7 @@
 pub mod commitments;
 pub mod extraction;
 pub mod guard;
+pub mod hook;
 pub mod identity;
 pub mod narrative;
 pub mod persistence;
@@ -10,6 +11,7 @@ pub mod types;
 pub use commitments::{check_fulfillment, extract_commitments};
 pub use extraction::{extract_channel_preference, extract_tool_preference};
 pub use guard::{ContinuityGuard, prune_low_confidence};
+pub use hook::{ContinuityHook, register_hook_factory};
 pub use identity::{
     compute_identity_checksum, identity_from_soul, identity_from_soul_with_epoch,
     verify_identity_rebuild,

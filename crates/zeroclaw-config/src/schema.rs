@@ -568,6 +568,8 @@ pub struct Config {
     #[serde(skip)]
     pub conscience: crate::x0_extensions::ConscienceConfig,
     #[serde(skip)]
+    pub continuity: crate::x0_extensions::ContinuityConfig,
+    #[serde(skip)]
     pub cosmic_brain: crate::x0_extensions::CosmicBrainConfig,
     #[serde(skip)]
     pub taskqueue: crate::x0_extensions::TaskQueueConfig,
@@ -13146,6 +13148,7 @@ impl Default for Config {
             cognitive: Default::default(),
             life: Default::default(),
             conscience: Default::default(),
+            continuity: Default::default(),
             snapshot: Default::default(),
             cosmic_brain: Default::default(),
             taskqueue: Default::default(),
@@ -16749,6 +16752,7 @@ auto_save = true
             cognitive: Default::default(),
             life: Default::default(),
             conscience: Default::default(),
+            continuity: Default::default(),
             snapshot: Default::default(),
             cosmic_brain: Default::default(),
             taskqueue: Default::default(),
@@ -17364,6 +17368,7 @@ default_temperature = 0.7
             cognitive: Default::default(),
             life: Default::default(),
             conscience: Default::default(),
+            continuity: Default::default(),
             snapshot: Default::default(),
             cosmic_brain: Default::default(),
             taskqueue: Default::default(),
