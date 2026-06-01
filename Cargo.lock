@@ -14756,6 +14756,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-conscience"
+version = "0.8.0-beta-2"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "zeroclaw-log",
+]
+
+[[package]]
 name = "zeroclaw-desktop"
 version = "0.1.0"
 dependencies = [
@@ -15249,6 +15259,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-conscience",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-infra",

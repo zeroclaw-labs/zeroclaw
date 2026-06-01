@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::types::{RepairPlan, SelfState};
+use crate::types::{RepairPlan, SelfState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Violation {
@@ -35,9 +35,9 @@ pub struct IntegrityLedger {
     pub repairs: Vec<RepairPlan>,
     pub drift_alerts: Vec<DriftAlert>,
     #[serde(default)]
-    pub audit_trail: Vec<super::types::VerdictRecord>,
+    pub audit_trail: Vec<crate::types::VerdictRecord>,
     #[serde(default)]
-    pub evolved_norms: Vec<super::types::NormConfig>,
+    pub evolved_norms: Vec<crate::types::NormConfig>,
 }
 
 impl Default for IntegrityLedger {
@@ -66,21 +66,19 @@ impl IntegrityLedger {
     /// hard failure should call [`Self::load`] (TODO when wanted).
     pub fn load_or_default(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(bytes) if !bytes.is_empty() => {
-                serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "path": path.display().to_string(),
-                                "error": e.to_string(),
-                            })),
-                        "IntegrityLedger: corrupt persistence file, starting fresh"
-                    );
-                    Self::default()
-                })
-            }
+            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "path": path.display().to_string(),
+                            "error": e.to_string(),
+                        })),
+                    "IntegrityLedger: corrupt persistence file, starting fresh"
+                );
+                Self::default()
+            }),
             _ => Self::default(),
         }
     }
@@ -151,11 +149,11 @@ impl IntegrityLedger {
     pub fn record_verdict(
         &mut self,
         tool_name: &str,
-        verdict: super::types::GateVerdict,
+        verdict: crate::types::GateVerdict,
         score: f64,
         user_response: Option<bool>,
     ) {
-        self.audit_trail.push(super::types::VerdictRecord {
+        self.audit_trail.push(crate::types::VerdictRecord {
             tool_name: tool_name.to_string(),
             verdict,
             score,

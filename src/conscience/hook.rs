@@ -36,9 +36,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_config::x0_extensions::{ConscienceConfig, NormConfigSerde};
 use zeroclaw_runtime::hooks::{HookHandler, HookResult};
 
-use super::gate::evaluate_tool_call;
-use super::ledger::IntegrityLedger;
-use super::types::{GateVerdict, Norm, NormAction, NormConfig, Thresholds};
+use zeroclaw_conscience::gate::evaluate_tool_call;
+use zeroclaw_conscience::ledger::IntegrityLedger;
+use zeroclaw_conscience::types::{GateVerdict, Norm, NormAction, Thresholds};
 
 /// Filename of the persisted integrity ledger under `<data_dir>/conscience/`.
 const LEDGER_FILENAME: &str = "ledger.json";
@@ -95,11 +95,7 @@ impl ConscienceHook {
                 ask_above: cfg.ask_threshold,
                 block_below: cfg.block_threshold,
             },
-            norms: cfg
-                .default_norms
-                .iter()
-                .map(|s| convert_norm(s).into_runtime_norm())
-                .collect(),
+            norms: cfg.default_norms.iter().map(convert_norm).collect(),
             ledger: Arc::new(Mutex::new(ledger)),
             ledger_path,
         }
@@ -234,11 +230,12 @@ fn verdict_label(verdict: &GateVerdict) -> &'static str {
 }
 
 /// Translate the serde-friendly mirror that lives in `zeroclaw-config`
-/// into the binary-local `NormConfig` shape, then into a runtime `Norm`.
-/// The intermediate hop is necessary because `zeroclaw-config` cannot
-/// depend on this binary-local module.
-fn convert_norm(serde_norm: &NormConfigSerde) -> NormConfig {
-    NormConfig {
+/// straight into the runtime `Norm` the gate evaluates against.
+/// `zeroclaw-config` cannot depend on the `zeroclaw-conscience` crate, so
+/// it carries its own `NormConfigSerde`; this adapter is the single hop
+/// that maps it onto the conscience crate's `Norm`.
+fn convert_norm(serde_norm: &NormConfigSerde) -> Norm {
+    Norm {
         name: serde_norm.name.clone(),
         action: match serde_norm.action {
             zeroclaw_config::x0_extensions::NormActionSerde::Allow => NormAction::Prefer,
@@ -247,19 +244,6 @@ fn convert_norm(serde_norm: &NormConfigSerde) -> NormConfig {
         },
         condition: serde_norm.condition.clone(),
         severity: serde_norm.severity,
-    }
-}
-
-impl NormConfig {
-    /// Shim that funnels the serialised + decoded `NormConfig` into the
-    /// runtime `Norm` the gate evaluates against.
-    fn into_runtime_norm(self) -> Norm {
-        Norm {
-            name: self.name,
-            action: self.action,
-            condition: self.condition,
-            severity: self.severity,
-        }
     }
 }
 
@@ -295,9 +279,7 @@ mod tests {
         let hook = ConscienceHook::new(&cfg);
         // file_read is a low-harm tool name (scores 0.74); at the shipped
         // defaults (allow_above=0.70) it falls in Allow.
-        let result = hook
-            .before_tool_call("file_read".into(), Value::Null)
-            .await;
+        let result = hook.before_tool_call("file_read".into(), Value::Null).await;
         assert!(
             matches!(result, HookResult::Continue(_)),
             "low-harm tool must Allow, got {:?}",
@@ -311,9 +293,7 @@ mod tests {
         let hook = ConscienceHook::new(&cfg);
         // shell calls map to (harm=0.6, reversibility=0.3); with default
         // thresholds the gate should produce something other than Allow.
-        let result = hook
-            .before_tool_call("shell".into(), Value::Null)
-            .await;
+        let result = hook.before_tool_call("shell".into(), Value::Null).await;
         match result {
             HookResult::Cancel(reason) => {
                 assert!(reason.starts_with("conscience:"), "reason: {reason}");
@@ -329,15 +309,17 @@ mod tests {
         let ledger_handle = hook.ledger();
 
         assert_eq!(
-            ledger_handle.lock().unwrap().to_self_state().recent_violations,
+            ledger_handle
+                .lock()
+                .unwrap()
+                .to_self_state()
+                .recent_violations,
             0,
             "fresh ledger reports no violations"
         );
 
         // Drive a non-Allow verdict.
-        let _ = hook
-            .before_tool_call("shell".into(), Value::Null)
-            .await;
+        let _ = hook.before_tool_call("shell".into(), Value::Null).await;
 
         let state_after = ledger_handle.lock().unwrap().to_self_state();
         assert!(
@@ -353,12 +335,14 @@ mod tests {
         let hook = ConscienceHook::new(&cfg);
         let ledger_handle = hook.ledger();
 
-        let _ = hook
-            .before_tool_call("file_read".into(), Value::Null)
-            .await;
+        let _ = hook.before_tool_call("file_read".into(), Value::Null).await;
 
         assert_eq!(
-            ledger_handle.lock().unwrap().to_self_state().recent_violations,
+            ledger_handle
+                .lock()
+                .unwrap()
+                .to_self_state()
+                .recent_violations,
             0,
             "Allow path must not write to the ledger"
         );
@@ -371,9 +355,7 @@ mod tests {
         let ledger_handle = hook.ledger();
 
         for _ in 0..3 {
-            let _ = hook
-                .before_tool_call("shell".into(), Value::Null)
-                .await;
+            let _ = hook.before_tool_call("shell".into(), Value::Null).await;
         }
 
         let state = ledger_handle.lock().unwrap().to_self_state();
@@ -392,9 +374,7 @@ mod tests {
         let path = tmp.path().join("conscience").join("ledger.json");
 
         // No file yet — first violation should create it.
-        let _ = hook
-            .before_tool_call("shell".into(), Value::Null)
-            .await;
+        let _ = hook.before_tool_call("shell".into(), Value::Null).await;
 
         assert!(
             path.exists(),
@@ -419,9 +399,7 @@ mod tests {
         {
             let hook = ConscienceHook::with_persistence(&cfg, tmp.path());
             for _ in 0..2 {
-                let _ = hook
-                    .before_tool_call("shell".into(), Value::Null)
-                    .await;
+                let _ = hook.before_tool_call("shell".into(), Value::Null).await;
             }
         }
 

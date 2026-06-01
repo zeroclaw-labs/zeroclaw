@@ -1,0 +1,13 @@
+[package]
+name = "zeroclaw-conscience"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure moral/ethical governance core: the conscience gate (pre-action verdict), audit, integrity ledger, and the value/norm/self-state types they operate on. No runtime, config, or cosmic dependencies — the binary's hook and cosmic_bridge adapters wire it in."
+publish = false
+
+[dependencies]
+zeroclaw-log.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

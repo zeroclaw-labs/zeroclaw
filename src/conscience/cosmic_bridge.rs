@@ -1,5 +1,5 @@
-use super::types::SelfState;
 use crate::cosmic::{EmotionalModulator, FreeEnergyState, GlobalVariable};
+use zeroclaw_conscience::types::SelfState;
 
 pub fn self_state_from_cosmic(
     modulator: &EmotionalModulator,

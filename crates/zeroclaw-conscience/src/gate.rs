@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub use super::types::GateVerdict;
-use super::types::{
+pub use crate::types::GateVerdict;
+use crate::types::{
     ActionContext, Impact, NormAction, ProposedAction, RepairPlan, SelfState, Thresholds, Value,
     ValueType,
 };
@@ -61,7 +61,7 @@ pub fn conscience_gate(
 
     score = apply_cosmic_adjustments(score, self_state);
 
-    let low_confidence = self_state.confidence.map_or(false, |c| c < 0.3);
+    let low_confidence = self_state.confidence.is_some_and(|c| c < 0.3);
 
     if score >= thresholds.allow_above {
         if low_confidence {
@@ -81,18 +81,18 @@ pub fn conscience_gate(
 fn apply_cosmic_adjustments(score: f64, self_state: &SelfState) -> f64 {
     let mut adjusted = score;
 
-    if let Some(arousal) = self_state.arousal {
-        if arousal > 0.7 {
-            let penalty = (arousal - 0.7) * 0.15;
-            adjusted *= 1.0 - penalty;
-        }
+    if let Some(arousal) = self_state.arousal
+        && arousal > 0.7
+    {
+        let penalty = (arousal - 0.7) * 0.15;
+        adjusted *= 1.0 - penalty;
     }
 
-    if let Some(fe) = self_state.free_energy {
-        if fe > 0.7 {
-            let penalty = (fe - 0.7) * 0.1;
-            adjusted *= 1.0 - penalty;
-        }
+    if let Some(fe) = self_state.free_energy
+        && fe > 0.7
+    {
+        let penalty = (fe - 0.7) * 0.1;
+        adjusted *= 1.0 - penalty;
     }
 
     adjusted
@@ -161,7 +161,7 @@ pub fn evaluate_tool_call(
     tool_name: &str,
     thresholds: &Thresholds,
     self_state: &SelfState,
-    norms: &[super::types::Norm],
+    norms: &[crate::types::Norm],
     llm_risk_override: Option<f64>,
     tool_affinity: Option<f64>,
 ) -> (GateVerdict, f64) {
@@ -184,10 +184,10 @@ pub fn evaluate_tool_call(
         (0.1, 0.9)
     };
 
-    if let Some(affinity) = tool_affinity {
-        if affinity > 0.7 {
-            harm = (harm - affinity * 0.3).max(0.0);
-        }
+    if let Some(affinity) = tool_affinity
+        && affinity > 0.7
+    {
+        harm = (harm - affinity * 0.3).max(0.0);
     }
 
     let proposed = ProposedAction {
@@ -231,7 +231,7 @@ pub fn evaluate_tool_call(
 
     heuristic_score = apply_cosmic_adjustments(heuristic_score, self_state);
 
-    let low_confidence = self_state.confidence.map_or(false, |c| c < 0.3);
+    let low_confidence = self_state.confidence.is_some_and(|c| c < 0.3);
 
     let verdict = if heuristic_score >= thresholds.allow_above {
         if low_confidence {

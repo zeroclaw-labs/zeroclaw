@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-conscience", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
@@ -19,6 +19,7 @@ zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta
 zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-2" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-2", default-features = false }
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-2" }
+zeroclaw-conscience = { path = "crates/zeroclaw-conscience", version = "0.8.0-beta-2" }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-2", default-features = false }
 zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.8.0-beta-2" }
 zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-2" }
@@ -80,6 +81,7 @@ zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
+zeroclaw-conscience = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
 zeroclaw-tui = { workspace = true, optional = true }
 zeroclaw-plugins = { workspace = true, optional = true }
@@ -365,6 +367,7 @@ embedded-web = ["zeroclaw-gateway/embedded-web"]
 # X0 fork features — all fork modules gated behind x0-extended until API porting is done
 x0-extended = [
     "agent-runtime", "wallet", "quantum", "runtime-wasm",
+    "dep:zeroclaw-conscience",
 ]
 # Legacy X0 fork modules whose imports reference pre-V3 schema items
 # (DelegateAgentConfig, TreasuryConfig, providers::Provider,
