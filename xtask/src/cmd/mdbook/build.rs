@@ -34,6 +34,7 @@ pub fn build_locales(root: &std::path::Path) -> anyhow::Result<()> {
             .join(" ")
     );
     inject_lang_switcher_locales(&book, &entries)?;
+    crate::cmd::mdbook::themes::run(root)?;
     let mdbook = mdbook_program()?;
     for entry in &entries {
         run_cmd(
