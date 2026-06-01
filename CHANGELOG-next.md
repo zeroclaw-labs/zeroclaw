@@ -205,6 +205,7 @@ The lowercase tail mirrors the dotted prop-path `config set` accepts (each `_` i
 - Observability: `runtime_trace::record_event` retired in favor of `record!` everywhere; the `record!` shape is locked and carries alias-bound attribution through spans.
 - Cron: the `agent_alias` fallback to `DEFAULT_AGENT_ALIAS` is removed; jobs must name their agent.
 - TTS/transcription `default_*_provider` fields are deleted; each agent declares its own.
+- **Agent builder API:** `AgentBuilder::memory_loader(Box<dyn MemoryLoader>)` is removed and replaced by `AgentBuilder::memory_strategy(Arc<dyn MemoryStrategy>)`. Callers that previously supplied a custom loader must now wrap it in a `DefaultMemoryStrategy` (or their own `MemoryStrategy` implementation) and pass it via `.memory_strategy(...)`. The builder's default fallback automatically creates a `DefaultMemoryStrategy` when no explicit strategy is provided, so most test and ad-hoc callers are unaffected. (#6850)
 
 ## Known Issues
 

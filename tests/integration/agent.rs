@@ -8,10 +8,11 @@
 //! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 6)
 
 use crate::support::helpers::{
-    StaticMemoryLoader, build_agent, build_agent_xml, build_recording_agent, text_response,
+    StaticMemoryStrategy, build_agent, build_agent_xml, build_recording_agent, text_response,
     tool_response,
 };
 use crate::support::{CountingTool, EchoTool, MockModelProvider, RecordingModelProvider};
+use std::sync::Arc;
 use zeroclaw::providers::traits::ChatMessage;
 use zeroclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
 
@@ -268,9 +269,9 @@ async fn e2e_memory_enrichment_injects_context() {
         RecordingModelProvider::new(vec![text_response("enriched response")]);
 
     let memory_context = "[Memory context]\n- user_name: test_user\n[/Memory context]\n\n";
-    let loader = StaticMemoryLoader::new(memory_context);
+    let strategy = Arc::new(StaticMemoryStrategy::new(memory_context));
 
-    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(strategy));
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "enriched response");
@@ -314,9 +315,9 @@ async fn e2e_multi_turn_with_memory_enrichment() {
         RecordingModelProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
     let memory_context = "[Memory context]\n- project: zeroclaw\n[/Memory context]\n\n";
-    let loader = StaticMemoryLoader::new(memory_context);
+    let strategy = Arc::new(StaticMemoryStrategy::new(memory_context));
 
-    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(strategy));
 
     let r1 = agent.turn("first question").await.unwrap();
     assert_eq!(r1, "answer 1");
@@ -364,9 +365,9 @@ async fn e2e_empty_memory_context_passthrough() {
     let (model_provider, recorded) =
         RecordingModelProvider::new(vec![text_response("plain response")]);
 
-    let loader = StaticMemoryLoader::new("");
+    let strategy = Arc::new(StaticMemoryStrategy::new(""));
 
-    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(strategy));
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "plain response");

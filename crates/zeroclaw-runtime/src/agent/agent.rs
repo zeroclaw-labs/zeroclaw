@@ -3,7 +3,6 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -35,7 +34,7 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_loader: Box<dyn MemoryLoader>,
+    memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
     config: zeroclaw_config::schema::AliasedAgentConfig,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
@@ -158,7 +157,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
+    memory_strategy: Option<Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -198,7 +197,7 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_loader: None,
+            memory_strategy: None,
             config: None,
             multimodal_config: None,
             model_name: None,
@@ -254,8 +253,11 @@ impl AgentBuilder {
         self
     }
 
-    pub fn memory_loader(mut self, memory_loader: Box<dyn MemoryLoader>) -> Self {
-        self.memory_loader = Some(memory_loader);
+    pub fn memory_strategy(
+        mut self,
+        memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+    ) -> Self {
+        self.memory_strategy = Some(memory_strategy);
         self
     }
 
@@ -403,6 +405,20 @@ impl AgentBuilder {
             tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
         }
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
+        let memory = self.memory.clone().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing_field": "memory"})),
+                "AgentBuilder::build missing required field"
+            );
+            anyhow::Error::msg("memory is required")
+        })?;
+        let workspace_dir = self
+            .workspace_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
 
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
@@ -417,16 +433,7 @@ impl AgentBuilder {
             })?,
             tools,
             tool_specs,
-            memory: self.memory.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing_field": "memory"})),
-                    "AgentBuilder::build missing required field"
-                );
-                anyhow::Error::msg("memory is required")
-            })?,
+            memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -450,9 +457,15 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
-            memory_loader: self
-                .memory_loader
-                .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
+            memory_strategy: self.memory_strategy.unwrap_or_else(|| {
+                Arc::new(
+                    crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                        memory.clone(),
+                        zeroclaw_config::schema::MemoryConfig::default(),
+                        workspace_dir.clone(),
+                    ),
+                )
+            }),
             config: self.config.unwrap_or_default(),
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             // No silent vendor-default model. Callers that construct `Agent` via the
@@ -465,6 +478,7 @@ impl AgentBuilder {
                 .model_provider_name
                 .unwrap_or_else(|| "<unconfigured>".into()),
             temperature: self.temperature.unwrap_or(0.7),
+            // Default for test callers that don't call workspace_dir().
             workspace_dir: self
                 .workspace_dir
                 .clone()
@@ -601,12 +615,8 @@ impl Agent {
         new_msgs: &mut Vec<ConversationMessage>,
     ) {
         let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
+            .memory_strategy
+            .load_context(user_message, self.memory_session_id.as_deref())
             .await
             .unwrap_or_default();
 
@@ -1130,14 +1140,17 @@ impl Agent {
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(tools)
-            .memory(memory)
+            .memory(memory.clone())
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(
-                5,
-                config.memory.min_relevance_score,
-            )))
+            .memory_strategy(Arc::new(
+                crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    memory.clone(),
+                    config.memory.clone(),
+                    security.workspace_dir.clone(),
+                ),
+            ))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(agent_cfg.clone())
             .multimodal_config(config.multimodal.clone())
@@ -1583,12 +1596,8 @@ impl Agent {
         }
 
         let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
+            .memory_strategy
+            .load_context(user_message, self.memory_session_id.as_deref())
             .await
             .unwrap_or_default();
 
