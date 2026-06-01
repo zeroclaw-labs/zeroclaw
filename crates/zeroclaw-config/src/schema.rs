@@ -17014,6 +17014,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -17736,6 +17737,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
