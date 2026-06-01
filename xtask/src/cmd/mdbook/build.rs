@@ -163,22 +163,19 @@ fn extract_shared_chrome(root: &Path, tag_dir: &str) -> anyhow::Result<()> {
                 continue;
             }
             let file_name = file.file_name().unwrap().to_string_lossy();
-            if let Some(pos) = file_name.rfind('-') {
-                if let Some(ext_pos) = file_name.rfind('.') {
-                    if pos < ext_pos {
-                        let hash = &file_name[pos + 1..ext_pos];
-                        if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                            let unhashed_name =
-                                format!("{}{}", &file_name[..pos], &file_name[ext_pos..]);
-                            let dest_rel = rel.parent().unwrap().join(unhashed_name);
-                            let dest = shared_dir.join(&dest_rel);
-                            std::fs::create_dir_all(dest.parent().unwrap())?;
-                            std::fs::copy(&file, &dest)?;
-                            let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
-                            replacements
-                                .push((rel_str.clone(), format!("../../_shared/{}", dest_rel_str)));
-                        }
-                    }
+            if let Some(pos) = file_name.rfind('-')
+                && let Some(ext_pos) = file_name.rfind('.')
+                && pos < ext_pos
+            {
+                let hash = &file_name[pos + 1..ext_pos];
+                if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let unhashed_name = format!("{}{}", &file_name[..pos], &file_name[ext_pos..]);
+                    let dest_rel = rel.parent().unwrap().join(unhashed_name);
+                    let dest = shared_dir.join(&dest_rel);
+                    std::fs::create_dir_all(dest.parent().unwrap())?;
+                    std::fs::copy(&file, &dest)?;
+                    let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
+                    replacements.push((rel_str.clone(), format!("../../_shared/{}", dest_rel_str)));
                 }
             }
         }
@@ -187,18 +184,18 @@ fn extract_shared_chrome(root: &Path, tag_dir: &str) -> anyhow::Result<()> {
     for entry in locale_entries() {
         let loc_dir = tag_out_dir.join(&entry.code);
         for file in walk_dir(&loc_dir) {
-            if file.extension().map_or(false, |e| e == "html") {
-                if let Ok(mut content) = std::fs::read_to_string(&file) {
-                    let mut changed = false;
-                    for (from, to) in &replacements {
-                        if content.contains(from) {
-                            content = content.replace(from, to);
-                            changed = true;
-                        }
+            if file.extension().is_some_and(|e| e == "html")
+                && let Ok(mut content) = std::fs::read_to_string(&file)
+            {
+                let mut changed = false;
+                for (from, to) in &replacements {
+                    if content.contains(from) {
+                        content = content.replace(from, to);
+                        changed = true;
                     }
-                    if changed {
-                        let _ = std::fs::write(&file, content);
-                    }
+                }
+                if changed {
+                    let _ = std::fs::write(&file, content);
                 }
             }
             if let Ok(rel) = file.strip_prefix(&loc_dir) {
