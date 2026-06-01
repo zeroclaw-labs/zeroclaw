@@ -2,7 +2,7 @@ name: Quality Gate
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number }}
@@ -33,7 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install system dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
       - name: Ensure web/dist placeholder exists
@@ -76,7 +76,7 @@ jobs:
         if: runner.os != 'Windows'
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y mold
@@ -102,8 +102,14 @@ jobs:
           - name: all features
             args: --features ci-all
             sys_deps: libudev-dev
+          # Library-crate guarantee: the libs must stay feature-clean for
+          # downstream consumers. Two members are excluded:
+          #   - zeroclawlabs: the agent-runtime CLI binary; agent-runtime is a
+          #     default feature and its 12 command groups can't compile without it.
+          #   - zeroclaw-desktop: the Tauri app, which needs Linux glib/gtk
+          #     system libraries this check job doesn't install.
           - name: no default features
-            args: --no-default-features
+            args: --no-default-features --workspace --exclude zeroclawlabs --exclude zeroclaw-desktop
             sys_deps: ""
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -113,7 +119,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install system dependencies
         if: matrix.sys_deps != ''
         run: sudo apt-get update -qq && sudo apt-get install -y ${{ matrix.sys_deps }}
@@ -136,13 +142,16 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install 32-bit system libraries
         run: sudo apt-get update -qq && sudo apt-get install -y gcc-multilib
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check (32-bit, no default features)
-        run: cargo check --locked --target i686-unknown-linux-gnu --no-default-features
+        # Library crates only. zeroclawlabs (agent-runtime CLI) is validated on
+        # the native-target build jobs; zeroclaw-desktop (Tauri) needs glib/gtk
+        # system libs not installed here.
+        run: cargo check --locked --target i686-unknown-linux-gnu --no-default-features --workspace --exclude zeroclawlabs --exclude zeroclaw-desktop
 
   bench:
     name: Benchmarks Compile
@@ -157,7 +166,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Verify benchmarks compile
@@ -178,7 +187,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -206,7 +215,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       - name: Check licenses, sources, and advisories

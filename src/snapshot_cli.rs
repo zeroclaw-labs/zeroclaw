@@ -156,7 +156,10 @@ async fn handle_restore(
     if !yes {
         let patch = snap.patch(hash).await;
         if patch.files.is_empty() {
-            println!("{} nothing to restore — no files changed vs {hash}", style("·").dim());
+            println!(
+                "{} nothing to restore — no files changed vs {hash}",
+                style("·").dim()
+            );
             return Ok(());
         }
         eprintln!(
@@ -199,8 +202,7 @@ async fn handle_revert(cwd: &std::path::Path, yes: bool, config: &Config) -> Res
     std::io::stdin()
         .read_to_string(&mut buf)
         .context("failed to read patch JSON from stdin")?;
-    let patches: Vec<Patch> =
-        serde_json::from_str(&buf).context("invalid patch JSON on stdin")?;
+    let patches: Vec<Patch> = serde_json::from_str(&buf).context("invalid patch JSON on stdin")?;
     if patches.is_empty() {
         println!("{} no patches supplied", style("·").dim());
         return Ok(());
@@ -230,6 +232,9 @@ async fn handle_revert(cwd: &std::path::Path, yes: bool, config: &Config) -> Res
 async fn handle_cleanup(cwd: &std::path::Path, config: &Config) -> Result<()> {
     let snap = snap_or_err(cwd, config)?;
     snap.cleanup().await;
-    println!("{} pruned shadow objects older than 7 days", style("✓").green());
+    println!(
+        "{} pruned shadow objects older than 7 days",
+        style("✓").green()
+    );
     Ok(())
 }

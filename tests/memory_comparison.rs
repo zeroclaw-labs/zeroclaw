@@ -206,11 +206,17 @@ async fn compare_recall_speed() {
 
     // Benchmark recall
     let start = Instant::now();
-    let sq_results = sq.recall("Rust systems", 10, None, None, None).await.unwrap();
+    let sq_results = sq
+        .recall("Rust systems", 10, None, None, None)
+        .await
+        .unwrap();
     let sq_dur = start.elapsed();
 
     let start = Instant::now();
-    let md_results = md.recall("Rust systems", 10, None, None, None).await.unwrap();
+    let md_results = md
+        .recall("Rust systems", 10, None, None, None)
+        .await
+        .unwrap();
     let md_dur = start.elapsed();
 
     println!("\n============================================================");

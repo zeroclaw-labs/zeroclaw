@@ -3312,14 +3312,13 @@ impl Config {
     ///
     /// Where the global gateway is the conflicting side, `alias_b` is
     /// the literal string `"<global gateway>"`.
-    pub fn find_duplicate_agent_gateway_ports(
-        &self,
-    ) -> Option<(String, String, u16)> {
-        let mut seen: std::collections::HashMap<u16, String> =
-            std::collections::HashMap::new();
+    pub fn find_duplicate_agent_gateway_ports(&self) -> Option<(String, String, u16)> {
+        let mut seen: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
         seen.insert(self.gateway.port, "<global gateway>".to_string());
         for (alias, agent) in &self.agents {
-            let Some(port) = agent.gateway_port else { continue };
+            let Some(port) = agent.gateway_port else {
+                continue;
+            };
             if let Some(prev) = seen.get(&port) {
                 return Some((prev.clone(), alias.clone(), port));
             }
@@ -12819,8 +12818,12 @@ pub struct SnapshotConfig {
     pub cleanup_interval_hours: u64,
 }
 
-fn default_snapshot_auto_track_interval_secs() -> u64 { 60 }
-fn default_snapshot_cleanup_interval_hours() -> u64 { 24 }
+fn default_snapshot_auto_track_interval_secs() -> u64 {
+    60
+}
+fn default_snapshot_cleanup_interval_hours() -> u64 {
+    24
+}
 
 impl Default for SnapshotConfig {
     fn default() -> Self {
@@ -15861,8 +15864,10 @@ mod tests {
     async fn agent_gateway_port_falls_back_to_global_when_unset() {
         let mut config = Config::default();
         config.gateway.port = 42617;
-        let mut agent = AliasedAgentConfig::default();
-        agent.gateway_port = None;
+        let agent = AliasedAgentConfig {
+            gateway_port: None,
+            ..Default::default()
+        };
         config.agents.insert("default".into(), agent);
 
         assert_eq!(config.agent_gateway_port("default"), 42617);
@@ -15872,8 +15877,10 @@ mod tests {
     async fn agent_gateway_port_uses_per_agent_override_when_set() {
         let mut config = Config::default();
         config.gateway.port = 42617;
-        let mut agent = AliasedAgentConfig::default();
-        agent.gateway_port = Some(9001);
+        let agent = AliasedAgentConfig {
+            gateway_port: Some(9001),
+            ..Default::default()
+        };
         config.agents.insert("support".into(), agent);
 
         assert_eq!(config.agent_gateway_port("support"), 9001);
@@ -15890,10 +15897,14 @@ mod tests {
     #[test]
     async fn duplicate_gateway_ports_between_agents_are_detected() {
         let mut config = Config::default();
-        let mut a = AliasedAgentConfig::default();
-        a.gateway_port = Some(9001);
-        let mut b = AliasedAgentConfig::default();
-        b.gateway_port = Some(9001);
+        let a = AliasedAgentConfig {
+            gateway_port: Some(9001),
+            ..Default::default()
+        };
+        let b = AliasedAgentConfig {
+            gateway_port: Some(9001),
+            ..Default::default()
+        };
         config.agents.insert("alpha".into(), a);
         config.agents.insert("beta".into(), b);
 
@@ -15912,8 +15923,10 @@ mod tests {
     async fn agent_gateway_port_colliding_with_global_is_detected() {
         let mut config = Config::default();
         config.gateway.port = 42617;
-        let mut a = AliasedAgentConfig::default();
-        a.gateway_port = Some(42617);
+        let a = AliasedAgentConfig {
+            gateway_port: Some(42617),
+            ..Default::default()
+        };
         config.agents.insert("alpha".into(), a);
 
         let dup = config.find_duplicate_agent_gateway_ports();
@@ -15947,16 +15960,18 @@ mod tests {
     async fn isolated_to_agent_returns_filtered_view_with_overridden_port() {
         let mut config = Config::default();
         config.gateway.port = 42617;
-        let mut a = AliasedAgentConfig::default();
-        a.gateway_port = Some(9001);
-        let mut b = AliasedAgentConfig::default();
-        b.gateway_port = Some(9002);
+        let a = AliasedAgentConfig {
+            gateway_port: Some(9001),
+            ..Default::default()
+        };
+        let b = AliasedAgentConfig {
+            gateway_port: Some(9002),
+            ..Default::default()
+        };
         config.agents.insert("alpha".into(), a);
         config.agents.insert("beta".into(), b);
 
-        let isolated = config
-            .isolated_to_agent("alpha")
-            .expect("alpha has a port");
+        let isolated = config.isolated_to_agent("alpha").expect("alpha has a port");
         assert_eq!(isolated.agents.len(), 1);
         assert!(isolated.agents.contains_key("alpha"));
         assert!(!isolated.agents.contains_key("beta"));
@@ -15973,10 +15988,14 @@ mod tests {
     async fn unique_agent_gateway_ports_pass() {
         let mut config = Config::default();
         config.gateway.port = 42617;
-        let mut a = AliasedAgentConfig::default();
-        a.gateway_port = Some(9001);
-        let mut b = AliasedAgentConfig::default();
-        b.gateway_port = Some(9002);
+        let a = AliasedAgentConfig {
+            gateway_port: Some(9001),
+            ..Default::default()
+        };
+        let b = AliasedAgentConfig {
+            gateway_port: Some(9002),
+            ..Default::default()
+        };
         config.agents.insert("alpha".into(), a);
         config.agents.insert("beta".into(), b);
 

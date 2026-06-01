@@ -50,10 +50,7 @@ pub struct AgentsSummaryResponse {
 
 /// `GET /api/agents/summary` — read-only overview of configured agents
 /// with per-agent gateway info.
-pub async fn handle_agents_summary(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_agents_summary(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -68,17 +65,12 @@ pub async fn handle_agents_summary(
         .iter()
         .map(|(alias, agent)| {
             let port = agent.gateway_port.unwrap_or(config.gateway.port);
-            let gateway_url = agent
-                .gateway_port
-                .map(|p| format!("{scheme}://{host}:{p}"));
+            let gateway_url = agent.gateway_port.map(|p| format!("{scheme}://{host}:{p}"));
             AgentSummary {
                 alias: alias.clone(),
                 enabled: agent.enabled,
                 channel_count: agent.channels.len(),
-                workspace_dir: config
-                    .agent_workspace_dir(alias)
-                    .display()
-                    .to_string(),
+                workspace_dir: config.agent_workspace_dir(alias).display().to_string(),
                 gateway_url,
                 gateway_port: port,
                 dedicated_gateway: agent.gateway_port.is_some(),

@@ -1230,6 +1230,10 @@ pub async fn run_tool_call_loop_ctx(ctx: LoopContext<'_>) -> Result<String> {
     .await
 }
 
+// 19 positional args predate the `LoopContext` work; Slice B of
+// Plans/glimmering-mixing-moore-v2.md folds these into a single context
+// struct, at which point this allow comes off.
+#[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,

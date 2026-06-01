@@ -10,7 +10,7 @@ name: Deploy mdBook docs to Pages
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - "docs/book/**"
       - "src/**"

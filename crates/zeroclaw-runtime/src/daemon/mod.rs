@@ -204,7 +204,9 @@ pub async fn run(
         // Plans/binary-seeking-umbrella.md Phase 2 — channels and cron
         // still see the full multi-agent config.
         for (alias, agent) in &config.agents {
-            let Some(agent_port) = agent.gateway_port else { continue };
+            let Some(agent_port) = agent.gateway_port else {
+                continue;
+            };
             let Some(isolated_cfg) = config.isolated_to_agent(alias) else {
                 continue;
             };
@@ -246,9 +248,7 @@ pub async fn run(
             let beat_name = name; // Re-use the leaked &'static str.
             handles.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Delay,
-                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     interval.tick().await;
                     crate::health::mark_component_ok(beat_name);

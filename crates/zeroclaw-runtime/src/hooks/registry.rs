@@ -32,8 +32,7 @@ use super::traits::HookHandler;
 /// binary wants to install in the next Agent. Run once per Agent build.
 /// Should be cheap — the closure runs on every agent spawn, including
 /// per-turn rebuilds in the gateway.
-pub type HookFactory =
-    Box<dyn Fn(&Config) -> Vec<Box<dyn HookHandler>> + Send + Sync + 'static>;
+pub type HookFactory = Box<dyn Fn(&Config) -> Vec<Box<dyn HookHandler>> + Send + Sync + 'static>;
 
 static REGISTRY: LazyLock<Mutex<Vec<HookFactory>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
