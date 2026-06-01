@@ -305,16 +305,6 @@ struct ModelCacheEntry {
     models: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ChannelRuntimeDefaults {
-    default_model_provider: String,
-    model: String,
-    temperature: Option<f64>,
-    api_key: Option<String>,
-    api_url: Option<String>,
-    reliability: zeroclaw_config::schema::ReliabilityConfig,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigFileStamp {
     modified: SystemTime,
@@ -360,7 +350,7 @@ struct ChannelCostTrackingState {
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     model_provider: Arc<dyn ModelProvider>,
-    default_model_provider: Arc<String>,
+    model_provider_ref: Arc<String>,
     /// Alias of the agent that owns this runtime context. Stamped onto
     /// every per-message tracing span so descendant events inherit the
     /// attribution without each call site re-passing it.
@@ -383,8 +373,6 @@ struct ChannelRuntimeContext {
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
-    api_key: Option<String>,
-    api_url: Option<String>,
     reliability: Arc<zeroclaw_config::schema::ReliabilityConfig>,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
@@ -976,61 +964,52 @@ fn canonical_model_provider_name(name: &str) -> Option<String> {
         .map(|model_provider| model_provider.name.to_string())
 }
 
-fn resolved_default_provider(config: &Config) -> String {
-    config
-        .first_model_provider_type()
-        .unwrap_or("openrouter")
-        .to_string()
+/// Strictly-resolved model provider for a runtime context, produced only by
+/// resolving an owning agent's mandatory `<type>.<alias>` reference against
+/// its own `[providers.models.<type>.<alias>]` entry. Carries no notion of a
+/// channel-wide "default" and has no fallback path — every field comes from
+/// the one resolved entry. Used solely to rebuild the provider on config
+/// reload.
+struct ResolvedRuntimeProvider {
+    model_provider: String,
+    model: String,
+    temperature: Option<f64>,
+    api_key: Option<String>,
+    api_url: Option<String>,
+    reliability: zeroclaw_config::schema::ReliabilityConfig,
 }
 
-/// Resolve the default model for channel startup: the first configured
-/// `[providers.models.<type>.<alias>]` entry's `model` field. Hard-fails
-/// with an actionable error when nothing is configured. There is no
-/// global fallback provider — every callsite either resolves through an
-/// agent's `model_provider` or comes through `first_provider()`.
-fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
-    if let Some(m) = config
-        .first_model_provider()
-        .and_then(|e| e.model.as_deref())
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        return Ok(m.to_string());
-    }
-    anyhow::bail!(
-        "no model configured: no [providers.models.<type>.<alias>] entry has a \
-         `model` field set. Configure at least one [providers.models.<type>.<alias>] \
-         model = \"...\", or define a [[model_routes]] hint, before starting channels.",
-    )
-}
-
-/// Resolve runtime defaults from `config` against a specific dotted
-/// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
-/// resolution path. Falls back to `first_model_provider()` when
-/// the reference is empty or doesn't resolve, preserving the conservative
-/// legacy behavior so misconfigured callsites still get safe defaults.
-fn runtime_defaults_from_config(
+/// Resolve the owning agent's model provider strictly from its mandatory
+/// dotted `<type>.<alias>` reference. There is no fallback: a ref that does
+/// not parse, does not resolve to a `[providers.models.<type>.<alias>]`
+/// entry, or whose entry has no `model` is rejected with an actionable
+/// error. Credentials (`api_key` / `uri`) come from that entry alone — a
+/// provider never inherits another provider's key.
+fn resolved_runtime_provider(
     config: &Config,
     model_provider: &str,
-) -> anyhow::Result<ChannelRuntimeDefaults> {
-    let dotted = model_provider.split_once('.');
-    let entry = dotted
-        .and_then(|(type_key, alias_key)| config.providers.models.find(type_key, alias_key))
-        .or_else(|| config.first_model_provider());
-    // `default_model_provider` carries the dotted `<type>.<alias>` ref so
-    // it compares equal to `route.model_provider` entries (also dotted),
-    // letting `get_or_create_provider` short-circuit the cache when a
-    // route targets the same alias as the default.
-    let default_model_provider = if !model_provider.is_empty() {
-        model_provider.to_string()
-    } else {
-        config
-            .first_model_provider_alias()
-            .unwrap_or_else(|| resolved_default_provider(config))
-    };
+) -> anyhow::Result<ResolvedRuntimeProvider> {
+    let (type_key, alias_key) = model_provider.split_once('.').ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "model_provider '{model_provider}' is not a dotted `<type>.<alias>` reference"
+        ))
+    })?;
+    let entry = config
+        .providers
+        .models
+        .find(type_key, alias_key)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider '{model_provider}' does not resolve to a \
+                 [providers.models.{type_key}.{alias_key}] entry"
+            ))
+        })?;
     let model = entry
-        .and_then(|e| e.model.clone())
-        .or_else(|| resolved_default_model(config).ok())
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(ToString::to_string)
         .ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1043,17 +1022,16 @@ fn runtime_defaults_from_config(
                 "orchestrator: model_provider has no resolvable model"
             );
             anyhow::Error::msg(format!(
-                "no model configured: model_provider '{model_provider}' does not resolve to a \
-                 ModelProviderConfig with a `model` field, and providers.models has no \
-                 fallback entry."
+                "model_provider '{model_provider}' has no `model` set in its \
+                 [providers.models.{type_key}.{alias_key}] entry"
             ))
         })?;
-    Ok(ChannelRuntimeDefaults {
-        default_model_provider,
+    Ok(ResolvedRuntimeProvider {
+        model_provider: model_provider.to_string(),
         model,
-        temperature: entry.and_then(|e| e.temperature),
-        api_key: entry.and_then(|e| e.api_key.clone()),
-        api_url: entry.and_then(|e| e.uri.clone()),
+        temperature: entry.temperature,
+        api_key: entry.api_key.clone(),
+        api_url: entry.uri.clone(),
         reliability: config.reliability.clone(),
     })
 }
@@ -1065,17 +1043,6 @@ fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
         .map(|dir| dir.join("config.toml"))
 }
 
-fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaults {
-    ChannelRuntimeDefaults {
-        default_model_provider: ctx.default_model_provider.as_str().to_string(),
-        model: ctx.model.as_str().to_string(),
-        temperature: ctx.temperature,
-        api_key: ctx.api_key.clone(),
-        api_url: ctx.api_url.clone(),
-        reliability: (*ctx.reliability).clone(),
-    }
-}
-
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
     let modified = metadata.modified().ok()?;
@@ -1085,10 +1052,10 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     })
 }
 
-async fn load_runtime_config_and_defaults(
+async fn load_runtime_config_and_provider(
     path: &Path,
     model_provider: &str,
-) -> Result<(Config, ChannelRuntimeDefaults)> {
+) -> Result<(Config, ResolvedRuntimeProvider)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -1102,8 +1069,8 @@ async fn load_runtime_config_and_defaults(
         parsed.decrypt_secrets(&store)?;
     }
 
-    let defaults = runtime_defaults_from_config(&parsed, model_provider)?;
-    Ok((parsed, defaults))
+    let resolved = resolved_runtime_provider(&parsed, model_provider)?;
+    Ok((parsed, resolved))
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -1125,55 +1092,67 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let (next_config, next_defaults) =
-        load_runtime_config_and_defaults(&config_path, &ctx.agent_cfg.model_provider).await?;
-    let next_options = zeroclaw_providers::options_for_provider_ref(
-        &next_config,
-        &next_defaults.default_model_provider,
+    let (reloaded_config, resolved) =
+        load_runtime_config_and_provider(&config_path, &ctx.agent_cfg.model_provider).await?;
+    let ResolvedRuntimeProvider {
+        model_provider,
+        model,
+        temperature,
+        api_key,
+        api_url,
+        reliability,
+    } = resolved;
+
+    let options = zeroclaw_providers::options_for_provider_ref(
+        &reloaded_config,
+        &model_provider,
         &ctx.provider_runtime_options,
     );
-    let next_default_model_provider = zeroclaw_providers::create_resilient_model_provider_from_ref(
-        &next_config,
-        &next_defaults.default_model_provider,
-        next_defaults.api_key.as_deref(),
-        next_defaults.api_url.as_deref(),
-        &next_defaults.reliability,
-        &next_options,
+    let model_provider_instance = zeroclaw_providers::create_resilient_model_provider_from_ref(
+        &reloaded_config,
+        &model_provider,
+        api_key.as_deref(),
+        api_url.as_deref(),
+        &reliability,
+        &options,
     )?;
-    let next_default_model_provider: Arc<dyn ModelProvider> =
-        Arc::from(next_default_model_provider);
+    let model_provider_instance: Arc<dyn ModelProvider> = Arc::from(model_provider_instance);
 
-    if let Err(err) = next_default_model_provider.warmup().await {
+    if let Err(err) = model_provider_instance.warmup().await {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
             return Ok(());
         }
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "err": err.to_string()})), "ModelProvider warmup failed after config reload (retryable, applying anyway)");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"model_provider": model_provider, "err": err.to_string()})
+                ),
+            "ModelProvider warmup failed after config reload (retryable, applying anyway)"
+        );
     }
 
     {
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
-        cache.insert(
-            next_defaults.default_model_provider.clone(),
-            Arc::clone(&next_default_model_provider),
-        );
+        cache.insert(model_provider.clone(), Arc::clone(&model_provider_instance));
     }
 
     *ctx.last_applied_config_stamp
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(stamp);
 
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "temperature": next_defaults.temperature, "agent_model_provider": ctx.agent_cfg.model_provider})), "Applied updated channel runtime config from disk");
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": model_provider, "model": model, "temperature": temperature, "agent_model_provider": ctx.agent_cfg.model_provider})), "Applied updated channel runtime config from disk");
 
     Ok(())
 }
 
-fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection {
-    let defaults = runtime_defaults_snapshot(ctx);
+fn agent_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection {
     ChannelRouteSelection {
-        model_provider: defaults.default_model_provider,
-        model: defaults.model,
+        model_provider: ctx.model_provider_ref.as_str().to_string(),
+        model: ctx.model.as_str().to_string(),
         api_key: None,
     }
 }
@@ -1184,16 +1163,16 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
         .unwrap_or_else(|e| e.into_inner())
         .get(sender_key)
         .cloned()
-        .unwrap_or_else(|| default_route_selection(ctx))
+        .unwrap_or_else(|| agent_route_selection(ctx))
 }
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
-    let default_route = default_route_selection(ctx);
+    let agent_route = agent_route_selection(ctx);
     let mut routes = ctx
         .route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if next == default_route {
+    if next == agent_route {
         routes.remove(sender_key);
     } else {
         routes.insert(sender_key.to_string(), next);
@@ -1603,6 +1582,28 @@ fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>) -> Strin
     }
 }
 
+/// Resolve a provider ref's own credentials strictly from its
+/// `[providers.models.<type>.<alias>]` entry. No default/global fallback: a
+/// provider only ever uses its own `api_key` / `uri`. Returns `(None, None)`
+/// for a ref that does not parse or does not resolve, so the provider factory
+/// surfaces the misconfiguration instead of silently borrowing another
+/// provider's key.
+fn provider_credentials_for_ref(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+) -> (Option<String>, Option<String>) {
+    let Some((type_key, alias_key)) = provider_ref.trim().split_once('.') else {
+        return (None, None);
+    };
+    config
+        .providers
+        .models
+        .find(type_key, alias_key)
+        .map_or((None, None), |entry| {
+            (entry.api_key.clone(), entry.uri.clone())
+        })
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
@@ -1620,30 +1621,28 @@ async fn get_or_create_provider(
         return Ok(existing);
     }
 
-    // Only return the pre-built default model_provider when there is no
-    // route-specific credential override — otherwise the default was
-    // created with the global key and would be wrong.
-    if route_api_key.is_none() && provider_name == ctx.default_model_provider.as_str() {
+    // Reuse the owning agent's already-built provider instance only when the
+    // request targets that same provider ref with no route-specific key. This
+    // is the agent using its own provider — not a fallback: a request for a
+    // different provider never borrows this instance or its key.
+    if route_api_key.is_none() && provider_name == ctx.model_provider_ref.as_str() {
         return Ok(Arc::clone(&ctx.model_provider));
     }
 
-    let defaults = runtime_defaults_snapshot(ctx);
-    let api_url = if provider_name == defaults.default_model_provider.as_str() {
-        defaults.api_url.as_deref()
-    } else {
-        None
-    };
-
-    // Prefer route-specific credential; fall back to the global key.
-    let effective_api_key = route_api_key
-        .map(ToString::to_string)
-        .or_else(|| ctx.api_key.clone());
+    // Resolve credentials and URL strictly from the requested provider's own
+    // `[providers.models.<type>.<alias>]` entry. There is no global/default
+    // fallback: a provider never inherits another provider's api_key or
+    // api_url. An unresolved ref yields no credentials so the factory
+    // surfaces the misconfiguration.
+    let (entry_api_key, entry_api_url) =
+        provider_credentials_for_ref(&ctx.prompt_config, provider_name);
+    let effective_api_key = route_api_key.map(ToString::to_string).or(entry_api_key);
 
     let model_provider = create_resilient_model_provider_nonblocking(
         Arc::clone(&ctx.prompt_config),
         provider_name,
         effective_api_key,
-        api_url.map(ToString::to_string),
+        entry_api_url,
         ctx.reliability.as_ref().clone(),
         ctx.provider_runtime_options.clone(),
     )
@@ -3444,7 +3443,6 @@ async fn process_channel_message_body(
         };
     }
 
-    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut active_model_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.model_provider,
@@ -3744,7 +3742,7 @@ async fn process_channel_message_body(
                     history[0].content.as_str(),
                     &history,
                     classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.temperature),
+                    classifier_temperature.or(ctx.temperature),
                 ),
             )
             .await
@@ -4147,7 +4145,7 @@ async fn process_channel_message_body(
                         notify_observer.as_ref() as &dyn Observer,
                         route.model_provider.as_str(),
                         route.model.as_str(),
-                        runtime_defaults.temperature,
+                        ctx.temperature,
                         true,
                         Some(&*ctx.approval_manager),
                         msg.channel.as_str(),
@@ -4203,11 +4201,18 @@ async fn process_channel_message_body(
                     )
                 );
 
+                // Resolve the switched-to provider's credentials strictly
+                // from its own `[providers.models.<type>.<alias>]` entry — the
+                // new provider must never inherit the previously-active
+                // provider's key or URL.
+                let (switch_api_key, switch_api_url) =
+                    provider_credentials_for_ref(&ctx.prompt_config, &new_model_provider);
+
                 match create_resilient_model_provider_nonblocking(
                     Arc::clone(&ctx.prompt_config),
                     &new_model_provider,
-                    ctx.api_key.clone(),
-                    ctx.api_url.clone(),
+                    switch_api_key,
+                    switch_api_url,
                     ctx.reliability.as_ref().clone(),
                     ctx.provider_runtime_options.clone(),
                 )
@@ -7539,13 +7544,19 @@ pub async fn start_channels(
     // via a one-time clone; channels themselves consult `config_arc`.
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
-    // No model resolves yet — the user has channels configured but hasn't
-    // finished onboarding their model_provider. Returning Ok() here lets the
-    // daemon supervisor mark the channels component "done" instead of
-    // restart-looping on the bail in `resolved_default_model`. The user
-    // completes onboarding at /onboard and reloads via /admin/reload to
-    // bring channels up.
-    if resolved_default_model(&config).is_err() {
+    // No agent's model provider resolves yet — the user has channels
+    // configured but hasn't finished onboarding their model_provider.
+    // Returning Ok() here lets the daemon supervisor mark the channels
+    // component "done" instead of restart-looping. The user completes
+    // onboarding at /onboard and reloads via /admin/reload to bring channels
+    // up. Resolution is strict: an enabled agent counts only if its mandatory
+    // `<type>.<alias>` ref resolves to a configured entry with a `model`.
+    let any_agent_provider_resolves = config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .any(|(_, a)| resolved_runtime_provider(&config, a.model_provider.as_str()).is_ok());
+    if !any_agent_provider_resolves {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7655,25 +7666,28 @@ pub async fn start_channels(
             })?
             .clone();
 
-        let agent_provider_entry = config
-            .model_provider_for_agent(agent_alias)
-            .or_else(|| config.first_model_provider());
-        let provider_name = config
-            .agents
-            .get(agent_alias)
-            .map(|a| a.model_provider.as_str().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| config.first_model_provider_alias())
-            .unwrap_or_else(|| resolved_default_provider(&config));
+        // Resolve the agent's model provider strictly from its mandatory
+        // `<type>.<alias>` reference. No fallback to a first/default provider:
+        // an agent whose ref does not resolve to a configured entry with a
+        // `model` is rejected here.
+        let ResolvedRuntimeProvider {
+            model_provider: provider_name,
+            model,
+            temperature,
+            api_key: provider_api_key,
+            api_url: provider_api_url,
+            reliability: provider_reliability,
+        } = resolved_runtime_provider(&config, agent.model_provider.as_str())
+            .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
                 &provider_name,
-                agent_provider_entry.and_then(|e| e.api_key.clone()),
-                agent_provider_entry.and_then(|e| e.uri.clone()),
-                config.reliability.clone(),
+                provider_api_key.clone(),
+                provider_api_url.clone(),
+                provider_reliability.clone(),
                 provider_runtime_options.clone(),
             )
             .await?,
@@ -7692,35 +7706,10 @@ pub async fn start_channels(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let model = agent_provider_entry
-            .and_then(|e| e.model.clone())
-            .or_else(|| {
-                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": agent_alias})), "model_provider has no `model` set; falling back to resolved_default_model");
-                resolved_default_model(&config).ok()
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "agent": agent_alias,
-                            "reason": "no_model_configured",
-                        })),
-                    "orchestrator: agent has no resolvable model"
-                );
-                anyhow::Error::msg(format!(
-                    "no model configured: agents.{agent_alias}.model_provider does not resolve to a \
-                     ModelProviderConfig with a `model` field, and providers.models is empty. \
-                     Configure `[providers.models.<type>.<alias>] model = \"...\"` and reference it \
-                     from `agents.{agent_alias}.model_provider`."
-                ))
-            })?;
-        let temperature: Option<f64> = agent_provider_entry.and_then(|e| e.temperature);
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             &config,
             agent_alias,
-            agent_provider_entry.and_then(|e| e.api_key.as_deref()),
+            provider_api_key.as_deref(),
         )
         .await?;
         let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -7758,7 +7747,7 @@ pub async fn start_channels(
             &config.web_fetch,
             &workspace,
             &config.agents,
-            agent_provider_entry.and_then(|e| e.api_key.as_deref()),
+            provider_api_key.as_deref(),
             &config,
             canvas_store.clone(),
             false,
@@ -8224,7 +8213,7 @@ pub async fn start_channels(
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&channels_by_name),
             model_provider: Arc::clone(&model_provider),
-            default_model_provider: Arc::new(provider_name.clone()),
+            model_provider_ref: Arc::new(provider_name.clone()),
             agent_alias: Arc::new(agent_alias.clone()),
             agent_cfg: Arc::new(agent.clone()),
             prompt_config: Arc::new(config.clone()),
@@ -8243,8 +8232,6 @@ pub async fn start_channels(
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: agent_provider_entry.and_then(|e| e.api_key.clone()),
-            api_url: agent_provider_entry.and_then(|e| e.uri.clone()),
             reliability: Arc::new(config.reliability.clone()),
             provider_runtime_options,
             workspace_dir: Arc::new(config.data_dir.clone()),
@@ -9006,7 +8993,7 @@ mod tests {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -9024,8 +9011,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9683,7 +9668,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -9699,8 +9684,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9813,7 +9796,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -9831,8 +9814,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9904,7 +9885,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -9920,8 +9901,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10011,7 +9990,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -10027,8 +10006,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10339,12 +10316,12 @@ mod tests {
         }
     }
 
-    fn test_runtime_ctx_with_config_agent_and_default_provider(
+    fn test_runtime_ctx_with_config_agent_and_provider_ref(
         channel: Arc<dyn Channel>,
         model_provider: Arc<dyn ModelProvider>,
         prompt_config: zeroclaw_config::schema::Config,
         agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
-        default_model_provider: &str,
+        model_provider_ref: &str,
     ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -10352,7 +10329,7 @@ mod tests {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider,
-            default_model_provider: Arc::new(default_model_provider.to_string()),
+            model_provider_ref: Arc::new(model_provider_ref.to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(agent_cfg),
             memory: Arc::new(NoopMemory),
@@ -10370,8 +10347,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -10975,7 +10950,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -10993,8 +10968,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11079,7 +11052,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(SessionsCurrentModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(
@@ -11098,8 +11071,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11187,7 +11158,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -11204,8 +11175,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11332,7 +11301,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -11349,8 +11318,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11448,7 +11415,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -11465,8 +11432,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11578,7 +11543,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -11596,8 +11561,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11692,7 +11655,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(RawToolArtifactModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -11710,8 +11673,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11791,7 +11752,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingAliasModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -11809,8 +11770,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11888,22 +11847,22 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let alt_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let alt_model_provider: Arc<dyn ModelProvider> = alt_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("openrouter".to_string(), alt_model_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -11921,8 +11880,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11999,9 +11956,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(route.model, "default-model");
 
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(alt_model_provider_impl.call_count.load(Ordering::SeqCst), 0);
@@ -12015,15 +11970,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let routed_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let routed_model_provider: Arc<dyn ModelProvider> = routed_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("openrouter".to_string(), routed_model_provider);
 
@@ -12040,8 +11995,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -12059,8 +12014,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12122,9 +12075,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
@@ -12167,7 +12118,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
         agent_cfg.precheck.timeout_secs = 1;
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_default_provider(
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             main_provider,
             prompt_config,
@@ -12238,7 +12189,7 @@ enabled = false
 timeout_secs = 5
 "#,
         );
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_default_provider(
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             provider,
             zeroclaw_config::schema::Config::default(),
@@ -12301,7 +12252,7 @@ timeout_secs = 5
             ..Default::default()
         };
         agent_cfg.precheck.timeout_secs = 5;
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_default_provider(
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             main_provider,
             prompt_config,
@@ -12377,7 +12328,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&startup_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -12395,8 +12346,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12471,7 +12420,7 @@ timeout_secs = 5
             model_provider: Arc::new(IterativeToolModelProvider {
                 required_tool_iterations: 11,
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -12489,8 +12438,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12575,7 +12522,7 @@ timeout_secs = 5
             model_provider: Arc::new(IterativeToolModelProvider {
                 required_tool_iterations: 20,
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -12593,8 +12540,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12938,7 +12883,7 @@ timeout_secs = 5
                 in_flight: in_flight.clone(),
                 peak_in_flight: peak_in_flight.clone(),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -12956,8 +12901,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13071,7 +13014,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -13089,8 +13032,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13214,7 +13155,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -13232,8 +13173,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13354,7 +13293,7 @@ timeout_secs = 5
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(180),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -13372,8 +13311,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13472,7 +13409,7 @@ timeout_secs = 5
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(20),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -13490,8 +13427,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13571,7 +13506,7 @@ timeout_secs = 5
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(5),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -13589,8 +13524,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14746,7 +14679,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -14764,8 +14697,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14903,7 +14834,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -14921,8 +14852,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
@@ -15102,7 +15031,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(RecallMemory),
@@ -15120,8 +15049,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -15230,7 +15157,7 @@ timeout_secs = 5
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -15246,8 +15173,6 @@ timeout_secs = 5
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16227,7 +16152,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -16245,8 +16170,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16333,7 +16256,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -16351,8 +16274,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16475,7 +16396,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(FormatErrorModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -16493,8 +16414,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16634,15 +16553,15 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let vision_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let vision_model_provider: Arc<dyn ModelProvider> = vision_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
@@ -16664,8 +16583,8 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -16683,8 +16602,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16747,9 +16664,7 @@ This is an example JSON object for profile settings."#;
 
         // Vision model_provider should have been called instead of the default.
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
@@ -16774,15 +16689,15 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let vision_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let vision_model_provider: Arc<dyn ModelProvider> = vision_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
@@ -16805,8 +16720,8 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -16824,8 +16739,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16888,9 +16801,7 @@ This is an example JSON object for profile settings."#;
 
         // Default model_provider should be used since classification is disabled.
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -16907,15 +16818,15 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let vision_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let vision_model_provider: Arc<dyn ModelProvider> = vision_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
@@ -16938,8 +16849,8 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -16957,8 +16868,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -17021,9 +16930,7 @@ This is an example JSON object for profile settings."#;
 
         // Default model_provider should be used since no classification rule matched.
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -17040,8 +16947,8 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let fast_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let fast_model_provider: Arc<dyn ModelProvider> = fast_model_provider_impl.clone();
         let code_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
@@ -17050,7 +16957,7 @@ This is an example JSON object for profile settings."#;
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("fast-provider".to_string(), fast_model_provider);
         provider_cache_seed.insert("code-provider".to_string(), code_model_provider);
@@ -17091,8 +16998,8 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -17110,8 +17017,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -17174,9 +17079,7 @@ This is an example JSON object for profile settings."#;
 
         // Higher-priority "code" rule (priority=10) should win over "fast" (priority=1).
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
@@ -17447,7 +17350,7 @@ This is an example JSON object for profile settings."#;
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(150),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -17465,8 +17368,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
