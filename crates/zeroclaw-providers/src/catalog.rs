@@ -113,8 +113,6 @@ struct NearaiModelMetadata {
 
 #[derive(Debug, Default, Deserialize)]
 struct NearaiArchitecture {
-    #[serde(default, rename = "inputModalities")]
-    input_modalities: Vec<String>,
     #[serde(default, rename = "outputModalities")]
     output_modalities: Vec<String>,
 }
