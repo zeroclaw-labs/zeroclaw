@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
@@ -21,6 +21,7 @@ zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-2" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-2", default-features = false }
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-2" }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-2", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.0-beta-2" }
 zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-2" }
 zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-2" }
 zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-2" }
@@ -83,6 +84,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
+zeroclaw-eval = { workspace = true, optional = true }
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }
 zeroclaw-hardware = { workspace = true, optional = true }
@@ -252,7 +254,7 @@ default = [
 # Channels are opt-in via the lean `default-channels` bundle, `channels-full`,
 # or individual `channel-*` features.
 agent-runtime = [
-    "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:zeroclaw-runtime", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",

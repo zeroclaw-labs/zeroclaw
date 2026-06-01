@@ -13062,6 +13062,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-eval"
+version = "0.8.0-beta-2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-memory",
+ "zeroclaw-runtime",
+]
+
+[[package]]
 name = "zeroclaw-gateway"
 version = "0.8.0-beta-2"
 dependencies = [
@@ -13522,6 +13539,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-infra",
