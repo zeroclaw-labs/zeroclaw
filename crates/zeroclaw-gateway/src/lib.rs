@@ -5285,10 +5285,7 @@ mod tests {
     /// Helper: build an `AppState` with one Linq channel registered under the
     /// given alias, with an allow-any peer resolver and an optional signing
     /// secret.
-    fn linq_test_state(
-        alias: &str,
-        signing_secret: Option<&str>,
-    ) -> AppState {
+    fn linq_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
@@ -5455,8 +5452,14 @@ mod tests {
 
         let body = linq_webhook_body("+15551234567", "hello from test");
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Signature", HeaderValue::from_static("sha256=deadbeef"));
-        headers.insert("X-Webhook-Timestamp", HeaderValue::from_static("9999999999"));
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_static("sha256=deadbeef"),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_static("9999999999"),
+        );
 
         let response = Box::pin(handle_linq_webhook(
             State(state),
@@ -5480,8 +5483,14 @@ mod tests {
         let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Signature", HeaderValue::from_str(&format!("sha256={sig}")).unwrap());
-        headers.insert("X-Webhook-Timestamp", HeaderValue::from_str(&timestamp).unwrap());
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
 
         let response = Box::pin(handle_linq_webhook(
             State(state),
