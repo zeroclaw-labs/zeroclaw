@@ -1,3 +1,8 @@
+/* @import must precede all style rules per the CSS spec, so the font import
+   leads the file — placed lower it is silently dropped and the docs fall back
+   to system fonts. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
 /* ============================================================================
    ZeroClaw docs reskin — Tier A (CSS-only)
    Ports the web dashboard's --pc-* design system onto mdBook's `ayu` theme.
@@ -47,7 +52,7 @@
   --pc-status-error: #ff4466;
   --pc-status-info: #0080ff;
 
-  /* Fonts (loaded via @import below) */
+  /* Fonts (loaded via the @import at the top of this file) */
   --pc-font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   --pc-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace;
 
@@ -103,8 +108,6 @@
 /* ---------------------------------------------------------------------------
    3. Fonts
    --------------------------------------------------------------------------- */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
 html,
 body,
 .content {
@@ -118,6 +121,7 @@ kbd,
 pre,
 .hljs,
 code span {
+  /* mdBook's ayu highlight.js theme sets font-family on these inline; override it. */
   font-family: var(--pc-font-mono) !important;
 }
 
@@ -304,6 +308,7 @@ li.chapter-item.expanded > .chapter-link-wrapper > .chapter-fold-toggle {
 }
 
 .content pre {
+  /* mdBook's ayu theme sets a fixed code background; override to our token. */
   background: var(--pc-bg-code) !important;
   border: 1px solid var(--pc-border);
   border-radius: var(--pc-radius);
@@ -416,11 +421,13 @@ pre > .buttons .clip-button:hover {
 }
 
 .content table tbody tr {
+  /* mdBook applies an alternating-row background; override so rows stay flat. */
   background: transparent !important;
   transition: background 0.15s ease;
 }
 
 .content table tbody tr:hover {
+  /* Same specificity battle as above — force our hover token over the zebra rule. */
   background: var(--pc-hover) !important;
 }
 
@@ -773,6 +780,7 @@ body,
   font-weight: 700;
   letter-spacing: -0.03em;
   margin: 0 0 0.6rem;
+  /* mdBook gives h1 a bottom border + padding; strip them so the gradient hero title sits flush. */
   border: none !important;
   padding: 0 !important;
   background: linear-gradient(135deg, var(--pc-text-primary), var(--pc-accent-light));
@@ -802,6 +810,7 @@ body,
   border-radius: 0.8rem;
   font-weight: 600;
   font-size: 0.92rem;
+  /* mdBook underlines .content links; the hero CTA buttons must not be underlined. */
   text-decoration: none !important;
   border: 1px solid transparent;
   transition: all 0.2s ease;
@@ -849,6 +858,7 @@ body,
 }
 
 .pc-theme-item > button.theme {
+  /* mdBook's theme-list buttons default to display:block; force flex for the swatch + label row. */
   display: flex !important;
   align-items: center;
   gap: 0.6rem;

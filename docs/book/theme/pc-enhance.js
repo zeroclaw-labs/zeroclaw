@@ -112,6 +112,9 @@
       '<div class="pc-hero-inner">' +
       '<div class="pc-hero-badge">ZeroClaw</div>' +
       '<h1 class="pc-hero-title"></h1>' +
+      // Subtitle is intentionally hardcoded here: it is product positioning,
+      // not page content, and changes rarely. If it needs to vary per build,
+      // promote it to a data-hero-sub attribute read from the landing Markdown.
       '<p class="pc-hero-sub">Your personal AI assistant — one static binary, runs anywhere, no vendor lock-in.</p>' +
       '<div class="pc-hero-actions">' +
       '<a class="pc-btn pc-btn-primary" href="getting-started/quick-start.html">Quick start →</a>' +
