@@ -632,14 +632,7 @@ pub async fn run_gateway(
 
     let (mut tools_registry_raw, delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            let (
-                tools_registry_raw,
-                delegate_handle_gw,
-                _reaction_handle_gw,
-                _channel_map_handle,
-                _ask_user_handle_gw,
-                _escalate_handle_gw,
-            ) = tools::all_tools_with_runtime(
+            let all_tools_result = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
                 &risk_profile,
@@ -660,7 +653,32 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
             );
-            (tools_registry_raw, delegate_handle_gw)
+            // Wire channel-driven tool handles so the dashboard agent can
+            // deliver messages to configured channels (same pattern as
+            // orchestrator::start_channels).
+            // reaction_handle_gw is PerToolChannelHandle (not Option);
+            // register_channels_for_tools expects &Option for all handles.
+            let reaction_handle_gw_opt = Some(all_tools_result.reaction_handle.clone());
+            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
+                &config,
+                &all_tools_result.ask_user_handle,
+                &reaction_handle_gw_opt,
+                &all_tools_result.poll_handle,
+                &all_tools_result.escalate_handle,
+                &all_tools_result.channel_send_handle,
+            );
+            if !channel_names.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                    &format!(
+                        "Registered {} channel(s) for dashboard agent",
+                        channel_names.len()
+                    ),
+                );
+            }
+            (all_tools_result.tools, all_tools_result.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned

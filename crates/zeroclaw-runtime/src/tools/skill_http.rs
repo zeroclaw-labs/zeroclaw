@@ -176,6 +176,8 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
+            target: None,
+            locked_args: HashMap::new(),
         }
     }
 
@@ -225,6 +227,8 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

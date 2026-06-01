@@ -2791,6 +2791,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_profiles_with_runtime_profile_propagates_budget_caps() {
+        use crate::schema::RuntimeProfileConfig;
+        use std::path::Path;
+
+        let risk = crate::schema::RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let runtime = RuntimeProfileConfig {
+            max_actions_per_hour: 99,
+            max_cost_per_day_cents: 1234,
+            shell_timeout_secs: 300,
+            ..RuntimeProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, Some(&runtime), Path::new("/ws"));
+
+        assert_eq!(policy.max_actions_per_hour, 99);
+        assert_eq!(policy.max_cost_per_day_cents, 1234);
+        assert_eq!(policy.shell_timeout_secs, 300);
+    }
+
+    #[test]
+    fn from_profiles_without_runtime_profile_uses_defaults() {
+        use std::path::Path;
+
+        let risk = crate::schema::RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(policy.max_actions_per_hour, 20);
+        assert_eq!(policy.max_cost_per_day_cents, 500);
+        assert_eq!(policy.shell_timeout_secs, 60);
+    }
+
     fn unix_forbidden_path_policy() -> SecurityPolicy {
         SecurityPolicy {
             workspace_dir: PathBuf::from("/workspace"),
