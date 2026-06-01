@@ -964,12 +964,19 @@ impl SlackChannel {
     ///   body — including it here would duplicate it for the agent),
     /// - unsupported message subtypes (`channel_join`, `channel_leave`,
     ///   bot status messages, etc. — same gate the main polling loop uses),
-    /// - messages from users not on the channel's allow-list (the count
-    ///   is returned separately so the renderer can surface a gap marker).
+    /// - messages with no `user` field (webhook posts, integration bots).
+    ///   The normal Socket Mode and polling paths skip these before they
+    ///   reach the agent under a restricted `allowed_users` config; the
+    ///   backfill path matches that boundary so historical webhook
+    ///   content can't be smuggled in via `conversations.replies`. The
+    ///   count is folded into the same allow-list gap marker so the
+    ///   agent learns context exists but is policy-filtered,
+    /// - messages from users not on the channel's allow-list. The count
+    ///   is returned separately so the renderer can surface a gap marker.
     ///
-    /// Messages with no `user` field (webhooks) and the bot's own past
-    /// replies pass through — the bot's prior turns are useful self-context,
-    /// and webhook content is already trusted at ingest.
+    /// The bot's own past replies (`user == bot_user_id`) are the only
+    /// positively-identified passthrough — they're useful self-context
+    /// for the agent and don't widen the channel's privacy boundary.
     fn filter_backfill_messages<'a>(
         messages: &'a [serde_json::Value],
         trigger_ts: &str,
@@ -995,8 +1002,12 @@ impl SlackChannel {
                     .get("user")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if user.is_empty() || user == bot_user_id {
+                if user == bot_user_id && !user.is_empty() {
                     return true;
+                }
+                if user.is_empty() {
+                    dropped_by_allow_list += 1;
+                    return false;
                 }
                 if is_user_allowed(user) {
                     true
@@ -6251,10 +6262,13 @@ mod tests {
     /// `filter_backfill_messages` must drop the triggering message
     /// (otherwise the agent sees it twice — once in `[Thread context]`,
     /// once as the message body), drop unsupported subtypes such as
-    /// `channel_join`, and count non-allow-listed messages without
-    /// passing them through.
+    /// `channel_join`, drop messages with no `user` field (matches the
+    /// normal Socket Mode + polling boundary — webhooks/integration bots
+    /// don't reach the agent under a restricted allow-list), and count
+    /// non-allow-listed and userless messages toward the gap marker so
+    /// the agent learns context exists but is policy-filtered.
     #[test]
-    fn thread_backfill_filter_drops_trigger_subtype_and_non_allow_listed() {
+    fn thread_backfill_filter_drops_trigger_subtype_userless_and_non_allow_listed() {
         let messages = vec![
             // Parent message from allow-listed user — keep.
             serde_json::json!({"ts": "T_PARENT", "user": "U_USER", "text": "parent"}),
@@ -6272,6 +6286,17 @@ mod tests {
             serde_json::json!({"ts": "T_R3", "thread_ts": "T_PARENT", "user": "U_BAD", "text": "filtered"}),
             // Bot's own past reply — must pass through (useful self-context).
             serde_json::json!({"ts": "T_R4", "thread_ts": "T_PARENT", "user": "U_BOT", "text": "bot turn"}),
+            // Userless message — webhook post, integration bot, etc. The
+            // normal inbound path drops these under restricted
+            // `allowed_users`; the backfill path must match that
+            // boundary so historical webhook content can't be smuggled
+            // into [Thread context]. Must be dropped AND counted.
+            serde_json::json!({"ts": "T_R5", "thread_ts": "T_PARENT", "text": "from a webhook"}),
+            // Same situation with a `bot_id` instead of `user` (some
+            // integration messages carry `bot_id` instead of `user`).
+            // Filter only inspects `user`, so `bot_id`-only messages
+            // also fall under the userless drop.
+            serde_json::json!({"ts": "T_R6", "thread_ts": "T_PARENT", "bot_id": "B999", "text": "from a bot integration"}),
             // The triggering reply itself — must be dropped to avoid
             // duplication in the agent payload.
             serde_json::json!({"ts": "T_TRIGGER", "thread_ts": "T_PARENT", "user": "U_USER", "text": "hi bot"}),
@@ -6289,11 +6314,11 @@ mod tests {
         assert_eq!(
             kept_ts,
             vec!["T_PARENT", "T_R1", "T_R4"],
-            "trigger, subtype, and non-allow-listed messages must be dropped",
+            "trigger, subtype, userless, and non-allow-listed messages must be dropped",
         );
         assert_eq!(
-            dropped, 1,
-            "only non-allow-listed messages count toward the gap marker",
+            dropped, 3,
+            "non-allow-listed and userless messages all count toward the gap marker",
         );
     }
 
