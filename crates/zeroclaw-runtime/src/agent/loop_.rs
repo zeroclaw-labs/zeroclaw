@@ -1230,34 +1230,60 @@ pub async fn run_tool_call_loop_ctx(ctx: LoopContext<'_>) -> Result<String> {
     .await
 }
 
-// 19 positional args predate the `LoopContext` work; Slice B of
-// Plans/glimmering-mixing-moore-v2.md folds these into a single context
-// struct, at which point this allow comes off.
-#[allow(clippy::too_many_arguments)]
-pub async fn agent_turn(
-    model_provider: &dyn ModelProvider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: Option<f64>,
-    silent: bool,
-    channel_name: &str,
-    channel_reply_target: Option<&str>,
-    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
-    max_tool_iterations: usize,
-    approval: Option<&ApprovalManager>,
-    excluded_tools: &[String],
-    dedup_exempt_tools: &[String],
-    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    model_switch_callback: Option<ModelSwitchCallback>,
-    strict_tool_parsing: bool,
-    channel: Option<&dyn Channel>,
-) -> Result<String> {
-    // First migrated call site for `LoopContext` (Plan v2 Slice B).
-    // Field order matches the struct definition so future additions stay
-    // easy to spot.
+/// Bundled inputs for [`agent_turn`].
+///
+/// `agent_turn` is the simplified, hooks-free, non-streaming turn entry
+/// used by `process_message` and the loop's own tests. Like
+/// [`LoopContext`], bundling the inputs into a named struct removes the
+/// 19-positional-argument footgun (argument-position bugs become compile
+/// errors) and lets new fields be added without touching every call site.
+pub struct AgentTurn<'a> {
+    pub model_provider: &'a dyn ModelProvider,
+    pub history: &'a mut Vec<ChatMessage>,
+    pub tools_registry: &'a [Box<dyn Tool>],
+    pub observer: &'a dyn Observer,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub temperature: Option<f64>,
+    pub silent: bool,
+    pub channel_name: &'a str,
+    pub channel_reply_target: Option<&'a str>,
+    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
+    pub max_tool_iterations: usize,
+    pub approval: Option<&'a ApprovalManager>,
+    pub excluded_tools: &'a [String],
+    pub dedup_exempt_tools: &'a [String],
+    pub activated_tools:
+        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    pub model_switch_callback: Option<ModelSwitchCallback>,
+    pub strict_tool_parsing: bool,
+    pub channel: Option<&'a dyn Channel>,
+}
+
+/// Run a single agent turn with sensible defaults (no hooks, no streaming,
+/// no budget), forwarding into [`run_tool_call_loop_ctx`].
+pub async fn agent_turn(turn: AgentTurn<'_>) -> Result<String> {
+    let AgentTurn {
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        approval,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        strict_tool_parsing,
+        channel,
+    } = turn;
     run_tool_call_loop_ctx(LoopContext {
         model_provider,
         history,
@@ -4827,27 +4853,27 @@ pub async fn process_message(
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
-                agent_turn(
-                    model_provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
+                agent_turn(AgentTurn {
+                    model_provider: model_provider.as_ref(),
+                    history: &mut history,
+                    tools_registry: &tools_registry,
+                    observer: observer.as_ref(),
                     provider_name,
-                    &model_name,
-                    effective_temperature,
-                    true,
-                    "daemon",
-                    None,
-                    &config.multimodal,
-                    agent.max_tool_iterations,
-                    Some(&approval_manager),
-                    &excluded_tools,
-                    &agent.tool_call_dedup_exempt,
-                    activated_handle_pm.as_ref(),
-                    None,
-                    agent.strict_tool_parsing,
-                    None, // channel: process_message path has no channel ref
-                ),
+                    model: &model_name,
+                    temperature: effective_temperature,
+                    silent: true,
+                    channel_name: "daemon",
+                    channel_reply_target: None,
+                    multimodal_config: &config.multimodal,
+                    max_tool_iterations: agent.max_tool_iterations,
+                    approval: Some(&approval_manager),
+                    excluded_tools: &excluded_tools,
+                    dedup_exempt_tools: &agent.tool_call_dedup_exempt,
+                    activated_tools: activated_handle_pm.as_ref(),
+                    model_switch_callback: None,
+                    strict_tool_parsing: agent.strict_tool_parsing,
+                    channel: None, // process_message path has no channel ref
+                }),
             )
             .await
     };
@@ -9857,27 +9883,27 @@ This is an example, not an invocation."#;
             ];
             let observer = NoopObserver;
 
-            let result = agent_turn(
-                &model_provider,
-                &mut history,
-                &tools_registry,
-                &observer,
-                "mock-provider",
-                "mock-model",
-                Some(0.0),
-                true,
-                "daemon",
-                None,
-                &zeroclaw_config::schema::MultimodalConfig::default(),
-                4,
-                None,
-                &[],
-                &[],
-                Some(&activated),
-                None,
-                false,
-                None, // channel
-            )
+            let result = agent_turn(AgentTurn {
+                model_provider: &model_provider,
+                history: &mut history,
+                tools_registry: &tools_registry,
+                observer: &observer,
+                provider_name: "mock-provider",
+                model: "mock-model",
+                temperature: Some(0.0),
+                silent: true,
+                channel_name: "daemon",
+                channel_reply_target: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                approval: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: Some(&activated),
+                model_switch_callback: None,
+                strict_tool_parsing: false,
+                channel: None,
+            })
             .await
             .expect("wrapper path should execute activated tools");
 
@@ -9922,27 +9948,27 @@ This is an example, not an invocation."#;
             ];
             let observer = NoopObserver;
 
-            let result = agent_turn(
-                &model_provider,
-                &mut history,
-                &tools_registry,
-                &observer,
-                "mock-provider",
-                "mock-model",
-                Some(0.0),
-                true,
-                "daemon",
-                None,
-                &zeroclaw_config::schema::MultimodalConfig::default(),
-                4,
-                None,
-                &[],
-                &[],
-                Some(&activated),
-                None,
-                true,
-                None, // channel
-            )
+            let result = agent_turn(AgentTurn {
+                model_provider: &model_provider,
+                history: &mut history,
+                tools_registry: &tools_registry,
+                observer: &observer,
+                provider_name: "mock-provider",
+                model: "mock-model",
+                temperature: Some(0.0),
+                silent: true,
+                channel_name: "daemon",
+                channel_reply_target: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                approval: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: Some(&activated),
+                model_switch_callback: None,
+                strict_tool_parsing: true,
+                channel: None,
+            })
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
 
