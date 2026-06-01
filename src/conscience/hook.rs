@@ -150,6 +150,28 @@ impl HookHandler for ConscienceHook {
             /* tool_affinity */ None,
         );
 
+        // Emit a structured verdict event for every gate decision (not just
+        // violations) so operators can observe the gate's behaviour through
+        // the unified log surface, /api/logs, and the broadcast hook that
+        // bridges to registered Observers. Without this the gate is a black
+        // box: Allow decisions left no trace and blocks only surfaced as a
+        // tool-call cancellation with no score attribution.
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(if matches!(verdict, GateVerdict::Allow) {
+                    ::zeroclaw_log::EventOutcome::Success
+                } else {
+                    ::zeroclaw_log::EventOutcome::Failure
+                })
+                .with_attrs(::serde_json::json!({
+                    "tool": name,
+                    "verdict": verdict_label(&verdict),
+                    "score": score,
+                })),
+            "conscience gate verdict"
+        );
+
         // Non-Allow verdicts record a violation so the score erodes for
         // subsequent calls (Plan v2 Slice A step 8). The harm magnitude
         // is approximated as `1 - score` — the gate's score is "how
@@ -196,6 +218,18 @@ impl HookHandler for ConscienceHook {
                 "conscience: revise (tool={name}, score={score:.2}) — adjust arguments and retry"
             )),
         }
+    }
+}
+
+/// Stable, log-friendly label for a gate verdict. Kept in English with a
+/// fixed set of values (RFC #5653 §4.6 — log fields are never translated)
+/// so downstream observers and dashboards can match on it.
+fn verdict_label(verdict: &GateVerdict) -> &'static str {
+    match verdict {
+        GateVerdict::Allow => "allow",
+        GateVerdict::Block => "block",
+        GateVerdict::Ask => "ask",
+        GateVerdict::Revise => "revise",
     }
 }
 
@@ -428,5 +462,15 @@ mod tests {
             state.integrity_score, 1.0,
             "corrupt file → fresh ledger → score 1.0"
         );
+    }
+
+    #[test]
+    fn verdict_label_is_stable_and_lowercase() {
+        // Observers and dashboards match on these exact strings; they are
+        // part of the log contract and must not drift.
+        assert_eq!(verdict_label(&GateVerdict::Allow), "allow");
+        assert_eq!(verdict_label(&GateVerdict::Block), "block");
+        assert_eq!(verdict_label(&GateVerdict::Ask), "ask");
+        assert_eq!(verdict_label(&GateVerdict::Revise), "revise");
     }
 }

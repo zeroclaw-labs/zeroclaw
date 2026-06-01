@@ -1,6 +1,4 @@
-use crate::agent::loop_::{
-    LoopContext, TOOL_LOOP_SESSION_KEY, run_tool_call_loop, run_tool_call_loop_ctx,
-};
+use crate::agent::loop_::{LoopContext, TOOL_LOOP_SESSION_KEY, run_tool_call_loop_ctx};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
