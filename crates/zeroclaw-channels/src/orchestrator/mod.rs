@@ -118,9 +118,9 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_runtime::agent::loop_::{
-    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
-    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_session_key,
-    scope_thread_id, scrub_credentials,
+    apply_policy_tool_filter, apply_text_tool_prompt_policy, build_tool_instructions_for_names,
+    clear_model_switch_request, get_model_switch_state, is_model_switch_requested,
+    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -7771,6 +7771,38 @@ pub async fn start_channels(
         let escalate_handle_ch = all_tools_result_ch.escalate_handle;
         let channel_send_handle_ch = all_tools_result_ch.channel_send_handle;
 
+        // ── Built-in SecurityPolicy tool gate (parity with agent::run /
+        // process_message / from_config) ────────────────────────────────────
+        // Apply the agent's allowlist (`allowed_tools`) AND denylist
+        // (`excluded_tools`) to the eager built-in registry, BEFORE MCP and
+        // skill tools are added. `start_channels` previously enforced only the
+        // risk-profile denylist on the prompt catalog here — never the
+        // per-agent allowlist on the registry sent to the model — so an agent
+        // allowlisted to e.g. `file_read` still received raw `shell` /
+        // `file_write` in its native tool specs. Filtering before skill
+        // registration is also what lets a scoped elevation wrapper survive:
+        // the raw target is removed while the distinct prefixed
+        // `{skill}__{tool}` wrapper is appended later. MCP tools are injected
+        // after this gate and are intentionally exempt (a restrictive allowlist
+        // must not silently drop a server's tools); the risk-profile denylist
+        // still applies to them.
+        let before_policy_filter_ch = built_tools.len();
+        apply_policy_tool_filter(&mut built_tools, Some(security.as_ref()), None);
+        if built_tools.len() != before_policy_filter_ch {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "agent": agent_alias,
+                        "before": before_policy_filter_ch,
+                        "retained": built_tools.len(),
+                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
+                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
+                    })),
+                "Applied SecurityPolicy built-in tool filter (channel path)"
+            );
+        }
+
         // Wire MCP tools into the per-agent registry before freezing —
         // non-fatal. When `mcp.deferred_loading` is enabled, MCP tools are
         // exposed via a `tool_search` built-in rather than added eagerly.
@@ -10962,6 +10994,71 @@ BTC is currently around $65,000 based on latest tool output."#
                 error: None,
             })
         }
+    }
+
+    /// Minimal fixed-name tool for allowlist-filter coverage.
+    struct NamedMockTool(&'static str);
+
+    impl ::zeroclaw_api::attribution::Attributable for NamedMockTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for NamedMockTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "named mock"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
+    /// `start_channels` must apply the agent's `allowed_tools` allowlist to the
+    /// eager built-in registry before MCP/skill registration, at parity with
+    /// `agent::run` / `process_message` / the `from_config` path. Before this
+    /// gate the channel path skipped `apply_policy_tool_filter`, so an agent
+    /// allowlisted to `file_read` still emitted raw `shell` / `file_write` in
+    /// its native tool specs to the model.
+    #[test]
+    fn channel_path_allowlist_drops_non_allowlisted_builtins() {
+        let mut built_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool("shell")),
+            Box::new(NamedMockTool("file_write")),
+            Box::new(NamedMockTool("file_read")),
+        ];
+        let policy = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        apply_policy_tool_filter(&mut built_tools, Some(&policy), None);
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"shell") && !names.contains(&"file_write"),
+            "raw built-ins outside the allowlist must be dropped on the channel path; got {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "allowlisted tool must survive the filter; got {names:?}"
+        );
     }
 
     #[tokio::test]
