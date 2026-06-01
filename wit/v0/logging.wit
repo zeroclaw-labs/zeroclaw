@@ -12,9 +12,11 @@ package zeroclaw:plugin@0.1.0;
 /// to which zeroclaw_log writes. Use `log-record` to ensure consistent logging.
 @unstable(feature = plugins-wit-v0)
 interface logging {
+    @unstable(feature = plugins-wit-v0)
     use types.{json-string};
 
     /// Severity level for a log record. Mirrors `Severity` in zeroclaw-log.
+    @unstable(feature = plugins-wit-v0)
     enum log-level {
         trace,
         debug,
@@ -25,6 +27,7 @@ interface logging {
 
     /// Closed taxonomy of actions a plugin may report. Mirrors the `Action`
     /// enum in zeroclaw-log; no escape hatch variant is provided on purpose.
+    @unstable(feature = plugins-wit-v0)
     enum plugin-action {
         start,
         complete,
@@ -69,12 +72,14 @@ interface logging {
 
     /// Binary outcome reported alongside an action. Absent maps to
     /// `EventOutcome::Unknown` on the host.
+    @unstable(feature = plugins-wit-v0)
     enum plugin-outcome {
         success,
         failure,
     }
 
     /// A structured log event emitted by a plugin.
+    @unstable(feature = plugins-wit-v0)
     record plugin-event {
         /// Namespace-qualified function path where the event occurred
         /// (e.g. `"my_plugin::tool::execute"`). Clarifies the `name` field

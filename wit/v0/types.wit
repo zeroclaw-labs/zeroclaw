@@ -5,5 +5,6 @@ package zeroclaw:plugin@0.1.0;
 interface types {
     /// Semantic alias: a JSON-encoded string value.
     /// Callers must produce valid JSON; receivers must parse it as JSON.
+    @unstable(feature = plugins-wit-v0)
     type json-string = string;
 }

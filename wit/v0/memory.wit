@@ -6,6 +6,7 @@ interface memory {
     // ── Types ─────────────────────────────────────────────────────────────────
 
     /// Classification of a memory entry.
+    @unstable(feature = plugins-wit-v0)
     variant memory-category {
         /// Long-term facts, preferences, decisions.
         core,
@@ -18,6 +19,7 @@ interface memory {
     }
 
     /// A single stored memory entry.
+    @unstable(feature = plugins-wit-v0)
     record memory-entry {
         id: string,
         key: string,
@@ -41,6 +43,7 @@ interface memory {
     }
 
     /// Filter criteria for bulk export (GDPR Art. 20 data portability).
+    @unstable(feature = plugins-wit-v0)
     record export-filter {
         namespace: option<string>,
         session-id: option<string>,
@@ -52,6 +55,7 @@ interface memory {
     }
 
     /// A single message in a conversation trace for procedural memory.
+    @unstable(feature = plugins-wit-v0)
     record procedural-message {
         role: string,
         content: string,
@@ -63,6 +67,7 @@ interface memory {
     /// The runtime maps the Rust `&[&str]` slice as follows:
     ///   empty slice  →  `all`   (no agent filter; return entries for every agent)
     ///   non-empty    →  `some`  (restrict to the listed agent IDs)
+    @unstable(feature = plugins-wit-v0)
     variant agent-filter {
         /// Return entries regardless of agent attribution.
         all,
@@ -89,6 +94,7 @@ interface memory {
     /// All corresponding functions must still be exported by the plugin
     /// (stub implementations are sufficient); the runtime simply never calls
     /// them when the flag is absent.
+    @unstable(feature = plugins-wit-v0)
     flags memory-capabilities {
         get-for-agent,
         purge-namespace,

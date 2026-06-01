@@ -3,9 +3,11 @@ package zeroclaw:plugin@0.1.0;
 /// Plugin interface for a single callable tool exposed to the ZeroClaw agent loop.
 @unstable(feature = plugins-wit-v0)
 interface tool {
+    @unstable(feature = plugins-wit-v0)
     use types.{json-string};
 
     /// Result returned by a tool execution.
+    @unstable(feature = plugins-wit-v0)
     record tool-result {
         success: bool,
         output: string,
