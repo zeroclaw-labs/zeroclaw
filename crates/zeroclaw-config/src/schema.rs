@@ -768,15 +768,6 @@ pub struct ModelProviderConfig {
     /// Path to a custom CA certificate file for TLS connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
-    /// Override the provider's default for native tool calling.
-    /// `None` (default) honors the provider's built-in choice. `Some(true)`
-    /// forces native tool calls on, `Some(false)` forces text-fallback.
-    /// Currently consulted only by the Groq factory, which defaults to
-    /// text-fallback because llama-family Groq models reject native tool
-    /// calls with HTTP 400 (#5848). Setting `native_tools = true` re-enables
-    /// native tool calling for Groq models that support it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_tools: Option<bool>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -15840,6 +15831,7 @@ impl Config {
         let _ = self.create_map_key(section, alias);
     }
 
+
     pub fn clear_dirty(&mut self) {
         self.dirty_paths.clear();
     }
@@ -16473,7 +16465,6 @@ impl_enum_prop_kind!(
 );
 
 impl HasPropKind for serde_json::Value {
-<<<<<<< HEAD
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
     // Classifying it as `Enum` previously made `enum_variants_for::<Value>()`
     // hand back the literal placeholder `"(unknown variants)"`, and the

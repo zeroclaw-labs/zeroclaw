@@ -313,9 +313,11 @@ impl OpenAiCompatibleModelProvider {
     pub fn with_tls_ca_cert_path(mut self, path: &str) -> Self {
         match std::fs::read(path) {
             Ok(bytes) => self.tls_ca_cert_pem = Some(bytes),
-            Err(e) => tracing::warn!(
-                path,
-                error = %e,
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", e)})),
                 "Failed to read CA certificate file — TLS will use system roots"
             ),
         }
@@ -443,8 +445,11 @@ impl OpenAiCompatibleModelProvider {
             if let Some(ref pem) = self.tls_ca_cert_pem {
                 match reqwest::Certificate::from_pem(pem) {
                     Ok(cert) => return builder.add_root_certificate(cert),
-                    Err(e) => tracing::warn!(
-                        error = %e,
+                    Err(e) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "Failed to parse CA certificate — TLS will use system roots"
                     ),
                 }
