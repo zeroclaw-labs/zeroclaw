@@ -9,12 +9,13 @@ publish = false
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
-zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-acp-server", "channel-email", "channel-telegram"] }
+zeroclaw-channels = { workspace = true, default-features = false, features = ["channel-acp-server"] }
 zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-hardware.workspace = true
@@ -85,7 +86,13 @@ default = ["schema-export"]
 plugins-wasm = ["dep:zeroclaw-plugins"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
+channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
+channel-email = ["zeroclaw-channels/channel-email"]
+channel-linq = ["zeroclaw-channels/channel-linq"]
+channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
+channel-wati = ["zeroclaw-channels/channel-wati"]
+channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated
 # JSON Schema body and the serde-side schemars derives transitively. Defaults

@@ -41,7 +41,7 @@ flowchart TB
 
 | Crate | Role |
 |---|---|
-| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding sections, TUI |
+| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding sections, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
 | `zeroclaw-api` | Public traits — `Provider`, `Channel`, `Tool`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
@@ -54,7 +54,7 @@ flowchart TB
 | `zeroclaw-hardware` | Hardware abstraction layer (GPIO, I2C, SPI, USB) |
 | `zeroclaw-infra` | Tracing, metrics, structured logging |
 | `zeroclaw-macros` | Derive macros for config, tool registration |
-| `zeroclaw-tui` | Terminal UI |
+| `zerocode` | Terminal UI |
 | `aardvark-sys`, `robot-kit` | Specialised hardware support |
 
 The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further — the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.

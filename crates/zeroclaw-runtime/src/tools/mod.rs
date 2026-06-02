@@ -51,7 +51,6 @@ pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
-pub use zeroclaw_tools::channel_send::ChannelSendTool;
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
@@ -395,7 +394,6 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
-    pub channel_send_handle: Option<PerToolChannelHandle>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -424,16 +422,9 @@ pub fn all_tools(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-) -> (
-    Vec<Box<dyn Tool>>,
-    Option<DelegateParentToolsHandle>,
-    Option<PerToolChannelHandle>,
-    PerToolChannelHandle,
-    Option<PerToolChannelHandle>,
-    Option<PerToolChannelHandle>,
-    Option<PerToolChannelHandle>,
-) {
-    let result = all_tools_with_runtime(
+    tui_env: Option<HashMap<String, String>>,
+) -> AllToolsResult {
+    all_tools_with_runtime(
         config,
         security,
         risk_profile,
@@ -451,15 +442,7 @@ pub fn all_tools(
         root_config,
         canvas_store,
         is_subagent_caller,
-    );
-    (
-        result.tools,
-        result.delegate_handle,
-        result.ask_user_handle,
-        result.reaction_handle,
-        result.poll_handle,
-        result.escalate_handle,
-        result.channel_send_handle,
+        tui_env,
     )
 }
 
@@ -487,6 +470,7 @@ pub fn all_tools_with_runtime(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
@@ -496,7 +480,12 @@ pub fn all_tools_with_runtime(
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
-                    .with_timeout_secs(root_config.shell_tool.timeout_secs),
+                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                        security.shell_timeout_secs
+                    } else {
+                        root_config.shell_tool.timeout_secs
+                    })
+                    .with_tui_env(tui_env),
                 security.clone(),
             ),
             security.clone(),
@@ -593,29 +582,22 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — always registered when a model_provider is configured
+    // LLM task tool — registered using the calling agent's provider
+    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = root_config
-            .first_model_provider_type()
-            .unwrap_or("openrouter")
-            .to_string();
-        let llm_task_model = root_config
-            .first_model_provider()
-            .and_then(|e| e.model.clone())
+        let llm_task_provider = family.to_string();
+        let llm_task_model = entry
+            .model
+            .clone()
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(root_config);
+            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            root_config
-                .first_model_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7),
-            root_config
-                .first_model_provider()
-                .and_then(|e| e.api_key.clone()),
+            entry.temperature,
+            entry.api_key.clone(),
             llm_task_runtime_options,
         )));
     }
@@ -763,6 +745,7 @@ pub fn all_tools_with_runtime(
             root_config.web_search.search_provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
+            root_config.web_search.jina_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
@@ -1101,18 +1084,6 @@ pub fn all_tools_with_runtime(
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
-    // Channel send tool — always registered; owns its own late-bound channel map
-    // and a map of configured default targets for recipient enforcement.
-    let channel_send_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
-    let default_targets = crate::channel_targets::build_default_targets_map(root_config);
-    let channel_send_tool = ChannelSendTool::new(
-        security.clone(),
-        channel_send_handle.as_ref().cloned().unwrap(),
-        Arc::new(parking_lot::RwLock::new(default_targets)),
-    );
-    tool_arcs.push(Arc::new(channel_send_tool));
-
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {
         let ms_cfg = &root_config.microsoft365;
@@ -1150,7 +1121,6 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
-                    channel_send_handle,
                 };
             }
 
@@ -1223,7 +1193,7 @@ pub fn all_tools_with_runtime(
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
     });
     let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_from_config(root_config);
+        zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
@@ -1266,7 +1236,8 @@ pub fn all_tools_with_runtime(
         .with_risk_profiles(root_config.risk_profiles.clone())
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
-        .with_root_config(config.clone());
+        .with_root_config(config.clone())
+        .with_caller_alias(agent_alias);
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -1348,7 +1319,6 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
-        channel_send_handle,
     }
 }
 
@@ -1393,7 +1363,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1410,7 +1380,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
@@ -1439,7 +1411,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1456,7 +1428,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"content_search"));
@@ -1586,7 +1560,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1603,7 +1577,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
     }
@@ -1623,7 +1599,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1640,7 +1616,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }
@@ -1662,7 +1640,7 @@ mod tests {
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1679,7 +1657,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
     }
@@ -1700,7 +1680,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1717,7 +1697,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
     }

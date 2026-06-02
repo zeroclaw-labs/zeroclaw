@@ -33,13 +33,13 @@ const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
 
 /// Paths that the schema exposes via `prop_fields()` but that operators must
-/// not override at runtime. Currently just `schema-version` (kebab form, as
+/// not override at runtime. Currently just `schema_version` (snake form, as
 /// emitted by `prop_fields()`) — the migration engine sets it from the
 /// on-disk file's value, and an env override would either skip needed
 /// migrations or trigger a no-op rerun. O(1) HashSet lookup so adding more
 /// reserved paths stays cheap.
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
-    LazyLock::new(|| HashSet::from(["schema-version"]));
+    LazyLock::new(|| HashSet::from(["schema_version"]));
 
 /// Outcome of [`apply_env_overrides`]: the set of overridden paths plus the
 /// per-path snapshot of pre-override raw values. The snapshot drives
@@ -171,24 +171,20 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
         let path = if inner.is_empty() {
             format!("{}.{}", section.path, alias)
         } else {
-            // Inner segments are `__`-separated; each segment is a snake-case
-            // field name that maps to kebab in the prop-path.
-            let inner_path = inner
-                .split(SEP)
-                .map(|seg| seg.replace('_', "-"))
-                .collect::<Vec<_>>()
-                .join(".");
+            // Inner segments are `__`-separated snake-case field names — the
+            // same casing the prop-path uses, so join them verbatim.
+            let inner_path = inner.split(SEP).collect::<Vec<_>>().join(".");
             format!("{}.{}.{}", section.path, alias, inner_path)
         };
         return Ok(path);
     }
 
-    // Non-map path: prop_fields() entries are dotted with kebab fields.
-    // Convert to env-form (`.` → `__`, `-` → `_`) and compare.
+    // Non-map path: prop_fields() entries are dotted snake-case field
+    // names. Convert to env-form (`.` → `__`) and compare.
     config
         .prop_fields()
         .into_iter()
-        .find(|f| f.name.replace('.', SEP).replace('-', "_") == tail)
+        .find(|f| f.name.replace('.', SEP) == tail)
         .map(|f| f.name)
         .ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -207,16 +203,21 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
 /// `Config::get_prop` applies. Returns `None` when the path doesn't resolve
 /// (e.g. the alias entry hasn't been created yet on disk).
 ///
-/// Walks the TOML serialization with `kebab → snake` field-name conversion
-/// (HashMap aliases keep `_` natively per the validator). Used by
-/// [`apply_env_overrides`] so the pre-override snapshot of a secret field
-/// captures the real plaintext rather than the display mask.
+/// Walks the TOML serialization. Each segment is resolved value-aware:
+/// tried verbatim first so hyphenated map keys (aliases, model names like
+/// `claude-opus-4-8`) survive, then snake-cased only as a fallback for a
+/// kebab field segment. Used by [`apply_env_overrides`] so the pre-override
+/// snapshot of a secret field captures the real plaintext rather than the
+/// display mask.
 fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
     let table = toml::Value::try_from(source).ok()?;
     let mut current: &toml::Value = &table;
     for segment in path.split('.') {
-        let key = segment.replace('-', "_");
-        current = current.as_table()?.get(&key)?;
+        let tbl = current.as_table()?;
+        current = match tbl.get(segment) {
+            Some(v) => v,
+            None => tbl.get(&segment.replace('-', "_"))?,
+        };
     }
     Some(match current {
         toml::Value::String(s) => s.clone(),
@@ -298,7 +299,7 @@ mod tests {
         assert!(
             applied
                 .paths
-                .contains("providers.models.anthropic.default.api-key"),
+                .contains("providers.models.anthropic.default.api_key"),
             "kebab-translated path should be recorded: {:?}",
             applied.paths,
         );
@@ -332,7 +333,7 @@ mod tests {
         assert!(
             applied
                 .paths
-                .contains("providers.models.openrouter.prod_v2.api-key"),
+                .contains("providers.models.openrouter.prod_v2.api_key"),
         );
         assert!(
             applied
@@ -360,7 +361,7 @@ mod tests {
         let mut config = Config::default();
         let applied = apply_env_overrides(&mut config).expect("apply succeeds");
 
-        assert!(applied.paths.contains("gateway.request-timeout-secs"));
+        assert!(applied.paths.contains("gateway.request_timeout_secs"));
         assert_eq!(config.gateway.request_timeout_secs, 120);
     }
 
@@ -442,7 +443,7 @@ mod tests {
         assert!(
             applied
                 .paths
-                .contains("providers.models.anthropic.default.api-key"),
+                .contains("providers.models.anthropic.default.api_key"),
         );
         // Env value is live in memory.
         assert_eq!(

@@ -75,6 +75,8 @@ pub struct WhatsAppWebChannel {
     mention_only: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
+    /// Bot LID number (digits only), resolved from device identity at runtime
+    bot_lid: Arc<Mutex<Option<String>>>,
     /// Usage mode (business vs personal policy filtering)
     mode: zeroclaw_config::schema::WhatsAppWebMode,
     /// DM policy when mode = personal
@@ -161,6 +163,7 @@ impl WhatsAppWebChannel {
             peer_resolver,
             mention_only,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
+            bot_lid: Arc::new(Mutex::new(None)),
             mode,
             dm_policy,
             group_policy,
@@ -705,7 +708,22 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn jid_digits(jid: &str) -> String {
         let user_part = jid.split_once('@').map(|(u, _)| u).unwrap_or(jid);
+        let user_part = user_part
+            .split_once(':')
+            .map(|(u, _)| u)
+            .unwrap_or(user_part);
         user_part.chars().filter(|c| c.is_ascii_digit()).collect()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn store_jid_digits(slot: &Arc<Mutex<Option<String>>>, jid: &str) -> Option<String> {
+        let digits = Self::jid_digits(jid);
+        if digits.is_empty() {
+            None
+        } else {
+            *slot.lock() = Some(digits.clone());
+            Some(digits)
+        }
     }
 
     /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
@@ -733,40 +751,53 @@ impl WhatsAppWebChannel {
 
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
     #[cfg(feature = "whatsapp-web")]
-    fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str) -> bool {
-        // 1. Structured: check if any mentioned_jid's digits match the bot's phone digits
+    fn contains_bot_mention(
+        text: &str,
+        mentioned_jids: &[String],
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        // 1. Structured: check if any mentioned_jid's digits match the bot's phone or LID digits
         for jid in mentioned_jids {
             let digits = Self::jid_digits(jid);
-            if !digits.is_empty() && digits == bot_phone {
+            if !digits.is_empty()
+                && ((!bot_phone.is_empty() && digits == bot_phone)
+                    || bot_lid.is_some_and(|lid| !lid.is_empty() && digits == lid))
+            {
                 return true;
             }
         }
 
         // 2. Text fallback: word-boundary-aware match for @<bot_digits>.
         //    Scan all occurrences -- an earlier prefix false-match must not mask a later real mention.
-        let pattern = format!("@{bot_phone}");
-        let mut search_from = 0;
-        while let Some(rel_pos) = text[search_from..].find(&pattern) {
-            let pos = search_from + rel_pos;
-            let after_idx = pos + pattern.len();
-            // Leading boundary: @ must be preceded by whitespace or start-of-string
-            let leading_ok = pos == 0
-                || text[..pos]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|ch| !ch.is_ascii_alphanumeric());
-            // Trailing boundary: character after digits must not be a digit
-            let trailing_ok = text[after_idx..]
-                .chars()
-                .next()
-                .is_none_or(|ch| !ch.is_ascii_digit());
-            if leading_ok && trailing_ok {
-                return true;
+        fn has_text_mention(text: &str, digits: &str) -> bool {
+            if digits.is_empty() {
+                return false;
             }
-            search_from = after_idx;
+
+            let pattern = format!("@{digits}");
+            let mut search_from = 0;
+            while let Some(rel_pos) = text[search_from..].find(&pattern) {
+                let pos = search_from + rel_pos;
+                let after_idx = pos + pattern.len();
+                let leading_ok = pos == 0
+                    || text[..pos]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+                let trailing_ok = text[after_idx..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !ch.is_ascii_digit());
+                if leading_ok && trailing_ok {
+                    return true;
+                }
+                search_from = after_idx;
+            }
+            false
         }
 
-        false
+        has_text_mention(text, bot_phone) || bot_lid.is_some_and(|lid| has_text_mention(text, lid))
     }
 }
 
@@ -879,7 +910,7 @@ impl Channel for WhatsAppWebChannel {
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
                 let tts_manager = self.tts_manager.clone().unwrap();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -1005,6 +1036,24 @@ impl Channel for WhatsAppWebChannel {
                 } else {
                     anyhow::bail!("Device exists but failed to load");
                 }
+                if let Some(ref pn) = device.pn
+                    && let Some(digits) = Self::store_jid_digits(&self.bot_phone, pn.user())
+                {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("pre-resolved bot phone from saved session: +{}", digits)
+                    );
+                }
+                if let Some(ref lid) = device.lid
+                    && let Some(digits) = Self::store_jid_digits(&self.bot_lid, lid.user())
+                {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("pre-resolved bot LID from saved session: {}", digits)
+                    );
+                }
             } else {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -1044,6 +1093,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
             let bot_phone_clone = self.bot_phone.clone();
+            let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
 
@@ -1079,6 +1129,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
                     let bot_phone_inner = bot_phone_clone.clone();
+                    let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     async move {
@@ -1266,13 +1317,17 @@ impl Channel for WhatsAppWebChannel {
                                 // mention_only: skip group messages without a bot mention
                                 if mention_only && is_group {
                                     let bot_phone = bot_phone_inner.lock();
-                                    if let Some(ref bp) = *bot_phone {
+                                    let bot_lid = bot_lid_inner.lock();
+                                    if bot_phone.is_some() || bot_lid.is_some() {
                                         let mentioned_jids =
                                             Self::extract_mentioned_jids(msg);
+                                        let bp = bot_phone.as_deref().unwrap_or("");
+                                        let bl = bot_lid.as_deref();
                                         if !Self::contains_bot_mention(
                                             &content,
                                             &mentioned_jids,
                                             bp,
+                                            bl,
                                         ) {
                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message without bot mention");
                                             return;
@@ -1333,17 +1388,18 @@ impl Channel for WhatsAppWebChannel {
                                     let device = client
                                         .persistence_manager()
                                         .get_device_snapshot()
-                                        .await;
-                                    if let Some(ref pn) = device.pn {
-                                        let phone = pn.user();
-                                        let digits: String = phone
-                                            .chars()
-                                            .filter(|c: &char| c.is_ascii_digit())
-                                            .collect();
-                                        if !digits.is_empty() {
-                                            *bot_phone_inner.lock() = Some(digits.clone());
-                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot identity from device: +{}", digits));
-                                        }
+                                    .await;
+                                    if let Some(ref pn) = device.pn
+                                        && let Some(digits) =
+                                            Self::store_jid_digits(&bot_phone_inner, pn.user())
+                                    {
+                                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot identity from device: +{}", digits));
+                                    }
+                                    if let Some(ref lid) = device.lid
+                                        && let Some(digits) =
+                                            Self::store_jid_digits(&bot_lid_inner, lid.user())
+                                    {
+                                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot LID from device: {}", digits));
                                     }
                                 }
                             }
@@ -2179,12 +2235,14 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey check this",
             &jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2195,12 +2253,14 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2211,12 +2271,14 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &no_jids,
-            "91921191606"
+            "91921191606",
+            None
         ));
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "hey @155512345678",
             &no_jids,
-            "15551234567"
+            "15551234567",
+            None
         ));
     }
 
@@ -2227,7 +2289,8 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "just a regular message",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2238,7 +2301,8 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "@9192119160691 real @919211916069",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2249,7 +2313,51 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "foo@919211916069 bar",
             &no_jids,
+            "919211916069",
+            None
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn jid_digits_strips_device_suffix() {
+        assert_eq!(
+            WhatsAppWebChannel::jid_digits("919211916069:16@s.whatsapp.net"),
             "919211916069"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::jid_digits("227728477442093:3@lid"),
+            "227728477442093"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_matches_lid() {
+        let jids = vec!["227728477442093@lid".to_string()];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @DisplayName check this",
+            &jids,
+            "6287778315246",
+            Some("227728477442093")
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_matches_lid_when_phone_unknown() {
+        let jids = vec!["227728477442093@lid".to_string()];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @DisplayName check this",
+            &jids,
+            "",
+            Some("227728477442093")
+        ));
+        assert!(!WhatsAppWebChannel::contains_bot_mention(
+            "plain @ mention",
+            &[],
+            "",
+            None
         ));
     }
 
@@ -2272,6 +2380,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
         );
         assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
+        assert_eq!(*ch.bot_lid.lock(), None);
     }
 
     #[test]

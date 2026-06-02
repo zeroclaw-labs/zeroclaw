@@ -27,9 +27,13 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// ModelProvider name from [providers.models.<name>] in config.toml
+        /// Provider alias from [providers.models.<kind>.<alias>] in config.toml
         #[arg(long)]
         model_provider: Option<String>,
+        /// Config directory holding config.toml and .secret-key (default:
+        /// ~/.zeroclaw). Mirrors `zeroclaw --config-dir`.
+        #[arg(long)]
+        config_dir: Option<String>,
         /// Entries per API call (default: 50)
         #[arg(long)]
         batch: Option<usize>,
@@ -40,6 +44,8 @@ enum Cmd {
     Check,
     /// Print space-separated locale codes from locales.toml (for CI use)
     Locales,
+    /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
+    Themes,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,13 +58,21 @@ fn main() -> anyhow::Result<()> {
             locale,
             force,
             model_provider,
+            config_dir,
             batch,
-        } => cmd::mdbook::sync::run(locale.as_deref(), force, model_provider.as_deref(), batch),
+        } => cmd::mdbook::sync::run(
+            locale.as_deref(),
+            force,
+            model_provider.as_deref(),
+            config_dir.as_deref(),
+            batch,
+        ),
         Cmd::Stats => cmd::mdbook::stats::run(),
         Cmd::Check => cmd::mdbook::check::run(),
         Cmd::Locales => {
             cmd::mdbook::build::print_locales();
             Ok(())
         }
+        Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
     }
 }

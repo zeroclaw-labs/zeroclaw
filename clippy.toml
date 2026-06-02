@@ -42,8 +42,27 @@ disallowed-macros = [
     # re-importing the macro under another name.
     { path = "anyhow::anyhow", reason = "emit ::zeroclaw_log::record! at the call site so span attribution propagates; then anyhow::bail! / anyhow::Error::msg for the returned error" },
 ]
-# `std::println` / `std::eprintln` are intentionally NOT in this list.
-# Build scripts emit cargo directives (`cargo:rerun-if-changed`) via
-# println; CLI utilities like `tools/fill-translations` use them for
-# stdout. Those are not log-pipeline emissions. The ban above targets
-# only what is genuinely a log: `tracing::*`, `log::*`, and `dbg!`.
+
+# Hard ban on direct `tokio::spawn` workspace-wide. Every fire-and-forget
+# task must go through `::zeroclaw_spawn::spawn!`, which threads the
+# caller's current tracing span into the child task so log events stay
+# attributed (session_key, channel, agent_id, …) instead of orphaning at
+# the tokio root. The macro itself lives in `zeroclaw-spawn` and must call
+# `tokio::spawn` to do its job; `robot-kit/src/safety.rs` is the one
+# other exemption (independent hardware-layer crate, no orchestrator
+# span in scope). Both files carry a local
+# `#![allow(clippy::disallowed_methods)]`.
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "use ::zeroclaw_spawn::spawn!(...) so the spawned task inherits the caller's attribution span" },
+]
+# `std::println` / `std::eprintln` — DAEMON-PATH INTENT: these must NOT be
+# used in daemon/supervisor code paths (zeroclaw-channels orchestrator,
+# zeroclaw-runtime daemon). All daemon-path output must go through
+# `::zeroclaw_log::record!` so it flows through the structured log pipeline.
+# They are NOT in disallowed-macros yet because ~430 existing violations across
+# the codebase would break CI. Tracked for cleanup. New daemon-path code must
+# use `::zeroclaw_log::record!` — reviewers must reject any new `println!`
+# in crates/zeroclaw-channels/src/orchestrator/ and crates/zeroclaw-runtime/src/daemon/.
+# Build scripts emit cargo directives (`cargo:rerun-if-changed`) via println;
+# CLI-facing commands (doctor, bind-identity, send-message) use them for
+# human-readable stdout. Those are the only legitimate uses outside tests.

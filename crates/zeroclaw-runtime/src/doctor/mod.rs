@@ -494,74 +494,72 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // ModelProvider validity (first configured model model_provider)
-    let primary_model_provider_doc = config.first_model_provider();
-    let primary_model_provider = config.first_model_provider_type();
-    if let Some(model_provider) = primary_model_provider {
-        if let Some(reason) = provider_validation_error(model_provider) {
-            items.push(DiagItem::error(
-                cat,
-                format!("model_provider \"{model_provider}\" is invalid: {reason}"),
-            ));
-        } else {
-            items.push(DiagItem::ok(
-                cat,
-                format!("model_provider \"{model_provider}\" is valid"),
-            ));
+    // ModelProvider validity — check each configured provider entry
+    {
+        let mut found_any = false;
+        for (family, alias, entry) in config.providers.models.iter_entries() {
+            found_any = true;
+            let label = format!("{family}.{alias}");
+            if let Some(reason) = provider_validation_error(family) {
+                items.push(DiagItem::error(
+                    cat,
+                    format!("model_provider \"{label}\" is invalid: {reason}"),
+                ));
+            } else {
+                items.push(DiagItem::ok(
+                    cat,
+                    format!("model_provider \"{label}\" is valid"),
+                ));
+            }
+
+            // API key presence
+            if family != "ollama" {
+                if entry.api_key.as_deref().is_some() {
+                    items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
+                } else {
+                    items.push(DiagItem::warn(
+                        cat,
+                        format!("{label}: no api_key set (may rely on env vars or model_provider defaults)"),
+                    ));
+                }
+            }
+
+            // Model configured
+            if let Some(model) = entry.model.as_deref() {
+                items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
+            } else {
+                items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // Temperature range
+            match entry.temperature {
+                Some(temperature) if (0.0..=2.0).contains(&temperature) => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!(
+                            "{label}: temperature {temperature:.1} (valid range 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
+                Some(temperature) => {
+                    items.push(DiagItem::error(
+                        cat,
+                        format!(
+                            "{label}: temperature {temperature:.1} is out of range (expected 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
+                None => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!("{label}: temperature unset (provider default)"),
+                    ));
+                }
+            }
         }
-    } else {
-        items.push(DiagItem::error(cat, "no model model_provider configured"));
-    }
-
-    // API key presence
-    if primary_model_provider != Some("ollama") {
-        if primary_model_provider_doc
-            .and_then(|e| e.api_key.as_deref())
-            .is_some()
-        {
-            items.push(DiagItem::ok(cat, "API key configured"));
-        } else {
-            items.push(DiagItem::warn(
-                cat,
-                "no api_key set (may rely on env vars or model_provider defaults)",
-            ));
+        if !found_any {
+            items.push(DiagItem::error(cat, "no model providers configured"));
         }
-    }
-
-    // Model configured
-    let primary_model = primary_model_provider_doc.and_then(|e| e.model.as_deref());
-    if primary_model.is_some() {
-        items.push(DiagItem::ok(
-            cat,
-            format!("model: {}", primary_model.unwrap_or("?")),
-        ));
-    } else {
-        items.push(DiagItem::warn(
-            cat,
-            "no model configured on primary model_provider",
-        ));
-    }
-
-    // Temperature range
-    let primary_temperature = primary_model_provider_doc
-        .and_then(|e| e.temperature)
-        .unwrap_or(0.7);
-    if (0.0..=2.0).contains(&primary_temperature) {
-        items.push(DiagItem::ok(
-            cat,
-            format!(
-                "temperature {:.1} (valid range 0.0–2.0)",
-                primary_temperature
-            ),
-        ));
-    } else {
-        items.push(DiagItem::error(
-            cat,
-            format!(
-                "temperature {:.1} is out of range (expected 0.0–2.0)",
-                primary_temperature
-            ),
-        ));
     }
 
     // Gateway port range
@@ -1110,9 +1108,9 @@ mod tests {
     #[test]
     fn config_validation_catches_bad_temperature() {
         // Single model_provider entry with an out-of-range temperature so the
-        // doctor's `first_model_provider()` lookup deterministically picks it
+        // doctor's `iter_entries()` walk deterministically finds it
         // (HashMap iteration order is unspecified — multiple entries
-        // produce a coin-flip first pick).
+        // produce a coin-flip iteration order).
         let mut config = Config::default();
         config
             .providers
@@ -1189,7 +1187,7 @@ mod tests {
     #[test]
     fn config_validation_catches_unknown_provider() {
         // Typed slots can only hold canonical family names, so an unknown
-        // family can no longer reach `first_model_provider_type()`. The
+        // family can no longer reach `iter_entries()`. The
         // remaining reachable path is `agent.model_provider`, which is a
         // free-form `String` an operator can set to any dotted ref.
         let mut config = Config::default();

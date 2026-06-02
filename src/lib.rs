@@ -109,6 +109,7 @@ pub use config::Config;
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GatewayCommands {
     /// Start the gateway server (default if no subcommand specified)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Start the gateway server (webhooks, websockets).
 
@@ -132,6 +133,7 @@ Examples:
         host: Option<String>,
     },
     /// Restart the gateway server
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Restart the gateway server.
 
@@ -152,6 +154,7 @@ Examples:
         host: Option<String>,
     },
     /// Show or generate the pairing code without restarting
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Show or generate the gateway pairing code.
 
@@ -216,6 +219,7 @@ pub enum ChannelCommands {
     /// Run health checks for configured channels (handled in main.rs for async)
     Doctor,
     /// Add a new channel configuration
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a new channel configuration.
 
@@ -239,6 +243,7 @@ Examples:
         name: String,
     },
     /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Bind a Telegram identity into the allowlist.
 
@@ -254,6 +259,7 @@ Examples:
         identity: String,
     },
     /// Send a message to a configured channel
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Send a one-off message to a configured channel.
 
@@ -286,6 +292,7 @@ pub enum SkillCommands {
     /// List all installed skills
     List,
     /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Scaffold a new skill under a skill bundle. Writes <bundle.directory>/<name>/SKILL.md \
 plus the canonical optional subdirs (scripts/, references/, assets/). \
@@ -415,6 +422,7 @@ pub enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a new recurring scheduled task.
 
@@ -446,6 +454,7 @@ Examples:
         command: String,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp with explicit Z or offset
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
@@ -471,6 +480,7 @@ Examples:
         command: String,
     },
     /// Add a fixed-interval scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a task that repeats at a fixed interval.
 
@@ -495,6 +505,7 @@ Examples:
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a one-shot task that fires after a delay from now.
 
@@ -525,6 +536,7 @@ Examples:
         id: String,
     },
     /// Update a scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Update one or more fields of an existing scheduled task.
 
@@ -629,6 +641,7 @@ pub enum IntegrationCommands {
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HardwareCommands {
     /// Enumerate USB devices (VID/PID) and show known boards
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Enumerate USB devices and show known boards.
 
@@ -639,6 +652,7 @@ Examples:
   zeroclaw hardware discover")]
     Discover,
     /// Introspect a device by path (e.g. /dev/ttyACM0)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Introspect a device by its serial or device path.
 
@@ -653,6 +667,7 @@ Examples:
         path: String,
     },
     /// Get chip info via USB (probe-rs over ST-Link). No firmware needed on target.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Get chip info via USB using probe-rs over ST-Link.
 
@@ -675,6 +690,7 @@ pub enum PeripheralCommands {
     /// List configured peripherals
     List,
     /// Add a peripheral (board path, e.g. nucleo-f401re /dev/ttyACM0)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a peripheral by board type and transport path.
 
@@ -695,6 +711,7 @@ Examples:
         path: String,
     },
     /// Flash ZeroClaw firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Flash ZeroClaw firmware to an Arduino board.
 

@@ -468,13 +468,40 @@ impl GitOperationsTool {
                 anyhow::Error::msg("Missing 'message' parameter")
             })?;
 
-        // Sanitize commit message
-        let sanitized = message
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Sanitize commit message.
+        // Trim trailing whitespace from each line but preserve blank lines —
+        // git uses the blank line between the subject and the body to separate
+        // them, so stripping blank lines collapses the entire message onto one
+        // line in `git log --oneline` and breaks `git log --format=%b`.
+        // We do strip leading blank lines and collapse runs of 3+ consecutive
+        // blank lines down to 2 (one blank line = paragraph break is fine;
+        // more than that is just noise).
+        let trimmed_lines: Vec<&str> = message.lines().map(|l| l.trim_end()).collect();
+        // Drop leading blank lines.
+        let trimmed_lines = trimmed_lines
+            .iter()
+            .copied()
+            .skip_while(|l| l.is_empty())
+            .collect::<Vec<_>>();
+        // Collapse runs of more than 2 consecutive blank lines to 2.
+        let mut sanitized_lines: Vec<&str> = Vec::with_capacity(trimmed_lines.len());
+        let mut consecutive_blanks = 0usize;
+        for line in &trimmed_lines {
+            if line.is_empty() {
+                consecutive_blanks += 1;
+                if consecutive_blanks <= 2 {
+                    sanitized_lines.push(line);
+                }
+            } else {
+                consecutive_blanks = 0;
+                sanitized_lines.push(line);
+            }
+        }
+        // Drop trailing blank lines.
+        while sanitized_lines.last().is_some_and(|l: &&str| l.is_empty()) {
+            sanitized_lines.pop();
+        }
+        let sanitized = sanitized_lines.join("\n");
 
         if sanitized.is_empty() {
             anyhow::bail!("Commit message cannot be empty");
@@ -517,17 +544,23 @@ impl GitOperationsTool {
             anyhow::Error::msg("Missing 'paths' parameter")
         })?;
 
-        // Validate paths against injection patterns
-        self.sanitize_git_args(paths)?;
+        // Validate paths against injection patterns. Returns each
+        // whitespace-separated pathspec as its own argument so the join is
+        // not handed to git as a single literal path.
+        let sanitized = self.sanitize_git_args(paths)?;
+        if sanitized.is_empty() {
+            anyhow::bail!("No paths to stage");
+        }
 
-        let output = self
-            .run_git_command(&["add", "--", paths], working_dir)
-            .await;
+        let mut git_args: Vec<&str> = vec!["add", "--"];
+        git_args.extend(sanitized.iter().map(String::as_str));
+
+        let output = self.run_git_command(&git_args, working_dir).await;
 
         match output {
             Ok(_) => Ok(ToolResult {
                 success: true,
-                output: format!("Staged: {paths}"),
+                output: format!("Staged: {}", sanitized.join(" ")),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -598,8 +631,47 @@ impl GitOperationsTool {
 
         let output = match action {
             "push" | "save" => {
-                self.run_git_command(&["stash", "push", "-m", "auto-stash"], working_dir)
-                    .await
+                // Build args: stash push [-m MSG] [-k] [--] [PATHSPEC...]
+                // `keep_index` preserves the staged area inside the working
+                // tree after stashing — needed to stash only unstaged
+                // changes and keep the index intact for the next commit.
+                // `paths` (space-separated) scopes the stash to specific
+                // pathspecs, leaving everything else untouched.
+                let message = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("auto-stash")
+                    .to_string();
+                let keep_index = args
+                    .get("keep_index")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let include_untracked = args
+                    .get("include_untracked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let paths_raw = args
+                    .get("paths")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let mut cmd: Vec<String> =
+                    vec!["stash".into(), "push".into(), "-m".into(), message];
+                if keep_index {
+                    cmd.push("-k".into());
+                }
+                if include_untracked {
+                    cmd.push("-u".into());
+                }
+                if !paths_raw.is_empty() {
+                    cmd.push("--".into());
+                    for p in paths_raw.split_whitespace() {
+                        cmd.push(p.to_string());
+                    }
+                }
+                let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+                self.run_git_command(&cmd_refs, working_dir).await
             }
             "pop" => self.run_git_command(&["stash", "pop"], working_dir).await,
             "list" => self.run_git_command(&["stash", "list"], working_dir).await,
@@ -817,11 +889,11 @@ impl Tool for GitOperationsTool {
                 },
                 "message": {
                     "type": "string",
-                    "description": "Commit message (for 'commit' operation)"
+                    "description": "Commit message (for 'commit' operation); stash message (for 'stash push', defaults to 'auto-stash')"
                 },
                 "paths": {
                     "type": "string",
-                    "description": "File paths to stage (for 'add' operation)"
+                    "description": "Space-separated file paths. For 'add', files to stage. For 'stash push', pathspecs to scope the stash to — without this, the entire working tree is stashed."
                 },
                 "branch": {
                     "type": "string",
@@ -851,6 +923,14 @@ impl Tool for GitOperationsTool {
                 "index": {
                     "type": "integer",
                     "description": "Stash index (for 'stash' with 'drop' action)"
+                },
+                "keep_index": {
+                    "type": "boolean",
+                    "description": "For 'stash push': preserve staged changes in the working tree after stashing — only unstaged changes go into the stash."
+                },
+                "include_untracked": {
+                    "type": "boolean",
+                    "description": "For 'stash push': also stash untracked files (-u). Without this, `git stash push` only touches tracked files."
                 },
                 "path": {
                     "type": "string",
@@ -973,6 +1053,28 @@ mod tests {
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    /// Initialise a git repo for tests with commit/tag signing disabled and a
+    /// fixed identity. Tests run real `git commit`; without this they inherit
+    /// the developer's global `commit.gpgsign`, blocking the suite on a
+    /// hardware-key tap.
+    fn git_init_no_sign(dir: &std::path::Path, extra_init: &[&str]) {
+        let mut init = vec!["init"];
+        init.extend_from_slice(extra_init);
+        for args in [
+            init.as_slice(),
+            &["config", "user.email", "test@test.com"],
+            &["config", "user.name", "Test"],
+            &["config", "commit.gpgsign", "false"],
+            &["config", "tag.gpgsign", "false"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        }
     }
 
     fn test_tool_with_allowed_root(
@@ -1158,12 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn blocks_readonly_mode_for_write_ops() {
         let tmp = TempDir::new().unwrap();
-        // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        git_init_no_sign(tmp.path(), &[]);
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
@@ -1189,12 +1286,7 @@ mod tests {
     #[tokio::test]
     async fn allows_branch_listing_in_readonly_mode() {
         let tmp = TempDir::new().unwrap();
-        // Initialize a git repository so the command can succeed
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        git_init_no_sign(tmp.path(), &[]);
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
@@ -1250,12 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_operation() {
         let tmp = TempDir::new().unwrap();
-        // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        git_init_no_sign(tmp.path(), &[]);
 
         let tool = test_tool(tmp.path());
 
@@ -1267,6 +1354,56 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Unknown operation")
+        );
+    }
+
+    /// The blank line between the subject and body must be preserved so that
+    /// `git log --format=%b` and `git log --oneline` both work correctly.
+    /// Before the fix, `filter(|l| !l.is_empty())` stripped all blank lines
+    /// and collapsed the whole message onto a single line.
+    #[tokio::test]
+    async fn commit_message_preserves_blank_line_between_subject_and_body() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        // Create an initial commit so HEAD exists.
+        std::fs::write(tmp.path().join("README.md"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+
+        let msg = "fix(foo): subject line\n\nThis is the body paragraph.\n\nSecond paragraph.";
+        let result = tool
+            .execute(json!({"operation": "commit", "message": msg}))
+            .await
+            .unwrap();
+        assert!(result.success, "commit failed: {:?}", result.error);
+
+        // Read back the raw commit message via git log.
+        let log_out = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let log_msg = String::from_utf8_lossy(&log_out.stdout);
+
+        // Subject line must be on its own line.
+        assert!(
+            log_msg.starts_with("fix(foo): subject line\n"),
+            "subject line missing or not first: {log_msg:?}"
+        );
+        // A blank line must follow the subject.
+        assert!(
+            log_msg.contains("fix(foo): subject line\n\n"),
+            "blank line between subject and body missing: {log_msg:?}"
+        );
+        // Body text must be present.
+        assert!(
+            log_msg.contains("This is the body paragraph."),
+            "body paragraph missing: {log_msg:?}"
         );
     }
 
@@ -1326,21 +1463,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("nested");
         std::fs::create_dir(&sub).unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&sub)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&sub)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&sub)
-            .output()
-            .unwrap();
+        git_init_no_sign(&sub, &[]);
 
         let tool = test_tool(tmp.path());
 
@@ -1359,11 +1482,7 @@ mod tests {
     #[tokio::test]
     async fn git_worktree_list_works() {
         let tmp = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        git_init_no_sign(tmp.path(), &[]);
 
         let tool = test_tool(tmp.path());
 
@@ -1385,5 +1504,241 @@ mod tests {
             worktrees[0]["path"].as_str().is_some_and(|p| !p.is_empty()),
             "Main worktree must have a non-empty path"
         );
+    }
+
+    /// Helper: bootstrap a usable repo (init + identity + initial commit on
+    /// `master`) so subsequent stash tests have something to stash against.
+    /// `tracked_files` are added & committed so they appear as tracked
+    /// modifications when later edited — `git stash` only handles tracked
+    /// files by default, so all stash test fixtures must use this seam.
+    async fn bootstrap_repo(dir: &std::path::Path, tracked_files: &[&str]) {
+        git_init_no_sign(dir, &["-b", "master"]);
+        std::fs::write(dir.join("README.md"), "hello").unwrap();
+        for f in tracked_files {
+            std::fs::write(dir.join(f), "initial").unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+
+    /// `stash push` with no extra args stashes everything tracked — staged
+    /// and unstaged. Regression guard: this is the legacy behaviour and
+    /// must keep working when no `keep_index` / `paths` are supplied.
+    #[tokio::test]
+    async fn stash_push_default_stashes_staged_and_unstaged() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["staged.txt", "unstaged.txt"]).await;
+
+        std::fs::write(tmp.path().join("staged.txt"), "s-modified").unwrap();
+        std::fs::write(tmp.path().join("unstaged.txt"), "u-modified").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+        assert!(result.success, "stash push failed: {:?}", result.error);
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let status_out = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_out.trim().is_empty(),
+            "expected clean working tree after default stash, got: {status_out:?}"
+        );
+    }
+
+    /// `stash push` with `keep_index: true` stashes only unstaged changes
+    /// and leaves the index intact. This is the fix for the tool's
+    /// "stashes everything indiscriminately" bug.
+    #[tokio::test]
+    async fn stash_push_with_keep_index_preserves_staged() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["staged.txt", "unstaged.txt"]).await;
+
+        std::fs::write(tmp.path().join("staged.txt"), "s-modified").unwrap();
+        std::fs::write(tmp.path().join("unstaged.txt"), "u-modified").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+        let result = tool
+            .execute(json!({
+                "operation": "stash",
+                "action": "push",
+                "keep_index": true,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "stash push -k failed: {:?}", result.error);
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let status_out = String::from_utf8_lossy(&status.stdout).to_string();
+        // `staged.txt` modification still present and staged (`M ` prefix);
+        // `unstaged.txt` modification was stashed away — file matches HEAD.
+        assert!(
+            status_out.contains("M  staged.txt"),
+            "staged modification should remain staged, status: {status_out:?}"
+        );
+        assert!(
+            !status_out.contains("unstaged.txt"),
+            "unstaged modification should have been stashed, status: {status_out:?}"
+        );
+    }
+
+    /// `stash push` with `paths` scopes the stash to specific pathspecs.
+    /// Files outside the pathspec stay in the working tree.
+    #[tokio::test]
+    async fn stash_push_with_paths_scopes_to_pathspec() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["a.txt", "b.txt"]).await;
+
+        std::fs::write(tmp.path().join("a.txt"), "a-modified").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "b-modified").unwrap();
+
+        let tool = test_tool(tmp.path());
+        let result = tool
+            .execute(json!({
+                "operation": "stash",
+                "action": "push",
+                "paths": "a.txt",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "stash push -- a.txt failed: {:?}",
+            result.error
+        );
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let status_out = String::from_utf8_lossy(&status.stdout).to_string();
+        assert!(
+            !status_out.contains("a.txt"),
+            "a.txt should have been stashed, status: {status_out:?}"
+        );
+        assert!(
+            status_out.contains("b.txt"),
+            "b.txt should remain modified, status: {status_out:?}"
+        );
+    }
+
+    /// `stash push` with a custom `message` records that message instead
+    /// of the default `auto-stash`.
+    #[tokio::test]
+    async fn stash_push_with_custom_message() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["a.txt"]).await;
+        std::fs::write(tmp.path().join("a.txt"), "a-modified").unwrap();
+
+        let tool = test_tool(tmp.path());
+        let result = tool
+            .execute(json!({
+                "operation": "stash",
+                "action": "push",
+                "message": "scoped-fix-wip",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "stash push -m failed: {:?}", result.error);
+
+        let list = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let list_out = String::from_utf8_lossy(&list.stdout).to_string();
+        assert!(
+            list_out.contains("scoped-fix-wip"),
+            "custom stash message missing from list, got: {list_out:?}"
+        );
+    }
+
+    /// `stash push` with `include_untracked: true` also stashes untracked
+    /// files — `git stash` ignores them by default.
+    #[tokio::test]
+    async fn stash_push_with_include_untracked_captures_new_files() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        std::fs::write(tmp.path().join("new.txt"), "untracked").unwrap();
+
+        let tool = test_tool(tmp.path());
+        let result = tool
+            .execute(json!({
+                "operation": "stash",
+                "action": "push",
+                "include_untracked": true,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "stash push -u failed: {:?}", result.error);
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let status_out = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_out.trim().is_empty(),
+            "expected clean tree after -u stash, got: {status_out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_stages_multiple_space_separated_paths() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"operation": "add", "paths": "a.txt b.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "add failed: {:?}", result.error);
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&status.stdout);
+        assert!(out.contains("A  a.txt"), "a.txt not staged: {out:?}");
+        assert!(out.contains("A  b.txt"), "b.txt not staged: {out:?}");
     }
 }

@@ -314,7 +314,7 @@ channel-wecom-ws-voice-unavailable = 我现在无法处理语音消息 {$emoji}
 channel-wecom-ws-unsupported-message = 暂不支持该消息类型。
 channel-wecom-ws-welcome = 你好，欢迎来找我聊天 {$emoji}
 channel-wecom-ws-supplemental-message =
-    [补充消息]
+    {"["}补充消息]
     {$extra}
 channel-wecom-ws-group-allowlist-missing =
     管理员尚未配置 WeCom allowlist，当前机器人不接收任何群消息。
