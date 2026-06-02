@@ -376,10 +376,10 @@ Each GitHub Release publishes the following artifacts:
 | `zeroclaw` kernel binary | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` | Static musl build for Linux x86_64; GNU for ARM targets |
 | `zeroclaw` kernel binary (hardware) | `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf` | Same targets, compiled with `peripheral-rpi` and `hardware` flags for Raspberry Pi deployments |
 | `zeroclaw-gw` gateway binary | Same platform matrix as kernel | Published alongside the kernel; users install separately |
-| WASM plugin files | `wasm32-wasip1` | Published to the plugin registry (not GitHub Releases); installable via `zeroclaw plugin install` |
+| WASM plugin files | `wasm32-wasip2` | Published to the plugin registry (not GitHub Releases); installable via `zeroclaw plugin install` |
 | `zeroclaw-desktop` installer | `x86_64` and `aarch64` for macOS, Windows, Linux (AppImage/deb) | Bundles kernel + gateway + full plugin set; built by the Tauri workflow |
 
-The `wasm32-wasip1` plugin builds run in a separate CI job and are published to the plugin registry on their own cadence. A plugin release does not require a kernel release.
+The `wasm32-wasip2` plugin builds run in a separate CI job and are published to the plugin registry on their own cadence. A plugin release does not require a kernel release.
 
 ---
 
@@ -446,7 +446,7 @@ Standards are agreements that have been made by many smart people over many year
 - Define WIT interface files for `Tool`, `Channel`, and `Memory` plugin types (a `wit/` directory at the root of the workspace)
 - Use `wit-bindgen` to generate the Rust host-side bindings from those WIT files
 - Document the WIT interfaces as the official plugin SDK
-- A plugin author writes Rust (or Go, or C, or Python) against the WIT interface and `cargo build --target wasm32-wasi` — the result drops into `~/.zeroclaw/plugins/`
+- A plugin author writes Rust (or Go, or C, or Python) against the WIT interface and `cargo build --target wasm32-wasip2` — the result drops into `~/.zeroclaw/plugins/`
 
 **Standards:** WASI 0.2 · W3C WebAssembly Component Model · WIT IDL
 
@@ -720,7 +720,7 @@ Approximately 60 of the 70+ tools move to plugin crates, grouped by domain: `zer
 Publish a plugin development guide. A developer should be able to write a new tool plugin in an afternoon:
 1. Add `zeroclaw-plugin-sdk` as a dependency
 2. Implement the WIT-generated trait
-3. `cargo build --target wasm32-wasi`
+3. `cargo build --target wasm32-wasip2`
 4. `zeroclaw plugin install ./my-plugin/`
 
 The SDK handles the host function bindings, the manifest format, and the permissions model.
