@@ -1837,7 +1837,8 @@ mod tests {
 
         loop {
             if let Ok(content) = std::fs::read_to_string(&result_path) {
-                let result: BackgroundDelegateResult = serde_json::from_str(&content).unwrap();
+                let result: BackgroundDelegateResult =
+                    serde_json::from_str(&content).expect("failed to deserialize background delegate result; JSON written by subprocess may be malformed");
                 if result.status != BackgroundTaskStatus::Running {
                     return result;
                 }
