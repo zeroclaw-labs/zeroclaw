@@ -716,6 +716,15 @@ pub async fn run_gateway(
         None
     };
 
+    // ── Migrate standalone devices.db → state.db (Track 4) ──
+    if let Ok(state_db) = daemonclaw_config::state_db::StateDb::open(&config.workspace_dir) {
+        match state_db.migrate_devices_from_standalone(&config.workspace_dir) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("📦 Migrated {n} device(s) from standalone devices.db to state.db"),
+            Err(e) => tracing::warn!("Device migration from standalone devices.db failed: {e}"),
+        }
+    }
+
     // ── Device registry (must be created before PairingGuard so we can load tokens) ──
     let device_registry: Option<Arc<api_pairing::DeviceRegistry>> =
         if config.gateway.require_pairing {

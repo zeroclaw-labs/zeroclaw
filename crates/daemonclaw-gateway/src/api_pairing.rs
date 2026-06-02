@@ -33,20 +33,13 @@ pub struct DeviceRegistry {
 
 impl DeviceRegistry {
     pub fn new(workspace_dir: &Path) -> Self {
-        let db_path = workspace_dir.join("devices.db");
-        let conn = Connection::open(&db_path).expect("Failed to open device registry database");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS devices (
-                token_hash TEXT PRIMARY KEY,
-                id TEXT NOT NULL,
-                name TEXT,
-                device_type TEXT,
-                paired_at TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                ip_address TEXT
-            )",
-        )
-        .expect("Failed to create devices table");
+        let state_db = daemonclaw_config::state_db::StateDb::open(workspace_dir)
+            .expect("Failed to open state.db for device registry");
+        state_db
+            .ensure_devices_table()
+            .expect("Failed to ensure devices table in state.db");
+        let db_path = state_db.path().to_path_buf();
+        let conn = Connection::open(&db_path).expect("Failed to open state.db for device registry");
 
         // Warm the in-memory cache from DB
         let mut cache = HashMap::new();

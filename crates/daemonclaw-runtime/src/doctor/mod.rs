@@ -776,40 +776,43 @@ fn workspace_probe_path(workspace_dir: &Path) -> std::path::PathBuf {
 
 fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "daemon";
-    let state_file = crate::daemon::state_file_path(config);
 
-    if !state_file.exists() {
-        items.push(DiagItem::error(
-            cat,
-            format!(
-                "state file not found: {} — is the daemon running?",
-                state_file.display()
-            ),
-        ));
+    let state_db = match daemonclaw_config::state_db::StateDb::open(&config.workspace_dir) {
+        Ok(db) => db,
+        Err(_) => {
+            // Fall back to legacy JSON file
+            return check_daemon_state_legacy(config, items);
+        }
+    };
+    let _ = state_db.ensure_daemon_health_table();
+    let conn = match state_db.connect() {
+        Ok(c) => c,
+        Err(_) => return check_daemon_state_legacy(config, items),
+    };
+
+    let row: Option<(String, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT written_at, uptime_secs, components FROM daemon_health ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+
+    let Some((written_at, _uptime, components_str)) = row else {
+        items.push(DiagItem::error(cat, "no health snapshots in state.db — is the daemon running?"));
         return;
-    }
-
-    let raw = match std::fs::read_to_string(&state_file) {
-        Ok(r) => r,
-        Err(e) => {
-            items.push(DiagItem::error(cat, format!("cannot read state file: {e}")));
-            return;
-        }
     };
 
-    let snapshot: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            items.push(DiagItem::error(cat, format!("invalid state JSON: {e}")));
-            return;
-        }
-    };
+    let components_json: serde_json::Value = components_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!({}));
+    let snapshot = serde_json::json!({
+        "updated_at": &written_at,
+        "components": components_json,
+    });
 
-    // Daemon heartbeat freshness
-    let updated_at = snapshot
-        .get("updated_at")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let updated_at = written_at.as_str();
 
     if let Ok(ts) = DateTime::parse_from_rfc3339(updated_at) {
         let age = Utc::now()
@@ -902,6 +905,41 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 cat,
                 format!("{channel_count} channels, {stale} stale"),
             ));
+        }
+    }
+}
+
+fn check_daemon_state_legacy(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "daemon";
+    let state_file = crate::daemon::state_file_path(config);
+    if !state_file.exists() {
+        items.push(DiagItem::error(
+            cat,
+            format!("state file not found: {} — is the daemon running?", state_file.display()),
+        ));
+        return;
+    }
+    let raw = match std::fs::read_to_string(&state_file) {
+        Ok(r) => r,
+        Err(e) => {
+            items.push(DiagItem::error(cat, format!("cannot read state file: {e}")));
+            return;
+        }
+    };
+    let snapshot: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            items.push(DiagItem::error(cat, format!("invalid state JSON: {e}")));
+            return;
+        }
+    };
+    let updated_at = snapshot.get("updated_at").and_then(serde_json::Value::as_str).unwrap_or("");
+    if let Ok(ts) = DateTime::parse_from_rfc3339(updated_at) {
+        let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc)).num_seconds();
+        if age <= DAEMON_STALE_SECONDS {
+            items.push(DiagItem::ok(cat, format!("heartbeat fresh ({age}s ago) [legacy JSON]")));
+        } else {
+            items.push(DiagItem::error(cat, format!("heartbeat stale ({age}s ago) [legacy JSON]")));
         }
     }
 }
