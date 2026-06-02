@@ -83,7 +83,8 @@ struct CachedApiKey {
 struct ApiChatRequest<'a> {
     model: String,
     messages: Vec<ApiMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,7 +382,7 @@ impl CopilotModelProvider {
         messages: Vec<ApiMessage>,
         tools: Option<&[ToolSpec]>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (token, endpoint) = self.get_api_key().await?;
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
@@ -690,8 +691,6 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
-
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(ApiMessage {
@@ -720,7 +719,6 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let response = self
             .send_chat_request(Self::convert_messages(messages), None, model, temperature)
             .await?;
@@ -733,7 +731,6 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         self.send_chat_request(
             Self::convert_messages(request.messages),
             request.tools,

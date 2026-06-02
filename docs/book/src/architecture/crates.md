@@ -6,7 +6,7 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ### `zeroclaw-runtime`
 
-The agent loop, security-policy enforcement, SOP engine, cron scheduler, onboarding sections, and TUI. Depends on every other core and edge crate.
+The agent loop, security-policy enforcement, SOP engine, cron scheduler, onboarding sections, and RPC layer for zerocode. Depends on every other core and edge crate.
 
 Notable submodules:
 
@@ -127,7 +127,7 @@ backend. Not a tracing/metrics layer — that's `zeroclaw-log`.
 
 Derive macros for config schema, tool registration, and channel registration. Saves boilerplate across the workspace.
 
-### `zeroclaw-tui`
+### `zerocode`
 
 Terminal UI. Optional — compile with `--features tui`.
 

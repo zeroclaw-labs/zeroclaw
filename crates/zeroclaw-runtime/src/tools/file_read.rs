@@ -59,7 +59,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion. Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .xlsx/.docx); offset/limit are ignored in that mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -72,11 +72,16 @@ impl Tool for FileReadTool {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Starting line number (1-based, default: 1)"
+                    "description": "Starting line number (1-based, default: 1). Ignored when encoding is 'base64'."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to return (default: all)"
+                    "description": "Maximum number of lines to return (default: all). Ignored when encoding is 'base64'."
+                },
+                "encoding": {
+                    "type": "string",
+                    "enum": ["utf8", "base64"],
+                    "description": "Output encoding (default: 'utf8'). Use 'base64' to read binary files as base64-encoded bytes."
                 }
             },
             "required": ["path"]
@@ -166,6 +171,41 @@ impl Tool for FileReadTool {
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
+        }
+
+        let encoding = args
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .unwrap_or("utf8");
+
+        if encoding == "base64" {
+            // Binary read: return raw bytes base64-encoded. Line numbering and
+            // offset/limit are text concepts and do not apply here.
+            let bytes = match tokio::fs::read(&resolved_path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to read file: {e}")),
+                    });
+                }
+            };
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Ok(ToolResult {
+                success: true,
+                output: encoded,
+                error: None,
+            });
+        } else if encoding != "utf8" {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unsupported encoding '{encoding}' (expected 'utf8' or 'base64')"
+                )),
+            });
         }
 
         match tokio::fs::read_to_string(&resolved_path).await {
@@ -427,6 +467,63 @@ mod tests {
         let tool = test_tool(std::env::temp_dir());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn file_read_schema_has_encoding() {
+        let tool = test_tool(std::env::temp_dir());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["encoding"].is_object());
+    }
+
+    #[tokio::test]
+    async fn file_read_base64_returns_encoded_bytes() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_base64");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Non-UTF-8 bytes — proves we return raw bytes, not lossy text.
+        let raw: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'P', b'K', 0x03, 0x04];
+        tokio::fs::write(dir.join("data.bin"), &raw).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "data.bin", "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(result.output.trim())
+            .expect("output must be valid base64");
+        assert_eq!(decoded, raw, "base64 read must round-trip exact bytes");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_unsupported_encoding_errors() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_bad_encoding");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("f.txt"), "hi").await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "f.txt", "encoding": "hex"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unsupported encoding")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

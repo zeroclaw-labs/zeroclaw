@@ -5,6 +5,7 @@ pub mod v1;
 pub mod v2;
 
 use crate::autonomy::AutonomyLevel;
+use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
@@ -87,7 +88,7 @@ pub struct Config {
     /// Populated by `apply_env_overrides`; consulted by `save()` to mask the
     /// env-injected values back to disk-or-default before encryption, and by
     /// `prop_is_env_overridden` for O(1) display-layer lookup (config list,
-    /// dashboard, onboarding).
+    /// dashboard, quickstart).
     #[serde(skip)]
     pub env_overridden_paths: std::collections::HashSet<String>,
     /// Per-path snapshot of pre-override raw values, captured at apply time
@@ -248,6 +249,11 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub gateway: GatewayConfig,
+
+    /// WebSocket Secure (WSS) transport for remote TUI connections (`[wss]`).
+    #[serde(default)]
+    #[nested]
+    pub wss: WssConfig,
 
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
@@ -435,7 +441,7 @@ pub struct Config {
     #[nested]
     pub nodes: NodesConfig,
 
-    /// Meta-state for `zeroclaw onboard` (which sections the user has
+    /// Meta-state for the Quickstart flow (which sections the user has
     /// already walked through). Not user-facing config (`[onboard_state]`).
     #[serde(default)]
     #[nested]
@@ -554,21 +560,30 @@ pub struct Config {
 /// When enabled, each client engagement gets an isolated workspace with
 /// separate memory, audit, secrets, and tool restrictions.
 #[allow(clippy::struct_excessive_bools)]
-/// Opaque state the `zeroclaw onboard` flow writes so it can tell, on a
+/// Opaque state the Quickstart flow writes so it can tell, on a
 /// re-run, which sections the user has already walked through at least
 /// once — which lets it offer "Reconfigure? [y/N]" skip gates instead of
 /// forcing users through every field again.
 ///
-/// This is meta-state about the onboard process, not user-facing config.
+/// This is meta-state about the Quickstart flow, not user-facing config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "onboard_state"]
 pub struct OnboardStateConfig {
-    /// Section keys the user has completed at least once via onboard.
+    /// Section keys the user has completed at least once.
     /// Values are the lowercased Section variant names
     /// (`"workspace"`, `"model_providers"`, …).
     #[serde(default)]
     pub completed_sections: Vec<String>,
+    /// `true` once the Quickstart has applied a `BuilderSubmission`
+    /// successfully on this install. Web gateway and TUI auto-launch
+    /// the Quickstart on startup iff this is `false` **and** no
+    /// `agents.*` entries exist (the implicit-completion rule covers
+    /// upgrades). The flag is flipped in the same atomic write that
+    /// lands the Quickstart submission; re-entering the Quickstart
+    /// later to add another agent does not flip it back to `false`.
+    #[serde(default)]
+    pub quickstart_completed: bool,
 }
 
 /// Used by `#[serde(skip_serializing_if)]` on plain `bool` fields to omit
@@ -650,6 +665,7 @@ pub enum AuthMode {
 pub struct ModelProviderConfig {
     /// Secret API token for this model_provider — grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -660,38 +676,48 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
+    #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
     /// Model identifier to send with each request — the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
+    #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
     /// deterministic, near-verbatim output — fits code, routing, summarization.
     /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
+    #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
+    #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
+    #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_headers: HashMap<String, String>,
     /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider — only override if you're forcing an unusual combination.
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
     /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
+    #[tab(Connection)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_openai_auth: bool,
     /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
+    #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
     /// Extra JSON parameters to include in API requests.
     /// Merged at the top level of the request body, allowing provider-specific
     /// features (routing, transforms, etc.) without code changes.
     /// Example: `provider_extra = { model_provider = { only = ["Anthropic"] } }`
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
     /// Per-model pricing for cost tracking, USD per 1M tokens.
@@ -705,6 +731,7 @@ pub struct ModelProviderConfig {
     ///
     /// Example: `pricing = { opus = 15.0, sonnet = 3.0 }`
     /// Or split: `pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }`
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pricing: HashMap<String, f64>,
     /// Override the provider's default for native tool calling.
@@ -714,12 +741,14 @@ pub struct ModelProviderConfig {
     /// text-fallback because llama-family Groq models reject native tool
     /// calls with HTTP 400. Setting `native_tools = true` re-enables native
     /// tool calling for Groq models that support it.
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
     /// Enable or disable chain-of-thought thinking for models that support it
     /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
     /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
     /// in the request body; mirrors the Ollama provider's `think` field.
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
     /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
@@ -727,6 +756,7 @@ pub struct ModelProviderConfig {
     /// template variables that control behaviour not exposed by other fields.
     /// Example (Qwen3 thinking suppression):
     ///   `chat_template_kwargs = { enable_thinking = false }`
+    #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
 }
@@ -2737,55 +2767,117 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
+/// Runtime tunables resolved from the agent's runtime profile. Populated
+/// by `Config::resolved_agent_config`; never deserialized from the agent
+/// table. The runtime profile is the sole config surface for these.
+#[derive(Debug, Clone)]
+pub struct ResolvedRuntime {
+    pub compact_context: bool,
+    pub max_tool_iterations: usize,
+    pub max_history_messages: usize,
+    pub max_context_tokens: usize,
+    pub parallel_tools: bool,
+    pub tool_dispatcher: String,
+    pub strict_tool_parsing: bool,
+    pub tool_call_dedup_exempt: Vec<String>,
+    pub tool_filter_groups: Vec<ToolFilterGroup>,
+    pub max_system_prompt_chars: usize,
+    pub thinking: crate::scattered_types::ThinkingConfig,
+    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
+    pub context_aware_tools: bool,
+    pub eval: crate::scattered_types::EvalConfig,
+    pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
+    pub context_compression: crate::scattered_types::ContextCompressionConfig,
+    pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
+    pub tool_receipts: ToolReceiptsConfig,
+}
+
+impl Default for ResolvedRuntime {
+    fn default() -> Self {
+        Self {
+            compact_context: true,
+            max_tool_iterations: 10,
+            max_history_messages: 50,
+            max_context_tokens: 32_000,
+            parallel_tools: false,
+            tool_dispatcher: default_agent_tool_dispatcher(),
+            strict_tool_parsing: false,
+            tool_call_dedup_exempt: Vec::new(),
+            tool_filter_groups: Vec::new(),
+            max_system_prompt_chars: default_max_system_prompt_chars(),
+            thinking: crate::scattered_types::ThinkingConfig::default(),
+            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
+            context_aware_tools: false,
+            eval: crate::scattered_types::EvalConfig::default(),
+            auto_classify: None,
+            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
+            max_tool_result_chars: default_max_tool_result_chars(),
+            keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
+        }
+    }
+}
+
 /// Configuration for an aliased agent. Each `[agents.<alias>]` TOML
 /// block deserializes into one of these. The `DelegateTool` looks up
 /// entries here to dispatch a subtask to a named sibling agent.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "delegate-agent"]
+#[prefix = "delegate_agent"]
 pub struct AliasedAgentConfig {
     /// Whether this agent is active. Set false to disable without removing the definition.
+    #[tab(General)]
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Channel aliases this agent handles (e.g. `["telegram.<alias>", "discord.<alias>"]`).
     /// Each entry is a `ChannelRef` resolving through `[channels.<type>.<alias>]`;
     /// `Config::validate()` fails loud on dangling references.
+    #[tab(Channels)]
     #[serde(default)]
     pub channels: Vec<crate::providers::ChannelRef>,
     /// Dotted model-provider alias (e.g. `"anthropic.<alias>"`).
     /// Resolves through `model_providers.<type>.<alias>` at runtime;
     /// `Config::validate()` fails loud on dangling references.
+    #[tab(Providers)]
     #[serde(default)]
     pub model_provider: crate::providers::ModelProviderRef,
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
+    #[tab(General)]
     #[serde(default)]
     pub risk_profile: String,
     /// Runtime profile alias (e.g. `"default"`). Resolves agentic/iteration settings.
+    #[tab(General)]
     #[serde(default)]
     pub runtime_profile: String,
     /// Skill bundle aliases. Each entry resolves to
     /// `skill_bundles[key].directory` at runtime; the agent loads every
     /// listed bundle.
+    #[tab(Bundles)]
     #[serde(default)]
     pub skill_bundles: Vec<String>,
     /// Knowledge bundle aliases. Additive — the agent loads every listed
     /// bundle.
+    #[tab(Bundles)]
     #[serde(default)]
     pub knowledge_bundles: Vec<String>,
     /// MCP bundle aliases. Each entry references `mcp_bundles[key]`,
     /// itself a named group of MCP servers; agents pick which bundles to
     /// load.
+    #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
     /// Cron job aliases. Each entry references `cron[key]` — a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
+    #[tab(Cron)]
     #[serde(default)]
     pub cron_jobs: Vec<String>,
     /// TTS provider as a dotted alias reference (`<type>.<alias>`,
     /// e.g. `"openai.<alias>"`). Resolves through `tts_providers.<type>.<alias>`.
     /// Empty = no TTS for this agent (there is no global default-provider concept;
     /// every agent that wants TTS sets its own `tts_provider`).
+    #[tab(Providers)]
     #[serde(default)]
     pub tts_provider: crate::providers::TtsProviderRef,
     /// Transcription / STT provider as a dotted alias reference
@@ -2795,6 +2887,7 @@ pub struct AliasedAgentConfig {
     /// resolved provider (there is no global default), so an inbound voice
     /// flow into an agent with empty `transcription_provider` errors loudly
     /// at the channel boundary.
+    #[tab(Providers)]
     #[serde(default)]
     pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
@@ -2822,105 +2915,21 @@ pub struct AliasedAgentConfig {
     ///
     /// ACP channels (IDE-direct) always reply and skip the classifier
     /// entirely — this field has no effect on ACP traffic.
+    #[tab(Providers)]
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
-    // ── Agent loop / runtime tunables (folded from `[agent]` ──────
-    // These are per-agent. Defaults preserve the legacy single-agent
-    // behavior so an unconfigured agent runs identically to a config
-    // that previously lived under a global `[agent]` table.
-    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
-    #[serde(default = "default_agent_compact_context")]
-    pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
-    #[serde(default = "default_agent_max_tool_iterations")]
-    pub max_tool_iterations: usize,
-    /// Maximum conversation history messages retained per session. Default: `50`.
-    #[serde(default = "default_agent_max_history_messages")]
-    pub max_history_messages: usize,
-    /// Maximum estimated tokens for conversation history before compaction triggers.
-    /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
-    /// are summarized to preserve context while staying within budget. Default: `32000`.
-    #[serde(default = "default_agent_max_context_tokens")]
-    pub max_context_tokens: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
-    #[serde(default)]
-    pub parallel_tools: bool,
-    /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
-    #[serde(default = "default_agent_tool_dispatcher")]
-    pub tool_dispatcher: String,
-    /// When true, only native provider tool calls are executable. Text fallback
-    /// parsing remains disabled, so XML/markdown/GLM-looking text is treated as
-    /// final assistant text.
-    #[serde(default)]
-    pub strict_tool_parsing: bool,
-    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
-    #[serde(default)]
-    pub tool_call_dedup_exempt: Vec<String>,
-    /// Per-turn MCP tool schema filtering groups.
-    ///
-    /// When non-empty, only MCP tools matched by an active group are included in the
-    /// tool schema sent to the LLM for that turn. Built-in tools always pass through.
-    /// Default: `[]` (no filtering — all tools included).
-    #[serde(default)]
-    pub tool_filter_groups: Vec<ToolFilterGroup>,
-    /// Maximum characters for the assembled system prompt. When `> 0`, the prompt
-    /// is truncated to this limit after assembly (keeping the top portion which
-    /// contains identity and safety instructions). `0` means unlimited.
-    /// Useful for small-context models (e.g. glm-4.5-air ~8K tokens → set to 8000).
-    #[serde(default = "default_max_system_prompt_chars")]
-    pub max_system_prompt_chars: usize,
-    /// Thinking/reasoning level control. Configures how deeply the model reasons
-    /// per message. Users can override per-message with `/think:<level>` directives.
-    #[nested]
-    #[serde(default)]
-    pub thinking: crate::scattered_types::ThinkingConfig,
-    /// History pruning configuration for token efficiency.
-    #[nested]
-    #[serde(default)]
-    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
-    /// Reply-intent precheck configuration for channel messages.
-    #[nested]
-    #[serde(default)]
-    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
-    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
-    #[serde(default)]
-    pub context_aware_tools: bool,
-    /// Post-response quality evaluator configuration.
-    #[nested]
-    #[serde(default)]
-    pub eval: crate::scattered_types::EvalConfig,
-    /// Automatic complexity-based classification fallback.
-    #[nested]
-    #[serde(default)]
-    pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
-    /// Context compression configuration for automatic conversation compaction.
-    #[nested]
-    #[serde(default)]
-    pub context_compression: crate::scattered_types::ContextCompressionConfig,
-    /// Maximum characters for a single tool result before truncation.
-    /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
-    /// middle. Set to `0` to disable truncation. Default: `50000`.
-    #[serde(default = "default_max_tool_result_chars")]
-    pub max_tool_result_chars: usize,
-    /// Number of most recent conversation turns whose full tool-call/result
-    /// messages are preserved in channel conversation history. Older turns
-    /// keep only the final assistant text. Set to `0` to disable (previous
-    /// behavior). Default: `2`.
-    #[serde(default = "default_keep_tool_context_turns")]
-    pub keep_tool_context_turns: usize,
-
-    /// HMAC tool execution receipt configuration.
-    #[nested]
-    #[serde(default)]
-    pub tool_receipts: ToolReceiptsConfig,
+    // ── Resolved runtime tunables (populated by `resolved_agent_config`
+    // from the runtime profile; not config-settable on the agent). ──
+    #[serde(skip)]
+    pub resolved: ResolvedRuntime,
 
     /// Per-agent workspace block (`[agents.<alias>.workspace]`).
     /// Holds the agent's filesystem path, cross-agent access allowlist,
     /// filesystem-escape boolean, and cross-agent memory allowlist.
     /// Default is fully jailed (no cross-agent access). See
     /// `crate::multi_agent::AgentWorkspaceConfig`.
+    #[tab(Workspace)]
     #[serde(default)]
     #[nested]
     pub workspace: crate::multi_agent::AgentWorkspaceConfig,
@@ -2929,6 +2938,7 @@ pub struct AliasedAgentConfig {
     /// The `backend` field is locked at agent creation and immutable on
     /// subsequent loads. Defaults to `Sqlite`. See
     /// `crate::multi_agent::AgentMemoryConfig`.
+    #[tab(Memory)]
     #[serde(default)]
     #[nested]
     pub memory: crate::multi_agent::AgentMemoryConfig,
@@ -2938,13 +2948,10 @@ pub struct AliasedAgentConfig {
     /// per-agent workspace; this block selects the format (OpenClaw or
     /// AIEOS) and optional inline/file source for the agent's identity
     /// document.
+    #[tab(Tuning)]
     #[serde(default)]
     #[nested]
     pub identity: IdentityConfig,
-}
-
-fn default_agent_compact_context() -> bool {
-    true
 }
 
 impl Default for AliasedAgentConfig {
@@ -2962,26 +2969,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
-            compact_context: default_agent_compact_context(),
-            max_tool_iterations: default_agent_max_tool_iterations(),
-            max_history_messages: default_agent_max_history_messages(),
-            max_context_tokens: default_agent_max_context_tokens(),
-            parallel_tools: false,
-            tool_dispatcher: default_agent_tool_dispatcher(),
-            strict_tool_parsing: false,
-            tool_call_dedup_exempt: Vec::new(),
-            tool_filter_groups: Vec::new(),
-            max_system_prompt_chars: default_max_system_prompt_chars(),
-            thinking: crate::scattered_types::ThinkingConfig::default(),
-            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
-            context_aware_tools: false,
-            eval: crate::scattered_types::EvalConfig::default(),
-            auto_classify: None,
-            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
-            max_tool_result_chars: default_max_tool_result_chars(),
-            keep_tool_context_turns: default_keep_tool_context_turns(),
-            tool_receipts: ToolReceiptsConfig::default(),
+            resolved: ResolvedRuntime::default(),
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
@@ -3038,52 +3026,6 @@ impl Config {
             .map(ToString::to_string)
     }
 
-    /// Return the first `ModelProviderConfig` (the shared base) from
-    /// `model_providers`, if any exists.
-    #[must_use]
-    pub fn first_model_provider(&self) -> Option<&ModelProviderConfig> {
-        self.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(_, _, base)| base)
-    }
-
-    /// Mutable form of [`Self::first_model_provider`].
-    pub fn first_model_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
-        self.providers
-            .models
-            .iter_entries_mut()
-            .next()
-            .map(|(_, _, base)| base)
-    }
-
-    /// Return the model-provider type key of the first entry in
-    /// `model_providers`, if any. Use this when callers need the bare
-    /// type name (e.g. provider routing factories that take
-    /// `"openrouter"` not `"openrouter.default"`).
-    #[must_use]
-    pub fn first_model_provider_type(&self) -> Option<&'static str> {
-        self.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, _, _)| ty)
-    }
-
-    /// Return the dotted `<type>.<alias>` identifier of the first
-    /// configured model-provider entry, if any. Use this when callers
-    /// need the alias reference (matches `agents.<x>.model_provider`
-    /// values).
-    #[must_use]
-    pub fn first_model_provider_alias(&self) -> Option<String> {
-        self.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-    }
-
     /// Resolve the risk profile for an explicit agent alias.
     ///
     /// Each agent's `risk_profile` field names a `[risk_profiles.<alias>]`
@@ -3117,16 +3059,157 @@ impl Config {
         self.runtime_profiles.get(profile_alias)
     }
 
+    // ── Effective per-agent runtime tunables ──────────────────────────
+    //
+    // Precedence: `[runtime_profiles.<profile>].<field>` (when explicitly
+    // set / non-sentinel) wins over `[agents.<alias>].<field>`. This
+    // matches the documented "None inherits" semantics on
+    // `RuntimeProfileConfig` and the precedence that
+    // `crates/zeroclaw-runtime/src/tools/delegate.rs` already applies for
+    // subagent dispatch. The agent inline field remains the fallback so
+    // configs that only set the agent value keep working unchanged.
+
+    #[must_use]
+    pub fn effective_max_tool_iterations(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .map(|p| p.max_tool_iterations)
+            .filter(|&v| v > 0)
+            .unwrap_or(10)
+    }
+
+    #[must_use]
+    pub fn effective_max_history_messages(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_history_messages)
+            .unwrap_or(50)
+    }
+
+    #[must_use]
+    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_context_tokens)
+            .unwrap_or(32_000)
+    }
+
+    #[must_use]
+    pub fn effective_memory_recall_limit(&self, agent_alias: &str) -> usize {
+        let raw = self
+            .runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.memory_recall_limit)
+            .unwrap_or(5);
+        if raw == 0 { usize::MAX } else { raw }
+    }
+
+    #[must_use]
+    pub fn effective_compact_context(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.compact_context)
+            .unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn effective_parallel_tools(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.parallel_tools)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn effective_tool_dispatcher(&self, agent_alias: &str) -> String {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_dispatcher.as_ref())
+            .filter(|s| !s.trim().is_empty())
+            .map_or_else(default_agent_tool_dispatcher, Clone::clone)
+    }
+
+    #[must_use]
+    pub fn effective_tool_call_dedup_exempt(&self, agent_alias: &str) -> Vec<String> {
+        self.runtime_profile_for_agent(agent_alias)
+            .map(|p| p.tool_call_dedup_exempt.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn effective_max_system_prompt_chars(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_system_prompt_chars)
+            .unwrap_or_else(default_max_system_prompt_chars)
+    }
+
+    #[must_use]
+    pub fn effective_context_aware_tools(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.context_aware_tools)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn effective_max_tool_result_chars(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_tool_result_chars)
+            .unwrap_or_else(default_max_tool_result_chars)
+    }
+
+    #[must_use]
+    pub fn effective_keep_tool_context_turns(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.keep_tool_context_turns)
+            .unwrap_or_else(default_keep_tool_context_turns)
+    }
+
+    /// Return a clone of the named agent's `AliasedAgentConfig` with all
+    /// runtime-profile overrides baked in. Use this when an `Agent` (or
+    /// any other struct) needs to own a self-contained, already-resolved
+    /// view of the agent's runtime knobs without holding a reference to
+    /// the full `Config`.
+    ///
+    /// Returns `None` when `agent_alias` is not present in `agents`.
+    ///
+    /// Semantics: every field touched here mirrors the matching
+    /// `effective_*` helper above. If you add a new runtime_profile knob,
+    /// add it both to an `effective_*` helper *and* to this function so
+    /// downstream consumers see consistent values regardless of which
+    /// surface they read from.
+    #[must_use]
+    pub fn resolved_agent_config(&self, agent_alias: &str) -> Option<AliasedAgentConfig> {
+        let mut out = self.agents.get(agent_alias)?.clone();
+        let mut resolved = ResolvedRuntime {
+            max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
+            max_history_messages: self.effective_max_history_messages(agent_alias),
+            max_context_tokens: self.effective_max_context_tokens(agent_alias),
+            compact_context: self.effective_compact_context(agent_alias),
+            parallel_tools: self.effective_parallel_tools(agent_alias),
+            tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
+            tool_call_dedup_exempt: self.effective_tool_call_dedup_exempt(agent_alias),
+            max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
+            context_aware_tools: self.effective_context_aware_tools(agent_alias),
+            max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
+            keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
+            ..ResolvedRuntime::default()
+        };
+        if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
+            resolved.strict_tool_parsing = profile.strict_tool_parsing;
+            resolved.thinking = profile.thinking.clone();
+            resolved.history_pruning = profile.history_pruning.clone();
+            resolved.eval = profile.eval.clone();
+            resolved.auto_classify = profile.auto_classify.clone();
+            resolved.context_compression = profile.context_compression.clone();
+            resolved.tool_receipts = profile.tool_receipts.clone();
+            resolved.tool_filter_groups = profile.tool_filter_groups.clone();
+        }
+        out.resolved = resolved;
+        Some(out)
+    }
+
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
     /// its concrete `ModelProviderConfig` entry. Returns `None` when the
     /// agent doesn't exist, the reference is unparseable, or the
     /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
     ///
     /// This is the lookup the orchestrator uses to build per-agent
-    /// model_provider runtime options instead of falling back to
-    /// `first_model_provider()`, which silently collapses multiple aliases
-    /// under the same model_provider family to whichever entry happens to be
-    /// first. The matching split logic lives in
+    /// model_provider runtime options via explicit `<type>.<alias>`
+    /// resolution — there is no concept of a "first" or "default"
+    /// provider. The matching split logic lives in
     /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
     /// the delegation path; this helper exposes the same contract for the
     /// channel-server startup path.
@@ -3715,12 +3798,14 @@ pub struct McpServerConfig {
 #[prefix = "mcp"]
 pub struct McpConfig {
     /// Enable MCP tool loading.
+    #[tab(Settings)]
     #[serde(default)]
     pub enabled: bool,
     /// Load MCP tool schemas on-demand via `tool_search` instead of eagerly
     /// including them in the LLM context window. When `true` (the default),
     /// only tool names are listed in the system prompt; the LLM must call
     /// `tool_search` to fetch full schemas before invoking a deferred tool.
+    #[tab(Settings)]
     #[serde(default = "default_deferred_loading")]
     pub deferred_loading: bool,
     /// Configured MCP servers. The `#[nested]` annotation makes the macro
@@ -3728,6 +3813,7 @@ pub struct McpConfig {
     /// dashboard's `+ Add MCP server` affordance and the `POST
     /// /api/config/map-key?path=mcp.servers&key=<name>` endpoint pick it
     /// up automatically (no hand-table on the gateway side).
+    #[tab(Servers)]
     #[serde(default, alias = "mcpServers")]
     #[nested]
     pub servers: Vec<McpServerConfig>,
@@ -3750,7 +3836,7 @@ impl Default for McpConfig {
 /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "verifiable-intent"]
+#[prefix = "verifiable_intent"]
 pub struct VerifiableIntentConfig {
     /// Enable VI credential verification on commerce tool calls (default: false).
     #[serde(default)]
@@ -3867,7 +3953,7 @@ impl Default for TtsConfig {
 /// are quietly ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "tts-provider"]
+#[prefix = "tts_provider"]
 #[serde(default)]
 pub struct TtsProviderConfig {
     /// API key (openai, elevenlabs, google).
@@ -4361,7 +4447,7 @@ pub struct GoogleSttConfig {
 /// Configures a self-hosted STT endpoint. Can be on localhost, a private network host, or any reachable URL.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "transcription.local-whisper"]
+#[prefix = "transcription.local_whisper"]
 pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
     pub url: String,
@@ -4399,7 +4485,7 @@ fn default_local_whisper_timeout_secs() -> u64 {
 /// `docs/book/src/security/tool-receipts.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "delegate-agent.tool_receipts"]
+#[prefix = "delegate_agent.tool_receipts"]
 pub struct ToolReceiptsConfig {
     /// Generate HMAC receipts on every tool execution. Default: `false`.
     /// When false, the entire receipt subsystem is inert (no key, no
@@ -4438,18 +4524,6 @@ fn default_max_tool_result_chars() -> usize {
 
 fn default_keep_tool_context_turns() -> usize {
     2
-}
-
-fn default_agent_max_tool_iterations() -> usize {
-    10
-}
-
-fn default_agent_max_history_messages() -> usize {
-    50
-}
-
-fn default_agent_max_context_tokens() -> usize {
-    32_000
 }
 
 fn default_agent_tool_dispatcher() -> String {
@@ -4594,7 +4668,7 @@ pub struct SkillsConfig {
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "skills.skill-creation"]
+#[prefix = "skills.skill_creation"]
 #[serde(default)]
 pub struct SkillCreationConfig {
     /// Enable automatic skill creation after successful multi-step tasks.
@@ -4621,7 +4695,7 @@ impl Default for SkillCreationConfig {
 /// Prompt-triggered skill install suggestions (`[skills.install_suggestions]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "skills.install-suggestions"]
+#[prefix = "skills.install_suggestions"]
 #[serde(default)]
 pub struct SkillInstallSuggestionsConfig {
     /// Enable suggestions for installable skills before normal agent turns.
@@ -4632,7 +4706,7 @@ pub struct SkillInstallSuggestionsConfig {
 /// Skill self-improvement configuration (`[skills.auto_improve]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "skills.skill-improvement"]
+#[prefix = "skills.skill_improvement"]
 pub struct SkillImprovementConfig {
     /// Enable automatic skill improvement after successful skill usage.
     /// Default: `true`.
@@ -4720,6 +4794,19 @@ pub struct MultimodalConfig {
     /// Maximum image payload size in MiB before base64 encoding.
     #[serde(default = "default_multimodal_max_image_size_mb")]
     pub max_image_size_mb: usize,
+    /// Maximum age of images in conversation turns.
+    ///
+    /// When non-zero, images in user messages that are more than this many
+    /// turns back from the end of history are stripped before the request is
+    /// sent to the provider. This prevents a single screenshot from being
+    /// re-encoded and re-uploaded on every subsequent turn indefinitely.
+    /// Tool-result images are already managed by the stale-tool-result
+    /// mechanism and are not affected by this setting.
+    ///
+    /// `0` (the default) disables age-based trimming entirely — images are
+    /// only evicted by the `max_images` count cap.
+    #[serde(default)]
+    pub max_image_turns: usize,
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
@@ -4756,6 +4843,7 @@ impl Default for MultimodalConfig {
         Self {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
+            max_image_turns: 0,
             allow_remote_fetch: false,
             vision_model_provider: None,
             vision_model: None,
@@ -4773,7 +4861,7 @@ impl Default for MultimodalConfig {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "media-pipeline"]
+#[prefix = "media_pipeline"]
 pub struct MediaPipelineConfig {
     /// Master toggle for the media pipeline (default: false).
     #[serde(default)]
@@ -4845,26 +4933,32 @@ impl Default for IdentityConfig {
 #[prefix = "cost"]
 pub struct CostConfig {
     /// Enable cost tracking (default: true)
+    #[tab(Limits)]
     #[serde(default = "default_cost_enabled")]
     pub enabled: bool,
 
     /// Daily spending limit in USD (default: 10.00)
+    #[tab(Limits)]
     #[serde(default = "default_daily_limit")]
     pub daily_limit_usd: f64,
 
     /// Monthly spending limit in USD (default: 100.00)
+    #[tab(Limits)]
     #[serde(default = "default_monthly_limit")]
     pub monthly_limit_usd: f64,
 
     /// Warn when spending reaches this percentage of limit (default: 80)
+    #[tab(Limits)]
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
 
     /// Allow requests to exceed budget with --override flag (default: false)
+    #[tab(Limits)]
     #[serde(default)]
     pub allow_override: bool,
 
     /// Cost enforcement behavior when budget limits are approached or exceeded.
+    #[tab(Limits)]
     #[serde(default)]
     #[nested]
     pub enforcement: CostEnforcementConfig,
@@ -4873,6 +4967,7 @@ pub struct CostConfig {
     /// `/api/cost?agent=<alias>` and CLI rollups can attribute spend to a
     /// specific agent. Disable on high-volume deployments if the extra
     /// HashMap aggregation shows up in profiles (default: true).
+    #[tab(Limits)]
     #[serde(default = "default_track_per_agent")]
     pub track_per_agent: bool,
 
@@ -4896,6 +4991,7 @@ pub struct CostConfig {
     /// [cost.rates.tools.web_search]
     /// per_call = 0.005
     /// ```
+    #[tab(Costs)]
     #[serde(default)]
     #[nested]
     pub rates: CostRatesConfig,
@@ -5324,7 +5420,7 @@ impl Default for GatewayConfig {
 /// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "gateway.pairing-dashboard"]
+#[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
     /// Length of pairing codes (default: 8)
     #[serde(default = "default_pairing_code_length")]
@@ -5392,7 +5488,7 @@ pub struct GatewayTlsConfig {
 /// Client certificate authentication (mTLS) configuration (`[gateway.tls.client_auth]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "gateway.tls.client-auth"]
+#[prefix = "gateway.tls.client_auth"]
 pub struct GatewayClientAuthConfig {
     /// Enable client certificate verification (default: false).
     #[serde(default)]
@@ -5420,10 +5516,56 @@ impl Default for GatewayClientAuthConfig {
     }
 }
 
+/// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).
+///
+/// When enabled, the daemon listens for TLS-encrypted WebSocket connections
+/// on the configured bind address and port. TUI clients connect via
+/// `--connect wss://host:port`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "wss"]
+pub struct WssConfig {
+    /// Enable the WSS listener (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address for the WSS listener (default: "0.0.0.0").
+    #[serde(default = "default_wss_bind")]
+    pub bind: String,
+    /// Port for the WSS listener (default: 9781).
+    #[serde(default = "default_wss_port")]
+    pub port: u16,
+    /// Path to the PEM-encoded server certificate file.
+    #[serde(default)]
+    pub cert_path: String,
+    /// Path to the PEM-encoded server private key file.
+    #[serde(default)]
+    pub key_path: String,
+}
+
+impl Default for WssConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_wss_bind(),
+            port: default_wss_port(),
+            cert_path: String::new(),
+            key_path: String::new(),
+        }
+    }
+}
+
+fn default_wss_bind() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_wss_port() -> u16 {
+    9781
+}
+
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "node-transport"]
+#[prefix = "node_transport"]
 pub struct NodeTransportConfig {
     /// Enable the secure transport layer.
     #[serde(default = "default_node_transport_enabled")]
@@ -5620,7 +5762,7 @@ impl Default for SecretsConfig {
 /// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "browser.computer-use"]
+#[prefix = "browser.computer_use"]
 pub struct BrowserComputerUseConfig {
     /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
     #[serde(default = "default_browser_computer_use_endpoint")]
@@ -5749,7 +5891,7 @@ impl Default for BrowserConfig {
 /// requests are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "http-request"]
+#[prefix = "http_request"]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
     #[serde(default)]
@@ -5799,7 +5941,7 @@ fn default_http_timeout_secs() -> u64 {
 /// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "web-fetch"]
+#[prefix = "web_fetch"]
 pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
@@ -5845,7 +5987,7 @@ pub enum FirecrawlMode {
 /// falls back to the Firecrawl API for stealth content extraction.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "web-fetch.firecrawl"]
+#[prefix = "web_fetch.firecrawl"]
 pub struct FirecrawlConfig {
     /// Enable Firecrawl fallback
     #[serde(default)]
@@ -5916,7 +6058,7 @@ impl Default for WebFetchConfig {
 /// explicit tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "link-enricher"]
+#[prefix = "link_enricher"]
 pub struct LinkEnricherConfig {
     /// Enable the link enricher pipeline stage (default: false)
     #[serde(default)]
@@ -5955,7 +6097,7 @@ impl Default for LinkEnricherConfig {
 /// text. Designed for headless/SSH environments without graphical browsers.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "text-browser"]
+#[prefix = "text_browser"]
 pub struct TextBrowserConfig {
     /// Enable `text_browser` tool
     #[serde(default)]
@@ -5991,7 +6133,7 @@ impl Default for TextBrowserConfig {
 /// shell command may run before it is killed.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "shell-tool"]
+#[prefix = "shell_tool"]
 pub struct ShellToolConfig {
     /// Maximum shell command execution time in seconds (default: 60).
     #[serde(default = "default_shell_tool_timeout_secs")]
@@ -6035,12 +6177,12 @@ pub struct EscalationConfig {
 /// Web search tool configuration (`[web_search]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "web-search"]
+#[prefix = "web_search"]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), or "jina" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -6053,6 +6195,11 @@ pub struct WebSearchConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub tavily_api_key: Option<String>,
+    /// Jina AI API key (required if search_provider is "jina")
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub jina_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -6083,6 +6230,7 @@ impl Default for WebSearchConfig {
             search_provider: default_web_search_provider(),
             brave_api_key: None,
             tavily_api_key: None,
+            jina_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -6095,7 +6243,7 @@ impl Default for WebSearchConfig {
 /// Project delivery intelligence configuration (`[project_intel]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "project-intel"]
+#[prefix = "project_intel"]
 pub struct ProjectIntelConfig {
     /// Enable the project_intel tool. Default: false.
     #[serde(default)]
@@ -6220,7 +6368,7 @@ impl Default for BackupConfig {
 /// Data retention and purge configuration (`[data_retention]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "data-retention"]
+#[prefix = "data_retention"]
 pub struct DataRetentionConfig {
     /// Enable the `data_management` tool.
     #[serde(default)]
@@ -6347,7 +6495,7 @@ pub struct GoogleWorkspaceAllowedOperation {
 /// being registered.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "google-workspace"]
+#[prefix = "google_workspace"]
 #[integration(
     category = "ToolsAutomation",
     display_name = "Google Workspace",
@@ -6841,7 +6989,7 @@ impl Default for ImageProviderFluxConfig {
 /// to the workspace `images/` directory.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "image-gen"]
+#[prefix = "image_gen"]
 pub struct ImageGenConfig {
     /// Enable the standalone image generation tool. Default: false.
     #[serde(default)]
@@ -6887,7 +7035,7 @@ impl Default for ImageGenConfig {
 /// When `url` is `None` or empty, the tool is not registered.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "file-upload"]
+#[prefix = "file_upload"]
 pub struct FileUploadConfig {
     /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
     #[serde(default)]
@@ -7110,7 +7258,7 @@ impl Default for FileDownloadConfig {
 /// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "claude-code"]
+#[prefix = "claude_code"]
 pub struct ClaudeCodeConfig {
     /// Enable the `claude_code` tool
     #[serde(default)]
@@ -7166,7 +7314,7 @@ impl Default for ClaudeCodeConfig {
 /// in-place with progress plus an SSH handoff link.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "claude-code-runner"]
+#[prefix = "claude_code_runner"]
 pub struct ClaudeCodeRunnerConfig {
     /// Enable the `claude_code_runner` tool
     #[serde(default)]
@@ -7210,7 +7358,7 @@ impl Default for ClaudeCodeRunnerConfig {
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "codex-cli"]
+#[prefix = "codex_cli"]
 pub struct CodexCliConfig {
     /// Enable the `codex_cli` tool
     #[serde(default)]
@@ -7254,7 +7402,7 @@ impl Default for CodexCliConfig {
 /// `env_passthrough` includes `GOOGLE_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "gemini-cli"]
+#[prefix = "gemini_cli"]
 pub struct GeminiCliConfig {
     /// Enable the `gemini_cli` tool
     #[serde(default)]
@@ -7298,7 +7446,7 @@ impl Default for GeminiCliConfig {
 /// `env_passthrough` includes provider-specific keys.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "opencode-cli"]
+#[prefix = "opencode_cli"]
 pub struct OpenCodeCliConfig {
     /// Enable the `opencode_cli` tool
     #[serde(default)]
@@ -8402,7 +8550,7 @@ pub struct StorageConfig {
 /// SQLite storage backend (`[storage.sqlite.<alias>]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage-sqlite"]
+#[prefix = "storage_sqlite"]
 #[serde(default)]
 pub struct SqliteStorageConfig {
     /// Optional override for the SQLite database path.
@@ -8419,7 +8567,7 @@ pub struct SqliteStorageConfig {
 /// entry; previously these lived in two separate sections.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage-postgres"]
+#[prefix = "storage_postgres"]
 #[serde(default)]
 pub struct PostgresStorageConfig {
     /// Connection URL (e.g. `"postgres://user:pass@host/db"`).
@@ -8459,7 +8607,7 @@ impl Default for PostgresStorageConfig {
 /// (`QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_API_KEY`) when unset.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage-qdrant"]
+#[prefix = "storage_qdrant"]
 #[serde(default)]
 pub struct QdrantStorageConfig {
     /// Qdrant server URL (e.g. `"http://localhost:6333"`).
@@ -8488,7 +8636,7 @@ impl Default for QdrantStorageConfig {
 /// Markdown directory storage (`[storage.markdown.<alias>]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage-markdown"]
+#[prefix = "storage_markdown"]
 #[serde(default)]
 pub struct MarkdownStorageConfig {
     /// Optional override for the markdown root directory.
@@ -8499,7 +8647,7 @@ pub struct MarkdownStorageConfig {
 /// Lucid CLI sync backend (`[storage.lucid.<alias>]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage-lucid"]
+#[prefix = "storage_lucid"]
 #[serde(default)]
 pub struct LucidStorageConfig {
     /// Optional path to the lucid-memory binary.
@@ -8893,7 +9041,7 @@ fn default_log_tool_io() -> String {
 }
 
 fn default_log_tool_io_truncate_bytes() -> usize {
-    8192
+    40960
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
@@ -8943,7 +9091,7 @@ pub struct BuiltinHooksConfig {
 /// centralised audit logging, SIEM ingestion, or compliance pipelines.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "hooks.builtin.webhook-audit"]
+#[prefix = "hooks.builtin.webhook_audit"]
 pub struct WebhookAuditConfig {
     /// Enable the webhook-audit hook. Default: `false`.
     #[serde(default)]
@@ -9079,7 +9227,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 /// behaves the same as a config from before the per-profile split.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "risk-profile"]
+#[prefix = "risk_profile"]
 #[serde(default)]
 pub struct RiskProfileConfig {
     /// Autonomy level applied to this profile. Default: `supervised`.
@@ -9103,6 +9251,12 @@ pub struct RiskProfileConfig {
     /// Extra directory roots the agent may access.
     #[serde(alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
+    /// Whether and to which agents this profile may delegate. Defaults to
+    /// `Forbidden`. Delegation requires caller and target to share a risk
+    /// profile; the allow-list names the reachable same-profile agents.
+    #[serde(default)]
+    #[nested]
+    pub delegation_policy: DelegationPolicy,
     /// Tools the agent may call in agentic mode. Empty = inherit / no
     /// authorization constraint. Authorization decision: which tools is
     /// the agent permitted to invoke at all. See `excluded_tools` for
@@ -9132,6 +9286,7 @@ impl Default for RiskProfileConfig {
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
+            delegation_policy: DelegationPolicy::default(),
             allowed_tools: Vec::new(),
             excluded_tools: Vec::new(),
             sandbox_enabled: None,
@@ -9153,7 +9308,7 @@ impl Default for RiskProfileConfig {
 /// `[providers.models.<type>.<alias>]`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "runtime-profile"]
+#[prefix = "runtime_profile"]
 #[serde(default)]
 pub struct RuntimeProfileConfig {
     /// Enable agentic (multi-turn tool-call loop) mode.
@@ -9199,6 +9354,23 @@ pub struct RuntimeProfileConfig {
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
     pub keep_tool_context_turns: Option<usize>,
+    /// Maximum memory entries injected per turn. `None` inherits global default (5).
+    /// Set to `0` for unlimited.
+    pub memory_recall_limit: Option<usize>,
+    pub strict_tool_parsing: bool,
+    #[nested]
+    pub thinking: crate::scattered_types::ThinkingConfig,
+    #[nested]
+    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
+    #[nested]
+    pub eval: crate::scattered_types::EvalConfig,
+    #[nested]
+    pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
+    #[nested]
+    pub context_compression: crate::scattered_types::ContextCompressionConfig,
+    #[nested]
+    pub tool_receipts: ToolReceiptsConfig,
+    pub tool_filter_groups: Vec<ToolFilterGroup>,
 }
 
 impl Default for RuntimeProfileConfig {
@@ -9222,6 +9394,15 @@ impl Default for RuntimeProfileConfig {
             context_aware_tools: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
+            memory_recall_limit: None,
+            strict_tool_parsing: false,
+            thinking: crate::scattered_types::ThinkingConfig::default(),
+            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
+            eval: crate::scattered_types::EvalConfig::default(),
+            auto_classify: None,
+            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
+            tool_receipts: ToolReceiptsConfig::default(),
+            tool_filter_groups: Vec::new(),
         }
     }
 }
@@ -9232,7 +9413,7 @@ impl Default for RuntimeProfileConfig {
 /// by alias, controlling which skills are loaded and from where.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "skill-bundle"]
+#[prefix = "skill_bundle"]
 #[serde(default)]
 pub struct SkillBundleConfig {
     /// Directory path (relative to workspace root) to load skills from.
@@ -9249,7 +9430,7 @@ pub struct SkillBundleConfig {
 /// that can be attached to an agent by alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "knowledge-bundle"]
+#[prefix = "knowledge_bundle"]
 #[serde(default)]
 pub struct KnowledgeBundleConfig {
     /// Paths or URLs to include in this knowledge bundle.
@@ -9263,7 +9444,7 @@ pub struct KnowledgeBundleConfig {
 /// A reusable group of MCP servers that can be activated together by alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "mcp-bundle"]
+#[prefix = "mcp_bundle"]
 #[serde(default)]
 pub struct McpBundleConfig {
     /// MCP server IDs to include in this bundle.
@@ -9573,7 +9754,7 @@ pub struct EmbeddingRouteConfig {
 /// and routes to the appropriate model hint. Disabled by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "query-classification"]
+#[prefix = "query_classification"]
 pub struct QueryClassificationConfig {
     /// Enable automatic query classification. Default: `false`.
     #[serde(default)]
@@ -9828,7 +10009,7 @@ impl Default for CronScheduleDecl {
 /// Delivery configuration for declarative cron jobs.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "cron-delivery"]
+#[prefix = "cron_delivery"]
 pub struct DeliveryConfigDecl {
     /// Delivery mode: `"none"` or `"announce"`.
     #[serde(default = "default_delivery_mode")]
@@ -10268,166 +10449,238 @@ impl ChannelsConfig {
         use super::traits::ChannelInfo;
         vec![
             ChannelInfo {
+                kind: "telegram",
                 name: "Telegram",
                 desc: "connect your bot",
                 configured: !self.telegram.is_empty(),
             },
             ChannelInfo {
+                kind: "discord",
                 name: "Discord",
                 desc: "connect your bot",
                 configured: !self.discord.is_empty(),
             },
             ChannelInfo {
+                kind: "slack",
                 name: "Slack",
                 desc: "connect your bot",
                 configured: !self.slack.is_empty(),
             },
             ChannelInfo {
+                kind: "mattermost",
                 name: "Mattermost",
                 desc: "connect to your bot",
                 configured: !self.mattermost.is_empty(),
             },
             ChannelInfo {
+                kind: "imessage",
                 name: "iMessage",
                 desc: "macOS only",
                 configured: !self.imessage.is_empty(),
             },
             ChannelInfo {
+                kind: "matrix",
                 name: "Matrix",
                 desc: "self-hosted chat",
                 configured: !self.matrix.is_empty(),
             },
             ChannelInfo {
+                kind: "signal",
                 name: "Signal",
                 desc: "An open-source, encrypted messaging service",
                 configured: !self.signal.is_empty(),
             },
             ChannelInfo {
+                kind: "whatsapp",
                 name: "WhatsApp",
                 desc: "Business Cloud API",
                 configured: !self.whatsapp.is_empty(),
             },
             ChannelInfo {
+                kind: "whatsapp-web",
                 name: "WhatsApp Web",
                 desc: "native WhatsApp Web (wa-rs)",
                 configured: self.whatsapp.values().any(|c| c.is_web_config()),
             },
             ChannelInfo {
+                kind: "linq",
                 name: "Linq",
                 desc: "iMessage/RCS/SMS via Linq API",
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
+                kind: "wati",
                 name: "WATI",
                 desc: "WhatsApp via WATI Business API",
                 configured: !self.wati.is_empty(),
             },
             ChannelInfo {
+                kind: "nextcloud",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
                 configured: !self.nextcloud_talk.is_empty(),
             },
             ChannelInfo {
+                kind: "email",
                 name: "Email",
                 desc: "Email over IMAP/SMTP",
                 configured: !self.email.is_empty(),
             },
             ChannelInfo {
+                kind: "gmail-push",
                 name: "Gmail Push",
                 desc: "Gmail Pub/Sub push notifications",
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
+                kind: "irc",
                 name: "IRC",
                 desc: "IRC over TLS",
                 configured: !self.irc.is_empty(),
             },
             ChannelInfo {
+                kind: "lark",
                 name: "Lark",
                 desc: "Lark Bot",
                 configured: !self.lark.is_empty(),
             },
             ChannelInfo {
+                kind: "dingtalk",
                 name: "DingTalk",
                 desc: "DingTalk Stream Mode",
                 configured: !self.dingtalk.is_empty(),
             },
             ChannelInfo {
+                kind: "wecom",
                 name: "WeCom",
                 desc: "WeCom Bot Webhook",
                 configured: !self.wecom.is_empty(),
             },
             ChannelInfo {
+                kind: "wecom-ws",
                 name: "WeCom WebSocket",
                 desc: "WeCom AI Bot long connection",
                 configured: !self.wecom_ws.is_empty(),
             },
             ChannelInfo {
+                kind: "wechat",
                 name: "WeChat",
                 desc: "WeChat iLink Bot",
                 configured: !self.wechat.is_empty(),
             },
             ChannelInfo {
+                kind: "qq",
                 name: "QQ Official",
                 desc: "Tencent QQ Bot",
                 configured: !self.qq.is_empty(),
             },
             ChannelInfo {
+                kind: "nostr",
                 name: "Nostr",
                 desc: "Nostr DMs",
                 configured: !self.nostr.is_empty(),
             },
             ChannelInfo {
+                kind: "clawdtalk",
                 name: "ClawdTalk",
                 desc: "ClawdTalk Channel",
                 configured: !self.clawdtalk.is_empty(),
             },
             ChannelInfo {
+                kind: "reddit",
                 name: "Reddit",
                 desc: "Reddit bot (OAuth2)",
                 configured: !self.reddit.is_empty(),
             },
             ChannelInfo {
+                kind: "bluesky",
                 name: "Bluesky",
                 desc: "AT Protocol",
                 configured: !self.bluesky.is_empty(),
             },
             ChannelInfo {
+                kind: "twitter",
                 name: "X/Twitter",
                 desc: "X/Twitter Bot via API v2",
                 configured: !self.twitter.is_empty(),
             },
             ChannelInfo {
+                kind: "mochat",
                 name: "Mochat",
                 desc: "Mochat Customer Service",
                 configured: !self.mochat.is_empty(),
             },
             ChannelInfo {
+                kind: "line",
                 name: "LINE",
                 desc: "connect your LINE bot",
                 configured: !self.line.is_empty(),
             },
             ChannelInfo {
+                kind: "voice-call",
                 name: "Voice Call",
                 desc: "outbound voice call channel",
                 configured: !self.voice_call.is_empty(),
             },
             ChannelInfo {
+                kind: "voice-wake",
                 name: "VoiceWake",
                 desc: "voice wake word detection",
                 configured: !self.voice_wake.is_empty(),
             },
             ChannelInfo {
+                kind: "mqtt",
                 name: "MQTT",
                 desc: "MQTT SOP Listener",
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
+                kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
         ]
+    }
+
+    /// Returns `true` when at least one channel entry across all channel types
+    /// has `enabled = true`. Used by the daemon to decide whether the channels
+    /// supervisor should be started — a config with only `enabled = false`
+    /// entries (e.g. partially-configured or disabled bots) must not start the
+    /// supervisor, otherwise it exits immediately and restarts in a tight loop.
+    pub fn has_any_enabled(&self) -> bool {
+        self.telegram.values().any(|c| c.enabled)
+            || self.discord.values().any(|c| c.enabled)
+            || self.slack.values().any(|c| c.enabled)
+            || self.mattermost.values().any(|c| c.enabled)
+            || self.webhook.values().any(|c| c.enabled)
+            || self.imessage.values().any(|c| c.enabled)
+            || self.matrix.values().any(|c| c.enabled)
+            || self.signal.values().any(|c| c.enabled)
+            || self.whatsapp.values().any(|c| c.enabled)
+            || self.linq.values().any(|c| c.enabled)
+            || self.wati.values().any(|c| c.enabled)
+            || self.nextcloud_talk.values().any(|c| c.enabled)
+            || self.email.values().any(|c| c.enabled)
+            || self.gmail_push.values().any(|c| c.enabled)
+            || self.irc.values().any(|c| c.enabled)
+            || self.lark.values().any(|c| c.enabled)
+            || self.line.values().any(|c| c.enabled)
+            || self.dingtalk.values().any(|c| c.enabled)
+            || self.wecom.values().any(|c| c.enabled)
+            || self.wecom_ws.values().any(|c| c.enabled)
+            || self.wechat.values().any(|c| c.enabled)
+            || self.qq.values().any(|c| c.enabled)
+            || self.twitter.values().any(|c| c.enabled)
+            || self.mochat.values().any(|c| c.enabled)
+            || self.nostr.values().any(|c| c.enabled)
+            || self.clawdtalk.values().any(|c| c.enabled)
+            || self.reddit.values().any(|c| c.enabled)
+            || self.bluesky.values().any(|c| c.enabled)
+            || self.voice_call.values().any(|c| c.enabled)
+            || self.voice_wake.values().any(|c| c.enabled)
+            || self.voice_duplex.values().any(|c| c.enabled)
+            || self.mqtt.values().any(|c| c.enabled)
     }
 }
 
@@ -10530,50 +10783,54 @@ pub struct TelegramConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Telegram Bot API token (from @BotFather).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
     /// Streaming mode for progressive response delivery via message edits.
+    #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
+    #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     /// When true, a newer Telegram message from the same sender in the same chat
     /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
+    #[tab(Behavior)]
     #[serde(default)]
     pub ack_reactions: Option<bool>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// How long (seconds) to wait for the operator to tap an inline-keyboard
     /// button on a tool approval prompt before auto-denying. Default: 120.
+    #[tab(Behavior)]
     #[serde(default = "default_telegram_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -10595,75 +10852,84 @@ pub struct DiscordConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Discord bot token (from Discord Developer Portal).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
     /// Guild (server) IDs to restrict the bot to. Empty = listen across all
     /// guilds the bot is invited to. Migrated from the legacy `guild_id`
     /// singular field.
+    #[tab(Advanced)]
     #[serde(default)]
     pub guild_ids: Vec<String>,
     /// Channel IDs to watch. Empty = watch every channel the bot can see.
     /// Used by the archive sidecar (when `archive = true`) and by the
     /// in-channel filter when set.
+    #[tab(Advanced)]
     #[serde(default)]
     pub channel_ids: Vec<String>,
     /// When true, the channel opens a sidecar `discord.db` SQLite memory
     /// backend, archives every non-bot message it sees, and registers the
     /// `discord_search` tool against it. Default: false. Folded in from
     /// the legacy `[channels.discord-history]` block.
+    #[tab(Advanced)]
     #[serde(default)]
     pub archive: bool,
     /// When true, process messages from other bots (not just humans).
     /// The bot still ignores its own messages to prevent feedback loops.
+    #[tab(Advanced)]
     #[serde(default)]
     pub listen_to_bots: bool,
     /// When true, a newer Discord message from the same sender in the same channel
     /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot.
     /// Other messages in the guild are silently ignored.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// Streaming mode for progressive response delivery.
     /// `off` (default): single message. `partial`: editable draft updates.
     /// `multi_message`: split response into separate messages at paragraph boundaries.
+    #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     /// Only used when `stream_mode = "partial"`.
+    #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     /// Delay (ms) between sending each message chunk in multi-message mode.
     /// Only used when `stream_mode = "multi_message"`.
+    #[tab(Behavior)]
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
     /// Stall-watchdog timeout in seconds. When non-zero, the bot will abort
     /// and retry if no progress is made within this duration. 0 = disabled.
+    #[tab(Advanced)]
     #[serde(default)]
     pub stall_timeout_secs: u64,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -10685,31 +10951,38 @@ pub struct SlackConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Slack bot OAuth token (xoxb-...).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
     /// Slack app-level token for Socket Mode (xapp-...).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_token: Option<String>,
     /// Explicit list of channel IDs to watch.
     /// Empty = listen across all accessible channels.
     /// Migrated from the legacy `channel_id` singular field.
+    #[tab(Advanced)]
     #[serde(default)]
     pub channel_ids: Vec<String>,
     /// When true, a newer Slack message from the same sender in the same channel
     /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// When true (default), replies stay in the originating Slack thread.
     /// When false, replies go to the channel root instead.
+    #[tab(Advanced)]
     #[serde(default)]
     pub thread_replies: Option<bool>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages remain allowed.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
     /// When true (and `mention_only` is also true), messages inside a Slack
@@ -10718,42 +10991,44 @@ pub struct SlackConfig {
     /// keep a back-and-forth going without the user repeating @-mentions.
     /// Set this to true in channels shared with human discussion where the
     /// bot should stay silent unless explicitly addressed.
+    #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
+    #[tab(Advanced)]
     #[serde(default)]
     pub use_markdown_blocks: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// Enable progressive draft message streaming via `chat.update`.
+    #[tab(Behavior)]
     #[serde(default)]
     pub stream_drafts: bool,
     /// Minimum interval (ms) between draft message edits to avoid Slack rate limits.
+    #[tab(Behavior)]
     #[serde(default = "default_slack_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     /// For example, `"x"` means reacting with `:x:` cancels the task.
     /// Leave unset to disable reaction-based cancellation.
+    #[tab(Advanced)]
     #[serde(default)]
     pub cancel_reaction: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -10778,24 +11053,29 @@ pub struct MattermostConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
+    #[tab(Connection)]
     pub url: String,
     /// Mattermost bot access token. When unset, the channel falls back to
     /// the login flow using `login_id` + `password`.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub bot_token: Option<String>,
     /// Login ID (email or username) for the password login flow. Used only
     /// when `bot_token` is unset; both `login_id` and `password` must be
     /// set together.
+    #[tab(Connection)]
     #[serde(default)]
     pub login_id: Option<String>,
     /// Account password for the login flow. Used only when `bot_token` is
     /// unset; both `login_id` and `password` must be set together.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub password: Option<String>,
@@ -10804,12 +11084,14 @@ pub struct MattermostConfig {
     /// poll them all. Explicit IDs disable discovery and pin the bot to the
     /// listed channels only. Migrated from the legacy `channel_id` singular
     /// field.
+    #[tab(Advanced)]
     #[serde(default)]
     pub channel_ids: Vec<String>,
     /// Team IDs to restrict auto-discovery to. Empty = discover across every
     /// team the bot belongs to. Non-empty = only discover public/private
     /// channels whose `team_id` is in this list. DMs and group DMs (which
     /// have no team) are governed by `discover_dms` instead.
+    #[tab(Advanced)]
     #[serde(default)]
     pub team_ids: Vec<String>,
     /// When true (default), auto-discovery includes DM (`type=D`) and group
@@ -10817,10 +11099,12 @@ pub struct MattermostConfig {
     /// private team channels only. Has no effect when `channel_ids` lists
     /// explicit IDs. Defaults to `true` at the call site via
     /// `discover_dms.unwrap_or(true)`.
+    #[tab(Advanced)]
     #[serde(default)]
     pub discover_dms: Option<bool>,
     /// When true (default), replies thread on the original post.
     /// When false, replies go to the channel root.
+    #[tab(Advanced)]
     #[serde(default)]
     pub thread_replies: Option<bool>,
     /// When true, only respond to messages that @-mention the bot. Other
@@ -10828,27 +11112,25 @@ pub struct MattermostConfig {
     /// channels always bypass this filter: a 1:1 (or small-group) direct
     /// conversation has no ambient noise to gate against, so every message
     /// is treated as addressed to the bot.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: Option<bool>,
     /// When true, a newer Mattermost message from the same sender in the same channel
     /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -10872,31 +11154,39 @@ pub struct WebhookConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Port to listen on for incoming webhooks.
+    #[tab(Advanced)]
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
+    #[tab(Advanced)]
     #[serde(default)]
     pub listen_path: Option<String>,
     /// URL to POST/PUT outbound messages to.
+    #[tab(Advanced)]
     #[serde(default)]
     pub send_url: Option<String>,
     /// HTTP method for outbound messages (`POST` or `PUT`). Default: `POST`.
+    #[tab(Advanced)]
     #[serde(default)]
     pub send_method: Option<String>,
     /// Optional `Authorization` header value for outbound requests.
+    #[tab(Connection)]
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_header: Option<String>,
     /// Optional shared secret for webhook signature verification (HMAC-SHA256).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 
@@ -10932,10 +11222,12 @@ pub struct IMessageConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -10958,79 +11250,90 @@ pub struct MatrixConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
+    #[tab(Connection)]
     pub homeserver: String,
     /// Matrix access token for the bot account. When unset, the channel
     /// falls back to password login using `user_id` + `password`.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub access_token: Option<String>,
     /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
+    #[tab(Connection)]
     #[serde(default)]
     pub user_id: Option<String>,
     /// Optional Matrix device ID.
+    #[tab(Connection)]
     #[serde(default)]
     pub device_id: Option<String>,
     /// Allowed Matrix room IDs or aliases. Empty = allow all rooms.
     /// Supports canonical room IDs (`!abc:server`) and aliases (`#room:server`).
+    #[tab(Behavior)]
     #[serde(default)]
     pub allowed_rooms: Vec<String>,
     /// Whether to interrupt an in-flight agent response when a new message arrives.
+    #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Streaming mode for progressive response delivery.
     /// `"off"` (default): single message. `"partial"`: edit-in-place draft.
     /// `"multi_message"`: paragraph-split delivery.
+    #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
     /// Minimum interval (ms) between draft message edits in Partial mode.
+    #[tab(Behavior)]
     #[serde(default = "default_matrix_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     /// Delay (ms) between sending each paragraph in MultiMessage mode.
+    #[tab(Behavior)]
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
     /// Optional Matrix recovery key for automatic E2EE key backup restore.
     /// When set, ZeroClaw recovers room keys and cross-signing secrets on startup.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub recovery_key: Option<String>,
     /// Optional login password for Matrix account (used for initial login flow).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub password: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
     /// When true (default), replies are sent as thread replies. Starts a new thread from the
     /// incoming message when none exists. When false, only continues existing threads.
+    #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub reply_in_thread: bool,
     /// Override for the top-level `[channels].ack_reactions`. When
     /// `None`, falls back to the channels-wide default. When set
     /// explicitly (`true`/`false`), takes precedence for this Matrix
     /// instance only.
+    #[tab(Behavior)]
     #[serde(default)]
     pub ack_reactions: Option<bool>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -11050,47 +11353,51 @@ pub struct SignalConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Base URL for the signal-cli HTTP daemon (e.g. `"http://127.0.0.1:8686"`).
+    #[tab(Connection)]
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
+    #[tab(Connection)]
     pub account: String,
     /// Group IDs to filter messages. Empty = accept all messages (DMs and
     /// groups). When non-empty, only messages from listed groups are
     /// accepted (DMs are still accepted unless `dm_only` flips the policy
     /// to DMs-only). Migrated from the legacy `group_id` singular field.
+    #[tab(Advanced)]
     #[serde(default)]
     pub group_ids: Vec<String>,
     /// When true, only accept direct messages and ignore all group traffic.
     /// Mutually exclusive with `group_ids` (which is ignored when this is
     /// set). Migrated from the legacy `group_id = "dm"` sentinel.
+    #[tab(Advanced)]
     #[serde(default)]
     pub dm_only: bool,
     /// Skip messages that are attachment-only (no text body).
+    #[tab(Advanced)]
     #[serde(default)]
     pub ignore_attachments: bool,
     /// Skip incoming story messages.
+    #[tab(Advanced)]
     #[serde(default)]
     pub ignore_stories: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -11145,20 +11452,24 @@ pub struct WhatsAppConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Access token from Meta Business Suite (Cloud API mode)
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub access_token: Option<String>,
     /// Phone number ID from Meta Business API (Cloud API mode)
+    #[tab(Connection)]
     #[serde(default)]
     pub phone_number_id: Option<String>,
     /// Webhook verify token (you define this, Meta sends it back for verification)
     /// Only used in Cloud API mode
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
@@ -11166,78 +11477,87 @@ pub struct WhatsAppConfig {
     /// Only used in Cloud API mode
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_secret: Option<String>,
     /// Session database path for WhatsApp Web client (Web mode)
     /// When set, enables native WhatsApp Web mode with wa-rs
+    #[tab(Connection)]
     #[serde(default)]
     pub session_path: Option<String>,
     /// Phone number for pair code linking (Web mode, optional)
     /// Format: country code + number (e.g., "15551234567")
     /// If not set, QR code pairing will be used
+    #[tab(Connection)]
     #[serde(default)]
     pub pair_phone: Option<String>,
     /// Custom pair code for linking (Web mode, optional)
     /// Leave empty to let WhatsApp generate one
+    #[tab(Connection)]
     #[serde(default)]
     pub pair_code: Option<String>,
     /// Override the WhatsApp Web WebSocket URL (Web mode, optional). Used
     /// by integration tests and proxy setups; leave unset to use the
     /// default endpoint that ships with `wa-rs`.
+    #[tab(Connection)]
     #[serde(default)]
     pub ws_url: Option<String>,
     /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
     /// Direct messages are always processed.
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// In personal mode the bot applies dm_policy, group_policy, and
     /// self_chat_mode to decide which chats to respond in.
+    #[tab(Advanced)]
     #[serde(default)]
     pub mode: WhatsAppWebMode,
     /// Policy for direct messages when mode = "personal".
     /// "allowlist" (default) | "ignore" | "all".
+    #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: WhatsAppChatPolicy,
     /// Policy for group chats when mode = "personal".
     /// "allowlist" (default) | "ignore" | "all".
+    #[tab(Advanced)]
     #[serde(default)]
     pub group_policy: WhatsAppChatPolicy,
     /// When true and mode = "personal", always respond to messages in the
     /// user's own self-chat (Notes to Self). Defaults to false.
+    #[tab(Advanced)]
     #[serde(default)]
     pub self_chat_mode: bool,
     /// Regex patterns for DM mention gating (case-insensitive).
     /// When non-empty, only direct messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     /// Example: `["@?ZeroClaw", "\\+?15555550123"]`
+    #[tab(Advanced)]
     #[serde(default)]
     pub dm_mention_patterns: Vec<String>,
     /// Regex patterns for group-chat mention gating (case-insensitive).
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     /// Example: `["@?ZeroClaw", "\\+?15555550123"]`
+    #[tab(Advanced)]
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -11257,22 +11577,27 @@ pub struct LinqConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Linq Partner API token (Bearer auth)
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// Phone number to send from (E.164 format)
+    #[tab(Advanced)]
     pub from_phone: String,
     /// Webhook signing secret for signature verification
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub signing_secret: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -11295,25 +11620,31 @@ pub struct WatiConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// WATI API token (Bearer auth).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// WATI API base URL (default: <https://live-mt-server.wati.io>).
+    #[tab(Advanced)]
     #[serde(default = "default_wati_api_url")]
     pub api_url: String,
     /// Tenant ID for multi-channel setups (optional).
+    #[tab(Advanced)]
     #[serde(default)]
     pub tenant_id: Option<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -11334,18 +11665,21 @@ impl ChannelConfig for WatiConfig {
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.nextcloud-talk"]
+#[prefix = "channels.nextcloud_talk"]
 pub struct NextcloudTalkConfig {
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
+    #[tab(Connection)]
     pub base_url: String,
     /// Bot app token used for OCS API bearer auth.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_token: String,
     /// Shared secret for webhook signature verification.
@@ -11353,19 +11687,23 @@ pub struct NextcloudTalkConfig {
     /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_secret: Option<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// Display name of the bot in Nextcloud Talk (e.g. "zeroclaw").
     /// Used to filter out the bot's own messages and prevent feedback loops.
     /// If not set, defaults to an empty string (no self-message filtering by name).
+    #[tab(Advanced)]
     #[serde(default)]
     pub bot_name: Option<String>,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
     /// Controls whether and how streaming draft updates are delivered.
@@ -11373,10 +11711,12 @@ pub struct NextcloudTalkConfig {
     /// - `"off"` (default) — responses are sent as a single final message.
     /// - `"partial"` — a placeholder is posted first and edited incrementally
     ///   as tokens arrive, making long responses visible in real time.
+    #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
     /// Minimum interval in milliseconds between consecutive OCS edit calls per
     /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
 }
@@ -11434,37 +11774,47 @@ pub struct MqttConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// MQTT broker URL (e.g., `mqtt://localhost:1883` or `mqtts://broker.example.com:8883`).
     /// Use `mqtt://` for plain connections or `mqtts://` for TLS.
+    #[tab(Connection)]
     pub broker_url: String,
     /// MQTT client ID (must be unique per broker).
+    #[tab(Advanced)]
     pub client_id: String,
     /// Topics to subscribe to (e.g., `sensors/#`, `alerts/+/critical`).
     /// At least one topic is required.
+    #[tab(Advanced)]
     #[serde(default)]
     pub topics: Vec<String>,
     /// MQTT QoS level (0 = at-most-once, 1 = at-least-once, 2 = exactly-once). Default: 1.
+    #[tab(Advanced)]
     #[serde(default = "default_mqtt_qos")]
     pub qos: u8,
     /// Username for authentication (optional).
+    #[tab(Connection)]
     pub username: Option<String>,
     /// Password for authentication (optional).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub password: Option<String>,
     /// Enable TLS encryption. Must match the broker_url scheme:
     /// - `mqtt://` → `use_tls: false`
     /// - `mqtts://` → `use_tls: true`
+    #[tab(Advanced)]
     #[serde(default)]
     pub use_tls: bool,
     /// Keep-alive interval in seconds (default: 30). Prevents broker disconnect on idle.
+    #[tab(Advanced)]
     #[serde(default = "default_mqtt_keep_alive_secs")]
     pub keep_alive_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -11550,49 +11900,55 @@ pub struct IrcConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// IRC server hostname
+    #[tab(Advanced)]
     pub server: String,
     /// IRC server port (default: 6697 for TLS)
+    #[tab(Advanced)]
     #[serde(default = "default_irc_port")]
     pub port: u16,
     /// Bot nickname
+    #[tab(Advanced)]
     pub nickname: String,
     /// Username (defaults to nickname if not set)
+    #[tab(Connection)]
     pub username: Option<String>,
     /// Channels to join on connect
+    #[tab(Advanced)]
     #[serde(default)]
     pub channels: Vec<String>,
     /// Server password (for bouncers like ZNC)
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub server_password: Option<String>,
     /// NickServ IDENTIFY password
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub nickserv_password: Option<String>,
     /// SASL PLAIN password (IRCv3)
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub sasl_password: Option<String>,
     /// Verify TLS certificate (default: true)
+    #[tab(Advanced)]
     pub verify_tls: Option<bool>,
     /// When true, only respond to messages that mention the bot.
     /// Other messages in the channel are silently ignored.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for IrcConfig {
@@ -11631,53 +11987,58 @@ pub struct LarkConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// App ID from Lark/Feishu developer console
+    #[tab(Connection)]
     pub app_id: String,
     /// App Secret from Lark/Feishu developer console
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_secret: String,
     /// Encrypt key for webhook message decryption (optional)
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub encrypt_key: Option<String>,
     /// Verification token for webhook validation (optional)
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verification_token: Option<String>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
+    #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
+    #[tab(Advanced)]
     #[serde(default)]
     pub use_feishu: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
+    #[tab(Advanced)]
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
     /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
     /// Not required (and ignored) for websocket mode.
+    #[tab(Advanced)]
     #[serde(default)]
     pub port: Option<u16>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-
-    /// Default recipient for daemon/CLI `channel_send` calls.
-    /// Injected into the agent system prompt so it knows where to deliver
-    /// outbound messages without asking the user for a target ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -11727,6 +12088,7 @@ pub struct LineConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Long-lived channel access token (from LINE Developers Console).
@@ -11734,6 +12096,7 @@ pub struct LineConfig {
     /// Falls back to the `LINE_CHANNEL_ACCESS_TOKEN` environment variable if empty.
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub channel_access_token: String,
     /// Channel secret (from LINE Developers Console).
@@ -11741,6 +12104,7 @@ pub struct LineConfig {
     /// Falls back to the `LINE_CHANNEL_SECRET` environment variable if empty.
     #[serde(default)]
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub channel_secret: String,
     /// DM (1:1 chat) access policy. Default: `pairing`.
@@ -11748,6 +12112,7 @@ pub struct LineConfig {
     /// - `open`      — respond to everyone
     /// - `pairing`   — require one-time `/bind <code>` handshake on first contact
     /// - `allowlist` — respond only to user IDs listed in `allowed_users`
+    #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: LineDmPolicy,
     /// Group / multi-person chat policy. Default: `mention`.
@@ -11755,18 +12120,22 @@ pub struct LineConfig {
     /// - `open`     — respond to every message
     /// - `mention`  — respond only when @mentioned
     /// - `disabled` — ignore all group messages
+    #[tab(Advanced)]
     #[serde(default)]
     pub group_policy: LineGroupPolicy,
     /// TCP port the embedded webhook server listens on. Default: `8443`.
+    #[tab(Advanced)]
     #[serde(default = "default_line_webhook_port")]
     pub webhook_port: u16,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12256,21 +12625,26 @@ pub struct DingTalkConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Client ID (AppKey) from DingTalk developer console
+    #[tab(Connection)]
     pub client_id: String,
     /// Client Secret (AppSecret) from DingTalk developer console
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_secret: String,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12293,15 +12667,18 @@ pub struct WeComConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Webhook key from WeCom Bot configuration
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_key: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12418,21 +12795,26 @@ pub struct WeChatConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
+    #[tab(Advanced)]
     #[serde(default)]
     pub api_base_url: Option<String>,
     /// Override the CDN base URL. Default: `https://novac2c.cdn.weixin.qq.com/c2c`.
+    #[tab(Advanced)]
     #[serde(default)]
     pub cdn_base_url: Option<String>,
     /// Directory to persist bot token and sync cursor.
     /// Default: `~/.zeroclaw/wechat/`.
+    #[tab(Advanced)]
     #[serde(default)]
     pub state_dir: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12455,21 +12837,26 @@ pub struct QQConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// App ID from QQ Bot developer console
+    #[tab(Connection)]
     pub app_id: String,
     /// App Secret from QQ Bot developer console
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_secret: String,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12492,15 +12879,18 @@ pub struct TwitterConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Twitter API v2 Bearer Token (OAuth 2.0)
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12523,20 +12913,25 @@ pub struct MochatConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Mochat API base URL
+    #[tab(Advanced)]
     pub api_url: String,
     /// Mochat API token
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// Poll interval in seconds for new messages. Default: 5
+    #[tab(Advanced)]
     #[serde(default = "default_mochat_poll_interval")]
     pub poll_interval_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12563,28 +12958,35 @@ pub struct RedditConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Reddit OAuth2 client ID.
+    #[tab(Connection)]
     pub client_id: String,
     /// Reddit OAuth2 client secret.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_secret: String,
     /// Reddit OAuth2 refresh token for persistent access.
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub refresh_token: String,
     /// Reddit bot username (without `u/` prefix).
+    #[tab(Advanced)]
     pub username: String,
     /// Subreddits to filter messages (without `r/` prefix). Empty = accept
     /// from any subreddit the bot has access to. Migrated from the legacy
     /// `subreddit` singular field.
+    #[tab(Advanced)]
     #[serde(default)]
     pub subreddits: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12607,17 +13009,21 @@ pub struct BlueskyConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Bluesky handle (e.g. `"mybot.bsky.social"`).
+    #[tab(Connection)]
     pub handle: String,
     /// App-specific password (from Bluesky settings).
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_password: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12657,7 +13063,7 @@ pub struct VoiceDuplexConfig {
 /// existing transcription API.
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "voice-wake"]
+#[prefix = "voice_wake"]
 pub struct VoiceWakeConfig {
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
@@ -12735,18 +13141,22 @@ pub struct NostrConfig {
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
     /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
     /// Private key in hex or nsec bech32 format
     #[secret]
+    #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub private_key: String,
     /// Relay URLs (wss://). Defaults to popular public relays if omitted.
+    #[tab(Advanced)]
     #[serde(default = "default_nostr_relays")]
     pub relays: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
 }
@@ -12920,7 +13330,7 @@ impl Default for JiraConfig {
 /// IaC review, migration assessment, cost analysis, and architecture review.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "cloud-ops"]
+#[prefix = "cloud_ops"]
 pub struct CloudOpsConfig {
     /// Enable cloud operations tools. Default: false.
     #[serde(default)]
@@ -13046,7 +13456,7 @@ fn default_conversational_ai_timeout_secs() -> u64 {
 /// consumed by the runtime. Setting `enabled = true` will produce a startup warning.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "conversational-ai"]
+#[prefix = "conversational_ai"]
 pub struct ConversationalAiConfig {
     /// Enable conversational AI features. Default: false.
     #[serde(default)]
@@ -13109,7 +13519,7 @@ impl Default for ConversationalAiConfig {
 /// Managed Cybersecurity Service (MCSS) dashboard agent configuration (`[security_ops]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "security-ops"]
+#[prefix = "security_ops"]
 pub struct SecurityOpsConfig {
     /// Enable security operations tools.
     #[serde(default)]
@@ -13205,6 +13615,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -13291,6 +13702,39 @@ fn default_config_dir() -> Result<PathBuf> {
     Ok(home.join(".zeroclaw"))
 }
 
+/// Canonical on-disk directory for a locale's runtime/zerocode FTL catalogues:
+/// `<config_dir>/data/ftl/<locale>/`. This is where `zeroclaw locales fetch`
+/// writes downloaded translations and where the runtime i18n loader reads them.
+/// `<config_dir>` honors `ZEROCLAW_CONFIG_DIR` and otherwise defaults to
+/// `~/.zeroclaw`. The zerocode binary mirrors this path inline (it carries no
+/// `zeroclaw-*` dependency).
+pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
+    Ok(default_config_dir()?.join("data").join("ftl").join(locale))
+}
+
+/// The FTL catalogues that `zeroclaw locales fetch` / the daemon's
+/// `locales/fetch` RPC can download, as `(name, upstream-path-template,
+/// output-filename)`. `{locale}` is substituted per request. This is the single
+/// source of truth — a caller supplies only a catalog *name* matched against
+/// this table, never a path.
+pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
+    (
+        "cli",
+        "crates/zeroclaw-runtime/locales/{locale}/cli.ftl",
+        "cli.ftl",
+    ),
+    (
+        "tools",
+        "crates/zeroclaw-runtime/locales/{locale}/tools.ftl",
+        "tools.ftl",
+    ),
+    (
+        "zerocode",
+        "apps/zerocode/locales/{locale}/zerocode.ftl",
+        "zerocode.ftl",
+    ),
+];
+
 /// Build a default path string by joining `relative` onto the resolved
 /// platform config dir. The form sees the resolved absolute path
 /// (`/home/<user>/.zeroclaw/<relative>` on Linux,
@@ -13337,12 +13781,12 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
     (data_config_dir.clone(), data_config_dir.join("data"))
 }
 
-/// Resolve the current runtime config/data directories for onboarding flows.
+/// Resolve the current runtime config/data directories.
 ///
 /// This mirrors the same precedence used by `Config::load_or_init()`:
 /// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE`
 /// (deprecated) > defaults.
-pub async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
+pub async fn resolve_runtime_dirs() -> Result<(PathBuf, PathBuf)> {
     let (default_zeroclaw_dir, default_data_dir) = default_config_and_data_dirs()?;
     let (config_dir, data_dir, _) =
         resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_data_dir).await?;
@@ -13678,7 +14122,7 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 
 /// Ensure that essential bootstrap files exist in the workspace directory.
 ///
-/// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
+/// When the workspace is created outside of Quickstart (e.g., non-tty
 /// daemon/cron sessions), these files would otherwise be missing. This function
 /// creates sensible defaults that allow the agent to operate with a basic identity.
 pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
@@ -13811,7 +14255,7 @@ impl Config {
 
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
     /// override at load time. O(1) HashSet lookup; safe to call per row in
-    /// list-rendering paths (`config list`, dashboard, onboarding).
+    /// list-rendering paths (`config list`, dashboard, quickstart).
     pub fn prop_is_env_overridden(&self, path: &str) -> bool {
         self.env_overridden_paths.contains(path)
     }
@@ -14009,8 +14453,8 @@ impl Config {
             // `auto_approve` in the approval decision (see approval/mod.rs).
             //
             // Skipped when the loaded config has no `risk_profiles.default`
-            // entry: we will not synthesize a `default` alias here. Per
-            // v0.8.0 rules, `default` is a migration artifact (V1/V2→V3
+            // entry: we will not synthesize a `default` alias here.
+            // `default` is a migration artifact (V1/V2→V3
             // single-instance bridge); a config that arrives without it
             // is a legitimate multi-aliased shape and must not have one
             // injected at load time.
@@ -14270,7 +14714,7 @@ impl Config {
                 }
             }
             if let Err(e) = crate::skill_bundles::validate_uniqueness(self, &install_root) {
-                validation_bail!(InvalidFormat, "skill-bundles", "{e}");
+                validation_bail!(InvalidFormat, "skill_bundles", "{e}");
             }
         }
 
@@ -14477,7 +14921,7 @@ impl Config {
             // explicit `uri` (the model_provider factory resolves the
             // family's default endpoint via `ModelEndpoint`). An entry
             // with no identifying information at all is almost always an
-            // in-progress onboarding state — the user picked the model
+            // in-progress quickstart state — the user picked the model
             // provider but hasn't filled anything in yet. Warn but don't
             // bail; the runtime falls back to family-default endpoint at
             // use time, and a chat against the unconfigured model
@@ -14492,7 +14936,7 @@ impl Config {
                 .is_some_and(|v| !v.trim().is_empty());
             if !has_uri && !has_api_key && !has_model {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
-                     Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
+                     Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
                      to make this model_provider usable.");
                 continue;
             }
@@ -15012,16 +15456,12 @@ impl Config {
                 let trimmed = ch.trim();
                 match trimmed.split_once('.') {
                     Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                        // `get_map_keys` stores section names in kebab form
-                        // (the schema macro converts snake idents via
-                        // `snake_to_kebab`). Operator-written refs use the
-                        // dotted alias they see in TOML, which is the raw
-                        // field ident — snake for `gmail_push`, `voice_call`,
-                        // `nextcloud_talk`, etc. Convert before the lookup so
-                        // underscored channel types resolve correctly.
-                        let ty_kebab = ty.replace('_', "-");
+                        // `get_map_keys` stores section names using the raw
+                        // field ident (snake), the same dotted form the
+                        // operator sees in TOML (`gmail_push`, `voice_call`,
+                        // `nextcloud_talk`). Look up verbatim.
                         let exists = self
-                            .get_map_keys(&format!("channels.{ty_kebab}"))
+                            .get_map_keys(&format!("channels.{ty}"))
                             .is_some_and(|keys| keys.iter().any(|k| k == inner));
                         if !exists {
                             validation_bail!(
@@ -15093,13 +15533,13 @@ impl Config {
             // what `prop_fields()` emits, so DanglingReference paths bind
             // directly to the right inline error in the dashboard form.
             let bare_multi: &[(&str, &str, &[String])] = &[
-                ("skill-bundles", "skill_bundles", &agent.skill_bundles),
+                ("skill_bundles", "skill_bundles", &agent.skill_bundles),
                 (
-                    "knowledge-bundles",
+                    "knowledge_bundles",
                     "knowledge_bundles",
                     &agent.knowledge_bundles,
                 ),
-                ("mcp-bundles", "mcp_bundles", &agent.mcp_bundles),
+                ("mcp_bundles", "mcp_bundles", &agent.mcp_bundles),
             ];
             for (section, field, values) in bare_multi {
                 for (i, key) in values.iter().enumerate() {
@@ -15120,10 +15560,10 @@ impl Config {
                 }
             }
             let bare_single: &[(&str, &str, &str)] = &[
-                ("risk-profiles", "risk-profile", agent.risk_profile.as_str()),
+                ("risk_profiles", "risk_profile", agent.risk_profile.as_str()),
                 (
-                    "runtime-profiles",
-                    "runtime-profile",
+                    "runtime_profiles",
+                    "runtime_profile",
                     agent.runtime_profile.as_str(),
                 ),
             ];
@@ -15151,16 +15591,8 @@ impl Config {
             if agent.enabled && agent.risk_profile.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("agents.{alias}.risk-profile"),
+                    format!("agents.{alias}.risk_profile"),
                     "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
-                );
-            }
-
-            if agent.precheck.timeout_secs == 0 {
-                validation_bail!(
-                    InvalidNumericRange,
-                    format!("agents.{alias}.precheck.timeout_secs"),
-                    "agents.{alias}.precheck.timeout_secs must be greater than 0",
                 );
             }
 
@@ -15235,17 +15667,13 @@ impl Config {
                     "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
                 );
             }
-            // `get_map_keys` stores section names in kebab form (the schema
-            // macro converts snake idents via `snake_to_kebab`); convert
-            // before the lookup so underscored channel types like
-            // `nextcloud_talk` resolve correctly.
+            // `get_map_keys` stores section names using the raw field ident
+            // (snake); look up the channel type verbatim.
             let (group_channel_type, group_channel_alias) = match group_channel.split_once('.') {
                 Some((ty, al)) => (ty, Some(al)),
                 None => (group_channel, None),
             };
-            let group_channel_type_kebab = group_channel_type.replace('_', "-");
-            let channel_aliases =
-                self.get_map_keys(&format!("channels.{group_channel_type_kebab}"));
+            let channel_aliases = self.get_map_keys(&format!("channels.{group_channel_type}"));
             if channel_aliases.is_none() {
                 validation_bail!(
                     DanglingReference,
@@ -15300,6 +15728,37 @@ impl Config {
 
     pub fn mark_dirty(&mut self, path: &str) {
         self.dirty_paths.insert(path.to_string());
+    }
+
+    pub fn ensure_map_key_for_path(&mut self, path: &str) {
+        use crate::traits::MapKeyKind;
+        let mut best: Option<&'static str> = None;
+        for s in Self::map_key_sections()
+            .iter()
+            .filter(|s| s.kind == MapKeyKind::Map)
+        {
+            let prefix = format!("{}.", s.path);
+            if path.starts_with(&prefix)
+                && path.len() > prefix.len()
+                && best.is_none_or(|b| s.path.len() > b.len())
+            {
+                best = Some(s.path);
+            }
+        }
+        let Some(section) = best else {
+            return;
+        };
+        let rest = &path[section.len() + 1..];
+        let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
+            return;
+        };
+        if self
+            .get_map_keys(section)
+            .is_some_and(|keys| keys.iter().any(|k| k == alias))
+        {
+            return;
+        }
+        let _ = self.create_map_key(section, alias);
     }
 
     pub fn clear_dirty(&mut self) {
@@ -15862,6 +16321,7 @@ impl_enum_prop_kind!(
     OtpMethod,
     SandboxBackend,
     AutonomyLevel,
+    DelegationPolicy,
     AuthMode,
     OpenAIEndpoint,
     AzureEndpoint,
@@ -16043,9 +16503,9 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        // No model_provider configured by default — set during onboarding.
+        // No model_provider configured by default — set during Quickstart.
         assert!(c.providers.models.is_empty());
-        assert!(c.first_model_provider().is_none());
+        assert!(c.providers.models.iter_entries().next().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert!(!c.skills.install_suggestions.enabled);
@@ -16175,7 +16635,7 @@ enabled = true
         assert_eq!(o.log_persistence_path, "state/runtime-trace.jsonl");
         assert_eq!(o.log_persistence_max_entries, 200);
         assert_eq!(o.log_tool_io, "redacted");
-        assert_eq!(o.log_tool_io_truncate_bytes, 8192);
+        assert_eq!(o.log_tool_io_truncate_bytes, 40960);
         assert!(o.log_tool_io_denylist.is_empty());
     }
 
@@ -16613,7 +17073,6 @@ auto_save = true
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
                         excluded_tools: vec![],
-                        default_target: None,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -16659,6 +17118,7 @@ auto_save = true
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -16752,7 +17212,11 @@ default_temperature = 0.7
         let parsed = parse_test_config(minimal);
         assert!(
             parsed
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.api_key.as_deref())
                 .is_none()
         );
@@ -16780,7 +17244,11 @@ default_temperature = 0.7
         // Temperature migrated onto the primary model_provider entry
         assert!(
             (parsed
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.7)
@@ -16789,7 +17257,11 @@ default_temperature = 0.7
         );
         assert_eq!(
             parsed
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             DEFAULT_DELEGATE_TIMEOUT_SECS
@@ -16928,7 +17400,9 @@ provider_timeout_secs = 300
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert_eq!(
             parsed
-                .first_model_provider()
+                .providers
+                .models
+                .find("openrouter", "default")
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             300
@@ -16948,8 +17422,10 @@ X-Title = "zeroclaw"
 "#;
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let headers = &parsed
-            .first_model_provider()
-            .expect("synthesized default model_provider")
+            .providers
+            .models
+            .find("openrouter", "default")
+            .expect("synthesized openrouter.default model_provider")
             .extra_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("User-Agent").unwrap(), "MyApp/1.0");
@@ -16964,8 +17440,11 @@ default_temperature = 0.7
         let parsed = parse_test_config(raw);
         assert!(
             parsed
-                .first_model_provider()
-                .map(|e| e.extra_headers.is_empty())
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e.extra_headers.is_empty())
                 .unwrap_or(true)
         );
     }
@@ -17036,16 +17515,16 @@ reasoning_effort = "turbo"
     #[test]
     async fn agent_config_defaults() {
         let cfg = AliasedAgentConfig::default();
-        assert!(cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 10);
-        assert_eq!(cfg.max_history_messages, 50);
-        assert!(!cfg.parallel_tools);
-        assert_eq!(cfg.tool_dispatcher, "auto");
-        assert!(!cfg.strict_tool_parsing);
+        assert!(cfg.resolved.compact_context);
+        assert_eq!(cfg.resolved.max_tool_iterations, 10);
+        assert_eq!(cfg.resolved.max_history_messages, 50);
+        assert!(!cfg.resolved.parallel_tools);
+        assert_eq!(cfg.resolved.tool_dispatcher, "auto");
+        assert!(!cfg.resolved.strict_tool_parsing);
     }
 
     #[test]
-    async fn agent_config_deserializes() {
+    async fn agent_level_tunable_keys_are_inert() {
         let raw = r#"
 default_temperature = 0.7
 [agents.default]
@@ -17061,12 +17540,9 @@ strict_tool_parsing = true
             .agents
             .get("default")
             .expect("[agents.default] parses into agents map");
-        assert!(agent.compact_context);
-        assert_eq!(agent.max_tool_iterations, 20);
-        assert_eq!(agent.max_history_messages, 80);
-        assert!(agent.parallel_tools);
-        assert_eq!(agent.tool_dispatcher, "xml");
-        assert!(agent.strict_tool_parsing);
+        assert_eq!(agent.resolved.max_tool_iterations, 10);
+        assert_eq!(agent.resolved.tool_dispatcher, "auto");
+        assert!(!agent.resolved.strict_tool_parsing);
     }
 
     #[test]
@@ -17258,6 +17734,7 @@ default_temperature = 0.7
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -17394,7 +17871,6 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
-                default_target: None,
             },
         );
 
@@ -17643,7 +18119,6 @@ default_temperature = 0.7
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -17680,7 +18155,6 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17706,7 +18180,6 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17763,7 +18236,6 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -17797,7 +18269,6 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -17847,7 +18318,6 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -17872,7 +18342,6 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -17929,7 +18398,6 @@ allowed_users = ["@u:matrix.org"]
                     reply_in_thread: true,
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
-                    default_target: None,
                 },
             )]),
             signal: HashMap::new(),
@@ -18205,7 +18673,6 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -18236,7 +18703,6 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -18290,7 +18756,6 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -18318,7 +18783,6 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
-            default_target: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -18358,7 +18822,6 @@ allowed_numbers = ["+1", "+2"]
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
-                    default_target: None,
                 },
             )]),
             linq: HashMap::new(),
@@ -18821,7 +19284,7 @@ requires_openai_auth = true
                 .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        assert!(config.first_model_provider().is_some());
+        assert!(config.providers.models.find("custom", "default").is_some());
     }
 
     #[test]
@@ -19400,7 +19863,9 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(
             config
-                .first_model_provider()
+                .providers
+                .models
+                .find("openrouter", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("legacy-model")
         );
@@ -19453,7 +19918,6 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
-                default_target: None,
             },
         );
         config.save().await.unwrap();
@@ -19514,7 +19978,9 @@ default_model = "persisted-profile"
         assert_eq!(config.config_path, config_path);
         assert_eq!(
             config
-                .first_model_provider()
+                .providers
+                .models
+                .find("openrouter", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -19922,7 +20388,6 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
-            default_target: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -19947,7 +20412,6 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
-            default_target: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -20186,7 +20650,7 @@ group_policy = "disabled"
             "test setup requires world-readable config"
         );
 
-        if let Some(entry) = config.first_model_provider_mut() {
+        if let Some(entry) = config.providers.models.ensure("openrouter", "default") {
             entry.temperature = Some(0.6);
         }
         config.save().await.unwrap();
@@ -20350,7 +20814,6 @@ require_otp_to_resume = true
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 excluded_tools: vec![],
-                default_target: None,
             },
         );
 
@@ -21193,14 +21656,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
-        assert_eq!(fields[0].name, "channels.matrix.access-token");
+        assert_eq!(fields[0].name, "channels.matrix.access_token");
         assert_eq!(fields[0].category, "Channels");
         assert!(fields[0].is_set);
-        assert_eq!(fields[1].name, "channels.matrix.recovery-key");
+        assert_eq!(fields[1].name, "channels.matrix.recovery_key");
         assert!(!fields[1].is_set);
         assert_eq!(fields[2].name, "channels.matrix.password");
         assert!(!fields[2].is_set);
@@ -21226,7 +21688,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -21252,9 +21713,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
-        mx.set_secret("channels.matrix.access-token", "new-token".into())
+        mx.set_secret("channels.matrix.access_token", "new-token".into())
             .unwrap();
         assert_eq!(mx.access_token.as_deref(), Some("new-token"));
     }
@@ -21279,7 +21739,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -21317,14 +21776,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
-                default_target: None,
             },
         );
 
         let fields = config.secret_fields();
         let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
-        assert!(names.contains(&"channels.matrix.access-token"));
-        assert!(names.contains(&"channels.matrix.recovery-key"));
+        assert!(names.contains(&"channels.matrix.access_token"));
+        assert!(names.contains(&"channels.matrix.recovery_key"));
     }
 
     #[test]
@@ -21350,12 +21808,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
-                default_target: None,
             },
         );
 
         config
-            .set_secret("channels.matrix.access-token", "new".into())
+            .set_secret("channels.matrix.access_token", "new".into())
             .unwrap();
         assert_eq!(
             config
@@ -21392,11 +21849,10 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
-                default_target: None,
             },
         );
         config
-            .set_secret("channels.matrix.access-token", "sk-test".into())
+            .set_secret("channels.matrix.access_token", "sk-test".into())
             .unwrap();
         assert_eq!(
             config
@@ -21443,7 +21899,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
 
         // Encrypt
@@ -21481,7 +21936,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21515,7 +21969,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21544,7 +21997,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
-            default_target: None,
         }
     }
 
@@ -21561,26 +22013,26 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(homeserver.display_value, "https://m.org");
 
         // Option<String> — set
-        let user_id = by_name["channels.matrix.user-id"];
+        let user_id = by_name["channels.matrix.user_id"];
         assert_eq!(user_id.type_hint, "Option<String>");
         assert_eq!(user_id.display_value, "@bot:m.org");
 
         // Option<String> — unset
-        let device_id = by_name["channels.matrix.device-id"];
+        let device_id = by_name["channels.matrix.device_id"];
         assert_eq!(device_id.display_value, "<unset>");
 
         // u64 field
-        let interval = by_name["channels.matrix.draft-update-interval-ms"];
+        let interval = by_name["channels.matrix.draft_update_interval_ms"];
         assert_eq!(interval.type_hint, "u64");
         assert_eq!(interval.display_value, "1500");
 
         // Enum field
-        let stream = by_name["channels.matrix.stream-mode"];
+        let stream = by_name["channels.matrix.stream_mode"];
         assert!(stream.is_enum());
         assert!(stream.enum_variants.is_some());
 
         // Secret field — masked
-        let token = by_name["channels.matrix.access-token"];
+        let token = by_name["channels.matrix.access_token"];
         assert!(token.is_secret);
         assert_eq!(token.display_value, "****");
 
@@ -21599,18 +22051,18 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             "https://m.org"
         );
         assert_eq!(
-            mx.get_prop("channels.matrix.draft-update-interval-ms")
+            mx.get_prop("channels.matrix.draft_update_interval_ms")
                 .unwrap(),
             "1500"
         );
         assert_eq!(
-            mx.get_prop("channels.matrix.user-id").unwrap(),
+            mx.get_prop("channels.matrix.user_id").unwrap(),
             "@bot:m.org"
         );
-        assert_eq!(mx.get_prop("channels.matrix.device-id").unwrap(), "<unset>");
+        assert_eq!(mx.get_prop("channels.matrix.device_id").unwrap(), "<unset>");
         // Secrets return masked value
         assert_eq!(
-            mx.get_prop("channels.matrix.access-token").unwrap(),
+            mx.get_prop("channels.matrix.access_token").unwrap(),
             "**** (encrypted)"
         );
     }
@@ -21632,7 +22084,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_prop_bool() {
         let mut mx = test_matrix_config();
-        mx.set_prop("channels.matrix.interrupt-on-new-message", "true")
+        mx.set_prop("channels.matrix.interrupt_on_new_message", "true")
             .unwrap();
         assert!(mx.interrupt_on_new_message);
     }
@@ -21641,7 +22093,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     async fn set_prop_bool_rejects_invalid() {
         let mut mx = test_matrix_config();
         let err = mx
-            .set_prop("channels.matrix.interrupt-on-new-message", "yes")
+            .set_prop("channels.matrix.interrupt_on_new_message", "yes")
             .unwrap_err();
         assert!(err.to_string().contains("bool"));
     }
@@ -21649,7 +22101,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_prop_u64() {
         let mut mx = test_matrix_config();
-        mx.set_prop("channels.matrix.draft-update-interval-ms", "3000")
+        mx.set_prop("channels.matrix.draft_update_interval_ms", "3000")
             .unwrap();
         assert_eq!(mx.draft_update_interval_ms, 3000);
     }
@@ -21658,7 +22110,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     async fn set_prop_u64_rejects_invalid() {
         let mut mx = test_matrix_config();
         assert!(
-            mx.set_prop("channels.matrix.draft-update-interval-ms", "abc")
+            mx.set_prop("channels.matrix.draft_update_interval_ms", "abc")
                 .is_err()
         );
     }
@@ -21666,23 +22118,23 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_prop_option_string_set_and_clear() {
         let mut mx = test_matrix_config();
-        mx.set_prop("channels.matrix.user-id", "@new:m.org")
+        mx.set_prop("channels.matrix.user_id", "@new:m.org")
             .unwrap();
         assert_eq!(mx.user_id.as_deref(), Some("@new:m.org"));
 
         // Empty string clears Option
-        mx.set_prop("channels.matrix.user-id", "").unwrap();
+        mx.set_prop("channels.matrix.user_id", "").unwrap();
         assert!(mx.user_id.is_none());
     }
 
     #[test]
     async fn set_prop_enum() {
         let mut mx = test_matrix_config();
-        mx.set_prop("channels.matrix.stream-mode", "partial")
+        mx.set_prop("channels.matrix.stream_mode", "partial")
             .unwrap();
         assert_eq!(mx.stream_mode, StreamMode::Partial);
 
-        mx.set_prop("channels.matrix.stream-mode", "multi_message")
+        mx.set_prop("channels.matrix.stream_mode", "multi_message")
             .unwrap();
         assert_eq!(mx.stream_mode, StreamMode::MultiMessage);
     }
@@ -21691,7 +22143,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     async fn set_prop_enum_rejects_invalid() {
         let mut mx = test_matrix_config();
         let err = mx
-            .set_prop("channels.matrix.stream-mode", "invalid")
+            .set_prop("channels.matrix.stream_mode", "invalid")
             .unwrap_err();
         assert!(err.to_string().contains("expected one of"));
     }
@@ -21704,11 +22156,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn prop_is_secret_static_check() {
-        assert!(MatrixConfig::prop_is_secret("channels.matrix.access-token"));
-        assert!(MatrixConfig::prop_is_secret("channels.matrix.recovery-key"));
+        assert!(MatrixConfig::prop_is_secret("channels.matrix.access_token"));
+        assert!(MatrixConfig::prop_is_secret("channels.matrix.recovery_key"));
         assert!(!MatrixConfig::prop_is_secret("channels.matrix.homeserver"));
         assert!(!MatrixConfig::prop_is_secret(
-            "channels.matrix.interrupt-on-new-message"
+            "channels.matrix.interrupt_on_new_message"
         ));
     }
 
@@ -21740,19 +22192,19 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         // Empty by default — no env applied.
         let mut cfg = Config::default();
         assert!(!cfg.prop_is_env_overridden("channels.matrix.homeserver"));
-        assert!(!cfg.prop_is_env_overridden("gateway.request-timeout-secs"));
+        assert!(!cfg.prop_is_env_overridden("gateway.request_timeout_secs"));
 
         // Populate the field directly (the same set that
         // `apply_env_overrides` returns from `load_or_init`).
         cfg.env_overridden_paths = std::collections::HashSet::from([
             "channels.matrix.homeserver".to_string(),
-            "gateway.request-timeout-secs".to_string(),
+            "gateway.request_timeout_secs".to_string(),
         ]);
 
         // True for paths in the list, false for anything else.
         assert!(cfg.prop_is_env_overridden("channels.matrix.homeserver"));
-        assert!(cfg.prop_is_env_overridden("gateway.request-timeout-secs"));
-        assert!(!cfg.prop_is_env_overridden("channels.matrix.access-token"));
+        assert!(cfg.prop_is_env_overridden("gateway.request_timeout_secs"));
+        assert!(!cfg.prop_is_env_overridden("channels.matrix.access_token"));
         assert!(!cfg.prop_is_env_overridden("gateway.host"));
         // Empty path / non-schema path → false.
         assert!(!cfg.prop_is_env_overridden(""));
@@ -21769,10 +22221,10 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         // non-secret branch and emitted `{value}` instead of `{populated}` for
         // any secret on a map-keyed nested type.
         assert!(Config::prop_is_secret(
-            "providers.models.openrouter.default.api-key"
+            "providers.models.openrouter.default.api_key"
         ));
         assert!(Config::prop_is_secret(
-            "providers.models.anthropic.default.api-key"
+            "providers.models.anthropic.default.api_key"
         ));
         assert!(!Config::prop_is_secret(
             "providers.models.openrouter.default.endpoint"
@@ -21802,7 +22254,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .expect("custom typed slot");
 
         let prefix = format!("providers.models.custom.{alias}");
-        let api_key_path = format!("{prefix}.api-key");
+        let api_key_path = format!("{prefix}.api_key");
         let uri_path = format!("{prefix}.uri");
         let model_path = format!("{prefix}.model");
         let temperature_path = format!("{prefix}.temperature");
@@ -21876,7 +22328,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         // review: an operator with a real on-disk credential who sets a
         // `ZEROCLAW_*` env override for the same path and triggers any
         // save (dashboard auto-save, CLI `config set` for an unrelated
-        // field, onboarding finalizer) must NOT corrupt the disk file.
+        // field, Quickstart finalizer) must NOT corrupt the disk file.
         //
         // Pre-fix behavior: `mask_env_overrides_for_save` read disk via
         // `get_prop`, which returns `"**** (encrypted)"` for secret-typed
@@ -21895,7 +22347,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             ..Default::default()
         };
         let original_secret = "sk-ant-real-on-disk-credential";
-        let api_key_path = "providers.models.anthropic.default.api-key";
+        let api_key_path = "providers.models.anthropic.default.api_key";
         config
             .providers
             .models
@@ -21981,7 +22433,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let fields = mx.prop_fields();
         let stream_field = fields
             .iter()
-            .find(|f| f.name == "channels.matrix.stream-mode")
+            .find(|f| f.name == "channels.matrix.stream_mode")
             .unwrap();
         let variants = (stream_field.enum_variants.unwrap())();
         assert!(variants.contains(&"off".to_string()));
@@ -22075,6 +22527,35 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn ensure_map_key_for_path_materializes_typed_provider_maps() {
+        for (path, value) in [
+            ("providers.models.openai.default.model", "gpt-4o"),
+            ("providers.tts.openai.default.voice", "alloy"),
+            ("providers.transcription.openai.default.model", "whisper-1"),
+            ("channels.telegram.default.bot_token", "tok"),
+        ] {
+            let mut config = Config::default();
+            assert!(
+                config.set_prop(path, value).is_err(),
+                "precondition: {path} is unknown on a fresh config"
+            );
+            config.ensure_map_key_for_path(path);
+            assert!(
+                config.set_prop(path, value).is_ok(),
+                "{path} must be settable after ensure_map_key_for_path"
+            );
+        }
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_ignores_plain_fields() {
+        let mut config = Config::default();
+        config.ensure_map_key_for_path("gateway.port");
+        config.ensure_map_key_for_path("locale");
+        assert!(config.set_prop("gateway.port", "8080").is_ok());
+    }
+
+    #[test]
     async fn create_map_key_rejects_unknown_section() {
         let mut config = Config::default();
         let err = config
@@ -22129,7 +22610,7 @@ allowed_users = []
 
         config
             .set_prop(
-                "channels.matrix.default.allowed-rooms",
+                "channels.matrix.default.allowed_rooms",
                 r#"["alice","bob"]"#,
             )
             .expect("set_prop should succeed against deserialized matrix");
@@ -22143,7 +22624,7 @@ allowed_users = []
     async fn init_defaults_then_set_prop_round_trips_vec_string() {
         // Regression for #6175 Channels picker → form → save:
         // 1. create_map_key inserts channels.matrix["default"] = MatrixConfig::default()
-        // 2. set_prop on channels.matrix.default.allowed-rooms must accept a JSON-array
+        // 2. set_prop on channels.matrix.default.allowed_rooms must accept a JSON-array
         //    string (the shape coerce_for_set_prop emits for Vec<String>).
         // 3. get_prop reads it back.
         let mut config = Config::default();
@@ -22156,16 +22637,16 @@ allowed_users = []
         let has_field = config
             .prop_fields()
             .iter()
-            .any(|f| f.name == "channels.matrix.default.allowed-rooms");
+            .any(|f| f.name == "channels.matrix.default.allowed_rooms");
         assert!(
             has_field,
-            "channels.matrix.default.allowed-rooms must appear in prop_fields after init"
+            "channels.matrix.default.allowed_rooms must appear in prop_fields after init"
         );
 
         // set_prop with the JSON-array string the gateway PATCH path produces.
         config
             .set_prop(
-                "channels.matrix.default.allowed-rooms",
+                "channels.matrix.default.allowed_rooms",
                 r#"["alice","bob"]"#,
             )
             .expect("set_prop should accept JSON-array string for Vec<String>");
@@ -22344,7 +22825,10 @@ allowed_users = []
 
             // set_prop: round-trip the display value back through set_prop.
             // Skip secrets (masked), enums (need valid variant), and <unset> Options.
-            if field.is_secret || field.is_enum() || field.display_value == "<unset>" {
+            if field.is_secret
+                || field.is_enum()
+                || field.display_value == crate::traits::UNSET_DISPLAY
+            {
                 continue;
             }
 
@@ -22369,7 +22853,7 @@ allowed_users = []
 
     /// Audit gate: every path emitted by `prop_fields()` must round-trip
     /// through `get_prop`. The CLI (`zeroclaw config get/set`), the TUI
-    /// onboarding prompts (`prompt_field`), the gateway list endpoint
+    /// Quickstart prompts (`prompt_field`), the gateway list endpoint
     /// (`/api/config/list`), and the dashboard form all derive from
     /// `prop_fields()`; if a path appears here but `get_prop` rejects
     /// it, that field is unreachable on every surface.
@@ -22401,13 +22885,41 @@ allowed_users = []
         let mut config = Config::default();
 
         config
-            .set_prop("onboard-state.completed-sections", "agents")
+            .set_prop("onboard_state.completed_sections", "agents")
             .expect("onboard state marker path should be writable");
         assert_eq!(
             config
-                .get_prop("onboard-state.completed-sections")
+                .get_prop("onboard_state.completed_sections")
                 .expect("onboard state marker path should be readable"),
             "[\"agents\"]"
+        );
+    }
+
+    /// `onboard_state.quickstart_completed` is the flag the Quickstart
+    /// flips when it lands a `BuilderSubmission`. Defaults to `false`
+    /// so first launches auto-open the Quickstart; round-trips through
+    /// `set_prop` / `get_prop` like any other top-level config field.
+    #[test]
+    async fn onboard_state_quickstart_completed_round_trips() {
+        let mut config = Config::default();
+
+        assert_eq!(
+            config
+                .get_prop("onboard_state.quickstart_completed")
+                .expect("default quickstart-completed should be readable"),
+            "false",
+            "fresh configs default to quickstart-completed=false so the \
+             Quickstart auto-opens on first launch",
+        );
+
+        config
+            .set_prop("onboard_state.quickstart_completed", "true")
+            .expect("quickstart-completed should be writable via prop path");
+        assert_eq!(
+            config
+                .get_prop("onboard_state.quickstart_completed")
+                .expect("quickstart-completed should be readable after set"),
+            "true"
         );
     }
 
@@ -22417,51 +22929,33 @@ allowed_users = []
         config
             .agents
             .insert("bob".to_string(), AliasedAgentConfig::default());
+        config.runtime_profiles.insert(
+            "fast".to_string(),
+            crate::schema::RuntimeProfileConfig::default(),
+        );
 
         let fields = config.prop_fields();
         assert!(
             fields
                 .iter()
-                .any(|field| field.name == "agents.bob.history-pruning.enabled"),
-            "agent nested history-pruning fields should be emitted under the agent alias"
-        );
-        assert!(
-            fields
-                .iter()
-                .any(|field| field.name == "agents.bob.precheck.enabled"),
-            "agent nested precheck fields should be emitted under the agent alias"
+                .any(|field| field.name == "runtime_profiles.fast.history_pruning.enabled"),
+            "history-pruning is a runtime-profile field, emitted under the profile alias"
         );
         assert!(
             !fields
                 .iter()
-                .any(|field| field.name.starts_with("agents.bob.agent.history-pruning")),
-            "agent nested fields must not leak the legacy global agent prefix"
-        );
-        assert!(
-            !fields
-                .iter()
-                .any(|field| field.name.starts_with("agents.bob.agent.precheck")),
-            "agent nested precheck fields must not leak the legacy global agent prefix"
+                .any(|field| field.name.starts_with("agents.bob.history_pruning")),
+            "history-pruning must no longer be settable on the agent"
         );
 
         config
-            .set_prop("agents.bob.history-pruning.enabled", "true")
-            .expect("set_prop should accept the emitted per-agent nested path");
+            .set_prop("runtime_profiles.fast.history_pruning.enabled", "true")
+            .expect("set_prop should accept the runtime-profile nested path");
         assert_eq!(
             config
-                .get_prop("agents.bob.history-pruning.enabled")
-                .expect("get_prop should accept the emitted per-agent nested path"),
+                .get_prop("runtime_profiles.fast.history_pruning.enabled")
+                .expect("get_prop should accept the runtime-profile nested path"),
             "true"
-        );
-
-        config
-            .set_prop("agents.bob.precheck.enabled", "false")
-            .expect("set_prop should accept the emitted per-agent precheck path");
-        assert_eq!(
-            config
-                .get_prop("agents.bob.precheck.enabled")
-                .expect("get_prop should accept the emitted per-agent precheck path"),
-            "false"
         );
     }
 
@@ -22490,7 +22984,7 @@ allowed_users = []
                 Err(_) => continue,
             };
             // Sentinel for unset Option fields — no round-trip applies.
-            if value == "<unset>" {
+            if value == crate::traits::UNSET_DISPLAY {
                 continue;
             }
             let result = config.set_prop(&field.name, &value);
@@ -22627,34 +23121,6 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
-    }
-
-    #[test]
-    async fn validate_accepts_per_agent_precheck_controls() {
-        let mut config = multi_agent_test_config();
-        let alpha = config.agents.get_mut("alpha").unwrap();
-        alpha.precheck.enabled = false;
-        alpha.precheck.timeout_secs = 5;
-
-        config
-            .validate()
-            .expect("precheck enabled/timeout controls should validate");
-    }
-
-    #[test]
-    async fn validate_rejects_per_agent_precheck_zero_timeout() {
-        let mut config = multi_agent_test_config();
-        let alpha = config.agents.get_mut("alpha").unwrap();
-        alpha.precheck.timeout_secs = 0;
-
-        let err = config
-            .validate()
-            .expect_err("zero precheck timeout must fail validation")
-            .to_string();
-        assert!(
-            err.contains("agents.alpha.precheck.timeout_secs"),
-            "expected precheck timeout field path, got: {err}"
-        );
     }
 
     #[test]

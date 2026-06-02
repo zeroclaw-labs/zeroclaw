@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true

@@ -610,7 +610,7 @@ impl TelegramChannel {
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
 
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -881,7 +881,7 @@ impl TelegramChannel {
             // Finalize path: text is already the final answer — no debounce.
             let text = content.to_string();
             let recipient = recipient.to_string();
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 if let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
@@ -932,7 +932,7 @@ impl TelegramChannel {
 
         let pending = self.pending_voice.clone();
         let recipient = recipient.to_string();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -3701,7 +3701,7 @@ Ensure only one `zeroclaw` process is using this bot token."
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             loop {
                 let body = serde_json::json!({
                     "chat_id": &chat_id,
@@ -3982,7 +3982,7 @@ mod tests {
         // Manually insert a dummy handle
         {
             let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            *guard = Some(zeroclaw_spawn::spawn!(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }
@@ -4007,7 +4007,7 @@ mod tests {
         // Insert a dummy handle first
         {
             let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            *guard = Some(zeroclaw_spawn::spawn!(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }

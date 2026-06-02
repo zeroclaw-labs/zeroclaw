@@ -1202,7 +1202,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         // Spawn a minimal HTTP server that responds with a known body.
-        let server_handle = tokio::spawn(async move {
+        let server_handle = zeroclaw_spawn::spawn!(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 use tokio::io::AsyncWriteExt;
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello from ipv6!";

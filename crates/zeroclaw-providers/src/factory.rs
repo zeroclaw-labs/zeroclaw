@@ -708,15 +708,24 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Codex variant routing: the `requires_openai_auth` flag on the
-        // shared base flips OpenAI to its Codex-protocol cousin. Lives on
-        // the typed alias — operators set it via the schema-mirror grammar
-        // alongside any other OpenAI alias field.
+        // Codex variant routing: OAuth subscription auth → Codex responses protocol.
         if self.base.requires_openai_auth {
             return Ok(Box::new(
                 crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?,
             ));
         }
+        // Responses wire protocol with standard API key — full streaming tool calls.
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, api_url, key);
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
+        // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
@@ -1281,7 +1290,7 @@ mod tests {
                 post(capture_chat_request),
             )
             .with_state(capture.clone());
-        let server = tokio::spawn(async move {
+        let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.expect("serve test server");
         });
 

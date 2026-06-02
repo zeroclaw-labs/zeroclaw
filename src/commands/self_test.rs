@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::path::Path;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 /// Result of a single diagnostic check.
 pub struct CheckResult {
@@ -95,9 +96,24 @@ pub fn print_results(results: &[CheckResult]) {
     }
     println!();
     if failed == 0 {
-        println!("  \x1b[32mAll {total} checks passed.\x1b[0m");
+        println!(
+            "  \x1b[32m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-all-passed",
+                &[("total", &total.to_string())]
+            )
+        );
     } else {
-        println!("  \x1b[31m{failed}/{total} checks failed.\x1b[0m");
+        println!(
+            "  \x1b[31m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-some-failed",
+                &[
+                    ("failed", &failed.to_string()),
+                    ("total", &total.to_string())
+                ],
+            )
+        );
     }
     println!();
 }
@@ -367,13 +383,7 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(
-        &config.memory,
-        &config.data_dir,
-        config
-            .first_model_provider()
-            .and_then(|e| e.api_key.as_deref()),
-    ) {
+    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };

@@ -11,15 +11,10 @@ Don't ask permission. Just do it.
 
 ## Memory System
 
-memory.backend = "none" — persistent memory is disabled.
-No daily notes or MEMORY.md will be created or injected.
-All context exists only within the current session.
-
-### Write It Down — No Mental Notes!
-- Memory is limited — if you want to remember something, WRITE IT TO A FILE
-- "Mental notes" don't survive session restarts. Files do.
-- When someone says "remember this" -> update daily file or MEMORY.md
-- When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill
+Persistent memory is disabled in this session type (`memory.backend = "none"`).
+No daily notes, MEMORY.md, or memory tools will be created or injected.
+Session context comes from the conversation history, which persists across
+resumes. Do not write memory files or attempt to use memory tools.
 
 ## Safety
 
@@ -47,7 +42,7 @@ Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.
 ## Crash Recovery
 
 - If a run stops unexpectedly, recover context before acting.
-- Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.
+- Review the session history to avoid duplicate work.
 - Resume from the last confirmed step, not from scratch.
 
 ## Sub-task Scoping
