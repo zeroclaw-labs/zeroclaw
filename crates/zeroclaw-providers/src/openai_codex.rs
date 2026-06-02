@@ -1126,7 +1126,109 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
     parse_responses_body(&body)
 }
 
+struct ResolvedCodexCredentials {
+    bearer_token: String,
+    account_id: Option<String>,
+    access_token: Option<String>,
+    use_gateway_api_key_auth: bool,
+}
+
 impl OpenAiCodexModelProvider {
+    async fn resolve_credentials(&self) -> anyhow::Result<ResolvedCodexCredentials> {
+        let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
+
+        let profile = match self
+            .auth
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(profile) => profile,
+            Err(err) if use_gateway_api_key_auth => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        let oauth_access_token = match self
+            .auth
+            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(token) => token,
+            Err(err) if use_gateway_api_key_auth => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        let account_id = profile.and_then(|p| p.account_id).or_else(|| {
+            oauth_access_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        });
+
+        let access_token = if use_gateway_api_key_auth {
+            oauth_access_token
+        } else {
+            Some(oauth_access_token.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
+                    "openai_codex: auth profile not found"
+                );
+                anyhow::Error::msg(
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
+                )
+            })?)
+        };
+
+        let account_id = if use_gateway_api_key_auth {
+            account_id
+        } else {
+            Some(account_id.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "account_id"})),
+                    "openai_codex: account_id not found in profile/token"
+                );
+                anyhow::Error::msg(
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                )
+            })?)
+        };
+
+        let bearer_token = if use_gateway_api_key_auth {
+            self.gateway_api_key.clone().unwrap_or_default()
+        } else {
+            access_token.clone().unwrap_or_default()
+        };
+
+        Ok(ResolvedCodexCredentials {
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+        })
+    }
+
     fn responses_request_builder(
         &self,
         bearer_token: &str,
@@ -1170,81 +1272,7 @@ impl OpenAiCodexModelProvider {
         tools: Option<Vec<ResponsesToolSpec>>,
         model: &str,
     ) -> anyhow::Result<ResponsesTurnResult> {
-        let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
-        let profile = match self
-            .auth
-            .get_profile("openai-codex", self.auth_profile_override.as_deref())
-            .await
-        {
-            Ok(profile) => profile,
-            Err(err) if use_gateway_api_key_auth => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
-                );
-                None
-            }
-            Err(err) => return Err(err),
-        };
-        let oauth_access_token = match self
-            .auth
-            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
-            .await
-        {
-            Ok(token) => token,
-            Err(err) if use_gateway_api_key_auth => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
-                );
-                None
-            }
-            Err(err) => return Err(err),
-        };
-
-        let account_id = profile.and_then(|profile| profile.account_id).or_else(|| {
-            oauth_access_token
-                .as_deref()
-                .and_then(extract_account_id_from_jwt)
-        });
-        let access_token = if use_gateway_api_key_auth {
-            oauth_access_token
-        } else {
-            Some(oauth_access_token.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
-                    "openai_codex: auth profile not found"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
-                )
-            })?)
-        };
-        let account_id = if use_gateway_api_key_auth {
-            account_id
-        } else {
-            Some(account_id.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "account_id"})),
-                    "openai_codex: account_id not found in profile/token"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
-                )
-            })?)
-        };
+        let creds = self.resolve_credentials().await?;
         let normalized_model = normalize_model_id(model);
 
         let has_tools = tools.is_some();
@@ -1270,17 +1298,11 @@ impl OpenAiCodexModelProvider {
             parallel_tool_calls: has_tools.then_some(true),
         };
 
-        let bearer_token = if use_gateway_api_key_auth {
-            self.gateway_api_key.as_deref().unwrap_or_default()
-        } else {
-            access_token.as_deref().unwrap_or_default()
-        };
-
         let request_builder = self.responses_request_builder(
-            bearer_token,
-            account_id.as_deref(),
-            access_token.as_deref(),
-            use_gateway_api_key_auth,
+            &creds.bearer_token,
+            creds.account_id.as_deref(),
+            creds.access_token.as_deref(),
+            creds.use_gateway_api_key_auth,
             &request,
         );
 
@@ -1311,10 +1333,10 @@ impl OpenAiCodexModelProvider {
                 request.stream = false;
                 let non_streaming_response = self
                     .responses_request_builder(
-                        bearer_token,
-                        account_id.as_deref(),
-                        access_token.as_deref(),
-                        use_gateway_api_key_auth,
+                        &creds.bearer_token,
+                        creds.account_id.as_deref(),
+                        creds.access_token.as_deref(),
+                        creds.use_gateway_api_key_auth,
                         &request,
                     )
                     .json(&request)
@@ -1430,11 +1452,11 @@ impl ModelProvider for OpenAiCodexModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        false
+        true
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        false
+        true
     }
 
     fn stream_chat(
@@ -1453,7 +1475,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let tools = request.tools.map(|items| items.to_vec());
         let model = model.to_string();
         let count_tokens = options.count_tokens;
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
             let config = zeroclaw_config::schema::MultimodalConfig::default();
@@ -1468,43 +1490,53 @@ impl ModelProvider for OpenAiCodexModelProvider {
                     }
                 };
 
-            let (instructions, input) = build_responses_input(&prepared.messages);
-            let result = provider
-                .send_responses_request(
-                    input,
-                    instructions,
-                    convert_tools(tools.as_deref()),
-                    &model,
-                )
-                .await;
-
-            match result {
-                Ok(response) => {
-                    for tool_call in response.tool_calls {
-                        if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
-                            return;
-                        }
-                    }
-
-                    if let Some(text) = response.text.filter(|text| !text.is_empty()) {
-                        let chunk = if count_tokens {
-                            StreamChunk::delta(text).with_token_estimate()
-                        } else {
-                            StreamChunk::delta(text)
-                        };
-                        if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
-                            return;
-                        }
-                    }
-
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
-                }
+            let creds = match provider.resolve_credentials().await {
+                Ok(c) => c,
                 Err(err) => {
                     let _ = tx
                         .send(Err(StreamError::ModelProvider(err.to_string())))
                         .await;
+                    return;
                 }
-            }
+            };
+
+            let (instructions, input) = build_responses_input(&prepared.messages);
+            let normalized_model = normalize_model_id(&model);
+            let tools = convert_tools(tools.as_deref());
+            let has_tools = tools.is_some();
+            let request = ResponsesRequest {
+                model: normalized_model.to_string(),
+                input,
+                instructions,
+                store: false,
+                stream: true,
+                text: ResponsesTextOptions {
+                    verbosity: "medium".to_string(),
+                },
+                reasoning: ResponsesReasoningOptions {
+                    effort: resolve_reasoning_effort(
+                        normalized_model,
+                        provider.reasoning_effort.as_deref(),
+                    ),
+                    summary: "auto".to_string(),
+                },
+                include: vec!["reasoning.encrypted_content".to_string()],
+                tools,
+                tool_choice: has_tools.then(|| "auto".to_string()),
+                parallel_tool_calls: has_tools.then_some(true),
+            };
+
+            let request_builder = provider
+                .responses_request_builder(
+                    &creds.bearer_token,
+                    creds.account_id.as_deref(),
+                    creds.access_token.as_deref(),
+                    creds.use_gateway_api_key_auth,
+                    &request,
+                )
+                .json(&request);
+
+            crate::openai::run_responses_sse(request_builder, &tx, count_tokens).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1788,7 +1820,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("OpenAI Codex stream error: quota exceeded"),
+                .contains("OpenAI responses stream error: quota exceeded"),
             "{err}"
         );
         assert_eq!(captured.lock().unwrap().len(), 1);
@@ -2305,12 +2337,12 @@ data: [DONE]
     }
 
     #[test]
-    fn provider_does_not_advertise_streaming_until_live_sse_is_wired() {
+    fn provider_advertises_streaming_tool_events() {
         let provider =
             OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
                 .expect("provider should initialize");
 
-        assert!(!provider.supports_streaming());
-        assert!(!provider.supports_streaming_tool_events());
+        assert!(provider.supports_streaming());
+        assert!(provider.supports_streaming_tool_events());
     }
 }

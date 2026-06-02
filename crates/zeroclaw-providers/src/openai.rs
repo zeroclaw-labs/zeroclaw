@@ -715,6 +715,112 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
         .collect()
 }
 
+/// Drive a Responses API SSE connection to completion, emitting events on `tx`.
+///
+/// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
+/// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
+pub(crate) async fn run_responses_sse(
+    request_builder: reqwest::RequestBuilder,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    count_tokens: bool,
+) {
+    let http_response = match request_builder.send().await {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
+            return;
+        }
+    };
+
+    if !http_response.status().is_success() {
+        let status = http_response.status();
+        let body = http_response.text().await.unwrap_or_default();
+        let sanitized = super::sanitize_api_error(&body);
+        let _ = tx
+            .send(Err(StreamError::ModelProvider(format!(
+                "OpenAI API error ({status}): {sanitized}"
+            ))))
+            .await;
+        return;
+    }
+
+    let mut state = ResponsesStreamState::default();
+    let mut byte_stream = http_response.bytes_stream();
+    let mut pending_utf8: Vec<u8> = Vec::new();
+    let mut chunk_buf = String::new();
+
+    loop {
+        match byte_stream.next().await {
+            Some(Ok(bytes)) => {
+                if let Err(err) =
+                    append_utf8_stream_chunk(&mut chunk_buf, &mut pending_utf8, &bytes)
+                {
+                    let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
+                    return;
+                }
+            }
+            Some(Err(err)) => {
+                let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
+                return;
+            }
+            None => break,
+        }
+
+        while let Some(idx) = chunk_buf.find("\n\n") {
+            let chunk_str = chunk_buf[..idx].to_string();
+            chunk_buf = chunk_buf[idx + 2..].to_string();
+
+            match process_sse_chunk(&chunk_str, &mut state) {
+                Ok(events) => {
+                    for event in events {
+                        if let StreamEvent::TextDelta(ref chunk) = event {
+                            let event = if count_tokens {
+                                StreamEvent::TextDelta(
+                                    StreamChunk::delta(chunk.delta.clone()).with_token_estimate(),
+                                )
+                            } else {
+                                event
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        } else if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
+                        let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    if !chunk_buf.trim().is_empty() {
+        if let Ok(events) = process_sse_chunk(&chunk_buf, &mut state) {
+            for event in events {
+                let _ = tx.send(Ok(event)).await;
+            }
+        }
+    }
+
+    if !state.saw_text_delta {
+        if let Some(text) = state.fallback_text.filter(|t| !t.is_empty()) {
+            let chunk = if count_tokens {
+                StreamChunk::delta(text).with_token_estimate()
+            } else {
+                StreamChunk::delta(text)
+            };
+            let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
+        }
+    }
+
+    let _ = tx.send(Ok(StreamEvent::Final)).await;
+}
+
 pub struct OpenAiResponsesModelProvider {
     alias: String,
     responses_url: String,
@@ -913,7 +1019,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 effort: effort.to_string(),
             });
             let req = ResponsesApiRequest {
-                model: model.clone(),
+                model,
                 input,
                 instructions,
                 stream: true,
@@ -925,105 +1031,13 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 reasoning,
             };
 
-            let http_response = match client
+            let request_builder = client
                 .post(&responses_url)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("Accept", "text/event-stream")
-                .json(&req)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
-                    return;
-                }
-            };
+                .json(&req);
 
-            if !http_response.status().is_success() {
-                let status = http_response.status();
-                let body = http_response.text().await.unwrap_or_default();
-                let sanitized = super::sanitize_api_error(&body);
-                let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!("OpenAI API error ({status}): {sanitized}"))))
-                    .await;
-                return;
-            }
-
-            let mut state = ResponsesStreamState::default();
-            let mut byte_stream = http_response.bytes_stream();
-            let mut pending_utf8: Vec<u8> = Vec::new();
-            let mut chunk_buf = String::new();
-
-            loop {
-                match byte_stream.next().await {
-                    Some(Ok(bytes)) => {
-                        if let Err(err) = append_utf8_stream_chunk(&mut chunk_buf, &mut pending_utf8, &bytes) {
-                            let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
-                            return;
-                        }
-                    }
-                    Some(Err(err)) => {
-                        let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
-                        return;
-                    }
-                    None => break,
-                }
-
-                // Emit complete SSE chunks (separated by blank lines).
-                while let Some(idx) = chunk_buf.find("\n\n") {
-                    let chunk_str = chunk_buf[..idx].to_string();
-                    chunk_buf = chunk_buf[idx + 2..].to_string();
-
-                    match process_sse_chunk(&chunk_str, &mut state) {
-                        Ok(events) => {
-                            for event in events {
-                                if let StreamEvent::TextDelta(ref chunk) = event {
-                                    let event = if count_tokens {
-                                        StreamEvent::TextDelta(StreamChunk::delta(chunk.delta.clone()).with_token_estimate())
-                                    } else {
-                                        event
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                } else if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
-                                let _ = tx.send(Err(StreamError::ModelProvider(err.to_string()))).await;
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Process any remaining buffer content.
-            if !chunk_buf.trim().is_empty() {
-                if let Ok(events) = process_sse_chunk(&chunk_buf, &mut state) {
-                    for event in events {
-                        let _ = tx.send(Ok(event)).await;
-                    }
-                }
-            }
-
-            // Emit fallback text if no delta text was streamed.
-            if !state.saw_text_delta {
-                if let Some(text) = state.fallback_text.filter(|t| !t.is_empty()) {
-                    let chunk = if count_tokens {
-                        StreamChunk::delta(text).with_token_estimate()
-                    } else {
-                        StreamChunk::delta(text)
-                    };
-                    let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
-                }
-            }
-
-            let _ = tx.send(Ok(StreamEvent::Final)).await;
+            run_responses_sse(request_builder, &tx, count_tokens).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
