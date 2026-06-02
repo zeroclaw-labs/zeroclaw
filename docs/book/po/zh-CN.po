@@ -31657,11 +31657,11 @@ msgstr "为工作区中的每个新 crate 编写 `AGENTS.md` 文件（按照架�
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write `docs/architecture/diagrams/component-map.md` (Mermaid, reflects target crate topology)"
-msgstr ""
+msgstr "编写 `docs/architecture/diagrams/component-map.md`（Mermaid，反映目标 crate 拓扑）"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write `docs/architecture/diagrams/data-flow.md` (Mermaid, message lifecycle)"
-msgstr ""
+msgstr "编写 `docs/architecture/diagrams/data-flow.md`（Mermaid，消息生命周期）"
 
 #: src/tools/overview.md
 msgid "Write a file (same path constraint)"
@@ -31673,7 +31673,7 @@ msgstr "对仓库的写入访问"
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Write an OpenAPI 3.1 spec for the kernel's local IPC API before implementing it"
-msgstr ""
+msgstr "在实现之前，为内核的本地 IPC API 编写 OpenAPI 3.1 规范"
 
 #: src/contributing/pr-review-protocol.md
 msgid "Write as a thoughtful senior contributor who has read everything and cares about the outcome:"
@@ -31697,7 +31697,7 @@ msgstr "写入一个字段。请求体：`{path, value, comment?}`。密钥仅�
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write root-level `AGENTS.md` for `crates/zeroclaw-api` (in anticipation of extraction)"
-msgstr ""
+msgstr "为 `crates/zeroclaw-api` 编写根级 `AGENTS.md`（为后续提取做准备）"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)"

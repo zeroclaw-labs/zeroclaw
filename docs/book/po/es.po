@@ -31658,11 +31658,11 @@ msgstr "Escribe `AGENTS.md` para cada nuevo crate a medida que el espacio de tra
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write `docs/architecture/diagrams/component-map.md` (Mermaid, reflects target crate topology)"
-msgstr ""
+msgstr "Escribir `docs/architecture/diagrams/component-map.md` (Mermaid, refleja la topología de crates objetivo)"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write `docs/architecture/diagrams/data-flow.md` (Mermaid, message lifecycle)"
-msgstr ""
+msgstr "Escribir `docs/architecture/diagrams/data-flow.md` (Mermaid, ciclo de vida de los mensajes)"
 
 #: src/tools/overview.md
 msgid "Write a file (same path constraint)"
@@ -31674,7 +31674,7 @@ msgstr "Acceso de escritura al repositorio"
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Write an OpenAPI 3.1 spec for the kernel's local IPC API before implementing it"
-msgstr ""
+msgstr "Escribir una especificación OpenAPI 3.1 para la API de IPC local del kernel antes de implementarla"
 
 #: src/contributing/pr-review-protocol.md
 msgid "Write as a thoughtful senior contributor who has read everything and cares about the outcome:"
@@ -31698,7 +31698,7 @@ msgstr "Escribe un campo. Cuerpo: `{path, value, comment?}`. Los secretos respon
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write root-level `AGENTS.md` for `crates/zeroclaw-api` (in anticipation of extraction)"
-msgstr ""
+msgstr "Escribir el `AGENTS.md` de nivel raíz para `crates/zeroclaw-api` (anticipándose a la extracción)"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)"
