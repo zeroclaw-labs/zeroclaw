@@ -2176,6 +2176,7 @@ dependencies = [
  "rand 0.10.0",
  "regex",
  "reqwest 0.12.28",
+ "rusqlite",
  "rustls",
  "rustls-pki-types",
  "schemars 1.2.1",

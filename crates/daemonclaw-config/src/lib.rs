@@ -13,6 +13,7 @@ pub mod providers;
 pub mod scattered_types;
 pub mod schema;
 pub mod secrets;
+pub mod state_db;
 pub mod traits;
 pub mod workspace;
 
