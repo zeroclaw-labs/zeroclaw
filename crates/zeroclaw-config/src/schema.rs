@@ -15730,6 +15730,37 @@ impl Config {
         self.dirty_paths.insert(path.to_string());
     }
 
+    pub fn ensure_map_key_for_path(&mut self, path: &str) {
+        use crate::traits::MapKeyKind;
+        let mut best: Option<&'static str> = None;
+        for s in Self::map_key_sections()
+            .iter()
+            .filter(|s| s.kind == MapKeyKind::Map)
+        {
+            let prefix = format!("{}.", s.path);
+            if path.starts_with(&prefix)
+                && path.len() > prefix.len()
+                && best.is_none_or(|b| s.path.len() > b.len())
+            {
+                best = Some(s.path);
+            }
+        }
+        let Some(section) = best else {
+            return;
+        };
+        let rest = &path[section.len() + 1..];
+        let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
+            return;
+        };
+        if self
+            .get_map_keys(section)
+            .is_some_and(|keys| keys.iter().any(|k| k == alias))
+        {
+            return;
+        }
+        let _ = self.create_map_key(section, alias);
+    }
+
     pub fn clear_dirty(&mut self) {
         self.dirty_paths.clear();
     }
@@ -22493,6 +22524,35 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .create_map_key("providers.models.anthropic", "default")
             .expect("second add still resolves the section");
         assert!(!again, "duplicate add should report created=false");
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_materializes_typed_provider_maps() {
+        for (path, value) in [
+            ("providers.models.openai.default.model", "gpt-4o"),
+            ("providers.tts.openai.default.voice", "alloy"),
+            ("providers.transcription.openai.default.model", "whisper-1"),
+            ("channels.telegram.default.bot_token", "tok"),
+        ] {
+            let mut config = Config::default();
+            assert!(
+                config.set_prop(path, value).is_err(),
+                "precondition: {path} is unknown on a fresh config"
+            );
+            config.ensure_map_key_for_path(path);
+            assert!(
+                config.set_prop(path, value).is_ok(),
+                "{path} must be settable after ensure_map_key_for_path"
+            );
+        }
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_ignores_plain_fields() {
+        let mut config = Config::default();
+        config.ensure_map_key_for_path("gateway.port");
+        config.ensure_map_key_for_path("locale");
+        assert!(config.set_prop("gateway.port", "8080").is_ok());
     }
 
     #[test]

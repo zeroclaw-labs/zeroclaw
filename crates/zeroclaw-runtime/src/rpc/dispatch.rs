@@ -1920,6 +1920,7 @@ impl RpcDispatcher {
         let req: ConfigSetParams = parse_params(params)?;
         {
             let mut config = self.ctx.config.write();
+            config.ensure_map_key_for_path(&req.prop);
             let info = config
                 .prop_fields()
                 .into_iter()

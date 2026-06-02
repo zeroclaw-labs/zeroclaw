@@ -4528,6 +4528,7 @@ async fn main() -> Result<()> {
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
+                config.ensure_map_key_for_path(&path);
                 if no_interactive {
                     let val = value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -6005,6 +6006,38 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn ensure_map_key_materializes_typed_provider_entries() {
+        use crate::config::schema::Config;
+        for (path, value) in [
+            ("providers.models.openai.default.model", "gpt-4o"),
+            ("providers.tts.openai.default.voice", "alloy"),
+            ("providers.transcription.openai.default.model", "whisper-1"),
+            ("channels.telegram.default.bot_token", "tok"),
+        ] {
+            let mut config = Config::default();
+            assert!(
+                config.set_prop(path, value).is_err(),
+                "precondition: {path} should be unknown on a fresh config"
+            );
+            config.ensure_map_key_for_path(path);
+            assert!(
+                config.set_prop(path, value).is_ok(),
+                "{path} must be settable after map-key materialization"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn ensure_map_key_ignores_non_map_paths() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        config.ensure_map_key_for_path("gateway.port");
+        config.ensure_map_key_for_path("locale");
     }
 
     #[test]

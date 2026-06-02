@@ -614,6 +614,7 @@ pub async fn handle_prop_put(
     }
 
     let mut new_config = state.config.read().clone();
+    new_config.ensure_map_key_for_path(&body.path);
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&body.path)),
@@ -1207,6 +1208,9 @@ pub async fn handle_patch(
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
+        if matches!(op.op.as_str(), "add" | "replace") {
+            working.ensure_map_key_for_path(&path);
+        }
         let info = lookup_prop_field(&working, &path);
         let is_sensitive = info
             .as_ref()

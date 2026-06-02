@@ -1069,6 +1069,7 @@ fn write_risk_preset(config: &mut Config, preset_name: &str) -> Result<String, S
     config
         .risk_profiles
         .insert(preset.preset_name.to_string(), (preset.values)());
+    config.mark_dirty(&format!("risk_profiles.{}", preset.preset_name));
     Ok(preset.preset_name.to_string())
 }
 
@@ -1085,6 +1086,7 @@ fn write_runtime_preset(config: &mut Config, preset_name: &str) -> Result<String
     config
         .runtime_profiles
         .insert(preset.preset_name.to_string(), (preset.values)());
+    config.mark_dirty(&format!("runtime_profiles.{}", preset.preset_name));
     Ok(preset.preset_name.to_string())
 }
 
@@ -1559,9 +1561,10 @@ fn apply_agent(
             return None;
         }
     }
-    for r in channel_refs {
+    if !channel_refs.is_empty() {
         let path = format!("{prefix}.channels");
-        if let Err(err) = config.set_prop_persistent(&path, r) {
+        let json = serde_json::to_string(channel_refs).unwrap_or_else(|_| "[]".to_string());
+        if let Err(err) = config.set_prop_persistent(&path, &json) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Agent,
                 "channels",
@@ -1629,7 +1632,8 @@ pub fn model_provider_is_local(model_provider: &str) -> bool {
 mod tests {
     use super::*;
     use zeroclaw_config::presets::{
-        AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
+        SelectorChoice,
     };
     use zeroclaw_config::schema::Config;
 
@@ -1918,5 +1922,74 @@ mod tests {
                 "`api_key` must be non-required for `{kind}` (Codex subscription / local providers don't need one)",
             );
         }
+    }
+
+    async fn apply_to_temp(submission: BuilderSubmission) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let mut config = config;
+        super::apply(submission, &mut config)
+            .await
+            .expect("apply should succeed");
+        (dir, config)
+    }
+
+    fn reload(dir: &tempfile::TempDir) -> Config {
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        toml::from_str(&raw).expect("on-disk config must round-trip")
+    }
+
+    #[tokio::test]
+    async fn fresh_preset_profiles_persist_to_disk() {
+        let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
+        assert!(applied.risk_profiles.contains_key("balanced"));
+        assert!(applied.runtime_profiles.contains_key("balanced"));
+        let reloaded = reload(&dir);
+        assert!(
+            reloaded.risk_profiles.contains_key("balanced"),
+            "risk_profiles.balanced must survive save_dirty + reload, not dangle"
+        );
+        assert!(
+            reloaded.runtime_profiles.contains_key("balanced"),
+            "runtime_profiles.balanced must survive save_dirty + reload, not dangle"
+        );
+        let agent = reloaded.agents.get("bot").expect("agent persisted");
+        assert_eq!(agent.risk_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "balanced");
+    }
+
+    #[tokio::test]
+    async fn multiple_channels_all_bind_to_agent() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![
+            SelectorChoice::Fresh(ChannelQuickStart {
+                channel_type: "telegram".into(),
+                alias: "tg".into(),
+                token: Some("tok-a".into()),
+            }),
+            SelectorChoice::Fresh(ChannelQuickStart {
+                channel_type: "discord".into(),
+                alias: "dc".into(),
+                token: Some("tok-b".into()),
+            }),
+        ];
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let agent = reloaded.agents.get("bot").expect("agent persisted");
+        let bound: Vec<String> = agent.channels.iter().map(|c| c.to_string()).collect();
+        assert!(
+            bound.iter().any(|c| c.contains("tg")),
+            "first channel must stay bound; got {bound:?}"
+        );
+        assert!(
+            bound.iter().any(|c| c.contains("dc")),
+            "second channel must also be bound; got {bound:?}"
+        );
+        assert_eq!(bound.len(), 2, "both channels bound, not just the last");
     }
 }
