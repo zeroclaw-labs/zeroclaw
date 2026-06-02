@@ -157,7 +157,7 @@ Please respond with only the new description text in <new_description> tags, not
 
     # Safety net: the prompt already states the 1024-char hard limit, but if
     # the model blew past it anyway, make one fresh single-turn call that
-    # quotes the too-long version and asks for a shorter rewrite. (The old
+    # quotes the too-int version and asks for a shorter rewrite. (The old
     # SDK path did this as a true multi-turn; `claude -p` is one-shot, so we
     # inline the prior output into the new prompt instead.)
     if len(description) > 1024:
