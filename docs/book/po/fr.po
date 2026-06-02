@@ -23004,15 +23004,7 @@ msgstr "Lire les notes de version"
 
 #: src/contributing/architecture-map.md
 msgid "Read the repo-root `AGENTS.md` first. It contains the current risk tiers, protected files, anti-patterns, localization rules, and agent-specific workflow contracts."
-msgstr ""
-"Je comprends, mais je ne vois aucun fichier `AGENTS.md` joint à notre conversation. Je ne peux pas lire de fichiers depuis un dépôt sans que leur contenu me soit fourni.\n"
-"\n"
-"Pour que je puisse appliquer les règles dont vous parlez (niveaux de risque, fichiers protégés, anti-patterns, règles de localisation et contrats de workflow spécifiques aux agents), veuillez :\n"
-"\n"
-"1. **Coller le contenu de `AGENTS.md`** directement dans le chat, ou\n"
-"2. **Joindre le fichier** à votre message.\n"
-"\n"
-"Une fois que j'aurai son contenu, je pourrai m'y référer pour le reste de notre échange."
+msgstr "Lisez d'abord le `AGENTS.md` à la racine du dépôt. Il contient les niveaux de risque actuels, les fichiers protégés, les anti-modèles, les règles de localisation et les contrats de flux de travail spécifiques aux agents."
 
 #: src/foundations/index.md
 msgid "Read these in order if you can. Each document builds on the ones before it, and the sequence tells a story. You can enter anywhere and learn something useful, but reading them from the beginning gives you the full arc: from the shape of the architecture, to how we record and coordinate and ship and collaborate, to what it means to write the code well at the sentence level."
@@ -23677,7 +23669,7 @@ msgstr "Types de réponse : `\"text\"` (texte brut) ou `\"tool_calls\"` (requêt
 
 #: src/channels/matrix.md
 msgid "Response:"
-msgstr ""
+msgstr "Réponse :"
 
 #: src/ops/service.md
 msgid "Restart behaviour"
@@ -30033,7 +30025,7 @@ msgstr "Utilisez les tableaux ci-dessous pour choisir l'architecture et les docu
 
 #: src/contributing/pr-review-protocol.md
 msgid "Use these canonical forms:"
-msgstr ""
+msgstr "Utilisez ces formes canoniques :"
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use this as the basis for security-related issues and PRs"

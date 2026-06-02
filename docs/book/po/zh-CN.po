@@ -14772,7 +14772,7 @@ msgstr "ZeroClaw 中的示例"
 
 #: src/ops/observability.md
 msgid "Examples:"
-msgstr ""
+msgstr "示例："
 
 #: src/reference/cli.md
 msgid "Examples: - `zeroclaw estop` - `zeroclaw estop --level network-kill` - `zeroclaw estop --level domain-block --domain \"*.chase.com\"` - `zeroclaw estop --level tool-freeze --tool shell --tool browser` - `zeroclaw estop status` - `zeroclaw estop resume --network` - `zeroclaw estop resume --domain \"*.chase.com\"` - `zeroclaw estop resume --tool shell`"
@@ -18310,7 +18310,7 @@ msgstr "以学习为导向，通过体验引导"
 
 #: src/maintainers/reviewer-playbook.md
 msgid "Leave one actionable checklist comment, stop deep review"
-msgstr ""
+msgstr "留下一条可操作的检查清单评论，停止深入审查。"
 
 #: src/maintainers/labels.md
 msgid "Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch."
@@ -22985,7 +22985,7 @@ msgstr "阅读发布说明"
 
 #: src/contributing/architecture-map.md
 msgid "Read the repo-root `AGENTS.md` first. It contains the current risk tiers, protected files, anti-patterns, localization rules, and agent-specific workflow contracts."
-msgstr "我会先阅读仓库根目录的 `AGENTS.md` 文件。它包含当前的风险等级、受保护文件、反模式、本地化规则以及特定于 agent 的工作流约定。"
+msgstr "请先阅读仓库根目录的 `AGENTS.md`。其中包含当前的风险层级、受保护文件、反模式、本地化规则以及特定于代理的工作流约定。"
 
 #: src/foundations/index.md
 msgid "Read these in order if you can. Each document builds on the ones before it, and the sequence tells a story. You can enter anywhere and learn something useful, but reading them from the beginning gives you the full arc: from the shape of the architecture, to how we record and coordinate and ship and collaborate, to what it means to write the code well at the sentence level."
@@ -29982,7 +29982,7 @@ msgstr "使用看板来跟踪问题就绪状态、活跃负责人、路线图分
 
 #: src/maintainers/release-runbook.md
 msgid "Use the changelog-generation skill to produce `CHANGELOG-next.md`:"
-msgstr "我将使用 changelog-generation 技能来生成 `CHANGELOG-next.md`："
+msgstr "使用 changelog-generation 技能生成 `CHANGELOG-next.md`："
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use the eight quality characteristics as a lens in PR reviews for significant changes"
@@ -30006,7 +30006,7 @@ msgstr "请使用下表选择与变更相匹配的架构和基础文档。"
 
 #: src/contributing/pr-review-protocol.md
 msgid "Use these canonical forms:"
-msgstr ""
+msgstr "使用以下规范形式："
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use this as the basis for security-related issues and PRs"
@@ -31677,7 +31677,7 @@ msgstr "在实现之前，为内核的本地 IPC API 编写 OpenAPI 3.1 规范"
 
 #: src/contributing/pr-review-protocol.md
 msgid "Write as a thoughtful senior contributor who has read everything and cares about the outcome:"
-msgstr ""
+msgstr "以一位通读了所有材料并关心最终成果的资深贡献者的身份来撰写："
 
 #: src/maintainers/changelog-generation.md
 msgid "Write each entry as a sentence for a human reader — not a raw commit message. Reference PR numbers with `(#NNNN)` where available."

@@ -10997,7 +10997,7 @@ msgstr "CLIヘルプテキスト、コマンドの説明、ランタイムメッ
 
 #: src/getting-started/language.md
 msgid "CLI message translations"
-msgstr ""
+msgstr "CLI メッセージの翻訳"
 
 #: src/getting-started/language.md
 msgid "CLI messages and command help"
@@ -11061,7 +11061,7 @@ msgstr "`AardvarkTransport.send()` を呼び出します"
 
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "Can I describe the problem in one sentence without mentioning implementation details?"
-msgstr "はい、実装の詳細に触れずに、問題を一文で説明することは可能です。"
+msgstr "実装の詳細に触れずに、問題を一文で説明できるか？"
 
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "Can I describe what a correct implementation looks like before I see one?"
@@ -14818,7 +14818,7 @@ msgstr "ZeroClawの例"
 
 #: src/ops/observability.md
 msgid "Examples:"
-msgstr ""
+msgstr "例："
 
 #: src/reference/cli.md
 msgid "Examples: - `zeroclaw estop` - `zeroclaw estop --level network-kill` - `zeroclaw estop --level domain-block --domain \"*.chase.com\"` - `zeroclaw estop --level tool-freeze --tool shell --tool browser` - `zeroclaw estop status` - `zeroclaw estop resume --network` - `zeroclaw estop resume --domain \"*.chase.com\"` - `zeroclaw estop resume --tool shell`"
@@ -23028,7 +23028,7 @@ msgstr "リリースノートを読む"
 
 #: src/contributing/architecture-map.md
 msgid "Read the repo-root `AGENTS.md` first. It contains the current risk tiers, protected files, anti-patterns, localization rules, and agent-specific workflow contracts."
-msgstr ""
+msgstr "まずリポジトリのルートにある `AGENTS.md` を読んでください。現在のリスク階層、保護対象ファイル、アンチパターン、ローカライゼーションのルール、エージェント固有のワークフロー契約が記載されています。"
 
 #: src/foundations/index.md
 msgid "Read these in order if you can. Each document builds on the ones before it, and the sequence tells a story. You can enter anywhere and learn something useful, but reading them from the beginning gives you the full arc: from the shape of the architecture, to how we record and coordinate and ship and collaborate, to what it means to write the code well at the sentence level."
