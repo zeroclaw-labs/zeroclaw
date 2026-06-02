@@ -223,7 +223,45 @@ impl McpServer {
         if let Some(err) = resp.error {
             bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
         }
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+
+        let result = resp.result.unwrap_or(serde_json::Value::Null);
+
+        // MCP servers signal *tool-execution* failures (as opposed to JSON-RPC
+        // protocol errors) with HTTP 200 + `result.isError: true` and the detail
+        // in `result.content[].text`, per the MCP spec. Without surfacing this,
+        // the error envelope is returned as a normal success — so the failure is
+        // invisible to the model and the daemon log, and callers only ever see a
+        // generic "error during tool call" with no detail.
+        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+            let detail = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|s: &String| !s.is_empty())
+                .unwrap_or_else(|| "(no error detail returned by server)".to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &inner.config.name,
+                        "tool": tool_name,
+                        "detail": &detail,
+                    })),
+                "mcp_client: tool returned isError:true"
+            );
+            bail!(
+                "MCP tool `{tool_name}` (server `{}`) returned isError: {detail}",
+                inner.config.name
+            );
+        }
+
+        Ok(result)
     }
 }
 
