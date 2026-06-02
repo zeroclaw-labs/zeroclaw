@@ -261,10 +261,11 @@ agent-runtime = [
 ]
 
 # Lean channel bundle included in `default`. These channels cover local/editor
-# ACP, gateway/webhook ingress, and common first-run external chat/email paths.
+# ACP, gateway/webhook ingress, common first-run external chat/email paths,
+# and a basic social/broadcast channel (Twitter/X).
 default-channels = [
     "channel-acp-server", "channel-webhook",
-    "channel-email", "channel-telegram",
+    "channel-email", "channel-telegram", "channel-twitter",
 ]
 
 # Historical broad channel bundle. Use this for builds that should preserve the

@@ -160,6 +160,7 @@ default-channels = [
   "channel-acp-server",
   "channel-email",
   "channel-telegram",
+  "channel-twitter",
   "channel-webhook",
 ]
 channels-full = [
