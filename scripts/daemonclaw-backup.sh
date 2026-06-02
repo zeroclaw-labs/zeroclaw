@@ -53,6 +53,11 @@ if [ -f "${WORKSPACE}/devices.db" ]; then
     backup_sqlite "${WORKSPACE}/devices.db" "${staging}/devices.db"
 fi
 
+# Audit (audit.db) — Merkle-chained security audit trail
+if [ -f "${WORKSPACE}/audit/audit.db" ]; then
+    backup_sqlite "${WORKSPACE}/audit/audit.db" "${staging}/audit/audit.db"
+fi
+
 # ── Non-DB files ────────────────────────────────────────────────
 # Config (follow symlink to /etc/daemonclaw/config.toml)
 if [ -f "${ETC_DIR}/config.toml" ]; then
