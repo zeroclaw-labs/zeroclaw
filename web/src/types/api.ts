@@ -211,6 +211,8 @@ export interface ChannelDetail {
   message_count: number;
   last_message_at: string | null;
   health: "healthy" | "degraded" | "down";
+  /** Per-alias readiness breakdown (present when the gateway computes it). */
+  readiness?: ChannelReadiness;
 }
 
 export interface SSEEvent {
