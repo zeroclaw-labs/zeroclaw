@@ -1097,13 +1097,19 @@ WantedBy=multi-user.target
         fs::write(timer_path, timer)
             .with_context(|| format!("write {}", timer_path.display()))?;
 
+        let backup_script_path = format!("{home}/.daemonclaw/backup.sh", home = HOME_DIR);
+        let backup_script = include_str!("../../../../scripts/daemonclaw-backup.sh");
+        fs::write(&backup_script_path, backup_script)
+            .with_context(|| format!("write {backup_script_path}"))?;
+        set_mode(Path::new(&backup_script_path), 0o750)?;
+        set_owner(Path::new(&backup_script_path), "root", AGENTS_GROUP)?;
+
         let backup_svc = format!(
             "[Unit]\nDescription=DaemonClaw state backup\n\n\
              [Service]\nType=oneshot\n\
-             ExecStart=/bin/bash -c 'ts=$(date +%%Y%%m%%d-%%H%%M%%S) && \
-             tar czf {backup}/state-${{ts}}.tar.gz -C {home}/.daemonclaw state/'\n\
+             ExecStart={script}\n\
              User=root\nGroup={agents}\n",
-            backup = BACKUP_DIR, home = HOME_DIR, agents = AGENTS_GROUP,
+            script = backup_script_path, agents = AGENTS_GROUP,
         );
         fs::write(backup_svc_path, &backup_svc)
             .with_context(|| format!("write {}", backup_svc_path.display()))?;
