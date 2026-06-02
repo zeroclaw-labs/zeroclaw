@@ -4089,13 +4089,21 @@ async fn process_channel_message_body(
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision = ctx.model_provider.supports_vision();
-        let transcription_manager =
-            crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .ok()
-                .map(|m| {
-                    m.with_typed_providers(&ctx.prompt_config.providers.transcription)
-                        .with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
-                });
+        // Build from legacy config; if that fails (e.g. no legacy api_key
+        // but typed providers are configured), fall back to an empty shell
+        // so with_typed_providers() can still populate the registry.
+        let transcription_manager = {
+            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
+                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            let m = base
+                .with_typed_providers(&ctx.prompt_config.providers.transcription)
+                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
+            if m.available_providers().is_empty() {
+                None
+            } else {
+                Some(m)
+            }
+        };
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
@@ -7058,7 +7066,11 @@ fn collect_configured_channels(
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
-                    .with_agent_transcription_provider(agent_transcription_provider)
+                    .with_agent_transcription_provider(agent_transcription_provider.clone())
+                    .with_typed_transcription_providers(
+                        &config.providers.transcription,
+                        &agent_transcription_provider,
+                    )
                     .with_tts(&config)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())

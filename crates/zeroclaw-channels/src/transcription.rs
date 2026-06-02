@@ -870,6 +870,16 @@ pub struct TranscriptionManager {
 }
 
 impl TranscriptionManager {
+    /// Empty manager with no providers. Used as a base when only typed
+    /// `[providers.transcription.<family>.<alias>]` config is present and
+    /// there is no legacy `[transcription]` block to seed from.
+    pub fn empty() -> Self {
+        Self {
+            transcription_providers: HashMap::new(),
+            agent_transcription_provider: String::new(),
+        }
+    }
+
     /// Build a `TranscriptionManager` from a `TranscriptionConfig`. The
     /// resolved agent alias starts empty; orchestrators that wire the
     /// manager to a specific agent should call
