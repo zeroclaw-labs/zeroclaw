@@ -45,6 +45,13 @@ pub struct OpenAiTtsProvider {
     api_key: String,
     model: String,
     speed: f64,
+    /// Full endpoint URL. Defaults to the OpenAI production endpoint; can be
+    /// overridden via `[providers.tts.openai.<alias>].uri` to point at any
+    /// OpenAI-compatible TTS backend (Groq, Azure, self-hosted proxies).
+    base_url: String,
+    /// Audio response format. Defaults to `"opus"`; override to `"wav"` for
+    /// Orpheus-class models or `"mp3"` for broader compatibility.
+    response_format: String,
     client: reqwest::Client,
 }
 
@@ -74,6 +81,16 @@ impl OpenAiTtsProvider {
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or_else(|| "tts-1".to_string()),
             speed: config.speed.unwrap_or(1.0),
+            base_url: config
+                .uri
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".to_string()),
+            response_format: config
+                .response_format
+                .clone()
+                .filter(|f| !f.trim().is_empty())
+                .unwrap_or_else(|| "opus".to_string()),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -94,12 +111,12 @@ impl TtsProvider for OpenAiTtsProvider {
             "input": text,
             "voice": voice,
             "speed": self.speed,
-            "response_format": "opus",
+            "response_format": self.response_format,
         });
 
         let resp = self
             .client
-            .post("https://api.openai.com/v1/audio/speech")
+            .post(&self.base_url)
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -941,5 +958,87 @@ mod tests {
         cfg.tts.max_text_length = 0;
         let manager = TtsManager::from_config(&cfg).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    #[tokio::test]
+    async fn synthesize_posts_to_configured_uri_with_response_format() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FAKE_WAV".to_vec()))
+            .mount(&server)
+            .await;
+
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            uri: Some(format!("{}/v1/audio/speech", server.uri())),
+            response_format: Some("wav".to_string()),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
+
+        let audio = provider.synthesize("hello world", "hannah").await.unwrap();
+        assert_eq!(
+            audio, b"FAKE_WAV",
+            "synthesize should return the bytes served by the configured endpoint"
+        );
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "exactly one POST should reach the configured uri"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["response_format"], "wav",
+            "configured response_format must reach the outgoing request body"
+        );
+        assert_eq!(body["input"], "hello world");
+        assert_eq!(body["voice"], "hannah");
+        assert_eq!(body["model"], "tts-1");
+    }
+
+    #[tokio::test]
+    async fn synthesize_defaults_response_format_to_opus_when_unset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
+            .mount(&server)
+            .await;
+
+        // uri points at the mock so we can inspect the body; response_format left unset.
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            uri: Some(format!("{}/v1/audio/speech", server.uri())),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
+        provider.synthesize("hi", "alloy").await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["response_format"], "opus",
+            "unset response_format must default to opus in the outgoing request"
+        );
+    }
+
+    #[test]
+    fn openai_defaults_to_production_endpoint_when_uri_unset() {
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
+        assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
+        assert_eq!(provider.response_format, "opus");
     }
 }

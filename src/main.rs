@@ -1703,6 +1703,12 @@ async fn main() -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
+            // Register channel map factory for late-bound tool handle population.
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
+                let config_clone = config.clone();
+                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+            }));
+
             Box::pin(agent::run(
                 config,
                 &agent_alias,
@@ -3200,7 +3206,7 @@ async fn main() -> Result<()> {
                 if !daemon_running {
                     eprintln!(
                         "Note: gateway does not appear to be running at {host}:{port}. \
-                         Start it with `zeroclaw daemon start` to load the explorer."
+                         Start it with `zeroclaw service start` (background) or `zeroclaw daemon` (foreground) to load the explorer."
                     );
                 }
                 Ok(())

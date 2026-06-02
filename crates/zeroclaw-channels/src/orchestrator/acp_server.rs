@@ -32,6 +32,7 @@ use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
+use zeroclaw_runtime::tools::CanvasStore;
 
 use crate::acp_channel::AcpChannel;
 
@@ -304,6 +305,11 @@ pub struct AcpServer {
     /// against `max_sessions`.
     loading_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
     store: Option<Arc<AcpSessionStore>>,
+    /// Shared canvas store from the gateway / daemon supervisor.  When set,
+    /// agents created by this server write canvas frames to the same store
+    /// that `/ws/canvas/:id` WebSocket subscribers read from.  `None` in
+    /// standalone `zeroclaw acp` mode where no gateway is running.
+    canvas_store: Option<CanvasStore>,
 }
 
 impl AcpServer {
@@ -354,7 +360,16 @@ impl AcpServer {
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             store,
+            canvas_store: None,
         }
+    }
+
+    /// Attach the shared gateway [`CanvasStore`] so that agents created by
+    /// this server write canvas frames to the same store that the
+    /// `/ws/canvas/:id` WebSocket endpoint serves.
+    pub fn with_canvas_store(mut self, canvas_store: CanvasStore) -> Self {
+        self.canvas_store = Some(canvas_store);
+        self
     }
 
     /// Run the ACP server, reading JSON-RPC requests from stdin and writing
@@ -462,7 +477,8 @@ impl AcpServer {
     ///
     /// This is used by the gateway WebSocket bridge, where inbound WebSocket
     /// text messages are already complete JSON-RPC frames and outbound frames
-    /// are supplied by the writer channel passed to [`new_with_writer`].
+    /// are supplied by the writer channel passed to [`Self::new_with_writer`]
+    /// or [`Self::new_with_writer_and_store`].
     pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
         while let Some(line) = input_rx.recv().await {
             let trimmed = line.trim();
@@ -685,6 +701,7 @@ impl AcpServer {
             &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
             false,
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -834,6 +851,7 @@ impl AcpServer {
             &restore_alias,
             Some(&workspace_dir),
             false,
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -982,6 +1000,7 @@ impl AcpServer {
             &restore_alias,
             Some(&workspace_dir),
             false,
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {

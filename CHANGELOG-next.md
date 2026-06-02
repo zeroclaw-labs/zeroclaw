@@ -17,6 +17,37 @@ v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. O
 
 ## What's New
 
+### Added
+
+- **agents**: Added `[agents.<alias>].classifier_provider` (`ModelProviderRef`)
+  to route the reply-intent classifier (`classify_channel_reply_intent`) to a
+  separate, cheaper provider/model than the main answering model. Empty (default)
+  preserves pre-release behavior: the classifier reuses the main agent's
+  `model_provider`. Non-empty values must reference a configured
+  `[providers.models.<type>.<alias>]` entry (validated at config-load fail-loud
+  through the same `typed_provider_refs` check that covers `tts_provider` and
+  `transcription_provider`). ACP channels skip the classifier entirely and
+  are unaffected.
+
+  Example: route classification through a free fast model while answering
+  with the premium model:
+
+      [providers.models.custom.default]
+      api_key  = "..."
+      model    = "qwen3.6-plus"
+      uri      = "https://coding.dashscope.aliyuncs.com/v1"
+      wire_api = "chat_completions"
+
+      [providers.models.custom.kimi-k2-5]    # alias may NOT contain '.';
+      api_key  = "..."                       # write 'kimi-k2-5' not 'kimi-k2.5'
+      model    = "kimi-k2.5"                 # the model string CAN contain '.'
+      uri      = "https://coding.dashscope.aliyuncs.com/v1"
+      wire_api = "chat_completions"
+
+      [agents.default]
+      model_provider      = "custom.default"
+      classifier_provider = "custom.kimi-k2-5"
+
 ### Multi-Agent & Runtime
 
 The multi-agent epic (#6272) is the spine of this release:
@@ -100,6 +131,7 @@ ACP mode (the `zeroclaw acp` subprocess and the `zeroclaw-acp-bridge` editor bri
 
 - NixOS module + test for `services.zeroclaw.instances` (#6562).
 - Desktop (Tauri): macOS onboarding wizard with permission primitives and capability sync (#6506), Linux/Windows permission onboarding (#6710), and `take_screenshot` / `run_applescript` commands (#6507).
+- **Lean default channel bundle.** Standard default builds and release/prebuilt artifacts now compile the core first-run/gateway channel set by default: ACP server, webhook, email, and Telegram. The historical broad bundle remains available as `channels-full`, and `install.sh --source --preset full` selects that bundle for source installs that need every bundled channel (#6904).
 
 ### Internationalization
 
@@ -136,6 +168,24 @@ zeroclaw config migrate          # add --json for a machine-readable report
 ```
 
 **Back up first.** SQLite memory is backed up automatically (`brain.db.backup-<ts>`), and the install tree is copied to `backup-<ts>/` before the split. **Postgres and Qdrant are NOT backed up for you. Dump them yourself before upgrading.**
+
+### Default builds are now leaner
+
+Default/source builds and release/prebuilt artifacts no longer inherit every historical channel through Cargo defaults. The default channel bundle is now ACP server, webhook, email, and Telegram, with release builds adding only their explicit release features. Long-tail channels such as Discord, Slack, Signal, Mattermost, IRC, iMessage, DingTalk, QQ, Bluesky, Twitter/X, Reddit, Notion, MQTT, Linq, WATI, Nextcloud Talk, Voice Call, ClawdTalk, WeCom, WeCom WebSocket, WhatsApp Cloud, and Mochat remain in the repository, but they must be selected with `channels-full` or with their specific `channel-*` features.
+
+Existing channel config is not deleted. If a config references a channel that is not compiled into the current binary, `/api/channels` reports it as `not_compiled` / `unavailable` so operators can rebuild with the needed feature set. To preserve the historical broad channel bundle from source, use:
+
+```bash
+./install.sh --source --preset full
+```
+
+or build/install with:
+
+```bash
+cargo install --path . --features channels-full
+```
+
+Packagers that intentionally ship every bundled channel should add `channels-full` to their build features. Packagers that want a narrower binary should list the specific `channel-*` features they intend to support. (#6904)
 
 ### Schema V3 and the install layout
 

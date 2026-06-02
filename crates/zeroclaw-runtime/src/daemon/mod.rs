@@ -1284,6 +1284,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1324,6 +1325,7 @@ mod tests {
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1379,6 +1381,9 @@ mod tests {
                 auth_header: None,
                 secret: None,
                 excluded_tools: vec![],
+                max_retries: None,
+                retry_base_delay_ms: None,
+                retry_max_delay_ms: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1455,6 +1460,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -1480,6 +1486,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.

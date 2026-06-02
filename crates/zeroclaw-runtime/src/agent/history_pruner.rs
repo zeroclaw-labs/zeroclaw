@@ -65,6 +65,29 @@ pub struct PrunedOrphans {
     pub orphan_tool_call_ids: Vec<String>,
 }
 
+fn is_tool_exchange_summary(content: &str) -> bool {
+    content.starts_with("[Tool exchange:") && content.contains("results collapsed]")
+}
+
+fn assistant_tool_calls_have_immediate_results(
+    messages: &[ChatMessage],
+    assistant_idx: usize,
+    tool_call_ids: &[String],
+) -> bool {
+    if tool_call_ids.is_empty() {
+        return false;
+    }
+
+    tool_call_ids.iter().all(|expected| {
+        messages
+            .iter()
+            .skip(assistant_idx + 1)
+            .take_while(|msg| msg.role == "tool")
+            .filter_map(|msg| extract_tool_call_id(&msg.content))
+            .any(|actual| actual == *expected)
+    })
+}
+
 impl PrunedOrphans {
     pub fn is_empty(&self) -> bool {
         self.removed == 0
@@ -84,13 +107,17 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
     // them, destroying structured tool_use blocks and orphaning the results.
     let mut i = 0;
     while i < messages.len() {
-        if messages[i].role == "assistant"
-            && extract_assistant_tool_call_ids(&messages[i].content).is_some()
+        let assistant_tool_call_ids = if messages[i].role == "assistant" {
+            extract_assistant_tool_call_ids(&messages[i].content)
+        } else {
+            None
+        };
+        if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
+            && (!is_tool_exchange_summary(&messages[i - 1].content)
+                || !assistant_tool_calls_have_immediate_results(messages, i, &doomed_ids))
         {
-            let doomed_ids =
-                extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
             outcome
                 .orphan_tool_call_ids
                 .extend(doomed_ids.iter().cloned());
@@ -302,8 +329,45 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         }
     }
 
-    // Phase 3 – remove orphaned tool messages left behind by phases 1-2.
+    // Phase 3 – merge consecutive synthetic tool-exchange summaries. GLM/Z.AI
+    // reject adjacent assistant messages, but these summaries are safe to
+    // combine because they are both pruner-generated placeholders.
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        if messages[i].role == "assistant"
+            && messages[i + 1].role == "assistant"
+            && is_tool_exchange_summary(&messages[i].content)
+            && is_tool_exchange_summary(&messages[i + 1].content)
+        {
+            let next = messages.remove(i + 1);
+            messages[i].content = format!("{}\n\n{}", messages[i].content, next.content);
+            dropped_messages += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Phase 4 – remove orphaned tool messages left behind by phases 1-3.
     dropped_messages += remove_orphaned_tool_messages(messages).removed;
+
+    // Phase 5 – separate any remaining adjacent assistant messages. These can
+    // happen when a protected assistant(tool_calls) group follows a collapsed
+    // summary. Insert a tiny user boundary rather than dropping protected data.
+    let mut i = 1;
+    while i < messages.len() {
+        if messages[i - 1].role == "assistant" && messages[i].role == "assistant" {
+            messages.insert(
+                i,
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "[context continues]".to_string(),
+                },
+            );
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
 
     PruneStats {
         messages_before,
@@ -608,6 +672,198 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn prune_merges_consecutive_collapsed_assistant_messages() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"t1","content":"first"}"#),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"t2","name":"web","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"t2","content":"second"}"#),
+            msg("user", "recent"),
+            msg("assistant", "done"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 2,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.collapsed_pairs, 2);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].content.contains("1 tool call(s)"));
+        assert_eq!(messages.iter().filter(|m| m.role == "assistant").count(), 2);
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == "assistant" && pair[1].role == "assistant")),
+            "pruned roles should not contain adjacent assistants: {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prune_preserves_straddled_tool_group_after_collapsed_summary() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"old","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"old","content":"old result"}"#),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"live","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"live","content":"live result"}"#),
+            msg("user", "follow up"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 3,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.collapsed_pairs, 1);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.contains("\"id\":\"live\"")),
+            "protected assistant tool call should survive: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("\"tool_call_id\":\"live\"")),
+            "matching protected tool result should survive: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "user" && m.content == "[context continues]"),
+            "Phase 5 should separate collapsed summary from live assistant"
+        );
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == "assistant" && pair[1].role == "assistant")),
+            "pruned roles should not contain adjacent assistants: {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prune_removes_dangling_tool_call_after_collapsed_summary() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                "[Tool exchange: 1 tool call(s) — results collapsed]",
+            ),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"dangling","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("user", "follow up"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 2,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.dropped_messages, 1);
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("\"id\":\"dangling\"")),
+            "dangling assistant tool call should not survive: {messages:?}"
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "assistant", "user"]
+        );
+    }
+
+    #[test]
+    fn prune_does_not_merge_json_tool_call_assistants_as_summaries() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"live1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"live1","content":"first"}"#),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"live2","name":"web","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"live2","content":"second"}"#),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 4,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.collapsed_pairs, 0);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("\"id\":\"live1\"")),
+            "first protected tool call should remain structured"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("\"id\":\"live2\"")),
+            "second protected tool call should remain structured"
+        );
+    }
+
+    #[test]
+    fn prune_inserts_separator_when_tight_budget_leaves_protected_assistants() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("assistant", "protected assistant one"),
+            msg("assistant", "protected assistant two"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 1,
+            keep_recent: 2,
+            collapse_tool_results: false,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.dropped_messages, 0);
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "assistant", "user", "assistant"]
+        );
+        assert_eq!(messages[2].content, "[context continues]");
     }
 
     // -----------------------------------------------------------------------

@@ -1493,6 +1493,7 @@ impl DelegateTool {
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            channel_targets: None,
         };
 
         let builder = SystemPromptBuilder::default()
@@ -2828,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn enriched_prompt_includes_tools_workspace_datetime() {
+    fn enriched_prompt_includes_tools_workspace_date() {
         let config = AliasedAgentConfig {
             model_provider: "openrouter.test".into(),
             ..Default::default()
@@ -2859,9 +2860,12 @@ mod tests {
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE & TIME"),
-            "should contain datetime section"
+            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
+            "should contain date section"
         );
+        assert!(!prompt.contains("CURRENT DATE & TIME"));
+        assert!(!prompt.contains("Time:"));
+        assert!(!prompt.contains("ISO 8601:"));
         // Identity files come from the target sub-agent's per-agent
         // workspace dir. The test's install_root is unset, so no
         // identity files exist for the dummy alias — the prompt still

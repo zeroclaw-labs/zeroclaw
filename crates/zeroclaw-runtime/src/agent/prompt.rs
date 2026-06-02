@@ -4,7 +4,7 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, Local};
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -36,6 +36,9 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// Pre-rendered channel target section injected so the agent knows
+    /// where to deliver outbound messages via `channel_send`.
+    pub channel_targets: Option<String>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -61,6 +64,7 @@ impl SystemPromptBuilder {
                 Box::new(WorkspaceSection),
                 Box::new(RuntimeSection),
                 Box::new(ChannelMediaSection),
+                Box::new(ChannelTargetsSection),
             ],
         }
     }
@@ -93,6 +97,10 @@ pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
+
+/// Injects configured channel targets into the system prompt so the agent
+/// knows where to deliver outbound messages via `channel_send`.
+pub struct ChannelTargetsSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -279,16 +287,13 @@ impl PromptSection for DateTimeSection {
         let now = Local::now();
         // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
         let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
 
         Ok(format!(
-            "## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n\
-             The following is the ABSOLUTE TRUTH regarding the current date and time. \
+            "## CRITICAL CONTEXT: CURRENT DATE\n\n\
+             The following is the ABSOLUTE TRUTH regarding the current date. \
              Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
              Date: {year:04}-{month:02}-{day:02}\n\
-             Time: {hour:02}:{minute:02}:{second:02} ({tz})\n\
-             ISO 8601: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{}",
+             UTC offset: {}",
             now.format("%:z")
         ))
     }
@@ -306,6 +311,20 @@ impl PromptSection for ChannelMediaSection {
             - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
             - `[Document: <name>] <path>` — A file attachment saved to the workspace."
             .into())
+    }
+}
+
+impl PromptSection for ChannelTargetsSection {
+    fn name(&self) -> &str {
+        "channel_targets"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(ctx
+            .channel_targets
+            .as_deref()
+            .unwrap_or_default()
+            .to_string())
     }
 }
 
@@ -376,6 +395,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let section = IdentitySection;
@@ -409,6 +429,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -432,6 +453,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -455,6 +477,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -483,6 +506,8 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: None,
@@ -501,6 +526,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -527,6 +553,8 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
@@ -545,6 +573,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -560,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn datetime_section_includes_timestamp_and_timezone() {
+    fn datetime_section_includes_date_and_offset_without_wall_clock_time() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -575,15 +604,19 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n"));
+        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE\n\n"));
+        assert!(!rendered.contains("CURRENT DATE & TIME"));
 
-        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n");
+        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE\n\n");
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains("Date:"));
-        assert!(payload.contains("Time:"));
+        assert!(payload.contains("UTC offset:"));
+        assert!(!payload.contains("Time:"));
+        assert!(!payload.contains("ISO 8601:"));
     }
 
     #[test]
@@ -601,6 +634,8 @@ mod tests {
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: std::collections::HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -618,6 +653,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -654,6 +690,7 @@ mod tests {
 
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -691,6 +728,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -720,6 +758,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -757,6 +796,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            channel_targets: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();

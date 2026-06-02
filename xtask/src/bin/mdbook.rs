@@ -40,6 +40,8 @@ enum Cmd {
     Check,
     /// Print space-separated locale codes from locales.toml (for CI use)
     Locales,
+    /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
+    Themes,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -60,5 +62,6 @@ fn main() -> anyhow::Result<()> {
             cmd::mdbook::build::print_locales();
             Ok(())
         }
+        Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
     }
 }
