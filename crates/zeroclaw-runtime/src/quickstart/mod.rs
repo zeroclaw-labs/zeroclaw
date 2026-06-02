@@ -930,25 +930,40 @@ fn apply_model_provider(
                 ));
                 return None;
             }
-            if section_has_alias(
-                config,
-                "providers.models",
-                &choice.provider_type,
-                &choice.alias,
-            ) {
+            // Canonicalize the provider type against the registry. The picker
+            // offers canonical `info.name` keys, but a hand-typed or
+            // whitespace-padded value (e.g. "llamacpp ", "llama.cpp") would
+            // otherwise reach `create_map_key` verbatim and fail with a cryptic
+            // "no map-keyed/list section" because the family key doesn't match.
+            let provider_type = choice.provider_type.trim();
+            let provider_type = match zeroclaw_providers::list_model_providers()
+                .into_iter()
+                .find(|info| info.name.eq_ignore_ascii_case(provider_type))
+            {
+                Some(info) => info.name.to_string(),
+                None => {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::ModelProvider,
+                        "provider_type",
+                        format!(
+                            "unknown model provider type `{}` — pick one from the provider list",
+                            choice.provider_type.trim()
+                        ),
+                    ));
+                    return None;
+                }
+            };
+            if section_has_alias(config, "providers.models", &provider_type, &choice.alias) {
                 errors.push(QuickstartError::new(
                     QuickstartStep::ModelProvider,
                     "alias",
-                    format!(
-                        "alias `{}.{}` already exists",
-                        choice.provider_type, choice.alias
-                    ),
+                    format!("alias `{}.{}` already exists", provider_type, choice.alias),
                 ));
                 return None;
             }
-            let prefix = format!("providers.models.{}.{}", choice.provider_type, choice.alias);
+            let prefix = format!("providers.models.{}.{}", provider_type, choice.alias);
             if let Err(err) = config.create_map_key(
-                &format!("providers.models.{}", choice.provider_type),
+                &format!("providers.models.{}", provider_type),
                 &choice.alias,
             ) {
                 errors.push(QuickstartError::new(
@@ -985,7 +1000,7 @@ fn apply_model_provider(
                     return None;
                 }
             }
-            Some(format!("{}.{}", choice.provider_type, choice.alias))
+            Some(format!("{}.{}", provider_type, choice.alias))
         }
     }
 }
@@ -1694,6 +1709,73 @@ mod tests {
         assert!(
             !toml.contains("api-key"),
             "kebab `api-key` leaked into serialized config:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn apply_provider_type_trims_and_canonicalizes_whitespace() {
+        // A provider type with stray whitespace must canonicalize to the
+        // registry's family key, not reach create_map_key verbatim (which would
+        // fail with "no map-keyed/list section at providers.models.llamacpp ").
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "  llamacpp  ".into(),
+            alias: "local".into(),
+            model: "qwen2.5-coder".into(),
+            fields: std::collections::HashMap::new(),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        assert!(
+            cfg.providers.models.find("llamacpp", "local").is_some(),
+            "expected providers.models.llamacpp.local to exist"
+        );
+        let agent = cfg.agents.get("bot").expect("agent created");
+        assert_eq!(agent.model_provider.as_str(), "llamacpp.local");
+    }
+
+    #[test]
+    fn apply_provider_type_case_insensitive() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "Anthropic".into(),
+            alias: "main".into(),
+            model: "claude-sonnet-4-5".into(),
+            fields: std::collections::HashMap::new(),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        assert!(cfg.providers.models.find("anthropic", "main").is_some());
+    }
+
+    #[test]
+    fn apply_unknown_provider_type_errors_clearly() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "not_a_real_provider".into(),
+            alias: "x".into(),
+            model: "m".into(),
+            fields: std::collections::HashMap::new(),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(applied.is_none());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.step == QuickstartStep::ModelProvider
+                    && e.message.contains("unknown model provider type")),
+            "expected a clear unknown-provider error, got: {errors:?}"
         );
     }
 
