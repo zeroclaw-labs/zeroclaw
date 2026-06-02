@@ -58,13 +58,13 @@ struct ResponsesRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponsesToolSpec {
+pub(crate) struct ResponsesToolSpec {
     #[serde(rename = "type")]
-    kind: String,
-    name: String,
-    description: String,
-    parameters: Value,
-    strict: bool,
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) parameters: Value,
+    pub(crate) strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,29 +87,29 @@ struct ResponsesResponse {
 }
 
 #[derive(Debug, Default)]
-struct ResponsesStreamState {
-    saw_text_delta: bool,
-    text_accumulator: String,
-    fallback_text: Option<String>,
-    tool_calls: HashMap<String, PendingToolCall>,
-    emitted_tool_call_ids: HashSet<String>,
-    collected_tool_calls: Vec<ProviderToolCall>,
-    output_items: Vec<Value>,
+pub(crate) struct ResponsesStreamState {
+    pub(crate) saw_text_delta: bool,
+    pub(crate) text_accumulator: String,
+    pub(crate) fallback_text: Option<String>,
+    pub(crate) tool_calls: HashMap<String, PendingToolCall>,
+    pub(crate) emitted_tool_call_ids: HashSet<String>,
+    pub(crate) collected_tool_calls: Vec<ProviderToolCall>,
+    pub(crate) output_items: Vec<Value>,
 }
 
 #[derive(Debug, Default, Clone)]
-struct PendingToolCall {
-    item_id: Option<String>,
-    call_id: Option<String>,
-    name: Option<String>,
-    arguments: String,
+pub(crate) struct PendingToolCall {
+    pub(crate) item_id: Option<String>,
+    pub(crate) call_id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) arguments: String,
 }
 
 #[derive(Debug, Default)]
-struct ResponsesTurnResult {
-    text: Option<String>,
-    tool_calls: Vec<ProviderToolCall>,
-    reasoning_content: Option<String>,
+pub(crate) struct ResponsesTurnResult {
+    pub(crate) text: Option<String>,
+    pub(crate) tool_calls: Vec<ProviderToolCall>,
+    pub(crate) reasoning_content: Option<String>,
 }
 
 impl OpenAiCodexModelProvider {
@@ -211,7 +211,7 @@ fn is_default_responses_url(url: &str) -> bool {
     canonical_endpoint(url) == canonical_endpoint(DEFAULT_CODEX_RESPONSES_URL)
 }
 
-fn first_nonempty(text: Option<&str>) -> Option<String> {
+pub(crate) fn first_nonempty(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -226,7 +226,7 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
+pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
     let items = tools?;
     if items.is_empty() {
         return None;
@@ -320,7 +320,7 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
     (!items.is_empty()).then_some(items)
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
@@ -494,7 +494,7 @@ fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String 
     clamp_reasoning_effort(model_id, &raw)
 }
 
-fn nonempty_preserve(text: Option<&str>) -> Option<String> {
+pub(crate) fn nonempty_preserve(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         if value.is_empty() {
             None
@@ -650,17 +650,17 @@ fn emit_tool_call(
 }
 
 #[derive(Debug)]
-struct ResponsesStreamApiError(String);
+pub(crate) struct ResponsesStreamApiError(pub(crate) String);
 
 impl std::fmt::Display for ResponsesStreamApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpenAI Codex stream error: {}", self.0)
+        write!(f, "OpenAI responses stream error: {}", self.0)
     }
 }
 
 impl std::error::Error for ResponsesStreamApiError {}
 
-fn process_responses_stream_event(
+pub(crate) fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
@@ -833,7 +833,7 @@ fn process_responses_stream_event(
     Ok(emitted)
 }
 
-fn process_sse_chunk(
+pub(crate) fn process_sse_chunk(
     chunk: &str,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
@@ -925,7 +925,7 @@ fn ensure_nonempty_responses_turn(
     }
 }
 
-fn extract_stream_error_message(event: &Value) -> Option<String> {
+pub(crate) fn extract_stream_error_message(event: &Value) -> Option<String> {
     let event_type = event.get("type").and_then(Value::as_str);
 
     if event_type == Some("error") {
@@ -956,7 +956,7 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
-fn append_utf8_stream_chunk(
+pub(crate) fn append_utf8_stream_chunk(
     body: &mut String,
     pending: &mut Vec<u8>,
     chunk: &[u8],
