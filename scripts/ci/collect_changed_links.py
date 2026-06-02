@@ -170,7 +170,7 @@ def main() -> int:
                     unique_urls.append(link)
 
     Path(args.output).write_text("\n".join(unique_urls) + ("\n" if unique_urls else ""), encoding="utf-8")
-    print(f"Collected {len(unique_urls)} added link(s) from {len(existing_files)} docs file(s).")
+    print(f"Collected {len(unique_urls)} added link(s) from {len(existing_files)} docs open(s).")
     return 0
 
 
