@@ -487,7 +487,6 @@ cli-cron-every = {"  "}Every(ms): {$v}
 
 # ── main / status / quickstart / pairing / desktop ──
 cli-no-command = No command provided.
-cli-try-quickstart = Try `zeroclaw quickstart` to create your first agent.
 cli-press-enter = Press Enter to exit...
 cli-quickstart-title = Quickstart — create one working agent end-to-end.
 cli-quickstart-cancelled = Quickstart cancelled. No config written.
