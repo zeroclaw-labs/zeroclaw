@@ -1088,28 +1088,27 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(reaction_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let ask_user_handle = Arc::new(RwLock::new(HashMap::new()));
     let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
+        AskUserTool::new(security.clone(), ask_user_handle);
     tool_arcs.push(Arc::new(ask_user_tool));
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        escalate_handle,
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
     // Channel send tool — always registered; owns its own late-bound channel map
     // and a map of configured default targets for recipient enforcement.
-    let channel_send_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
+    let channel_send_handle = Arc::new(RwLock::new(HashMap::new()));
     let default_targets = crate::channel_targets::build_default_targets_map(root_config);
     let channel_send_tool = ChannelSendTool::new(
         security.clone(),
-        channel_send_handle.as_ref().cloned().unwrap(),
+        channel_send_handle,
         Arc::new(parking_lot::RwLock::new(default_targets)),
     );
     tool_arcs.push(Arc::new(channel_send_tool));
