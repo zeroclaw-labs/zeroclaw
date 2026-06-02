@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+﻿use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -83,7 +83,10 @@ impl DoraCollector {
     ///
     /// `lead_time` is the duration from commit to deploy completion.
     pub fn record_deployment(&self, success: bool, lead_time: Option<Duration>) {
-        let mut state = self.inner.write().expect("DORA lock poisoned");
+        let mut state = self
+            .inner
+            .write()
+            .expect("DORA lock poisoned in record_deployment");
         if state.deployments.len() >= MAX_RECORDS {
             state.deployments.pop_front();
         }
@@ -101,7 +104,10 @@ impl DoraCollector {
 
     /// Record a recovery from a failed deployment.
     pub fn record_recovery(&self, duration: Duration) {
-        let mut state = self.inner.write().expect("DORA lock poisoned");
+        let mut state = self
+            .inner
+            .write()
+            .expect("DORA lock poisoned in record_recovery");
         if state.recoveries.len() >= MAX_RECORDS {
             state.recoveries.pop_front();
         }
@@ -132,7 +138,7 @@ impl DoraCollector {
     }
 
     fn snapshot_window(&self, window: Duration) -> DoraSnapshot {
-        let state = self.inner.read().expect("DORA lock poisoned");
+        let state = self.inner.read().expect("DORA lock poisoned in snapshot_window");
         let cutoff =
             Utc::now() - chrono::Duration::from_std(window).unwrap_or(chrono::Duration::MAX);
 
