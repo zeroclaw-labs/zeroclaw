@@ -719,6 +719,7 @@ pub async fn agent_turn(
         channel,
         None, // receipt_generator
         None, // collected_receipts
+        None, // audit_logger
     )
     .await
 }
@@ -886,6 +887,7 @@ pub async fn run_tool_call_loop(
     channel: Option<&dyn Channel>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    audit_logger: Option<&crate::security::audit::AuditLogger>,
 ) -> Result<String> {
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -2200,6 +2202,19 @@ pub async fn run_tool_call_loop(
                 }),
             );
 
+            // ── Audit: log tool execution ─────────────────────
+            if let Some(logger) = audit_logger {
+                let _ = logger.log_command_event(crate::security::audit::CommandExecutionLog {
+                    channel: channel_name,
+                    command: &call.name,
+                    risk_level: "standard",
+                    approved: true,
+                    allowed: true,
+                    success: outcome.success,
+                    duration_ms: outcome.duration.as_millis() as u64,
+                });
+            }
+
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
                 let tool_result_obj = crate::tools::ToolResult {
@@ -3191,6 +3206,7 @@ pub async fn run(
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
                         None, // collected_receipts
+                        None, // audit_logger
                     ),
                 )
                 .await
@@ -3506,6 +3522,7 @@ pub async fn run(
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
                             None, // collected_receipts
+                            None, // audit_logger
                         ),
                     )
                     .await
@@ -5179,6 +5196,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5237,6 +5255,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5289,6 +5308,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5340,6 +5360,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -5398,6 +5419,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -5456,6 +5478,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -5515,6 +5538,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -5572,6 +5596,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -5629,6 +5654,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -5769,6 +5795,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("parallel execution should complete");
@@ -5849,6 +5876,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5921,6 +5949,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5988,6 +6017,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6068,6 +6098,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6138,6 +6169,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6228,6 +6260,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("loop should complete");
@@ -6292,6 +6325,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6383,6 +6417,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -6451,6 +6486,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("streaming provider should complete");
@@ -6522,6 +6558,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -6600,6 +6637,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -6687,6 +6725,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("routed streaming provider should complete");
@@ -7957,6 +7996,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("tool loop should complete");
@@ -8120,6 +8160,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // audit_logger
                 ),
             )
             .await
@@ -8209,6 +8250,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // audit_logger
                 ),
             )
             .await
@@ -8271,6 +8313,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("should succeed without cost scope");

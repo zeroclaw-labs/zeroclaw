@@ -1305,6 +1305,7 @@ impl DelegateTool {
                 None, // channel: delegate subagents don't support approval
                 None, // receipt_generator
                 None, // collected_receipts
+                None, // audit_logger
             ),
         )
         .await;

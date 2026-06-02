@@ -370,6 +370,7 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<daemonclaw_infra::debounce::MessageDebouncer>,
+    audit_logger: Option<Arc<daemonclaw_runtime::security::audit::AuditLogger>>,
 }
 
 #[derive(Clone)]
@@ -3079,6 +3080,7 @@ async fn process_channel_message(
                         target_channel.as_deref(),
                         None, // receipt_generator
                         None, // collected_receipts
+                        ctx.audit_logger.as_deref(),
                     ),
                     ),
                     ),
@@ -5624,6 +5626,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
         debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
+        audit_logger: if config.security.audit.enabled {
+            match daemonclaw_runtime::security::audit::AuditLogger::new(
+                config.security.audit.clone(),
+                config.workspace_dir.clone(),
+            ) {
+                Ok(logger) => {
+                    tracing::info!("🔒 Audit logger enabled (audit.db)");
+                    Some(Arc::new(logger))
+                }
+                Err(e) => {
+                    tracing::warn!("Audit logger failed to initialize: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        },
     });
 
     // Hydrate in-memory conversation histories from persisted sessions.
@@ -6153,6 +6172,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6279,6 +6299,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6362,6 +6383,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6462,6 +6484,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -7063,6 +7086,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7155,6 +7179,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7261,6 +7286,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7352,6 +7378,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7453,6 +7480,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7575,6 +7603,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7678,6 +7707,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7796,6 +7826,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -8018,6 +8049,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(4);
@@ -8132,6 +8164,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -8265,6 +8298,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -8395,6 +8429,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -8503,6 +8538,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -8592,6 +8628,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -8681,6 +8718,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9476,6 +9514,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9622,6 +9661,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9809,6 +9849,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9927,6 +9968,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -10551,6 +10593,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -10649,6 +10692,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -10781,6 +10825,7 @@ This is an example JSON object for profile settings."#;
             )),
             media_pipeline: daemonclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: daemonclaw_config::schema::TranscriptionConfig::default(),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -10957,6 +11002,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11079,6 +11125,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11193,6 +11240,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11327,6 +11375,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11643,6 +11692,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);

@@ -1393,7 +1393,7 @@ mod spine_contract {
             &multimodal, 0, None, None, Some(&hooks_stop),
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
-            0, 0, None, None, None, None,
+            0, 0, None, None, None, None, None,
         ).await.unwrap();
 
         assert!(
@@ -1430,7 +1430,7 @@ mod spine_contract {
             &multimodal, 0, None, None, Some(&hooks_prevent),
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
-            0, 0, None, None, None, None,
+            0, 0, None, None, None, None, None,
         ).await.unwrap();
 
         // PreventStop should have forced more than 1 call before the
@@ -1483,7 +1483,7 @@ mod spine_contract {
             &multimodal, 0, None, None, Some(&hooks),
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
-            0, 0, None, None, None, None,
+            0, 0, None, None, None, None, None,
         ).await.unwrap();
 
         // The hook fires on every final response and injects an error,
@@ -1988,7 +1988,7 @@ mod spine_contract {
             &multimodal, 0, None, None, None,
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
-            0, 0, None, None, None, None,
+            0, 0, None, None, None, None, None,
         ).await.unwrap();
 
         // The response text should appear exactly once, not doubled.
@@ -2097,7 +2097,7 @@ mod spine_contract {
             &multimodal, 0, None, None, None,
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
-            0, 0, None, None, None, None,
+            0, 0, None, None, None, None, None,
         ).await.unwrap();
 
         // The novel content must survive to delivery.
