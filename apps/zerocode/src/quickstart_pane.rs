@@ -11,6 +11,16 @@ use ratatui::{
 };
 use std::sync::Arc;
 
+/// Display placeholder the daemon emits for an unset `Option` field,
+/// mirroring `zeroclaw_config::traits::UNSET_DISPLAY`. zerocode talks to
+/// the daemon over RPC and mirrors config types on the wire rather than
+/// depending on `zeroclaw-config`, so the sentinel is duplicated here.
+/// It is a *display* value, never a real default — seeding a field
+/// buffer with it or submitting it makes the daemon validate `<unset>`
+/// against the field's true type (e.g. a bool), which fails with
+/// "bool value with length 7".
+const UNSET_DISPLAY: &str = "<unset>";
+
 use crate::client::{
     QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor, QuickstartFieldSection,
     QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
@@ -351,6 +361,17 @@ impl FormState {
             // active step.
             Selector::Submit => false,
         }
+    }
+
+    /// Whether every real form selector is satisfied. Excludes `Submit`
+    /// — it's the action row, not a field, and `is_satisfied(Submit)`
+    /// is always false until the daemon accepts the submission, so
+    /// including it would make Create permanently unreachable.
+    fn all_selectors_satisfied(&self) -> bool {
+        Selector::ALL
+            .iter()
+            .filter(|s| !matches!(s, Selector::Submit))
+            .all(|s| self.is_satisfied(*s))
     }
 
     fn summary(&self, sel: Selector) -> String {
@@ -1491,16 +1512,22 @@ impl QuickstartPane {
                 }
                 // For enum fields, default the buffer to the first
                 // variant so the user lands on a valid value. ←/→
-                // cycles through the list.
+                // cycles through the list. The daemon's `<unset>`
+                // placeholder for optional fields is treated as no
+                // value — seeding or submitting it would fail
+                // validation against the field's real type.
+                let default = d
+                    .default
+                    .clone()
+                    .filter(|v| v != UNSET_DISPLAY && !v.is_empty());
                 let buf = if let Some(variants) = d.enum_variants.as_deref()
                     && !variants.is_empty()
                 {
-                    d.default
-                        .clone()
+                    default
                         .filter(|v| variants.contains(v))
                         .unwrap_or_else(|| variants[0].clone())
                 } else {
-                    d.default.clone().unwrap_or_default()
+                    default.unwrap_or_default()
                 };
                 FieldFormRow { descriptor: d, buf }
             })
@@ -1562,7 +1589,7 @@ impl QuickstartPane {
                         continue;
                     }
                     let value = row.buf.trim();
-                    if !value.is_empty() {
+                    if !value.is_empty() && value != UNSET_DISPLAY {
                         provider_fields.insert(row.descriptor.key.clone(), value.to_string());
                     }
                 }
@@ -1642,7 +1669,7 @@ impl QuickstartPane {
     }
 
     fn can_create(&self) -> bool {
-        Selector::ALL.iter().all(|s| self.form.is_satisfied(*s)) && !self.busy
+        self.form.all_selectors_satisfied() && !self.busy
     }
 
     async fn submit(&mut self) {
@@ -2243,4 +2270,61 @@ fn draw_modal(
         })
         .collect();
     (rect, row_rects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A FormState with every real selector satisfied.
+    fn complete_form() -> FormState {
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+        f.risk = "balanced".into();
+        f.runtime = "balanced".into();
+        f.memory_chosen = true;
+        f.channels_visited = true;
+        f.peer_groups_visited = true;
+        f.agent_name = "bob".into();
+        f
+    }
+
+    #[test]
+    fn submit_is_excluded_from_completeness() {
+        // Regression: can_create walked Selector::ALL including Submit,
+        // and is_satisfied(Submit) is always false, so Create could
+        // never enable even with every field filled.
+        let f = complete_form();
+        assert!(!f.is_satisfied(Selector::Submit));
+        assert!(f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn incomplete_form_is_not_satisfied() {
+        let f = FormState::default_form();
+        assert!(!f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn missing_one_field_blocks_completeness() {
+        let mut f = complete_form();
+        f.agent_name.clear();
+        assert!(!f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn unset_placeholder_is_not_a_real_default() {
+        // The daemon emits `<unset>` as a display placeholder for
+        // optional fields. Seeding a buffer with it (or submitting it)
+        // made the daemon validate `<unset>` against the field's real
+        // type, failing e.g. a bool with "length 7". Confirm the
+        // sentinel matches the daemon's UNSET_DISPLAY wire value.
+        assert_eq!(UNSET_DISPLAY, "<unset>");
+        let seeded = Some(UNSET_DISPLAY.to_string())
+            .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
+            .unwrap_or_default();
+        assert!(seeded.is_empty());
+    }
 }
