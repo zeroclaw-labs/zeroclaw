@@ -55,6 +55,28 @@ docker compose exec zeroclaw zeroclaw onboard
 
 Drop `ZEROCLAW_ALLOW_PUBLIC_BIND` if you only need local access.
 
+## macOS — OrbStack vs Colima
+
+macOS has no native Linux kernel, so every option (Docker Desktop, Podman, OrbStack, Colima) runs the container inside a lightweight Linux VM. For a Mac dev box, the two mac-native VMs worth comparing are OrbStack and Colima — both run the container with the same `docker run`/Compose commands above.
+
+| | OrbStack | Colima |
+|---|---|---|
+| Engine | custom, tuned Linux VM (Apple Silicon optimized) | Lima VM + containerd/Docker |
+| License | commercial, freemium (free personal use) | MIT (Lima underneath is Apache 2.0) |
+| Interface | GUI app + CLI | CLI-first (`colima start/stop`), scriptable |
+| Best when | minimal fuss, polished UX | everything OSS, config in code |
+
+```bash
+# OrbStack — provides the docker CLI:
+brew install --cask orbstack
+
+# Colima — docker CLI talks to colima's VM:
+brew install colima docker docker-compose   # docker-compose = the Compose v2 plugin; install if you need `docker compose`
+colima start --cpu 4 --memory 8   # add --network-address to expose the VM IP to macOS
+```
+
+Performance is comparable for typical dev workloads; the real differentiators are licensing (commercial vs OSS) and UX preference, not raw speed — benchmark both on your own machine if idle RAM or build throughput matters. Either way you drive the engine inside the VM with `docker`; systemd quadlets (below) are a Linux-host feature and don't apply on macOS.
+
 ## Podman & systemd quadlets
 
 On a Linux server, the cleanest way to run the container long-term is a Podman **quadlet** — a declarative unit file that systemd turns into a real service. You get `systemctl` lifecycle, journald logs, auto-restart, and boot ordering with no daemon and no `--restart` hack, and the unit file is config you commit to git. This is the recommended server pattern; `docker run`/Compose are fine for a laptop.
