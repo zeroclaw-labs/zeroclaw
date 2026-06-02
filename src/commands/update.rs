@@ -169,7 +169,15 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     match smoke_test(&current_exe).await {
         Ok(()) => {
             // Cleanup backup on success
-            let _ = tokio::fs::remove_file(&backup_path).await;
+            if let Err(e) = tokio::fs::remove_file(&backup_path).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "path": backup_path.display().to_string()})),
+                    "Failed to remove post-update backup"
+                );
+            }
             println!("Successfully updated to v{}!", update_info.latest_version);
             Ok(())
         }
@@ -559,7 +567,15 @@ async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
 
 async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
     // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
-    let _ = tokio::fs::remove_file(target).await;
+    if let Err(e) = tokio::fs::remove_file(target).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e), "path": target.display().to_string()})),
+            "Failed to remove old binary during rollback; proceeding with copy anyway"
+        );
+    }
     tokio::fs::copy(backup, target)
         .await
         .context("failed to restore backup binary")?;
