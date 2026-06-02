@@ -342,6 +342,56 @@ impl SessionStore {
         orphaned
     }
 
+    /// Drop every *idle* session owned by `tui_id` in the same `chat_mode` as a
+    /// freshly created session, except `except_id` itself. zerocode keeps one
+    /// active session per mode per TUI: creating or loading another session of
+    /// that mode abandons the prior one until it is explicitly reloaded, so the
+    /// prior agent and its history are dead weight in RSS. Chat and Code
+    /// sessions are orthogonal, so a Chat switch must never evict the live Code
+    /// session and vice versa.
+    ///
+    /// A session with a registered cancel token has a turn in flight: a spawned
+    /// `session/prompt` task still holds an `Arc<Mutex<Agent>>` clone, so
+    /// removing the map's strong ref would neither free the agent nor be safe to
+    /// trim against, and force-cancelling another TUI's mid-turn work is exactly
+    /// the freeze the reaper guards against. Such sessions are skipped; they
+    /// finish their turn and are reclaimed later by the idle reaper. Returns the
+    /// `(session_key, agent_alias)` of each session actually dropped, so the
+    /// caller can attribute the eviction and knows the agents are freed before
+    /// it trims.
+    pub async fn evict_same_mode_sibling(
+        &self,
+        tui_id: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        except_id: &str,
+    ) -> Vec<(String, String)> {
+        let in_flight: std::collections::HashSet<String> = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut sessions = self.sessions.lock().await;
+        let victims: Vec<String> = sessions
+            .iter()
+            .filter(|(key, s)| {
+                key.as_str() != except_id
+                    && s.owner_tui_id.as_deref() == Some(tui_id)
+                    && &s.chat_mode == chat_mode
+                    && !in_flight.contains(key.as_str())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut evicted = Vec::with_capacity(victims.len());
+        for key in victims {
+            if let Some(s) = sessions.remove(&key) {
+                evicted.push((key, s.agent_alias));
+            }
+        }
+        evicted
+    }
+
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
     /// session doesn't exist, `Some(None)` if it exists but is unowned (e.g.
     /// created by an anonymous connection), `Some(Some(id))` if owned by `id`.
@@ -652,6 +702,93 @@ mod tests {
     async fn remove_nonexistent_returns_false() {
         let store = make_store(4);
         assert!(!store.remove("ghost").await);
+    }
+
+    #[tokio::test]
+    async fn evict_same_mode_sibling_drops_only_same_mode_owner() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = |mode: ChatMode, owner: &str| {
+            RpcSession::new(make_agent(), "a", ".", mode).with_owner(Some(owner.to_string()))
+        };
+        store
+            .insert("old_chat".into(), mk(ChatMode::Chat, "tui1"))
+            .await
+            .unwrap();
+        store
+            .insert("old_code".into(), mk(ChatMode::Acp, "tui1"))
+            .await
+            .unwrap();
+        store
+            .insert("other_chat".into(), mk(ChatMode::Chat, "tui2"))
+            .await
+            .unwrap();
+        store
+            .insert("new_chat".into(), mk(ChatMode::Chat, "tui1"))
+            .await
+            .unwrap();
+
+        let evicted = store
+            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .await;
+
+        let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["old_chat"]);
+        assert!(
+            store.get_agent("new_chat").await.is_some(),
+            "new session preserved"
+        );
+        assert!(
+            store.get_agent("old_code").await.is_some(),
+            "cross-mode Code session preserved"
+        );
+        assert!(
+            store.get_agent("other_chat").await.is_some(),
+            "other TUI session preserved"
+        );
+        assert!(
+            store.get_agent("old_chat").await.is_none(),
+            "abandoned same-mode session evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_same_mode_sibling_skips_in_flight_turn() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = |mode: ChatMode, owner: &str| {
+            RpcSession::new(make_agent(), "a", ".", mode).with_owner(Some(owner.to_string()))
+        };
+        store
+            .insert("busy_chat".into(), mk(ChatMode::Chat, "tui1"))
+            .await
+            .unwrap();
+        store
+            .insert("new_chat".into(), mk(ChatMode::Chat, "tui1"))
+            .await
+            .unwrap();
+        // A registered cancel token marks a turn in flight: a spawned prompt
+        // task still holds an Agent clone, so this session must NOT be force
+        // evicted (that is the reaper's documented mid-turn freeze).
+        let token = tokio_util::sync::CancellationToken::new();
+        store.register_cancel_token("busy_chat", token.clone());
+
+        let evicted = store
+            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .await;
+
+        assert!(
+            evicted.is_empty(),
+            "in-flight same-mode session must be left to finish its turn"
+        );
+        assert!(
+            store.get_agent("busy_chat").await.is_some(),
+            "mid-turn session preserved"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "eviction must not fire a mid-turn cancel token"
+        );
     }
 
     #[tokio::test]

@@ -392,6 +392,12 @@ pub async fn run(
                         );
                     }
                     if queue_evicted > 0 {
+                        let span = ::zeroclaw_log::info_span!(
+                            target: "zeroclaw_log_internal_scope",
+                            "zeroclaw_scope",
+                            channel = "rpc",
+                        );
+                        let _guard = span.enter();
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -407,6 +413,25 @@ pub async fn run(
                     }
                     if !evicted.is_empty() || queue_evicted > 0 {
                         crate::util::release_freed_heap();
+                        let span = ::zeroclaw_log::info_span!(
+                            target: "zeroclaw_log_internal_scope",
+                            "zeroclaw_scope",
+                            channel = "rpc",
+                        );
+                        let _guard = span.enter();
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "evicted_sessions": evicted.len(),
+                                "evicted_queue_slots": queue_evicted,
+                            })),
+                            "Trimmed glibc arenas after session reaper sweep"
+                        );
                     }
                 }
             });

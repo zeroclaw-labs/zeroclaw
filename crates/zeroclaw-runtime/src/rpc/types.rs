@@ -155,6 +155,7 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[derive(PartialEq, Eq)]
     pub enum ChatMode {
         Chat,
         Acp,

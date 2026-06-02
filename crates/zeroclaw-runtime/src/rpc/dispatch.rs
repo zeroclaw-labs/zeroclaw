@@ -715,6 +715,49 @@ impl RpcDispatcher {
             .await
             .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
 
+        if let Some(ref tui_id) = self.tui_id {
+            let evicted = self
+                .ctx
+                .sessions
+                .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
+                .await;
+            if !evicted.is_empty() {
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    session_key = %session_id,
+                    agent_alias = %req.agent_alias,
+                    channel = "rpc",
+                );
+                let _guard = span.enter();
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "tui_id": tui_id,
+                            "evicted": evicted.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                        })),
+                    "Evicted abandoned same-mode session(s) on session/new"
+                );
+                // Every evicted session was idle (no in-flight turn), so its
+                // removal above dropped the last Agent strong ref and freed the
+                // history. Trimming now actually returns those pages.
+                crate::util::release_freed_heap();
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_count": evicted.len(),
+                        })),
+                    "Trimmed glibc arenas after same-mode session eviction"
+                );
+            }
+        }
+
         let mut message_count = 0;
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
@@ -826,6 +869,22 @@ impl RpcDispatcher {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         crate::util::release_freed_heap();
+        {
+            let span = ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                session_key = %req.session_id,
+                channel = "rpc",
+            );
+            let _guard = span.enter();
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "Trimmed glibc arenas after session close"
+            );
+        }
         to_result(SessionCloseResult {
             session_id: req.session_id,
             closed: true,
