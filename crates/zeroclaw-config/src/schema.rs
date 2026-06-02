@@ -2594,6 +2594,48 @@ pub struct KiloCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Kilo (AI Gateway — OpenAI-compatible) ──
+
+/// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloEndpoint {
+    #[default]
+    Gateway,
+}
+impl ModelEndpoint for KiloEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Gateway => "https://api.kilo.ai/api/gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilo"]
+pub struct KiloModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Kilo endpoint variant. Defaults to the canonical Kilo AI Gateway.
+    #[serde(default, skip_serializing_if = "KiloEndpoint::is_default")]
+    pub endpoint: KiloEndpoint,
+}
+
+impl KiloEndpoint {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+}
+
+impl FamilyEndpoint for KiloModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -16395,6 +16437,7 @@ impl_enum_prop_kind!(
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
+    KiloEndpoint,
     CustomEndpoint,
 );
 

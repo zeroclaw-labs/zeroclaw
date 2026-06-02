@@ -31,6 +31,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "minimax" => (Some("minimax"), Some("minimax")),
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
+        "kilo" => (Some("kilo"), None),
         "ovh" => (Some("ovhcloud"), None),
         // Compat families — mirrors the consts in CompatFamilySpec impls.
         "moonshot" => (Some("moonshotai"), Some("moonshotai")),

@@ -1083,7 +1083,6 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "friendliai" => "friendli",
         "lepton-ai" => "lepton",
         "step" => "stepfun",
-        "kilo" => "kilocli",
         // Moonshot / Kimi (regional + code variants fold to one family).
         "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
         | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
@@ -1728,6 +1727,11 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             name: "kilocli",
             display_name: "KiloCLI",
             local: true,
+        },
+        ModelProviderInfo {
+            name: "kilo",
+            display_name: "Kilo",
+            local: false,
         },
         ModelProviderInfo {
             name: "lmstudio",
@@ -2638,6 +2642,11 @@ mod tests {
     #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
+    }
+
+    #[test]
+    fn factory_kilo() {
+        assert!(create_model_provider("kilo", Some("kilo-test-key")).is_ok());
     }
 
     #[test]

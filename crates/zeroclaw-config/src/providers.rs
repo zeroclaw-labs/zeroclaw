@@ -13,7 +13,7 @@ use super::schema::{
     FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    KiloModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
     ModelProviderConfig, MoonshotModelProviderConfig, NebiusModelProviderConfig,
     NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
@@ -230,7 +230,9 @@ macro_rules! for_each_model_provider_slot {
             (litellm, "litellm", LitellmModelProviderConfig),
             (lepton, "lepton", LeptonModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
-            (opencode, "opencode", OpencodeModelProviderConfig),            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (opencode, "opencode", OpencodeModelProviderConfig), 
+            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (kilo, "kilo", KiloModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };

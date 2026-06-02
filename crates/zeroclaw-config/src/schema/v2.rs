@@ -622,8 +622,8 @@ fn normalize_provider_type(
         "lepton" | "lepton-ai" => Some("lepton"),
         // Stepfun: was stepfun|step (stepfun-intl handled below as variant)
         "stepfun" | "step" => Some("stepfun"),
-        // KiloCli: was kilocli|kilo
-        "kilocli" | "kilo" => Some("kilocli"),
+        // KiloCli: was kilocli|kilo-cli
+        "kilocli" | "kilo-cli" => Some("kilocli"),
         _ => None,
     };
 

@@ -121,6 +121,18 @@ model = "..."
 
 Local inference via KiloCLI.
 
+### Kilo AI Gateway — slot `kilo`
+
+```toml
+[providers.models.kilo.home]
+model   = "kilo-auto/free"
+api_key = "..."
+# endpoint = "gateway"  # default → https://app.kilo.ai/api/gateway
+```
+
+Cloud API via Kilo AI Gateway. Bearer-token auth with multiple model tiers (free, balanced, pro).
+Catalog sourced from models.dev under the `kilo` key.
+
 ---
 
 ## OpenAI-compatible families
@@ -139,7 +151,7 @@ Every OpenAI-compatible vendor has its own canonical slot. There is no generic `
 | `friendli`, `stepfun`, `aihubmix`, `siliconflow` | per vendor | |
 | `astrai`, `avian`, `deepmyst`, `venice`, `novita`, `nvidia` | per vendor | |
 | `vercel`, `cloudflare`, `ovh` | per vendor gateway | |
-| `lepton`, `synthetic`, `opencode` | per vendor | |
+| `lepton`, `synthetic`, `opencode`, `kilo` | per vendor | |
 | `lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm` | `http://localhost:<port>/v1` | Local-server slots with sensible defaults |
 
 Worked example (Groq):

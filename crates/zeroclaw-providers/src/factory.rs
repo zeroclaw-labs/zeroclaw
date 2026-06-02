@@ -251,7 +251,7 @@ use zeroclaw_config::schema::{
     FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    KiloModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
     MoonshotEndpoint, MoonshotModelProviderConfig, NebiusModelProviderConfig,
     NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
@@ -1057,6 +1057,14 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
             self.binary_path.as_deref(),
         )))
     }
+}
+
+// ── Kilo AI Gateway (OpenAI-compatible) ────────────────────────────────
+
+impl CompatFamilySpec for KiloModelProviderConfig {
+    const DISPLAY: &'static str = "Kilo";
+    const DEFAULT_URL: &'static str = "https://app.kilo.ai/api/gateway";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
 }
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {
