@@ -409,6 +409,8 @@ impl OllamaModelProvider {
             .to_string()
     }
 
+    // Only used by tests; kept for direct build_chat_request access without
+    // the reasoning-parameter variant.
     #[allow(dead_code)]
     fn build_chat_request(
         &self,
