@@ -112,6 +112,7 @@ pub async fn run(
     rpc: Arc<RpcClient>,
     term: &mut config_manager::Term,
     connect_label: &str,
+    insecure_tls: bool,
     reconnect_state: SharedReconnectState,
     config_dir: &std::path::Path,
 ) -> Result<bool> {
@@ -124,7 +125,7 @@ pub async fn run(
     let mut content_area = Rect::default();
     let mut disconnect_since: Option<std::time::Instant> = None;
 
-    let mut dashboard_pane = dashboard::Dashboard::new(&rpc, connect_label);
+    let mut dashboard_pane = dashboard::Dashboard::new(&rpc, connect_label, insecure_tls);
     dashboard_pane.init().await?;
     let mut config_app = config_manager::App::new(&rpc, config_dir);
     config_app.init().await?;

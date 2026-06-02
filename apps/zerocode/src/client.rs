@@ -668,10 +668,14 @@ impl RpcClient {
             }
         }
 
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports the default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
 
         Arc::new(config)
     }
@@ -2056,5 +2060,16 @@ mod notification_tests {
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(50), update_rx.recv()).await;
         assert!(result.is_err(), "unknown method must be dropped");
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    #[test]
+    fn insecure_tls_config_builds_without_panic() {
+        let cfg = RpcClient::insecure_tls_config();
+        assert!(Arc::strong_count(&cfg) >= 1);
     }
 }

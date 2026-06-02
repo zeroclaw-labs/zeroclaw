@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use crate::config;
+use crate::config::WssSection;
 use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
 
@@ -26,9 +27,16 @@ enum Focus {
     Presets,
     Bindings,
     Locale,
+    Connection,
 }
 
-const FOCI: [Focus; 4] = [Focus::Theme, Focus::Presets, Focus::Bindings, Focus::Locale];
+const FOCI: [Focus; 5] = [
+    Focus::Theme,
+    Focus::Presets,
+    Focus::Bindings,
+    Focus::Locale,
+    Focus::Connection,
+];
 
 impl Focus {
     fn fluent_key(self) -> &'static str {
@@ -37,6 +45,38 @@ impl Focus {
             Self::Presets => "zc-zerocode-tab-presets",
             Self::Bindings => "zc-zerocode-tab-bindings",
             Self::Locale => "zc-zerocode-tab-locale",
+            Self::Connection => "zc-zerocode-tab-connection",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnField {
+    Uri,
+    SkipVerify,
+    SkipVerifyRoutes,
+}
+
+const CONN_FIELDS: [ConnField; 3] = [
+    ConnField::Uri,
+    ConnField::SkipVerify,
+    ConnField::SkipVerifyRoutes,
+];
+
+impl ConnField {
+    fn fluent_key(self) -> &'static str {
+        match self {
+            Self::Uri => "zc-zerocode-conn-uri",
+            Self::SkipVerify => "zc-zerocode-conn-skip-verify",
+            Self::SkipVerifyRoutes => "zc-zerocode-conn-skip-verify-routes",
+        }
+    }
+
+    fn leaf_path(self) -> &'static str {
+        match self {
+            Self::Uri => "uri",
+            Self::SkipVerify => "tls.skip_verify",
+            Self::SkipVerifyRoutes => "tls.skip_verify_routes",
         }
     }
 }
@@ -87,6 +127,14 @@ pub(crate) struct ZerocodePane {
     focus_area: Rect,
     content_area: Rect,
     double_click: crate::mouse::DoubleClickTracker,
+    conn: WssSection,
+    conn_cursor: usize,
+    conn_edit: Option<ConnEdit>,
+}
+
+struct ConnEdit {
+    field: ConnField,
+    buf: String,
 }
 
 impl ZerocodePane {
@@ -122,6 +170,12 @@ impl ZerocodePane {
             focus_area: Rect::default(),
             content_area: Rect::default(),
             double_click: crate::mouse::DoubleClickTracker::new(),
+            conn: config::ensure_and_load(config_dir)
+                .ok()
+                .map(|c| c.connection.wss)
+                .unwrap_or_default(),
+            conn_cursor: 0,
+            conn_edit: None,
         };
         pane.rebuild_rows();
         pane
@@ -137,10 +191,7 @@ impl ZerocodePane {
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
-        // No pane state consumes raw text: the Locale tab is a pick-from-list
-        // surface (no free-entry), and binding capture grabs keys but is not
-        // text entry. Returning false keeps global chords (Ctrl+C) live.
-        false
+        self.conn_edit.is_some()
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -163,6 +214,7 @@ impl ZerocodePane {
             Focus::Presets => self.draw_presets(frame, cols[1]),
             Focus::Bindings => self.draw_bindings(frame, cols[1]),
             Focus::Locale => self.draw_locale(frame, cols[1]),
+            Focus::Connection => self.draw_connection(frame, cols[1]),
         }
 
         if self.capture.is_some() {
@@ -327,6 +379,74 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Locale (Enter to select / download) "))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            area,
+            &mut state,
+        );
+    }
+
+    fn conn_field_value(&self, field: ConnField) -> String {
+        match field {
+            ConnField::Uri => self
+                .conn
+                .uri
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| crate::i18n::t("zc-zerocode-conn-unset")),
+            ConnField::SkipVerify => if self.conn.tls.skip_verify {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            ConnField::SkipVerifyRoutes => {
+                if self.conn.tls.skip_verify_routes.is_empty() {
+                    crate::i18n::t("zc-zerocode-conn-no-routes")
+                } else {
+                    self.conn.tls.skip_verify_routes.join(", ")
+                }
+            }
+        }
+    }
+
+    fn draw_connection(&self, frame: &mut Frame, area: Rect) {
+        if let Some(edit) = &self.conn_edit {
+            let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
+            let hint = match edit.field {
+                ConnField::SkipVerify => crate::i18n::t("zc-zerocode-conn-edit-bool"),
+                ConnField::SkipVerifyRoutes => crate::i18n::t("zc-zerocode-conn-edit-routes"),
+                ConnField::Uri => crate::i18n::t("zc-zerocode-conn-edit-text"),
+            };
+            let body = format!("{}\n\n{}", edit.buf, hint);
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(theme::panel_block(&title))
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+
+        let items: Vec<ListItem> = CONN_FIELDS
+            .iter()
+            .map(|f| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<22}", crate::i18n::t(f.fluent_key())),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(self.conn_field_value(*f), theme::body_style()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.conn_cursor.min(CONN_FIELDS.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&crate::i18n::t(
+                    "zc-zerocode-conn-title",
+                )))
                 .highlight_style(theme::selected_style())
                 .highlight_symbol("› "),
             area,
@@ -508,6 +628,10 @@ impl ZerocodePane {
             self.handle_capture_key(key);
             return;
         }
+        if self.conn_edit.is_some() {
+            self.handle_conn_edit_key(key);
+            return;
+        }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
             Some(ConfigTabAction::Up) => self.move_cursor(-1),
@@ -534,6 +658,7 @@ impl ZerocodePane {
             Focus::Presets => (&mut self.preset_cursor, self.presets.len()),
             Focus::Bindings => (&mut self.binding_cursor, self.rows.len()),
             Focus::Locale => (&mut self.locale_cursor, self.locales.len() + 1),
+            Focus::Connection => (&mut self.conn_cursor, CONN_FIELDS.len()),
         };
         if len == 0 {
             return;
@@ -555,6 +680,109 @@ impl ZerocodePane {
                 }
             }
             Focus::Locale => self.select_locale_row(),
+            Focus::Connection => self.activate_connection(),
+        }
+    }
+
+    fn activate_connection(&mut self) {
+        let Some(field) = CONN_FIELDS.get(self.conn_cursor).copied() else {
+            return;
+        };
+        if field == ConnField::SkipVerify {
+            self.conn.tls.skip_verify = !self.conn.tls.skip_verify;
+            self.persist_conn_field(field);
+            return;
+        }
+        let buf = match field {
+            ConnField::Uri => self.conn.uri.clone().unwrap_or_default(),
+            ConnField::SkipVerifyRoutes => self.conn.tls.skip_verify_routes.join("\n"),
+            ConnField::SkipVerify => String::new(),
+        };
+        self.conn_edit = Some(ConnEdit { field, buf });
+    }
+
+    fn persist_conn_field(&mut self, field: ConnField) {
+        let value = match field {
+            ConnField::Uri => toml::Value::String(self.conn.uri.clone().unwrap_or_default()),
+            ConnField::SkipVerify => toml::Value::Boolean(self.conn.tls.skip_verify),
+            ConnField::SkipVerifyRoutes => toml::Value::Array(
+                self.conn
+                    .tls
+                    .skip_verify_routes
+                    .iter()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        };
+        match config::persist_connection_field(&self.config_dir, field.leaf_path(), value) {
+            Ok(()) => self.status = Some(crate::i18n::t("zc-zerocode-conn-saved")),
+            Err(e) => self.status = Some(format!("save failed: {e}")),
+        }
+    }
+
+    fn commit_conn_edit(&mut self) {
+        let Some(edit) = self.conn_edit.take() else {
+            return;
+        };
+        match edit.field {
+            ConnField::Uri => {
+                let trimmed = edit.buf.trim();
+                self.conn.uri = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            ConnField::SkipVerifyRoutes => {
+                self.conn.tls.skip_verify_routes = edit
+                    .buf
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            ConnField::SkipVerify => {}
+        }
+        self.persist_conn_field(edit.field);
+    }
+
+    fn handle_conn_edit_key(&mut self, key: KeyEvent) {
+        use crate::keymap::ConfigEditorAction;
+        let is_routes = self
+            .conn_edit
+            .as_ref()
+            .is_some_and(|e| e.field == ConnField::SkipVerifyRoutes);
+        match ConfigEditorAction::from_chord(&key) {
+            Some(ConfigEditorAction::Cancel) => {
+                self.conn_edit = None;
+            }
+            Some(ConfigEditorAction::Save) => {
+                self.commit_conn_edit();
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                if is_routes {
+                    if let Some(e) = self.conn_edit.as_mut() {
+                        e.buf.push('\n');
+                    }
+                } else {
+                    self.commit_conn_edit();
+                }
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                if let Some(e) = self.conn_edit.as_mut() {
+                    e.buf.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(e) = self.conn_edit.as_mut()
+                {
+                    e.buf.push(c);
+                }
+            }
         }
     }
 
@@ -692,6 +920,9 @@ impl ZerocodePane {
             Focus::Locale => {
                 entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-locale")));
             }
+            Focus::Connection => {
+                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-conn")));
+            }
         }
         entries.push(E::spacer());
         entries.push(E::new(
@@ -760,6 +991,7 @@ impl ZerocodePane {
             Focus::Presets => self.presets.len(),
             Focus::Bindings => self.rows.len(),
             Focus::Locale => self.locales.len() + 1,
+            Focus::Connection => CONN_FIELDS.len(),
         }
     }
 
@@ -774,6 +1006,7 @@ impl ZerocodePane {
             Focus::Presets => self.preset_cursor = idx,
             Focus::Bindings => self.binding_cursor = idx,
             Focus::Locale => self.locale_cursor = idx,
+            Focus::Connection => self.conn_cursor = idx,
         }
     }
 }

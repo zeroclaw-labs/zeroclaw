@@ -52,12 +52,62 @@ impl Default for ThemeSection {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ConnectionSection {
+    #[serde(default, skip_serializing_if = "WssSection::is_empty")]
+    pub wss: WssSection,
+}
+
+impl ConnectionSection {
+    fn is_empty(&self) -> bool {
+        self.wss.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct WssSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
+    pub tls: WssTlsSection,
+}
+
+impl WssSection {
+    fn is_empty(&self) -> bool {
+        self.uri.is_none() && self.tls.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct WssTlsSection {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_verify: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_verify_routes: Vec<String>,
+}
+
+impl WssTlsSection {
+    pub fn route_acked(&self, uri: &str) -> bool {
+        self.skip_verify_routes.iter().any(|r| r == uri)
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.skip_verify && self.skip_verify_routes.is_empty()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ZerocodeConfig {
     #[serde(default = "default_locale")]
     pub locale: Option<String>,
     #[serde(default)]
     pub theme: ThemeSection,
+    #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
+    pub connection: ConnectionSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -69,6 +119,7 @@ impl Default for ZerocodeConfig {
         Self {
             locale: default_locale(),
             theme: ThemeSection::default(),
+            connection: ConnectionSection::default(),
             keybindings: HashMap::new(),
         }
     }
@@ -155,6 +206,15 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
+    if let Some(v) = doc.get("connection") {
+        match v.clone().try_into::<ConnectionSection>() {
+            Ok(section) => config.connection = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [connection] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
     if let Some(v) = doc.get("keybindings") {
         match v.clone().try_into::<HashMap<String, ChordSpec>>() {
             Ok(rows) => config.keybindings = rows,
@@ -205,7 +265,47 @@ pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
     write_document(&path, &doc)
 }
 
-/// Persist the top-level `locale` key, leaving every other section intact.
+fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a mut toml::Table> {
+    let mut cur = doc;
+    for key in keys {
+        cur = section_mut(cur, key)?;
+    }
+    Ok(cur)
+}
+
+pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let tls = section_mut_path(&mut doc, &["connection", "wss", "tls"])?;
+    let routes = tls
+        .entry("skip_verify_routes")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::Error::msg("skip_verify_routes is not an array"))?;
+    let already = routes.iter().any(|v| v.as_str().is_some_and(|s| s == uri));
+    if !already {
+        routes.push(toml::Value::String(uri.to_string()));
+    }
+    write_document(&path, &doc)
+}
+
+pub(crate) fn persist_connection_field(
+    config_dir: &Path,
+    leaf_path: &str,
+    value: toml::Value,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let mut segments: Vec<&str> = leaf_path.split('.').collect();
+    let leaf = segments
+        .pop()
+        .ok_or_else(|| anyhow::Error::msg("empty connection field path"))?;
+    let mut prefix = vec!["connection", "wss"];
+    prefix.extend(segments);
+    section_mut_path(&mut doc, &prefix)?.insert(leaf.to_string(), value);
+    write_document(&path, &doc)
+}
+
 pub(crate) fn persist_locale(config_dir: &Path, locale: &str) -> Result<()> {
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
@@ -512,5 +612,133 @@ mod tests {
         persist_theme(dir.path(), "gruvbox").unwrap();
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+    }
+
+    #[test]
+    fn connection_section_round_trips() {
+        let mut c = ZerocodeConfig::default();
+        c.connection.wss.uri = Some("wss://host:9781".to_string());
+        c.connection.wss.tls.skip_verify = true;
+        c.connection.wss.tls.skip_verify_routes = vec!["wss://host:9781".to_string()];
+        let body = toml::to_string_pretty(&c).unwrap();
+        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(back.connection.wss.uri.as_deref(), Some("wss://host:9781"));
+        assert!(back.connection.wss.tls.skip_verify);
+        assert_eq!(
+            back.connection.wss.tls.skip_verify_routes,
+            vec!["wss://host:9781"]
+        );
+    }
+
+    #[test]
+    fn empty_connection_defaults_are_clean() {
+        let c = ZerocodeConfig::default();
+        assert!(c.connection.wss.uri.is_none());
+        assert!(!c.connection.wss.tls.skip_verify);
+        assert!(c.connection.wss.tls.skip_verify_routes.is_empty());
+        let parsed: ZerocodeConfig = toml::from_str("locale = \"en\"\n").unwrap();
+        assert!(parsed.connection.wss.uri.is_none());
+        assert!(parsed.connection.wss.tls.skip_verify_routes.is_empty());
+    }
+
+    #[test]
+    fn default_config_writes_no_connection_scaffolding() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            !body.contains("connection"),
+            "default config must not emit any [connection] scaffolding; got:\n{body}"
+        );
+        assert!(!body.contains("skip_verify"), "got:\n{body}");
+        assert!(!body.contains("wss"), "got:\n{body}");
+    }
+
+    #[test]
+    fn first_run_file_has_no_connection_section() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_and_load(dir.path()).unwrap();
+        let on_disk = read(dir.path());
+        assert!(
+            !on_disk.contains("connection"),
+            "first-run file must not scaffold [connection]; got:\n{on_disk}"
+        );
+    }
+
+    #[test]
+    fn setting_one_field_materializes_only_that_path() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_connection_field(dir.path(), "tls.skip_verify", toml::Value::Boolean(true))
+            .unwrap();
+        let on_disk = read(dir.path());
+        assert!(on_disk.contains("[connection.wss.tls]"));
+        assert!(on_disk.contains("skip_verify = true"));
+        assert!(
+            !on_disk.contains("skip_verify_routes"),
+            "untouched fields must not appear; got:\n{on_disk}"
+        );
+    }
+
+    #[test]
+    fn route_acked_membership() {
+        let tls = WssTlsSection {
+            skip_verify_routes: vec!["wss://a:1".to_string(), "wss://b:2".to_string()],
+            ..Default::default()
+        };
+        assert!(tls.route_acked("wss://a:1"));
+        assert!(tls.route_acked("wss://b:2"));
+        assert!(!tls.route_acked("wss://c:3"));
+    }
+
+    #[test]
+    fn persist_wss_route_ack_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
+        persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
+        persist_wss_route_ack(dir.path(), "wss://b:2").unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(
+            cfg.connection.wss.tls.skip_verify_routes,
+            vec!["wss://a:1".to_string(), "wss://b:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn persist_wss_route_ack_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(
+            doc["connection"]["wss"]["tls"]["skip_verify_routes"][0].as_str(),
+            Some("wss://a:1")
+        );
+    }
+
+    #[test]
+    fn persist_connection_field_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[theme]\nname = \"nord\"\n");
+        persist_connection_field(
+            dir.path(),
+            "uri",
+            toml::Value::String("wss://host:9781".to_string()),
+        )
+        .unwrap();
+        persist_connection_field(dir.path(), "tls.skip_verify", toml::Value::Boolean(true))
+            .unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(
+            doc["connection"]["wss"]["uri"].as_str(),
+            Some("wss://host:9781")
+        );
+        assert_eq!(
+            doc["connection"]["wss"]["tls"]["skip_verify"].as_bool(),
+            Some(true)
+        );
     }
 }

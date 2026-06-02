@@ -66,6 +66,7 @@ impl Tab {
 pub(crate) struct Dashboard<'a> {
     rpc: &'a RpcClient,
     connect_label: String,
+    insecure_tls: bool,
     tab: Tab,
     last_poll: Option<Instant>,
     // Data
@@ -123,10 +124,11 @@ pub(crate) struct Dashboard<'a> {
 }
 
 impl<'a> Dashboard<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str) -> Self {
+    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str, insecure_tls: bool) -> Self {
         Self {
             rpc,
             connect_label: connect_label.to_string(),
+            insecure_tls,
             tab: Tab::Overview,
             last_poll: None,
             status: None,
@@ -449,14 +451,22 @@ impl<'a> Dashboard<'a> {
         frame.render_widget(status_block, chunks[0]);
 
         if let Some(ref s) = self.status {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-connected")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(&self.connect_label, theme::accent_style()),
-                ]),
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-connected")),
+                    theme::dim_style(),
+                ),
+                Span::styled(&self.connect_label, theme::accent_style()),
+            ])];
+
+            if self.insecure_tls {
+                lines.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-dashboard-label-insecure-tls"),
+                    theme::warn_style(),
+                )));
+            }
+
+            lines.extend([
                 Line::from(vec![
                     Span::styled(
                         format!("{:<11}", crate::i18n::t("zc-dashboard-label-server")),
@@ -478,7 +488,7 @@ impl<'a> Dashboard<'a> {
                     ),
                     Span::styled(format!("{}", s.active_sessions), theme::accent_style()),
                 ]),
-            ];
+            ]);
 
             // Process stats from health
             if let Some(ref h) = self.health

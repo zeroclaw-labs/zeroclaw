@@ -96,6 +96,26 @@ impl ConnectTarget {
             Self::Wss { url, .. } => url.clone(),
         }
     }
+
+    fn insecure_tls(&self) -> bool {
+        matches!(
+            self,
+            Self::Wss {
+                skip_verify: true,
+                ..
+            }
+        )
+    }
+}
+
+fn resolve_wss_target(
+    cli_connect: Option<String>,
+    cli_skip_verify: bool,
+    cfg_wss: &config::WssSection,
+) -> Option<(String, bool)> {
+    let uri = cli_connect.or_else(|| cfg_wss.uri.clone())?;
+    let skip_verify = cli_skip_verify || cfg_wss.tls.skip_verify;
+    Some((uri, skip_verify))
 }
 
 #[tokio::main]
@@ -136,31 +156,37 @@ fn force_restore_terminal() {
     }
 }
 
-/// Gate an insecure WSS connection (`--tls-skip-verify`) behind an explicit
-/// y/n prompt. zerocode takes over the terminal immediately after connecting,
-/// so a logged warning would be wiped before the user sees it — this prompt
-/// runs while stdin/stdout are still normal. Interim beta guard: a runtime
-/// warning surfaced inside the TUI should replace it before v1.0.
-fn confirm_insecure_tls_or_abort(url: &str) -> anyhow::Result<()> {
+enum InsecureTlsChoice {
+    Once,
+    Always,
+    Abort,
+}
+
+fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
     use std::io::Write as _;
     eprintln!(
         "\nWARNING: --tls-skip-verify DISABLES TLS certificate verification for\n\
          {url}\nThis connection is UNSAFE on untrusted networks (susceptible to\n\
          man-in-the-middle). Only continue on a trusted network against a\n\
-         self-signed cert you control."
+         self-signed cert you control.\n\n\
+         You are accepting an UNVERIFIED route, not a trusted peer.\n\
+         [y] yes, connect once   [a] always (remember this route)   [N] no, abort"
     );
-    eprint!("Continue with verification disabled? [y/N] ");
+    eprint!("Continue with verification disabled? [y/a/N] ");
     std::io::stderr().flush().ok();
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(()),
-        _ => anyhow::bail!("aborted: insecure TLS connection not confirmed"),
+        "y" | "yes" => Ok(InsecureTlsChoice::Once),
+        "a" | "always" => Ok(InsecureTlsChoice::Always),
+        _ => Ok(InsecureTlsChoice::Abort),
     }
 }
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let local_config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
@@ -203,15 +229,20 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let target = if let Some(url) = cli.connect {
-        ConnectTarget::Wss {
-            url,
-            skip_verify: cli.tls_skip_verify,
+    let target = {
+        let cfg_wss = &loaded_config.connection.wss;
+        if let Some((uri, skip_verify)) =
+            resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
+        {
+            ConnectTarget::Wss {
+                url: uri,
+                skip_verify,
+            }
+        } else {
+            let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+            let socket = client::resolve_socket_path(&config_dir)?;
+            ConnectTarget::LocalSocket(socket)
         }
-    } else {
-        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
-        let socket = client::resolve_socket_path(&config_dir)?;
-        ConnectTarget::LocalSocket(socket)
     };
 
     // Initial connection (before the terminal is initialized).
@@ -227,8 +258,16 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         ConnectTarget::Wss { url, skip_verify } => {
-            if *skip_verify {
-                confirm_insecure_tls_or_abort(url)?;
+            if *skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
+                match confirm_insecure_tls(url)? {
+                    InsecureTlsChoice::Once => {}
+                    InsecureTlsChoice::Always => {
+                        config::persist_wss_route_ack(&local_config_dir, url)?;
+                    }
+                    InsecureTlsChoice::Abort => {
+                        anyhow::bail!("aborted: insecure TLS connection not confirmed");
+                    }
+                }
             }
             client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
         }
@@ -294,6 +333,7 @@ async fn run_with_reconnect(
             Arc::clone(&rpc),
             term,
             &label,
+            target.insecure_tls(),
             Arc::clone(&reconnect_state),
             config_dir,
         )
@@ -391,5 +431,59 @@ async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::
             Ok(c) => return Ok(c),
             Err(_) => tokio::time::sleep(DAEMON_CONNECT_INTERVAL).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::config::WssSection;
+
+    #[test]
+    fn flag_connect_overrides_config_uri() {
+        let cfg = WssSection {
+            uri: Some("wss://config:1".to_string()),
+            ..Default::default()
+        };
+        let got = resolve_wss_target(Some("wss://flag:2".to_string()), false, &cfg);
+        assert_eq!(got, Some(("wss://flag:2".to_string(), false)));
+    }
+
+    #[test]
+    fn config_uri_used_when_no_flag() {
+        let cfg = WssSection {
+            uri: Some("wss://config:1".to_string()),
+            ..Default::default()
+        };
+        let got = resolve_wss_target(None, false, &cfg);
+        assert_eq!(got, Some(("wss://config:1".to_string(), false)));
+    }
+
+    #[test]
+    fn no_uri_anywhere_is_local_socket() {
+        let cfg = WssSection::default();
+        assert_eq!(resolve_wss_target(None, false, &cfg), None);
+    }
+
+    #[test]
+    fn skip_verify_is_flag_or_config() {
+        let mut cfg = WssSection {
+            uri: Some("wss://h:1".to_string()),
+            ..Default::default()
+        };
+        cfg.tls.skip_verify = true;
+        assert_eq!(
+            resolve_wss_target(None, false, &cfg),
+            Some(("wss://h:1".to_string(), true))
+        );
+        cfg.tls.skip_verify = false;
+        assert_eq!(
+            resolve_wss_target(None, true, &cfg),
+            Some(("wss://h:1".to_string(), true))
+        );
+        assert_eq!(
+            resolve_wss_target(None, false, &cfg),
+            Some(("wss://h:1".to_string(), false))
+        );
     }
 }
