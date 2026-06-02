@@ -3949,7 +3949,7 @@ impl Channel for SlackChannel {
         let client = self.http_client();
         let token = self.bot_token.clone();
         let channel = recipient.to_string();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut body = serde_json::json!({
                 "channel": channel,
                 "ts": real_ts,

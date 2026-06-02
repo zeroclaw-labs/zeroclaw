@@ -21,8 +21,9 @@ pub struct LlmTaskTool {
     default_model_provider: String,
     /// Default model from root config.
     default_model: String,
-    /// Default temperature from root config.
-    default_temperature: f64,
+    /// Default temperature from root config. `None` means no temperature
+    /// is sent on the wire; provider applies its own default.
+    default_temperature: Option<f64>,
     /// API key for model_provider authentication.
     api_key: Option<String>,
     /// ModelProvider runtime options inherited from root config.
@@ -34,7 +35,7 @@ impl LlmTaskTool {
         security: Arc<SecurityPolicy>,
         default_model_provider: String,
         default_model: String,
-        default_temperature: f64,
+        default_temperature: Option<f64>,
         api_key: Option<String>,
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     ) -> Self {
@@ -124,7 +125,7 @@ impl Tool for LlmTaskTool {
         let temperature = args
             .get("temperature")
             .and_then(|v| v.as_f64())
-            .unwrap_or(self.default_temperature);
+            .or(self.default_temperature);
 
         // Build the effective prompt, adding JSON schema instructions when needed
         let effective_prompt = if let Some(schema_obj) = schema {
@@ -160,10 +161,10 @@ impl Tool for LlmTaskTool {
             };
 
         // Make the LLM call (no tools, no agent loop). `temperature` is
-        // already resolved to an f64 (tool arg → config default), so wrap
-        // it back into Some for the model_provider trait's Option<f64> contract.
+        // already Option<f64>; pass straight through. None omits the field
+        // on the wire so the provider applies its own default.
         let response = match model_provider
-            .simple_chat(&effective_prompt, model, Some(temperature))
+            .simple_chat(&effective_prompt, model, temperature)
             .await
         {
             Ok(text) => text,
@@ -419,7 +420,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
             zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
@@ -445,7 +446,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
             zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
@@ -461,7 +462,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
             zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
@@ -477,7 +478,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "nonexistent_provider_xyz".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
             zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );

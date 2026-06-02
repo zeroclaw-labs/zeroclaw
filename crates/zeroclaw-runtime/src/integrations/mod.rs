@@ -94,7 +94,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw onboard --channels-only");
+            println!("    3. Run: zeroclaw onboard channels");
             println!("    4. Start: zeroclaw channel start");
         }
         "Discord" => {
@@ -102,13 +102,13 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    1. Go to https://discord.com/developers/applications");
             println!("    2. Create app → Bot → Copy token");
             println!("    3. Enable MESSAGE CONTENT intent");
-            println!("    4. Run: zeroclaw onboard --channels-only");
+            println!("    4. Run: zeroclaw onboard channels");
         }
         "Slack" => {
             println!("  Setup:");
             println!("    1. Go to https://api.slack.com/apps");
             println!("    2. Create app → Bot Token Scopes → Install");
-            println!("    3. Run: zeroclaw onboard --channels-only");
+            println!("    3. Run: zeroclaw onboard channels");
         }
         "iMessage" => {
             println!("  Setup (macOS only):");

@@ -46,6 +46,7 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     // to an unbuilt locale will 404 in single-locale mode, which is fine for
     // local iteration.
     crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &entries)?;
+    crate::cmd::mdbook::themes::run(&root)?;
 
     // Watched locale: the one passed in, or the first entry in locales.toml.
     let watch_locale = locale

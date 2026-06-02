@@ -2332,7 +2332,7 @@ impl Channel for WeChatChannel {
         let url = self.api_url("sendtyping");
         let user_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             loop {
                 let body = serde_json::json!({
                     "ilink_user_id": &user_id,

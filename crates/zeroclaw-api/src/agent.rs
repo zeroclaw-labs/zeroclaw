@@ -49,6 +49,11 @@ pub enum TurnEvent {
     /// unavailable for this call" rather than zero.
     Usage {
         input_tokens: Option<u64>,
+        /// Tokens served from the provider's prompt cache (e.g. Anthropic
+        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). These count
+        /// toward the context window and must be added to `input_tokens` to
+        /// get the true total context size.
+        cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },

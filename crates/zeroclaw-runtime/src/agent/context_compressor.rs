@@ -417,13 +417,30 @@ impl ContextCompressor {
         }
 
         // Splice: head + [SUMMARY] + tail
-        let summary_msg = ChatMessage::assistant(format!(
-            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
-        ));
+        let summary_msg = build_summary_message(&history[start..end], &summary, message_count);
         history.splice(start..end, std::iter::once(summary_msg));
 
         // Repair orphaned tool pairs
-        repair_tool_pairs(history);
+        let tool_pairs_removed = repair_tool_pairs(history);
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "messages_summarized": message_count,
+                    "summary_chars": summary.len(),
+                    "tool_pairs_removed": tool_pairs_removed,
+                    "protect_first_n": self.config.protect_first_n,
+                    "protect_last_n": self.config.protect_last_n,
+                })),
+            "context_compressor: middle of conversation replaced with a \
+             text summary. The model loses structural tool_use/tool_result \
+             pairs from this range. If this fires mid-turn the model can \
+             act like it just woke up. Raise protect_last_n / \
+             protect_first_n, or raise max_context_tokens, or lower \
+             threshold_ratio carefully."
+        );
 
         Ok(true)
     }
@@ -442,36 +459,47 @@ fn align_boundary_forward(messages: &[ChatMessage], idx: usize) -> usize {
     i
 }
 
-/// Move the tail boundary backward past any orphan-creating split.
+/// Move the tail boundary backward past any orphan-creating split, and
+/// past the assistant + user pair that initiated the current turn.
 ///
-/// First step past any leading `tool` messages — their owning assistant
-/// is earlier and must travel with them into the protected tail.
+/// The goal is "the protected tail starts on a turn boundary, not in
+/// the middle of a turn." Without this the compressor summarises the
+/// user's question while leaving the assistant's response + tool work
+/// in the tail, and the model re-enters the loop seeing dispatched
+/// tools with no prompt — looks exactly like "the model woke up
+/// mid-action."
 ///
-/// Second, if we land on an assistant that owns `tool_calls`, back up
-/// past it as well. Otherwise that assistant gets summarized while its
-/// already-protected `tool_result` blocks remain in the tail, creating
-/// the 400 "unexpected tool_use_id in tool_result blocks" failure mode
-/// at the root of #5813.
+/// One-shot, not iterative: this aligns the *tail edge* to the nearest
+/// preceding turn boundary, it does NOT keep eating preceding turns.
+/// The middle still gets compressed; only the boundary moves.
+///
+/// Returns the new `end` index such that `middle = messages[start..end]`
+/// and `tail = messages[end..]`.
 fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
     let mut i = idx;
-    loop {
-        while i > 0 && messages[i].role == "tool" {
-            i -= 1;
-        }
-        if messages[i].role == "assistant"
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&messages[i].content)
-            && v.get("tool_calls")
-                .and_then(|a| a.as_array())
-                .is_some_and(|a| !a.is_empty())
-        {
-            if i == 0 {
-                break;
-            }
-            i -= 1;
-            continue;
-        }
-        break;
+
+    // Step past any leading `tool` messages — their owning assistant
+    // is earlier and must travel with them into the protected tail.
+    while i > 0 && messages[i - 1].role == "tool" {
+        i -= 1;
     }
+
+    // Step past trailing `assistant` messages — both the tool-dispatching
+    // one and any preamble assistant immediately preceding it. The
+    // original code only stepped past assistants carrying `tool_calls`,
+    // which left preamble text in the middle.
+    while i > 0 && messages[i - 1].role == "assistant" {
+        i -= 1;
+    }
+
+    // Step past exactly one user message — the one that initiated this
+    // turn — so the turn is protected atomically. Do NOT loop back
+    // further: that would eat the entire conversation and produce an
+    // empty middle.
+    if i > 0 && messages[i - 1].role == "user" {
+        i -= 1;
+    }
+
     i
 }
 
@@ -485,7 +513,8 @@ fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
 /// summarized away, and vice versa. This function cleans up the history
 /// so every tool_result has a matching assistant message and every
 /// tool_call-bearing assistant message has results.
-fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
+fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) -> usize {
+    let mut removed = 0;
     // Heuristic: tool messages whose content references a call ID that no longer
     // exists in any assistant message should be removed. Since ChatMessage is a
     // simple role+content struct (no structured tool_call_id field), we use a
@@ -497,6 +526,7 @@ fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
             // Remove any immediately following orphaned tool results
             while i + 1 < messages.len() && messages[i + 1].role == "tool" {
                 messages.remove(i + 1);
+                removed += 1;
             }
         }
         i += 1;
@@ -511,7 +541,9 @@ fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
     };
     while start < messages.len() && messages[start].role == "tool" {
         messages.remove(start);
+        removed += 1;
     }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +599,46 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut result = s[..end].to_string();
     result.push_str("...");
     result
+}
+
+/// Construct the synthesized assistant message that replaces a compressed
+/// range. When the compressed range contains an assistant turn with
+/// `reasoning_content` (a thinking-mode response from providers like
+/// DeepSeek V4), embed the most recent such payload in the summary as a
+/// JSON-encoded `{content, reasoning_content}` body — matching the shape
+/// `build_native_assistant_history` already produces — so the next request
+/// to the provider passes its reasoning round-trip check. See #6269.
+fn build_summary_message(
+    compressed: &[ChatMessage],
+    summary: &str,
+    message_count: usize,
+) -> ChatMessage {
+    let summary_text = format!(
+        "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
+    );
+
+    let last_reasoning = compressed
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant")
+        .find_map(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("reasoning_content")
+                        .and_then(|rc| rc.as_str().map(ToString::to_string))
+                })
+        });
+
+    if let Some(rc) = last_reasoning {
+        let payload = serde_json::json!({
+            "content": summary_text,
+            "reasoning_content": rc,
+        });
+        ChatMessage::assistant(payload.to_string())
+    } else {
+        ChatMessage::assistant(summary_text)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,15 +836,23 @@ mod tests {
     }
 
     #[test]
-    fn test_align_boundary_backward_noop_on_plain_assistant() {
+    fn test_align_boundary_backward_protects_whole_turn() {
+        // Boundary alignment must back up past the assistant AND the
+        // user that initiated the turn so the protected tail contains
+        // complete user→assistant turns. Previously this returned 2,
+        // splitting `[U:q, A:plain] | [U:next]` and leaving the model
+        // looking at a tail that starts with a user message but missing
+        // the prior assistant's framing.
         let messages = vec![
             msg("system", "sys"),
             msg("user", "q"),
             msg("assistant", "plain text reply"),
             msg("user", "next"),
         ];
-        // No tool_calls on the assistant — boundary should not retreat.
-        assert_eq!(align_boundary_backward(&messages, 2), 2);
+        // Tail starts at `[A: plain]`. Function steps back past the
+        // assistant + its initiating user, landing on 1 (the protected
+        // tail is `[U:q, A:plain, U:next]`).
+        assert_eq!(align_boundary_backward(&messages, 2), 1);
     }
 
     #[test]
@@ -927,8 +1007,12 @@ mod tests {
         };
         let mut history = vec![
             msg("system", "sys"),
-            msg("user", "Earlier question [IMAGE:/tmp/example.png]"),
-            msg("assistant", "Earlier answer"),
+            msg("user", "First question"),
+            msg("assistant", "First answer"),
+            msg("user", "Middle question [IMAGE:/tmp/example.png]"),
+            msg("assistant", "Middle answer about the image"),
+            msg("user", "Another middle question"),
+            msg("assistant", "Another middle answer"),
             msg("user", "Newest question"),
         ];
 
@@ -960,8 +1044,12 @@ mod tests {
         };
         let mut history = vec![
             msg("system", "sys"),
-            msg("user", "Earlier question [IMAGE:/tmp/summary-override.png]"),
-            msg("assistant", "Earlier answer"),
+            msg("user", "First question"),
+            msg("assistant", "First answer"),
+            msg("user", "Middle question [IMAGE:/tmp/summary-override.png]"),
+            msg("assistant", "Middle answer about the image"),
+            msg("user", "Another middle question"),
+            msg("assistant", "Another middle answer"),
             msg("user", "Newest question"),
         ];
 
@@ -1087,5 +1175,90 @@ mod tests {
         let mut history = vec![msg("tool", &big)];
         let saved = compressor.fast_trim_tool_results(&mut history);
         assert_eq!(saved, 0);
+    }
+
+    /// When the compressed range has no thinking-mode reasoning_content,
+    /// the synthesized summary is plain text — same as before #6269.
+    #[test]
+    fn build_summary_message_uses_plain_text_when_no_reasoning() {
+        let compressed = vec![
+            msg("user", "what's the weather"),
+            msg("assistant", "it's sunny"),
+        ];
+        let out = build_summary_message(&compressed, "weather chat", 2);
+        assert_eq!(out.role, "assistant");
+        assert!(out.content.starts_with("[CONTEXT SUMMARY"));
+        assert!(out.content.contains("weather chat"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out.content).is_err(),
+            "plain-text summary must not parse as JSON"
+        );
+    }
+
+    /// Regression test for #6269 — when an assistant message in the
+    /// compressed range carries `reasoning_content` (thinking-mode replay
+    /// payload), the synthesized summary preserves it via JSON-encoded
+    /// content matching `build_native_assistant_history`'s shape.
+    /// Without this, providers that require reasoning round-trip
+    /// (DeepSeek V4 thinking) reject every post-compression request.
+    #[test]
+    fn build_summary_message_preserves_reasoning_content_when_present() {
+        let assistant_with_reasoning = serde_json::json!({
+            "content": "let me look",
+            "reasoning_content": "user wants weather; need to check",
+        })
+        .to_string();
+        let compressed = vec![
+            msg("user", "what's the weather"),
+            msg("assistant", &assistant_with_reasoning),
+        ];
+
+        let out = build_summary_message(&compressed, "weather chat", 2);
+        assert_eq!(out.role, "assistant");
+        let parsed: serde_json::Value = serde_json::from_str(&out.content)
+            .expect("summary must be JSON when reasoning_content is preserved");
+        assert!(
+            parsed["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("[CONTEXT SUMMARY")),
+            "summary text belongs in `content`",
+        );
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("user wants weather; need to check"),
+            "must carry reasoning_content from the most recent compressed assistant turn",
+        );
+    }
+
+    /// When multiple compressed assistant turns have reasoning_content,
+    /// the most recent one survives — this matches DeepSeek's protocol
+    /// expectation that the *immediately prior* assistant turn's
+    /// reasoning is what gets replayed.
+    #[test]
+    fn build_summary_message_picks_last_reasoning_content() {
+        let earlier = serde_json::json!({
+            "content": "first answer",
+            "reasoning_content": "EARLIER reasoning",
+        })
+        .to_string();
+        let later = serde_json::json!({
+            "content": "second answer",
+            "reasoning_content": "LATER reasoning",
+        })
+        .to_string();
+        let compressed = vec![
+            msg("user", "q1"),
+            msg("assistant", &earlier),
+            msg("user", "q2"),
+            msg("assistant", &later),
+        ];
+
+        let out = build_summary_message(&compressed, "two-turn chat", 4);
+        let parsed: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("LATER reasoning"),
+            "must pick the most recent reasoning_content, not the earliest",
+        );
     }
 }

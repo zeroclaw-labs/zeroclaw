@@ -596,17 +596,17 @@ impl EmailChannel {
             }
 
             let msg = ChannelMessage {
-                id: email.msg_id,
-                reply_target: email.sender.clone(),
-                sender: email.sender,
-                content: email.content,
-                channel: "email".to_string(),
                 channel_alias: Some(self.alias.clone()),
-                timestamp: email.timestamp,
-                thread_ts: None,
-                interruption_scope_id: None,
                 attachments: email.attachments,
                 subject: Some(email.subject),
+                ..ChannelMessage::new(
+                    email.msg_id,
+                    email.sender.clone(),
+                    email.sender,
+                    email.content,
+                    "email",
+                    email.timestamp,
+                )
             };
 
             if tx.send(msg).await.is_err() {
@@ -619,16 +619,10 @@ impl EmailChannel {
     }
 
     fn smtp_credentials(&self) -> Credentials {
-        let user = self
-            .config
-            .smtp_username
-            .as_deref()
+        let user = smtp_credential_override(self.config.smtp_username.as_deref())
             .unwrap_or(&self.config.username)
             .to_owned();
-        let pass = self
-            .config
-            .smtp_password
-            .as_deref()
+        let pass = smtp_credential_override(self.config.smtp_password.as_deref())
             .unwrap_or(&self.config.password)
             .to_owned();
         Credentials::new(user, pass)
@@ -687,6 +681,11 @@ fn markdown_to_html(md: &str) -> String {
     html::push_html(&mut html_output, parser);
     html_output
 }
+
+fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 #[async_trait]
 
 impl Channel for EmailChannel {
@@ -1449,6 +1448,40 @@ mod tests {
         let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
         let creds = channel.smtp_credentials();
         let expected = Credentials::new("smtp@example.com".to_string(), "smtp_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_ignore_blank_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("   ".to_string()),
+            smtp_password: Some("".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected =
+            Credentials::new("shared@example.com".to_string(), "shared_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_preserve_nonblank_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("  smtp@example.com  ".to_string()),
+            smtp_password: Some("  smtp_pass  ".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected = Credentials::new(
+            "  smtp@example.com  ".to_string(),
+            "  smtp_pass  ".to_string(),
+        );
         assert_eq!(creds, expected);
     }
 }

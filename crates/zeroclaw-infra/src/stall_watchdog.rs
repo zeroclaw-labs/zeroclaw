@@ -80,7 +80,7 @@ impl StallWatchdog {
         let timeout = self.timeout_secs;
         let poll_interval = std::time::Duration::from_secs((timeout / 2).max(1));
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let mut interval = tokio::time::interval(poll_interval);
             // The first tick completes immediately — skip it so we wait a full
             // interval before the first check.

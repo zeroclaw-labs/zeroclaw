@@ -607,6 +607,11 @@ mod e2e_tests {
         // writer::tests run sees this test's event land in its tempdir.
         let _subscriber_guard = TEST_LOCK.lock();
         let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        // Hold the broadcast hook lock too: the broadcast module's own tests
+        // clear/install the global hook under this same lock. Without it, a
+        // parallel `clear_broadcast_hook` drops this test's event and the
+        // search below times out.
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
 
         try_install_capture_subscriber();
         let mut rx = subscribe_or_install();
