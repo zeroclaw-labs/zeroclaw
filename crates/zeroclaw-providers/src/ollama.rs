@@ -138,7 +138,8 @@ struct OutgoingFunction {
 
 #[derive(Debug, Serialize)]
 struct Options {
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_ctx: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,7 +415,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         tools: Option<&[serde_json::Value]>,
     ) -> ChatRequest {
         self.build_chat_request_with_think(
@@ -431,7 +432,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         tools: Option<&[serde_json::Value]>,
         think: Option<bool>,
     ) -> ChatRequest {
@@ -440,7 +441,7 @@ impl OllamaModelProvider {
             messages,
             stream: false,
             options: Options {
-                temperature: self.tuning.temperature_override.unwrap_or(temperature),
+                temperature: self.tuning.temperature_override.or(temperature),
                 num_ctx: Some(self.tuning.num_ctx),
                 num_predict: Some(self.tuning.num_predict),
             },
@@ -575,7 +576,7 @@ impl OllamaModelProvider {
         &self,
         messages: &[Message],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
         think: Option<bool>,
@@ -589,7 +590,7 @@ impl OllamaModelProvider {
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={}",
+                "Ollama request: url={} model={} message_count={} temperature={:?} think={:?} tool_count={}",
                 url,
                 model,
                 request.messages.len(),
@@ -671,7 +672,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> anyhow::Result<ApiChatResponse> {
@@ -816,7 +817,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let mut messages = Vec::new();
@@ -877,7 +877,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -926,7 +925,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -1243,7 +1241,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.7,
+            Some(0.7),
             None,
         );
 
@@ -1267,7 +1265,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.7,
+            Some(0.7),
             None,
         );
 
@@ -1290,7 +1288,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.2,
+            Some(0.2),
             None,
         );
 
@@ -1303,11 +1301,10 @@ mod tests {
 
     #[test]
     fn build_chat_request_with_think_emits_explicit_options() {
-        // Wire-shape snapshot: the JSON body of every Ollama /api/chat
-        // request MUST carry an `options` object with all three keys
-        // (`temperature`, `num_ctx`, `num_predict`) populated. Older
-        // tests cover individual fields piecemeal; this one locks the
-        // full shape so a future refactor can't silently drop a field.
+        // Wire-shape snapshot: when temperature is Some, the JSON body of
+        // every Ollama /api/chat request must carry an `options` object
+        // with `num_ctx` and `num_predict`, and a `temperature` matching
+        // the value passed. None must omit the temperature key entirely.
         let provider = OllamaModelProvider::new("test", None, None);
         let request = provider.build_chat_request_with_think(
             vec![Message {
@@ -1318,7 +1315,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.3,
+            Some(0.3),
             None,
             Some(true),
         );
@@ -1328,9 +1325,10 @@ mod tests {
             .get("options")
             .expect("options object missing from request body");
 
-        assert!(
-            options.get("temperature").is_some(),
-            "options.temperature must be present on every wire request"
+        assert_eq!(
+            options.get("temperature"),
+            Some(&serde_json::json!(0.3)),
+            "options.temperature must match the value passed in"
         );
         assert!(
             options.get("num_ctx").is_some(),
@@ -1362,7 +1360,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.5,
+            Some(0.5),
             None,
         );
 
@@ -1388,7 +1386,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.9,
+            Some(0.9),
             None,
         );
 
@@ -1409,7 +1407,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.42,
+            Some(0.42),
             None,
         );
 
@@ -1441,11 +1439,12 @@ mod tests {
         let first = provider.build_chat_request_with_think(
             messages.clone(),
             "llama3",
-            0.4,
+            Some(0.4),
             None,
             Some(true),
         );
-        let retry = provider.build_chat_request_with_think(messages, "llama3", 0.4, None, None);
+        let retry =
+            provider.build_chat_request_with_think(messages, "llama3", Some(0.4), None, None);
 
         let first_json = serde_json::to_value(first).unwrap();
         let retry_json = serde_json::to_value(retry).unwrap();

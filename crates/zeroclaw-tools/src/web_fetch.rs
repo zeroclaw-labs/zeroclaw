@@ -494,6 +494,24 @@ fn validate_target_url(
     allowed_private_hosts: &[String],
     tool_name: &str,
 ) -> anyhow::Result<String> {
+    validate_target_url_with_dns_check(
+        raw_url,
+        allowed_domains,
+        blocked_domains,
+        allowed_private_hosts,
+        tool_name,
+        validate_resolved_host_is_public,
+    )
+}
+
+fn validate_target_url_with_dns_check(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    allowed_private_hosts: &[String],
+    tool_name: &str,
+    validate_dns: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
     let url = raw_url.trim();
 
     if url.is_empty() {
@@ -522,10 +540,11 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
+    let host_is_private_or_local = is_private_or_local_host(&host);
     let private_host_allowed =
-        is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+        host_matches_private_allowlist(&host, allowed_private_hosts, host_is_private_or_local);
 
-    if is_private_or_local_host(&host) && !private_host_allowed {
+    if host_is_private_or_local && !private_host_allowed {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
              To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
@@ -538,7 +557,7 @@ fn validate_target_url(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"tool_name": tool_name, "host": host})),
-            ": allowing private/local host '' via allowed_private_hosts"
+            "web_fetch: allowing host via allowed_private_hosts"
         );
     }
 
@@ -547,7 +566,7 @@ fn validate_target_url(
     }
 
     if !private_host_allowed {
-        validate_resolved_host_is_public(&host)?;
+        validate_dns(&host)?;
     }
 
     Ok(url.to_string())
@@ -693,6 +712,23 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
             || host
                 .strip_suffix(domain)
                 .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn host_matches_private_allowlist(
+    host: &str,
+    allowed_private_hosts: &[String],
+    host_is_private_or_local: bool,
+) -> bool {
+    allowed_private_hosts.iter().any(|domain| {
+        if domain == "*" {
+            host_is_private_or_local
+        } else {
+            host == domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }
     })
 }
 
@@ -1724,6 +1760,99 @@ mod tests {
     fn allowed_private_host_bypasses_ssrf_block() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5/api").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_domain_skips_dns_public_check() {
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["local.internal".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://local.internal/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| {
+                panic!("DNS public-host validation should be skipped");
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "allowlisted private domain was rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unallowed_domain_resolving_private_ip_still_blocked() {
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec![];
+
+        let err = validate_target_url_with_dns_check(
+            "https://local.internal/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |host| {
+                validate_resolved_ips_are_public(
+                    host,
+                    &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        192, 168, 1, 5,
+                    ))],
+                )
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_allowlist_wildcard_does_not_allow_public_domain_miss() {
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://not-example.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("allowed_domains"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn blocklist_overrides_allowed_private_domain() {
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec!["local.internal".to_string()];
+        let allowed_private_hosts = vec!["local.internal".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://local.internal/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::bail!("blocklist should run before DNS validation"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("blocked_domains"), "unexpected error: {err}");
     }
 
     #[test]

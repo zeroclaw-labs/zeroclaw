@@ -17,11 +17,12 @@ pub mod api;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
-pub mod api_onboard;
 pub mod api_pairing;
 pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
+pub mod api_quickstart;
+pub mod api_sections;
 pub mod api_skills;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
@@ -41,10 +42,19 @@ pub mod ws;
 pub mod ws_approval;
 
 use anyhow::{Context, Result};
+#[cfg(any(
+    feature = "channel-email",
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::body::Bytes;
+#[cfg(any(feature = "channel-wati", feature = "channel-whatsapp-cloud"))]
+use axum::extract::Query;
 use axum::{
     Router,
-    body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
@@ -57,12 +67,24 @@ use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::ToolSpec;
-use zeroclaw_channels::{
-    gmail_push::GmailPushChannel, linq::LinqChannel, nextcloud_talk::NextcloudTalkChannel,
-    wati::WatiChannel, whatsapp::WhatsAppChannel,
-};
+#[cfg(feature = "channel-email")]
+use zeroclaw_channels::gmail_push::GmailPushChannel;
+#[cfg(feature = "channel-linq")]
+use zeroclaw_channels::linq::LinqChannel;
+#[cfg(feature = "channel-nextcloud")]
+use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
+#[cfg(feature = "channel-wati")]
+use zeroclaw_channels::wati::WatiChannel;
+#[cfg(feature = "channel-whatsapp-cloud")]
+use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
@@ -114,22 +136,32 @@ fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
 }
 
+#[cfg(feature = "channel-whatsapp-cloud")]
 fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-linq")]
 fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-wati")]
 fn wati_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("wati_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-nextcloud")]
 fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
 fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match &msg.thread_ts {
         Some(thread_id) => format!("{channel}_{thread_id}_{}", msg.sender),
@@ -377,17 +409,25 @@ pub struct AppState {
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
+    #[cfg(feature = "channel-whatsapp-cloud")]
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
+    #[cfg(feature = "channel-whatsapp-cloud")]
     pub whatsapp_app_secret: Option<Arc<str>>,
+    #[cfg(feature = "channel-linq")]
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
+    #[cfg(feature = "channel-linq")]
     pub linq_signing_secret: Option<Arc<str>>,
+    #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
+    #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    #[cfg(feature = "channel-wati")]
     pub wati: Option<Arc<WatiChannel>>,
     /// Gmail Pub/Sub push notification channel
+    #[cfg(feature = "channel-email")]
     pub gmail_push: Option<Arc<GmailPushChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn zeroclaw_runtime::observability::Observer>,
@@ -439,6 +479,9 @@ pub struct AppState {
     /// need to be rebuilt to apply it." The dashboard polls
     /// `/api/config/reload-status` and surfaces a reload banner when true.
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
+    /// TUI session registry from the daemon (for /api/tuis endpoint).
+    /// `None` when the gateway runs standalone without a daemon.
+    pub tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
 }
 
 /// Resolves the directory containing the Web UI distribution files (`web/dist/`).
@@ -514,6 +557,8 @@ pub async fn run_gateway(
     // the daemon's wait loop reacts via `subscribe()` and tears down to
     // re-init. Cross-platform replacement for the SIGUSR1 hack.
     reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    // TUI session registry from the daemon for the /api/tuis endpoint.
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
@@ -543,38 +588,79 @@ pub async fn run_gateway(
         None
     };
 
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "host": host,
+                        "port": port,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: host:port did not parse as a SocketAddr; falling back to \
+                 127.0.0.1 so the gateway can still boot. Fix [gateway] host and \
+                 POST /admin/reload."
+            );
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.first_model_provider();
-    let model_provider_name = config
-        .first_model_provider_alias()
-        .unwrap_or_else(|| "openrouter".to_string());
-    let provider_runtime_options_base =
-        zeroclaw_providers::provider_runtime_options_from_config(&config);
-    let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
-        &config,
-        &model_provider_name,
-        &provider_runtime_options_base,
-    );
-    let model_provider: Arc<dyn ModelProvider> = Arc::from(
-        zeroclaw_providers::create_resilient_model_provider_from_ref(
+    let (boot_family, boot_alias, boot_entry) = config
+        .providers
+        .models
+        .iter_entries()
+        .next()
+        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
+        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
+    let fallback = boot_entry;
+    let model_provider_name = boot_family.as_str();
+    let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
+        match zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
-            &model_provider_name,
+            model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
-            &provider_runtime_options,
-        )?,
-    );
+            &zeroclaw_providers::provider_runtime_options_for_alias(
+                &config,
+                &boot_family,
+                &boot_alias,
+            ),
+        ) {
+            Ok(p) => (Arc::from(p), false),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": model_provider_name,
+                            "alias": boot_alias,
+                            "error": format!("{e}"),
+                        })),
+                    "Gateway: seed model_provider failed to construct; booting in \
+                     needs_quickstart mode so /quickstart and /admin/reload stay \
+                     reachable. Fix the [providers.models.<type>.<alias>] entry \
+                     and POST /admin/reload."
+                );
+                (
+                    Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
+                    true,
+                )
+            }
+        };
     // Model resolution (1) the first-model_provider's `model`,
     // (2) the first configured `[providers.models.<type>.<alias>]`
     // model with a WARN naming what to set, (3) leave the model empty so
     // the gateway boots and the dashboard can complete browser-based
-    // onboarding at /onboard. The chat-dispatch path checks
-    // `state.model.is_empty()` and returns a structured needs_onboarding
+    // quickstart at /quickstart. The chat-dispatch path checks
+    // `state.model.is_empty()` and returns a structured needs_quickstart
     // error before any model_provider call, so the original "no silent
     // vendor-default substitution" guarantee is preserved at request-time
     // rather than at boot. V3 has no global fallback model_provider — every
@@ -582,14 +668,16 @@ pub async fn run_gateway(
     // `?agent=` parameter; this resolution is purely the seed value the
     // gateway uses for boot-time logging and the AppState default model
     // string.
-    let model = match fallback
-        .and_then(|e| e.model.as_deref())
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        Some(m) => m.to_string(),
-        None => {
-            match config.resolve_default_model() {
+    let model = if boot_provider_failed {
+        String::new()
+    } else {
+        match fallback
+            .and_then(|e| e.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => match config.resolve_default_model() {
                 Some(m) => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
                      providers.models entry as default. Set \
@@ -603,11 +691,13 @@ pub async fn run_gateway(
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                        "Gateway booting without a configured model. Visit http:///onboard to complete browser onboarding. Chat endpoints will return 503 needs_onboarding until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                        &format!(
+                            "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                        )
                     );
                     String::new()
                 }
-            }
+            },
         }
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
@@ -619,22 +709,53 @@ pub async fn run_gateway(
     // synthesize `<workspace_dir>/memory/brain.db` on a fresh install
     // that has nothing to remember; per-agent memory factories under
     // `agents/<alias>/workspace/memory/` are the only legitimate
-    // origin of memory state in v0.8.0. AppState gets a NoneMemory
+    // origin of memory state. AppState gets a NoneMemory
     // stub so endpoints that read `state.mem` keep working until an
     // agent comes online.
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
+        match zeroclaw_memory::create_memory_with_storage_and_routes(
             &config.memory,
             &config.embedding_routes,
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
-        )?)
+        ) {
+            Ok(m) => Arc::from(m),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "Gateway: memory backend failed to construct; falling back to \
+                     NoneMemory so the gateway can still boot. Fix [memory] and \
+                     POST /admin/reload."
+                );
+                Arc::new(zeroclaw_memory::NoneMemory::new("none"))
+            }
+        }
     };
-    let runtime: Arc<dyn platform::RuntimeAdapter> =
-        Arc::from(platform::create_runtime(&config.runtime)?);
+    let runtime: Arc<dyn platform::RuntimeAdapter> = match platform::create_runtime(&config.runtime)
+    {
+        Ok(r) => Arc::from(r),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "runtime_kind": config.runtime.kind,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: runtime adapter failed to construct; falling back to \
+                     NativeRuntime so the gateway can still boot. Fix [runtime] and \
+                     POST /admin/reload."
+            );
+            Arc::new(platform::NativeRuntime::new())
+        }
+    };
     // Gateway is infrastructure — it doesn't run as an agent. Endpoints
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the
@@ -645,7 +766,7 @@ pub async fn run_gateway(
     //
     // Agent count is unconstrained at boot. Zero agents is a valid
     // state — the gateway must come up so `/admin/reload` and
-    // `/onboard` can install one — and the legacy seed simply stays
+    // `/quickstart` can install one — and the legacy seed simply stays
     // empty. With one or more enabled agents, any of them seeds the
     // vestige; aliases are arbitrary so the iteration-order pick is
     // load-bearing on nothing.
@@ -670,7 +791,7 @@ pub async fn run_gateway(
     // test mock — they are not load-bearing for per-request agent dispatch.
     // When the seed agent's `risk_profile` (or any related per-agent
     // validation) fails to resolve, the gateway must still boot so the
-    // operator can fix the config via `/admin/reload` or `/onboard`
+    // operator can fix the config via `/admin/reload` or `/quickstart`
     // instead of crash-looping the daemon supervisor. Degraded boot:
     // log a warning and fall through to the empty-tools-registry branch.
     let agent_setup: Option<(
@@ -678,14 +799,14 @@ pub async fn run_gateway(
         Arc<SecurityPolicy>,
     )> = agent_alias_opt.as_ref().and_then(|agent_alias| {
         let Some(risk_profile) = config.risk_profile_for_agent(agent_alias) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "agent_alias": agent_alias})), "Gateway: agents..risk_profile does not name a configured risk_profiles entry; booting with empty tools registry. Fix via /admin/reload or /onboard.");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "agent_alias": agent_alias})), "Gateway: agents..risk_profile does not name a configured risk_profiles entry; booting with empty tools registry. Fix via /admin/reload or /quickstart.");
             return None;
         };
         let risk_profile = risk_profile.clone();
         let security = match SecurityPolicy::for_agent(&config, agent_alias) {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "error": format!("{}", e), "agent_alias": agent_alias})), "Gateway: agent SecurityPolicy failed to build; booting with empty tools registry. Fix [agents.] via /admin/reload or /onboard.");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "error": format!("{}", e), "agent_alias": agent_alias})), "Gateway: agent SecurityPolicy failed to build; booting with empty tools registry. Fix [agents.] via /admin/reload or /quickstart.");
                 return None;
             }
         };
@@ -709,11 +830,12 @@ pub async fn run_gateway(
                 &config.data_dir,
                 &config.agents,
                 config
-                    .first_model_provider()
+                    .model_provider_for_agent(agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
                 &config,
                 Some(canvas_store.clone()),
                 false,
+                None,
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
@@ -727,7 +849,6 @@ pub async fn run_gateway(
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
-                &all_tools_result.channel_send_handle,
             );
             if !channel_names.is_empty() {
                 ::zeroclaw_log::record!(
@@ -752,7 +873,9 @@ pub async fn run_gateway(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                "Gateway: no [agents.<alias>] configured — booting with empty tools registry. Visit http:///onboard to add an agent."
+                &format!(
+                    "Gateway: no [agents.<alias>] configured — booting with empty tools registry. Visit http://{display_addr}/quickstart to add an agent."
+                )
             );
             (Vec::new(), None)
         }
@@ -857,6 +980,7 @@ pub async fn run_gateway(
         });
 
     // WhatsApp channel (if configured)
+    #[cfg(feature = "channel-whatsapp-cloud")]
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
         .channels
         .whatsapp
@@ -879,6 +1003,7 @@ pub async fn run_gateway(
         });
 
     // WhatsApp app secret for webhook signature verification.
+    #[cfg(feature = "channel-whatsapp-cloud")]
     let whatsapp_app_secret: Option<Arc<str>> = config
         .channels
         .whatsapp
@@ -894,6 +1019,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Linq channel (if configured)
+    #[cfg(feature = "channel-linq")]
     let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.values().next().map(|lq| {
         let alias = "default".to_string();
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
@@ -910,6 +1036,7 @@ pub async fn run_gateway(
     });
 
     // Linq signing secret for webhook signature verification.
+    #[cfg(feature = "channel-linq")]
     let linq_signing_secret: Option<Arc<str>> = config
         .channels
         .linq
@@ -925,6 +1052,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // WATI channel (if configured)
+    #[cfg(feature = "channel-wati")]
     let wati_channel: Option<Arc<WatiChannel>> =
         config.channels.wati.values().next().map(|wati_cfg| {
             let alias = "default".to_string();
@@ -946,6 +1074,7 @@ pub async fn run_gateway(
         });
 
     // Nextcloud Talk channel (if configured)
+    #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
         config.channels.nextcloud_talk.values().next().map(|nc| {
             let alias = "default".to_string();
@@ -968,6 +1097,7 @@ pub async fn run_gateway(
         });
 
     // Nextcloud Talk webhook secret for signature verification.
+    #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_webhook_secret: Option<Arc<str>> = config
         .channels
         .nextcloud_talk
@@ -982,6 +1112,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Gmail Push channel (if configured and referenced by an enabled agent)
+    #[cfg(feature = "channel-email")]
     let gmail_push_channel: Option<Arc<GmailPushChannel>> = {
         let active: std::collections::HashSet<String> = config
             .agents
@@ -1084,7 +1215,23 @@ pub async fn run_gateway(
         .filter(|p| !p.is_empty());
 
     // ── Tunnel ────────────────────────────────────────────────
-    let tunnel = zeroclaw_runtime::tunnel::create_tunnel(&config.tunnel)?;
+    let tunnel = match zeroclaw_runtime::tunnel::create_tunnel(&config.tunnel) {
+        Ok(t) => t,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tunnel_provider": config.tunnel.tunnel_provider,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: tunnel adapter failed to construct; booting without a \
+                 tunnel. Fix [tunnel] and POST /admin/reload."
+            );
+            None
+        }
+    };
     let mut tunnel_url: Option<String> = None;
 
     if let Some(ref tun) = tunnel {
@@ -1178,17 +1325,21 @@ pub async fn run_gateway(
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
+    #[cfg(feature = "channel-whatsapp-cloud")]
     if whatsapp_channel.is_some() {
         println!("  GET  {pfx}/whatsapp  — Meta webhook verification");
         println!("  POST {pfx}/whatsapp  — WhatsApp message webhook");
     }
+    #[cfg(feature = "channel-linq")]
     if linq_channel.is_some() {
         println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    #[cfg(feature = "channel-wati")]
     if wati_channel.is_some() {
         println!("  GET  {pfx}/wati      — WATI webhook verification");
         println!("  POST {pfx}/wati      — WATI message webhook");
     }
+    #[cfg(feature = "channel-nextcloud")]
     if nextcloud_talk_channel.is_some() {
         println!("  POST {pfx}/nextcloud-talk — Nextcloud Talk bot webhook");
     }
@@ -1264,13 +1415,21 @@ pub async fn run_gateway(
         rate_limiter,
         auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
         idempotency_store,
+        #[cfg(feature = "channel-whatsapp-cloud")]
         whatsapp: whatsapp_channel,
+        #[cfg(feature = "channel-whatsapp-cloud")]
         whatsapp_app_secret,
+        #[cfg(feature = "channel-linq")]
         linq: linq_channel,
+        #[cfg(feature = "channel-linq")]
         linq_signing_secret,
+        #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk: nextcloud_talk_channel,
+        #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret,
+        #[cfg(feature = "channel-wati")]
         wati: wati_channel,
+        #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
         observer: state_observer,
         tools_registry,
@@ -1289,6 +1448,7 @@ pub async fn run_gateway(
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tui_registry,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1328,13 +1488,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
-        .route("/whatsapp", get(handle_whatsapp_verify))
-        .route("/whatsapp", post(handle_whatsapp_message))
-        .route("/linq", post(handle_linq_webhook))
-        .route("/wati", get(handle_wati_verify))
-        .route("/wati", post(handle_wati_webhook))
-        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
-        .route("/webhook/gmail", post(handle_gmail_push_webhook))
+        .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
@@ -1366,26 +1520,46 @@ pub async fn run_gateway(
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
-        .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
+        .route("/api/config/catalog", get(api_sections::handle_catalog))
         .route(
-            "/api/onboard/catalog/models",
-            get(api_onboard::handle_catalog_models),
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
         )
-        .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
+        .route("/api/config/status", get(api_sections::handle_section_status))
         .route(
-            "/api/onboard/agent-options",
-            get(api_onboard::handle_agent_options),
+            "/api/config/agent-options",
+            get(api_sections::handle_agent_options),
         )
-        .route("/api/onboard/sections", get(api_onboard::handle_sections))
+        .route("/api/config/sections", get(api_sections::handle_sections))
         .route(
-            "/api/onboard/sections/{section}",
-            get(api_onboard::handle_section_picker),
+            "/api/config/sections/{section}",
+            get(api_sections::handle_section_picker),
         )
         .route(
-            "/api/onboard/sections/{section}/items/{key}",
-            post(api_onboard::handle_section_select),
+            "/api/config/sections/{section}/items/{key}",
+            post(api_sections::handle_section_select),
         )
         .route("/api/personality", get(api_personality::handle_index))
+        .route(
+            "/api/quickstart/state",
+            get(api_quickstart::handle_state),
+        )
+        .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route(
+            "/api/quickstart/apply",
+            post(api_quickstart::handle_apply),
+        )
+        .route(
+            "/api/quickstart/dismiss",
+            post(api_quickstart::handle_dismiss),
+        )
         .route(
             "/api/personality/templates",
             get(api_personality::handle_templates),
@@ -1463,6 +1637,7 @@ pub async fn run_gateway(
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
@@ -1624,7 +1799,7 @@ pub async fn run_gateway(
                     .await
                     .expect("infallible make_service");
 
-                    tokio::spawn(async move {
+                    zeroclaw_spawn::spawn!(async move {
                         let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -1892,23 +2067,55 @@ struct GatewayChatOutcome {
     cost_usd: Option<f64>,
 }
 
-/// Returns a structured `needs_onboarding` error when `model` is empty
+struct UnconfiguredModelProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for UnconfiguredModelProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!(
+            "needs_quickstart: gateway booted without a working model_provider. \
+             Complete browser quickstart at /quickstart, or fix \
+             [providers.models.<type>.<alias>] and POST /admin/reload."
+        )
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for UnconfiguredModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "unconfigured"
+    }
+}
+
+/// Returns a structured `needs_quickstart` error when `model` is empty
 /// or whitespace-only, otherwise `None`. Empty model means the gateway
 /// booted with nothing configured (fresh install). Callers refuse the
 /// dispatch with this marker instead of calling the provider with an
 /// empty model id. Mirrors `agent::Agent::from_config` at
-/// request-time so `/onboard` stays reachable.
-fn needs_onboarding_for(model: &str) -> Option<anyhow::Error> {
+/// request-time so `/quickstart` stays reachable.
+fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
     if model.trim().is_empty() {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-            "gateway dispatch refused: no model configured (browser onboarding incomplete)"
+            "gateway dispatch refused: no model configured (browser quickstart incomplete)"
         );
         Some(anyhow::Error::msg(
-            "needs_onboarding: gateway has no model configured. Complete \
-             browser onboarding at /onboard, or set [providers.models.<type>.<alias>] \
+            "needs_quickstart: gateway has no model configured. Complete \
+             browser quickstart at /quickstart, or set [providers.models.<type>.<alias>] \
              model = \"...\" before sending messages.",
         ))
     } else {
@@ -1916,21 +2123,21 @@ fn needs_onboarding_for(model: &str) -> Option<anyhow::Error> {
     }
 }
 
-/// True when `e` carries the marker produced by `needs_onboarding_for`.
+/// True when `e` carries the marker produced by `needs_quickstart_for`.
 /// Used by chat-dispatch error paths to map the marker to a 503
-/// `needs_onboarding` HTTP response or a more accurate channel-side
+/// `needs_quickstart` HTTP response or a more accurate channel-side
 /// reply, instead of the generic 500 / "sorry" catch-all.
-fn is_needs_onboarding_err(e: &anyhow::Error) -> bool {
-    e.to_string().contains("needs_onboarding")
+fn is_needs_quickstart_err(e: &anyhow::Error) -> bool {
+    e.to_string().contains("needs_quickstart")
 }
 
 /// Reply text sent over a channel SDK when chat dispatch refuses
 /// because the gateway has no model configured. Resolved through the
-/// shared Fluent catalog (`channel-needs-onboarding-reply` in
+/// shared Fluent catalog (`channel-needs-quickstart-reply` in
 /// `crates/zeroclaw-runtime/locales/<locale>/cli.ftl`) so non-English
 /// operators see localized text instead of a Rust-side English literal.
-fn needs_onboarding_channel_reply() -> String {
-    i18n::get_required_cli_string("channel-needs-onboarding-reply")
+fn needs_quickstart_channel_reply() -> String {
+    i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
 /// Full-featured chat with tools for channel and webhook handlers.
@@ -1939,7 +2146,7 @@ async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<GatewayChatOutcome> {
-    if let Some(err) = needs_onboarding_for(&state.model) {
+    if let Some(err) = needs_quickstart_for(&state.model) {
         return Err(err);
     }
 
@@ -2047,6 +2254,25 @@ async fn run_gateway_chat_with_tools(
             cost_usd,
         })
     }
+}
+
+fn optional_channel_routes() -> Router<AppState> {
+    let router: Router<AppState> = Router::new();
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    let router = router
+        .route("/whatsapp", get(handle_whatsapp_verify))
+        .route("/whatsapp", post(handle_whatsapp_message));
+    #[cfg(feature = "channel-linq")]
+    let router = router.route("/linq", post(handle_linq_webhook));
+    #[cfg(feature = "channel-wati")]
+    let router = router
+        .route("/wati", get(handle_wati_verify))
+        .route("/wati", post(handle_wati_webhook));
+    #[cfg(feature = "channel-nextcloud")]
+    let router = router.route("/nextcloud-talk", post(handle_nextcloud_talk_webhook));
+    #[cfg(feature = "channel-email")]
+    let router = router.route("/webhook/gmail", post(handle_gmail_push_webhook));
+    router
 }
 
 /// Webhook request body
@@ -2193,12 +2419,15 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .read()
-        .first_model_provider_type()
-        .unwrap_or("unknown")
-        .to_string();
+    let provider_label = {
+        let cfg = state.config.read();
+        cfg.providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
     let model_label = state.model.clone();
     let started_at = Instant::now();
 
@@ -2294,17 +2523,17 @@ async fn handle_webhook(
                 },
             );
 
-            if is_needs_onboarding_err(&e) {
+            if is_needs_quickstart_err(&e) {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Webhook chat refused: gateway has no model configured; \
-                     visit /onboard"
+                     visit /quickstart"
                 );
                 let body = serde_json::json!({
-                    "error": "needs_onboarding",
-                    "url": "/onboard"
+                    "error": "needs_quickstart",
+                    "url": "/quickstart"
                 });
                 (StatusCode::SERVICE_UNAVAILABLE, Json(body))
             } else {
@@ -2334,6 +2563,7 @@ pub struct WhatsAppVerifyQuery {
 }
 
 /// GET /whatsapp — Meta webhook verification
+#[cfg(feature = "channel-whatsapp-cloud")]
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
     Query(params): Query<WhatsAppVerifyQuery>,
@@ -2398,6 +2628,7 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
 }
 
 /// POST /whatsapp — incoming message webhook
+#[cfg(feature = "channel-whatsapp-cloud")]
 async fn handle_whatsapp_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2508,15 +2739,15 @@ async fn handle_whatsapp_message(
                 }
             }
             Err(e) => {
-                let reply = if is_needs_onboarding_err(&e) {
+                let reply = if is_needs_quickstart_err(&e) {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         "WhatsApp chat refused: gateway has no model configured; \
-                         visit /onboard"
+                         visit /quickstart"
                     );
-                    needs_onboarding_channel_reply()
+                    needs_quickstart_channel_reply()
                 } else {
                     ::zeroclaw_log::record!(
                         ERROR,
@@ -2539,6 +2770,7 @@ async fn handle_whatsapp_message(
 }
 
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+#[cfg(feature = "channel-linq")]
 async fn handle_linq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2650,15 +2882,15 @@ async fn handle_linq_webhook(
                 }
             }
             Err(e) => {
-                let reply = if is_needs_onboarding_err(&e) {
+                let reply = if is_needs_quickstart_err(&e) {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         "Linq chat refused: gateway has no model configured; \
-                         visit /onboard"
+                         visit /quickstart"
                     );
-                    needs_onboarding_channel_reply()
+                    needs_quickstart_channel_reply()
                 } else {
                     ::zeroclaw_log::record!(
                         ERROR,
@@ -2681,6 +2913,7 @@ async fn handle_linq_webhook(
 }
 
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
+#[cfg(feature = "channel-wati")]
 async fn handle_wati_verify(
     State(state): State<AppState>,
     Query(params): Query<WatiVerifyQuery>,
@@ -2710,6 +2943,7 @@ pub struct WatiVerifyQuery {
 }
 
 /// POST /wati — incoming WATI WhatsApp message webhook
+#[cfg(feature = "channel-wati")]
 async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let Some(ref wati) = state.wati else {
         return (
@@ -2787,15 +3021,15 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                 }
             }
             Err(e) => {
-                let reply = if is_needs_onboarding_err(&e) {
+                let reply = if is_needs_quickstart_err(&e) {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         "WATI chat refused: gateway has no model configured; \
-                         visit /onboard"
+                         visit /quickstart"
                     );
-                    needs_onboarding_channel_reply()
+                    needs_quickstart_channel_reply()
                 } else {
                     ::zeroclaw_log::record!(
                         ERROR,
@@ -2818,6 +3052,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
 }
 
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+#[cfg(feature = "channel-nextcloud")]
 async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2892,7 +3127,7 @@ async fn handle_nextcloud_talk_webhook(
     for msg in messages {
         let state = state.clone();
         let nextcloud_talk = Arc::clone(nextcloud_talk);
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
             let session_id = sender_session_id("nextcloud_talk", &msg);
 
@@ -2934,7 +3169,7 @@ async fn handle_nextcloud_talk_webhook(
                     }
                 }
                 Err(e) => {
-                    let reply = if is_needs_onboarding_err(&e) {
+                    let reply = if is_needs_quickstart_err(&e) {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -2943,9 +3178,9 @@ async fn handle_nextcloud_talk_webhook(
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                             "Nextcloud Talk chat refused: gateway has no model configured; \
-                             visit /onboard"
+                             visit /quickstart"
                         );
-                        needs_onboarding_channel_reply()
+                        needs_quickstart_channel_reply()
                     } else {
                         ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "error": format!("{}", e)})), "LLM error");
                         "Sorry, I couldn't process your message right now.".to_string()
@@ -2963,9 +3198,11 @@ async fn handle_nextcloud_talk_webhook(
 
 /// Maximum request body size for the Gmail webhook endpoint (1 MB).
 /// Google Pub/Sub messages are typically under 10 KB.
+#[cfg(feature = "channel-email")]
 const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
 
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
+#[cfg(feature = "channel-email")]
 async fn handle_gmail_push_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3033,7 +3270,7 @@ async fn handle_gmail_push_webhook(
 
     // Process the notification asynchronously (non-blocking for the webhook response)
     let channel = Arc::clone(gmail_push);
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         if let Err(e) = channel.handle_notification(&envelope).await {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -3156,7 +3393,7 @@ async fn handle_admin_reload(
     // down + bring up = correct" but "/admin/reload = stale".
     let shutdown_tx = state.shutdown_tx.clone();
     // Brief delay so the HTTP response flushes before tear-down begins.
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         // Drain axum first so the listener releases.
         let _ = shutdown_tx.send(true);
@@ -3273,6 +3510,7 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
@@ -3371,7 +3609,7 @@ mod tests {
     }
 
     /// Regression: the gateway must boot with zero configured agents so
-    /// a fresh install can reach `/admin/reload` and `/onboard` to add
+    /// a fresh install can reach `/admin/reload` and `/quickstart` to add
     /// one. Earlier the boot path returned
     /// `gateway start requires at least one configured [agents.<alias>]
     /// entry`, which crashed the daemon supervisor before the reload
@@ -3391,10 +3629,9 @@ mod tests {
         // immediately with that Err. We race a short delay against
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
-        let handle =
-            tokio::spawn(
-                async move { run_gateway("127.0.0.1", 0, config, None, None, None).await },
-            );
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+        });
 
         match tokio::time::timeout(
             std::time::Duration::from_millis(750),
@@ -3418,7 +3655,7 @@ mod tests {
         if handle.is_finished() {
             let result = handle.await.expect("task did not panic");
             panic!(
-                "gateway exited during boot with zero agents — must stay up for reload/onboard: {:?}",
+                "gateway exited during boot with zero agents — must stay up for reload/quickstart: {:?}",
                 result
             );
         }
@@ -3430,7 +3667,7 @@ mod tests {
     /// Earlier the boot path used `config.risk_profile_for_agent(...).with_context(...)?`
     /// which propagated up through the daemon supervisor and crash-looped
     /// the gateway component, locking the operator out of `/admin/reload`
-    /// and `/onboard` — the exact endpoints they need to fix the broken
+    /// and `/quickstart` — the exact endpoints they need to fix the broken
     /// risk_profile reference. The fix degrades gracefully: warn,
     /// fall through to an empty tools registry, keep serving.
     #[tokio::test]
@@ -3447,10 +3684,9 @@ mod tests {
         };
         config.agents.insert("fake123".to_string(), agent);
 
-        let handle =
-            tokio::spawn(
-                async move { run_gateway("127.0.0.1", 0, config, None, None, None).await },
-            );
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+        });
 
         match tokio::time::timeout(
             std::time::Duration::from_millis(750),
@@ -3468,7 +3704,49 @@ mod tests {
             let result = handle.await.expect("task did not panic");
             panic!(
                 "gateway exited during boot when agent.risk_profile was unresolved \
-                 — must stay up so operator can fix via /admin/reload or /onboard: {:?}",
+                 — must stay up so operator can fix via /admin/reload or /quickstart: {:?}",
+                result
+            );
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("anthropic/claude-sonnet-4-6".to_string()),
+                    api_key: Some("sk-test-openai-shaped-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            &mut Box::pin(async {
+                let _ = tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => panic!("test setup timed out before checking gateway state"),
+        }
+
+        if handle.is_finished() {
+            let result = handle.await.expect("task did not panic");
+            panic!(
+                "gateway exited during boot when seed provider API key was \
+                 mismatched — must stay up so operator can fix via /admin/reload \
+                 or /quickstart: {:?}",
                 result
             );
         }
@@ -3490,13 +3768,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -3517,6 +3803,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3560,13 +3847,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
@@ -3587,6 +3882,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3846,6 +4142,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_memory_key_includes_sender_and_message_id() {
         let msg = ChannelMessage {
@@ -4112,13 +4409,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4139,6 +4444,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4195,13 +4501,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4222,6 +4536,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4290,13 +4605,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4317,6 +4640,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4357,13 +4681,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4384,6 +4716,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4429,13 +4762,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4456,6 +4797,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4478,6 +4820,7 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -4488,6 +4831,7 @@ mod tests {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
@@ -4506,13 +4850,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4533,6 +4885,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4548,6 +4901,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_rejects_invalid_signature() {
         let provider_impl = Arc::new(MockModelProvider::default());
@@ -4583,13 +4937,19 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4610,6 +4970,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4638,12 +4999,14 @@ mod tests {
     // Regression for #6156: handler must return 200 OK before the (potentially
     // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
     // request at its ~5s timeout.
+    #[cfg(feature = "channel-nextcloud")]
     #[derive(Default)]
     struct SlowProvider {
         calls: AtomicUsize,
         started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[async_trait]
     impl ModelProvider for SlowProvider {
         async fn chat_with_system(
@@ -4661,6 +5024,7 @@ mod tests {
             Ok("slow ok".into())
         }
     }
+    #[cfg(feature = "channel-nextcloud")]
     impl ::zeroclaw_api::attribution::Attributable for SlowProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -4674,6 +5038,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_returns_before_llm_call_completes() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -4707,14 +5072,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4771,6 +5143,7 @@ mod tests {
     // WhatsApp Signature Verification Tests (CWE-345 Prevention)
     // ══════════════════════════════════════════════════════════
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -4780,10 +5153,12 @@ mod tests {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
         format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_valid() {
         let app_secret = generate_test_secret();
@@ -4798,6 +5173,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
         let app_secret = generate_test_secret();
@@ -4813,6 +5189,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
         let app_secret = generate_test_secret();
@@ -4829,6 +5206,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_missing_prefix() {
         let app_secret = generate_test_secret();
@@ -4844,6 +5222,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_empty_header() {
         let app_secret = generate_test_secret();
@@ -4852,6 +5231,7 @@ mod tests {
         assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_invalid_hex() {
         let app_secret = generate_test_secret();
@@ -4867,6 +5247,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_empty_body() {
         let app_secret = generate_test_secret();
@@ -4881,6 +5262,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_unicode_body() {
         let app_secret = generate_test_secret();
@@ -4895,6 +5277,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_json_payload() {
         let app_secret = generate_test_secret();
@@ -4909,6 +5292,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
         let app_secret = generate_test_secret();
@@ -4929,6 +5313,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_truncated_hex() {
         let app_secret = generate_test_secret();
@@ -4945,6 +5330,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_extra_bytes() {
         let app_secret = generate_test_secret();
@@ -5185,90 +5571,90 @@ mod tests {
     }
 
     #[test]
-    fn needs_onboarding_for_flags_empty_model() {
+    fn needs_quickstart_for_flags_empty_model() {
         let err =
-            needs_onboarding_for("").expect("empty model must produce a needs_onboarding error");
+            needs_quickstart_for("").expect("empty model must produce a needs_quickstart error");
         let msg = err.to_string();
         assert!(
-            msg.contains("needs_onboarding"),
-            "error must carry the needs_onboarding marker for callers to map to 503; got: {msg}"
+            msg.contains("needs_quickstart"),
+            "error must carry the needs_quickstart marker for callers to map to 503; got: {msg}"
         );
         assert!(
-            msg.contains("/onboard"),
-            "error must point the user at /onboard; got: {msg}"
+            msg.contains("/quickstart"),
+            "error must point the user at /quickstart; got: {msg}"
         );
     }
 
     #[test]
-    fn needs_onboarding_for_flags_whitespace_only_model() {
+    fn needs_quickstart_for_flags_whitespace_only_model() {
         assert!(
-            needs_onboarding_for("   ").is_some(),
+            needs_quickstart_for("   ").is_some(),
             "whitespace-only model must be treated as empty"
         );
         assert!(
-            needs_onboarding_for("\n\t ").is_some(),
+            needs_quickstart_for("\n\t ").is_some(),
             "tabs and newlines count as empty too"
         );
     }
 
     #[test]
-    fn needs_onboarding_for_passes_real_model() {
+    fn needs_quickstart_for_passes_real_model() {
         assert!(
-            needs_onboarding_for("anthropic/claude-sonnet-4").is_none(),
+            needs_quickstart_for("anthropic/claude-sonnet-4").is_none(),
             "a real model id must not be flagged"
         );
         assert!(
-            needs_onboarding_for("  gpt-4  ").is_none(),
+            needs_quickstart_for("  gpt-4  ").is_none(),
             "leading/trailing whitespace around a real model id must not be flagged"
         );
     }
 
     #[test]
-    fn is_needs_onboarding_err_detects_marker_from_helper() {
-        let err = needs_onboarding_for("").expect("empty model produces marker");
+    fn is_needs_quickstart_err_detects_marker_from_helper() {
+        let err = needs_quickstart_for("").expect("empty model produces marker");
         assert!(
-            is_needs_onboarding_err(&err),
-            "the marker emitted by needs_onboarding_for must be detected"
+            is_needs_quickstart_err(&err),
+            "the marker emitted by needs_quickstart_for must be detected"
         );
     }
 
     #[test]
-    fn is_needs_onboarding_err_ignores_unrelated_errors() {
+    fn is_needs_quickstart_err_ignores_unrelated_errors() {
         let err = anyhow::Error::msg("upstream timeout: provider returned 504");
         assert!(
-            !is_needs_onboarding_err(&err),
-            "unrelated errors must not be misclassified as needs_onboarding"
+            !is_needs_quickstart_err(&err),
+            "unrelated errors must not be misclassified as needs_quickstart"
         );
         let err = anyhow::Error::msg("invalid api key");
-        assert!(!is_needs_onboarding_err(&err));
+        assert!(!is_needs_quickstart_err(&err));
     }
 
     #[test]
-    fn is_needs_onboarding_err_detects_via_substring() {
+    fn is_needs_quickstart_err_detects_via_substring() {
         // Defends the contract that the substring marker is the
         // detection key — not the exact string. Wrappers (e.g.
         // anyhow::Error::context) must not break the check.
         let err =
-            anyhow::Error::msg("provider call failed").context("needs_onboarding: empty model");
-        assert!(is_needs_onboarding_err(&err));
+            anyhow::Error::msg("provider call failed").context("needs_quickstart: empty model");
+        assert!(is_needs_quickstart_err(&err));
     }
 
     #[test]
-    fn needs_onboarding_channel_reply_resolves_via_fluent() {
-        // The Fluent key channel-needs-onboarding-reply must resolve
+    fn needs_quickstart_channel_reply_resolves_via_fluent() {
+        // The Fluent key channel-needs-quickstart-reply must resolve
         // to real text from the embedded en/cli.ftl, not the missing-
-        // key fallback `{channel-needs-onboarding-reply}` that
+        // key fallback `{channel-needs-quickstart-reply}` that
         // `missing_cli_string` produces. Guarding this in a test
         // keeps the i18n contract from quietly drifting if the key
         // gets renamed in lib.rs without a matching ftl edit.
-        let reply = needs_onboarding_channel_reply();
+        let reply = needs_quickstart_channel_reply();
         assert!(
             !reply.starts_with('{') && !reply.ends_with('}'),
             "fluent missing-key fallback leaked into channel reply: {reply:?}"
         );
         assert!(
-            reply.to_lowercase().contains("onboarding"),
-            "channel reply must mention onboarding so users know what's missing: {reply:?}"
+            reply.to_lowercase().contains("quickstart"),
+            "channel reply must mention Quickstart so users know what's missing: {reply:?}"
         );
     }
 }

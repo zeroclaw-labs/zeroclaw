@@ -195,6 +195,12 @@ impl Default for PerSenderTracker {
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
+    /// Name of the risk profile this policy was built from. Used to gate
+    /// delegation: a Delegate may only target an agent sharing the caller's
+    /// risk profile. Empty when constructed outside the profile path.
+    pub risk_profile_name: String,
+    /// Whether and to which agents this profile may delegate.
+    pub delegation_policy: crate::autonomy::DelegationPolicy,
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
@@ -530,6 +536,8 @@ impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
             autonomy: AutonomyLevel::Supervised,
+            risk_profile_name: String::new(),
+            delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
@@ -2314,6 +2322,8 @@ impl SecurityPolicy {
 
         Self {
             autonomy: risk_profile.level,
+            risk_profile_name: String::new(),
+            delegation_policy: risk_profile.delegation_policy.clone(),
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
@@ -2321,6 +2331,10 @@ impl SecurityPolicy {
             allowed_roots: risk_profile
                 .allowed_roots
                 .iter()
+                .filter(|root| {
+                    let t = root.trim();
+                    !t.is_empty() && t != crate::traits::UNSET_DISPLAY && t != "*"
+                })
                 .map(|root| {
                     let expanded = expand_user_path(root);
                     if expanded.is_absolute() {
@@ -2389,6 +2403,9 @@ impl SecurityPolicy {
         // own dir, not the install-wide legacy path.
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut policy = Self::from_profiles(risk_profile, runtime_profile, &agent_workspace);
+        if let Some(agent_cfg) = config.agents.get(agent_alias) {
+            policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
+        }
 
         // Shared skills directory: every agent reads from
         // `<install>/shared/skills/` so the `read_skills` tool resolves
@@ -2713,6 +2730,7 @@ mod tests {
             auto_approve: vec!["memory_recall".into()],
             always_ask: vec!["shell".into()],
             allowed_roots: vec!["/tmp/extra".into()],
+            delegation_policy: crate::autonomy::DelegationPolicy::default(),
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),

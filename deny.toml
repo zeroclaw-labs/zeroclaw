@@ -9,6 +9,15 @@ unmaintained = "all"
 yanked = "deny"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
+    # bincode -- unmaintained advisory (informational only, no CVE); team ceased
+    # development after a doxxing/harassment incident; advisory affects all
+    # versions including 2.x. In our tree, bincode is pulled in only via
+    # probe-rs 0.31's `builtin-targets` feature (precompiled chip definitions)
+    # behind the optional `probe` cargo feature on zeroclaw-tools and
+    # zeroclaw-hardware. probe-rs is the de facto Rust embedded debug toolchain
+    # with no alternative; replacing builtin-targets requires runtime Registry
+    # construction (separate work). Not in any default build path.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (informational, no CVE); transitive via probe-rs `builtin-targets`; behind optional `probe` feature; awaiting probe-rs upstream serialization migration" },
     # rand -- re-entrancy unsoundness via custom global logger; fixed in rand 0.8.6
     # for the 0.8.x copy in our tree; the 0.7.x copy predates rand::rng() entirely
     # and is not affected; the 0.9.x copy is outside the advisory's affected range
