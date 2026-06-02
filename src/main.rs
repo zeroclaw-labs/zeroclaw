@@ -2190,6 +2190,37 @@ fn model_path_provider_type(path: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
+fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
+    let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
+    let mut parts = tail.split('.');
+    let key = parts.next().filter(|key| !key.is_empty())?;
+    parts.next()?;
+    Some(key)
+}
+
+fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
+    let Some((section_path, key)) = Config::map_key_sections()
+        .into_iter()
+        .filter(|section| section.path.starts_with("providers.models."))
+        .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
+        .filter_map(|section| {
+            let key = map_key_for_prop_path(section.path, prop_path)?;
+            Some((section.path, key))
+        })
+        .max_by_key(|(section_path, _)| section_path.len())
+    else {
+        return Ok(false);
+    };
+
+    let created = config
+        .create_map_key(section_path, key)
+        .map_err(anyhow::Error::msg)?;
+    if created {
+        config.mark_dirty(&format!("{section_path}.{key}"));
+    }
+    Ok(created)
+}
+
 #[cfg(feature = "agent-runtime")]
 fn trimmed_agent_name_for_templates(prior_name: Option<&str>) -> String {
     prior_name
@@ -4527,8 +4558,12 @@ async fn main() -> Result<()> {
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
-                let path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
-                config.ensure_map_key_for_path(&path);
+                let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
+                if ensure_map_key_for_prop_path(&mut config, &path)? {
+                    let known_paths: Vec<String> =
+                        config.prop_fields().into_iter().map(|f| f.name).collect();
+                    path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
+                }
                 if no_interactive {
                     let val = value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -6509,6 +6544,72 @@ mod tests {
         });
 
         assert!((final_temperature - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_missing_typed_provider_alias() {
+        let mut config = Config::default();
+        let path = "providers.models.deepseek.default.model";
+
+        assert!(
+            config
+                .providers
+                .models
+                .find("deepseek", "default")
+                .is_none(),
+            "fresh config should not already contain the requested provider alias"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known typed provider path should be materialized");
+
+        assert!(created, "missing provider alias should be created");
+        config
+            .set_prop_persistent(path, "deepseek-chat")
+            .expect("materialized path should be writable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .find("deepseek", "default")
+                .and_then(|provider| provider.model.as_deref()),
+            Some("deepseek-chat")
+        );
+
+        let known_paths: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let api_key_path = zeroclaw_config::helpers::resolve_field_path(
+            &known_paths,
+            "providers.models.deepseek.default.api-key",
+        );
+        config
+            .set_prop_persistent(&api_key_path, "sk-test-placeholder")
+            .expect(
+                "kebab-case secret path should resolve to the materialized typed provider field",
+            );
+        assert_eq!(
+            config
+                .providers
+                .models
+                .find("deepseek", "default")
+                .and_then(|provider| provider.api_key.as_deref()),
+            Some("sk-test-placeholder")
+        );
+    }
+
+    #[test]
+    fn config_set_does_not_materialize_non_provider_map_keys() {
+        let mut config = Config::default();
+        let created = ensure_map_key_for_prop_path(
+            &mut config,
+            "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+        )
+        .expect("non-provider map paths should be ignored, not rejected");
+
+        assert!(
+            !created,
+            "auto-materialization must stay scoped to typed model provider aliases"
+        );
     }
 
     #[test]

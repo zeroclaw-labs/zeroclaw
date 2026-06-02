@@ -430,10 +430,12 @@ pub fn validate_alias_key(key: &str) -> Result<(), String> {
 ///
 /// Field segments derived from the schema are kebab-case; aliases are
 /// snake-only per [`validate_alias_key`]. For each known canonical
-/// path, segments are compared pairwise: equal verbatim, OR equal
-/// after swapping `_`/`-` only when the canonical segment contains a
-/// `-` (i.e. is a schema-derived field name, not an alias). Returns
-/// `raw` unchanged when no canonical path matches.
+/// path, segments are compared pairwise: equal verbatim, equal after
+/// swapping `-` → `_` when the canonical segment contains `-`, or
+/// equal after swapping `_` → `-` for the final field segment. The
+/// final-segment rule lets older CLI spelling like `api-key` resolve
+/// to schema-canonical `api_key` without rewriting map aliases such as
+/// `my_bot`. Returns `raw` unchanged when no canonical path matches.
 #[must_use]
 pub fn resolve_field_path(known_paths: &[String], raw: &str) -> String {
     let raw_segs: Vec<&str> = raw.split('.').collect();
@@ -442,10 +444,16 @@ pub fn resolve_field_path(known_paths: &[String], raw: &str) -> String {
         if known_segs.len() != raw_segs.len() {
             continue;
         }
+        let final_index = known_segs.len().saturating_sub(1);
         let all_match = known_segs
             .iter()
             .zip(raw_segs.iter())
-            .all(|(k, r)| k == r || (k.contains('-') && k.replace('-', "_") == **r));
+            .enumerate()
+            .all(|(idx, (k, r))| {
+                k == r
+                    || (k.contains('-') && k.replace('-', "_") == **r)
+                    || (idx == final_index && k.contains('_') && k.replace('_', "-") == **r)
+            });
         if all_match {
             return known.clone();
         }
@@ -669,6 +677,15 @@ mod tests {
         assert_eq!(
             resolve_field_path(&known, "providers.models.anthropic.my_bot.api-key"),
             "providers.models.anthropic.my_bot.api-key",
+        );
+    }
+
+    #[test]
+    fn resolve_field_path_canonicalizes_kebab_final_field_segments() {
+        let known = vec!["providers.models.deepseek.default.api_key".to_string()];
+        assert_eq!(
+            resolve_field_path(&known, "providers.models.deepseek.default.api-key"),
+            "providers.models.deepseek.default.api_key",
         );
     }
 
