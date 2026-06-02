@@ -43,7 +43,9 @@ impl Chord {
     }
 
     pub fn matches(&self, event: &KeyEvent) -> bool {
-        event.code == self.code && normalise_mods(self.modifiers) == normalise_mods(event.modifiers)
+        event.code == self.code
+            && normalise_mods(self.code, self.modifiers)
+                == normalise_mods(event.code, event.modifiers)
     }
 
     /// `Ctrl+K` on most platforms; `⌘K` on darwin.
@@ -232,16 +234,31 @@ impl<'de> Deserialize<'de> for Chord {
 }
 
 #[cfg(target_os = "macos")]
-fn normalise_mods(mut m: KeyModifiers) -> KeyModifiers {
+fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
     if m.contains(KeyModifiers::CONTROL) {
         m.remove(KeyModifiers::CONTROL);
         m.insert(KeyModifiers::SUPER);
     }
-    m
+    strip_redundant_shift(code, m)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn normalise_mods(m: KeyModifiers) -> KeyModifiers {
+fn normalise_mods(code: KeyCode, m: KeyModifiers) -> KeyModifiers {
+    strip_redundant_shift(code, m)
+}
+
+/// Drop the SHIFT bit for character keys. A shifted character (`?`,
+/// `G`, `:`) already encodes its shift in the glyph itself, but
+/// platforms disagree on whether SHIFT is *also* reported alongside
+/// it: Unix terminals strip it, the Windows console keeps it. Comparing
+/// it would make `?` (the default Help chord) only match on platforms
+/// that strip SHIFT, forcing Windows users to hand-bind `shift+?`.
+/// Modifier keys that genuinely change the keystroke (Ctrl/Alt/Super)
+/// are left untouched.
+fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
+    if matches!(code, KeyCode::Char(_)) {
+        m.remove(KeyModifiers::SHIFT);
+    }
     m
 }
 
@@ -285,6 +302,48 @@ mod tests {
         let chord = Chord::ctrl('k');
         let event = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(!chord.matches(&event));
+    }
+
+    #[test]
+    fn question_mark_matches_with_or_without_shift() {
+        // `?` is Shift+/ physically. Unix terminals report Char('?')
+        // with no modifier; the Windows console reports Char('?') with
+        // SHIFT still set. The default Help chord (bare '?') must match
+        // both, or Windows users have to hand-bind shift+?.
+        let chord = Chord::char('?');
+        let unix = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        let windows = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
+        assert!(chord.matches(&unix));
+        assert!(chord.matches(&windows));
+    }
+
+    #[test]
+    fn explicit_shift_char_chord_still_matches_bare_event() {
+        // A user who hand-bound `shift+?` as a workaround keeps working:
+        // SHIFT is redundant on a char key, so it's stripped from both
+        // sides of the comparison.
+        let chord = Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT);
+        let event = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(chord.matches(&event));
+    }
+
+    #[test]
+    fn shift_still_discriminates_non_char_keys() {
+        // Shift is only redundant on character glyphs. On named keys it
+        // genuinely changes the chord, so Shift+Up must not match Up.
+        let chord = Chord::shift(KeyCode::Up);
+        let bare = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let shifted = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(!chord.matches(&bare));
+        assert!(chord.matches(&shifted));
+    }
+
+    #[test]
+    fn ctrl_on_char_key_still_required_despite_shift_stripping() {
+        // Stripping SHIFT must not weaken Ctrl/Alt enforcement.
+        let chord = Chord::ctrl('k');
+        let no_ctrl = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT);
+        assert!(!chord.matches(&no_ctrl));
     }
 
     #[cfg(not(target_os = "macos"))]
