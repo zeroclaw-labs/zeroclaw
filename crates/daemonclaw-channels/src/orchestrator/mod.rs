@@ -611,6 +611,7 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     sender: &str,
+    session_key: &str,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -644,9 +645,11 @@ fn build_channel_system_prompt(
     if !reply_target.is_empty() {
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}, sender={sender}. \
+             reply_target={reply_target}, sender={sender}, session_id={session_key}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
+             The session_id is the durable identifier for this conversation — use it \
+             for self-reference, resume, checkpointing, and cross-session continuity. \
              When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
              \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
@@ -2771,6 +2774,7 @@ async fn process_channel_message(
         &msg.channel,
         &msg.reply_target,
         &msg.sender,
+        &history_key,
     );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
@@ -11838,23 +11842,25 @@ This is an example JSON object for profile settings."#;
             "mattermost",
             "channel123:root456",
             "user_abc123",
+            "mattermost_channel123_user_abc123",
         );
         assert!(prompt.contains("sender=user_abc123"));
         assert!(prompt.contains("channel=mattermost"));
         assert!(prompt.contains("reply_target=channel123:root456"));
+        assert!(prompt.contains("session_id=mattermost_channel123_user_abc123"));
     }
 
     #[test]
     fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
-        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123");
+        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123", "key");
         assert!(!prompt.contains("sender="));
         assert!(!prompt.contains("Channel context:"));
     }
 
     #[test]
     fn build_channel_system_prompt_sender_distinguishes_users() {
-        let prompt_a = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa");
-        let prompt_b = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb");
+        let prompt_a = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa", "key_a");
+        let prompt_b = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb", "key_b");
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
