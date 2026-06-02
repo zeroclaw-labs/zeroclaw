@@ -41,6 +41,7 @@
   - [Routing](./providers/routing.md)
   - [Provider catalog](./providers/catalog.md)
   - [Custom providers](./providers/custom.md)
+  - [OpenAI Codex (subscription)](./providers/openai-codex-subscription.md)
 
 - [Channels & Integrations]()
   - [Overview](./channels/overview.md)
