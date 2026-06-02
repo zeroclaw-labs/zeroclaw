@@ -2201,7 +2201,7 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = Config::map_key_sections()
         .into_iter()
-        .filter(|section| section.path.starts_with("providers.models."))
+        .filter(|section| section.path.starts_with("providers."))
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
         .filter_map(|section| {
             let key = map_key_for_prop_path(section.path, prop_path)?;
@@ -6598,6 +6598,76 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_missing_tts_provider_alias() {
+        let mut config = Config::default();
+        let path = "providers.tts.openai.alloy.voice";
+
+        assert!(
+            config
+                .providers
+                .tts
+                .iter_entries()
+                .all(|(family, alias, _)| !(family == "openai" && alias == "alloy")),
+            "fresh config should not already contain the requested tts alias"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known typed tts provider path should be materialized");
+
+        assert!(created, "missing tts alias should be created");
+        config
+            .set_prop_persistent(path, "alloy")
+            .expect("materialized tts path should be writable");
+        assert!(
+            config
+                .providers
+                .tts
+                .iter_entries()
+                .any(|(family, alias, _)| family == "openai" && alias == "alloy"),
+            "tts alias should resolve after materialization"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_missing_transcription_provider_alias() {
+        let mut config = Config::default();
+        let raw = "providers.transcription.groq.fast.model";
+
+        assert!(
+            config
+                .providers
+                .transcription
+                .iter_aliases()
+                .all(|(family, alias)| !(family == "groq" && alias == "fast")),
+            "fresh config should not already contain the requested transcription alias"
+        );
+
+        // Mirror the CLI `config set` path exactly: resolve, materialize the
+        // map key, then re-resolve so the now-present alias field is found.
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("known typed transcription provider path should be materialized");
+        assert!(created, "missing transcription alias should be created");
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+
+        config
+            .set_prop_persistent(&path, "whisper-large-v3")
+            .expect("materialized transcription path should be writable");
+        assert!(
+            config
+                .providers
+                .transcription
+                .iter_aliases()
+                .any(|(family, alias)| family == "groq" && alias == "fast"),
+            "transcription alias should resolve after materialization"
+        );
+    }
+
+    #[test]
     fn config_set_does_not_materialize_non_provider_map_keys() {
         let mut config = Config::default();
         let created = ensure_map_key_for_prop_path(
@@ -6608,7 +6678,7 @@ mod tests {
 
         assert!(
             !created,
-            "auto-materialization must stay scoped to typed model provider aliases"
+            "auto-materialization must stay scoped to typed provider aliases"
         );
     }
 
