@@ -6088,6 +6088,7 @@ pub struct WebSearchConfig {
     /// Jina AI API key (required if search_provider is "jina")
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub jina_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
