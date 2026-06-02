@@ -63,10 +63,17 @@ impl Tool for EmailReadTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let uid = args
+        let uid: u32 = args
             .get("uid")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::Error::msg("uid is required"))? as u32;
+            .ok_or_else(|| anyhow::Error::msg("uid is required"))?
+            .try_into()
+            .map_err(|_| {
+                anyhow::Error::msg(
+                    "uid exceeds maximum IMAP UID (4294967295); \
+                     check that the uid came from email_search on this mailbox",
+                )
+            })?;
         let channel_alias = args.get("channel").and_then(|v| v.as_str());
         let folder = args
             .get("folder")
@@ -174,4 +181,19 @@ fn strip_html(html: &str) -> String {
         }
     }
     result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uid_rejects_value_above_u32_max() {
+        // 4294967297 = u32::MAX + 2; must not silently wrap to a different UID.
+        let args = serde_json::json!({"uid": 4294967297u64});
+        let raw = args.get("uid").and_then(|v| v.as_u64()).unwrap();
+        let result: Result<u32, _> = raw.try_into();
+        assert!(
+            result.is_err(),
+            "oversized UID must fail checked conversion"
+        );
+    }
 }
