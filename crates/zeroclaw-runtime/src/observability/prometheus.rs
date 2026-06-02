@@ -1,4 +1,4 @@
-use super::traits::{Observer, ObserverEvent, ObserverMetric};
+﻿use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use prometheus::{
     Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
 };
@@ -55,7 +55,7 @@ impl PrometheusObserver {
             prometheus::Opts::new("zeroclaw_agent_starts_total", "Total agent invocations"),
             &["model_provider", "model"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let llm_requests = IntCounterVec::new(
             prometheus::Opts::new(
@@ -64,13 +64,13 @@ impl PrometheusObserver {
             ),
             &["model_provider", "model", "success"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let tokens_input_total = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_tokens_input_total", "Total input tokens consumed"),
             &["model_provider", "model"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let tokens_output_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -79,41 +79,41 @@ impl PrometheusObserver {
             ),
             &["model_provider", "model"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let tool_calls = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_tool_calls_total", "Total tool calls"),
             &["tool", "success"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let channel_messages = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_channel_messages_total", "Total channel messages"),
             &["channel", "direction"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let heartbeat_ticks =
             prometheus::IntCounter::new("zeroclaw_heartbeat_ticks_total", "Total heartbeat ticks")
-                .expect("valid metric");
+                .expect("failed to register metric; check for duplicate metric name in registry");
 
         let errors = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_errors_total", "Total errors by component"),
             &["component"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let cache_hits = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_cache_hits_total", "Total response cache hits"),
             &["cache_type"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let cache_misses = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_cache_misses_total", "Total response cache misses"),
             &["cache_type"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let cache_tokens_saved = IntCounterVec::new(
             prometheus::Opts::new(
@@ -122,7 +122,7 @@ impl PrometheusObserver {
             ),
             &["cache_type"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let agent_duration = HistogramVec::new(
             HistogramOpts::new(
@@ -132,7 +132,7 @@ impl PrometheusObserver {
             .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
             &["model_provider", "model"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let tool_duration = HistogramVec::new(
             HistogramOpts::new(
@@ -142,7 +142,7 @@ impl PrometheusObserver {
             .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
             &["tool"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let request_latency = Histogram::with_opts(
             HistogramOpts::new(
@@ -151,31 +151,31 @@ impl PrometheusObserver {
             )
             .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let tokens_used = prometheus::IntGauge::new(
             "zeroclaw_tokens_used_last",
             "Tokens used in the last request",
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let active_sessions = GaugeVec::new(
             prometheus::Opts::new("zeroclaw_active_sessions", "Number of active sessions"),
             &[],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let queue_depth = GaugeVec::new(
             prometheus::Opts::new("zeroclaw_queue_depth", "Message queue depth"),
             &[],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let deployments_total = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_deployments_total", "Total deployments by status"),
             &["status"],
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let deployment_lead_time = Histogram::with_opts(
             HistogramOpts::new(
@@ -186,13 +186,13 @@ impl PrometheusObserver {
                 60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0, 43200.0, 86400.0,
             ]),
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let deployment_failure_rate = prometheus::Gauge::new(
             "zeroclaw_deployment_failure_rate",
             "Ratio of failed deployments to total deployments",
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let recovery_time = Histogram::with_opts(
             HistogramOpts::new(
@@ -203,11 +203,11 @@ impl PrometheusObserver {
                 60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0, 43200.0, 86400.0,
             ]),
         )
-        .expect("valid metric");
+        .expect("failed to register metric; check for duplicate metric name in registry");
 
         let mttr =
             prometheus::Gauge::new("zeroclaw_mttr_seconds", "Mean time to recovery in seconds")
-                .expect("valid metric");
+                .expect("failed to register metric; check for duplicate metric name in registry");
 
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
