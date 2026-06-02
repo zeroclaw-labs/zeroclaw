@@ -2174,7 +2174,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     continue;
                 }
                 // Default: escape HTML entities
-                let ch = line[i..].chars().next().unwrap();
+                let ch = line[i..]
+                    .chars()
+                    .next()
+                    .expect("line slice must be non-empty after i < bytes.len()");
                 match ch {
                     '<' => line_out.push_str("&lt;"),
                     '>' => line_out.push_str("&gt;"),
