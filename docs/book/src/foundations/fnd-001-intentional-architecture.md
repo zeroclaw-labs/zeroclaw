@@ -200,28 +200,28 @@ If `zeroclaw-runtime` ever imports `TelegramChannel`, the architecture has been 
 │   │  Plugin Host · Local IPC API                                 │  │
 │   │  Core Tools: shell, file, git, memory recall/store           │  │
 │   │                                                              │  │
-│   │  ┌──────────────────────────────────────────────────────┐   │  │
-│   │  │   Foundation  (--no-default-features)                │   │  │
-│   │  │                                                      │   │  │
-│   │  │  zeroclaw-api · zeroclaw-config · zeroclaw-infra     │   │  │
-│   │  │  zeroclaw-providers · zeroclaw-memory                │   │  │
-│   │  │  zeroclaw-tool-call-parser                           │   │  │
-│   │  │                                                      │   │  │
-│   │  │  Vision target: <5 MB RAM at runtime                 │   │  │
-│   │  └──────────────────────────────────────────────────────┘   │  │
+│   │  ┌──────────────────────────────────────────────────────┐    │  │
+│   │  │   Foundation  (--no-default-features)                │    │  │
+│   │  │                                                      │    │  │
+│   │  │  zeroclaw-api · zeroclaw-config · zeroclaw-infra     │    │  │
+│   │  │  zeroclaw-providers · zeroclaw-memory                │    │  │
+│   │  │  zeroclaw-tool-call-parser                           │    │  │
+│   │  │                                                      │    │  │
+│   │  │  Vision target: <5 MB RAM at runtime                 │    │  │
+│   │  └──────────────────────────────────────────────────────┘    │  │
 │   └──────────────────────────────────────────────────────────────┘  │
 │                              ▲                                      │
 │                   zeroclaw-api (traits only)                        │
 │                              ▲                                      │
-│   ┌──────────────┐  ┌────────┴────────┐  ┌─────────────────────┐   │
-│   │  zeroclaw-gw │  │  Channel plugins│  │   Tool plugins      │   │
-│   │  (opt-in     │  │                 │  │                     │   │
-│   │   binary)    │  │  channel-discord│  │  tools-web          │   │
-│   │              │  │  channel-slack  │  │  tools-integrations │   │
-│   │  HTTP/WS/SSE │  │  channel-tg     │  │  tools-hardware     │   │
-│   │  Web UI      │  │  channel-email  │  │  tools-mcp          │   │
-│   │  REST API    │  │  ...            │  │  ...                │   │
-│   └──────┬───────┘  └─────────────────┘  └─────────────────────┘   │
+│   ┌──────────────┐  ┌────────┴────────┐  ┌─────────────────────┐    │
+│   │  zeroclaw-gw │  │  Channel plugins│  │   Tool plugins      │    │
+│   │  (opt-in     │  │                 │  │                     │    │
+│   │   binary)    │  │  channel-discord│  │  tools-web          │    │
+│   │              │  │  channel-slack  │  │  tools-integrations │    │
+│   │  HTTP/WS/SSE │  │  channel-tg     │  │  tools-hardware     │    │
+│   │  Web UI      │  │  channel-email  │  │  tools-mcp          │    │
+│   │  REST API    │  │  ...            │  │  ...                │    │
+│   └──────┬───────┘  └─────────────────┘  └─────────────────────┘    │
 │          │                                                          │
 │          ▼                                                          │
 │   ┌─────────────────┐                                               │
