@@ -71,7 +71,8 @@ impl BrowserDelegateTool {
     /// Prevents policy bypass by embedding blocked URLs in the `task` text,
     /// which is forwarded verbatim to the browser CLI subprocess.
     fn validate_task_urls(&self, task: &str) -> anyhow::Result<()> {
-        let url_re = Regex::new(r#"https?://[^\s\)\]\},\"'`<>]+"#).expect("valid regex");
+        let url_re = Regex::new(r#"https?://[^\s\)\]\},\"'`<>]+"#)
+            .expect("failed to compile URL extraction regex for browser-delegate task validation");
         for m in url_re.find_iter(task) {
             self.validate_url(m.as_str())?;
         }

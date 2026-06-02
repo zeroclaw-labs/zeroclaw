@@ -590,14 +590,16 @@ fn parse_content_line(line: &str) -> Option<(&str, bool)> {
     static CONTEXT_RE: OnceLock<regex::Regex> = OnceLock::new();
 
     let match_re = MATCH_RE.get_or_init(|| {
-        regex::Regex::new(r"^(?P<path>.+?):\d+:").expect("match line regex must be valid")
+        regex::Regex::new(r"^(?P<path>.+?):\d+:")
+            .expect("failed to compile ripgrep match-line regex for content_search")
     });
     if let Some(caps) = match_re.captures(line) {
         return caps.name("path").map(|m| (m.as_str(), true));
     }
 
     let context_re = CONTEXT_RE.get_or_init(|| {
-        regex::Regex::new(r"^(?P<path>.+?)-\d+-").expect("context line regex must be valid")
+        regex::Regex::new(r"^(?P<path>.+?)-\d+-")
+            .expect("failed to compile ripgrep context-line regex for content_search")
     });
     if let Some(caps) = context_re.captures(line) {
         return caps.name("path").map(|m| (m.as_str(), false));
@@ -610,7 +612,8 @@ fn parse_content_line(line: &str) -> Option<(&str, bool)> {
 fn parse_count_line(line: &str) -> Option<(&str, usize)> {
     static COUNT_RE: OnceLock<regex::Regex> = OnceLock::new();
     let count_re = COUNT_RE.get_or_init(|| {
-        regex::Regex::new(r"^(?P<path>.+?):(?P<count>\d+)\s*$").expect("count line regex valid")
+        regex::Regex::new(r"^(?P<path>.+?):(?P<count>\d+)\s*$")
+            .expect("failed to compile ripgrep count-line regex for content_search")
     });
 
     let caps = count_re.captures(line)?;

@@ -196,7 +196,9 @@ impl GmailPushChannel {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("failed to build HTTP client");
+            .expect(
+                "failed to build HTTP client for Gmail push channel — check TLS/cert configuration",
+            );
         Self {
             config,
             alias: alias.into(),
