@@ -91,9 +91,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: .workflow-scripts
-          sparse-checkout: |
-            .github/scripts
-          sparse-checkout-cone-mode: false
           fetch-depth: 1
 
 
@@ -209,10 +206,10 @@ jobs:
             rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
           else
             # Old-tag fallback: extract chrome from the deployed version content
-            python3 "${SCRIPTS}/extract-shared-chrome.py" "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
+            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
           fi
 
-          python3 "${SCRIPTS}/generate-versions.py" > versions.json
+          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
 
           # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
           if [ -d "stable" ]; then

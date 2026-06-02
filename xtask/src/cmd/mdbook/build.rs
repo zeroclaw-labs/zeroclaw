@@ -108,22 +108,22 @@ pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()>
     // Write small metadata file with the version tag
     let version_meta = format!("{}\n", tag.unwrap_or(DEFAULT_TAG));
     std::fs::write(out_dir.join("_version.txt"), version_meta)?;
-    extract_shared_chrome(root, tag_dir)?;
+
+    let version_dir = out_dir;
+    let shared_dir = book.join("book").join("_shared");
+    extract_shared_chrome(&version_dir, &shared_dir)?;
     Ok(())
 }
 
-fn extract_shared_chrome(root: &Path, tag_dir: &str) -> anyhow::Result<()> {
+pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::Result<()> {
     println!("==> Extracting shared chrome layer");
-    let book = book_dir(root);
-    let tag_out_dir = book.join("book").join(tag_dir);
-    let shared_dir = book.join("book").join("_shared");
 
     let first_locale = locale_entries()
         .into_iter()
         .next()
         .map(|e| e.code)
         .unwrap_or_else(|| "en".to_string());
-    let src_dir = tag_out_dir.join(&first_locale);
+    let src_dir = version_dir.join(&first_locale);
     if !src_dir.exists() {
         return Ok(());
     }
@@ -135,6 +135,8 @@ fn extract_shared_chrome(root: &Path, tag_dir: &str) -> anyhow::Result<()> {
         "theme/version-selector",
         "theme/lang-switcher",
         "favicon",
+        "theme/pc-themes",
+        "theme/pc-enhance",
     ];
 
     let walk_dir = |dir: &Path| -> Vec<std::path::PathBuf> {
@@ -182,7 +184,7 @@ fn extract_shared_chrome(root: &Path, tag_dir: &str) -> anyhow::Result<()> {
     }
 
     for entry in locale_entries() {
-        let loc_dir = tag_out_dir.join(&entry.code);
+        let loc_dir = version_dir.join(&entry.code);
         for file in walk_dir(&loc_dir) {
             if file.extension().is_some_and(|e| e == "html")
                 && let Ok(mut content) = std::fs::read_to_string(&file)

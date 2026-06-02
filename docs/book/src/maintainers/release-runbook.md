@@ -313,7 +313,7 @@ To manually re-deploy a specific version:
 To prevent accidentally deploying very old or unsupported versions, the workflow enforces a minimum version floor (currently `v0.7.5`).
 
 - Tags older than `DOCS_MIN_VERSION` (like `v0.7.4`) are rejected by the workflow.
-- `generate-versions.py` ignores any directories on `gh-pages` below this floor, keeping them out of the version dropdown.
+- `cargo mdbook gen-versions` (the xtask helper) ignores any directories on `gh-pages` below this floor, keeping them out of the version dropdown.
 
 If you need to raise the floor to drop support for an older version:
 1. Update the `DOCS_MIN_VERSION` environment variable in `.github/workflows/docs-deploy.yml`.
