@@ -1512,6 +1512,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     let mut lines: Vec<Line> = state.cached_lines.iter().map(borrow_line).collect();
+    let mut transient = false;
 
     if !state.streaming_text.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -1519,6 +1520,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
             theme::agent_label_style(),
         )]));
         lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
+        transient = true;
     }
 
     if state.show_thoughts && !state.streaming_thought.is_empty() {
@@ -1526,12 +1528,14 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
             Span::styled("(thinking) ", theme::thought_style()),
             Span::styled(state.streaming_thought.as_str(), theme::dim_style()),
         ]));
+        transient = true;
     }
 
     if state.pending_approval().is_some() {
         for _ in 0..APPROVAL_OVERLAY_HEIGHT {
             lines.push(Line::default());
         }
+        transient = true;
     }
 
     let inner_height = area.height.saturating_sub(2);
@@ -1542,8 +1546,11 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .block(block)
         .wrap(Wrap { trim: false });
 
-    // Use ratatui's own line_count for accurate wrapped row total.
-    let total_rows = p.line_count(inner_width) as u16;
+    let total_rows = if transient {
+        p.line_count(inner_width) as u16
+    } else {
+        state.cached_total_rows
+    };
     let max_scroll = total_rows.saturating_sub(inner_height);
     let scroll = if state.pinned_to_bottom {
         max_scroll
@@ -2314,6 +2321,7 @@ pub struct ChatState {
     /// A width change forces a full rebuild because tables compute their
     /// column budgets from it.
     cached_render_width: u16,
+    cached_total_rows: u16,
     /// Cumulative token count for this session: every Usage event from the
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
@@ -2357,6 +2365,7 @@ impl ChatState {
             cached_entry_count: 0,
             cached_render_start: 0,
             cached_render_width: 0,
+            cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
         }
@@ -2538,10 +2547,15 @@ impl ChatState {
                     new_ranges.push((abs_idx, base + before, base + after));
                 }
             }
+            let appended_rows =
+                Paragraph::new(new_lines.iter().map(borrow_line).collect::<Vec<_>>())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width) as u16;
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = total - start;
             self.dirty = LinesDirty::Clean;
+            self.cached_total_rows = self.cached_total_rows.saturating_add(appended_rows);
             return;
         }
 
@@ -2569,6 +2583,18 @@ impl ChatState {
         self.cached_entry_count = total - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
+        self.cached_total_rows = self.compute_cached_rows(width);
+    }
+
+    fn compute_cached_rows(&self, width: u16) -> u16 {
+        Paragraph::new(
+            self.cached_lines
+                .iter()
+                .map(borrow_line)
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
@@ -2969,6 +2995,51 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
+        Paragraph::new(s.cached_lines.iter().map(borrow_line).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .line_count(width) as u16
+    }
+
+    #[test]
+    fn cached_total_rows_matches_full_line_count() {
+        let width: u16 = 40;
+        let mut s = state();
+
+        for i in 0..50 {
+            s.push_user_message(Some(format!("message number {i} with enough text to wrap across the forty column width budget")), Vec::new());
+        }
+        s.rebuild_lines(width);
+        assert_eq!(
+            s.cached_total_rows,
+            authoritative_rows(&s, width),
+            "full-rebuild row total must match line_count"
+        );
+
+        for i in 50..60 {
+            s.push_user_message(
+                Some(format!(
+                    "appended message {i} also long enough to wrap somewhere in the middle of a row"
+                )),
+                Vec::new(),
+            );
+        }
+        s.rebuild_lines(width);
+        assert_eq!(
+            s.cached_total_rows,
+            authoritative_rows(&s, width),
+            "incremental-append row total must match line_count"
+        );
+
+        let narrower: u16 = 20;
+        s.rebuild_lines(narrower);
+        assert_eq!(
+            s.cached_total_rows,
+            authoritative_rows(&s, narrower),
+            "width change must force a recompute that still matches line_count"
+        );
     }
 
     #[tokio::test]
