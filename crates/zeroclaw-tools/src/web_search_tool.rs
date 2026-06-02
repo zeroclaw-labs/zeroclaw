@@ -844,8 +844,9 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 }
 
 fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(content, "").to_string()
+    static RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"<[^>]+>").expect("strip_tags regex must compile"));
+    RE.replace_all(content, "").to_string()
 }
 
 #[async_trait]
