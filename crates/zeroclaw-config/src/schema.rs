@@ -9255,6 +9255,7 @@ pub struct RiskProfileConfig {
     /// `Forbidden`. Delegation requires caller and target to share a risk
     /// profile; the allow-list names the reachable same-profile agents.
     #[serde(default)]
+    #[nested]
     pub delegation_policy: DelegationPolicy,
     /// Tools the agent may call in agentic mode. Empty = inherit / no
     /// authorization constraint. Authorization decision: which tools is

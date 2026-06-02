@@ -352,7 +352,7 @@ impl DelegateTool {
                 "could not resolve security policy for delegate target {target_alias:?}: {e}"
             ))
         })?;
-        if !self.security.delegation_policy.permits(target_alias) {
+        if !self.security.delegation_policy.permits() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -361,11 +361,11 @@ impl DelegateTool {
                         "target_agent": target_alias,
                         "caller_risk_profile": self.security.risk_profile_name,
                     })),
-                "delegate refused: target not permitted by caller delegation_policy"
+                "delegate refused: caller delegation_policy forbids delegation"
             );
             return Err(anyhow::Error::msg(format!(
-                "delegate target {target_alias:?} is not permitted by the caller's \
-                 delegation_policy; add it to [risk_profiles.{}].delegation_policy agents",
+                "delegation is forbidden by the caller's delegation_policy; set \
+                 [risk_profiles.{}].delegation_policy mode = \"allow\"",
                 self.security.risk_profile_name
             )));
         }
@@ -524,12 +524,18 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let delegation_permitted = self.security.delegation_policy.permits();
+        let caller_profile = self.security.risk_profile_name.as_str();
+        // Advertise only agents the caller can actually reach: delegation must
+        // be permitted, the target shares the caller's risk profile, and the
+        // delegator never lists itself.
         let mut agent_names: Vec<&str> = self
             .agents
-            .keys()
-            .map(|s: &String| s.as_str())
-            .filter(|name| *name != self.caller_alias.as_str())
-            .filter(|name| self.security.delegation_policy.permits(name))
+            .iter()
+            .filter(|_| delegation_permitted)
+            .filter(|(name, _)| name.as_str() != self.caller_alias.as_str())
+            .filter(|(_, cfg)| cfg.risk_profile.trim() == caller_profile)
+            .map(|(name, _)| name.as_str())
             .collect();
         agent_names.sort_unstable();
         json!({
@@ -1791,10 +1797,10 @@ mod tests {
         Arc::new(SecurityPolicy::default())
     }
 
-    fn security_allowing(agents: &[&str]) -> Arc<SecurityPolicy> {
+    fn security_allowing() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
-            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy::Allow {
-                agents: agents.iter().map(|s| (*s).to_string()).collect(),
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
             },
             ..SecurityPolicy::default()
         })
@@ -2146,7 +2152,7 @@ mod tests {
         let tool = DelegateTool::new(
             sample_agents(),
             None,
-            security_allowing(&["researcher", "coder"]),
+            security_allowing(),
         );
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
@@ -2157,15 +2163,75 @@ mod tests {
 
     #[test]
     fn schema_roster_filtered_by_delegation_policy() {
-        // Only "researcher" is permitted; "coder" must be excluded from
-        // the advertised roster even though it is a configured agent.
-        let tool = DelegateTool::new(sample_agents(), None, security_allowing(&["researcher"]));
+        // When delegation is permitted, every configured agent (minus the
+        // caller) is advertised — reachability is gated by shared risk
+        // profile at delegation time, not by a per-agent roster allow-list.
+        let tool = DelegateTool::new(sample_agents(), None, security_allowing());
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
             .as_str()
             .unwrap();
         assert!(desc.contains("researcher"));
-        assert!(!desc.contains("coder"));
+        assert!(desc.contains("coder"));
+
+        // When delegation is forbidden, the roster is empty.
+        let forbidden = DelegateTool::new(sample_agents(), None, Arc::new(SecurityPolicy::default()));
+        let forbidden_schema = forbidden.parameters_schema();
+        let forbidden_desc = forbidden_schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(!forbidden_desc.contains("researcher"));
+        assert!(!forbidden_desc.contains("coder"));
+    }
+
+    #[test]
+    fn schema_roster_lists_only_same_risk_profile_peers() {
+        // Three agents: two on "alpha", one on "beta". Caller is on "alpha".
+        let mut agents = HashMap::new();
+        agents.insert(
+            "alpha_peer".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "alpha".into(),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "alpha_self".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "alpha".into(),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "beta_outsider".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "beta".into(),
+                ..Default::default()
+            },
+        );
+
+        // Caller on "alpha" with delegation allowed; it owns "alpha_self".
+        let mut policy = SecurityPolicy {
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+            },
+            ..SecurityPolicy::default()
+        };
+        policy.risk_profile_name = "alpha".into();
+        let mut tool = DelegateTool::new(agents, None, Arc::new(policy));
+        tool.caller_alias = "alpha_self".to_string();
+
+        let desc = tool.parameters_schema()["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Same-profile peer is listed.
+        assert!(desc.contains("alpha_peer"), "{desc}");
+        // Delegator excludes itself.
+        assert!(!desc.contains("alpha_self"), "{desc}");
+        // Off-profile agent is excluded.
+        assert!(!desc.contains("beta_outsider"), "{desc}");
     }
 
     #[test]
@@ -2175,7 +2241,7 @@ mod tests {
         let tool = DelegateTool::new(
             sample_agents(),
             None,
-            security_allowing(&["researcher", "coder"]),
+            security_allowing(),
         )
         .with_caller_alias("researcher");
         let schema = tool.parameters_schema();
@@ -3612,7 +3678,7 @@ mod tests {
         target_alias: &str,
         target_max_actions: u32,
     ) -> Arc<zeroclaw_config::schema::Config> {
-        use zeroclaw_config::autonomy::DelegationPolicy;
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
         };
@@ -3623,8 +3689,8 @@ mod tests {
         config.risk_profiles.insert(
             "narrow".to_string(),
             RiskProfileConfig {
-                delegation_policy: DelegationPolicy::Allow {
-                    agents: vec![target_alias.to_string()],
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
                 },
                 ..RiskProfileConfig::default()
             },
@@ -3740,15 +3806,15 @@ mod tests {
     /// profile. Delegation requires caller and target to share a risk
     /// profile, so this exercises the same-profile rejection gate.
     fn config_with_narrowed_target() -> Arc<zeroclaw_config::schema::Config> {
-        use zeroclaw_config::autonomy::DelegationPolicy;
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
         let mut config = Config::default();
         config.risk_profiles.insert(
             "broad".to_string(),
             RiskProfileConfig {
                 allowed_commands: vec!["git".into(), "cargo".into()],
-                delegation_policy: DelegationPolicy::Allow {
-                    agents: vec!["target".to_string()],
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
                 },
                 ..RiskProfileConfig::default()
             },

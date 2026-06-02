@@ -537,7 +537,7 @@ impl Default for SecurityPolicy {
         Self {
             autonomy: AutonomyLevel::Supervised,
             risk_profile_name: String::new(),
-            delegation_policy: crate::autonomy::DelegationPolicy::Forbidden,
+            delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
@@ -2730,7 +2730,7 @@ mod tests {
             auto_approve: vec!["memory_recall".into()],
             always_ask: vec!["shell".into()],
             allowed_roots: vec!["/tmp/extra".into()],
-            delegation_policy: crate::autonomy::DelegationPolicy::Forbidden,
+            delegation_policy: crate::autonomy::DelegationPolicy::default(),
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),

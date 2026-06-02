@@ -13043,7 +13043,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-desktop"
-version = "0.1.0"
+version = "0.8.0-beta-2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -13534,7 +13534,6 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
- "zerocode",
  "zip",
 ]
 
