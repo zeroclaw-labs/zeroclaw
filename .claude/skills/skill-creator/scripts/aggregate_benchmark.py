@@ -38,7 +38,7 @@ import argparse
 import json
 import math
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timezone
 from pathlib import Path
 
 
