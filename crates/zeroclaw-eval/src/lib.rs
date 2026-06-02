@@ -11,7 +11,7 @@
 //! ## Pieces
 //! - [`case`] — the [`LlmTrace`] fixture/case format and suite loading.
 //! - [`replay::TraceLlmProvider`] — a [`ModelProvider`](zeroclaw_api::model_provider::ModelProvider)
-//!   that replays trace steps in FIFO order.
+//!   that replays trace steps per turn, FIFO within each turn's boundary.
 //! - [`tools`] — deterministic built-in tools the replay agent can dispatch.
 //! - [`observer::RecordingObserver`] — captures tool-call names/outcomes and token
 //!   usage from the agent run.

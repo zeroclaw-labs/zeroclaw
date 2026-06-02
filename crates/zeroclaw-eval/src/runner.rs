@@ -71,7 +71,9 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider: Box<dyn ModelProvider> = Box::new(TraceLlmProvider::from_trace(trace));
+    let replay = TraceLlmProvider::from_trace(trace);
+    let replay_handle = replay.handle();
+    let provider: Box<dyn ModelProvider> = Box::new(replay);
 
     let mut agent = Agent::builder()
         .model_provider(provider)
@@ -83,8 +85,11 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
         .build()?;
 
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        // Enforce the turn boundary: every step scripted for this turn must have been
+        // consumed before the next turn begins, so responses cannot bleed across turns.
+        replay_handle.finish_turn(turn_index)?;
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
@@ -148,5 +153,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = run_suite(dir.path(), Mode::Live).await.unwrap_err();
         assert!(err.to_string().contains("live mode is not implemented"));
+    }
+
+    const MULTI_TURN: &str = r#"{
+        "model_name": "test-multi-turn",
+        "turns": [
+            { "user_input": "Hi", "steps": [{ "response": { "type": "text", "content": "Hello there." } }] },
+            { "user_input": "And goodbye?", "steps": [{ "response": { "type": "text", "content": "Goodbye!" } }] }
+        ],
+        "expects": {}
+    }"#;
+
+    #[tokio::test]
+    async fn replays_multi_turn_trace_in_order() {
+        let trace: LlmTrace = serde_json::from_str(MULTI_TURN).unwrap();
+        let record = run_case(&trace).await.unwrap();
+        // The final response comes from the *last* turn, proving turns replay in order
+        // with each turn's step consumed within its own boundary.
+        assert!(
+            record.final_response.contains("Goodbye"),
+            "final response: {:?}",
+            record.final_response
+        );
+    }
+
+    #[tokio::test]
+    async fn over_specified_turn_is_an_error() {
+        // The turn declares two steps but the agent makes a single chat() call, so the
+        // extra step is left unconsumed. Under the old flat queue this passed silently;
+        // now it must surface as a turn-scoped error rather than bleed into a next turn.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-over-specified",
+                "turns": [{ "user_input": "Hi", "steps": [
+                    { "response": { "type": "text", "content": "Hello there." } },
+                    { "response": { "type": "text", "content": "unused extra step" } }
+                ] }],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = match run_case(&trace).await {
+            Ok(_) => panic!("expected an error: an over-specified turn left a step unconsumed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("over-specifies") || msg.contains("never requested"),
+            "unexpected error: {msg}"
+        );
     }
 }
