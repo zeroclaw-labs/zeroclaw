@@ -40,7 +40,10 @@ impl DeviceRegistry {
         let db_path = workspace_dir.join("devices.db");
         let conn = Connection::open(&db_path).expect("Failed to open device registry database");
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS devices (
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             CREATE TABLE IF NOT EXISTS devices (
                 token_hash TEXT PRIMARY KEY,
                 id TEXT NOT NULL,
                 name TEXT,
@@ -106,7 +109,15 @@ impl DeviceRegistry {
     }
 
     fn open_db(&self) -> Connection {
-        Connection::open(&self.db_path).expect("Failed to open device registry database")
+        let conn =
+            Connection::open(&self.db_path).expect("Failed to open device registry database");
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;",
+        )
+        .expect("Failed to set device registry pragmas");
+        conn
     }
 
     pub fn register(&self, token_hash: String, info: DeviceInfo) {
