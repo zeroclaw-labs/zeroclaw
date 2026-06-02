@@ -194,6 +194,8 @@ Thanks to everyone who contributed between v0.8.0-beta-1 and v0.8.0-beta-2:
 @theonlyhennygod
 @tidux
 @tmigone
+@tylerjenningsw
+@whtiehack
 @XiaoliangWang1991
 @yijunyu
 
