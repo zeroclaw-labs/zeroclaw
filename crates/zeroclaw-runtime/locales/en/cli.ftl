@@ -383,6 +383,8 @@ channel-wecom-ws-dm-access-denied =
     Your userid: {$userid}
 
     Ask an administrator to add your userid to {$allowed_users_path}.
+channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
+channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =

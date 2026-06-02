@@ -78,8 +78,9 @@ list_features() {
   [ -n "$other" ]         && printf "  %s\n    %s\n\n" "$(bold "Other:")" "$other"
 
   printf "  %s\n" "$(bold "Build profiles:")"
-  printf "    %s                                        # full (default features)\n" "$0"
+  printf "    %s                                        # standard lean default features\n" "$0"
   printf "    %s --minimal                              # kernel only (~6.6MB)\n" "$0"
+  printf "    %s --preset full                          # historical broad channel bundle\n" "$0"
   printf "    %s --minimal --features agent-runtime,channel-discord\n" "$0"
   echo
 }
@@ -255,7 +256,7 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (default features). Source builds only.
+                       'full' (historical broad channel bundle). Source builds only.
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --with-gateway       Force the gateway feature on (overrides preset/feature default)
@@ -274,6 +275,7 @@ Examples:
   $0 --prebuilt                                # download pre-built binary (fast)
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
+  $0 --source --preset full                    # broad channel compatibility build
   $0 --source --features agent-runtime,channel-discord  # custom feature set
   $0 --skip-onboard                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
@@ -488,7 +490,7 @@ UNINSTALL=false
 DRY_RUN=false
 PREFIX="$HOME"
 INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
-PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=default-features
+PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=channels-full
 WITH_GATEWAY=""   # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 
 # Support legacy env var
@@ -714,6 +716,10 @@ if [ "$MINIMAL" = true ]; then
   CARGO_FLAGS="--no-default-features"
 fi
 
+if [ "$PRESET" = "full" ]; then
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}channels-full"
+fi
+
 # `--without-gateway` overrides the default-features set: switch to
 # --no-default-features and re-add everything in `default` except gateway.
 if [ "$WITH_GATEWAY" = "false" ] && [ "$MINIMAL" != true ]; then
@@ -786,7 +792,7 @@ if [ -n "$PATH_BIN" ]; then
     fi
   fi
   if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-    info "--preset full: building from source with the full default feature set."
+    info "--preset full: building from source with the historical broad channel bundle."
   fi
 fi
 

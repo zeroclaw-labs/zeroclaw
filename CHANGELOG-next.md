@@ -131,6 +131,7 @@ ACP mode (the `zeroclaw acp` subprocess and the `zeroclaw-acp-bridge` editor bri
 
 - NixOS module + test for `services.zeroclaw.instances` (#6562).
 - Desktop (Tauri): macOS onboarding wizard with permission primitives and capability sync (#6506), Linux/Windows permission onboarding (#6710), and `take_screenshot` / `run_applescript` commands (#6507).
+- **Lean default channel bundle.** Standard default builds and release/prebuilt artifacts now compile the core first-run/gateway channel set by default: ACP server, webhook, email, and Telegram. The historical broad bundle remains available as `channels-full`, and `install.sh --source --preset full` selects that bundle for source installs that need every bundled channel (#6904).
 
 ### Internationalization
 
@@ -167,6 +168,24 @@ zeroclaw config migrate          # add --json for a machine-readable report
 ```
 
 **Back up first.** SQLite memory is backed up automatically (`brain.db.backup-<ts>`), and the install tree is copied to `backup-<ts>/` before the split. **Postgres and Qdrant are NOT backed up for you. Dump them yourself before upgrading.**
+
+### Default builds are now leaner
+
+Default/source builds and release/prebuilt artifacts no longer inherit every historical channel through Cargo defaults. The default channel bundle is now ACP server, webhook, email, and Telegram, with release builds adding only their explicit release features. Long-tail channels such as Discord, Slack, Signal, Mattermost, IRC, iMessage, DingTalk, QQ, Bluesky, Twitter/X, Reddit, Notion, MQTT, Linq, WATI, Nextcloud Talk, Voice Call, ClawdTalk, WeCom, WeCom WebSocket, WhatsApp Cloud, and Mochat remain in the repository, but they must be selected with `channels-full` or with their specific `channel-*` features.
+
+Existing channel config is not deleted. If a config references a channel that is not compiled into the current binary, `/api/channels` reports it as `not_compiled` / `unavailable` so operators can rebuild with the needed feature set. To preserve the historical broad channel bundle from source, use:
+
+```bash
+./install.sh --source --preset full
+```
+
+or build/install with:
+
+```bash
+cargo install --path . --features channels-full
+```
+
+Packagers that intentionally ship every bundled channel should add `channels-full` to their build features. Packagers that want a narrower binary should list the specific `channel-*` features they intend to support. (#6904)
 
 ### Schema V3 and the install layout
 

@@ -354,6 +354,24 @@ fn push_failure(
     ));
 }
 
+/// True when a syntactically-successful response carries no usable content:
+/// no text, no tool calls, and no reasoning. Such "empty completions" (a 2xx
+/// with a null/blank message, a 0-token sample, a content-filter soft block, or
+/// a truncated stream) are never a legitimate final answer — they are almost
+/// always a transient provider hiccup — so callers re-roll them like a
+/// retryable error instead of surfacing a blank turn.
+///
+/// Prompt-guided tool calls embed the call in `text`, so a response carrying
+/// `<tool_call>…` is non-empty here and is never misclassified.
+fn is_empty_completion(resp: &ChatResponse) -> bool {
+    resp.text_or_empty().trim().is_empty()
+        && resp.tool_calls.is_empty()
+        && resp
+            .reasoning_content
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+}
+
 // ── Resilient ModelProvider Wrapper ────────────────────────────────────────────
 // Two-level strategy: model_provider chain → retry loop.
 //   Outer loop: iterate registered model_providers in priority order. The production
@@ -439,6 +457,43 @@ impl ReliableModelProvider {
             base
         }
     }
+
+    /// Shared tail of the empty-completion retry path used by every chat method:
+    /// record the empty attempt, warn, sleep the current backoff, then double it
+    /// (capped). The caller keeps the emptiness check (it differs per return
+    /// type) and the `continue`. See [`is_empty_completion`].
+    async fn backoff_after_empty_completion(
+        &self,
+        failures: &mut Vec<String>,
+        provider_name: &str,
+        model: &str,
+        attempt: u32,
+        backoff_ms: &mut u64,
+    ) {
+        push_failure(
+            failures,
+            provider_name,
+            model,
+            attempt + 1,
+            self.max_retries + 1,
+            "empty_response",
+            "model_provider returned an empty completion",
+        );
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": provider_name,
+                    "model": model,
+                    "attempt": attempt + 1,
+                    "backoff_ms": *backoff_ms
+                })),
+            "Empty completion; retrying"
+        );
+        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+        *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+    }
 }
 
 #[async_trait]
@@ -488,6 +543,19 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
+                            // Re-roll a transient empty completion instead of
+                            // returning a blank turn (bounded by `max_retries`).
+                            if attempt < self.max_retries && resp.trim().is_empty() {
+                                self.backoff_after_empty_completion(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    &mut backoff_ms,
+                                )
+                                .await;
+                                continue;
+                            }
                             if attempt > 0
                                 || *current_model != model
                                 || self.model_providers.first().map(|(n, _)| n.as_str())
@@ -605,6 +673,19 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
+                            // Re-roll a transient empty completion instead of
+                            // returning a blank turn (bounded by `max_retries`).
+                            if attempt < self.max_retries && resp.trim().is_empty() {
+                                self.backoff_after_empty_completion(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    &mut backoff_ms,
+                                )
+                                .await;
+                                continue;
+                            }
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
@@ -742,6 +823,20 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
+                            // Re-roll a transient empty completion instead of
+                            // returning a blank turn (bounded by `max_retries`;
+                            // see `is_empty_completion`).
+                            if attempt < self.max_retries && is_empty_completion(&resp) {
+                                self.backoff_after_empty_completion(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    &mut backoff_ms,
+                                )
+                                .await;
+                                continue;
+                            }
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
@@ -866,6 +961,20 @@ impl ModelProvider for ReliableModelProvider {
                     };
                     match model_provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
+                            // Re-roll a transient empty completion instead of
+                            // returning a blank turn (bounded by `max_retries`;
+                            // see `is_empty_completion`).
+                            if attempt < self.max_retries && is_empty_completion(&resp) {
+                                self.backoff_after_empty_completion(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    &mut backoff_ms,
+                                )
+                                .await;
+                                continue;
+                            }
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
@@ -1367,6 +1476,223 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Returns an empty completion (blank `chat_with_system` text, which the
+    /// default `chat`/`chat_with_tools`/`chat_with_history` impls surface as a
+    /// blank `ChatResponse`) for the first `empty_until_attempt` calls, then a
+    /// non-empty response. Counts total calls so tests can assert re-rolls.
+    struct EmptyThenTextMock {
+        calls: Arc<AtomicUsize>,
+        empty_until_attempt: usize,
+        response: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyThenTextMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.empty_until_attempt {
+                Ok(String::new())
+            } else {
+                Ok(self.response.to_string())
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for EmptyThenTextMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyThenTextMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_retries_empty_completion_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: 1,
+                    response: "recovered",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = model_provider
+            .chat(request, "test", Some(0.0))
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("recovered"));
+        // One empty completion + one successful re-roll.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_retries_empty_completion_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: 1,
+                    response: "recovered",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let result = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_retries_empty_string_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: 1,
+                    response: "recovered",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let result = model_provider
+            .chat_with_history(&messages, "test", Some(0.0))
+            .await
+            .unwrap();
+        assert_eq!(result, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_retries_empty_string_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: 1,
+                    response: "recovered",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        // `simple_chat` routes through `ReliableModelProvider::chat_with_system`,
+        // the path subagent delegation uses.
+        let result = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .unwrap();
+        assert_eq!(result, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_persistent_empty_returns_blank_without_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: usize::MAX, // always empty
+                    response: "never",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        // Exhausting the empty re-rolls returns the last (blank) response rather
+        // than erroring — strictly never worse than the pre-fix behavior.
+        let result = model_provider
+            .chat(request, "test", Some(0.0))
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some(""));
+        // Initial attempt + max_retries (2) re-rolls = 3 calls.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn chat_nonempty_response_is_not_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: 0, // never empty
+                    response: "direct",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = model_provider
+            .chat(request, "test", Some(0.0))
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("direct"));
+        // A non-empty response must not trigger any re-roll.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

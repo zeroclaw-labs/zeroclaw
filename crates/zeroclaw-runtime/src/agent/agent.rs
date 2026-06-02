@@ -1914,6 +1914,8 @@ impl Agent {
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut streamed_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
             let mut got_stream = false;
+            let mut visible_streamed_output = false;
+            let mut stream_error: Option<String> = None;
             let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut was_cancelled = false;
 
@@ -1951,12 +1953,14 @@ impl Agent {
                                 let _ = event_tx
                                     .send(TurnEvent::Thinking { delta: reasoning })
                                     .await;
+                                visible_streamed_output = true;
                             }
                             if !chunk.delta.is_empty() {
                                 got_stream = true;
                                 streamed_text.push_str(&chunk.delta);
                                 let _ =
                                     event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                                visible_streamed_output = true;
                             }
                         }
                         zeroclaw_providers::traits::StreamEvent::ToolCall(tc) => {
@@ -1981,6 +1985,7 @@ impl Agent {
                                     args: serde_json::from_str(&args).unwrap_or_default(),
                                 })
                                 .await;
+                            visible_streamed_output = true;
                             // NOT pushed to streamed_tool_calls — already executed by proxy
                         }
                         zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
@@ -1998,6 +2003,7 @@ impl Agent {
                                     output,
                                 })
                                 .await;
+                            visible_streamed_output = true;
                         }
                         zeroclaw_providers::traits::StreamEvent::Usage(usage) => {
                             streamed_usage = Some(usage);
@@ -2005,35 +2011,7 @@ impl Agent {
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
                     Err(error) => {
-                        if got_stream || !committed_response.is_empty() {
-                            if !streamed_text.is_empty() {
-                                let partial = Self::marked_partial_response(
-                                    &streamed_text,
-                                    "[stream interrupted]",
-                                );
-                                self.append_streamed_assistant_message_to_history(
-                                    partial,
-                                    &mut new_msgs,
-                                    &mut committed_response,
-                                );
-                            }
-                            let safe_error =
-                                zeroclaw_providers::sanitize_api_error(&error.to_string());
-                            self.observer.record_event(&ObserverEvent::LlmResponse {
-                                model_provider: self.model_provider_name.clone(),
-                                model: effective_model.clone(),
-                                duration: llm_started_at.elapsed(),
-                                success: false,
-                                error_message: Some(safe_error),
-                                input_tokens: None,
-                                output_tokens: None,
-                            });
-                            return Err(StreamedTurnError {
-                                error: anyhow::Error::msg(error.to_string()),
-                                committed_response,
-                                new_messages: new_msgs,
-                            });
-                        }
+                        stream_error = Some(error.to_string());
                         break;
                     }
                 }
@@ -2068,9 +2046,41 @@ impl Agent {
                 });
             }
 
-            // If streaming produced text, use it as the response and
-            // check for tool calls via the dispatcher.
-            let response = if got_stream {
+            if stream_error.is_some() && visible_streamed_output {
+                if !streamed_text.is_empty() {
+                    let partial =
+                        Self::marked_partial_response(&streamed_text, "[stream interrupted]");
+                    self.append_streamed_assistant_message_to_history(
+                        partial,
+                        &mut new_msgs,
+                        &mut committed_response,
+                    );
+                }
+                let safe_error = zeroclaw_providers::sanitize_api_error(
+                    stream_error.as_deref().unwrap_or_default(),
+                );
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(safe_error),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+                return Err(StreamedTurnError {
+                    error: anyhow::Error::msg(stream_error.unwrap_or_default()),
+                    committed_response,
+                    new_messages: new_msgs,
+                });
+            }
+
+            // If streaming completed cleanly and produced text, use it as the
+            // response and check for tool calls via the dispatcher. If the
+            // stream errored before emitting visible output, fall back to
+            // non-streaming chat so provider error text does not become the
+            // final answer.
+            let response = if got_stream && stream_error.is_none() {
                 // Build a synthetic ChatResponse from streamed text.
                 // `streamed_reasoning` carries signed thinking blocks from
                 // providers that emit them via `StreamChunk.reasoning`
@@ -2087,6 +2097,18 @@ impl Agent {
                     },
                 }
             } else {
+                if let Some(error) = stream_error.as_ref() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": effective_model.as_str(),
+                                "error": zeroclaw_providers::sanitize_api_error(error),
+                            })),
+                        "turn_streamed provider stream failed; falling back to non-streaming chat"
+                    );
+                }
                 // Fall back to non-streaming chat, with cancellation guard
                 let chat_fut = self.model_provider.chat(
                     ChatRequest {
@@ -2105,8 +2127,16 @@ impl Agent {
                     tokio::select! {
                         biased;
                         () = token.cancelled() => {
+                            let partial = if streamed_text.is_empty() {
+                                "[interrupted by user]".to_string()
+                            } else {
+                                Self::marked_partial_response(
+                                    &streamed_text,
+                                    "[interrupted by user]",
+                                )
+                            };
                             self.append_streamed_assistant_message_to_history(
-                                "[interrupted by user]".to_string(),
+                                partial,
                                 &mut new_msgs,
                                 &mut committed_response,
                             );
@@ -2143,6 +2173,17 @@ impl Agent {
                             input_tokens: None,
                             output_tokens: None,
                         });
+                        if got_stream && !streamed_text.is_empty() {
+                            let partial = Self::marked_partial_response(
+                                &streamed_text,
+                                "[stream interrupted]",
+                            );
+                            self.append_streamed_assistant_message_to_history(
+                                partial,
+                                &mut new_msgs,
+                                &mut committed_response,
+                            );
+                        }
                         return Err(StreamedTurnError {
                             error,
                             committed_response,
@@ -2599,7 +2640,9 @@ mod tests {
         seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
         call_count: AtomicUsize,
         fail_on_call: Option<usize>,
+        fail_chat_on_call: Option<usize>,
         fail_after_delta_on_call: Option<usize>,
+        delay_chat_on_call: Option<usize>,
     }
 
     #[async_trait]
@@ -2622,8 +2665,14 @@ mod tests {
         ) -> Result<zeroclaw_providers::ChatResponse> {
             let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
             self.seen_messages.lock().push(request.messages.to_vec());
+            if self.delay_chat_on_call == Some(call) {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
             if self.fail_on_call == Some(call) {
                 anyhow::bail!("synthetic provider failure on call {call}");
+            }
+            if self.fail_chat_on_call == Some(call) {
+                anyhow::bail!("synthetic chat failure on call {call}");
             }
             if self.fail_after_delta_on_call == Some(call) {
                 anyhow::bail!("synthetic provider failure after delta on call {call}");
@@ -4832,7 +4881,9 @@ mod tests {
             seen_messages: seen_messages.clone(),
             call_count: AtomicUsize::new(0),
             fail_on_call: None,
+            fail_chat_on_call: None,
             fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
         });
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -4928,7 +4979,9 @@ mod tests {
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             call_count: AtomicUsize::new(0),
             fail_on_call: Some(2),
+            fail_chat_on_call: Some(3),
             fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
         });
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -4982,7 +5035,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_streamed_error_after_delta_returns_visible_partial_output() {
+    async fn turn_streamed_error_before_visible_output_falls_back_to_chat() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: Some(1),
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let handle = tokio::spawn(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, None)
+                .await
+        });
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("pre-output stream failure should fall back to non-streaming chat");
+        assert_eq!(outcome.response, "final");
+        assert!(
+            outcome.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "final")
+            }),
+            "new messages should carry the fallback assistant answer"
+        );
+        assert!(
+            !outcome.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains("[stream interrupted]"))
+            }),
+            "successful fallback should not persist interrupted stream text"
+        );
+
+        let seen = seen_messages.lock();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            !seen[1]
+                .iter()
+                .any(|msg| { msg.role == "assistant" && msg.content.contains("draft") }),
+            "fallback chat must not receive the abandoned stream attempt as prior assistant text"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_error_after_delta_preserves_visible_partial() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -4996,7 +5115,9 @@ mod tests {
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             call_count: AtomicUsize::new(0),
             fail_on_call: None,
+            fail_chat_on_call: None,
             fail_after_delta_on_call: Some(1),
+            delay_chat_on_call: None,
         });
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -5027,7 +5148,7 @@ mod tests {
         let err = handle
             .await
             .expect("turn task should finish")
-            .expect_err("provider stream failure should be returned");
+            .expect_err("post-output stream failure should return an error with partial output");
         assert!(
             err.error
                 .to_string()
@@ -5036,18 +5157,74 @@ mod tests {
             err.error
         );
         assert!(
-            err.committed_response.contains("draft"),
-            "visible streamed text should be committed after a provider stream error"
-        );
-        assert!(
             err.committed_response.contains("[stream interrupted]"),
-            "persisted partial text should mark that the stream did not complete"
+            "persisted partial text should mark that the visible stream was interrupted"
         );
         assert!(
             err.new_messages.iter().any(|msg| {
                 matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains("draft"))
             }),
             "new messages should carry the visible assistant partial for gateway persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_error_before_visible_output_fallback_can_be_cancelled() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: Some(1),
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: Some(2),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_for_task = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, Some(cancel_for_task), None)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cancel_token.cancel();
+
+        let err = handle
+            .await
+            .expect("turn task should finish")
+            .expect_err("cancelled fallback should return cancellation");
+        assert!(
+            crate::agent::loop_::is_tool_loop_cancelled(&err.error),
+            "unexpected error: {}",
+            err.error
+        );
+        assert_eq!(err.committed_response, "[interrupted by user]");
+        assert!(
+            err.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "[interrupted by user]")
+            }),
+            "pre-output fallback cancellation should include an interruption marker"
         );
     }
 
@@ -5066,7 +5243,9 @@ mod tests {
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             call_count: AtomicUsize::new(0),
             fail_on_call: None,
+            fail_chat_on_call: None,
             fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
         });
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -5117,7 +5296,9 @@ mod tests {
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             call_count: AtomicUsize::new(0),
             fail_on_call: None,
+            fail_chat_on_call: None,
             fail_after_delta_on_call: Some(1),
+            delay_chat_on_call: None,
         });
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -5213,7 +5394,9 @@ mod tests {
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             call_count: AtomicUsize::new(0),
             fail_on_call: None,
+            fail_chat_on_call: None,
             fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
         });
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
