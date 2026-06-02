@@ -342,6 +342,8 @@ channel-wecom-ws-dm-access-denied =
     你的 userid: {$userid}
 
     请管理员将你的 userid 加入 {$allowed_users_path}。
+channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）
+channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）

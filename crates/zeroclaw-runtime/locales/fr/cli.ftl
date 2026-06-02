@@ -346,6 +346,8 @@ channel-wecom-ws-dm-access-denied =
     Votre userid : {$userid}
 
     Demandez à un administrateur d'ajouter votre userid à {$allowed_users_path}.
+channel-discord-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)
+channel-discord-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} fichiers.)
 onboard-openai-auth-note =
     Authentification OpenAI :
     • Clé API — accès API standard via platform.openai.com (sk-...)

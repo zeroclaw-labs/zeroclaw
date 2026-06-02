@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ZeroClaw Docs\n"
-"POT-Creation-Date: 2026-05-31T18:55:48+10:00\n"
+"POT-Creation-Date: 2026-06-02T22:11:54+10:00\n"
 "PO-Revision-Date: 2026-04-24T20:52:43+10:00\n"
 "Last-Translator: Automatically generated\n"
 "Language-Team: none\n"
@@ -35,6 +35,10 @@ msgstr "\"$GATEWAY_TIMEOUT_SECS\""
 #: src/ops/troubleshooting.md
 msgid "\"$HOME/.cargo/bin:$PATH\""
 msgstr "\"$HOME/.cargo/bin:$PATH\""
+
+#: src/gateway/web-dashboard.md
+msgid "\"$HOME/zeroclaw/web/dist\"   # shell expands $HOME\n"
+msgstr "\"$HOME/zeroclaw/web/dist\"   # shell expands $HOME\n"
 
 #: src/setup/macos.md src/ops/troubleshooting.md
 msgid "\"$HOMEBREW_PREFIX/var/zeroclaw\""
@@ -104,6 +108,10 @@ msgstr "\"%USERPROFILE%\\.zeroclaw\\bin\\zeroclaw.exe\""
 #: src/channels/acp.md
 msgid "\"...\""
 msgstr "\"...\""
+
+#: src/gateway/web-dashboard.md
+msgid "\"/absolute/path/to/zeroclaw/web/dist\""
+msgstr "\"/absolute/path/to/zeroclaw/web/dist\""
 
 #: src/channels/acp.md
 msgid "\"/path/to/project\""
@@ -357,6 +365,10 @@ msgstr "Texte de résultat affiché au LLM"
 msgid "\"Set up Telegram integration\""
 msgstr "Configurer l'intégration Telegram"
 
+#: src/gateway/web-dashboard.md
+msgid "\"Stale path\" WARN at startup"
+msgstr "Avertissement « Chemin obsolète » au démarrage"
+
 #: src/channels/acp.md
 msgid "\"Summarise the changes in the last commit.\""
 msgstr "Résumez les modifications du dernier commit."
@@ -393,6 +405,10 @@ msgstr "\"Message utilisateur\""
 msgid "\"VNC available at:\""
 msgstr "« VNC disponible à : »"
 
+#: src/gateway/web-dashboard.md
+msgid "\"Web dashboard: not available\" at startup"
+msgstr "« Web dashboard: not available » au démarrage"
+
 #: src/developing/plugin-protocol.md
 msgid "\"What this tool does\""
 msgstr "« Ce que fait cet outil »"
@@ -424,6 +440,10 @@ msgstr "\"access_token\""
 #: src/architecture/logging.md
 msgid "\"action\""
 msgstr "action"
+
+#: src/channels/overview.md
+msgid "\"agent-runtime,gateway,channel-discord\""
+msgstr "agent-runtime,gateway,channel-discord"
 
 #: src/foundations/fnd-006-zero-compromise-in-practice.md
 msgid "\"agent.tool_call\""
@@ -1521,6 +1541,10 @@ msgstr "- Téléchargez et installez\n"
 msgid "# Download the appropriate binary\n"
 msgstr "# Téléchargez le binaire approprié\n"
 
+#: src/gateway/web-dashboard.md
+msgid "# Equivalent env-var override (in-memory only, never persisted)\n"
+msgstr "# Équivalent de surcharge par variable d'environnement (en mémoire uniquement, jamais persisté)\n"
+
 #: src/developing/building-docs.md src/maintainers/docs-and-translations.md
 msgid "# Fast delta pass (only new or changed strings since last release)\n"
 msgstr "# Passage rapide des deltas (seulement les nouvelles chaînes ou celles modifiées depuis la dernière version)\n"
@@ -1697,6 +1721,10 @@ msgstr "# Pi 4 (4 Go, avec swap) : utiliser release-fast\n"
 msgid "# Pi 5 (8 GB, with swap): default release works\n"
 msgstr "# Pi 5 (8 Go, avec swap) : la version par défaut fonctionne\n"
 
+#: src/reference/env-vars.md
+msgid "# Point the gateway at a built web dashboard (absolute path; no ~ / $HOME)\n"
+msgstr "# Pointer la passerelle vers un tableau de bord web généré (chemin absolu ; pas de ~ / $HOME)\n"
+
 #: src/hardware/adding-boards-and-tools.md
 msgid "# Restart daemon to apply\n"
 msgstr "# Redémarrez le daemon pour appliquer\n"
@@ -1792,6 +1820,12 @@ msgstr "# aarch64 → 64 bits (utiliser le binaire aarch64)\n"
 #: src/hardware/index.md
 msgid "# add yourself to hardware groups (re-login after)\n"
 msgstr "# ajoutez-vous aux groupes matériels (déconnectez-vous et reconnectez-vous après)\n"
+
+#: src/gateway/web-dashboard.md
+msgid ""
+"# alias for `cargo run -p xtask --bin web -- build`\n"
+"                          # auto-runs `npm install` on first run\n"
+msgstr "# alias pour `cargo run -p xtask --bin web -- build`\n                          # exécute automatiquement `npm install` au premier lancement\n"
 
 #: src/setup/linux.md src/setup/macos.md
 msgid "# always build from source\n"
@@ -1919,7 +1953,13 @@ msgstr "# sélecteur interactif\n"
 
 #: src/getting-started/language.md
 msgid "# just CLI strings\n"
-msgstr "# CLI just\n\n\nJe remarque que cette chaîne semble incomplète. Le titre `# just CLI strings` indique qu'il s'agit probablement d'un en-tête pour une section contenant des chaînes CLI, mais aucune chaîne réelle à traduire n'est fournie.\n\nPourriez-vous me communiquer les chaînes CLI à traduire ?\n"
+msgstr "Pourriez-vous me communiquer les chaînes CLI à traduire ?"
+"# CLI just\n"
+"\n"
+"\n"
+"Je remarque que cette chaîne semble incomplète. Le titre `# just CLI strings` indique qu'il s'agit probablement d'un en-tête pour une section contenant des chaînes CLI, mais aucune chaîne réelle à traduire n'est fournie.\n"
+"\n"
+"Pourriez-vous me communiquer les chaînes CLI à traduire ?\n"
 
 #: src/setup/linux.md src/setup/macos.md
 msgid "# kernel only (~6.6 MB)\n"
@@ -2253,14 +2293,6 @@ msgstr "(Les tâches d'agent lancées par cron constituent un site de générati
 #: src/hardware/adding-boards-and-tools.md
 msgid "(Uno Q IP)"
 msgstr "(Uno Q IP)"
-
-#: src/channels/overview.md
-msgid "(always on with gateway)"
-msgstr "(toujours activé avec la passerelle)"
-
-#: src/channels/overview.md
-msgid "(always on with runtime)"
-msgstr "(toujours activé avec l'exécution)"
 
 #: src/getting-started/tui.md
 msgid "(none)"
@@ -3533,6 +3565,10 @@ msgstr "**Les commandes GPIO sont ignorées** — Assurez-vous que l’applicati
 #: src/hardware/hardware-peripherals-design.md
 msgid "**GPIO:** Restrict which pins are exposed; avoid power/reset pins."
 msgstr "**GPIO :** Restreindre les broches exposées ; éviter les broches d'alimentation et de réinitialisation."
+
+#: src/architecture/subagents.md
+msgid "**Gating**"
+msgstr "**Contrôle d'accès**"
 
 #: src/providers/configuration.md
 msgid "**Gemini CLI** — `[providers.models.gemini_cli.<alias>]` shells out to the `gemini` CLI; use the CLI's own auth flow."
@@ -4873,6 +4909,10 @@ msgstr "**Service indisponible (503)** : problème temporaire du service"
 #: src/channels/acp.md
 msgid "**Session context** comes from the persisted conversation history in `acp-sessions.db`. Sessions are persistent, resumable, and deleteable — the session history serves as the working context, not the agent's long-term memory."
 msgstr "**Le contexte de session** provient de l'historique de conversation persisté dans `acp-sessions.db`. Les sessions sont persistantes, reprenables et supprimables — l'historique de session sert de contexte de travail, et non de mémoire à long terme de l'agent."
+
+#: src/architecture/subagents.md
+msgid "**Shared risk profile** — the target agent must use the **same** risk profile as the caller. Delegation does not cross trust tiers: an agent on `hardened` cannot delegate to an agent on `permissive`. When they differ, the refusal is:"
+msgstr "**Profil de risque partagé** — l'agent cible doit utiliser le **même** profil de risque que l'appelant. La délégation ne franchit pas les niveaux de confiance : un agent sur `hardened` ne peut pas déléguer à un agent sur `permissive`. Lorsqu'ils diffèrent, le refus est le suivant :"
 
 #: src/hardware/hardware-peripherals-design.md
 msgid "**Shutdown:** Call `disconnect()` on each peripheral."
@@ -6455,8 +6495,12 @@ msgid "**`cargo-deny` is not cached.** The `security` job installs it fresh from
 msgstr "**`cargo-deny` n'est pas mis en cache.** Le job `security` l'installe à partir des sources à chaque exécution. Une amélioration future consisterait à utiliser `taiki-e/install-action`, qui met déjà en cache `cargo-nextest`."
 
 #: src/architecture/subagents.md
-msgid "**`delegate`** — hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity, its own risk profile, its own model provider. Use when a sibling agent is the right specialist for the work."
-msgstr "**`delegate`** — délègue la requête à un agent configuré DIFFÉRENT (identifié par alias). L'agent cible s'exécute sous sa propre identité, son propre profil de risque, son propre fournisseur de modèle. À utiliser lorsqu'un agent du même niveau est le spécialiste approprié pour la tâche."
+msgid "**`delegate`** — hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity and model provider, but delegation is gated: the caller's risk profile must set `delegation_policy mode = \"allow\"` (default is `\"forbidden\"`), AND the target must share the **same** risk profile as the caller. Use when a sibling agent on the same trust tier is the right specialist for the work. See [Delegation gating](#delegation-gating) below."
+msgstr "**`delegate`** — transmet la requête à un agent configuré DIFFÉRENT (désigné par alias). L'agent cible s'exécute sous sa propre identité et son propre fournisseur de modèle, mais la délégation est contrôlée : le profil de risque de l'appelant doit définir `delegation_policy mode = \"allow\"` (la valeur par défaut est `\"forbidden\"`), ET la cible doit partager le **même** profil de risque que l'appelant. À utiliser lorsqu'un agent frère du même niveau de confiance est le bon spécialiste pour la tâche. Voir [Contrôle de délégation](#delegation-gating) ci-dessous."
+
+#: src/architecture/subagents.md
+msgid "**`delegation_policy.mode`** — the caller's risk profile must permit delegation. `[risk_profiles.<alias>].delegation_policy` is `{ mode = \"forbidden\" }` by default; set `mode = \"allow\"` to permit delegation at all. When forbidden, the refusal is:"
+msgstr "**`delegation_policy.mode`** — le profil de risque de l'appelant doit autoriser la délégation. `[risk_profiles.<alias>].delegation_policy` vaut `{ mode = \"forbidden\" }` par défaut ; définissez `mode = \"allow\"` pour autoriser la délégation. Lorsque la délégation est interdite, le refus est :"
 
 #: src/channels/matrix.md
 msgid "**`device-id` drift is detected but tolerated, not wiped.** If `channels.matrix.device-id` differs from the device id stored in `session.json`, the channel logs a warning and honors the saved id (which is the value the homeserver actually assigned at login). Wiping on drift would create a recovery loop because auto-recovery itself generates a new id, leaving config and session permanently out of sync."
@@ -6774,6 +6818,10 @@ msgstr "/etc/zeroclaw         # emplacement du fichier de configuration\n"
 msgid "/srv/zeroclaw          # workspace root\n"
 msgstr "/srv/zeroclaw          # racine de l'espace de travail\n"
 
+#: src/reference/env-vars.md
+msgid "/srv/zeroclaw/web/dist"
+msgstr "/srv/zeroclaw/web/dist"
+
 #: src/architecture/rpc-socket.md
 msgid "/tmp/my-zeroclaw.sock"
 msgstr "/tmp/my-zeroclaw.sock"
@@ -6782,8 +6830,9 @@ msgstr "/tmp/my-zeroclaw.sock"
 msgid "/zeroclaw-data"
 msgstr "/zeroclaw-data"
 
-#: src/hardware/arduino-uno-q-setup.md src/hardware/nucleo-setup.md
-#: src/foundations/index.md src/foundations/fnd-001-intentional-architecture.md
+#: src/gateway/web-dashboard.md src/hardware/arduino-uno-q-setup.md
+#: src/hardware/nucleo-setup.md src/foundations/index.md
+#: src/foundations/fnd-001-intentional-architecture.md
 #: src/foundations/fnd-003-governance.md
 #: src/foundations/fnd-004-engineering-infrastructure.md
 #: src/foundations/fnd-006-zero-compromise-in-practice.md
@@ -7030,8 +7079,9 @@ msgstr "1 à 3 jours"
 msgid "1–63 characters."
 msgstr "1–63 caractères."
 
-#: src/hardware/arduino-uno-q-setup.md src/hardware/nucleo-setup.md
-#: src/foundations/index.md src/foundations/fnd-001-intentional-architecture.md
+#: src/gateway/web-dashboard.md src/hardware/arduino-uno-q-setup.md
+#: src/hardware/nucleo-setup.md src/foundations/index.md
+#: src/foundations/fnd-001-intentional-architecture.md
 #: src/foundations/fnd-003-governance.md
 msgid "2"
 msgstr "2"
@@ -7236,8 +7286,9 @@ msgstr "240"
 msgid "2g"
 msgstr "2g"
 
-#: src/hardware/arduino-uno-q-setup.md src/hardware/nucleo-setup.md
-#: src/foundations/index.md src/foundations/fnd-001-intentional-architecture.md
+#: src/gateway/web-dashboard.md src/hardware/arduino-uno-q-setup.md
+#: src/hardware/nucleo-setup.md src/foundations/index.md
+#: src/foundations/fnd-001-intentional-architecture.md
 #: src/foundations/fnd-003-governance.md
 msgid "3"
 msgstr "3"
@@ -7426,8 +7477,9 @@ msgstr "31 × `README.*.md` à la racine"
 msgid "371"
 msgstr "371"
 
-#: src/hardware/arduino-uno-q-setup.md src/hardware/nucleo-setup.md
-#: src/foundations/index.md src/foundations/fnd-003-governance.md
+#: src/gateway/web-dashboard.md src/hardware/arduino-uno-q-setup.md
+#: src/hardware/nucleo-setup.md src/foundations/index.md
+#: src/foundations/fnd-003-governance.md
 msgid "4"
 msgstr "4"
 
@@ -7619,9 +7671,9 @@ msgstr "404"
 msgid "409"
 msgstr "409"
 
-#: src/hardware/arduino-uno-q-setup.md src/hardware/nucleo-setup.md
-#: src/foundations/index.md src/foundations/fnd-003-governance.md
-#: src/maintainers/labels.md
+#: src/gateway/web-dashboard.md src/hardware/arduino-uno-q-setup.md
+#: src/hardware/nucleo-setup.md src/foundations/index.md
+#: src/foundations/fnd-003-governance.md src/maintainers/labels.md
 msgid "5"
 msgstr "5"
 
@@ -8247,6 +8299,10 @@ msgstr "Un SBC de laboratoire domestique où vous possédez chaque octet sur la 
 msgid "A label policy or threshold changes."
 msgstr "Une politique d'étiquette ou un seuil a changé."
 
+#: src/gateway/web-dashboard.md
+msgid "A literal tilde is **not** expanded by the gateway:"
+msgstr "Un tilde littéral n'est **pas** développé par la passerelle :"
+
 #: src/foundations/fnd-003-governance.md
 msgid "A meaningful feature, a refactor of one module, a new test suite"
 msgstr "Une fonctionnalité significative, une refonte d'un module, une nouvelle suite de tests"
@@ -8467,6 +8523,10 @@ msgstr "Une vulnérabilité dans une dépendance transitive à trois niveaux de 
 msgid "A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, cost tiering, local-first with hosted backup, API key rotation, and rate-limit handling."
 msgstr "Présentation des modèles courants d'utilisation de plusieurs fournisseurs de modèles : répartition par agent, hiérarchisation des coûts, priorité au local avec sauvegarde hébergée, rotation des clés API et gestion des limites de débit."
 
+#: src/gateway/web-dashboard.md
+msgid "A) Source checkout (developers / packagers)"
+msgstr "A) Récupération des sources (développeurs / mainteneurs de paquets)"
+
 #: src/channels/matrix.md
 msgid "A. Room and membership"
 msgstr "A. Salle et appartenance"
@@ -8620,6 +8680,10 @@ msgstr "Modifications de l'API, nouveaux sous-systèmes, changements de comporte
 msgid "API documentation"
 msgstr "Documentation de l'API"
 
+#: src/gateway/web-dashboard.md
+msgid "API endpoints still work — only the HTML/JS bundle is missing. Build it (option A/B/C above) or set the path."
+msgstr "Les points de terminaison de l'API fonctionnent toujours — seul le bundle HTML/JS est manquant. Compilez-le (option A/B/C ci-dessus) ou définissez le chemin."
+
 #: src/hardware/arduino-uno-q-setup.md
 msgid "API key for LLM (OpenRouter, etc.)"
 msgstr "Clé API pour le LLM (OpenRouter, etc.)"
@@ -8647,6 +8711,10 @@ msgstr "API v2"
 #: src/channels/overview.md
 msgid "AT Protocol"
 msgstr "Protocole AT"
+
+#: src/gateway/web-dashboard.md
+msgid "AUR / system package install"
+msgstr "Installation du paquet AUR / système"
 
 #: src/providers/configuration.md
 msgid "AWS-credentials chain, region template"
@@ -10028,6 +10096,10 @@ msgstr "Archive automatiquement les sessions de passerie obsolètes depuis plus 
 msgid "Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`."
 msgstr "Archive automatiquement les sessions obsolètes après ce nombre d'heures. `0` désactive. Par défaut : `0`."
 
+#: src/gateway/web-dashboard.md
+msgid "Auto-detect (the five candidates above)"
+msgstr "Détection automatique (les cinq candidats ci-dessus)"
+
 #: src/security/sandboxing.md
 msgid "Auto-detection"
 msgstr "Détection automatique"
@@ -10172,6 +10244,10 @@ msgstr "Azure OpenAI"
 msgid "Azure OpenAI — slot `azure`"
 msgstr "Azure OpenAI — emplacement `azure`"
 
+#: src/gateway/web-dashboard.md
+msgid "B) Pre-built release artifact"
+msgstr "B) Artefact de version pré-compilé"
+
 #: src/channels/matrix.md
 msgid "B. Sender allowlist"
 msgstr "B. Liste blanche des expéditeurs"
@@ -10255,6 +10331,10 @@ msgstr "Jeton Bearer pour l'authentification de l'endpoint."
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Because application crates share a unified version, the team needs a product-level definition of a breaking change — distinct from a breaking change inside a single crate's internal implementation. A breaking change within a plugin crate that does not cross any of the boundaries below is **not** a product-level breaking change and does not warrant a MAJOR bump."
 msgstr "Étant donné que les crates d’application partagent une version unifiée, l’équipe doit définir ce qu’est une modification incompatible au niveau du produit — distincte d’une modification incompatible au sein de l’implémentation interne d’une seule crate. Une modification incompatible au sein d’une crate de plugin qui ne franchit aucune des limites ci-dessous **n’est pas** une modification incompatible au niveau du produit et ne justifie pas de bump MAJOR."
+
+#: src/architecture/subagents.md
+msgid "Because reachability is gated by the shared risk profile, the advertised roster (the `agent` parameter's enum in the tool schema) lists only the configured agents that share the caller's risk profile, minus the caller itself — and only when `delegation_policy.mode = \"allow\"`. There is no separate per-agent allow-list: the shared profile _is_ the allow-list."
+msgstr "Étant donné que l'accessibilité est conditionnée par le profil de risque partagé, la liste publiée (l'enum du paramètre `agent` dans le schéma de l'outil) ne répertorie que les agents configurés qui partagent le profil de risque de l'appelant, à l'exception de l'appelant lui-même — et uniquement lorsque `delegation_policy.mode = \"allow\"`. Il n'existe pas de liste d'autorisation distincte par agent : le profil partagé _est_ la liste d'autorisation."
 
 #: src/security/tool-receipts.md
 msgid "Because the model sees receipts in its context, it may echo them when describing tool results. The leak detector is configured to pass `zc-receipt-*` tokens through unmodified so this echoing works. If both the runtime and the model include a receipts block, the user sees two — strip one via channel-specific formatting rules."
@@ -10709,6 +10789,10 @@ msgstr "Cible de construction"
 msgid "Build with `--features hardware` to include Uno Q support."
 msgstr "Compilez avec `--features hardware` pour inclure la prise en charge d'Uno Q."
 
+#: src/channels/chat-others.md
+msgid "Build with `channel-lark` for either Lark or Feishu. The root `channel-feishu` feature is an alias for `channel-lark`; runtime selection still happens through `use_feishu = true`."
+msgstr "Compilez avec `channel-lark` pour Lark ou Feishu. La fonctionnalité racine `channel-feishu` est un alias de `channel-lark` ; la sélection à l'exécution se fait toujours via `use_feishu = true`."
+
 #: src/setup/windows.md
 msgid "Build with common channels (Telegram, Discord, Slack, Matrix)"
 msgstr "Construire avec des canaux communs (Telegram, Discord, Slack, Matrix)"
@@ -10809,6 +10893,10 @@ msgstr "En soumettant une contribution (pull request, correctif, problème inclu
 #: src/foundations/fnd-003-governance.md
 msgid "By v1.0.0, the governance model should be self-sustaining — the team should not need to think about it, it should just work."
 msgstr "D'ici la version 1.0.0, le modèle de gouvernance devrait être autosuffisant — l'équipe ne devrait pas avoir à s'en soucier, il devrait simplement fonctionner."
+
+#: src/gateway/web-dashboard.md
+msgid "C) Docker image"
+msgstr "C) Image Docker"
 
 #: src/channels/matrix.md
 msgid "C. Token and identity"
@@ -11038,6 +11126,10 @@ msgstr "Peut écrire des fichiers (pas encore implémenté)"
 #: src/architecture/rpc-socket.md
 msgid "Cancel an in-flight turn"
 msgstr "Annuler un tour en cours"
+
+#: src/gateway/web-dashboard.md
+msgid "Candidate"
+msgstr "Candidat"
 
 #: src/maintainers/labels.md
 msgid "Canonical spelling"
@@ -11613,6 +11705,10 @@ msgstr "Modes de défaillance courants, dans l'ordre dans lequel vous êtes susc
 msgid "Common key patterns:"
 msgstr "Schémas de clés courants :"
 
+#: src/gateway/web-dashboard.md
+msgid "Common pitfalls"
+msgstr "Pièges courants"
+
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "CommonMark + GitHub Flavored Markdown"
 msgstr "CommonMark + GitHub Flavored Markdown"
@@ -11640,6 +11736,10 @@ msgstr "Étiquettes de prise en charge communautaire"
 #: src/foundations/fnd-003-governance.md
 msgid "Community-visible, no PR required, separates early conversation from committed work, promotes concrete outcomes into the owning tracked surface"
 msgstr "Visible par la communauté, aucune PR requise, sépare les discussions préliminaires du travail validé, fait remonter les résultats concrets vers la surface suivie correspondante"
+
+#: src/gateway/web-dashboard.md
+msgid "Companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961) adds the targeted \"looks like an unexpanded `~` / `$VAR` — [`shellexpand`](https://crates.io/crates/shellexpand) it before writing this value\" check tracked in [issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079) to both `zeroclaw doctor` and `zeroclaw self-test` as a Warn-severity diagnostic. Neither command surfaces it on current `master` — until #6961 lands, expand `~` / `$VAR` yourself before writing `gateway.web_dist_dir` (for example write `/home/alice/zeroclaw/web/dist` instead of `~/zeroclaw/web/dist`)."
+msgstr "La [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961) associée ajoute la vérification ciblée « ressemble à un `~` / `$VAR` non développé — utilisez [`shellexpand`](https://crates.io/crates/shellexpand) avant d'écrire cette valeur », suivie dans l'[issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079), à la fois à `zeroclaw doctor` et à `zeroclaw self-test` en tant que diagnostic de sévérité Warn. Aucune des deux commandes ne la fait remonter sur le `master` actuel — tant que #6961 n'est pas intégrée, développez vous-même `~` / `$VAR` avant d'écrire `gateway.web_dist_dir` (par exemple, écrivez `/home/alice/zeroclaw/web/dist` au lieu de `~/zeroclaw/web/dist`)."
 
 #: src/reference/config.md
 msgid "Compatibility"
@@ -12799,6 +12899,10 @@ msgstr "ID de voix par défaut transmis au fournisseur tts sélectionné."
 msgid "Default workflow-owner allowlist is configured via the `WORKFLOW_OWNER_LOGINS` repository variable (see CODEOWNERS for the current list)."
 msgstr "La liste d'autorisation par défaut des propriétaires de workflow est configurée via la variable de dépôt `WORKFLOW_OWNER_LOGINS` (voir CODEOWNERS pour la liste actuelle)."
 
+#: src/gateway/web-dashboard.md
+msgid "Default — auto-detect order"
+msgstr "Par défaut — détection automatique de l'ordre"
+
 #: src/maintainers/changelog-generation.md
 msgid "Default: last stable tag → HEAD"
 msgstr "Par défaut : dernière balise stable → HEAD"
@@ -12874,6 +12978,10 @@ msgstr "Délègue les tâches de codage à l’interface CLI `gemini -p`. L’au
 #: src/reference/config.md
 msgid "Delegates coding tasks to the `opencode run` CLI. Authentication uses the binary's own session by default — no API key needed unless `env_passthrough` includes provider-specific keys."
 msgstr "Délègue les tâches de codage à l’interface CLI `opencode run`. L’authentification utilise par défaut la session propre au binaire — aucune clé API n’est requise, sauf si `env_passthrough` inclut des clés spécifiques au fournisseur."
+
+#: src/architecture/subagents.md
+msgid "Delegation gating"
+msgstr "Restriction de délégation"
 
 #: src/contributing/multi-agent-setup.md
 msgid "Delete an agent"
@@ -13488,6 +13596,10 @@ msgstr "Ne pointez pas deux daemons vers le même espace de travail. SQLite est 
 #: src/maintainers/changelog-generation.md
 msgid "Don't push directly to `master`."
 msgstr "Ne poussez pas directement sur `master`."
+
+#: src/gateway/web-dashboard.md
+msgid "Don't use `~` or `$HOME`"
+msgstr "N'utilisez pas `~` ou `$HOME`"
 
 #: src/maintainers/labels.md
 msgid "Dormant PR or issue; candidate for closing"
@@ -14278,6 +14390,10 @@ msgstr "Énumère chaque chemin accessible avec son type et sa catégorie. Les e
 #: src/reference/env-vars.md
 msgid "Env var"
 msgstr "Variable d'environnement"
+
+#: src/gateway/web-dashboard.md
+msgid "Env-var overrides apply to the in-memory `Config` only; they are never written back to `config.toml`."
+msgstr "Les substitutions de variables d'environnement s'appliquent uniquement à la `Config` en mémoire ; elles ne sont jamais réécrites dans `config.toml`."
 
 #: src/security/sandboxing.md src/maintainers/release-runbook.md
 msgid "Environment"
@@ -15249,10 +15365,6 @@ msgstr "Se déclenche après une version stable réussie. Publie un tweet d'anno
 #: src/maintainers/ci-and-actions.md
 msgid "Fires after a successful stable release. Posts the release notes to the community Discord."
 msgstr "Se déclenche après une version stable réussie. Publie les notes de version sur le Discord communautaire."
-
-#: src/maintainers/ci-and-actions.md
-msgid "Fires after every stable release. Auto-opens PRs to update version numbers in the downstream marketplace template repos (docker, k8s, compose)."
-msgstr "Se déclenche après chaque version stable. Ouvre automatiquement des PRs pour mettre à jour les numéros de version dans les dépôts de modèles en aval (docker, k8s, compose)."
 
 #: src/maintainers/ci-and-actions.md
 msgid "Fires on every PR targeting `master`. Composite job with multiple matrix legs:"
@@ -16505,8 +16617,8 @@ msgid "Heartbeat configuration for periodic health pings (`[heartbeat]` section)
 msgstr "Configuration du heartbeat pour les pings de santé périodiques (section `[heartbeat]`)."
 
 #: src/setup/container.md
-msgid "Helm chart and marketplace templates are published to the [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates) repo. Typical manifest fragment:"
-msgstr "Les chartes Helm et les modèles du marketplace sont publiés dans le dépôt [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates). Fragment de manifeste typique :"
+msgid "Helm chart templates are published to the [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates) repo. Typical manifest fragment:"
+msgstr "Les modèles de chart Helm sont publiés dans le dépôt [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates). Fragment de manifeste typique :"
 
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "Here is the most useful reframe for working with AI effectively:"
@@ -16683,6 +16795,10 @@ msgstr "Comment contribuer"
 #: src/api.md
 msgid "How to navigate it"
 msgstr "Comment le naviguer"
+
+#: src/gateway/web-dashboard.md
+msgid "How to obtain a `web/dist`"
+msgstr "Comment obtenir un `web/dist`"
 
 #: src/ops/overview.md
 msgid "How to run ZeroClaw in production. The surface is intentionally small: one binary, one config file, one SQLite workspace. Most \"operations\" is \"systemd and journald\"."
@@ -16903,6 +17019,10 @@ msgstr "Si l’un des contrôles d’entrée échoue, laissez un seul commentair
 msgid "If anything in here feels heavyweight, that is intentional friction — we do not yet have the automation discipline to remove it safely."
 msgstr "Si quoi que ce soit ici vous semble lourd, il s'agit d'une friction intentionnelle — nous n'avons pas encore la discipline d'automatisation nécessaire pour la supprimer en toute sécurité."
 
+#: src/gateway/web-dashboard.md
+msgid "If auto-detect also turns up nothing — the gateway runs in API-only mode and `GET /` returns a \"not available\" message that points back here."
+msgstr "Si la détection automatique ne donne également aucun résultat — la passerelle fonctionne en mode API uniquement et `GET /` renvoie un message « non disponible » qui renvoie ici."
+
 #: src/channels/matrix.md
 msgid "If backup is already set up, your recovery key was shown when you first enabled it. If you saved it, use that."
 msgstr "Si la sauvegarde est déjà configurée, votre clé de récupération a été affichée lors de la première activation. Si vous l'avez sauvegardée, utilisez-la."
@@ -16966,6 +17086,10 @@ msgstr "Si aucun code ou design n'a été intégré (seulement de l'inspiration)
 #: src/channels/acp.md
 msgid "If no turn is active for the session, the cancel is a noop — it succeeds silently without error. This follows ACP notification semantics: notifications must not produce errors."
 msgstr "Si aucun tour n'est actif pour la session, l'annulation est sans effet — elle réussit silencieusement sans erreur. Cela suit la sémantique des notifications ACP : les notifications ne doivent pas produire d'erreurs."
+
+#: src/gateway/web-dashboard.md
+msgid "If no — logs a WARN (\"path doesn't contain `index.html` on this machine; falling back to auto-detect\") and tries the auto-detect candidates below."
+msgstr "Si non — enregistre un avertissement WARN (« le chemin ne contient pas `index.html` sur cette machine ; retour à la détection automatique ») et essaie les candidats de détection automatique ci-dessous."
 
 #: src/reference/config.md
 msgid "If omitted or empty, the locale is auto-detected from `ZEROCLAW_LOCALE`, `LANG`, or `LC_ALL` environment variables (defaulting to `\"en\"`)."
@@ -17103,6 +17227,10 @@ msgstr "Si vous utilisez un alias (`#...`), vérifiez qu'il correspond bien à l
 msgid "If writing a unit test for a function requires standing up a database connection, mocking six dependencies, building a full configuration object, and starting an async runtime explicitly — that function is probably doing too much, depending on too much, or sitting at the wrong layer of the architecture. The difficulty is not a nuisance to work around. It is feedback. The test is being honest about something the code is not yet honest about."
 msgstr "Si l’écriture d’un test unitaire pour une fonction nécessite l’ouverture d’une connexion à une base de données, le mock de six dépendances, la construction d’un objet de configuration complet et le démarrage explicite d’un runtime asynchrone, alors cette fonction fait probablement trop, dépend de trop d’éléments ou se situe au mauvais niveau de l’architecture. La difficulté n’est pas un inconvénient à contourner. C’est un retour d’information. Le test est honnête sur quelque chose que le code n’est pas encore capable d’exprimer."
 
+#: src/gateway/web-dashboard.md
+msgid "If yes — serves the dashboard from that path."
+msgstr "Si oui — sert le tableau de bord depuis ce chemin."
+
 #: src/hardware/raspberry-pi-setup.md
 msgid "If you already have a beefier machine, cross-compiling is faster than building on the Pi."
 msgstr "Si vous disposez déjà d'une machine plus puissante, la compilation croisée est plus rapide que la compilation sur le Pi."
@@ -17186,6 +17314,10 @@ msgstr "Si vous souhaitez utiliser les périphériques GPIO du Pi depuis des ski
 #: src/contributing/privacy.md
 msgid "If you're capturing an incident trace, log payload, or external response in a test fixture: redact and anonymize before committing. Real session IDs, real user IDs, real hostnames, and real auth tokens all need to go through a scrubbing pass first. The redacted version is what ships; the original stays out of git."
 msgstr "Si vous capturez une trace d’incident, un payload de journalisation ou une réponse externe dans un jeu de tests : redigez et anonymisez avant de valider. Les vrais identifiants de session, les vrais identifiants utilisateur, les vrais noms d’hôte et les vrais jetons d’authentification doivent tous passer par une étape de nettoyage. La version redigée est celle qui est livrée ; l’original reste hors du dépôt git."
+
+#: src/gateway/web-dashboard.md
+msgid "If you're on one of those distributions and the dashboard \"just works\", you don't need to set `gateway.web_dist_dir` at all — the auto-detect found it."
+msgstr "Si vous utilisez l'une de ces distributions et que le tableau de bord « fonctionne tout simplement », vous n'avez pas besoin de définir `gateway.web_dist_dir` du tout — la détection automatique l'a trouvé."
 
 #: src/ops/service.md
 msgid "If you're seeing repeated restarts, enable debug logging (`RUST_LOG=debug` via the unit file's `Environment=`) and let one more crash happen to capture the full trace."
@@ -21110,6 +21242,10 @@ msgstr "Remplacer le modèle par défaut pour ce canal"
 msgid "Override for the hardcoded timeout scaling cap (default: 4)."
 msgstr "Remplacement de la valeur par défaut du facteur d'échelle du délai d'attente (par défaut : 4)."
 
+#: src/gateway/web-dashboard.md
+msgid "Override precedence"
+msgstr "Priorité de remplacement"
+
 #: src/getting-started/tui.md
 msgid "Override the config directory"
 msgstr "Remplacer le répertoire de configuration"
@@ -22074,6 +22210,10 @@ msgstr "Liste de contrôle avant le push"
 msgid "Preamble"
 msgstr "Préambule"
 
+#: src/gateway/web-dashboard.md
+msgid "Prebuilt-binary installer (per-user)"
+msgstr "Programme d'installation de binaire précompilé (par utilisateur)"
+
 #: src/ops/network-deployment.md
 msgid "Prefer `--prebuilt` on a Pi — compiling from source can take 30+ minutes."
 msgstr "Privilégiez `--prebuilt` sur un Pi — la compilation depuis les sources peut prendre plus de 30 minutes."
@@ -22890,6 +23030,10 @@ msgstr "Ordre de lecture"
 msgid "Reads operations from the given file, or from stdin when path is `-` or omitted. Supported ops: `add`, `replace`, `remove`, `test`. `move` and `copy` are rejected."
 msgstr "Lit les opérations depuis le fichier donné, ou depuis stdin lorsque le chemin est `-` ou omis. Opérations prises en charge : `add`, `replace`, `remove`, `test`. `move` et `copy` sont rejetées."
 
+#: src/gateway/web-dashboard.md
+msgid "Reads the value from `config.toml` (or the env-var override)."
+msgstr "Lit la valeur depuis `config.toml` (ou la substitution par variable d'environnement)."
+
 #: src/hardware/aardvark.md
 msgid "Real hardware"
 msgstr "Matériel réel"
@@ -23118,6 +23262,10 @@ msgstr "Lié"
 msgid "Related Documentation"
 msgstr "Documentation Connexe"
 
+#: src/gateway/web-dashboard.md
+msgid "Relative paths resolve against CWD, not the config file"
+msgstr "Les chemins relatifs sont résolus par rapport au CWD, et non au fichier de configuration"
+
 #: src/maintainers/release-runbook.md
 msgid "Release Runbook"
 msgstr "Livre de procédure de version"
@@ -23129,6 +23277,10 @@ msgstr "Version Stable (`release-stable-manual.yml`)"
 #: src/maintainers/ci-and-actions.md
 msgid "Release `validate` failed"
 msgstr "La validation de la version a échoué"
+
+#: src/gateway/web-dashboard.md
+msgid "Release archives on the [Releases page](https://github.com/zeroclaw-labs/zeroclaw/releases) ship the daemon with `web/dist/` already populated alongside the binary. Auto-detect candidate 2 finds it; no `gateway.web_dist_dir` configuration needed."
+msgstr "Les archives de version disponibles sur la [page Releases](https://github.com/zeroclaw-labs/zeroclaw/releases) fournissent le daemon avec `web/dist/` déjà rempli aux côtés du binaire. Le candidat 2 de détection automatique le trouve ; aucune configuration `gateway.web_dist_dir` n'est nécessaire."
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Release automation via `release-plz` is straightforward: one PR, one bump, one changelog entry"
@@ -23935,8 +24087,8 @@ msgid "Run this once. Replace `your.homeserver`, the bot username, password, and
 msgstr "Exécutez ceci une seule fois. Remplacez `your.homeserver`, le nom d'utilisateur du bot, le mot de passe, et choisissez une chaîne `device_id` courte (alphanumérique, sans espaces — il s'agit de l'étiquette d'appareil _côté serveur_ que ZeroClaw réutilisera à chaque redémarrage) :"
 
 #: src/getting-started/multi-model-setup.md
-msgid "Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Each agent picks the risk profile that matches its trust surface: `frontline` faces public traffic, so it gets a stricter `hardened` profile; `heavy` is reached only via `delegate` from inside the trusted agent loop, so it can run on a looser `permissive` profile."
-msgstr "Exécutez deux agents et routez les canaux vers le niveau approprié. L'outil `delegate` permet à un agent de transférer une conversation à un autre en cours de route. Chaque agent choisit le profil de risque qui correspond à sa surface de confiance : `frontline` est exposé au trafic public, il bénéficie donc d'un profil `hardened` plus strict ; `heavy` n'est accessible que via `delegate` depuis l'intérieur de la boucle d'agents de confiance, il peut donc s'exécuter avec un profil `permissive` plus souple."
+msgid "Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Delegation is gated: the caller's risk profile must set `delegation_policy mode = \"allow\"`, and **both agents must share the same risk profile** (delegation does not cross trust tiers). So the frontline and heavy agents below run on the _same_ `trusted` risk profile — they differ in model and runtime profile (iteration budget), not in trust surface."
+msgstr "Exécutez deux agents et routez les canaux vers le niveau approprié. L'outil `delegate` permet à un agent de transférer la conversation à un autre en cours de discussion. La délégation est conditionnelle : le profil de risque de l'appelant doit définir `delegation_policy mode = \"allow\"`, et **les deux agents doivent partager le même profil de risque** (la délégation ne franchit pas les niveaux de confiance). Ainsi, les agents frontline et heavy ci-dessous s'exécutent sur le _même_ profil de risque `trusted` — ils diffèrent par le modèle et le profil d'exécution (budget d'itération), et non par la surface de confiance."
 
 #: src/ops/service.md
 msgid "Run two services pointing at different workspaces:"
@@ -23961,6 +24113,10 @@ msgstr "Exécution des compétences Python"
 #: src/hardware/raspberry-pi-setup.md
 msgid "Running ZeroClaw under Podman"
 msgstr "Exécuter ZeroClaw avec Podman"
+
+#: src/gateway/web-dashboard.md
+msgid "Running `cargo run` from the repo root in dev"
+msgstr "Exécuter `cargo run` depuis la racine du dépôt en dev"
 
 #: src/maintainers/skills.md
 msgid "Running a backlog sweep, closing stale/duplicate issues, applying labels, enforcing the RFC stale policy"
@@ -24386,6 +24542,10 @@ msgstr "Migration de schéma qui casse les configurations existantes"
 msgid "Schema versioning and migration"
 msgstr "Versionnement des schémas et migration"
 
+#: src/gateway/web-dashboard.md
+msgid "Schema-mirror grammar — deriving `ZEROCLAW_gateway__web_dist_dir`"
+msgstr "Grammaire en miroir du schéma — dérivation de `ZEROCLAW_gateway__web_dist_dir`"
+
 #: src/security/sandboxing.md
 msgid "Schema: `RiskProfileConfig` and `DockerRuntimeConfig` in `crates/zeroclaw-config/src/schema.rs`"
 msgstr "Schéma : `RiskProfileConfig` et `DockerRuntimeConfig` dans `crates/zeroclaw-config/src/schema.rs`"
@@ -24675,12 +24835,13 @@ msgid "See `anthropic.rs` as a reference for a provider with a fully custom wire
 msgstr "Voir `anthropic.rs` comme référence pour un fournisseur avec un format filaire entièrement personnalisé. Voir `compatible.rs` pour le pattern de streaming SSE compatible OpenAI."
 
 #: src/getting-started/yolo.md src/setup/service.md
-#: src/providers/configuration.md src/providers/routing.md
-#: src/providers/custom.md src/channels/matrix.md src/channels/mattermost.md
-#: src/channels/line.md src/channels/nextcloud-talk.md src/channels/webhook.md
-#: src/channels/acp.md src/tools/overview.md src/tools/skills.md
-#: src/security/overview.md src/security/tool-receipts.md src/ops/overview.md
-#: src/ops/service.md src/ops/troubleshooting.md src/ops/network-deployment.md
+#: src/gateway/web-dashboard.md src/providers/configuration.md
+#: src/providers/routing.md src/providers/custom.md src/channels/matrix.md
+#: src/channels/mattermost.md src/channels/line.md
+#: src/channels/nextcloud-talk.md src/channels/webhook.md src/channels/acp.md
+#: src/tools/overview.md src/tools/skills.md src/security/overview.md
+#: src/security/tool-receipts.md src/ops/overview.md src/ops/service.md
+#: src/ops/troubleshooting.md src/ops/network-deployment.md
 #: src/hardware/index.md src/contributing/how-to.md src/contributing/rfcs.md
 #: src/contributing/communication.md
 msgid "See also"
@@ -25018,6 +25179,10 @@ msgstr "Politique de shell"
 #: src/reference/config.md
 msgid "Shell tool configuration (`[shell_tool]` section)."
 msgstr "Configuration de l'outil Shell (section `[shell_tool]`)."
+
+#: src/gateway/web-dashboard.md
+msgid "Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded. Pre-expand them in the env var if you set the value that way:"
+msgstr "Les variables shell (`$HOME`, `%USERPROFILE%`) ne sont pas non plus développées. Développez-les au préalable dans la variable d'environnement si vous définissez la valeur de cette manière :"
 
 #: src/philosophy.md
 msgid "Shell-policy validation"
@@ -25381,6 +25546,10 @@ msgstr "Configuration de l'outil de génération d'images autonome (`[image_gen]
 #: src/foundations/fnd-006-zero-compromise-in-practice.md
 msgid "Standard"
 msgstr "Standard"
+
+#: src/gateway/web-dashboard.md
+msgid "Standard Docker / packaged-volume layout"
+msgstr "Structure standard Docker / volume packagé"
 
 #: src/providers/catalog.md
 msgid "Standard OpenAI shape"
@@ -25915,10 +26084,6 @@ msgstr "Symptôme"
 msgid "Symptoms:"
 msgstr "Symptômes :"
 
-#: src/maintainers/ci-and-actions.md
-msgid "Sync Marketplace Templates (`sync-marketplace-templates.yml`)"
-msgstr "Synchroniser les modèles du Marketplace (`sync-marketplace-templates.yml`)"
-
 #: src/maintainers/release-runbook.md
 msgid "Sync all other version references:"
 msgstr "Synchroniser toutes les autres références de version :"
@@ -25982,6 +26147,10 @@ msgstr "Systemd est la solution par défaut. OpenRC est détecté et pris en cha
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "TBD after optimization pass"
 msgstr "À déterminer après la passe d'optimisation"
+
+#: src/gateway/web-dashboard.md
+msgid "TL;DR"
+msgstr "TL;DR"
 
 #: src/reference/config.md
 msgid "TLS configuration for the gateway server (`[gateway.tls]`)."
@@ -26101,12 +26270,12 @@ msgid "Target agent's configured provider"
 msgstr "Fournisseur configuré de l'agent cible"
 
 #: src/architecture/subagents.md
-msgid "Target agent's identity (different alias, different profile)"
-msgstr "Identité de l'agent cible (alias différent, profil différent)"
+msgid "Target agent's identity (different alias, **same** risk profile — delegation requires it)"
+msgstr "Identité de l'agent cible (alias différent, **même** profil de risque — la délégation l'exige)"
 
 #: src/architecture/subagents.md
-msgid "Target agent's own policy"
-msgstr "Politique propre de l'agent cible"
+msgid "Target agent's own policy (within the shared risk profile)"
+msgstr "Stratégie propre de l'agent cible (au sein du profil de risque partagé)"
 
 #: src/reference/config.md
 msgid "Target chip identifier for `transport = probe` (e.g. `STM32F401RE`, `nRF52840_xxAA`). Passed straight to probe-rs for flash/debug operations; must match a chip probe-rs recognizes."
@@ -26925,6 +27094,10 @@ msgstr "Le pont lit l'adresse de la passerelle et le jeton d'authentification de
 msgid "The browser tool is enabled by default with `allowed_domains = [\"*\"]`. Restrict domains or disable it via `zeroclaw config set`:"
 msgstr "L'outil de navigateur est activé par défaut avec `allowed_domains = [\"*\"]`. Restreignez les domaines ou désactivez-le via `zeroclaw config set` :"
 
+#: src/gateway/web-dashboard.md
+msgid "The bundle lands in `web/dist/`. Point `web_dist_dir` at the absolute path of that directory, or run the daemon from the repo root and let auto-detect candidate 1 pick it up."
+msgstr "Le bundle est généré dans `web/dist/`. Faites pointer `web_dist_dir` vers le chemin absolu de ce répertoire, ou exécutez le daemon depuis la racine du dépôt et laissez le candidat 1 de la détection automatique le récupérer."
+
 #: src/architecture/subagents.md
 msgid "The caller-supplied `allowed_tools` argument to `agent::run`. `spawn_subagent` is in the registry but its `is_subagent_caller` flag is set to `true` for the child, so the depth-1 refusal fires before any spawn work."
 msgstr "L'argument `allowed_tools` fourni par l'appelant à `agent::run`. `spawn_subagent` est dans le registre mais son indicateur `is_subagent_caller` est défini sur `true` pour l'enfant, donc le refus de profondeur 1 se déclenche avant tout travail de spawn."
@@ -27121,6 +27294,10 @@ msgstr "La page Logs du tableau de bord est la surface principale. En dessous :"
 msgid "The default WSS port is **9781**. Change it with `port = <number>` in the `[wss]` section."
 msgstr "Le port WSS par défaut est **9781**. Modifiez-le avec `port = <number>` dans la section `[wss]`."
 
+#: src/channels/overview.md
+msgid "The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, and Telegram. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Pre-built binaries use this lean default. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:"
+msgstr "La build par défaut de ZeroClaw inclut un bundle de canaux léger : ACP, webhook, email et Telegram. Ceux-ci couvrent les sessions locales/éditeur, l'entrée de la passerelle et la messagerie externe courante au premier lancement, sans compiler chaque intégration de plateforme du bundle. Les binaires précompilés utilisent ce paramètre léger par défaut. Pour les installations depuis les sources nécessitant l'ensemble historique étendu de canaux, exécutez `install.sh --source --preset full`, compilez avec `--features channels-full`, ou utilisez les fonctionnalités individuelles `channel-*` pour des builds sélectives :"
+
 #: src/channels/whatsapp.md
 msgid "The default `mode = \"business\"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = \"personal\"` with `dm_policy = \"allowlist\"` and `group_policy = \"allowlist\"`."
 msgstr "Le `mode = \"business\"` par défaut n'applique pas la séparation des politiques DM/groupe personnelle. Pour les déploiements de comptes ordinaires restreints aux pairs, utilisez `mode = \"personal\"` avec `dm_policy = \"allowlist\"` et `group_policy = \"allowlist\"`."
@@ -27290,12 +27467,16 @@ msgid "The following workflows exist in `.github/workflows/` but are dangerous a
 msgstr "Les workflows suivants existent dans `.github/workflows/` mais sont dangereux et leur suppression est planifiée pour la version v0.7.4 (#5915). Ne les déclenchez pas. Ne les étendez pas."
 
 #: src/getting-started/multi-model-setup.md
-msgid "The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = \"heavy\"` and the heavier agent picks up the sub-task."
-msgstr "L'agent de première ligne traite chaque message entrant sur Haiku. Lorsqu'il a besoin d'un raisonnement plus approfondi, il appelle l'outil `delegate` avec `agent = \"heavy\"` et l'agent plus puissant prend en charge la sous-tâche."
+msgid "The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = \"heavy\"`; because both agents share the `trusted` risk profile and that profile allows delegation, the heavier agent picks up the sub-task on Opus."
+msgstr "L'agent de première ligne traite chaque message entrant sur Haiku. Lorsqu'il a besoin d'un raisonnement plus approfondi, il appelle l'outil `delegate` avec `agent = \"heavy\"` ; comme les deux agents partagent le profil de risque `trusted` et que ce profil autorise la délégation, l'agent plus lourd prend en charge la sous-tâche sur Opus."
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "The full plugin catalog is installable with `zeroclaw plugin install --profile full`"
 msgstr "Le catalogue complet des plugins est installable avec `zeroclaw plugin install --profile full`"
+
+#: src/gateway/web-dashboard.md
+msgid "The full set of `cargo web` subcommands (`dev`, `check`, `gen-api`, etc.) is documented in [Building the web dashboard](../developing/web.md)."
+msgstr "L'ensemble complet des sous-commandes `cargo web` (`dev`, `check`, `gen-api`, etc.) est documenté dans [Building the web dashboard](../developing/web.md)."
 
 #: src/foundations/fnd-006-zero-compromise-in-practice.md
 msgid "The gap between \"what the tools can verify\" and \"quality that serves users, contributors, and the project over time\" is filled by judgment. That judgment is what this document is trying to help you build — not to replace the tools, but to direct them."
@@ -27308,6 +27489,10 @@ msgstr "Les questions de validation — le code compile-t-il, les tests passent-
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "The gateway HTTP server contains webhook handlers for WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail — meaning specific channel integrations are baked into the web server"
 msgstr "Le serveur HTTP de la passerelle contient des gestionnaires de webhooks pour WhatsApp, WATI, Linq, Nextcloud Talk et Gmail — ce qui signifie que des intégrations spécifiques de canaux sont intégrées dans le serveur web."
+
+#: src/gateway/web-dashboard.md
+msgid "The gateway daemon ships its HTTP API in the binary, but the web dashboard HTML/JS/CSS lives on disk in a `web/dist/` directory produced by Vite. The `gateway.web_dist_dir` setting (and its `ZEROCLAW_gateway__web_dist_dir` schema-mirror env-var override) tells the daemon where that directory is. When neither the setting nor a known fallback location contains a built `index.html`, the gateway boots in **API-only mode** and the dashboard URL returns a \"not available\" message."
+msgstr "Le démon gateway intègre son API HTTP dans le binaire, mais les fichiers HTML/JS/CSS du tableau de bord web résident sur disque dans un répertoire `web/dist/` produit par Vite. Le paramètre `gateway.web_dist_dir` (et son remplacement par variable d'environnement miroir du schéma `ZEROCLAW_gateway__web_dist_dir`) indique au démon où se trouve ce répertoire. Lorsque ni le paramètre ni un emplacement de repli connu ne contient un `index.html` compilé, la gateway démarre en **mode API uniquement** et l'URL du tableau de bord renvoie un message « non disponible »."
 
 #: src/gateway/api.md
 msgid "The gateway exposes a REST surface alongside the local CLI. Anything that can be set with `zeroclaw config get/set/list/init/migrate` is also reachable via HTTP, so the dashboard, third-party tooling, and the CLI all drive the same underlying `Config` mutation core."
@@ -27328,6 +27513,14 @@ msgstr "La passerelle reste liée à `127.0.0.1` — le proxy s'occupe de l'éco
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "The gateway's external API should also have an OpenAPI spec"
 msgstr "L'API externe de la passerelle doit également disposer d'une spécification OpenAPI."
+
+#: src/reference/env-vars.md
+msgid "The gateway's web-dashboard location is configured via the standard schema-mirror form `ZEROCLAW_gateway__web_dist_dir` — see [Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full setting reference."
+msgstr "L'emplacement du tableau de bord web de la passerelle est configuré via le formulaire standard schema-mirror `ZEROCLAW_gateway__web_dist_dir` — consultez [Tableau de bord web (web_dist_dir)](../gateway/web-dashboard.md) pour la référence complète du paramètre."
+
+#: src/gateway/web-dashboard.md
+msgid "The general operator override grammar (see [Environment variables](../reference/env-vars.md)) maps the dotted TOML path to an env-var name mechanically:"
+msgstr "La grammaire générale de remplacement des opérateurs (voir [Variables d'environnement](../reference/env-vars.md)) associe le chemin TOML pointé à un nom de variable d'environnement de manière mécanique :"
 
 #: src/channels/email.md
 msgid "The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. Works with Gmail, Outlook, Fastmail, self-hosted Postfix, and anything else that speaks IMAP/SMTP."
@@ -27585,6 +27778,10 @@ msgstr "L'infrastructure d'observabilité est mature. OpenTelemetry, Prometheus 
 msgid "The observability infrastructure is mature: OpenTelemetry tracing, Prometheus metrics, DORA tracking, and a clean `Observer` trait are all in place. This is production-quality work. The teaching gap is between having the infrastructure and using it in a way that actually helps when something goes wrong — ideally before you know what went wrong."
 msgstr "L'infrastructure d'observabilité est mature : le traçage OpenTelemetry, les métriques Prometheus, le suivi DORA et un trait `Observer` propre sont tous en place. Il s'agit d'un travail de qualité production. Le fossé pédagogique réside dans le passage de la simple existence de cette infrastructure à son utilisation effective pour aider lorsqu'un problème survient — idéalement avant même de savoir ce qui s'est mal passé."
 
+#: src/gateway/web-dashboard.md
+msgid "The official Docker image places the bundle at `/zeroclaw-data/web/dist` (auto-detect candidate 3). It works out of the box; you only need to set `web_dist_dir` if you mount your own volume over that path."
+msgstr "L'image Docker officielle place le bundle dans `/zeroclaw-data/web/dist` (candidat de détection automatique 3). Elle fonctionne immédiatement ; vous n'avez besoin de définir `web_dist_dir` que si vous montez votre propre volume sur ce chemin."
+
 #: src/architecture/logging.md
 msgid "The on-disk JSON shape (`LogEvent` in `event.rs`):"
 msgstr "La structure JSON sur disque (`LogEvent` dans `event.rs`) :"
@@ -27624,6 +27821,10 @@ msgstr "La stratégie de migration globale repose sur le **Strangler Fig Pattern
 #: src/reference/env-vars.md
 msgid "The override state is surfaced wherever the config is rendered, with a 💉 indicator marking env-overridden fields:"
 msgstr "L'état de remplacement est affiché partout où la configuration est rendue, avec un indicateur 💉 marquant les champs remplacés par l'environnement :"
+
+#: src/gateway/web-dashboard.md
+msgid "The packaged binary ships `web/dist` next to itself"
+msgstr "Le binaire packagé fournit `web/dist` à côté de lui-même"
 
 #: src/tools/browser.md
 msgid "The page may not be fully loaded. Add a wait:"
@@ -27860,6 +28061,10 @@ msgstr "Le même principe régit la conception des spans de traçage. Une span d
 #: src/maintainers/reviewer-playbook.md
 msgid "The same risk-routing principle applies to issues, but the labels and signals are different."
 msgstr "Le même principe de routage des risques s'applique aux problèmes, mais les étiquettes et les signaux sont différents."
+
+#: src/gateway/web-dashboard.md
+msgid "The same three steps produce env-var names for every other gateway knob — e.g. `gateway.request_timeout_secs` becomes `ZEROCLAW_gateway__request_timeout_secs`."
+msgstr "Les trois mêmes étapes produisent les noms de variables d'environnement pour tous les autres paramètres du gateway — par ex. `gateway.request_timeout_secs` devient `ZEROCLAW_gateway__request_timeout_secs`."
 
 #: src/security/overview.md
 msgid "The sandbox confines filesystem access to the workspace, drops network reachability except what the tool explicitly needs, and removes access to the parent process's secrets."
@@ -28217,6 +28422,14 @@ msgstr "L'utilisateur ouvre un DM LINE avec le bot et envoie `/bind <code>`."
 msgid "The validator runs _before_ the command hits the shell. A blocked command surfaces as a tool error the model sees and can react to."
 msgstr "Le validateur s'exécute _avant_ que la commande n'atteigne le shell. Une commande bloquée se manifeste sous forme d'une erreur d'outil que le modèle peut voir et à laquelle il peut réagir."
 
+#: src/gateway/web-dashboard.md
+msgid "The value is resolved with the standard config-layer order:"
+msgstr "La valeur est résolue selon l'ordre standard des couches de configuration :"
+
+#: src/gateway/web-dashboard.md
+msgid "The value is treated as a hint, not a hard requirement. A stale path (typo, host-specific path copied from another machine, missing build) demotes to auto-detect rather than crashing every dashboard request."
+msgstr "La valeur est traitée comme une indication, et non comme une exigence stricte. Un chemin obsolète (faute de frappe, chemin propre à un hôte copié depuis une autre machine, build manquant) bascule en détection automatique plutôt que de faire échouer chaque requête du tableau de bord."
+
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "The versioning policy and stability tier table defined in §4.4.1 of this RFC become a standing contributor reference document at `docs/book/src/maintainers/stability-tiers.md`. This document is the day-to-day reference contributors use when assigning a tier to a new plugin crate, and that maintainers consult when making release decisions. The RFC itself remains the historical record of _why_ these decisions were made; the extracted document is _what_ contributors look up."
 msgstr "La politique de versionnement et le tableau des niveaux de stabilité définis dans la section 4.4.1 de cette RFC deviennent un document de référence permanent pour les contributeurs, situé à `docs/book/src/maintainers/stability-tiers.md`. Ce document sert de référence quotidienne aux contributeurs lors de l'attribution d'un niveau à un nouveau crate de plugin, et est consulté par les mainteneurs lors de la prise de décisions de publication. La RFC elle-même reste le registre historique expliquant _pourquoi_ ces décisions ont été prises ; le document extrait constitue _ce_ que les contributeurs consultent."
@@ -28272,6 +28485,10 @@ msgstr "Ajoutez ensuite `impl Attributable for X` à côté de la nouvelle struc
 #: src/ops/network-deployment.md
 msgid "Then any device on the LAN can reach `http://<pi-ip>:42617`. Doesn't help for internet-reachable webhooks — your router's public IP isn't forwarded to the Pi."
 msgstr "Ensuite, n'importe quel appareil sur le LAN peut accéder à `http://<pi-ip>:42617`. Cela ne convient pas pour les webhooks accessibles depuis Internet — l'adresse IP publique de votre routeur n'est pas redirigée vers le Pi."
+
+#: src/gateway/web-dashboard.md
+msgid "Then build the bundle once:"
+msgstr "Compilez ensuite le bundle une seule fois :"
 
 #: src/getting-started/multi-model-setup.md
 msgid "Then query traces:"
@@ -28565,6 +28782,10 @@ msgstr "Cela convient pour le développement local de confiance, les pipelines C
 msgid "This is deliberate. We have opinions about quality but not about vendors. If a better model ships tomorrow under a different banner, the config is a one-line change."
 msgstr "C'est intentionnel. Nous avons des opinions sur la qualité, mais pas sur les fournisseurs. Si un meilleur modèle est publié demain sous une autre bannière, la configuration ne nécessite qu'une modification d'une ligne."
 
+#: src/architecture/subagents.md
+msgid "This is editable in the gateway dashboard and zerocode at **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (a forbidden/allow select)."
+msgstr "Ceci est modifiable dans le tableau de bord de la passerelle et zerocode dans **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (un sélecteur forbidden/allow)."
+
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "This is harder than giving feedback for most people, and it is worth being honest about why."
 msgstr "C'est plus difficile que de donner des commentaires pour la plupart des gens, et il est utile d'être honnête quant aux raisons."
@@ -28705,6 +28926,10 @@ msgstr "Cela signifie que le workflow CI et le workflow de publication partagent
 msgid "This means the most valuable skill in an AI-assisted workflow is not prompt engineering. It is the ability to evaluate the output. That requires knowing what good looks like before you ask for anything. Which brings you back, every time, to the top of the decision hierarchy."
 msgstr "Cela signifie que la compétence la plus précieuse dans un flux de travail assisté par l'IA n'est pas l'ingénierie des prompts. C'est la capacité d'évaluer la sortie. Cela nécessite de savoir ce qui constitue une bonne sortie avant de demander quoi que ce soit. Ce qui vous ramène, à chaque fois, au sommet de la hiérarchie des décisions."
 
+#: src/gateway/web-dashboard.md
+msgid "This means the path is syntactically valid but the file isn't there yet. Either run `cargo web build`, fix the path, or remove the setting entirely and let auto-detect handle it."
+msgstr "Cela signifie que le chemin est syntaxiquement valide mais que le fichier n'est pas encore présent. Vous pouvez soit exécuter `cargo web build`, corriger le chemin, ou supprimer entièrement le paramètre et laisser la détection automatique s'en charger."
+
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "This mental model also means that the output is your responsibility. You cannot submit a PR and say \"the AI wrote it.\" You reviewed it. You opened the PR. It is your work."
 msgstr "Ce modèle mental signifie également que la sortie est votre responsabilité. Vous ne pouvez pas soumettre une PR et dire « l'IA l'a écrite ». Vous l'avez revue. Vous avez ouvert la PR. C'est votre travail."
@@ -28826,8 +29051,8 @@ msgid "This two-layer split was identified during the Phase 1 workspace decompos
 msgstr "Cette séparation en deux couches a été identifiée lors de la décomposition de l’espace de travail de la Phase 1 (PR #5559) et est reflétée dans la dénomination des crates : `zeroclaw-runtime` (la crate) est conditionnée par `agent-runtime` (la fonctionnalité). Les versions antérieures de cette RFC utilisaient le terme « kernel » de manière imprécise pour désigner ce qui est désormais correctement nommé la couche runtime. Cette révision corrige cette terminologie dans tout le document."
 
 #: src/maintainers/release-runbook.md
-msgid "This updates README badges, the Tauri config, marketplace templates, and workflow description examples. Commit everything together:"
-msgstr "Ceci met à jour les badges du README, la configuration Tauri, les modèles de la place de marché et les exemples de description de workflow. Validez le tout ensemble :"
+msgid "This updates README badges, the Tauri config, and workflow description examples. Commit everything together:"
+msgstr "Ceci met à jour les badges du README, la configuration Tauri et les exemples de description de workflow. Validez le tout ensemble :"
 
 #: src/hardware/raspberry-pi-setup.md
 msgid "This walks you through provider auth, gateway config, and creates `~/.zeroclaw/config.toml`."
@@ -29808,7 +30033,7 @@ msgstr "Utilisez les tableaux ci-dessous pour choisir l'architecture et les docu
 
 #: src/contributing/pr-review-protocol.md
 msgid "Use these canonical forms:"
-msgstr "D'accord, je suivrai les formes canoniques que vous me fournirez pour la traduction. Veuillez partager les formes canoniques que vous souhaitez que j'utilise."
+msgstr "D'accord. Veuillez fournir le texte à traduire en français."
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use this as the basis for security-related issues and PRs"
@@ -30072,6 +30297,10 @@ msgstr "Indicateur de verdict"
 msgid "Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section)."
 msgstr "Vérification et émission des identifiants d'intention vérifiable (VI) (section `[verifiable_intent]`)."
 
+#: src/gateway/web-dashboard.md
+msgid "Verifies the directory exists AND contains `index.html` on this machine."
+msgstr "Vérifie que le répertoire existe ET contient `index.html` sur cette machine."
+
 #: src/channels/nextcloud-talk.md
 msgid "Verifies webhook signatures (HMAC-SHA256) when a secret is configured"
 msgstr "Vérifie les signatures de webhook (HMAC-SHA256) lorsqu'un secret est configuré"
@@ -30286,8 +30515,8 @@ msgid "Walk the stale queue. Apply `status:no-stale` only when accepted or other
 msgstr "Parcourez la file d'attente des éléments obsolètes. Appliquez `status:no-stale` uniquement lorsqu'un travail accepté ou autrement de longue durée a une raison enregistrée de rester ouvert et n'est pas déjà protégé par une autre exclusion d'obsolescence."
 
 #: src/architecture/subagents.md
-msgid "Want a different specialist (different model, different permission envelope) to handle the task"
-msgstr "Confier la tâche à un autre spécialiste (modèle différent, périmètre d'autorisations différent)"
+msgid "Want a different specialist (different model, different alias) on the **same trust tier** to handle the task"
+msgstr "Vous souhaitez qu'un autre spécialiste (modèle différent, alias différent) du **même niveau de confiance** se charge de la tâche"
 
 #: src/introduction.md
 msgid "Want to contribute? → [Contributing](./contributing/how-to.md)"
@@ -30373,9 +30602,17 @@ msgstr "Tableau de bord Web"
 msgid "Web assets (moved to `zeroclaw-gw`)"
 msgstr "Actifs Web (déplacés vers `zeroclaw-gw`)"
 
+#: src/gateway/web-dashboard.md
+msgid "Web dashboard (`gateway.web_dist_dir`)"
+msgstr "Tableau de bord web (`gateway.web_dist_dir`)"
+
 #: src/architecture/crates.md
 msgid "Web dashboard (static assets + auth)"
 msgstr "Tableau de bord Web (actifs statiques + authentification)"
+
+#: src/SUMMARY.md
+msgid "Web dashboard (web_dist_dir)"
+msgstr "Tableau de bord web (web_dist_dir)"
 
 #: src/reference/config.md
 msgid "Web fetch tool configuration (`[web_fetch]` section)."
@@ -30610,6 +30847,10 @@ msgstr "Ce que fait l'installateur"
 msgid "What the sandbox confines"
 msgstr "Ce que le bac à sable confine"
 
+#: src/gateway/web-dashboard.md
+msgid "What the setting does"
+msgstr "Ce que fait le paramètre"
+
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "What they download"
 msgstr "Ce qu'ils téléchargent"
@@ -30795,6 +31036,10 @@ msgstr "Lorsque `enabled = true`, l'agent interroge une base de données Notion 
 msgid "When `enabled` is true, ZeroClaw validates incoming requests against a Nevis Security Suite instance and maps Nevis roles to tool/workspace permissions."
 msgstr "Lorsque `enabled` est true, ZeroClaw valide les requêtes entrantes par rapport à une instance de Nevis Security Suite et mappe les rôles Nevis aux permissions d'outils/espaces de travail."
 
+#: src/gateway/web-dashboard.md
+msgid "When `gateway.web_dist_dir` is unset (or set to a path with no `index.html`), the daemon probes these locations in order and serves from the first one that contains `index.html`:"
+msgstr "Lorsque `gateway.web_dist_dir` n'est pas défini (ou pointe vers un chemin sans `index.html`), le démon teste ces emplacements dans l'ordre et sert le contenu du premier qui contient `index.html` :"
+
 #: src/tools/python-skills.md
 msgid "When `runtime.docker.mount_workspace = true`, ZeroClaw mounts the configured workspace at `/workspace` in the container and sets the container workdir there. Skill scripts should use workspace-relative paths whenever possible."
 msgstr "Lorsque `runtime.docker.mount_workspace = true`, ZeroClaw monte l'espace de travail configuré sur `/workspace` dans le conteneur et y définit le répertoire de travail du conteneur. Les scripts de compétence doivent utiliser des chemins relatifs à l'espace de travail chaque fois que possible."
@@ -30934,6 +31179,10 @@ msgstr "Lorsque les ports entrants sont importants"
 #: src/setup/service.md
 msgid "When invoked with sudo/root, `zeroclaw service install` creates a system-scope unit at `/etc/systemd/system/zeroclaw.service` and provisions a dedicated `zeroclaw` service user."
 msgstr "Lorsqu'il est exécuté avec sudo/root, `zeroclaw service install` crée une unité au niveau du système dans `/etc/systemd/system/zeroclaw.service` et provisionne un utilisateur de service dédié `zeroclaw`."
+
+#: src/gateway/web-dashboard.md
+msgid "When it matches"
+msgstr "Lorsqu'elle correspond"
 
 #: src/sop/connectivity.md
 msgid "When pairing is enabled (default), provide:"
@@ -31483,7 +31732,7 @@ msgstr "Accès en écriture au dépôt"
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Write an OpenAPI 3.1 spec for the kernel's local IPC API before implementing it"
 msgstr "Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau."
-"Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Voici une spécification OpenAPI 3.1 pour l'API IPC locale du noyau. Cette spécification définit les points de terminaison, les schémas de données et les métadonnées nécessaires pour interagir avec l'API IPC locale du noyau.\n"
+"Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Cette spécification peut être utilisée comme base pour implémenter l'API IPC locale du noyau.Voici une spécification OpenAPI 3.1 pour l'API IPC locale du noyau. Cette spécification définit les points de terminaison, les schémas de données et les métadonnées nécessaires pour interagir avec l'API IPC locale du noyau.\n"
 "\n"
 "```yaml\n"
 "openapi: 3.1.0\n"
@@ -31612,7 +31861,7 @@ msgstr "Écrit un champ. Corps : `{path, value, comment?}`. Les secrets réponde
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write root-level `AGENTS.md` for `crates/zeroclaw-api` (in anticipation of extraction)"
 msgstr "Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails."
-"Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.# Documentation pour `crates/zeroclaw-api`\n"
+"Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.# Documentation pour `crates/zeroclaw-api`\n"
 "\n"
 "## Objectif\n"
 "\n"
@@ -31682,7 +31931,7 @@ msgstr "Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de d
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)"
 msgstr "Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté."
-"Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.# Document de gouvernance du Registre des Plugins\n"
+"Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.# Document de gouvernance du Registre des Plugins\n"
 "\n"
 "## 1. Introduction\n"
 "\n"
@@ -31903,6 +32152,10 @@ msgstr "Vous n'avez plus de blocages à lever, mais d'autres relecteurs ont des 
 #: src/contributing/pr-review-protocol.md
 msgid "You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions"
 msgstr "Vous avez des observations précises mais ce sont toutes des suggestions 🔵 ou des questions de clarification non bloquantes"
+
+#: src/gateway/web-dashboard.md
+msgid "You have three options. Pick whichever matches how you installed ZeroClaw."
+msgstr "Vous avez trois options. Choisissez celle qui correspond à la façon dont vous avez installé ZeroClaw."
 
 #: src/foundations/index.md
 msgid "You may be joining this project years after these were written. The tools will have changed. The codebase will look different. Some of what is described here will have been superseded, refined, or replaced by documents that came after."
@@ -32404,6 +32657,10 @@ msgstr "[Niveaux d'autonomie](./autonomy.md) — la couche de politique qui déc
 msgid "[Browser automation](./browser.md)"
 msgstr "[Automatisation du navigateur](./browser.md)"
 
+#: src/gateway/web-dashboard.md
+msgid "[Building the web dashboard](../developing/web.md) — `cargo web` subcommands and what gets generated"
+msgstr "[Construire le tableau de bord web](../developing/web.md) — sous-commandes `cargo web` et ce qui est généré"
+
 #: src/contributing/architecture-map.md
 msgid "[CI & Actions](../maintainers/ci-and-actions.md), [FND-004](../foundations/fnd-004-engineering-infrastructure.md), [PR workflow](../maintainers/pr-workflow.md)"
 msgstr "[CI & Actions](../maintainers/ci-and-actions.md), [FND-004](../foundations/fnd-004-engineering-infrastructure.md), [Processus PR](../maintainers/pr-workflow.md)"
@@ -32540,6 +32797,10 @@ msgstr "[Infrastructure d'ingénierie — Pipeline CI/CD](./fnd-004-engineering-
 msgid "[Environment variables](../reference/env-vars.md)"
 msgstr "[Variables d'environnement](../reference/env-vars.md)"
 
+#: src/gateway/web-dashboard.md
+msgid "[Environment variables](../reference/env-vars.md) — full schema-mirror grammar"
+msgstr "[Variables d'environnement](../reference/env-vars.md) — grammaire complète en miroir du schéma"
+
 #: src/contributing/architecture-map.md
 msgid "[Environment variables](../reference/env-vars.md), [Provider configuration](../providers/configuration.md), [FND-001](../foundations/fnd-001-intentional-architecture.md), [RFC process](./rfcs.md)"
 msgstr "[Variables d'environnement](../reference/env-vars.md), [Configuration du fournisseur](../providers/configuration.md), [FND-001](../foundations/fnd-001-intentional-architecture.md), [Processus RFC](./rfcs.md)"
@@ -32591,6 +32852,10 @@ msgstr "[Prise en charge en cinq minutes](#five-minute-intake)"
 #: src/contributing/architecture-map.md
 msgid "[Gateway HTTP API](../gateway/api.md), [Request lifecycle](../architecture/request-lifecycle.md), [Security overview](../security/overview.md), [Reviewer playbook](../maintainers/reviewer-playbook.md)"
 msgstr "[API HTTP Gateway](../gateway/api.md), [Cycle de vie d'une requête](../architecture/request-lifecycle.md), [Aperçu de la sécurité](../security/overview.md), [Guide du relecteur](../maintainers/reviewer-playbook.md)"
+
+#: src/gateway/web-dashboard.md
+msgid "[Gateway HTTP API](./api.md) — what the dashboard talks to"
+msgstr "[API HTTP Gateway](./api.md) — ce avec quoi le tableau de bord communique"
 
 #: src/foundations/fnd-003-governance.md
 msgid "[GitHub Discussions: Community Discussion and Handoff](#4-github-discussions-community-discussion-and-handoff)"
@@ -33819,7 +34084,7 @@ msgstr "[rppal](https://github.com/golemparts/rppal) — GPIO de Raspberry Pi en
 msgid "[tonic](https://github.com/hyperium/tonic) — gRPC for Rust"
 msgstr "[tonic](https://github.com/hyperium/tonic) — gRPC pour Rust"
 
-#: src/foundations/index.md
+#: src/gateway/web-dashboard.md src/foundations/index.md
 msgid "\\#"
 msgstr "\\#"
 
@@ -34423,6 +34688,10 @@ msgstr "`$ZEROCLAW_WORKSPACE/.zeroclaw/config.toml` si défini"
 msgid "`$ZEROCODE_LOCALE_DIR/<locale>/zerocode.ftl`"
 msgstr "`$ZEROCODE_LOCALE_DIR/<locale>/zerocode.ftl`"
 
+#: src/gateway/web-dashboard.md
+msgid "`${XDG_DATA_HOME:-~/.local/share}/zeroclaw/web/dist`"
+msgstr "`${XDG_DATA_HOME:-~/.local/share}/zeroclaw/web/dist`"
+
 #: src/maintainers/changelog-generation.md
 msgid "`*@noreply.anthropic.com`"
 msgstr "`*@noreply.anthropic.com`"
@@ -34983,6 +35252,10 @@ msgstr "`./scripts/dev/act-local.sh --all --no-allowlist` — désactive le filt
 msgid "`./scripts/dev/act-local.sh release-stable-manual:publish` — the explicit `<wf>:<job>` form runs what you ask for and prints a loud warning before invoking `act` if the target isn't on the allowlist."
 msgstr "`./scripts/dev/act-local.sh release-stable-manual:publish` — la forme explicite `<wf>:<job>` exécute ce que vous demandez et affiche un avertissement visible avant d'invoquer `act` si la cible n'est pas dans la liste d'autorisation."
 
+#: src/gateway/web-dashboard.md
+msgid "`./web/dist` (relative to CWD)"
+msgstr "`./web/dist` (relatif au CWD)"
+
 #: src/maintainers/labels.md
 msgid "`.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**`"
 msgstr "`.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**`"
@@ -35059,9 +35332,17 @@ msgstr "`/metrics/tools` (format Prometheus) :"
 msgid "`/metrics` exposes observer metrics when `[observability] backend = \"prometheus\"`."
 msgstr "`/metrics` expose les métriques d'observateur lorsque `[observability] backend = \"prometheus\"`."
 
+#: src/gateway/web-dashboard.md
+msgid "`/usr/share/zeroclawlabs/web/dist`"
+msgstr "`/usr/share/zeroclawlabs/web/dist`"
+
 #: src/ops/network-deployment.md
 msgid "`/var/log/zeroclaw/` — log files"
 msgstr "`/var/log/zeroclaw/` — fichiers journaux"
+
+#: src/gateway/web-dashboard.md
+msgid "`/zeroclaw-data/web/dist`"
+msgstr "`/zeroclaw-data/web/dist`"
 
 #: src/getting-started/tui.md
 msgid "`0.0.0.0`"
@@ -35434,6 +35715,10 @@ msgstr "`<config-dir>/zerocode/locales/<locale>/zerocode.ftl`"
 #: src/architecture/rpc-socket.md
 msgid "`<data_dir>/daemon.sock` (Unix domain socket)"
 msgstr "`<data_dir>/daemon.sock` (socket de domaine Unix)"
+
+#: src/gateway/web-dashboard.md
+msgid "`<dir-of-binary>/web/dist`"
+msgstr "`<dir-of-binary>/web/dist`"
 
 #: src/maintainers/docs-and-translations.md
 msgid "`<install-prefix>/share/zerocode/locales/<locale>/zerocode.ftl`"
@@ -35864,6 +36149,14 @@ msgid "`ZEROCLAW_gateway__request_timeout_secs=120`"
 msgstr "`ZEROCLAW_gateway__request_timeout_secs=120`"
 
 #: src/reference/env-vars.md
+msgid "`ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist`"
+msgstr "`ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist`"
+
+#: src/gateway/web-dashboard.md
+msgid "`ZEROCLAW_gateway__web_dist_dir` (schema-mirror env var, see [Environment variables](../reference/env-vars.md))"
+msgstr "`ZEROCLAW_gateway__web_dist_dir` (variable d'environnement reflétant le schéma, voir [Variables d'environnement](../reference/env-vars.md))"
+
+#: src/reference/env-vars.md
 msgid "`ZEROCLAW_providers__models__anthropic__home__api_key=...`"
 msgstr "`ZEROCLAW_providers__models__anthropic__home__api_key=...`"
 
@@ -35962,6 +36255,10 @@ msgstr "`[cost]` couvre l'application du budget et le comportement d'enregistrem
 #: src/reference/env-vars.md
 msgid "`[gateway] request_timeout_secs = 120`"
 msgstr "`[gateway] request_timeout_secs = 120`"
+
+#: src/reference/env-vars.md
+msgid "`[gateway] web_dist_dir = \"/srv/zeroclaw/web/dist\"`"
+msgstr "`[gateway] web_dist_dir = \"/srv/zeroclaw/web/dist\"`"
 
 #: src/reference/env-vars.md
 msgid "`[providers.models.anthropic.home] api_key = \"...\"`"
@@ -36311,6 +36608,20 @@ msgstr ""
 "    log \"[registry] aardvark0 prêt → Port Total Phase 0\"\n"
 "  ...\n"
 "```"
+
+#: src/architecture/subagents.md
+msgid ""
+"```\n"
+"delegate target \"<target>\" uses risk profile \"<target_profile>\", but delegation requires the same risk profile as the caller (\"<caller_profile>\")\n"
+"```"
+msgstr "delegate target \"<target>\" utilise le profil de risque \"<target_profile>\", mais la délégation requiert le même profil de risque que l'appelant (\"<caller_profile>\")"
+
+#: src/architecture/subagents.md
+msgid ""
+"```\n"
+"delegation is forbidden by the caller's delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = \"allow\"\n"
+"```"
+msgstr "la délégation est interdite par la delegation_policy de l'appelant ; définissez [risk_profiles.<caller_profile>].delegation_policy mode = \"allow\""
 
 #: src/hardware/aardvark.md
 msgid ""
@@ -36795,6 +37106,14 @@ msgstr ""
 "    TL --> FS\n"
 "```"
 
+#: src/gateway/web-dashboard.md
+msgid ""
+"```toml\n"
+"# Broken — the gateway looks for a directory literally named \"~\"\n"
+"web_dist_dir = \"~/zeroclaw/web/dist\"\n"
+"```"
+msgstr "```toml\n# Cassé — la passerelle recherche un répertoire littéralement nommé \"~\"\nweb_dist_dir = \"~/zeroclaw/web/dist\"\n```"
+
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid ""
 "```toml\n"
@@ -36817,6 +37136,14 @@ msgstr ""
 "version.workspace = true\n"
 "```"
 
+#: src/gateway/web-dashboard.md
+msgid ""
+"```toml\n"
+"# Correct\n"
+"web_dist_dir = \"/home/alice/zeroclaw/web/dist\"\n"
+"```"
+msgstr "```toml\n# Correct\nweb_dist_dir = \"/home/alice/zeroclaw/web/dist\"\n```"
+
 #: src/maintainers/docs-and-translations.md
 msgid ""
 "```toml\n"
@@ -36833,13 +37160,26 @@ msgstr ""
 "model = \"qwen3.6:35b-a3b\" # Modèle actuellement recommandé\n"
 "```"
 
+#: src/gateway/web-dashboard.md
+msgid ""
+"```toml\n"
+"# config.toml\n"
+"[gateway]\n"
+"web_dist_dir = \"/absolute/path/to/zeroclaw/web/dist\"   # NOTE: no ~, no $HOME\n"
+"```"
+msgstr "```toml\n# config.toml\n[gateway]\nweb_dist_dir = \"/absolute/path/to/zeroclaw/web/dist\"   # REMARQUE : pas de ~, pas de $HOME\n```"
+
 #: src/getting-started/language.md
 msgid ""
 "```toml\n"
 "# ~/.zeroclaw/config.toml\n"
 "locale = \"ja\"\n"
 "```"
-msgstr "```toml\n# ~/.zeroclaw/config.toml\nlocale = \"ja\"\n```"
+msgstr ""
+"```toml\n"
+"# ~/.zeroclaw/config.toml\n"
+"locale = \"ja\"\n"
+"```"
 
 #: src/maintainers/docs-and-translations.md
 msgid ""
@@ -37592,14 +37932,9 @@ msgid ""
 "enabled = true\n"
 "app_id = \"...\"\n"
 "app_secret = \"...\"\n"
+"# use_feishu = true  # route this Lark-compatible channel to Feishu endpoints\n"
 "```"
-msgstr ""
-"```toml\n"
-"[channels.lark]\n"
-"enabled = true\n"
-"app_id = \"...\"\n"
-"app_secret = \"...\"\n"
-"```"
+msgstr "```toml\n[channels.lark]\nenabled = true\napp_id = \"...\"\napp_secret = \"...\"\n# use_feishu = true  # acheminer ce canal compatible Lark vers les points de terminaison Feishu\n```"
 
 #: src/channels/mattermost.md
 msgid ""
@@ -38576,29 +38911,28 @@ msgid ""
 "\n"
 "[agents.frontline]\n"
 "model_provider  = \"anthropic.haiku\"\n"
-"risk_profile    = \"hardened\"     # public-facing strictness\n"
+"risk_profile    = \"trusted\"      # shared trust tier (delegation requires a match)\n"
 "runtime_profile = \"tight\"        # low iteration cap, fast turn-around\n"
 "channels        = [\"telegram.home\"]\n"
 "\n"
 "[agents.heavy]\n"
 "model_provider  = \"anthropic.opus\"\n"
-"risk_profile    = \"permissive\"   # internal-delegate trust\n"
+"risk_profile    = \"trusted\"      # SAME profile as frontline — required to be delegable\n"
 "runtime_profile = \"deep\"         # high iteration cap for chain-of-thought work\n"
 "# No channels — invoked via the delegate tool from frontline\n"
 "\n"
-"# risk_profile and runtime_profile reference independent alias maps —\n"
-"# the names above intentionally differ between the two profile kinds\n"
-"# to make that clear.\n"
+"# runtime_profile references an independent alias map from risk_profile;\n"
+"# the two agents share one risk profile but differ in runtime profile.\n"
 "\n"
-"[risk_profiles.hardened]\n"
+"[risk_profiles.trusted]\n"
 "level                            = \"supervised\"\n"
 "workspace_only                   = true\n"
 "require_approval_for_medium_risk = true\n"
 "block_high_risk_commands         = true\n"
-"\n"
-"[risk_profiles.permissive]\n"
-"level          = \"full\"\n"
-"workspace_only = false\n"
+"# allow this profile's agents to delegate to each other; without this,\n"
+"# delegation is forbidden by default.\n"
+"delegation_policy                = { mode = \"allow\" }\n"
+"allowed_tools                    = [\"shell\", \"file_read\", \"memory_recall\", \"delegate\"]\n"
 "\n"
 "[runtime_profiles.tight]\n"
 "max_tool_iterations  = 5\n"
@@ -38608,54 +38942,7 @@ msgid ""
 "max_tool_iterations  = 50\n"
 "max_actions_per_hour = 200\n"
 "```"
-msgstr ""
-"```toml\n"
-"[providers.models.anthropic.opus]\n"
-"model   = \"claude-opus-4-7\"\n"
-"api_key = \"sk-ant-...\"\n"
-"# (pas de temperature — claude-opus-4-7 rejette tout réglage de température)\n"
-"\n"
-"[providers.models.anthropic.haiku]\n"
-"model   = \"claude-haiku-4-5-20251001\"\n"
-"api_key = \"sk-ant-...\"\n"
-"\n"
-"[channels.telegram.home]\n"
-"bot_token = \"...\"\n"
-"\n"
-"[agents.frontline]\n"
-"model_provider  = \"anthropic.haiku\"\n"
-"risk_profile    = \"hardened\"     # niveau de rigueur pour le public\n"
-"runtime_profile = \"tight\"        # plafond d'itérations bas, réponse rapide\n"
-"channels        = [\"telegram.home\"]\n"
-"\n"
-"[agents.heavy]\n"
-"model_provider  = \"anthropic.opus\"\n"
-"risk_profile    = \"permissive\"   # confiance déléguée en interne\n"
-"runtime_profile = \"deep\"         # plafond d'itérations élevé pour le raisonnement en chaîne\n"
-"# Pas de channels — invoqué via l'outil delegate depuis frontline\n"
-"\n"
-"# risk_profile et runtime_profile référencent des tables d'alias indépendantes —\n"
-"# les noms ci-dessus diffèrent volontairement entre les deux types de profils\n"
-"# pour rendre cela clair.\n"
-"\n"
-"[risk_profiles.hardened]\n"
-"level                            = \"supervised\"\n"
-"workspace_only                   = true\n"
-"require_approval_for_medium_risk = true\n"
-"block_high_risk_commands         = true\n"
-"\n"
-"[risk_profiles.permissive]\n"
-"level          = \"full\"\n"
-"workspace_only = false\n"
-"\n"
-"[runtime_profiles.tight]\n"
-"max_tool_iterations  = 5\n"
-"max_actions_per_hour = 30\n"
-"\n"
-"[runtime_profiles.deep]\n"
-"max_tool_iterations  = 50\n"
-"max_actions_per_hour = 200\n"
-"```"
+msgstr "```toml\n[providers.models.anthropic.opus]\nmodel   = \"claude-opus-4-7\"\napi_key = \"sk-ant-...\"\n# (pas de temperature — claude-opus-4-7 rejette tout réglage de temperature)\n\n[providers.models.anthropic.haiku]\nmodel   = \"claude-haiku-4-5-20251001\"\napi_key = \"sk-ant-...\"\n\n[channels.telegram.home]\nbot_token = \"...\"\n\n[agents.frontline]\nmodel_provider  = \"anthropic.haiku\"\nrisk_profile    = \"trusted\"      # niveau de confiance partagé (la délégation nécessite une correspondance)\nruntime_profile = \"tight\"        # faible plafond d'itérations, exécution rapide\nchannels        = [\"telegram.home\"]\n\n[agents.heavy]\nmodel_provider  = \"anthropic.opus\"\nrisk_profile    = \"trusted\"      # MÊME profil que frontline — requis pour être délégable\nruntime_profile = \"deep\"         # plafond d'itérations élevé pour le raisonnement en chaîne\n# Pas de channels — invoqué via l'outil delegate depuis frontline\n\n# runtime_profile référence une table d'alias indépendante de risk_profile ;\n# les deux agents partagent un même profil de risque mais diffèrent par leur profil d'exécution.\n\n[risk_profiles.trusted]\nlevel                            = \"supervised\"\nworkspace_only                   = true\nrequire_approval_for_medium_risk = true\nblock_high_risk_commands         = true\n# autorise les agents de ce profil à se déléguer mutuellement ; sans cela,\n# la délégation est interdite par défaut.\ndelegation_policy                = { mode = \"allow\" }\nallowed_tools                    = [\"shell\", \"file_read\", \"memory_recall\", \"delegate\"]\n\n[runtime_profiles.tight]\nmax_tool_iterations  = 5\nmax_actions_per_hour = 30\n\n[runtime_profiles.deep]\nmax_tool_iterations  = 50\nmax_actions_per_hour = 200\n```"
 
 #: src/providers/routing.md
 msgid ""
@@ -40261,6 +40548,10 @@ msgstr "`allowed_services` : vecteur vide, ce qui accorde l'accès à l'ensemble
 msgid "`allowed_tools`"
 msgstr "`allowed_tools`"
 
+#: src/architecture/subagents.md
+msgid "`allowed_tools` must list `delegate`, caller's `delegation_policy mode = \"allow\"`, and target shares the caller's risk profile"
+msgstr "`allowed_tools` doit lister `delegate`, le `delegation_policy mode = \"allow\"` de l'appelant, et la cible partage le profil de risque de l'appelant"
+
 #: src/channels/overview.md
 msgid "`allowed_users`"
 msgstr "`allowed_users`"
@@ -40823,6 +41114,10 @@ msgid "`channel-<name>` — opt-in per channel (e.g. `channel-matrix`, `channel-
 msgstr "`channel-<nom>` — activation par canal (par ex. `channel-matrix`, `channel-discord`)"
 
 #: src/channels/overview.md
+msgid "`channel-acp-server`"
+msgstr "`channel-acp-server`"
+
+#: src/channels/overview.md
 msgid "`channel-bluesky`"
 msgstr "`channel-bluesky`"
 
@@ -40833,10 +41128,6 @@ msgstr "`channel-clawdtalk`"
 #: src/channels/overview.md
 msgid "`channel-email`"
 msgstr "`channel-email`"
-
-#: src/channels/overview.md
-msgid "`channel-gmail-push`"
-msgstr "`channel-gmail-push`"
 
 #: src/channels/overview.md
 msgid "`channel-line`"
@@ -40851,8 +41142,8 @@ msgid "`channel-mattermost`"
 msgstr "`channel-mattermost`"
 
 #: src/channels/overview.md
-msgid "`channel-nextcloud-talk`"
-msgstr "`channel-nextcloud-talk`"
+msgid "`channel-nextcloud`"
+msgstr "`channel-nextcloud`"
 
 #: src/channels/overview.md
 msgid "`channel-nostr`"
@@ -40871,10 +41162,6 @@ msgid "`channel-signal`"
 msgstr "`channel-signal`"
 
 #: src/channels/overview.md
-msgid "`channel-tts`"
-msgstr "`channel-tts`"
-
-#: src/channels/overview.md
 msgid "`channel-twitter`"
 msgstr "`channel-twitter`"
 
@@ -40883,8 +41170,8 @@ msgid "`channel-voice-call`"
 msgstr "`channel-voice-call`"
 
 #: src/channels/overview.md
-msgid "`channel-voice-wake`"
-msgstr "`channel-voice-wake`"
+msgid "`channel-webhook`"
+msgstr "`channel-webhook`"
 
 #: src/channels/overview.md
 msgid "`channel-whatsapp-cloud`"
@@ -41587,6 +41874,10 @@ msgid "`delegate` does not emit a dedicated tracing span today. The signal is th
 msgstr "`delegate` n'émet pas aujourd'hui de span de traçage dédié. Le signal est l'apparition dans le journal de la boucle de l'agent **cible**, qui hérite de la portée dans laquelle se trouvait le dispatch d'appel d'outil du parent. Les spawns en mode arrière-plan sont plus faciles à vérifier hors bande : le fichier de résultat `<workspace>/delegate_results/<uuid>.json` existe sur le disque et contient les champs `status` + `output` de l'agent cible ; `cat` ou `jq` fonctionne sans toucher au journal du tout."
 
 #: src/architecture/subagents.md
+msgid "`delegate` enforces two gates in `crates/zeroclaw-runtime/src/tools/delegate.rs` before a target agent runs, in this order:"
+msgstr "`delegate` applique deux contrôles dans `crates/zeroclaw-runtime/src/tools/delegate.rs` avant qu'un agent cible ne s'exécute, dans cet ordre :"
+
+#: src/architecture/subagents.md
 msgid "`delegate`: how to verify it actually fired"
 msgstr "`delegate` : comment vérifier qu'il s'est réellement déclenché"
 
@@ -42207,6 +42498,14 @@ msgstr "`gateway.tls.client_auth`"
 #: src/reference/config.md
 msgid "`gateway.tls`"
 msgstr "`gateway.tls`"
+
+#: src/gateway/web-dashboard.md
+msgid "`gateway.web_dist_dir` in `config.toml`"
+msgstr "`gateway.web_dist_dir` dans `config.toml`"
+
+#: src/gateway/web-dashboard.md
+msgid "`gateway.web_dist_dir` is an `Option<String>` pointing at the directory that contains a built `index.html`. At gateway start, the daemon:"
+msgstr "`gateway.web_dist_dir` est une `Option<String>` qui pointe vers le répertoire contenant un fichier `index.html` compilé. Au démarrage de la passerelle, le démon :"
 
 #: src/reference/config.md src/maintainers/labels.md
 msgid "`gateway`"
@@ -44253,6 +44552,10 @@ msgstr "`risque:faible`"
 msgid "`risk:medium`"
 msgstr "`risque:moyen`"
 
+#: src/architecture/subagents.md
+msgid "`risk_profile.allowed_tools` must list `spawn_subagent`"
+msgstr "`risk_profile.allowed_tools` doit lister `spawn_subagent`"
+
 #: src/providers/configuration.md
 msgid "`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry."
 msgstr "`risk_profile` et `runtime_profile` référencent des tables d'alias indépendantes, leurs noms n'ont donc pas besoin de correspondre (`runtime_profile` est également facultatif). `Config::validate()` échoue bruyamment au démarrage si `model_provider` ne se résout pas en une entrée `[providers.models.<type>.<alias>]` configurée, ou si `risk_profile` ne se résout pas en une entrée `[risk_profiles.<alias>]` configurée."
@@ -45817,6 +46120,10 @@ msgstr "`vision_model`"
 msgid "`vllm`"
 msgstr "`vllm`"
 
+#: src/channels/overview.md
+msgid "`voice-wake`"
+msgstr "`voice-wake`"
+
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "`voice-wake` (libasound2 dependency)"
 msgstr "`voice-wake` (dépendance libasound2)"
@@ -45884,6 +46191,10 @@ msgstr "`web/public/sitemap.xml` — définir le `<lastmod>` de l'entrée `/blog
 #: src/developing/web.md
 msgid "`web/src/lib/api-generated.ts`"
 msgstr "`web/src/lib/api-generated.ts`"
+
+#: src/gateway/web-dashboard.md
+msgid "`web_dist_dir = \"web/dist\"` is interpreted relative to the daemon's working directory at start time — not relative to the location of `config.toml`. If you ship a config to another host or invoke the daemon from a different directory (e.g. via systemd), the relative form will look in the wrong place. **Use absolute paths in `config.toml`.**"
+msgstr "`web_dist_dir = \"web/dist\"` est interprété relativement au répertoire de travail du daemon au moment du démarrage — et non relativement à l'emplacement de `config.toml`. Si vous déployez une configuration vers un autre hôte ou invoquez le daemon depuis un répertoire différent (par exemple via systemd), la forme relative cherchera au mauvais endroit. **Utilisez des chemins absolus dans `config.toml`.**"
 
 #: src/reference/config.md
 msgid "`web_dist_dir`"
@@ -46880,6 +47191,10 @@ msgid "agent context → `[<agent_alias>]`"
 msgstr "agent context → `[<agent_alias>]`"
 
 #: src/channels/overview.md
+msgid "always compiled with channel support"
+msgstr "toujours compilé avec la prise en charge des canaux"
+
+#: src/channels/overview.md
 msgid "always on"
 msgstr "toujours activé"
 
@@ -47625,6 +47940,10 @@ msgstr "ce RFC"
 msgid "timestamp"
 msgstr "horodatage"
 
+#: src/gateway/web-dashboard.md
+msgid "to"
+msgstr "à"
+
 #: src/hardware/aardvark.md
 msgid "tools loaded"
 msgstr "outils chargés"
@@ -47900,6 +48219,10 @@ msgstr "~90 %"
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "—"
 msgstr "—"
+
+#: src/gateway/web-dashboard.md
+msgid "…and restart the daemon. The startup log changes from"
+msgstr "…et redémarrez le démon. Le journal de démarrage passe de"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "−2 files"

@@ -343,6 +343,8 @@ channel-wecom-ws-dm-access-denied =
     あなたのユーザーID: {$userid}
 
     管理者に、あなたのユーザーIDを {$allowed_users_path} に追加するよう依頼してください。
+channel-discord-delivery-failure-note-one = （注意：{$count}個のファイルを配信できませんでした。）
+channel-discord-delivery-failure-note-many = （注意：{$count}個のファイルを配信できませんでした。）
 onboard-openai-auth-note =
     OpenAI認証:
     • APIキー — platform.openai.com 経由の標準APIアクセス (sk-...)
