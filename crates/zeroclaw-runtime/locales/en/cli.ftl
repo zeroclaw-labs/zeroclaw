@@ -396,7 +396,7 @@ onboard-openai-auth-api-key = API key
 onboard-openai-auth-codex = Codex subscription
 onboard-openai-codex-followup =
     Codex subscription auth uses your ChatGPT account.
-    Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.
+    Run `zeroclaw auth login --model-provider openai-codex` to authenticate before starting your agent.
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
