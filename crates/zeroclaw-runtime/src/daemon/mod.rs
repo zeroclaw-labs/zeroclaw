@@ -405,6 +405,9 @@ pub async fn run(
                             "Session reaper released idle actor-queue slots"
                         );
                     }
+                    if !evicted.is_empty() || queue_evicted > 0 {
+                        crate::util::release_freed_heap();
+                    }
                 }
             });
         }

@@ -825,6 +825,7 @@ impl RpcDispatcher {
         if !self.ctx.sessions.remove(&req.session_id).await {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
+        crate::util::release_freed_heap();
         to_result(SessionCloseResult {
             session_id: req.session_id,
             closed: true,
