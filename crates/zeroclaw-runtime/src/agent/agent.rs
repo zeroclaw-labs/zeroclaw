@@ -1463,6 +1463,32 @@ impl Agent {
                 );
             }
 
+            // Safety: the orphan-removal cascades above can advance
+            // drop_count all the way to other_messages.len() when the only
+            // non-tool-call entry is the user message at position[0] and
+            // initial_drop_count drops it (e.g. max=50, history=[user,
+            // AC1, TR1, …, AC25, TR25]).  Sending zero messages to the
+            // provider causes a hard 400 "messages: at least one message
+            // is required".  When the cascade would wipe everything, skip
+            // this trim pass so the conversation stays functional even
+            // though it is temporarily over the message limit.
+            if drop_count >= other_messages.len() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "history_len": other_messages.len(),
+                            "max_history_messages": max,
+                        })),
+                    "trim_history: orphan-cascade would empty all non-system messages; skipping trim to preserve conversation"
+                );
+                self.history = system_messages;
+                self.history.extend(other_messages);
+                return;
+            }
+
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
