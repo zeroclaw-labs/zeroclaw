@@ -164,7 +164,7 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "lark", "feishu"],
+                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "lark", "feishu", "dingtalk"],
                                     "description": "Channel type to deliver output to"
                                 },
                                 "to": {
@@ -644,6 +644,7 @@ mod tests {
             "matrix",
             "qq",
             "webhook",
+            "dingtalk",
         ] {
             assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
         }

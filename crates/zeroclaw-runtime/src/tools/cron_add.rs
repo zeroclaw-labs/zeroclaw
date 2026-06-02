@@ -176,7 +176,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "lark", "feishu"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "lark", "feishu", "dingtalk"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -951,6 +951,24 @@ mod tests {
                 .unwrap_or_default();
 
         assert!(values.iter().any(|value| value == "matrix"));
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_dingtalk_channel() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let values =
+            tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]["enum"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+        assert!(
+            values.iter().any(|value| value == "dingtalk"),
+            "delivery.channel enum must include dingtalk"
+        );
     }
 
     #[tokio::test]
