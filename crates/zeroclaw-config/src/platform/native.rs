@@ -170,7 +170,10 @@ mod tests {
 
         // The core command text and operators must be present.
         assert!(debug.contains("dir"), "missing dir command, got: {debug}");
-        assert!(debug.contains("path with spaces"), "missing path, got: {debug}");
+        assert!(
+            debug.contains("path with spaces"),
+            "missing path, got: {debug}"
+        );
         assert!(
             debug.contains("2>nul"),
             "redirect operator must be present, got: {debug}"
