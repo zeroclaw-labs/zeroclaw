@@ -133,7 +133,17 @@ const TERMINAL: Theme = Theme {
     background: Color::Reset,
 };
 
-pub(crate) const DEFAULT_THEME_NAME: &str = "terminal";
+pub(crate) const DEFAULT_THEME_NAME: &str = if cfg!(target_os = "macos") {
+    "terminal"
+} else {
+    "icy_blue"
+};
+
+const DEFAULT_THEME: Theme = if cfg!(target_os = "macos") {
+    TERMINAL
+} else {
+    ICY_BLUE
+};
 
 pub(crate) const THEMES: &[(&str, Theme)] = &[
     ("terminal", TERMINAL),
@@ -155,7 +165,7 @@ pub(crate) fn theme_names() -> impl Iterator<Item = &'static str> {
     THEMES.iter().map(|(n, _)| *n)
 }
 
-static ACTIVE: RwLock<Theme> = RwLock::new(TERMINAL);
+static ACTIVE: RwLock<Theme> = RwLock::new(DEFAULT_THEME);
 
 pub(crate) fn set_active(theme: Theme) {
     if let Ok(mut guard) = ACTIVE.write() {
@@ -164,11 +174,11 @@ pub(crate) fn set_active(theme: Theme) {
 }
 
 pub(crate) fn active() -> Theme {
-    ACTIVE.read().map(|g| *g).unwrap_or(TERMINAL)
+    ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME)
 }
 
 pub(crate) fn default_theme() -> Theme {
-    TERMINAL
+    DEFAULT_THEME
 }
 
 pub(crate) fn fg_primary() -> Color {
@@ -394,5 +404,16 @@ mod tests {
             assert!(ok(name), "theme name '{name}' is not snake_case");
         }
         assert!(ok(DEFAULT_THEME_NAME), "default theme name not snake_case");
+    }
+
+    #[test]
+    fn default_theme_is_platform_conditional() {
+        let expected = if cfg!(target_os = "macos") {
+            "terminal"
+        } else {
+            "icy_blue"
+        };
+        assert_eq!(DEFAULT_THEME_NAME, expected);
+        assert!(theme_by_name(DEFAULT_THEME_NAME).is_some());
     }
 }
