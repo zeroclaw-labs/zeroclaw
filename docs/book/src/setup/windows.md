@@ -20,8 +20,8 @@ Flags:
 |---|---|
 | `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest — no Rust toolchain needed) |
 | `--minimal` | Build core only (`--no-default-features`; no channels, no hardware) |
-| `--standard` | Build with common channels (Telegram, Discord, Slack, Matrix) |
-| `--full` | Build everything |
+| `--standard` | Build with lean default channels (ACP server, webhook, email, Telegram) |
+| `--full` | Build with all channels (`channels-full`) |
 
 The script:
 
