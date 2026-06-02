@@ -233,10 +233,6 @@ fn default_eval_mode() -> String {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "eval"]
 pub struct EvalHarnessConfig {
-    /// Reserved for future auto-run integration; the `zeroclaw eval` command runs
-    /// regardless of this flag.
-    #[serde(default)]
-    pub enabled: bool,
     /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
     #[serde(default = "default_eval_suite_dir")]
     pub suite_dir: String,
@@ -248,7 +244,6 @@ pub struct EvalHarnessConfig {
 impl Default for EvalHarnessConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             suite_dir: default_eval_suite_dir(),
             mode: default_eval_mode(),
         }

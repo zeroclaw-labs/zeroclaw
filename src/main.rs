@@ -379,6 +379,7 @@ impl LogLevel {
 }
 
 /// Subcommands for `zeroclaw eval`.
+#[cfg(feature = "agent-runtime")]
 #[derive(Subcommand, Debug)]
 enum EvalCommands {
     /// Run a suite of evaluation cases.
@@ -388,12 +389,13 @@ enum EvalCommands {
         suite: Option<String>,
 
         /// Execution mode: `replay` (deterministic) or `live` (later phase).
-        #[arg(long, default_value = "replay")]
-        mode: String,
+        /// Defaults to config `[eval] mode`.
+        #[arg(long)]
+        mode: Option<String>,
 
-        /// Output format: `table` or `json`.
-        #[arg(long, default_value = "table")]
-        format: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: commands::eval::OutputFormat,
     },
 }
 
@@ -888,6 +890,7 @@ Examples:
         quick: bool,
     },
 
+    #[cfg(feature = "agent-runtime")]
     /// Run the agent evaluation harness
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -4453,9 +4456,10 @@ async fn main() -> Result<()> {
                 format,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
-                let mode: zeroclaw_eval::Mode = mode.parse()?;
+                let mode: zeroclaw_eval::Mode =
+                    mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
-                commands::eval::print_report(&report, &format);
+                commands::eval::print_report(&report, format);
                 if !report.all_passed() {
                     std::process::exit(1);
                 }

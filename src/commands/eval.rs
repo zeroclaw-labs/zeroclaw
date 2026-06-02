@@ -14,10 +14,19 @@ pub async fn run(suite: PathBuf, mode: Mode) -> Result<SuiteReport> {
     zeroclaw_eval::run_suite(&suite, mode).await
 }
 
-/// Render a suite report in the requested format (`table` or `json`).
-pub fn print_report(report: &SuiteReport, format: &str) {
+/// Output format for the eval report.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable table.
+    Table,
+    /// Machine-readable JSON, for CI artifacts.
+    Json,
+}
+
+/// Render a suite report in the requested format.
+pub fn print_report(report: &SuiteReport, format: OutputFormat) {
     match format {
-        "json" => println!("{}", report.to_json()),
-        _ => println!("{}", report.render_table()),
+        OutputFormat::Json => println!("{}", report.to_json()),
+        OutputFormat::Table => println!("{}", report.render_table()),
     }
 }
