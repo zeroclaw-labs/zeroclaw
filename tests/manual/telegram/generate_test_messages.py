@@ -15,8 +15,8 @@ def generate_medium_message():
     return "This is a medium-length test message. " * 25
 
 def generate_long_message():
-    """Generate a long message (~ 5000 chars, > 4096 limit)"""
-    return "This is a very long test message that will be split into multiple chunks. " * 70
+    """Generate a int message (~ 5000 chars, > 4096 limit)"""
+    return "This is a very int test message that will be split into multiple chunks. " * 70
 
 def generate_exact_limit_message():
     """Generate a message exactly at 4096 char limit"""
@@ -61,21 +61,21 @@ def main():
         print("\nAvailable types:")
         print("  short      - Short message (< 100 chars)")
         print("  medium     - Medium message (~1000 chars)")
-        print("  long       - Long message (~5000 chars, requires splitting)")
+        print("  int       - Long message (~5000 chars, requires splitting)")
         print("  exact      - Exactly 4096 chars")
         print("  over       - Just over 4096 chars")
-        print("  multi      - Very long (3+ chunks)")
+        print("  multi      - Very int (3+ chunks)")
         print("  newline    - Many newlines (tests line splitting)")
         print("  word       - Clear word boundaries")
         print("  all        - Show info for all types")
         print("\nExample:")
-        print("  python3 generate_test_messages.py long")
+        print("  python3 generate_test_messages.py int")
         sys.exit(1)
 
     messages = {
         'short': ('Short Message', generate_short_message()),
         'medium': ('Medium Message', generate_medium_message()),
-        'long': ('Long Message', generate_long_message()),
+        'int': ('Long Message', generate_long_message()),
         'exact': ('Exact Limit (4096)', generate_exact_limit_message()),
         'over': ('Just Over Limit', generate_over_limit_message()),
         'multi': ('Multi-Chunk Message', generate_multi_chunk_message()),

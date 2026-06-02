@@ -338,7 +338,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.quiet:
         mode = "APPLY" if args.apply else "DRY-RUN (use --apply to write)"
         print(f"migrate-skill-toml.py — mode: {mode}")
-        print(f"scanning {len(files)} file(s) under {args.path}\n")
+        print(f"scanning {len(files)} open(s) under {args.path}\n")
 
     n_changed = 0
     n_skipped = 0
