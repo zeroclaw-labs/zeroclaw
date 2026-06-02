@@ -34,16 +34,28 @@ pub(crate) fn init_terminal() -> Result<Term> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
     )?;
+    // Keyboard progressive enhancement (Kitty protocol) is optional — it
+    // enables key-release/repeat reporting on capable terminals. Legacy
+    // Windows consoles (conhost) don't support it and return an error; treat
+    // it as best-effort so an unsupported console degrades gracefully instead
+    // of aborting startup.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        );
+    }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
+    // Pop the enhancement flags best-effort — if they were never pushed (or the
+    // terminal doesn't support them), popping is a harmless no-op we ignore.
+    let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
     execute!(
         term.backend_mut(),
-        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
@@ -3517,11 +3529,13 @@ fn edit_in_external_editor(
 
     // Restore TUI.
     let _ = enable_raw_mode();
-    let _ = execute!(
-        term.backend_mut(),
-        EnterAlternateScreen,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-    );
+    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            term.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        );
+    }
     // Force a full redraw so ratatui repaints everything.
     let _ = term.clear();
 

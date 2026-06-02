@@ -2944,13 +2944,15 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen,);
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        );
+    }
 
     if status.map(|s| s.success()).unwrap_or(false) {
         std::fs::read_to_string(&path).unwrap_or_else(|_| content.to_string())
