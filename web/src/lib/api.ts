@@ -12,9 +12,10 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
-} from '../types/api';
-import { clearToken, getToken, setToken } from './auth';
-import { apiOrigin, basePath } from './basePath';
+  TuiEntry,
+} from "../types/api";
+import { clearToken, getToken, setToken } from "./auth";
+import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -22,8 +23,8 @@ import { apiOrigin, basePath } from './basePath';
 
 export class UnauthorizedError extends Error {
   constructor() {
-    super('Unauthorized');
-    this.name = 'UnauthorizedError';
+    super("Unauthorized");
+    this.name = "UnauthorizedError";
   }
 }
 
@@ -45,7 +46,7 @@ export class ApiError extends Error {
     },
   ) {
     super(`[${envelope.code}] ${envelope.message}`);
-    this.name = 'ApiError';
+    this.name = "ApiError";
   }
 }
 
@@ -57,40 +58,43 @@ export async function apiFetch<T = unknown>(
   const headers = new Headers(options.headers);
 
   if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
+    headers.set("Authorization", `Bearer ${token}`);
   }
 
   if (
     options.body &&
-    typeof options.body === 'string' &&
-    !headers.has('Content-Type')
+    typeof options.body === "string" &&
+    !headers.has("Content-Type")
   ) {
-    headers.set('Content-Type', 'application/json');
+    headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(`${apiOrigin}${basePath}${path}`, { ...options, headers });
+  const response = await fetch(`${apiOrigin}${basePath}${path}`, {
+    ...options,
+    headers,
+  });
 
   if (response.status === 401) {
     clearToken();
-    window.dispatchEvent(new Event('zeroclaw-unauthorized'));
+    window.dispatchEvent(new Event("zeroclaw-unauthorized"));
     throw new UnauthorizedError();
   }
 
   if (!response.ok) {
     // Try to parse a structured ConfigApiError envelope. Falls back to a
     // plain Error when the body is non-JSON or doesn't match the shape.
-    // Centralises the parsing so callers (including the onboarding flow)
+    // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
-    const text = await response.text().catch(() => '');
+    const text = await response.text().catch(() => "");
     if (text) {
       try {
         const parsed = JSON.parse(text);
         if (
           parsed &&
-          typeof parsed === 'object' &&
-          typeof parsed.code === 'string' &&
-          typeof parsed.message === 'string'
+          typeof parsed === "object" &&
+          typeof parsed.code === "string" &&
+          typeof parsed.message === "string"
         ) {
           throw new ApiError(response.status, parsed);
         }
@@ -111,7 +115,12 @@ export async function apiFetch<T = unknown>(
 }
 
 function unwrapField<T>(value: T | Record<string, T>, key: string): T {
-  if (value !== null && typeof value === 'object' && !Array.isArray(value) && key in value) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    key in value
+  ) {
     const unwrapped = (value as Record<string, T | undefined>)[key];
     if (unwrapped !== undefined) {
       return unwrapped;
@@ -126,13 +135,15 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 
 export async function pair(code: string): Promise<{ token: string }> {
   const response = await fetch(`${basePath}/pair`, {
-    method: 'POST',
-    headers: { 'X-Pairing-Code': code },
+    method: "POST",
+    headers: { "X-Pairing-Code": code },
   });
 
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Pairing failed (${response.status}): ${text || response.statusText}`);
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Pairing failed (${response.status}): ${text || response.statusText}`,
+    );
   }
 
   const data = (await response.json()) as { token: string };
@@ -140,31 +151,46 @@ export async function pair(code: string): Promise<{ token: string }> {
   return data;
 }
 
-export async function getAdminPairCode(): Promise<{ pairing_code: string | null; pairing_required: boolean }> {
+export async function getAdminPairCode(): Promise<{
+  pairing_code: string | null;
+  pairing_required: boolean;
+}> {
   // Use the public /pair/code endpoint which works in Docker and remote environments
   // (no localhost restriction). Falls back to the admin endpoint for backward compat.
   const publicResp = await fetch(`${basePath}/pair/code`);
   if (publicResp.ok) {
-    return publicResp.json() as Promise<{ pairing_code: string | null; pairing_required: boolean }>;
+    return publicResp.json() as Promise<{
+      pairing_code: string | null;
+      pairing_required: boolean;
+    }>;
   }
 
-  const response = await fetch('/admin/paircode');
+  const response = await fetch("/admin/paircode");
   if (!response.ok) {
     throw new Error(`Failed to fetch pairing code (${response.status})`);
   }
-  return response.json() as Promise<{ pairing_code: string | null; pairing_required: boolean }>;
+  return response.json() as Promise<{
+    pairing_code: string | null;
+    pairing_required: boolean;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
 // Public health (no auth required)
 // ---------------------------------------------------------------------------
 
-export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
+export async function getPublicHealth(): Promise<{
+  require_pairing: boolean;
+  paired: boolean;
+}> {
   const response = await fetch(`${basePath}/health`);
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
-  return response.json() as Promise<{ require_pairing: boolean; paired: boolean }>;
+  return response.json() as Promise<{
+    require_pairing: boolean;
+    paired: boolean;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,12 +198,25 @@ export async function getPublicHealth(): Promise<{ require_pairing: boolean; pai
 // ---------------------------------------------------------------------------
 
 export function getStatus(): Promise<StatusResponse> {
-  return apiFetch<StatusResponse>('/api/status');
+  return apiFetch<StatusResponse>("/api/status");
 }
 
 export function getHealth(): Promise<HealthSnapshot> {
-  return apiFetch<HealthSnapshot | { health: HealthSnapshot }>('/api/health').then((data) =>
-    unwrapField(data, 'health'),
+  return apiFetch<HealthSnapshot | { health: HealthSnapshot }>(
+    "/api/health",
+  ).then((data) => unwrapField(data, "health"));
+}
+
+// ---------------------------------------------------------------------------
+// TUIs
+// ---------------------------------------------------------------------------
+
+export function getTuis(): Promise<TuiEntry[]> {
+  return apiFetch<TuiEntry[] | { tuis: TuiEntry[] }>("/api/tuis").then(
+    (data) => {
+      const result = unwrapField(data, "tuis");
+      return Array.isArray(result) ? result : [];
+    },
   );
 }
 
@@ -230,7 +269,9 @@ export interface ListResponseEntry {
   is_secret: boolean;
   /** Variants for `kind === 'enum'` fields (drives <select> options). */
   enum_variants?: string[];
-  onboard_section?: string;
+  section?: string;
+  /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
+  tab?: string;
 }
 
 export interface DriftEntry {
@@ -247,7 +288,7 @@ export interface ListResponse {
 }
 
 export interface PatchOp {
-  op: 'add' | 'replace' | 'remove' | 'test' | 'comment';
+  op: "add" | "replace" | "remove" | "test" | "comment";
   path: string;
   value?: unknown;
   comment?: string;
@@ -280,7 +321,9 @@ export interface ConfigApiError {
 }
 
 export function getProp(path: string): Promise<PropResponse> {
-  return apiFetch<PropResponse>(`/api/config/prop?path=${encodeURIComponent(path)}`);
+  return apiFetch<PropResponse>(
+    `/api/config/prop?path=${encodeURIComponent(path)}`,
+  );
 }
 
 export function putProp(
@@ -288,45 +331,52 @@ export function putProp(
   value: unknown,
   comment?: string,
 ): Promise<PropResponse> {
-  return apiFetch<PropResponse>('/api/config/prop', {
-    method: 'PUT',
+  return apiFetch<PropResponse>("/api/config/prop", {
+    method: "PUT",
     body: JSON.stringify({ path, value, comment }),
   });
 }
 
 export function deleteProp(path: string): Promise<PropResponse> {
-  return apiFetch<PropResponse>(`/api/config/prop?path=${encodeURIComponent(path)}`, {
-    method: 'DELETE',
-  });
+  return apiFetch<PropResponse>(
+    `/api/config/prop?path=${encodeURIComponent(path)}`,
+    {
+      method: "DELETE",
+    },
+  );
 }
 
 export function listProps(prefix?: string): Promise<ListResponse> {
-  const q = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
+  const q = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
 export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
-  return apiFetch<PatchResponse>('/api/config', {
-    method: 'PATCH',
+  return apiFetch<PatchResponse>("/api/config", {
+    method: "PATCH",
     body: JSON.stringify(ops),
   });
 }
 
-export function initSection(section?: string): Promise<{ initialized: string[] }> {
-  const q = section ? `?section=${encodeURIComponent(section)}` : '';
-  return apiFetch<{ initialized: string[] }>(`/api/config/init${q}`, { method: 'POST' });
+export function initSection(
+  section?: string,
+): Promise<{ initialized: string[] }> {
+  const q = section ? `?section=${encodeURIComponent(section)}` : "";
+  return apiFetch<{ initialized: string[] }>(`/api/config/init${q}`, {
+    method: "POST",
+  });
 }
 
 export function getDrift(): Promise<{ drifted: DriftEntry[] }> {
-  return apiFetch<{ drifted: DriftEntry[] }>('/api/config/drift');
+  return apiFetch<{ drifted: DriftEntry[] }>("/api/config/drift");
 }
 
 export function getReloadStatus(): Promise<{ pending_reload: boolean }> {
-  return apiFetch<{ pending_reload: boolean }>('/api/config/reload-status');
+  return apiFetch<{ pending_reload: boolean }>("/api/config/reload-status");
 }
 
 export function getOpenApiSchema(): Promise<unknown> {
-  return apiFetch<unknown>('/api/openapi.json');
+  return apiFetch<unknown>("/api/openapi.json");
 }
 
 // ── Personality files ────────────────────────────────────────────────
@@ -357,14 +407,14 @@ export interface PersonalityPutResult {
 }
 
 export interface PersonalityConflict {
-  error: 'personality_disk_drift';
+  error: "personality_disk_drift";
   filename: string;
   current_content: string;
   current_mtime_ms: number | null;
 }
 
 function agentQuery(agent?: string): string {
-  return agent ? `?agent=${encodeURIComponent(agent)}` : '';
+  return agent ? `?agent=${encodeURIComponent(agent)}` : "";
 }
 
 export interface PersonalityTemplate {
@@ -387,27 +437,32 @@ export interface PersonalityTemplateOverrides {
 
 export function getPersonalityTemplates(
   overrides: PersonalityTemplateOverrides = {},
-  preset = 'default',
+  preset = "default",
   agent?: string,
 ): Promise<PersonalityTemplatesResponse> {
   const params = new URLSearchParams();
-  params.set('preset', preset);
-  if (agent) params.set('agent', agent);
-  if (overrides.agent_name) params.set('agent_name', overrides.agent_name);
-  if (overrides.user_name) params.set('user_name', overrides.user_name);
-  if (overrides.timezone) params.set('timezone', overrides.timezone);
+  params.set("preset", preset);
+  if (agent) params.set("agent", agent);
+  if (overrides.agent_name) params.set("agent_name", overrides.agent_name);
+  if (overrides.user_name) params.set("user_name", overrides.user_name);
+  if (overrides.timezone) params.set("timezone", overrides.timezone);
   if (overrides.communication_style)
-    params.set('communication_style', overrides.communication_style);
+    params.set("communication_style", overrides.communication_style);
   if (overrides.include_memory !== undefined)
-    params.set('include_memory', String(overrides.include_memory));
-  return apiFetch<PersonalityTemplatesResponse>(`/api/personality/templates?${params}`);
+    params.set("include_memory", String(overrides.include_memory));
+  return apiFetch<PersonalityTemplatesResponse>(
+    `/api/personality/templates?${params}`,
+  );
 }
 
 export function getPersonalityIndex(agent?: string): Promise<PersonalityIndex> {
   return apiFetch<PersonalityIndex>(`/api/personality${agentQuery(agent)}`);
 }
 
-export function getPersonalityFile(filename: string, agent?: string): Promise<PersonalityFile> {
+export function getPersonalityFile(
+  filename: string,
+  agent?: string,
+): Promise<PersonalityFile> {
   return apiFetch<PersonalityFile>(
     `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`,
   );
@@ -416,7 +471,7 @@ export function getPersonalityFile(filename: string, agent?: string): Promise<Pe
 export class PersonalityConflictError extends Error {
   constructor(public conflict: PersonalityConflict) {
     super(`personality file changed on disk: ${conflict.filename}`);
-    this.name = 'PersonalityConflictError';
+    this.name = "PersonalityConflictError";
   }
 }
 
@@ -429,27 +484,32 @@ export async function putPersonalityFile(
 ): Promise<PersonalityPutResult> {
   const url = `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`;
   const token = getToken();
-  const headers = new Headers({ 'Content-Type': 'application/json' });
-  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (token) headers.set("Authorization", `Bearer ${token}`);
   const response = await fetch(`${apiOrigin}${basePath}${url}`, {
-    method: 'PUT',
+    method: "PUT",
     headers,
-    body: JSON.stringify({ content, expected_mtime_ms: expectedMtimeMs ?? null }),
+    body: JSON.stringify({
+      content,
+      expected_mtime_ms: expectedMtimeMs ?? null,
+    }),
   });
   if (response.status === 401) {
     clearToken();
-    window.dispatchEvent(new Event('zeroclaw-unauthorized'));
+    window.dispatchEvent(new Event("zeroclaw-unauthorized"));
     throw new UnauthorizedError();
   }
   if (response.status === 409) {
-    const body = (await response.json().catch(() => null)) as PersonalityConflict | null;
-    if (body && body.error === 'personality_disk_drift') {
+    const body = (await response
+      .json()
+      .catch(() => null)) as PersonalityConflict | null;
+    if (body && body.error === "personality_disk_drift") {
       throw new PersonalityConflictError(body);
     }
-    throw new Error('API 409: personality file changed on disk');
+    throw new Error("API 409: personality file changed on disk");
   }
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
+    const text = await response.text().catch(() => "");
     throw new Error(`API ${response.status}: ${text || response.statusText}`);
   }
   return (await response.json()) as PersonalityPutResult;
@@ -495,14 +555,19 @@ export interface SkillCreateRequest {
 }
 
 export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
-  return apiFetch('/api/skills/bundles');
+  return apiFetch("/api/skills/bundles");
 }
 
-export function listSkillsInBundle(alias: string): Promise<{ skills: SkillEntry[] }> {
+export function listSkillsInBundle(
+  alias: string,
+): Promise<{ skills: SkillEntry[] }> {
   return apiFetch(`/api/skills/bundles/${encodeURIComponent(alias)}/skills`);
 }
 
-export function readSkill(bundle: string, name: string): Promise<SkillDocument> {
+export function readSkill(
+  bundle: string,
+  name: string,
+): Promise<SkillDocument> {
   return apiFetch(
     `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}`,
   );
@@ -516,8 +581,8 @@ export function writeSkill(
   return apiFetch(
     `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}`,
     {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
   );
@@ -528,17 +593,21 @@ export function createSkill(
   body: SkillCreateRequest,
 ): Promise<{ bundle: string; name: string; directory: string }> {
   return apiFetch(`/api/skills/bundles/${encodeURIComponent(bundle)}/skills`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 }
 
-export function deleteSkill(bundle: string, name: string, purge = false): Promise<void> {
-  const q = purge ? '?purge=true' : '';
+export function deleteSkill(
+  bundle: string,
+  name: string,
+  purge = false,
+): Promise<void> {
+  const q = purge ? "?purge=true" : "";
   return apiFetch(
     `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}${q}`,
-    { method: 'DELETE' },
+    { method: "DELETE" },
   );
 }
 
@@ -557,19 +626,21 @@ let configSchemaCache: Promise<JsonSchema> | null = null;
 
 export function fetchConfigSchema(): Promise<JsonSchema> {
   if (!configSchemaCache) {
-    configSchemaCache = apiFetch<JsonSchema>('/api/config', { method: 'OPTIONS' })
-      .catch(() => undefined);
+    configSchemaCache = apiFetch<JsonSchema>("/api/config", {
+      method: "OPTIONS",
+    }).catch(() => undefined);
   }
   return configSchemaCache;
 }
 
 function resolveRef(node: unknown, root: unknown): unknown {
-  if (!node || typeof node !== 'object') return node;
+  if (!node || typeof node !== "object") return node;
   const ref = (node as { $ref?: unknown }).$ref;
-  if (typeof ref !== 'string' || !ref.startsWith('#/')) return node;
+  if (typeof ref !== "string" || !ref.startsWith("#/")) return node;
   let target: unknown = root;
-  for (const seg of ref.slice(2).split('/')) {
-    if (target && typeof target === 'object') target = (target as Record<string, unknown>)[seg];
+  for (const seg of ref.slice(2).split("/")) {
+    if (target && typeof target === "object")
+      target = (target as Record<string, unknown>)[seg];
     else return node;
   }
   return target ?? node;
@@ -578,13 +649,16 @@ function resolveRef(node: unknown, root: unknown): unknown {
 // `Option<T>` serializes as `{ anyOf: [<T schema>, { type: "null" }] }`.
 // Take the non-null branch so traversal can dive into the inner type.
 function unwrapOptional(node: unknown): unknown {
-  if (!node || typeof node !== 'object') return node;
+  if (!node || typeof node !== "object") return node;
   const anyOf = (node as { anyOf?: unknown[] }).anyOf;
   if (!Array.isArray(anyOf)) return node;
   const nonNull = anyOf.find((b) => {
-    if (!b || typeof b !== 'object') return false;
+    if (!b || typeof b !== "object") return false;
     const t = (b as { type?: unknown }).type;
-    return t !== 'null' && !(Array.isArray(t) && t.includes('null') && t.length === 1);
+    return (
+      t !== "null" &&
+      !(Array.isArray(t) && t.includes("null") && t.length === 1)
+    );
   });
   return nonNull ?? node;
 }
@@ -629,15 +703,16 @@ export function objectArrayElementProps(
 ): ObjectArrayPropMeta[] | null {
   if (!schema) return null;
   let cur: unknown = schema;
-  for (const seg of kebabPath.split('.')) {
+  for (const seg of kebabPath.split(".")) {
     cur = unwrapOptional(resolveRef(cur, schema));
-    if (!cur || typeof cur !== 'object') return null;
-    const snake = seg.replace(/-/g, '_');
+    if (!cur || typeof cur !== "object") return null;
+    const snake = seg.replace(/-/g, "_");
     const props = (cur as { properties?: Record<string, unknown> }).properties;
-    const additional = (cur as { additionalProperties?: unknown }).additionalProperties;
+    const additional = (cur as { additionalProperties?: unknown })
+      .additionalProperties;
     if (props && Object.prototype.hasOwnProperty.call(props, snake)) {
       cur = props[snake];
-    } else if (additional && typeof additional === 'object') {
+    } else if (additional && typeof additional === "object") {
       cur = additional;
     } else {
       return null;
@@ -645,37 +720,57 @@ export function objectArrayElementProps(
   }
   // `cur` should now be an array schema; the element type is `items`.
   cur = unwrapOptional(resolveRef(cur, schema));
-  if (!cur || typeof cur !== 'object') return null;
+  if (!cur || typeof cur !== "object") return null;
   const items = (cur as { items?: unknown }).items;
   if (!items) return null;
   const elem = unwrapOptional(resolveRef(items, schema));
-  if (!elem || typeof elem !== 'object') return null;
-  const elemProps = (elem as { properties?: Record<string, unknown> }).properties;
+  if (!elem || typeof elem !== "object") return null;
+  const elemProps = (elem as { properties?: Record<string, unknown> })
+    .properties;
   if (!elemProps) return null;
   const out: ObjectArrayPropMeta[] = [];
   for (const [snakeKey, raw] of Object.entries(elemProps)) {
-    const wrapped = raw as { description?: unknown; type?: unknown; anyOf?: unknown[]; enum?: unknown[] } | null;
-    const desc = typeof wrapped?.description === 'string' ? wrapped.description : undefined;
-    const isOptional = Array.isArray(wrapped?.anyOf)
-      || (Array.isArray(wrapped?.type) && (wrapped!.type as string[]).includes('null'));
-    const resolved = unwrapOptional(resolveRef(wrapped, schema)) as Record<string, unknown> | null;
+    const wrapped = raw as {
+      description?: unknown;
+      type?: unknown;
+      anyOf?: unknown[];
+      enum?: unknown[];
+    } | null;
+    const desc =
+      typeof wrapped?.description === "string"
+        ? wrapped.description
+        : undefined;
+    const isOptional =
+      Array.isArray(wrapped?.anyOf) ||
+      (Array.isArray(wrapped?.type) &&
+        (wrapped!.type as string[]).includes("null"));
+    const resolved = unwrapOptional(resolveRef(wrapped, schema)) as Record<
+      string,
+      unknown
+    > | null;
     const t = resolved?.type;
     const enumVariants = Array.isArray(resolved?.enum)
-      ? (resolved!.enum as unknown[]).filter((v): v is string => typeof v === 'string')
+      ? (resolved!.enum as unknown[]).filter(
+          (v): v is string => typeof v === "string",
+        )
       : undefined;
-    let kind: string = 'unknown';
-    if (enumVariants && enumVariants.length > 0) kind = 'enum';
-    else if (t === 'boolean' || (Array.isArray(t) && t.includes('boolean'))) kind = 'bool';
-    else if (t === 'integer' || (Array.isArray(t) && t.includes('integer'))) kind = 'integer';
-    else if (t === 'number' || (Array.isArray(t) && t.includes('number'))) kind = 'float';
-    else if (t === 'string' || (Array.isArray(t) && t.includes('string'))) kind = 'string';
-    else if (t === 'array') {
+    let kind: string = "unknown";
+    if (enumVariants && enumVariants.length > 0) kind = "enum";
+    else if (t === "boolean" || (Array.isArray(t) && t.includes("boolean")))
+      kind = "bool";
+    else if (t === "integer" || (Array.isArray(t) && t.includes("integer")))
+      kind = "integer";
+    else if (t === "number" || (Array.isArray(t) && t.includes("number")))
+      kind = "float";
+    else if (t === "string" || (Array.isArray(t) && t.includes("string")))
+      kind = "string";
+    else if (t === "array") {
       const items = resolved?.items as { type?: unknown } | undefined;
-      kind = items?.type === 'string' ? 'string-array' : 'array';
-    } else if (t === 'object') kind = 'object';
+      kind = items?.type === "string" ? "string-array" : "array";
+    } else if (t === "object") kind = "object";
     out.push({
       key: snakeKey,
-      label: snakeKey.replace(/_/g, ' '),
+      label: snakeKey.replace(/_/g, " "),
       kind,
       description: desc,
       enumVariants,
@@ -685,19 +780,23 @@ export function objectArrayElementProps(
   return out;
 }
 
-export function descriptionForPath(schema: JsonSchema, kebabPath: string): string | null {
+export function descriptionForPath(
+  schema: JsonSchema,
+  kebabPath: string,
+): string | null {
   if (!schema) return null;
   let cur: unknown = schema;
   let last: unknown = null;
-  for (const seg of kebabPath.split('.')) {
+  for (const seg of kebabPath.split(".")) {
     cur = resolveAndUnwrap(cur, schema);
-    if (!cur || typeof cur !== 'object') return null;
-    const snake = seg.replace(/-/g, '_');
+    if (!cur || typeof cur !== "object") return null;
+    const snake = seg.replace(/-/g, "_");
     const props = (cur as { properties?: Record<string, unknown> }).properties;
-    const additional = (cur as { additionalProperties?: unknown }).additionalProperties;
+    const additional = (cur as { additionalProperties?: unknown })
+      .additionalProperties;
     if (props && Object.prototype.hasOwnProperty.call(props, snake)) {
       last = props[snake];
-    } else if (additional && typeof additional === 'object') {
+    } else if (additional && typeof additional === "object") {
       // `HashMap<String, T>` parent: current segment is a user-supplied
       // map key (e.g. provider name); dive into the value schema.
       last = additional;
@@ -709,10 +808,14 @@ export function descriptionForPath(schema: JsonSchema, kebabPath: string): strin
   // Wrapper carries the field's own `///` doc comment; the resolved
   // type's description is a fallback for fields that ref a typed config.
   const wrapDesc = (last as { description?: unknown } | null)?.description;
-  if (typeof wrapDesc === 'string' && wrapDesc.length > 0) return wrapDesc;
-  const resolved = resolveAndUnwrap(last, schema) as { description?: unknown } | null;
+  if (typeof wrapDesc === "string" && wrapDesc.length > 0) return wrapDesc;
+  const resolved = resolveAndUnwrap(last, schema) as {
+    description?: unknown;
+  } | null;
   const innerDesc = resolved?.description;
-  return typeof innerDesc === 'string' && innerDesc.length > 0 ? innerDesc : null;
+  return typeof innerDesc === "string" && innerDesc.length > 0
+    ? innerDesc
+    : null;
 }
 
 // ── Templates + map-key creation (issue #6175) ───────────────────────
@@ -725,7 +828,7 @@ export function descriptionForPath(schema: JsonSchema, kebabPath: string): strin
 export interface TemplateEntry {
   path: string;
   /** 'map' for HashMap<String, T>; 'list' for Vec<T>. */
-  kind: 'map' | 'list';
+  kind: "map" | "list";
   /** Rust value type, for display only. */
   value_type: string;
   /** Doc comment from the schema field — describes what the user is adding. */
@@ -737,7 +840,7 @@ export interface TemplatesResponse {
 }
 
 export function getTemplates(): Promise<TemplatesResponse> {
-  return apiFetch<TemplatesResponse>('/api/config/templates');
+  return apiFetch<TemplatesResponse>("/api/config/templates");
 }
 
 export interface MapKeyResponse {
@@ -756,7 +859,7 @@ export interface MapKeyResponse {
 export interface BrowseEntry {
   name: string;
   /** `"dir"` or `"file"`. */
-  kind: 'dir' | 'file';
+  kind: "dir" | "file";
   /** Bytes; absent for directories. */
   size?: number;
   /** True for top-level entries the runtime owns (e.g. `sessions/`,
@@ -771,15 +874,15 @@ export interface BrowseResponse {
   entries: BrowseEntry[];
 }
 
-export function browseShared(path = ''): Promise<BrowseResponse> {
-  const q = path ? `?path=${encodeURIComponent(path)}` : '';
+export function browseShared(path = ""): Promise<BrowseResponse> {
+  const q = path ? `?path=${encodeURIComponent(path)}` : "";
   return apiFetch<BrowseResponse>(`/api/browse${q}`);
 }
 
 /** Create a new directory under `<install>/shared/`. Idempotent on success. */
 export function mkdirShared(path: string): Promise<{ created: string }> {
   return apiFetch<{ created: string }>(`/api/browse/mkdir`, {
-    method: 'POST',
+    method: "POST",
     body: JSON.stringify({ path }),
   });
 }
@@ -788,7 +891,7 @@ export function mkdirShared(path: string): Promise<{ created: string }> {
  *  protected top-level entries (skills, skill-bundles, knowledge). */
 export function rmdirShared(path: string): Promise<{ removed: string }> {
   return apiFetch<{ removed: string }>(`/api/browse/rmdir`, {
-    method: 'DELETE',
+    method: "DELETE",
     body: JSON.stringify({ path }),
   });
 }
@@ -805,11 +908,14 @@ export interface AgentWorkspaceFileRead {
   is_text: boolean;
   /** UTF-8 text when `is_text` is true, base64 otherwise. */
   content: string;
-  encoding: 'utf8' | 'base64';
+  encoding: "utf8" | "base64";
 }
 
-export function listAgentWorkspace(alias: string, path = ''): Promise<BrowseResponse> {
-  const q = path ? `?path=${encodeURIComponent(path)}` : '';
+export function listAgentWorkspace(
+  alias: string,
+  path = "",
+): Promise<BrowseResponse> {
+  const q = path ? `?path=${encodeURIComponent(path)}` : "";
   return apiFetch<BrowseResponse>(
     `/api/agents/${encodeURIComponent(alias)}/workspace/list${q}`,
   );
@@ -830,7 +936,7 @@ export function deleteAgentWorkspacePath(
 ): Promise<{ removed: string }> {
   return apiFetch<{ removed: string }>(
     `/api/agents/${encodeURIComponent(alias)}/workspace/path`,
-    { method: 'DELETE', body: JSON.stringify({ path }) },
+    { method: "DELETE", body: JSON.stringify({ path }) },
   );
 }
 
@@ -841,7 +947,7 @@ export function moveAgentWorkspacePath(
 ): Promise<{ from: string; to: string }> {
   return apiFetch<{ from: string; to: string }>(
     `/api/agents/${encodeURIComponent(alias)}/workspace/move`,
-    { method: 'POST', body: JSON.stringify({ from, to }) },
+    { method: "POST", body: JSON.stringify({ from, to }) },
   );
 }
 
@@ -851,7 +957,7 @@ export function createAgentWorkspaceDirectory(
 ): Promise<{ created: string }> {
   return apiFetch<{ created: string }>(
     `/api/agents/${encodeURIComponent(alias)}/workspace/mkdir`,
-    { method: 'POST', body: JSON.stringify({ path }) },
+    { method: "POST", body: JSON.stringify({ path }) },
   );
 }
 
@@ -860,14 +966,17 @@ export function createAgentWorkspaceDirectory(
  * kinds the `key` is the new HashMap key; for List kinds it's the new
  * entry's natural identifier (e.g. `name` or `hint`).
  */
-export function createMapKey(path: string, key: string): Promise<MapKeyResponse> {
+export function createMapKey(
+  path: string,
+  key: string,
+): Promise<MapKeyResponse> {
   return apiFetch<MapKeyResponse>(
     `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
-    { method: 'POST' },
+    { method: "POST" },
   );
 }
 
-// ── Onboard catalog (provider + model picker source of truth) ────────
+// ── Curated section catalog (provider + model picker source of truth) ────────
 
 export interface CatalogProvider {
   name: string;
@@ -881,7 +990,7 @@ export interface CatalogResponse {
 }
 
 export function getCatalog(): Promise<CatalogResponse> {
-  return apiFetch<CatalogResponse>('/api/onboard/catalog');
+  return apiFetch<CatalogResponse>("/api/config/catalog");
 }
 
 export interface ModelsResponse {
@@ -897,11 +1006,11 @@ export function getCatalogModels(provider: string, alias?: string): Promise<Mode
   const params = new URLSearchParams({ provider });
   if (alias) params.set('alias', alias);
   return apiFetch<ModelsResponse>(
-    `/api/onboard/catalog/models?${params.toString()}`,
+    `/api/config/catalog/models?${params.toString()}`,
   );
 }
 
-// ── Onboard sections + picker (mirrors the TUI flow) ────────────────
+// ── Config sections + picker (mirrors the TUI flow) ─────────────────
 
 export interface SectionInfo {
   /** Stable section key — matches `Section::as_path_prefix` in zeroclaw-runtime. */
@@ -912,25 +1021,27 @@ export interface SectionInfo {
   help: string;
   /** True when the section requires picking an item before fields render. */
   has_picker: boolean;
-  /** True when the user has marked the section completed in onboard_state. */
+  /** True when the user has marked the section completed in the legacy
+   *  per-section ledger (on-disk key `onboard_state.completed_sections`,
+   *  retained for migration only). */
   completed: boolean;
   /** True when the section has enough usable config for first-run setup. */
   ready: boolean;
-  /** Display group for the sidebar (`Onboarding`, `Agent`, `Tools`, ...). */
+  /** Display group for the sidebar (`Quickstart`, `Agent`, `Tools`, ...). */
   group: string;
-  /** True when this section is part of the `/onboard` wizard (driven by
-   *  the canonical const in `zeroclaw_config::onboarding`). */
-  is_onboarding: boolean;
+  /** True when this section is part of the canonical Quickstart list (driven
+   *  by `zeroclaw_config::sections::QUICKSTART_SECTIONS`). */
+  is_quickstart: boolean;
   /** Editor shape (`direct_form` / `one_tier_alias_map` / `typed_family_map`
    *  / `backend_picker`). Server-emitted from `WizardSection::shape()` so
-   *  the dashboard explorer and the onboard wizard render the same UI for
-   *  the same section without hardcoded section keys on either side.
-   *  `null` / `undefined` for sections that aren't part of the canonical wizard. */
+   *  the dashboard explorer renders the same UI for the same section
+   *  without hardcoded section keys.
+   *  `null` / `undefined` for sections that aren't part of the canonical list. */
   shape?:
-    | 'direct_form'
-    | 'one_tier_alias_map'
-    | 'typed_family_map'
-    | 'backend_picker'
+    | "direct_form"
+    | "one_tier_alias_map"
+    | "typed_family_map"
+    | "backend_picker"
     | null;
 }
 
@@ -939,12 +1050,12 @@ export interface SectionsResponse {
 }
 
 export function getSections(): Promise<SectionsResponse> {
-  return apiFetch<SectionsResponse>('/api/onboard/sections');
+  return apiFetch<SectionsResponse>("/api/config/sections");
 }
 
-export interface OnboardStatusResponse {
+export interface SectionStatusResponse {
   /** True when no enabled agent can reply yet. */
-  needs_onboarding: boolean;
+  needs_quickstart: boolean;
   /** Stable machine-readable reason: `fresh_install`, `incomplete_agent`, or
    * `has_dispatchable_agent`. */
   reason: string;
@@ -963,8 +1074,8 @@ export interface OnboardRepairItem {
   focus?: string;
 }
 
-export function getOnboardStatus(): Promise<OnboardStatusResponse> {
-  return apiFetch<OnboardStatusResponse>('/api/onboard/status');
+export function getSectionStatus(): Promise<SectionStatusResponse> {
+  return apiFetch<SectionStatusResponse>("/api/config/status");
 }
 
 export interface AgentOptionsResponse {
@@ -981,7 +1092,7 @@ export interface AgentOptionsResponse {
 }
 
 export function getAgentOptions(): Promise<AgentOptionsResponse> {
-  return apiFetch<AgentOptionsResponse>('/api/onboard/agent-options');
+  return apiFetch<AgentOptionsResponse>("/api/config/agent-options");
 }
 
 export interface PickerItem {
@@ -999,7 +1110,7 @@ export interface PickerResponse {
 
 export function getSectionPicker(section: string): Promise<PickerResponse> {
   return apiFetch<PickerResponse>(
-    `/api/onboard/sections/${encodeURIComponent(section)}`,
+    `/api/config/sections/${encodeURIComponent(section)}`,
   );
 }
 
@@ -1016,14 +1127,184 @@ export function selectSectionItem(
 ): Promise<SelectItemResponse> {
   const body = alias ? JSON.stringify({ alias }) : undefined;
   return apiFetch<SelectItemResponse>(
-    `/api/onboard/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
+    `/api/config/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
     {
-      method: 'POST',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
       body,
     },
   );
 }
+// ── Quickstart ───────────────────────────────────────────────────────
+
+export interface QuickstartTypeOption {
+  /** Canonical kebab-case kind written into config (e.g. "anthropic", "telegram"). */
+  kind: string;
+  /** Picker label. */
+  display_name: string;
+  /** True for local providers that need no credential; always false for channels. */
+  local: boolean;
+}
+
+export interface QuickstartState {
+  quickstart_completed: boolean;
+  agents: string[];
+  risk_profiles: string[];
+  runtime_profiles: string[];
+  model_providers: string[];
+  channels: string[];
+  /**
+   * Subset of `channels` not yet bound to any agent — safe to reuse
+   * without breaking the one-channel-one-agent invariant.
+   */
+  unassigned_channels: string[];
+  storage: string[];
+  /**
+   * Picker rows for "Create new model provider", supplied by the
+   * daemon — sourced from `zeroclaw_providers::list_model_providers()`.
+   * Surfaces render this list as-is and never keep their own copy.
+   */
+  model_provider_types: QuickstartTypeOption[];
+  /**
+   * Picker rows for "Create new channel", supplied by the daemon —
+   * sourced from the schema-side `ChannelsConfig` inventory. Adding a
+   * channel family in the schema lights up here automatically.
+   */
+  channel_types: QuickstartTypeOption[];
+  /** Risk-profile presets from `RISK_PRESETS`. */
+  risk_presets: QuickstartPreset[];
+  /** Runtime-profile presets from `RUNTIME_PRESETS`. */
+  runtime_presets: QuickstartPreset[];
+  /** Memory backend snake-case keys from `MemoryBackendKind`. */
+  memory_kinds: string[];
+  /** Canonical personality filenames the Quickstart accepts. */
+  personality_files: string[];
+}
+
+/** One row in a closed-set preset table (risk / runtime). */
+export interface QuickstartPreset {
+  preset_name: string;
+  label: string;
+  help: string;
+}
+
+export function getQuickstartState(): Promise<QuickstartState> {
+  return apiFetch<QuickstartState>("/api/quickstart/state");
+}
+
+export interface QuickstartError {
+  step: string;
+  field: string;
+  message: string;
+}
+
+export type QuickstartValidateResult =
+  | { kind: "ok" }
+  | { kind: "errors"; errors: QuickstartError[] };
+
+export function quickstartValidate(submission: unknown): Promise<QuickstartValidateResult> {
+  return apiFetch<QuickstartValidateResult>("/api/quickstart/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(submission),
+  });
+}
+
+export interface AppliedAgent {
+  alias: string;
+  model_provider: string;
+  risk_profile: string;
+  runtime_profile: string;
+  channels: string[];
+  memory_backend: string;
+}
+
+export type QuickstartApplyResult =
+  | { kind: "applied"; agent: AppliedAgent; daemon_restarted: boolean }
+  | { kind: "errors"; errors: QuickstartError[] };
+
+export function quickstartApply(submission: unknown): Promise<QuickstartApplyResult> {
+  return apiFetch<QuickstartApplyResult>("/api/quickstart/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(submission),
+  });
+}
+
+/** Schema field-kind tag mirroring `zeroclaw_config::traits::PropKind`. */
+export type QuickstartFieldKind =
+  | "string"
+  | "bool"
+  | "integer"
+  | "float"
+  | "enum"
+  | "string_array"
+  | "object_array"
+  | "object"
+  | "duration"
+  | "secret";
+
+export interface QuickstartFieldDescriptor {
+  key: string;
+  label: string;
+  help: string;
+  kind: QuickstartFieldKind;
+  is_secret: boolean;
+  enum_variants: string[] | null;
+  required: boolean;
+  default: string | null;
+}
+
+export interface QuickstartFieldsRequest {
+  section: "model_provider" | "channel";
+  type_key: string;
+}
+
+export interface QuickstartFieldsResult {
+  fields: QuickstartFieldDescriptor[];
+}
+
+export function quickstartFields(
+  req: QuickstartFieldsRequest,
+): Promise<QuickstartFieldsResult> {
+  return apiFetch<QuickstartFieldsResult>("/api/quickstart/fields", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export type QuickstartStep =
+  | "model_provider"
+  | "risk_profile"
+  | "runtime_profile"
+  | "memory"
+  | "channels"
+  | "agent";
+
+export interface QuickstartDismissRequest {
+  run_id: string;
+  surface: "web" | "tui" | "cli";
+  last_step?: QuickstartStep | null;
+}
+
+/// Beacon fired when the user closes the Quickstart page without
+/// submitting a Create. The runtime records this as a `Note` event in
+/// the same stream as the apply lifecycle so dashboard / SSE
+/// consumers can see drop-off rates. Best-effort: failures are
+/// swallowed.
+export function quickstartDismiss(req: QuickstartDismissRequest): void {
+  // `keepalive: true` lets the request survive the navigation that
+  // typically triggers this — same trick `navigator.sendBeacon` uses,
+  // but goes through the existing auth path.
+  void apiFetch<void>("/api/quickstart/dismiss", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+    keepalive: true,
+  } as RequestInit).catch(() => {});
+}
+
 
 // ── Map-keyed alias CRUD ─────────────────────────────────────────────
 
@@ -1045,17 +1326,24 @@ export interface MapKeyMutResponse {
   created?: boolean;
 }
 
-export function deleteMapKey(path: string, key: string): Promise<MapKeyMutResponse> {
+export function deleteMapKey(
+  path: string,
+  key: string,
+): Promise<MapKeyMutResponse> {
   return apiFetch<MapKeyMutResponse>(
     `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
-    { method: 'DELETE' },
+    { method: "DELETE" },
   );
 }
 
-export function renameMapKey(path: string, from: string, to: string): Promise<MapKeyMutResponse> {
-  return apiFetch<MapKeyMutResponse>('/api/config/rename-map-key', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+export function renameMapKey(
+  path: string,
+  from: string,
+  to: string,
+): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>("/api/config/rename-map-key", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, from, to }),
   });
 }
@@ -1075,19 +1363,20 @@ export interface AdminResponse {
  * detect when the new instance is ready.
  */
 export function reloadDaemon(): Promise<AdminResponse> {
-  return apiFetch<AdminResponse>('/admin/reload', { method: 'POST' });
+  return apiFetch<AdminResponse>("/admin/reload", { method: "POST" });
 }
-
 
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
 export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) => {
-    const result = unwrapField(data, 'tools');
-    return Array.isArray(result) ? result : [];
-  });
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+    (data) => {
+      const result = unwrapField(data, "tools");
+      return Array.isArray(result) ? result : [];
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,14 +1384,14 @@ export function getTools(): Promise<ToolSpec[]> {
 // ---------------------------------------------------------------------------
 
 export function getCronJobs(): Promise<CronJob[]> {
-  return apiFetch<CronJob[] | { jobs: CronJob[] }>('/api/cron').then((data) => {
-    const result = unwrapField(data, 'jobs');
+  return apiFetch<CronJob[] | { jobs: CronJob[] }>("/api/cron").then((data) => {
+    const result = unwrapField(data, "jobs");
     return Array.isArray(result) ? result : [];
   });
 }
 
 export interface CronDelivery {
-  mode: 'none' | 'announce';
+  mode: "none" | "announce";
   channel?: string;
   to?: string;
   best_effort?: boolean;
@@ -1122,15 +1411,19 @@ export function addCronJob(body: {
   enabled?: boolean;
   delivery?: CronDelivery;
 }): Promise<CronJob> {
-  return apiFetch<CronJob | { status: string; job: CronJob }>('/api/cron', {
-    method: 'POST',
+  return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
+    method: "POST",
     body: JSON.stringify(body),
-  }).then((data) => (typeof (data as { job?: CronJob }).job === 'object' ? (data as { job: CronJob }).job : (data as CronJob)));
+  }).then((data) =>
+    typeof (data as { job?: CronJob }).job === "object"
+      ? (data as { job: CronJob }).job
+      : (data as CronJob),
+  );
 }
 
 export function deleteCronJob(id: string): Promise<void> {
   return apiFetch<void>(`/api/cron/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
+    method: "DELETE",
   });
 }
 
@@ -1146,24 +1439,37 @@ export interface CronTriggerResult {
 
 /** Manually trigger a cron job and wait for the result. */
 export function triggerCronJob(id: string): Promise<CronTriggerResult> {
-  return apiFetch<CronTriggerResult>(`/api/cron/${encodeURIComponent(id)}/run`, {
-    method: 'POST',
-  });
+  return apiFetch<CronTriggerResult>(
+    `/api/cron/${encodeURIComponent(id)}/run`,
+    {
+      method: "POST",
+    },
+  );
 }
 
 export function patchCronJob(
   id: string,
-  patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string },
+  patch: {
+    name?: string;
+    schedule?: string;
+    tz?: string;
+    clear_tz?: boolean;
+    command?: string;
+    prompt?: string;
+  },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
     `/api/cron/${encodeURIComponent(id)}`,
     {
-      method: 'PATCH',
+      method: "PATCH",
       body: JSON.stringify(patch),
     },
-  ).then((data) => (typeof (data as { job?: CronJob }).job === 'object' ? (data as { job: CronJob }).job : (data as CronJob)));
+  ).then((data) =>
+    typeof (data as { job?: CronJob }).job === "object"
+      ? (data as { job: CronJob }).job
+      : (data as CronJob),
+  );
 }
-
 
 export function getCronRuns(
   jobId: string,
@@ -1173,7 +1479,7 @@ export function getCronRuns(
   return apiFetch<CronRun[] | { runs: CronRun[] }>(
     `/api/cron/${encodeURIComponent(jobId)}/runs?${params}`,
   ).then((data) => {
-    const result = unwrapField(data, 'runs');
+    const result = unwrapField(data, "runs");
     return Array.isArray(result) ? result : [];
   });
 }
@@ -1185,14 +1491,14 @@ export interface CronSettings {
 }
 
 export function getCronSettings(): Promise<CronSettings> {
-  return apiFetch<CronSettings>('/api/cron/settings');
+  return apiFetch<CronSettings>("/api/cron/settings");
 }
 
 export function patchCronSettings(
   patch: Partial<CronSettings>,
 ): Promise<CronSettings> {
-  return apiFetch<CronSettings & { status: string }>('/api/cron/settings', {
-    method: 'PATCH',
+  return apiFetch<CronSettings & { status: string }>("/api/cron/settings", {
+    method: "PATCH",
     body: JSON.stringify(patch),
   });
 }
@@ -1202,12 +1508,12 @@ export function patchCronSettings(
 // ---------------------------------------------------------------------------
 
 export function getIntegrations(): Promise<Integration[]> {
-  return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
-    (data) => {
-      const result = unwrapField(data, 'integrations');
-      return Array.isArray(result) ? result : [];
-    },
-  );
+  return apiFetch<Integration[] | { integrations: Integration[] }>(
+    "/api/integrations",
+  ).then((data) => {
+    const result = unwrapField(data, "integrations");
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,10 +1521,13 @@ export function getIntegrations(): Promise<Integration[]> {
 // ---------------------------------------------------------------------------
 
 export function runDoctor(): Promise<DiagResult[]> {
-  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor', {
-    method: 'POST',
-    body: JSON.stringify({}),
-  }).then((data) => (Array.isArray(data) ? data : data.results));
+  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>(
+    "/api/doctor",
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  ).then((data) => (Array.isArray(data) ? data : data.results));
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,16 +1540,16 @@ export function getMemory(
   agent?: string,
 ): Promise<MemoryEntry[]> {
   const params = new URLSearchParams();
-  if (query) params.set('query', query);
-  if (category) params.set('category', category);
-  if (agent) params.set('agent', agent);
+  if (query) params.set("query", query);
+  if (category) params.set("category", category);
+  if (agent) params.set("agent", agent);
   const qs = params.toString();
-  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
-    (data) => {
-      const result = unwrapField(data, 'entries');
-      return Array.isArray(result) ? result : [];
-    },
-  );
+  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(
+    `/api/memory${qs ? `?${qs}` : ""}`,
+  ).then((data) => {
+    const result = unwrapField(data, "entries");
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 export function storeMemory(
@@ -1249,16 +1558,16 @@ export function storeMemory(
   category?: string,
   agent?: string,
 ): Promise<void> {
-  return apiFetch<unknown>('/api/memory', {
-    method: 'POST',
+  return apiFetch<unknown>("/api/memory", {
+    method: "POST",
     body: JSON.stringify({ key, content, category, agent }),
   }).then(() => undefined);
 }
 
 export function deleteMemory(key: string, agent?: string): Promise<void> {
-  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : '';
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
   return apiFetch<void>(`/api/memory/${encodeURIComponent(key)}${qs}`, {
-    method: 'DELETE',
+    method: "DELETE",
   });
 }
 
@@ -1268,12 +1577,12 @@ export function deleteMemory(key: string, agent?: string): Promise<void> {
 
 export function getCost(from?: Date, to?: Date): Promise<CostSummary> {
   const params = new URLSearchParams();
-  if (from) params.set('from', from.toISOString());
-  if (to) params.set('to', to.toISOString());
+  if (from) params.set("from", from.toISOString());
+  if (to) params.set("to", to.toISOString());
   const qs = params.toString();
-  const url = qs ? `/api/cost?${qs}` : '/api/cost';
+  const url = qs ? `/api/cost?${qs}` : "/api/cost";
   return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
-    unwrapField(data, 'cost'),
+    unwrapField(data, "cost"),
   );
 }
 
@@ -1282,7 +1591,7 @@ export function getCost(from?: Date, to?: Date): Promise<CostSummary> {
 export function getCostForAgent(alias: string): Promise<CostSummary> {
   const url = `/api/cost?agent=${encodeURIComponent(alias)}`;
   return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
-    unwrapField(data, 'cost'),
+    unwrapField(data, "cost"),
   );
 }
 
@@ -1291,10 +1600,12 @@ export function getCostForAgent(alias: string): Promise<CostSummary> {
 // ---------------------------------------------------------------------------
 
 export function getSessions(): Promise<Session[]> {
-  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) => {
-    const result = unwrapField(data, 'sessions');
-    return Array.isArray(result) ? result : [];
-  });
+  return apiFetch<Session[] | { sessions: Session[] }>("/api/sessions").then(
+    (data) => {
+      const result = unwrapField(data, "sessions");
+      return Array.isArray(result) ? result : [];
+    },
+  );
 }
 
 export function getSession(id: string): Promise<Session> {
@@ -1302,17 +1613,21 @@ export function getSession(id: string): Promise<Session> {
 }
 
 /** Load persisted gateway WebSocket chat transcript for the dashboard Agent Chat. */
-export function getSessionMessages(id: string): Promise<SessionMessagesResponse> {
+export function getSessionMessages(
+  id: string,
+): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
   );
 }
 
 /** Delete a persisted session by its full DB key. */
-export function deleteSession(sessionKey: string): Promise<{ deleted: boolean }> {
+export function deleteSession(
+  sessionKey: string,
+): Promise<{ deleted: boolean }> {
   return apiFetch<{ deleted: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionKey)}`,
-    { method: 'DELETE' },
+    { method: "DELETE" },
   );
 }
 
@@ -1323,7 +1638,7 @@ export function deleteSession(sessionKey: string): Promise<{ deleted: boolean }>
 export function abortSession(id: string): Promise<{ status: string }> {
   return apiFetch<{ status: string }>(
     `/api/sessions/${encodeURIComponent(id)}/abort`,
-    { method: 'POST' },
+    { method: "POST" },
   );
 }
 
@@ -1332,8 +1647,10 @@ export function abortSession(id: string): Promise<{ status: string }> {
 // ---------------------------------------------------------------------------
 
 export function getChannels(): Promise<ChannelDetail[]> {
-  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>('/api/channels').then((data) => {
-    const result = unwrapField(data, 'channels');
+  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>(
+    "/api/channels",
+  ).then((data) => {
+    const result = unwrapField(data, "channels");
     return Array.isArray(result) ? result : [];
   });
 }
@@ -1345,7 +1662,7 @@ export function getChannels(): Promise<ChannelDetail[]> {
 /** Mirrors `zeroclaw_log::event::LogEvent` (Rust is the source of truth). */
 export interface LogEvent {
   id: string;
-  '@timestamp': string;
+  "@timestamp": string;
   severity_number: number;
   severity_text: string;
   event: { category: string; action: string; outcome?: string };
@@ -1391,27 +1708,28 @@ export function getLogs(params: LogsQueryParams = {}): Promise<LogsResponse> {
   const usp = new URLSearchParams();
   const { field_eq, ...rest } = params;
   for (const [key, value] of Object.entries(rest)) {
-    if (value === undefined || value === null || value === '') continue;
+    if (value === undefined || value === null || value === "") continue;
     usp.set(key, String(value));
   }
   if (field_eq) {
     for (const [key, value] of Object.entries(field_eq)) {
-      if (value === undefined || value === null || value === '') continue;
+      if (value === undefined || value === null || value === "") continue;
       usp.set(key, value);
     }
   }
   const qs = usp.toString();
-  return apiFetch<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`);
+  return apiFetch<LogsResponse>(`/api/logs${qs ? `?${qs}` : ""}`);
 }
-
 
 // ---------------------------------------------------------------------------
 // CLI Tools
 // ---------------------------------------------------------------------------
 
 export function getCliTools(): Promise<CliTool[]> {
-  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) => {
-    const result = unwrapField(data, 'cli_tools');
-    return Array.isArray(result) ? result : [];
-  });
+  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>("/api/cli-tools").then(
+    (data) => {
+      const result = unwrapField(data, "cli_tools");
+      return Array.isArray(result) ? result : [];
+    },
+  );
 }

@@ -155,7 +155,7 @@ define_provider_ref!(ChannelRef, "channels");
 
 /// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this
+/// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
 /// macro so adding a new model_provider type is a one-line addition here, not a
 /// shotgun edit across multiple helpers.
 ///
@@ -339,6 +339,40 @@ impl ModelProviders {
             };
         }
         for_each_model_provider_slot!(emit_get)
+    }
+
+    /// Resolve a name that is either a bare `<alias>` or a `<kind>.<alias>` pair
+    /// to its `(kind, alias, &config)`. A bare alias is matched across every
+    /// family; ambiguity (same alias under multiple kinds) returns `None` so the
+    /// caller can ask the user to qualify it. Registry-driven via
+    /// `for_each_model_provider_slot!`.
+    pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
+        if let Some((kind, alias)) = name.split_once('.') {
+            macro_rules! emit_dotted {
+                ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                    match kind {
+                        $( $type_str => self.$field.get(alias).map(|c| ($type_str, alias.to_string(), &c.base)), )+
+                        _ => None,
+                    }
+                };
+            }
+            return for_each_model_provider_slot!(emit_dotted);
+        }
+        let mut hit: Option<(&'static str, String, &ModelProviderConfig)> = None;
+        macro_rules! emit_bare {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                $(
+                    if let Some(c) = self.$field.get(name) {
+                        if hit.is_some() {
+                            return None; // ambiguous across kinds
+                        }
+                        hit = Some(($type_str, name.to_string(), &c.base));
+                    }
+                )+
+            };
+        }
+        for_each_model_provider_slot!(emit_bare);
+        hit
     }
 
     /// Get-or-create the shared base config for a `<provider_type>.<alias>`

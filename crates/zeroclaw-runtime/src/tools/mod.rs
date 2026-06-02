@@ -62,8 +62,10 @@ pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
+pub use zeroclaw_tools::file_download::FileDownloadTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
+pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
@@ -82,6 +84,7 @@ pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::McpRegistry;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
+    build_deferred_tools_section_filtered,
 };
 pub use zeroclaw_tools::mcp_tool::McpToolWrapper;
 pub use zeroclaw_tools::memory_export::MemoryExportTool;
@@ -134,7 +137,7 @@ pub use security_ops::SecurityOpsTool;
 pub use send_message_to_peer::SendMessageToPeerTool;
 pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
-pub use skill_tool::SkillShellTool;
+pub use skill_tool::{SkillBuiltinTool, SkillShellTool};
 pub use sop_advance::SopAdvanceTool;
 pub use sop_approve::SopApproveTool;
 pub use sop_execute::SopExecuteTool;
@@ -151,6 +154,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
+
+/// Per-tool channel-map handle — `Arc<RwLock<HashMap<channel_name, channel>>>`.
+///
+/// Each channel-driven tool owns its own handle so callers can populate it
+/// independently (late-bound registration). Shared alias of the same
+/// underlying type formerly known as `ChannelMapHandle`.
+pub type PerToolChannelHandle =
+    Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
@@ -270,12 +281,26 @@ pub fn register_skill_tools(
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
 ) {
+    register_skill_tools_with_context(tools_registry, skills, security, &[]);
+}
+
+/// Register skill-defined tools with full context for builtin kinds.
+///
+/// `unfiltered_registry` provides the pre-policy tool list for `kind = "builtin"`
+/// delegation.
+pub fn register_skill_tools_with_context(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+    unfiltered_registry: &[Arc<dyn Tool>],
+) {
     if skills.is_empty() {
         return;
     }
 
     let before = tools_registry.len();
-    let skill_tools = crate::skills::skills_to_tools(skills, security);
+    let skill_tools =
+        crate::skills::skills_to_tools_with_context(skills, security, unfiltered_registry);
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
         .map(|t| t.name().to_string())
@@ -318,6 +343,29 @@ pub fn register_skill_tools(
     );
 }
 
+/// Build resolution-only MCP tool wrappers for skill MCP elevation
+/// (`kind = "mcp"`).
+///
+/// These wrappers are **not** added to the model-visible tool registry — they
+/// exist solely so a skill MCP elevation can resolve its `target`
+/// (`{server}__{tool}`, e.g. `images__generate`) by name at registration time
+/// and delegate to it. Cheap: MCP tool definitions are cached at connect time,
+/// so this performs no network I/O. Returned alongside the built-in
+/// `unfiltered_tool_arcs` to form the skill resolution registry.
+pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<dyn Tool>> {
+    let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
+    for name in registry.tool_names() {
+        if let Some(def) = registry.get_tool_def(&name).await {
+            arcs.push(Arc::new(McpToolWrapper::new(
+                name,
+                def,
+                Arc::clone(registry),
+            )));
+        }
+    }
+    arcs
+}
+
 /// Always-on built-in tools that surface in the integrations panel as
 /// `(display_name, description)` pairs. The integrations registry consumes
 /// this verbatim — adding a new always-on built-in is one row here, no
@@ -333,6 +381,23 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
         "Spawn an ephemeral SubAgent that inherits this agent's identity",
     ),
 ];
+
+/// Bundled return values from tool registry construction.
+///
+/// Named struct to avoid an ever-growing positional tuple that's painful
+/// to destructure across many callers.
+#[allow(clippy::type_complexity)]
+pub struct AllToolsResult {
+    pub tools: Vec<Box<dyn Tool>>,
+    pub delegate_handle: Option<DelegateParentToolsHandle>,
+    pub ask_user_handle: Option<PerToolChannelHandle>,
+    pub reaction_handle: PerToolChannelHandle,
+    pub poll_handle: Option<PerToolChannelHandle>,
+    pub escalate_handle: Option<PerToolChannelHandle>,
+    /// Pre-boxed Arcs of every tool (before policy filter). Used by
+    /// skill-scoped builtin elevation to resolve targets at registration.
+    pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+}
 
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
@@ -357,14 +422,8 @@ pub fn all_tools(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-) -> (
-    Vec<Box<dyn Tool>>,
-    Option<DelegateParentToolsHandle>,
-    Option<ChannelMapHandle>,
-    ChannelMapHandle,
-    Option<ChannelMapHandle>,
-    Option<ChannelMapHandle>,
-) {
+    tui_env: Option<HashMap<String, String>>,
+) -> AllToolsResult {
     all_tools_with_runtime(
         config,
         security,
@@ -383,6 +442,7 @@ pub fn all_tools(
         root_config,
         canvas_store,
         is_subagent_caller,
+        tui_env,
     )
 }
 
@@ -410,14 +470,8 @@ pub fn all_tools_with_runtime(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-) -> (
-    Vec<Box<dyn Tool>>,
-    Option<DelegateParentToolsHandle>,
-    Option<ChannelMapHandle>,
-    ChannelMapHandle,
-    Option<ChannelMapHandle>,
-    Option<ChannelMapHandle>,
-) {
+    tui_env: Option<HashMap<String, String>>,
+) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
     let sandbox_cfg = risk_profile.sandbox_config();
@@ -426,7 +480,12 @@ pub fn all_tools_with_runtime(
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
-                    .with_timeout_secs(root_config.shell_tool.timeout_secs),
+                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                        security.shell_timeout_secs
+                    } else {
+                        root_config.shell_tool.timeout_secs
+                    })
+                    .with_tui_env(tui_env),
                 security.clone(),
             ),
             security.clone(),
@@ -523,29 +582,22 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — always registered when a model_provider is configured
+    // LLM task tool — registered using the calling agent's provider
+    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = root_config
-            .first_model_provider_type()
-            .unwrap_or("openrouter")
-            .to_string();
-        let llm_task_model = root_config
-            .first_model_provider()
-            .and_then(|e| e.model.clone())
+        let llm_task_provider = family.to_string();
+        let llm_task_model = entry
+            .model
+            .clone()
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(root_config);
+            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            root_config
-                .first_model_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7),
-            root_config
-                .first_model_provider()
-                .and_then(|e| e.api_key.clone()),
+            entry.temperature,
+            entry.api_key.clone(),
             llm_task_runtime_options,
         )));
     }
@@ -564,33 +616,53 @@ pub fn all_tools_with_runtime(
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
-        tool_arcs.push(Arc::new(BrowserOpenTool::new(
+        match BrowserOpenTool::new(security.clone(), browser_config.allowed_domains.clone()) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(tool));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "browser_open: failed to construct tool, skipping registration"
+                );
+            }
+        }
+        // Add full browser automation tool (pluggable backend)
+        match BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
-        )));
-        // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            BrowserTool::new_with_backend(
-                security.clone(),
-                browser_config.allowed_domains.clone(),
-                browser_config.session_name.clone(),
-                browser_config.backend.clone(),
-                browser_config.headed,
-                browser_config.native_headless,
-                browser_config.native_webdriver_url.clone(),
-                browser_config.native_chrome_path.clone(),
-                ComputerUseConfig {
-                    endpoint: browser_config.computer_use.endpoint.clone(),
-                    api_key: browser_config.computer_use.api_key.clone(),
-                    timeout_ms: browser_config.computer_use.timeout_ms,
-                    allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                    window_allowlist: browser_config.computer_use.window_allowlist.clone(),
-                    max_coordinate_x: browser_config.computer_use.max_coordinate_x,
-                    max_coordinate_y: browser_config.computer_use.max_coordinate_y,
-                },
-            ),
-            security.clone(),
-        )));
+            browser_config.session_name.clone(),
+            browser_config.backend.clone(),
+            browser_config.headed,
+            browser_config.native_headless,
+            browser_config.native_webdriver_url.clone(),
+            browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "browser: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // Browser delegation tool (conditionally registered; requires shell access)
@@ -611,31 +683,51 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            HttpRequestTool::new(
-                security.clone(),
-                http_config.allowed_domains.clone(),
-                http_config.max_response_size,
-                http_config.timeout_secs,
-                http_config.allow_private_hosts,
-            ),
+        match HttpRequestTool::new(
             security.clone(),
-        )));
+            http_config.allowed_domains.clone(),
+            http_config.max_response_size,
+            http_config.timeout_secs,
+            http_config.allow_private_hosts,
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "http_request: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     if web_fetch_config.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            WebFetchTool::new(
-                security.clone(),
-                web_fetch_config.allowed_domains.clone(),
-                web_fetch_config.blocked_domains.clone(),
-                web_fetch_config.max_response_size,
-                web_fetch_config.timeout_secs,
-                web_fetch_config.firecrawl.clone(),
-                web_fetch_config.allowed_private_hosts.clone(),
-            ),
+        match WebFetchTool::new(
             security.clone(),
-        )));
+            web_fetch_config.allowed_domains.clone(),
+            web_fetch_config.blocked_domains.clone(),
+            web_fetch_config.max_response_size,
+            web_fetch_config.timeout_secs,
+            web_fetch_config.firecrawl.clone(),
+            web_fetch_config.allowed_private_hosts.clone(),
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "web_fetch: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // Text browser tool (headless text-based browser rendering)
@@ -653,6 +745,7 @@ pub fn all_tools_with_runtime(
             root_config.web_search.search_provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
+            root_config.web_search.jina_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
@@ -916,11 +1009,37 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Poll tool — always registered; uses late-bound channel map handle
-    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+    // File upload bundle tool — enabled iff [file_upload_bundle].url is set
+    if root_config
+        .file_upload_bundle
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        tool_arcs.push(Arc::new(FileUploadBundleTool::new(
+            security.clone(),
+            root_config.file_upload_bundle.clone(),
+        )));
+    }
+
+    // File download tool — enabled iff [file_download].url is set
+    if root_config
+        .file_download
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        tool_arcs.push(Arc::new(FileDownloadTool::new(
+            security.clone(),
+            root_config.file_download.clone(),
+        )));
+    }
+
+    // Poll tool — always registered; owns its own late-bound channel map.
+    let poll_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     tool_arcs.push(Arc::new(PollTool::new(
         security.clone(),
-        Arc::clone(&channel_map_handle),
+        Arc::clone(&poll_handle),
     )));
 
     // SOP tools (registered when sops_dir is configured)
@@ -945,22 +1064,24 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Emoji reaction tool — always registered; channel map populated later by start_channels.
-    let reaction_tool = ReactionTool::new(security.clone());
-    let reaction_handle = reaction_tool.channel_map_handle();
+    // Emoji reaction tool — always registered; owns its own late-bound channel map.
+    let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(reaction_tool));
 
-    // Interactive ask_user tool — always registered; channel map populated later by start_channels.
-    let ask_user_tool = AskUserTool::new(security.clone());
-    let ask_user_handle = ask_user_tool.channel_map_handle();
+    // Interactive ask_user tool — always registered; owns its own late-bound channel map.
+    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let ask_user_tool =
+        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
     tool_arcs.push(Arc::new(ask_user_tool));
 
-    // Human escalation tool — always registered; channel map populated later by start_channels.
+    // Human escalation tool — always registered; owns its own late-bound channel map.
+    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
+        escalate_handle.as_ref().cloned().unwrap(),
     );
-    let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 
     // Microsoft 365 Graph API integration
@@ -992,14 +1113,15 @@ pub fn all_tools_with_runtime(
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
-                return (
-                    boxed_registry_from_arcs(tool_arcs),
-                    None,
-                    Some(reaction_handle),
-                    channel_map_handle,
-                    Some(ask_user_handle),
-                    Some(escalate_handle),
-                );
+                return AllToolsResult {
+                    unfiltered_tool_arcs: tool_arcs.clone(),
+                    tools: boxed_registry_from_arcs(tool_arcs),
+                    delegate_handle: None,
+                    ask_user_handle,
+                    reaction_handle,
+                    poll_handle: Some(poll_handle),
+                    escalate_handle,
+                };
             }
 
             let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
@@ -1071,7 +1193,7 @@ pub fn all_tools_with_runtime(
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
     });
     let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_from_config(root_config);
+        zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
@@ -1114,7 +1236,8 @@ pub fn all_tools_with_runtime(
         .with_risk_profiles(root_config.risk_profiles.clone())
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
-        .with_root_config(config.clone());
+        .with_root_config(config.clone())
+        .with_caller_alias(agent_alias);
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -1188,14 +1311,15 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    (
-        boxed_registry_from_arcs(tool_arcs),
+    AllToolsResult {
+        unfiltered_tool_arcs: tool_arcs.clone(),
+        tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
-        Some(reaction_handle),
-        channel_map_handle,
-        Some(ask_user_handle),
-        Some(escalate_handle),
-    )
+        ask_user_handle,
+        reaction_handle,
+        poll_handle: Some(poll_handle),
+        escalate_handle,
+    }
 }
 
 #[cfg(test)]
@@ -1239,7 +1363,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1256,7 +1380,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
@@ -1285,7 +1411,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1302,7 +1428,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"content_search"));
@@ -1432,7 +1560,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1449,7 +1577,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
     }
@@ -1469,7 +1599,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1486,7 +1616,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }
@@ -1508,7 +1640,7 @@ mod tests {
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1525,7 +1657,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
     }
@@ -1546,7 +1680,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1563,7 +1697,9 @@ mod tests {
             &cfg,
             None,
             false,
-        );
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
     }

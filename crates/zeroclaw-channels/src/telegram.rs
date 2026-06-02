@@ -528,6 +528,23 @@ impl TelegramChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Wire the resolved STT backend alias here so the channel-internal
+                // voice path (`try_parse_voice_message` -> `manager.transcribe`)
+                // dispatches to a configured provider. The orchestrator only wires
+                // the alias for the MediaPipeline/attachment path, which inbound
+                // Telegram voice notes never traverse. Bind to the sole registered
+                // provider when exactly one is configured so the single-provider
+                // case dispatches without an agent context; multi-provider setups
+                // keep the alias empty and still require explicit
+                // `agent.<alias>.transcription_provider` routing through the
+                // orchestrator (mirrors `wati.rs` / `lark.rs` / `mattermost.rs`).
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
                 self.transcription = Some(config);
             }
@@ -593,7 +610,7 @@ impl TelegramChannel {
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
 
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -864,7 +881,7 @@ impl TelegramChannel {
             // Finalize path: text is already the final answer — no debounce.
             let text = content.to_string();
             let recipient = recipient.to_string();
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 if let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
@@ -915,7 +932,7 @@ impl TelegramChannel {
 
         let pending = self.pending_voice.clone();
         let recipient = recipient.to_string();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -3684,7 +3701,7 @@ Ensure only one `zeroclaw` process is using this bot token."
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             loop {
                 let body = serde_json::json!({
                     "chat_id": &chat_id,
@@ -3860,6 +3877,54 @@ mod tests {
         assert_eq!(ch.name(), "telegram");
     }
 
+    /// Regression for #6999 / #7000: the channel-internal voice path
+    /// (`try_parse_voice_message` -> `manager.transcribe`) must dispatch to a
+    /// configured STT backend. When exactly one provider is registered,
+    /// `with_transcription` binds it as the resolved alias so `transcribe()`
+    /// no longer fails with "Agent has no transcription_provider configured".
+    #[tokio::test]
+    async fn telegram_with_transcription_binds_sole_provider_alias() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+
+        // Only the Groq key is set -> exactly one provider registers.
+        let config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test-groq-key".to_string()),
+            ..zeroclaw_config::schema::TranscriptionConfig::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_transcription(config);
+
+        let manager = ch
+            .transcription_manager
+            .as_ref()
+            .expect("single configured provider must build a transcription manager");
+
+        // Alias is bound for the single-provider case. Stop before any network
+        // call by using an unsupported audio format, which `validate_audio`
+        // rejects first inside the provider's `transcribe`.
+        let err = manager
+            .transcribe(&[0u8; 16], "voice.aac")
+            .await
+            .expect_err("unsupported format must error before any network call");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no transcription_provider configured"),
+            "alias must be bound for the single-provider case; got: {msg}"
+        );
+        assert!(
+            msg.contains("Unsupported audio format"),
+            "expected the bound provider to reach audio validation; got: {msg}"
+        );
+    }
+
     #[test]
     fn random_telegram_ack_reaction_is_from_pool() {
         for _ in 0..128 {
@@ -3917,7 +3982,7 @@ mod tests {
         // Manually insert a dummy handle
         {
             let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            *guard = Some(zeroclaw_spawn::spawn!(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }
@@ -3942,7 +4007,7 @@ mod tests {
         // Insert a dummy handle first
         {
             let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            *guard = Some(zeroclaw_spawn::spawn!(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }

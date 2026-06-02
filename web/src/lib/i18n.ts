@@ -416,7 +416,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
     'nav.acp': 'ACP',
-    'nav.onboard': 'Onboard',
+    'nav.quickstart': 'Quickstart',
 
     // ACP Console
     'acp.title': 'ACP Console',

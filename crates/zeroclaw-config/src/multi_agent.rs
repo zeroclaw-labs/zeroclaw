@@ -83,7 +83,7 @@ pub enum MemoryBackendKind {
 /// for cross-reference and same-backend invariants at config load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent-workspace"]
+#[prefix = "agent_workspace"]
 #[serde(default)]
 pub struct AgentWorkspaceConfig {
     /// Optional explicit workspace path. `None` = derive from
@@ -114,7 +114,7 @@ pub struct AgentWorkspaceConfig {
 /// allowlist entries must point at same-backend siblings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent-memory"]
+#[prefix = "agent_memory"]
 #[serde(default)]
 pub struct AgentMemoryConfig {
     /// The backend kind this agent uses. Defaults to `Sqlite` for new
@@ -125,7 +125,7 @@ pub struct AgentMemoryConfig {
 /// `[peer_groups.<name>]` — mutual-opt-in peer group on a channel type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "peer-group"]
+#[prefix = "peer_group"]
 #[serde(default)]
 pub struct PeerGroupConfig {
     /// Either a channel type (`"telegram"`) or a dotted channel alias

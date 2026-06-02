@@ -29,6 +29,68 @@ static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::
 pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
+
+/// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
+/// Injected by the binary so `zeroclaw-runtime` doesn't depend on
+/// `zeroclaw-channels`.
+type ChannelMapFn = Box<
+    dyn Fn()
+            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
+        + Send
+        + Sync,
+>;
+
+/// Channel map factory, injected by the binary.
+static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
+
+/// Register the channel map factory. Called once at startup by the binary.
+pub fn register_channel_map_fn(f: ChannelMapFn) {
+    let _ = CHANNEL_MAP_FN.set(f);
+}
+
+/// Populate all channel-driven tool handles from the registered factory.
+/// Returns the number of channels seeded.
+///
+/// Parameter order matches the return tuple of `all_tools_with_runtime`:
+/// Seed all channel-driven tool handles from the registered channel map factory.
+/// Returns the number of channels seeded. Parameters match the return order of
+/// `all_tools_with_runtime`:
+///   ask_user_handle = `Option<PerToolChannelHandle>`
+///   reaction_handle = `PerToolChannelHandle` (NOT Option)
+///   poll_handle = `Option<PerToolChannelHandle>`
+///   escalate_handle = `Option<PerToolChannelHandle>`
+pub(crate) fn seed_channel_handles(
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let Some(factory) = CHANNEL_MAP_FN.get() else {
+        return 0;
+    };
+    let map = factory();
+    if map.is_empty() {
+        return 0;
+    }
+
+    let handles = [
+        ask_user_handle.as_ref(),
+        Some(reaction_handle),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+    ];
+
+    let mut count = 0;
+    for (name, ch) in &map {
+        for handle in handles.iter().flatten() {
+            handle
+                .write()
+                .insert(name.clone(), std::sync::Arc::clone(ch));
+        }
+        count += 1;
+    }
+    count
+}
 use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -143,6 +205,37 @@ pub fn apply_policy_tool_filter(
         let caller_ok = caller_allowed.is_none_or(|list| list.iter().any(|n| n == name));
         policy_ok && caller_ok
     });
+}
+
+/// Apply the SecurityPolicy built-in tool filter on the channel/daemon
+/// (`process_message`) path.
+///
+/// Extracted as a named seam so the production filtering of the eager
+/// built-in registry is regression-testable without driving the full agent
+/// loop (see `process_message_policy_filters_eager_builtins`). The channel
+/// path has no caller-supplied allowlist, so only the agent's own
+/// `SecurityPolicy` (`allowed_tools` + `excluded_tools`) gates here; the
+/// `run()` path additionally composes a caller-supplied `allowed_tools` gate.
+pub(crate) fn filter_channel_builtin_tools(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    security: &zeroclaw_config::policy::SecurityPolicy,
+) {
+    let before_filter = tools_registry.len();
+    apply_policy_tool_filter(tools_registry, Some(security), None);
+    if tools_registry.len() != before_filter {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "before": before_filter,
+                    "retained": tools_registry.len(),
+                    "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
+                    "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
+                })
+            ),
+            "Applied capability-based tool access filter (process_message)"
+        );
+    }
 }
 
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
@@ -1133,6 +1226,7 @@ pub async fn agent_turn(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     strict_tool_parsing: bool,
+    parallel_tools: bool,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -1158,6 +1252,7 @@ pub async fn agent_turn(
         model_switch_callback,
         &zeroclaw_config::schema::PacingConfig::default(),
         strict_tool_parsing,
+        parallel_tools,
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
@@ -1301,6 +1396,7 @@ pub async fn run_tool_call_loop(
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
     strict_tool_parsing: bool,
+    parallel_tools: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -1399,7 +1495,22 @@ pub async fn run_tool_call_loop(
         // counterpart was dropped by proactive trimming, context compression,
         // or session history reloading.  Without this, model_providers like MiniMax
         // reject the request with "tool result's tool id not found" (bug #5743).
-        crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+        let pruned_in_loop = crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+        if !pruned_in_loop.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "removed": pruned_in_loop.removed,
+                        "orphan_tool_call_ids": pruned_in_loop.orphan_tool_call_ids,
+                    })),
+                "remove_orphaned_tool_messages fired inside run_tool_call_loop: \
+                 assistant tool_use blocks and/or tool_results were stripped from \
+                 the live history. If this fires mid-conversation the model loses \
+                 the in-flight tool work and acts like it just woke up."
+            );
+        }
         normalize_system_messages(history);
 
         // Check if model switch was requested via model_switch tool
@@ -1593,18 +1704,24 @@ pub async fn run_tool_call_loop(
         let mut streamed_protocol_suppressed = false;
 
         let chat_result = if should_consume_provider_stream {
-            match consume_provider_streaming_response(
-                active_model_provider,
-                &prepared_messages.messages,
-                request_tools,
-                active_model,
-                temperature,
-                cancellation_token.as_ref(),
-                on_delta.as_ref(),
-                strict_tool_parsing,
+            use ::zeroclaw_log::Instrument;
+            let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
+            let stream_future = ::zeroclaw_log::scope!(
+                model: active_model,
+                =>
+                consume_provider_streaming_response(
+                    active_model_provider,
+                    &prepared_messages.messages,
+                    request_tools,
+                    active_model,
+                    temperature,
+                    cancellation_token.as_ref(),
+                    on_delta.as_ref(),
+                    strict_tool_parsing,
+                )
             )
-            .await
-            {
+            .instrument(provider_span);
+            match stream_future.await {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
                     streamed_protocol_suppressed = streamed.suppressed_protocol;
@@ -2130,7 +2247,8 @@ pub async fn run_tool_call_loop(
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
-        let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
+        let allow_parallel_execution =
+            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
 
@@ -2255,6 +2373,9 @@ pub async fn run_tool_call_loop(
                         Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
                             ApprovalResponse::No
                         }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
+                            replacement,
+                        }) => ApprovalResponse::ReplaceWith(replacement),
                         // Channel doesn't support approval — auto-deny.
                         None => ApprovalResponse::No,
                     }
@@ -2262,7 +2383,7 @@ pub async fn run_tool_call_loop(
                     mgr.prompt_cli(&request)
                 };
 
-                mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
+                mgr.record_decision(&tool_name, &tool_args, &decision, channel_name);
 
                 if decision == ApprovalResponse::No {
                     let denied = "Denied by user.".to_string();
@@ -2295,6 +2416,44 @@ pub async fn run_tool_call_loop(
                             output: denied.clone(),
                             success: false,
                             error_reason: Some(denied),
+                            duration: Duration::ZERO,
+                            receipt: None,
+                        },
+                    ));
+                    continue;
+                }
+
+                if let ApprovalResponse::ReplaceWith(replacement) = &decision {
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx
+                            .send(StreamDelta::Status(format!(
+                                "\u{270f} {}: replaced by user\n",
+                                tool_name
+                            )))
+                            .await;
+                    }
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "iteration": iteration + 1,
+                                "tool": tool_name.clone(),
+                                "arguments": scrub_credentials(&tool_args.to_string()),
+                                "replaced": true,
+                                "output": scrub_credentials(replacement),
+                                "trace_id": turn_id,
+                            })),
+                        "tool_call_result"
+                    );
+                    ordered_results[idx] = Some((
+                        tool_name.clone(),
+                        call.tool_call_id.clone(),
+                        ToolExecutionOutcome {
+                            output: crate::approval::sanitize_tool_replacement(replacement),
+                            success: true,
+                            error_reason: None,
                             duration: Duration::ZERO,
                             receipt: None,
                         },
@@ -2716,10 +2875,41 @@ pub async fn run_tool_call_loop(
             .ok()
             .flatten(),
     };
-    match model_provider
-        .chat(summary_request, model, temperature)
-        .await
-    {
+    let summary_future = model_provider.chat(summary_request, model, temperature);
+    let summary_call = match pacing.step_timeout_secs {
+        Some(step_secs) if step_secs > 0 => {
+            let step_timeout = Duration::from_secs(step_secs);
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = tokio::time::timeout(step_timeout, summary_future) => match result {
+                        Ok(inner) => inner,
+                        Err(_) => anyhow::bail!(
+                            "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
+                        ),
+                    },
+                }
+            } else {
+                match tokio::time::timeout(step_timeout, summary_future).await {
+                    Ok(inner) => inner,
+                    Err(_) => anyhow::bail!(
+                        "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
+                    ),
+                }
+            }
+        }
+        _ => {
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = summary_future => result,
+                }
+            } else {
+                summary_future.await
+            }
+        }
+    };
+    match summary_call {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
@@ -2730,11 +2920,17 @@ pub async fn run_tool_call_loop(
         }
         Err(e) => {
             ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Final summary LLM call failed, bailing"
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "provider": provider_name,
+                        "max_iterations": max_iterations,
+                        "trace_id": turn_id,
+                        "error": format!("{e}"),
+                    })),
+                "final summary LLM call failed after iteration exhaustion; bailing"
             );
             anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
         }
@@ -2828,7 +3024,7 @@ pub fn apply_text_tool_prompt_policy(
 ///
 /// SubAgent spawn paths use this to inject the validated child policy
 /// returned from [`SecurityPolicy::ensure_no_escalation_beyond`] (and,
-/// once v0.8.1 plumbs caller-supplied allowlist narrowing, the
+/// once caller-supplied allowlist narrowing lands, the
 /// validated agent-scoped memory wrapper). Without this hook the run
 /// path rebuilds both surfaces from config, so the validator's
 /// guarantees never reach the agent loop. `None` on either field
@@ -2908,7 +3104,7 @@ pub async fn run(
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
         .clone();
-    crate::agent::thinking::validate_thinking_config(&agent.thinking);
+    crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
         .with_context(|| {
@@ -2945,7 +3141,16 @@ pub async fn run(
     );
     let __zc_body = async move {
         let agent_alias: &str = __zc_alias.as_str();
-        // ── Wire up agnostic subsystems ──────────────────────────────
+        // ── Effective per-agent runtime tunables ──────────────────────
+        // Profile values (when set) override the agent's inline fields.
+        // See `Config::effective_*` helpers for precedence rules.
+        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
+        let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
+        let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
+        let eff_compact_context = config.effective_compact_context(agent_alias);
+        let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
+        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
+        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
@@ -3006,14 +3211,7 @@ pub async fn run(
         } else {
             (None, None)
         };
-        let (
-            mut tools_registry,
-            delegate_handle,
-            _reaction_handle,
-            _channel_map_handle,
-            _ask_user_handle,
-            _escalate_handle,
-        ) = tools::all_tools_with_runtime(
+        let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -3031,7 +3229,31 @@ pub async fn run(
             &config,
             None,
             is_subagent_caller,
+            None,
         );
+        let mut tools_registry = all_tools_result.tools;
+        let delegate_handle = all_tools_result.delegate_handle;
+        let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
+        let ask_user_handle = all_tools_result.ask_user_handle;
+        let reaction_handle = all_tools_result.reaction_handle;
+        let poll_handle = all_tools_result.poll_handle;
+        let escalate_handle = all_tools_result.escalate_handle;
+
+        // Populate all channel-driven tool handles from the registered factory.
+        let count = seed_channel_handles(
+            &ask_user_handle,
+            &reaction_handle,
+            &poll_handle,
+            &escalate_handle,
+        );
+        if count > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                &format!("Registered {} channel(s) for CLI agent", count),
+            );
+        }
 
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
@@ -3089,6 +3311,8 @@ pub async fn run(
         let mut activated_handle: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
+        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3101,6 +3325,7 @@ pub async fn run(
             match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -3119,16 +3344,28 @@ pub async fn run(
                                 registry.server_count()
                             )
                         );
-                        deferred_section =
-                            crate::tools::build_deferred_tools_section(&deferred_set);
+                        // Build access policy from SecurityPolicy so blocked
+                        // MCP tools never surface anywhere in context.
+                        let mcp_policy =
+                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                                security.allowed_tools.as_deref(),
+                                security.excluded_tools.as_deref(),
+                                allowed_tools.as_deref(),
+                            );
+                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
+                            mcp_policy.as_ref(),
+                        );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle = Some(std::sync::Arc::clone(&activated));
-                        tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        tools_registry.push(Box::new(tool_search));
                     } else {
                         // Eager path: register all MCP tools directly
                         let names = registry.tool_names();
@@ -3216,13 +3453,12 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options_base =
-            zeroclaw_providers::provider_runtime_options_from_config(&config);
-        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
-            &config,
-            &provider_name,
-            &provider_runtime_options_base,
-        );
+        let provider_runtime_options = match agent_provider_resolved.as_ref() {
+            Some((ty, alias, _)) => {
+                zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
+            }
+            None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
+        };
 
         // Resolve api_key and uri from the actual provider being constructed.
         // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
@@ -3288,7 +3524,19 @@ pub async fn run(
 
         // Register skill-defined tools as callable tool specs in the tool registry
         // so the LLM can invoke them via native function calling, not just XML prompts.
-        tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
+        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
+        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs
+            .iter()
+            .cloned()
+            .chain(mcp_elevation_arcs.iter().cloned())
+            .collect();
+        tools::register_skill_tools_with_context(
+            &mut tools_registry,
+            &skills,
+            security.clone(),
+            &skill_resolution_registry,
+        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
@@ -3408,7 +3656,7 @@ pub async fn run(
         ));
         }
         retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
-        let bootstrap_max_chars = if agent.compact_context {
+        let bootstrap_max_chars = if eff_compact_context {
             Some(6000)
         } else {
             None
@@ -3416,7 +3664,7 @@ pub async fn run(
         let native_tools = model_provider.supports_native_tools();
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
-            agent.strict_tool_parsing,
+            agent.resolved.strict_tool_parsing,
             &mut tool_descs,
             &mut deferred_section,
         );
@@ -3432,8 +3680,9 @@ pub async fn run(
                 Some(&risk_profile),
                 native_tools,
                 config.skills.prompt_injection_mode,
-                agent.compact_context,
-                agent.max_system_prompt_chars,
+                eff_compact_context,
+                eff_max_system_prompt_chars,
+                true,
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
@@ -3513,11 +3762,11 @@ pub async fn run(
             let thinking_level = crate::agent::thinking::resolve_thinking_level(
                 thinking_directive,
                 None,
-                &agent.thinking,
+                &agent.resolved.thinking,
             );
             let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
                 thinking_level,
-                &agent.thinking,
+                &agent.resolved.thinking,
             );
             let effective_temperature: Option<f64> = temperature.map(|t| {
                 crate::agent::thinking::clamp_temperature(
@@ -3559,18 +3808,22 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message.
-            // For non-interactive runs (cron, daemon heartbeat), exclude
-            // Conversation-category memories so chat history does not leak
-            // into autonomous executions. / #5456.
+            // Exclude Conversation-category memories when:
+            //   - non-interactive (cron, daemon heartbeat): chat history must
+            //     not leak into autonomous executions / #5456, OR
+            //   - no session scope is available (memory_session_id is None):
+            //     without a session filter, Conversation entries from other
+            //     channels (Matrix, Discord, …) would bleed into this session.
+            let exclude_conv = !interactive || memory_session_id.is_none();
             let mem_context = build_context(
                 mem.as_ref(),
                 &effective_msg,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
-                !interactive,
+                exclude_conv,
             )
             .await;
-            let rag_limit = if agent.compact_context { 2 } else { 5 };
+            let rag_limit = if eff_compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
@@ -3589,17 +3842,17 @@ pub async fn run(
             ];
 
             // Prune history for token efficiency (when enabled).
-            if agent.history_pruning.enabled {
+            if agent.resolved.history_pruning.enabled {
                 let _stats = crate::agent::history_pruner::prune_history(
                     &mut history,
-                    &agent.history_pruning,
+                    &agent.resolved.history_pruning,
                 );
             }
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
-                &agent.tool_filter_groups,
+                &agent.resolved.tool_filter_groups,
                 &effective_msg,
             );
 
@@ -3624,18 +3877,19 @@ pub async fn run(
                                 channel_name,
                                 None,
                                 &config.multimodal,
-                                agent.max_tool_iterations,
+                                agent.resolved.max_tool_iterations,
                                 None,
                                 None,
                                 None,
                                 &excluded_tools,
-                                &agent.tool_call_dedup_exempt,
+                                &agent.resolved.tool_call_dedup_exempt,
                                 activated_handle.as_ref(),
                                 Some(model_switch_callback.clone()),
                                 &config.pacing,
-                                agent.strict_tool_parsing,
-                                agent.max_tool_result_chars,
-                                agent.max_context_tokens,
+                                agent.resolved.strict_tool_parsing,
+                                agent.resolved.parallel_tools,
+                                agent.resolved.max_tool_result_chars,
+                                agent.resolved.max_context_tokens,
                                 None, // shared_budget
                                 None, // channel: CLI mode — uses prompt_cli
                                 None, // receipt_generator
@@ -3681,7 +3935,10 @@ pub async fn run(
                                     &zeroclaw_providers::options_for_provider_ref(
                                         &config,
                                         &new_model_provider,
-                                        &provider_runtime_options_base,
+                                        &zeroclaw_providers::provider_runtime_options_for_agent(
+                                            &config,
+                                            agent_alias,
+                                        ),
                                     ),
                                 )?;
 
@@ -3865,11 +4122,11 @@ pub async fn run(
                 let thinking_level = crate::agent::thinking::resolve_thinking_level(
                     thinking_directive,
                     None,
-                    &agent.thinking,
+                    &agent.resolved.thinking,
                 );
                 let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
                     thinking_level,
-                    &agent.thinking,
+                    &agent.resolved.thinking,
                 );
                 let turn_temperature: Option<f64> = temperature.map(|t| {
                     crate::agent::thinking::clamp_temperature(
@@ -3934,17 +4191,18 @@ pub async fn run(
                 }
 
                 // Inject memory + hardware RAG context into user message.
-                // Interactive REPL: keep Conversation memories (user is actively
-                // chatting in this session and may want their own history recalled).
+                // Keep Conversation memories only when a session scope is
+                // available; without one, cross-channel entries (Matrix,
+                // Discord, …) would bleed into this interactive session.
                 let mem_context = build_context(
                     mem.as_ref(),
                     &effective_input,
                     config.memory.min_relevance_score,
                     memory_session_id.as_deref(),
-                    false,
+                    memory_session_id.is_none(),
                 )
                 .await;
-                let rag_limit = if agent.compact_context { 2 } else { 5 };
+                let rag_limit = if eff_compact_context { 2 } else { 5 };
                 let hw_context = hardware_rag
                     .as_ref()
                     .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
@@ -3962,7 +4220,7 @@ pub async fn run(
                 // Compute per-turn excluded MCP tools from tool_filter_groups.
                 let excluded_tools = compute_excluded_mcp_tools(
                     &tools_registry,
-                    &agent.tool_filter_groups,
+                    &agent.resolved.tool_filter_groups,
                     &effective_input,
                 );
 
@@ -3974,7 +4232,7 @@ pub async fn run(
                 let content_streamed_flag = content_was_streamed.clone();
                 let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
-                let consumer_handle = tokio::spawn(async move {
+                let consumer_handle = zeroclaw_spawn::spawn!(async move {
                     use std::io::Write;
                     while let Some(event) = delta_rx.recv().await {
                         match event {
@@ -3999,7 +4257,7 @@ pub async fn run(
                 // Ctrl+C cancels the in-flight turn instead of killing the process.
                 let cancel_token = CancellationToken::new();
                 let cancel_token_clone = cancel_token.clone();
-                let ctrlc_handle = tokio::spawn(async move {
+                let ctrlc_handle = zeroclaw_spawn::spawn!(async move {
                     if tokio::signal::ctrl_c().await.is_ok() {
                         cancel_token_clone.cancel();
                     }
@@ -4024,18 +4282,19 @@ pub async fn run(
                                     channel_name,
                                     None,
                                     &config.multimodal,
-                                    agent.max_tool_iterations,
+                                    agent.resolved.max_tool_iterations,
                                     Some(cancel_token.clone()),
                                     Some(delta_tx.clone()),
                                     None,
                                     &excluded_tools,
-                                    &agent.tool_call_dedup_exempt,
+                                    &agent.resolved.tool_call_dedup_exempt,
                                     activated_handle.as_ref(),
                                     Some(model_switch_callback.clone()),
                                     &config.pacing,
-                                    agent.strict_tool_parsing,
-                                    agent.max_tool_result_chars,
-                                    agent.max_context_tokens,
+                                    agent.resolved.strict_tool_parsing,
+                                    agent.resolved.parallel_tools,
+                                    agent.resolved.max_tool_result_chars,
+                                    agent.resolved.max_context_tokens,
                                     None, // shared_budget
                                     None, // channel: interactive CLI — uses prompt_cli
                                     None, // receipt_generator
@@ -4083,7 +4342,10 @@ pub async fn run(
                                         &zeroclaw_providers::options_for_provider_ref(
                                             &config,
                                             &new_model_provider,
-                                            &provider_runtime_options_base,
+                                            &zeroclaw_providers::provider_runtime_options_for_agent(
+                                                &config,
+                                                agent_alias,
+                                            ),
                                         ),
                                     )?;
 
@@ -4112,8 +4374,8 @@ pub async fn run(
                                 );
                                 let mut compressor =
                                     crate::agent::context_compressor::ContextCompressor::new(
-                                        agent.context_compression.clone(),
-                                        agent.max_context_tokens,
+                                        agent.resolved.context_compression.clone(),
+                                        eff_max_context_tokens,
                                     )
                                     .with_memory(mem.clone());
                                 let error_msg = format!("{e}");
@@ -4182,8 +4444,8 @@ pub async fn run(
                 // Context compression before hard trimming to preserve long-context signal.
                 {
                     let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                        agent.context_compression.clone(),
-                        agent.max_context_tokens,
+                        agent.resolved.context_compression.clone(),
+                        eff_max_context_tokens,
                     )
                     .with_memory(mem.clone());
                     match compressor
@@ -4210,13 +4472,13 @@ pub async fn run(
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "Context compression failed, falling back to history trim"
                             );
-                            trim_history(&mut history, agent.max_history_messages / 2);
+                            trim_history(&mut history, eff_max_history_messages / 2);
                         }
                     }
                 }
 
                 // Hard cap as a safety net.
-                trim_history(&mut history, agent.max_history_messages);
+                trim_history(&mut history, eff_max_history_messages);
 
                 // Restore base system prompt (remove per-turn thinking prefix).
                 if thinking_params.system_prompt_prefix.is_some()
@@ -4262,7 +4524,7 @@ pub async fn process_message(
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
         .clone();
-    crate::agent::thinking::validate_thinking_config(&agent.thinking);
+    crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
         .with_context(|| {
@@ -4303,6 +4565,17 @@ pub async fn process_message(
         let agent_alias: &str = __zc_alias.as_str();
         let message: &str = __zc_message.as_str();
         let session_id: Option<&str> = __zc_session_id.as_deref();
+
+        // ── Effective per-agent runtime tunables ──────────────────────
+        // Profile values (when set) override the agent's inline fields.
+        // See `Config::effective_*` helpers for precedence rules.
+        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
+        let _eff_max_history_messages = config.effective_max_history_messages(agent_alias);
+        let _eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
+        let eff_compact_context = config.effective_compact_context(agent_alias);
+        let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
+        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
+        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -4345,14 +4618,7 @@ pub async fn process_message(
         } else {
             (None, None)
         };
-        let (
-            mut tools_registry,
-            delegate_handle_pm,
-            _reaction_handle_pm,
-            _channel_map_handle_pm,
-            _ask_user_handle_pm,
-            _escalate_handle_pm,
-        ) = tools::all_tools_with_runtime(
+        let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -4372,7 +4638,31 @@ pub async fn process_message(
             &config,
             None,
             false,
+            None,
         );
+        let mut tools_registry = all_tools_result_pm.tools;
+        let delegate_handle_pm = all_tools_result_pm.delegate_handle;
+        let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
+        let ask_user_handle_pm = all_tools_result_pm.ask_user_handle;
+        let reaction_handle_pm = all_tools_result_pm.reaction_handle;
+        let poll_handle_pm = all_tools_result_pm.poll_handle;
+        let escalate_handle_pm = all_tools_result_pm.escalate_handle;
+
+        // Populate all channel-driven tool handles from the registered factory.
+        let count = seed_channel_handles(
+            &ask_user_handle_pm,
+            &reaction_handle_pm,
+            &poll_handle_pm,
+            &escalate_handle_pm,
+        );
+        if count > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                &format!("Registered {} channel(s) for process_message agent", count),
+            );
+        }
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
         } else {
@@ -4380,14 +4670,24 @@ pub async fn process_message(
         };
         tools_registry.extend(peripheral_tools);
 
+        // ── Capability-based tool access control ─────────────────────
+        // Mirror the `run()` path: apply the SecurityPolicy filter
+        // (allowed_tools + excluded_tools) so daemon-provisioned agents get
+        // the same restriction as CLI-invoked agents. Extracted into
+        // `filter_channel_builtin_tools` so the production path is
+        // regression-tested (see process_message_policy_filters_eager_builtins).
+        filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
+
         // ── Wire MCP tools (non-fatal) — process_message path ────────
         // NOTE: Same ordering contract as the CLI path above — MCP tools must be
-        // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
-        // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+        // injected after the policy tool filter to avoid MCP tools being
+        // silently dropped by a restrictive allowlist.
         let mut deferred_section = String::new();
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
+        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -4400,6 +4700,7 @@ pub async fn process_message(
             match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -4417,16 +4718,26 @@ pub async fn process_message(
                                 registry.server_count()
                             )
                         );
-                        deferred_section =
-                            crate::tools::build_deferred_tools_section(&deferred_set);
+                        let mcp_policy_pm =
+                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                                security.allowed_tools.as_deref(),
+                                security.excluded_tools.as_deref(),
+                                None, // no caller-supplied allowlist in channel path
+                            );
+                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
+                            mcp_policy_pm.as_ref(),
+                        );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                        tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search_pm =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy_pm {
+                            tool_search_pm = tool_search_pm.with_access_policy(policy);
+                        }
+                        tools_registry.push(Box::new(tool_search_pm));
                     } else {
                         let names = registry.tool_names();
                         let mut registered = 0usize;
@@ -4529,7 +4840,18 @@ pub async fn process_message(
         let skills = crate::skills::load_skills_for_agent(&config.data_dir, &config, agent_alias);
 
         // Register skill-defined tools as callable tool specs (process_message path).
-        tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+        // Resolution registry = built-in arcs + resolution-only MCP wrappers.
+        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs_pm
+            .iter()
+            .cloned()
+            .chain(mcp_elevation_arcs.iter().cloned())
+            .collect();
+        tools::register_skill_tools_with_context(
+            &mut tools_registry,
+            &skills,
+            security.clone(),
+            &skill_resolution_registry,
+        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands."),
@@ -4588,26 +4910,42 @@ pub async fn process_message(
         ));
         }
 
-        // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
-        // Skip when the active risk profile's autonomy is `Full` — full-autonomy
-        // agents keep all tools.
+        // ── Compute final effective tool set BEFORE prompt construction ──
+        // This ensures the system prompt, tool instructions, and channel target
+        // injection all reflect the same policy-filtered tool set that will be
+        // used at execution time. Without this, the prompt could advertise
+        // tools (and their target identifiers) that the execution denylist
+        // would block — a control boundary violation.
+        //
+        // Note: compute_excluded_mcp_tools uses the raw message here (before
+        // thinking directive stripping). This is safe — dynamic tool filter
+        // keyword matching works the same, and risk-profile excluded_tools
+        // are message-independent.
+        let mut excluded_tools = compute_excluded_mcp_tools(
+            &tools_registry,
+            &agent.resolved.tool_filter_groups,
+            message,
+        );
         {
             let active_profile = &risk_profile;
             if active_profile.level != AutonomyLevel::Full {
-                let excluded = &active_profile.excluded_tools;
-                if !excluded.is_empty() {
-                    tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-                }
+                excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
             }
         }
-        // The risk-profile excluded_tools filter ran above on tool_descs
-        // already; here we only need the set of actually-registered tool
-        // names so we can drop description entries the registry can't fire.
-        let effective_tool_names: HashSet<&str> =
-            tools_registry.iter().map(|tool| tool.name()).collect();
+
+        // Filter tool descriptions to match the effective set.
+        tool_descs.retain(|(name, _)| !excluded_tools.iter().any(|ex| ex == name));
+
+        // Derive effective tool names from the filtered set so prompt builders
+        // and channel target guards see the correct state.
+        let effective_tool_names: HashSet<&str> = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
+            .collect();
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
-        let bootstrap_max_chars = if agent.compact_context {
+        let bootstrap_max_chars = if eff_compact_context {
             Some(6000)
         } else {
             None
@@ -4615,7 +4953,7 @@ pub async fn process_message(
         let native_tools = model_provider.supports_native_tools();
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
-            agent.strict_tool_parsing,
+            agent.resolved.strict_tool_parsing,
             &mut tool_descs,
             &mut deferred_section,
         );
@@ -4631,8 +4969,9 @@ pub async fn process_message(
                 Some(&risk_profile),
                 native_tools,
                 config.skills.prompt_injection_mode,
-                agent.compact_context,
-                agent.max_system_prompt_chars,
+                eff_compact_context,
+                eff_max_system_prompt_chars,
+                false,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -4662,14 +5001,14 @@ pub async fn process_message(
         let thinking_level = crate::agent::thinking::resolve_thinking_level(
             thinking_directive,
             None,
-            &agent.thinking,
+            &agent.resolved.thinking,
         );
         let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
             thinking_level,
-            &agent.thinking,
+            &agent.resolved.thinking,
         );
-        let effective_temperature: Option<f64> = config
-            .first_model_provider()
+        let effective_temperature: Option<f64> = agent_model_provider
+            .as_ref()
             .and_then(|e| e.temperature)
             .map(|t| {
                 crate::agent::thinking::clamp_temperature(
@@ -4703,7 +5042,7 @@ pub async fn process_message(
             false,
         )
         .await;
-        let rag_limit = if agent.compact_context { 2 } else { 5 };
+        let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
@@ -4722,7 +5061,7 @@ pub async fn process_message(
         ];
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
-            &agent.tool_filter_groups,
+            &agent.resolved.tool_filter_groups,
             effective_msg_ref,
         );
         {
@@ -4747,13 +5086,14 @@ pub async fn process_message(
                     "daemon",
                     None,
                     &config.multimodal,
-                    agent.max_tool_iterations,
+                    agent.resolved.max_tool_iterations,
                     Some(&approval_manager),
                     &excluded_tools,
-                    &agent.tool_call_dedup_exempt,
+                    &agent.resolved.tool_call_dedup_exempt,
                     activated_handle_pm.as_ref(),
                     None,
-                    agent.strict_tool_parsing,
+                    agent.resolved.strict_tool_parsing,
+                    agent.resolved.parallel_tools,
                     None, // channel: process_message path has no channel ref
                 ),
             )
@@ -6151,6 +6491,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6208,6 +6549,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6269,6 +6611,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6321,6 +6664,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6380,6 +6724,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6440,6 +6785,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6500,6 +6846,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6559,6 +6906,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6617,6 +6965,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6759,6 +7108,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6840,6 +7190,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6913,6 +7264,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -6981,6 +7333,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7062,6 +7415,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7133,6 +7487,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7224,6 +7579,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7289,6 +7645,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7358,6 +7715,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7422,6 +7780,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7484,6 +7843,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7549,6 +7909,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7611,6 +7972,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7672,6 +8034,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7725,6 +8088,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7779,6 +8143,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7833,6 +8198,7 @@ mod tests {
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7889,6 +8255,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -7950,6 +8317,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8023,6 +8391,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8079,6 +8448,7 @@ Done."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8138,6 +8508,7 @@ Done."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8195,6 +8566,7 @@ Done."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8253,6 +8625,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8368,6 +8741,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8434,6 +8808,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8504,6 +8879,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8594,6 +8970,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8663,6 +9040,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -8735,6 +9113,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -9602,6 +9981,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -9694,6 +10074,7 @@ This is an example, not an invocation."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -9784,7 +10165,8 @@ This is an example, not an invocation."#;
                 Some(&activated),
                 None,
                 false,
-                None, // channel
+                false, // parallel_tools
+                None,  // channel
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -9849,7 +10231,8 @@ This is an example, not an invocation."#;
                 Some(&activated),
                 None,
                 true,
-                None, // channel
+                false, // parallel_tools
+                None,  // channel
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -10494,18 +10877,44 @@ Let me check the result."#;
     }
 
     #[test]
-    fn trim_history_removes_oldest_non_system() {
+    fn trim_history_keeps_first_user_anchor_and_recent_tail() {
+        // The framing anchor (first user message) must survive trim so the
+        // model doesn't start a turn thinking "Continue" is the first thing
+        // it ever saw. Middle messages are the ones that get dropped.
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user("old msg"),
-            ChatMessage::assistant("old reply"),
-            ChatMessage::user("new msg"),
-            ChatMessage::assistant("new reply"),
+            ChatMessage::user("anchor: what's the task"),
+            ChatMessage::assistant("middle reply 1"),
+            ChatMessage::user("middle user 1"),
+            ChatMessage::assistant("middle reply 2"),
+            ChatMessage::user("recent user"),
+            ChatMessage::assistant("recent reply"),
         ];
-        trim_history(&mut history, 2);
-        assert_eq!(history.len(), 3); // system + 2 kept
+        // max_history = 3 → keep anchor + 2 most recent (=3 non-system).
+        trim_history(&mut history, 3);
         assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "new msg");
+        assert_eq!(
+            history[1].content, "anchor: what's the task",
+            "first user message (framing anchor) must survive"
+        );
+        let last = history.last().expect("history not empty");
+        assert_eq!(last.content, "recent reply", "tail must be preserved");
+    }
+
+    #[test]
+    fn trim_history_falls_back_to_tail_when_max_history_is_one() {
+        // With max_history=1 there's no room for both anchor and tail; fall
+        // back to plain head-drop so we don't produce a degenerate window.
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("anchor"),
+            ChatMessage::assistant("middle"),
+            ChatMessage::user("recent"),
+        ];
+        trim_history(&mut history, 1);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].content, "recent");
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
@@ -11113,6 +11522,7 @@ Let me check the result."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -11270,6 +11680,7 @@ Let me check the result."#;
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
                     false,
+                    false, // parallel_tools
                     0,
                     0,
                     None,
@@ -11327,6 +11738,7 @@ Let me check the result."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -11422,6 +11834,7 @@ Let me check the result."#;
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
                     false,
+                    false, // parallel_tools
                     0,
                     0,
                     None,
@@ -11484,6 +11897,7 @@ Let me check the result."#;
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -11676,6 +12090,124 @@ Let me check the result."#;
             Some("openai"),
             "bare family name would bypass the alias-aware factory path and drop \
              requires_openai_auth from the config, routing to the wrong provider"
+        );
+    }
+
+    // ── process_message() path regression (#6959) ─────────────────
+    //
+    // The bug was not that `apply_policy_tool_filter` filtered wrong; it
+    // was that the daemon/channel `process_message` path never called it,
+    // so a restrictive SecurityPolicy did not apply when the same agent was
+    // reached through a channel. This drives the exact seam that path now
+    // calls (`filter_channel_builtin_tools`) against the *real* eager
+    // built-in registry produced by `all_tools`, and proves an agent
+    // allowlisted to `file_read` does not get raw `shell` / `file_write`.
+    #[test]
+    fn process_message_policy_filters_eager_builtins() {
+        use std::sync::Arc;
+
+        let config = zeroclaw_config::schema::Config::default();
+        let security = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..TestPolicy::default()
+        });
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+
+        let mut registry = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            mem,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        // Sanity: the unrestricted channel registry exposes the dangerous
+        // eager built-ins a restrictive policy is expected to remove.
+        let unrestricted = tool_names(&registry);
+        assert!(
+            unrestricted.contains(&"file_read"),
+            "expected file_read in unrestricted registry, got {unrestricted:?}"
+        );
+        assert!(
+            unrestricted.contains(&"shell"),
+            "expected shell in unrestricted registry, got {unrestricted:?}"
+        );
+        assert!(
+            unrestricted.contains(&"file_write"),
+            "expected file_write in unrestricted registry, got {unrestricted:?}"
+        );
+
+        // Allowlist the agent to `file_read` only, then run the exact filter
+        // `process_message` applies.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..TestPolicy::default()
+        };
+        super::filter_channel_builtin_tools(&mut registry, &policy);
+
+        let filtered = tool_names(&registry);
+        assert!(
+            filtered.contains(&"file_read"),
+            "allowlisted tool must survive on process_message path, got {filtered:?}"
+        );
+        assert!(
+            !filtered.contains(&"shell"),
+            "shell must be filtered out on process_message path, got {filtered:?}"
+        );
+        assert!(
+            !filtered.contains(&"file_write"),
+            "file_write must be filtered out on process_message path, got {filtered:?}"
+        );
+
+        // Denylist variant: an exclusion drops only the named tool.
+        let mut registry2 = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &risk,
+            "test",
+            Arc::new(zeroclaw_memory::NoneMemory::new("test")),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let deny = TestPolicy {
+            excluded_tools: Some(vec!["shell".into()]),
+            ..TestPolicy::default()
+        };
+        super::filter_channel_builtin_tools(&mut registry2, &deny);
+        let after_deny = tool_names(&registry2);
+        assert!(
+            !after_deny.contains(&"shell"),
+            "excluded shell must be removed on process_message path, got {after_deny:?}"
+        );
+        assert!(
+            after_deny.contains(&"file_read"),
+            "non-excluded file_read must remain, got {after_deny:?}"
         );
     }
 }

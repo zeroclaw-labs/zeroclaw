@@ -7,6 +7,7 @@
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
 /docs/book/theme/lang-switcher.js
+/docs/book/theme/pc-themes.css
 /docs/superpowers/plans
 /docs/superpowers/specs
 .secrets
@@ -95,3 +96,4 @@ web/src/lib/api-generated.ts
 # Generated OpenAPI spec (transient handoff for openapi-typescript)
 target/openapi.json
 /v[0-9]*.toml
+.worktrees/

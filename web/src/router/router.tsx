@@ -13,8 +13,8 @@ import {
   Doctor,
   Integrations,
   Logs,
-  Onboard,
   Pairing,
+  Quickstart,
   Tools,
 } from './lazyPages';
 
@@ -52,7 +52,7 @@ export const Router = () => (
         <Route path="/pairing" element={<Pairing />} />
         <Route path="/canvas" element={<Canvas />} />
         <Route path="/acp-console" element={<AcpConsole />} />
-        <Route path="/onboard" element={<Onboard />} />
+        <Route path="/quickstart" element={<Quickstart />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

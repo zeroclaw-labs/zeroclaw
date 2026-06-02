@@ -84,7 +84,7 @@ Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options
 
 ## Kubernetes
 
-Helm chart and marketplace templates are published to the [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates) repo. Typical manifest fragment:
+Helm chart templates are published to the [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates) repo. Typical manifest fragment:
 
 ```yaml
 apiVersion: apps/v1

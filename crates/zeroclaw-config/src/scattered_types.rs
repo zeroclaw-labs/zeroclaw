@@ -138,7 +138,7 @@ fn default_collapse() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.history-pruning"]
+#[prefix = "agent.history_pruning"]
 pub struct HistoryPrunerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -167,7 +167,7 @@ fn default_cost_optimized_hint() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.auto-classify"]
+#[prefix = "agent.auto_classify"]
 pub struct AutoClassifyConfig {
     #[serde(default)]
     pub simple_hint: Option<String>,
@@ -252,7 +252,7 @@ fn default_tool_result_retrim_chars() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.context-compression"]
+#[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
@@ -310,27 +310,22 @@ fn default_precheck_timeout_secs() -> u64 {
 ///
 /// The precheck runs a lightweight `REPLY` / `NO_REPLY` classifier before the
 /// main agent loop so group-chat messages that are not addressed to the
-/// assistant do not trigger a full tool-using turn. By default it reuses the
-/// main route model, which can be unnecessarily slow on large reasoning
-/// models — set `model` to a literal model name served by the same provider
-/// to delegate the classification to a faster/cheaper model. A hard
-/// `timeout_secs` keeps a slow provider from blocking the whole turn; on
-/// timeout the precheck fails open to REPLY.
+/// assistant do not trigger a full tool-using turn.
+///
+/// In V3 multi-agent configs this block is configured inside each agent as
+/// `[agents.<alias>.precheck]`. Defaults preserve the current behavior: the
+/// classifier is enabled, model/provider selection follows the agent's
+/// `classifier_provider` ref when configured and otherwise reuses the active
+/// route model, and provider errors or timeouts fail open to REPLY.
+/// `timeout_secs` must be greater than zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.precheck"]
 pub struct ChannelPrecheckConfig {
-    /// When false, the precheck is skipped entirely and every channel message
-    /// triggers the full agent loop. Default: `true`.
+    /// When false, the precheck is skipped entirely for this agent and every
+    /// accepted channel message triggers the full agent loop. Default: `true`.
     #[serde(default = "default_precheck_enabled")]
     pub enabled: bool,
-    /// Model used for the precheck classification call. When `None`, falls
-    /// back to the route model used by the main agent turn. Must be a literal
-    /// model name served by the same provider as the route model — the
-    /// channel orchestrator does not resolve `hint:<name>` routing hints.
-    /// Default: `None`.
-    #[serde(default)]
-    pub model: Option<String>,
     /// Hard ceiling (seconds) on the precheck LLM call. On timeout the
     /// precheck fails open to REPLY. Default: `5`.
     #[serde(default = "default_precheck_timeout_secs")]
@@ -341,7 +336,6 @@ impl Default for ChannelPrecheckConfig {
     fn default() -> Self {
         Self {
             enabled: default_precheck_enabled(),
-            model: None,
             timeout_secs: default_precheck_timeout_secs(),
         }
     }
@@ -358,7 +352,7 @@ fn default_browser_task_timeout() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "browser-delegate"]
+#[prefix = "browser_delegate"]
 pub struct BrowserDelegateConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -667,7 +661,7 @@ fn default_max_call_duration() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.voice-call"]
+#[prefix = "channels.voice_call"]
 pub struct VoiceCallConfig {
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false` so an operator who pastes a partial

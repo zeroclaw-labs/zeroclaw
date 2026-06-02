@@ -9,7 +9,7 @@ SubAgents are not a separate configuration concept. There is no `[subagents.*]` 
 Two tools sit nearby. They are not interchangeable.
 
 - **`spawn_subagent`** — runs the SAME agent again under its own identity for a focused subtask. The child sees the parent's full permissions envelope minus any narrowing. Use when the parent wants to scope an internal subtask out of its main conversation history without changing identity.
-- **`delegate`** — hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity, its own risk profile, its own model provider. Use when a sibling agent is the right specialist for the work.
+- **`delegate`** — hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity and model provider, but delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"` (default is `"forbidden"`), AND the target must share the **same** risk profile as the caller. Use when a sibling agent on the same trust tier is the right specialist for the work. See [Delegation gating](#delegation-gating) below.
 
 This page documents `spawn_subagent` end to end. `delegate` lives at `crates/zeroclaw-runtime/src/tools/delegate.rs` and is a separate surface.
 
@@ -113,6 +113,23 @@ Cron-launched agent jobs use a different, more explicit span name: `subagent` (l
 
 This is a thin signal for the agent-loop spawn path. A dedicated "subagent started / completed" record routed through `attribution_span!(tool)` is tracked as a code-side follow-up — once the agent loop wraps tool execution in an attribution span, every `record!` inside the tool will carry `tool=spawn_subagent` automatically and the question becomes a trivial grep.
 
+### Delegation gating
+
+`delegate` enforces two gates in `crates/zeroclaw-runtime/src/tools/delegate.rs` before a target agent runs, in this order:
+
+1. **`delegation_policy.mode`** — the caller's risk profile must permit delegation. `[risk_profiles.<alias>].delegation_policy` is `{ mode = "forbidden" }` by default; set `mode = "allow"` to permit delegation at all. When forbidden, the refusal is:
+   ```
+   delegation is forbidden by the caller's delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = "allow"
+   ```
+   This is editable in the gateway dashboard and zerocode at **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (a forbidden/allow select).
+
+2. **Shared risk profile** — the target agent must use the **same** risk profile as the caller. Delegation does not cross trust tiers: an agent on `hardened` cannot delegate to an agent on `permissive`. When they differ, the refusal is:
+   ```
+   delegate target "<target>" uses risk profile "<target_profile>", but delegation requires the same risk profile as the caller ("<caller_profile>")
+   ```
+
+Because reachability is gated by the shared risk profile, the advertised roster (the `agent` parameter's enum in the tool schema) lists only the configured agents that share the caller's risk profile, minus the caller itself — and only when `delegation_policy.mode = "allow"`. There is no separate per-agent allow-list: the shared profile *is* the allow-list.
+
 ### `delegate`: output strings the model sees
 
 Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
@@ -148,13 +165,14 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 
 | | `spawn_subagent` | `delegate` |
 |---|---|---|
-| **Identity** | Same as parent (same UUID, same risk profile) | Target agent's identity (different alias, different profile) |
-| **Permission model** | Parent's policy verbatim (or narrowed subset) | Target agent's own policy |
+| **Identity** | Same as parent (same UUID, same risk profile) | Target agent's identity (different alias, **same** risk profile — delegation requires it) |
+| **Permission model** | Parent's policy verbatim (or narrowed subset) | Target agent's own policy (within the shared risk profile) |
 | **Model provider** | Parent's | Target agent's configured provider |
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
 | **Parallel fan-out** | Not supported | `parallel: [...]` runs multiple targets concurrently |
-| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different permission envelope) to handle the task |
+| **Gating** | `risk_profile.allowed_tools` must list `spawn_subagent` | `allowed_tools` must list `delegate`, caller's `delegation_policy mode = "allow"`, and target shares the caller's risk profile |
+| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) on the **same trust tier** to handle the task |
 
 ## What's not supported
 

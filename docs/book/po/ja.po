@@ -2527,8 +2527,8 @@ msgid "`zeroclawlabs/zeroclaw:latest` — latest stable"
 msgstr "`zeroclawlabs/zeroclaw:latest` — 最新の安定版"
 
 #: src/setup/container.md:10
-msgid "`zeroclawlabs/zeroclaw:v0.8.0-beta-1` — pinned"
-msgstr "`zeroclawlabs/zeroclaw:v0.8.0-beta-1` — ピン留め済み"
+msgid "`zeroclawlabs/zeroclaw:v0.8.0-beta-2` — pinned"
+msgstr "`zeroclawlabs/zeroclaw:v0.8.0-beta-2` — ピン留め済み"
 
 #: src/setup/container.md:11
 msgid ""
@@ -2748,8 +2748,8 @@ msgid "containers"
 msgstr "コンテナ"
 
 #: src/setup/container.md:94
-msgid "zeroclawlabs/zeroclaw:v0.8.0-beta-1"
-msgstr "zeroclawlabs/zeroclaw:v0.8.0-beta-1"
+msgid "zeroclawlabs/zeroclaw:v0.8.0-beta-2"
+msgstr "zeroclawlabs/zeroclaw:v0.8.0-beta-2"
 
 #: src/setup/container.md:96
 msgid "containerPort"
@@ -3318,8 +3318,8 @@ msgid "Derive macros for config, tool registration"
 msgstr "設定とツール登録のためのマクロを生成する"
 
 #: src/architecture/overview.md:57 src/architecture/crates.md:118
-msgid "`zeroclaw-tui`"
-msgstr "`zeroclaw-tui`"
+msgid "`zerocode`"
+msgstr "`zerocode`"
 
 #: src/architecture/overview.md:57
 msgid "Terminal UI"
@@ -25115,8 +25115,8 @@ msgid "The gateway exposes three health views:"
 msgstr "ゲートウェイは3つのヘルスビューを公開しています："
 
 #: src/ops/observability.md:151
-msgid "# { \"status\": \"ok\", \"version\": \"0.8.0-beta-1\" }\n"
-msgstr "# { \"status\": \"ok\", \"version\": \"0.8.0-beta-1\" }\n"
+msgid "# { \"status\": \"ok\", \"version\": \"0.8.0-beta-2\" }\n"
+msgstr "# { \"status\": \"ok\", \"version\": \"0.8.0-beta-2\" }\n"
 
 #: src/ops/observability.md:152
 msgid "# per-channel status\n"

@@ -65,6 +65,53 @@ pub struct PrunedOrphans {
     pub orphan_tool_call_ids: Vec<String>,
 }
 
+fn is_tool_exchange_summary(content: &str) -> bool {
+    content.starts_with("[Tool exchange:") && content.contains("results collapsed]")
+}
+
+fn assistant_tool_calls_have_immediate_results(
+    messages: &[ChatMessage],
+    assistant_idx: usize,
+    tool_call_ids: &[String],
+) -> bool {
+    if tool_call_ids.is_empty() {
+        return false;
+    }
+
+    tool_call_ids.iter().all(|expected| {
+        messages
+            .iter()
+            .skip(assistant_idx + 1)
+            .take_while(|msg| msg.role == "tool")
+            .filter_map(|msg| extract_tool_call_id(&msg.content))
+            .any(|actual| actual == *expected)
+    })
+}
+
+/// True when the assistant at `prev_idx` is itself an unresolved tool-call
+/// dispatch: it claims `tool_calls` but the rows between it and `next_idx`
+/// do not answer all of them. This is the genuinely poisoned shape where a
+/// second dispatch follows a first that never landed — distinct from a
+/// healthy `assistant(text preamble)` → `assistant(tool_calls)` turn, where
+/// the preamble has no tool_calls and is left untouched.
+fn assistant_is_unresolved_dispatch(
+    messages: &[ChatMessage],
+    prev_idx: usize,
+    next_idx: usize,
+) -> bool {
+    match extract_assistant_tool_call_ids(&messages[prev_idx].content) {
+        Some(ids) if !ids.is_empty() => {
+            let between = &messages[prev_idx + 1..next_idx];
+            !ids.iter().all(|id| {
+                between.iter().any(|m| {
+                    m.role == "tool" && extract_tool_call_id(&m.content).as_ref() == Some(id)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
 impl PrunedOrphans {
     pub fn is_empty(&self) -> bool {
         self.removed == 0
@@ -79,18 +126,35 @@ impl PrunedOrphans {
 /// The Anthropic API (and others) reject these with a 400 error.
 pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedOrphans {
     let mut outcome = PrunedOrphans::default();
-    // Pass 1: Remove assistant(tool_calls) + their tool_results when the
-    // assistant is preceded by another assistant. Normalization would merge
-    // them, destroying structured tool_use blocks and orphaning the results.
+    // Pass 1: Remove a second `assistant(tool_calls)` (and its immediate
+    // tool results) only when the *preceding* assistant is itself
+    // problematic in a way that normalization would corrupt:
+    //
+    //   * a collapsed tool-exchange summary whose merge would orphan this
+    //     dispatch's results (the GLM-history case, #7013), or
+    //   * an unresolved tool-call dispatch — a first dispatch that never
+    //     landed, immediately followed by this one (the poisoned
+    //     double-dispatch case).
+    //
+    // A healthy turn shape `assistant(text preamble)` → `assistant(tool_calls)`
+    // → `tool` must NOT be touched: the preamble has no tool_calls and is
+    // neither a summary nor an unresolved dispatch, so it is left intact.
+    // Nuking the dispatch there produces the "amnesia mid-tool-loop"
+    // failure where the model sees the next turn with none of its work.
     let mut i = 0;
     while i < messages.len() {
-        if messages[i].role == "assistant"
-            && extract_assistant_tool_call_ids(&messages[i].content).is_some()
+        let assistant_tool_call_ids = if messages[i].role == "assistant" {
+            extract_assistant_tool_call_ids(&messages[i].content)
+        } else {
+            None
+        };
+        if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
+            && ((is_tool_exchange_summary(&messages[i - 1].content)
+                && !assistant_tool_calls_have_immediate_results(messages, i, &doomed_ids))
+                || assistant_is_unresolved_dispatch(messages, i - 1, i))
         {
-            let doomed_ids =
-                extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
             outcome
                 .orphan_tool_call_ids
                 .extend(doomed_ids.iter().cloned());
@@ -302,8 +366,45 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         }
     }
 
-    // Phase 3 – remove orphaned tool messages left behind by phases 1-2.
+    // Phase 3 – merge consecutive synthetic tool-exchange summaries. GLM/Z.AI
+    // reject adjacent assistant messages, but these summaries are safe to
+    // combine because they are both pruner-generated placeholders.
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        if messages[i].role == "assistant"
+            && messages[i + 1].role == "assistant"
+            && is_tool_exchange_summary(&messages[i].content)
+            && is_tool_exchange_summary(&messages[i + 1].content)
+        {
+            let next = messages.remove(i + 1);
+            messages[i].content = format!("{}\n\n{}", messages[i].content, next.content);
+            dropped_messages += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Phase 4 – remove orphaned tool messages left behind by phases 1-3.
     dropped_messages += remove_orphaned_tool_messages(messages).removed;
+
+    // Phase 5 – separate any remaining adjacent assistant messages. These can
+    // happen when a protected assistant(tool_calls) group follows a collapsed
+    // summary. Insert a tiny user boundary rather than dropping protected data.
+    let mut i = 1;
+    while i < messages.len() {
+        if messages[i - 1].role == "assistant" && messages[i].role == "assistant" {
+            messages.insert(
+                i,
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "[context continues]".to_string(),
+                },
+            );
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
 
     PruneStats {
         messages_before,
@@ -610,6 +711,198 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prune_merges_consecutive_collapsed_assistant_messages() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"t1","content":"first"}"#),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"t2","name":"web","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"t2","content":"second"}"#),
+            msg("user", "recent"),
+            msg("assistant", "done"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 2,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.collapsed_pairs, 2);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].content.contains("1 tool call(s)"));
+        assert_eq!(messages.iter().filter(|m| m.role == "assistant").count(), 2);
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == "assistant" && pair[1].role == "assistant")),
+            "pruned roles should not contain adjacent assistants: {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prune_preserves_straddled_tool_group_after_collapsed_summary() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"old","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"old","content":"old result"}"#),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"live","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"live","content":"live result"}"#),
+            msg("user", "follow up"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 3,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.collapsed_pairs, 1);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.contains("\"id\":\"live\"")),
+            "protected assistant tool call should survive: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("\"tool_call_id\":\"live\"")),
+            "matching protected tool result should survive: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "user" && m.content == "[context continues]"),
+            "Phase 5 should separate collapsed summary from live assistant"
+        );
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == "assistant" && pair[1].role == "assistant")),
+            "pruned roles should not contain adjacent assistants: {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prune_removes_dangling_tool_call_after_collapsed_summary() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                "[Tool exchange: 1 tool call(s) — results collapsed]",
+            ),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"dangling","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("user", "follow up"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 2,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.dropped_messages, 1);
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("\"id\":\"dangling\"")),
+            "dangling assistant tool call should not survive: {messages:?}"
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "assistant", "user"]
+        );
+    }
+
+    #[test]
+    fn prune_does_not_merge_json_tool_call_assistants_as_summaries() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"live1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"live1","content":"first"}"#),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"live2","name":"web","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"live2","content":"second"}"#),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 4,
+            collapse_tool_results: true,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.collapsed_pairs, 0);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("\"id\":\"live1\"")),
+            "first protected tool call should remain structured"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("\"id\":\"live2\"")),
+            "second protected tool call should remain structured"
+        );
+    }
+
+    #[test]
+    fn prune_inserts_separator_when_tight_budget_leaves_protected_assistants() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("assistant", "protected assistant one"),
+            msg("assistant", "protected assistant two"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 1,
+            keep_recent: 2,
+            collapse_tool_results: false,
+        };
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.dropped_messages, 0);
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "assistant", "user", "assistant"]
+        );
+        assert_eq!(messages[2].content, "[context continues]");
+    }
+
     // -----------------------------------------------------------------------
     // remove_orphaned_tool_messages tests
     // -----------------------------------------------------------------------
@@ -716,38 +1009,60 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_assistant_with_tool_calls_stripped() {
-        // When poisoned turn removal leaves an assistant(text) followed by
-        // assistant(tool_calls), the second assistant and its tool_results
-        // must be removed — normalization would merge them, destroying the
-        // structured tool_use blocks and orphaning the results at the API.
-        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+    fn preamble_then_tool_calls_is_kept_intact() {
+        // Healthy shape: `[A: "let me check"] [A: tool_calls] [T: result]`.
+        // The assistant first emits a brief preamble, then dispatches the
+        // tool, then the tool returns. This is the normal flow of a real
+        // tool-using turn — Pass 1 must NOT touch it.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),
-            msg("assistant", "Here are the results."),
+            msg("assistant", "Let me check."),
             msg("assistant", tool_calls_assistant),
+            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_LIVE"}"#),
+            msg("assistant", "Here are the results."),
+        ];
+        let before = messages.len();
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(
+            pruned.removed, 0,
+            "preamble + dispatch + result is a healthy turn, not orphan poisoning"
+        );
+        assert_eq!(messages.len(), before);
+    }
+
+    #[test]
+    fn back_to_back_unresolved_tool_calls_strips_later_dispatch() {
+        // Genuinely poisoned shape: `[A: tool_calls A]` followed
+        // immediately by `[A: tool_calls B]` with no tool result for A
+        // sitting between them. The earlier dispatch is unresolved, so
+        // the later assistant + its results are removed to restore a
+        // well-formed turn.
+        let first_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_LOST","name":"shell","arguments":"{}"}]}"#;
+        let second_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "do something"),
+            msg("assistant", first_dispatch),
+            msg("assistant", second_dispatch),
             msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
-            msg(
-                "assistant",
-                "The model_provider returned an empty response.",
-            ),
+            msg("assistant", "summary"),
         ];
         let pruned = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
             pruned.removed, 2,
-            "should remove assistant(tool_calls) + tool_result"
+            "second dispatch + its tool_result must be removed when prior dispatch is unresolved"
         );
+        // What survives: sys, user, first_dispatch (now orphaned), summary.
+        // Pass 2 then sweeps any remaining orphan tool messages — there
+        // are none after Pass 1, but the orphaned first_dispatch itself
+        // (assistant with tool_calls and no responses) stays, because
+        // this function only removes *tool*-role orphans in Pass 2,
+        // not stranded assistant dispatches.
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "Here are the results.");
-        assert_eq!(messages[3].role, "assistant");
-        assert_eq!(
-            messages[3].content,
-            "The model_provider returned an empty response."
-        );
+        assert_eq!(messages[2].content, first_dispatch);
+        assert_eq!(messages[3].content, "summary");
     }
 
     #[test]
