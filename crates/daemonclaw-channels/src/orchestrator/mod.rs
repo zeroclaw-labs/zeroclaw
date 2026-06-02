@@ -357,7 +357,7 @@ struct ChannelRuntimeContext {
     query_classification: daemonclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
-    session_store: Option<Arc<daemonclaw_infra::session_store::SessionStore>>,
+    session_store: Option<Arc<dyn SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -5558,16 +5558,49 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {
-            match daemonclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
-                Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
+            let backend_name = config.channels.session_backend.as_str();
+            let store: Option<Arc<dyn SessionBackend>> = match backend_name {
+                "sqlite" => {
+                    match SqliteSessionBackend::new(&config.workspace_dir) {
+                        Ok(backend) => {
+                            match backend.migrate_from_jsonl(&config.workspace_dir) {
+                                Ok(0) => {}
+                                Ok(n) => tracing::info!("📂 Migrated {n} JSONL session(s) to SQLite"),
+                                Err(e) => tracing::warn!("JSONL→SQLite migration failed: {e}"),
+                            }
+                            if config.channels.session_ttl_hours > 0 {
+                                if let Ok(cleaned) = backend.cleanup_stale(config.channels.session_ttl_hours) {
+                                    if cleaned > 0 {
+                                        tracing::info!("📂 Cleaned up {cleaned} stale session(s)");
+                                    }
+                                }
+                            }
+                            tracing::info!("📂 Session persistence enabled (sqlite)");
+                            Some(Arc::new(backend))
+                        }
+                        Err(e) => {
+                            tracing::warn!("SQLite session backend failed, falling back to JSONL: {e}");
+                            match daemonclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
+                                Ok(store) => Some(Arc::new(store)),
+                                Err(e2) => { tracing::warn!("Session persistence disabled: {e2}"); None }
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Session persistence disabled: {e}");
-                    None
+                _ => {
+                    match daemonclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
+                        Ok(store) => {
+                            tracing::info!("📂 Session persistence enabled (jsonl)");
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Session persistence disabled: {e}");
+                            None
+                        }
+                    }
                 }
-            }
+            };
+            store
         } else {
             None
         },
@@ -5589,30 +5622,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )),
     });
 
-    // Hydrate in-memory conversation histories from persisted JSONL session files.
-    // Cap to MAX_CONVERSATION_SENDERS sessions (sorted by file mtime, most recent first)
+    // Hydrate in-memory conversation histories from persisted sessions.
+    // Cap to MAX_CONVERSATION_SENDERS sessions (sorted by last activity, most recent first)
     // and trim each to MAX_CHANNEL_HISTORY turns to bound startup memory.
     // If the last persisted turn is a user message (orphan from a crash mid-query),
     // close it with a marker so the LLM doesn't try to continue the old request.
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
-        let session_keys = store.list_sessions();
 
-        // Sort by file mtime (most recently modified first) for predictable hydration.
-        // Collect mtimes up front to avoid repeated FS reads inside the comparator.
-        let mut keyed: Vec<_> = session_keys
+        // list_sessions_with_metadata returns sorted by last_activity DESC for SQLite,
+        // and by list order for JSONL. Cap to MAX_CONVERSATION_SENDERS.
+        let metadata = store.list_sessions_with_metadata();
+        let session_keys: Vec<String> = metadata
             .into_iter()
-            .map(|k| {
-                let mt = store
-                    .session_mtime(&k)
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                (k, mt)
-            })
+            .take(MAX_CONVERSATION_SENDERS)
+            .map(|m| m.key)
             .collect();
-        keyed.sort_by(|a, b| b.1.cmp(&a.1));
-        keyed.truncate(MAX_CONVERSATION_SENDERS);
-        let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
 
         let mut histories = runtime_ctx
             .conversation_histories
@@ -6351,7 +6377,7 @@ mod tests {
     #[test]
     fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(daemonclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let store: Arc<dyn SessionBackend> = Arc::new(daemonclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
 
         let sender = "telegram_u4".to_string();
 
