@@ -301,6 +301,8 @@ impl SecretField for String {
         field: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
+        // `is_encrypted` also includes external secret references (`op://`):
+        // encryption must preserve them, while decryption resolves them for use.
         if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
             *self = store
                 .encrypt(self)
@@ -706,6 +708,16 @@ mod secret_field_tests {
         assert_eq!(s, enc1);
         s.decrypt_in_place(&store, "test.s").unwrap();
         assert_eq!(s, "sk-abc");
+    }
+
+    #[test]
+    fn string_op_reference_is_preserved_by_encrypt_in_place() {
+        let (_tmp, store) = store();
+        let mut s = String::from("op://vault/item/field");
+
+        s.encrypt_in_place(&store, "test.s").unwrap();
+
+        assert_eq!(s, "op://vault/item/field");
     }
 
     #[test]

@@ -56,11 +56,14 @@ There is one canonical key per vendor — no synonyms.
 
 ## Credentials
 
-Three ways to supply credentials, in resolution order:
+Supported credential input and storage forms:
 
 1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
-2. **Config-level secrets store** — encrypted at `~/.zeroclaw/secrets` via a local key file.
-3. **Generic env override** — `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+2. **1Password references** — set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
+3. **Config-level secrets store** — encrypted in config with the local `~/.zeroclaw/.secret_key` key file.
+4. **Generic env override** — `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+
+Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or `op://` value on disk.
 
 `zeroclaw onboard` writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (`$ANTHROPIC_API_KEY`, `$OPENROUTER_API_KEY`, …), the [env-vars reference](../reference/env-vars.md#bridging-ecosystem-default-env-vars) shows the one-line bash expansions that point a schema-mirror name at the existing value.
 

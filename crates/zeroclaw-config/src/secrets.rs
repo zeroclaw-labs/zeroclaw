@@ -25,6 +25,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
 #[cfg(test)]
@@ -32,6 +33,8 @@ const KEY_LEN: usize = 32;
 
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
+
+const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Manages encrypted storage of secrets (API keys, tokens, etc.)
 #[derive(Debug, Clone)]
@@ -86,6 +89,7 @@ impl SecretStore {
     /// Decrypt a secret.
     /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
     /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
+    /// - `op://` prefix → resolved via 1Password CLI (`op read`)
     /// - No prefix → returned as-is (plaintext config)
     ///
     /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
@@ -95,6 +99,8 @@ impl SecretStore {
             self.decrypt_chacha20(hex_str)
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
             self.decrypt_legacy_xor(hex_str)
+        } else if is_onepassword_ref(value) {
+            resolve_onepassword_ref(value)
         } else {
             Ok(value.to_string())
         }
@@ -124,6 +130,9 @@ impl SecretStore {
             let plaintext = self.decrypt_legacy_xor(hex_str)?;
             let migrated = self.encrypt(&plaintext)?;
             Ok((plaintext, Some(migrated)))
+        } else if is_onepassword_ref(value) {
+            let plaintext = resolve_onepassword_ref(value)?;
+            Ok((plaintext, None))
         } else {
             // Plaintext — no migration needed
             Ok((value.to_string(), None))
@@ -175,9 +184,14 @@ impl SecretStore {
             .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
     }
 
-    /// Check if a value is already encrypted (current or legacy format).
+    /// Check if a value is already encrypted or externally resolved.
     pub fn is_encrypted(value: &str) -> bool {
-        value.starts_with("enc2:") || value.starts_with("enc:")
+        value.starts_with("enc2:") || value.starts_with("enc:") || is_onepassword_ref(value)
+    }
+
+    /// Check if a value is a 1Password external secret reference.
+    pub fn is_onepassword_ref(value: &str) -> bool {
+        is_onepassword_ref(value)
     }
 
     /// Check if a value uses the secure `enc2:` format.
@@ -379,6 +393,99 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+fn is_onepassword_ref(value: &str) -> bool {
+    value.starts_with("op://")
+}
+
+fn validate_onepassword_ref(reference: &str) -> Result<()> {
+    let path = reference.strip_prefix("op://").unwrap_or("");
+    let mut segments = path.split('/');
+    let has_required_segments = (0..3).all(|_| segments.next().is_some_and(|s| !s.is_empty()));
+    anyhow::ensure!(
+        has_required_segments && segments.all(|segment| !segment.is_empty()),
+        "Invalid 1Password reference \"{reference}\". Expected format: op://vault-name/item-name/field-name"
+    );
+    Ok(())
+}
+
+/// Resolve a 1Password secret reference by invoking the `op` CLI.
+fn resolve_onepassword_ref(reference: &str) -> Result<String> {
+    use std::process::{Command, Stdio};
+
+    validate_onepassword_ref(reference)?;
+
+    let mut child = Command::new("op")
+        .args(["read", reference])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "Failed to run 1Password CLI"
+            );
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::msg(
+                    "1Password CLI (`op`) not found. Install it to use op:// secret references in config."
+                )
+            } else {
+                anyhow::Error::msg(format!("Failed to run 1Password CLI: {e}"))
+            }
+        })?;
+
+    let deadline = Instant::now() + ONEPASSWORD_READ_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to poll 1Password CLI process")?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "1Password CLI timed out resolving \"{reference}\" after {}s",
+                ONEPASSWORD_READ_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let output = child
+        .wait_with_output()
+        .context("Failed to collect 1Password CLI output")?;
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let hint = if stderr.contains("not signed in") || stderr.contains("session expired") {
+            " (hint: run `op signin` first)"
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "1Password CLI failed to resolve \"{reference}\": {}{hint}",
+            stderr.trim()
+        );
+    }
+
+    let secret = String::from_utf8(output.stdout)
+        .context("1Password CLI returned non-UTF-8 output")?
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+
+    anyhow::ensure!(
+        !secret.is_empty(),
+        "1Password CLI returned empty value for \"{reference}\". Verify the vault/item/field path is correct."
+    );
+
+    Ok(secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,8 +536,32 @@ mod tests {
     fn is_encrypted_detects_prefix() {
         assert!(SecretStore::is_encrypted("enc2:aabbcc"));
         assert!(SecretStore::is_encrypted("enc:aabbcc")); // legacy
+        assert!(SecretStore::is_encrypted("op://vault/item/field"));
         assert!(!SecretStore::is_encrypted("sk-plaintext"));
         assert!(!SecretStore::is_encrypted(""));
+    }
+
+    #[test]
+    fn op_reference_invalid_format_fails_before_plaintext_passthrough() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let err = store.decrypt("op://vault-only").unwrap_err().to_string();
+
+        assert!(err.contains("Invalid 1Password reference"));
+    }
+
+    #[test]
+    fn op_reference_decrypt_and_migrate_does_not_migrate_or_pass_through() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let err = store
+            .decrypt_and_migrate("op://vault-only")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Invalid 1Password reference"));
     }
 
     #[tokio::test]
