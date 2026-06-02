@@ -432,7 +432,6 @@ cli-cron-at = {"  "}时间    : {$v}
 cli-cron-at2 = {"  "}时间  : {$v}
 cli-cron-every = {"  "}间隔(ms): {$v}
 cli-no-command = 未提供命令。
-cli-try-quickstart = 尝试运行 `zeroclaw quickstart` 来创建你的第一个智能体。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。

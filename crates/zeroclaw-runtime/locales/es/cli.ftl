@@ -433,7 +433,6 @@ cli-cron-at = {"  "}En    : {$v}
 cli-cron-at2 = {"  "}En  : {$v}
 cli-cron-every = {"  "}Cada(ms): {$v}
 cli-no-command = No se proporcionó ningún comando.
-cli-try-quickstart = Prueba `zeroclaw quickstart` para crear tu primer agente.
 cli-press-enter = Presiona Enter para salir...
 cli-quickstart-title = Quickstart — crea un agente funcional de principio a fin.
 cli-quickstart-cancelled = Quickstart cancelado. No se escribió ninguna configuración.
