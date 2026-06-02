@@ -26,8 +26,9 @@ impl Default for LinkEnricherConfig {
 
 /// URL regex: matches `http://` and `https://` URLs, stopping at whitespace, angle
 /// brackets, or double-quotes.
-static URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://[^\s<>"']+"#).expect("link_enricher URL extraction regex must compile")
+});
 
 /// Extract URLs from message text, returning up to `max` unique URLs.
 pub fn extract_urls(text: &str, max: usize) -> Vec<String> {
