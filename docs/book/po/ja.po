@@ -10997,15 +10997,7 @@ msgstr "CLIヘルプテキスト、コマンドの説明、ランタイムメッ
 
 #: src/getting-started/language.md
 msgid "CLI message translations"
-msgstr "翻訳するメッセージをお送りください。"
-"はい、CLIメッセージの翻訳についてお手伝いします。翻訳したいメッセージを送信してください。\n"
-"\n"
-"ガイドラインに従って翻訳します：\n"
-"- バッククォート、太字（**text**）、インラインコード、URL、エスケープシーケンスはそのまま保持\n"
-"- ブランド名・プロジェクト名、コマンド名、CLIフラグ、ファイルパス、環境変数、コードリテラル、関数名・型名は翻訳しません\n"
-"- 確立されたソフトウェアローカライゼーション用語を使用します\n"
-"\n"
-"翻訳するメッセージをお送りください。"
+msgstr ""
 
 #: src/getting-started/language.md
 msgid "CLI messages and command help"
@@ -14826,7 +14818,7 @@ msgstr "ZeroClawの例"
 
 #: src/ops/observability.md
 msgid "Examples:"
-msgstr "Understood. Send the string to translate and I'll return only the ja translation, following all the rules."
+msgstr ""
 
 #: src/reference/cli.md
 msgid "Examples: - `zeroclaw estop` - `zeroclaw estop --level network-kill` - `zeroclaw estop --level domain-block --domain \"*.chase.com\"` - `zeroclaw estop --level tool-freeze --tool shell --tool browser` - `zeroclaw estop status` - `zeroclaw estop resume --network` - `zeroclaw estop resume --domain \"*.chase.com\"` - `zeroclaw estop resume --tool shell`"
@@ -23036,7 +23028,7 @@ msgstr "リリースノートを読む"
 
 #: src/contributing/architecture-map.md
 msgid "Read the repo-root `AGENTS.md` first. It contains the current risk tiers, protected files, anti-patterns, localization rules, and agent-specific workflow contracts."
-msgstr "承知しました。まずリポジトリのルートにある `AGENTS.md` を読みます。このファイルには、現在のリスク階層、保護対象ファイル、アンチパターン、ローカライゼーションのルール、およびエージェント固有のワークフロー契約が記載されています。"
+msgstr ""
 
 #: src/foundations/index.md
 msgid "Read these in order if you can. Each document builds on the ones before it, and the sequence tells a story. You can enter anywhere and learn something useful, but reading them from the beginning gives you the full arc: from the shape of the architecture, to how we record and coordinate and ship and collaborate, to what it means to write the code well at the sentence level."

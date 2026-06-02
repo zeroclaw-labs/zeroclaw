@@ -22978,7 +22978,7 @@ msgstr "Leer las notas de la versión"
 
 #: src/contributing/architecture-map.md
 msgid "Read the repo-root `AGENTS.md` first. It contains the current risk tiers, protected files, anti-patterns, localization rules, and agent-specific workflow contracts."
-msgstr "He leído el archivo `AGENTS.md` en la raíz del repositorio. Contiene los niveles de riesgo actuales, los archivos protegidos, los antipatrones, las reglas de localización y los contratos de flujo de trabajo específicos de cada agente."
+msgstr ""
 
 #: src/foundations/index.md
 msgid "Read these in order if you can. Each document builds on the ones before it, and the sequence tells a story. You can enter anywhere and learn something useful, but reading them from the beginning gives you the full arc: from the shape of the architecture, to how we record and coordinate and ship and collaborate, to what it means to write the code well at the sentence level."
@@ -29999,15 +29999,7 @@ msgstr "Utiliza las tablas siguientes para elegir los documentos de arquitectura
 
 #: src/contributing/pr-review-protocol.md
 msgid "Use these canonical forms:"
-msgstr "Por favor, comparte el texto a traducir."
-"Por favor, comparte el texto a traducir.De acuerdo, entiendo. Proporciona el texto técnico que necesitas traducir al español y lo traduciré siguiendo todas las reglas especificadas:\n"
-"\n"
-"- Preservaré los backticks, negritas (**texto**), código en línea, URLs y secuencias de escape exactamente como aparecen.\n"
-"- No traduciré: nombres de marcas y proyectos, nombres de comandos, flags de CLI, rutas de archivos, variables de entorno, literales de código, nombres de funciones/tipos.\n"
-"- Si la entrada ya está en español, es un literal de código, una URL o un identificador único, la devolveré sin cambios.\n"
-"- Usaré la terminología establecida de localización de software.\n"
-"\n"
-"Por favor, comparte el texto a traducir."
+msgstr ""
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use this as the basis for security-related issues and PRs"

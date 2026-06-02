@@ -23677,7 +23677,7 @@ msgstr "Types de réponse : `\"text\"` (texte brut) ou `\"tool_calls\"` (requêt
 
 #: src/channels/matrix.md
 msgid "Response:"
-msgstr "Veuillez fournir la chaîne de documentation en anglais à traduire."
+msgstr ""
 
 #: src/ops/service.md
 msgid "Restart behaviour"
@@ -30033,7 +30033,7 @@ msgstr "Utilisez les tableaux ci-dessous pour choisir l'architecture et les docu
 
 #: src/contributing/pr-review-protocol.md
 msgid "Use these canonical forms:"
-msgstr "D'accord. Veuillez fournir le texte à traduire en français."
+msgstr ""
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use this as the basis for security-related issues and PRs"

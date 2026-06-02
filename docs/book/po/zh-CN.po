@@ -14772,7 +14772,7 @@ msgstr "ZeroClaw 中的示例"
 
 #: src/ops/observability.md
 msgid "Examples:"
-msgstr "Understood. Send the strings to translate, and I'll return only the zh-CN translation for each, following all the rules."
+msgstr ""
 
 #: src/reference/cli.md
 msgid "Examples: - `zeroclaw estop` - `zeroclaw estop --level network-kill` - `zeroclaw estop --level domain-block --domain \"*.chase.com\"` - `zeroclaw estop --level tool-freeze --tool shell --tool browser` - `zeroclaw estop status` - `zeroclaw estop resume --network` - `zeroclaw estop resume --domain \"*.chase.com\"` - `zeroclaw estop resume --tool shell`"
@@ -18310,7 +18310,7 @@ msgstr "以学习为导向，通过体验引导"
 
 #: src/maintainers/reviewer-playbook.md
 msgid "Leave one actionable checklist comment, stop deep review"
-msgstr "请提供一个可操作的检查清单评论，停止深入审查。"
+msgstr ""
 
 #: src/maintainers/labels.md
 msgid "Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch."
@@ -30006,7 +30006,7 @@ msgstr "请使用下表选择与变更相匹配的架构和基础文档。"
 
 #: src/contributing/pr-review-protocol.md
 msgid "Use these canonical forms:"
-msgstr "请提供需要翻译的英文技术文档字符串。"
+msgstr ""
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "Use this as the basis for security-related issues and PRs"
@@ -31677,7 +31677,7 @@ msgstr "在实现之前，为内核的本地 IPC API 编写 OpenAPI 3.1 规范"
 
 #: src/contributing/pr-review-protocol.md
 msgid "Write as a thoughtful senior contributor who has read everything and cares about the outcome:"
-msgstr "作为一名资深贡献者，我已通读了所有相关资料，并深切关注最终成果。"
+msgstr ""
 
 #: src/maintainers/changelog-generation.md
 msgid "Write each entry as a sentence for a human reader — not a raw commit message. Reference PR numbers with `(#NNNN)` where available."
