@@ -377,7 +377,8 @@ fn compute_excluded_mcp_tools(
 }
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#)
+        .expect("SENSITIVE_KV_REGEX must compile")
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
@@ -623,7 +624,9 @@ fn build_native_assistant_history(
     });
 
     if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+        obj.as_object_mut()
+            .expect("json! macro always produces an object")
+            .insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
