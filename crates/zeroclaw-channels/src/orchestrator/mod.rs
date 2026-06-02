@@ -887,7 +887,8 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 /// output is never presented to the LLM without the corresponding `<tool_call>`.
 fn strip_tool_result_content(text: &str) -> String {
     static TOOL_RESULT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap()
+        regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>")
+            .expect("TOOL_RESULT_RE regex must compile")
     });
 
     let cleaned = TOOL_RESULT_RE.replace_all(text, "");
