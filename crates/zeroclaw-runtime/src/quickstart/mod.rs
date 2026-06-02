@@ -678,12 +678,17 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             continue;
         }
         // `display_value` already masks secrets as `****`; we want
-        // ghost-text defaults for plain fields only.
+        // ghost-text defaults for plain fields only. `<unset>` is the
+        // placeholder for an unset Option, not a real value — emitting
+        // it as a default makes every surface (CLI, TUI, web) echo it
+        // back into the submission, where the daemon then validates
+        // `<unset>` against the field's true type (e.g. a bool, which
+        // fails with "length 7"). Treat it like an empty default.
         let default = if info.is_secret {
             None
         } else {
             let raw = info.display_value.trim();
-            if raw.is_empty() {
+            if raw.is_empty() || raw == zeroclaw_config::traits::UNSET_DISPLAY {
                 None
             } else {
                 Some(raw.to_string())
@@ -1881,6 +1886,18 @@ mod tests {
                     row.key
                 );
             }
+        }
+        // No row may carry the `<unset>` placeholder as its default.
+        // It's a display sentinel for an unset Option; echoing it back
+        // through any surface (CLI/TUI/web) makes the daemon validate
+        // `<unset>` against the field's real type and reject it.
+        for row in &rows {
+            assert_ne!(
+                row.default.as_deref(),
+                Some(zeroclaw_config::traits::UNSET_DISPLAY),
+                "`{}` must not default to the <unset> placeholder",
+                row.key
+            );
         }
     }
 

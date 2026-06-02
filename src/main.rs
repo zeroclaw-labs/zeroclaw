@@ -1504,7 +1504,7 @@ async fn run_quickstart_cli(
                     // its schema identifier — no cherry-picking.
                     if d.key.eq_ignore_ascii_case("model") {
                         model = value;
-                    } else if !value.is_empty() {
+                    } else if !value.is_empty() && value != zeroclaw_config::traits::UNSET_DISPLAY {
                         field_buf.insert(d.key.clone(), value);
                     }
                 }
@@ -1738,7 +1738,8 @@ async fn run_quickstart_cli(
                                 aborted = true;
                                 break;
                             };
-                            if !value.is_empty() {
+                            if !value.is_empty() && value != zeroclaw_config::traits::UNSET_DISPLAY
+                            {
                                 extras.insert(d.key.clone(), value);
                             }
                         }
@@ -2249,7 +2250,12 @@ fn prompt_for_field(
         input = input.default(s.to_string());
     } else if let Some(d) = desc.default.as_deref()
         && !d.is_empty()
+        && d != zeroclaw_config::traits::UNSET_DISPLAY
     {
+        // `<unset>` is a display placeholder for an unset Option, not a
+        // real default. Seeding it pre-fills the prompt so a bare Enter
+        // submits `<unset>`, which the daemon then validates against the
+        // field's true type (e.g. a bool) and rejects.
         input = input.default(d.to_string());
     }
     // Same Ctrl+C-as-cancel mapping as the Password branch above.
