@@ -42,10 +42,19 @@ pub mod ws;
 pub mod ws_approval;
 
 use anyhow::{Context, Result};
+#[cfg(any(
+    feature = "channel-email",
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::body::Bytes;
+#[cfg(any(feature = "channel-wati", feature = "channel-whatsapp-cloud"))]
+use axum::extract::Query;
 use axum::{
     Router,
-    body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
@@ -58,12 +67,24 @@ use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::ToolSpec;
-use zeroclaw_channels::{
-    gmail_push::GmailPushChannel, linq::LinqChannel, nextcloud_talk::NextcloudTalkChannel,
-    wati::WatiChannel, whatsapp::WhatsAppChannel,
-};
+#[cfg(feature = "channel-email")]
+use zeroclaw_channels::gmail_push::GmailPushChannel;
+#[cfg(feature = "channel-linq")]
+use zeroclaw_channels::linq::LinqChannel;
+#[cfg(feature = "channel-nextcloud")]
+use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
+#[cfg(feature = "channel-wati")]
+use zeroclaw_channels::wati::WatiChannel;
+#[cfg(feature = "channel-whatsapp-cloud")]
+use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
@@ -115,22 +136,32 @@ fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
 }
 
+#[cfg(feature = "channel-whatsapp-cloud")]
 fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-linq")]
 fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-wati")]
 fn wati_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("wati_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-nextcloud")]
 fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-wati",
+    feature = "channel-whatsapp-cloud"
+))]
 fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match &msg.thread_ts {
         Some(thread_id) => format!("{channel}_{thread_id}_{}", msg.sender),
@@ -378,17 +409,25 @@ pub struct AppState {
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
+    #[cfg(feature = "channel-whatsapp-cloud")]
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
+    #[cfg(feature = "channel-whatsapp-cloud")]
     pub whatsapp_app_secret: Option<Arc<str>>,
+    #[cfg(feature = "channel-linq")]
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
+    #[cfg(feature = "channel-linq")]
     pub linq_signing_secret: Option<Arc<str>>,
+    #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
+    #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    #[cfg(feature = "channel-wati")]
     pub wati: Option<Arc<WatiChannel>>,
     /// Gmail Pub/Sub push notification channel
+    #[cfg(feature = "channel-email")]
     pub gmail_push: Option<Arc<GmailPushChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn zeroclaw_runtime::observability::Observer>,
@@ -875,6 +914,7 @@ pub async fn run_gateway(
         });
 
     // WhatsApp channel (if configured)
+    #[cfg(feature = "channel-whatsapp-cloud")]
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
         .channels
         .whatsapp
@@ -897,6 +937,7 @@ pub async fn run_gateway(
         });
 
     // WhatsApp app secret for webhook signature verification.
+    #[cfg(feature = "channel-whatsapp-cloud")]
     let whatsapp_app_secret: Option<Arc<str>> = config
         .channels
         .whatsapp
@@ -912,6 +953,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Linq channel (if configured)
+    #[cfg(feature = "channel-linq")]
     let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.values().next().map(|lq| {
         let alias = "default".to_string();
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
@@ -928,6 +970,7 @@ pub async fn run_gateway(
     });
 
     // Linq signing secret for webhook signature verification.
+    #[cfg(feature = "channel-linq")]
     let linq_signing_secret: Option<Arc<str>> = config
         .channels
         .linq
@@ -943,6 +986,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // WATI channel (if configured)
+    #[cfg(feature = "channel-wati")]
     let wati_channel: Option<Arc<WatiChannel>> =
         config.channels.wati.values().next().map(|wati_cfg| {
             let alias = "default".to_string();
@@ -964,6 +1008,7 @@ pub async fn run_gateway(
         });
 
     // Nextcloud Talk channel (if configured)
+    #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
         config.channels.nextcloud_talk.values().next().map(|nc| {
             let alias = "default".to_string();
@@ -986,6 +1031,7 @@ pub async fn run_gateway(
         });
 
     // Nextcloud Talk webhook secret for signature verification.
+    #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_webhook_secret: Option<Arc<str>> = config
         .channels
         .nextcloud_talk
@@ -1000,6 +1046,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Gmail Push channel (if configured and referenced by an enabled agent)
+    #[cfg(feature = "channel-email")]
     let gmail_push_channel: Option<Arc<GmailPushChannel>> = {
         let active: std::collections::HashSet<String> = config
             .agents
@@ -1239,17 +1286,21 @@ pub async fn run_gateway(
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
+    #[cfg(feature = "channel-whatsapp-cloud")]
     if whatsapp_channel.is_some() {
         println!("  GET  {pfx}/whatsapp  — Meta webhook verification");
         println!("  POST {pfx}/whatsapp  — WhatsApp message webhook");
     }
+    #[cfg(feature = "channel-linq")]
     if linq_channel.is_some() {
         println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    #[cfg(feature = "channel-wati")]
     if wati_channel.is_some() {
         println!("  GET  {pfx}/wati      — WATI webhook verification");
         println!("  POST {pfx}/wati      — WATI message webhook");
     }
+    #[cfg(feature = "channel-nextcloud")]
     if nextcloud_talk_channel.is_some() {
         println!("  POST {pfx}/nextcloud-talk — Nextcloud Talk bot webhook");
     }
@@ -1325,13 +1376,21 @@ pub async fn run_gateway(
         rate_limiter,
         auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
         idempotency_store,
+        #[cfg(feature = "channel-whatsapp-cloud")]
         whatsapp: whatsapp_channel,
+        #[cfg(feature = "channel-whatsapp-cloud")]
         whatsapp_app_secret,
+        #[cfg(feature = "channel-linq")]
         linq: linq_channel,
+        #[cfg(feature = "channel-linq")]
         linq_signing_secret,
+        #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk: nextcloud_talk_channel,
+        #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret,
+        #[cfg(feature = "channel-wati")]
         wati: wati_channel,
+        #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
         observer: state_observer,
         tools_registry,
@@ -1390,13 +1449,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
-        .route("/whatsapp", get(handle_whatsapp_verify))
-        .route("/whatsapp", post(handle_whatsapp_message))
-        .route("/linq", post(handle_linq_webhook))
-        .route("/wati", get(handle_wati_verify))
-        .route("/wati", post(handle_wati_webhook))
-        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
-        .route("/webhook/gmail", post(handle_gmail_push_webhook))
+        .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
@@ -2164,6 +2217,25 @@ async fn run_gateway_chat_with_tools(
     }
 }
 
+fn optional_channel_routes() -> Router<AppState> {
+    let router: Router<AppState> = Router::new();
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    let router = router
+        .route("/whatsapp", get(handle_whatsapp_verify))
+        .route("/whatsapp", post(handle_whatsapp_message));
+    #[cfg(feature = "channel-linq")]
+    let router = router.route("/linq", post(handle_linq_webhook));
+    #[cfg(feature = "channel-wati")]
+    let router = router
+        .route("/wati", get(handle_wati_verify))
+        .route("/wati", post(handle_wati_webhook));
+    #[cfg(feature = "channel-nextcloud")]
+    let router = router.route("/nextcloud-talk", post(handle_nextcloud_talk_webhook));
+    #[cfg(feature = "channel-email")]
+    let router = router.route("/webhook/gmail", post(handle_gmail_push_webhook));
+    router
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -2452,6 +2524,7 @@ pub struct WhatsAppVerifyQuery {
 }
 
 /// GET /whatsapp — Meta webhook verification
+#[cfg(feature = "channel-whatsapp-cloud")]
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
     Query(params): Query<WhatsAppVerifyQuery>,
@@ -2516,6 +2589,7 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
 }
 
 /// POST /whatsapp — incoming message webhook
+#[cfg(feature = "channel-whatsapp-cloud")]
 async fn handle_whatsapp_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2657,6 +2731,7 @@ async fn handle_whatsapp_message(
 }
 
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+#[cfg(feature = "channel-linq")]
 async fn handle_linq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2799,6 +2874,7 @@ async fn handle_linq_webhook(
 }
 
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
+#[cfg(feature = "channel-wati")]
 async fn handle_wati_verify(
     State(state): State<AppState>,
     Query(params): Query<WatiVerifyQuery>,
@@ -2828,6 +2904,7 @@ pub struct WatiVerifyQuery {
 }
 
 /// POST /wati — incoming WATI WhatsApp message webhook
+#[cfg(feature = "channel-wati")]
 async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let Some(ref wati) = state.wati else {
         return (
@@ -2936,6 +3013,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
 }
 
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+#[cfg(feature = "channel-nextcloud")]
 async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3081,9 +3159,11 @@ async fn handle_nextcloud_talk_webhook(
 
 /// Maximum request body size for the Gmail webhook endpoint (1 MB).
 /// Google Pub/Sub messages are typically under 10 KB.
+#[cfg(feature = "channel-email")]
 const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
 
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
+#[cfg(feature = "channel-email")]
 async fn handle_gmail_push_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3391,6 +3471,7 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
@@ -3648,13 +3729,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -3719,13 +3808,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
@@ -4006,6 +4103,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_memory_key_includes_sender_and_message_id() {
         let msg = ChannelMessage {
@@ -4272,13 +4370,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4356,13 +4462,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4452,13 +4566,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4520,13 +4642,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4593,13 +4723,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4643,6 +4781,7 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -4653,6 +4792,7 @@ mod tests {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
@@ -4671,13 +4811,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4714,6 +4862,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_rejects_invalid_signature() {
         let provider_impl = Arc::new(MockModelProvider::default());
@@ -4749,13 +4898,19 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4805,12 +4960,14 @@ mod tests {
     // Regression for #6156: handler must return 200 OK before the (potentially
     // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
     // request at its ~5s timeout.
+    #[cfg(feature = "channel-nextcloud")]
     #[derive(Default)]
     struct SlowProvider {
         calls: AtomicUsize,
         started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[async_trait]
     impl ModelProvider for SlowProvider {
         async fn chat_with_system(
@@ -4828,6 +4985,7 @@ mod tests {
             Ok("slow ok".into())
         }
     }
+    #[cfg(feature = "channel-nextcloud")]
     impl ::zeroclaw_api::attribution::Attributable for SlowProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -4841,6 +4999,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_returns_before_llm_call_completes() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -4874,15 +5033,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -4939,6 +5104,7 @@ mod tests {
     // WhatsApp Signature Verification Tests (CWE-345 Prevention)
     // ══════════════════════════════════════════════════════════
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -4948,10 +5114,12 @@ mod tests {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
         format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_valid() {
         let app_secret = generate_test_secret();
@@ -4966,6 +5134,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
         let app_secret = generate_test_secret();
@@ -4981,6 +5150,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
         let app_secret = generate_test_secret();
@@ -4997,6 +5167,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_missing_prefix() {
         let app_secret = generate_test_secret();
@@ -5012,6 +5183,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_empty_header() {
         let app_secret = generate_test_secret();
@@ -5020,6 +5192,7 @@ mod tests {
         assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_invalid_hex() {
         let app_secret = generate_test_secret();
@@ -5035,6 +5208,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_empty_body() {
         let app_secret = generate_test_secret();
@@ -5049,6 +5223,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_unicode_body() {
         let app_secret = generate_test_secret();
@@ -5063,6 +5238,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_json_payload() {
         let app_secret = generate_test_secret();
@@ -5077,6 +5253,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
         let app_secret = generate_test_secret();
@@ -5097,6 +5274,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_truncated_hex() {
         let app_secret = generate_test_secret();
@@ -5113,6 +5291,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "channel-whatsapp-cloud")]
     #[test]
     fn whatsapp_signature_extra_bytes() {
         let app_secret = generate_test_secret();

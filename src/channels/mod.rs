@@ -12,7 +12,9 @@ pub mod session_sqlite {
 
 use crate::config::Config;
 use anyhow::Result;
-use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+use zeroclaw_runtime::i18n::get_required_cli_string;
+#[cfg(feature = "channel-notion")]
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {

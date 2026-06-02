@@ -634,6 +634,14 @@ impl OpenAiCompatibleModelProvider {
     }
 }
 
+/// Kimi K2.5/K2.6 models enforce fixed temperatures per mode (1.0 thinking,
+/// 0.6 instant) and reject any other value with HTTP 400. Omit `temperature`
+/// for kimi-k2.* models so the backend chooses the correct mode default.
+/// Substring match covers k2.5, k2.6, and future k2.x variants.
+fn compatible_model_omits_temperature(model: &str) -> bool {
+    model.contains("kimi-k2")
+}
+
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
     model: String,
@@ -2189,6 +2197,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         // Normalize image markers (e.g. local file paths from channel
@@ -2301,6 +2314,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2382,6 +2400,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2489,6 +2512,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
@@ -2596,6 +2624,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
+
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
@@ -2744,6 +2778,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let provider = self.clone();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
@@ -2881,6 +2920,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
@@ -5482,5 +5526,22 @@ mod tests {
             observed.is_ok(),
             "dropped stream must abort the forwarder and close the upstream socket"
         );
+    }
+
+    #[test]
+    fn compatible_model_omits_temperature_matches_kimi_k2() {
+        assert!(compatible_model_omits_temperature("kimi-k2.5"));
+        assert!(compatible_model_omits_temperature("kimi-k2.6"));
+        assert!(compatible_model_omits_temperature("kimi-k2.7"));
+        assert!(compatible_model_omits_temperature("kimi-k2"));
+    }
+
+    #[test]
+    fn compatible_model_omits_temperature_skips_other_models() {
+        assert!(!compatible_model_omits_temperature("kimi-k1"));
+        assert!(!compatible_model_omits_temperature("kimi-latest"));
+        assert!(!compatible_model_omits_temperature("gpt-4o"));
+        assert!(!compatible_model_omits_temperature("claude-sonnet-4-6"));
+        assert!(!compatible_model_omits_temperature("llama-3.1-70b"));
     }
 }

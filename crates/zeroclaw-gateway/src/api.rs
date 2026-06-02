@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -1140,14 +1141,21 @@ pub async fn handle_api_channels(
         .into_iter()
         .map(|info| {
             let composite = format!("{}.{}", info.channel_type, info.alias);
+            let compiled_key = compiled_readiness_key_for_alias(&config, &info);
+            let compiled = zeroclaw_channels::listing::is_channel_type_compiled(compiled_key);
             let readiness = channel_readiness(&config, &info, &health, &state);
-            let (status, health_status) = channel_readiness_summary(&readiness);
+            let (status, health_status) = if compiled {
+                channel_readiness_summary(&readiness)
+            } else {
+                ("not_compiled", "unavailable")
+            };
             serde_json::json!({
                 "name": composite,
                 "type": info.channel_type,
                 "alias": info.alias,
                 "owning_agent": info.owning_agent,
                 "enabled": info.enabled,
+                "compiled": compiled,
                 "status": status,
                 "message_count": 0,
                 "last_message_at": null,
@@ -1188,6 +1196,20 @@ pub async fn handle_api_tuis(
         .unwrap_or_default();
 
     Json(serde_json::json!({ "tuis": tuis })).into_response()
+}
+
+fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
+    if info.channel_type == "whatsapp"
+        && config
+            .channels
+            .whatsapp
+            .get(&info.alias)
+            .is_some_and(|whatsapp| whatsapp.backend_type() == "web")
+    {
+        "whatsapp-web"
+    } else {
+        info.channel_type.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2005,13 +2027,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -2044,6 +2074,121 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[test]
+    fn api_channels_readiness_key_tracks_whatsapp_backend_type() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "cloud".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "ambiguous".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+
+        let web = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "web".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let cloud = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "cloud".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let ambiguous = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "ambiguous".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let discord = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "discord".to_string(),
+            alias: "default".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &web),
+            "whatsapp-web"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &cloud),
+            "whatsapp"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &ambiguous),
+            "whatsapp",
+            "ambiguous WhatsApp configs follow runtime Cloud precedence"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &discord),
+            "discord"
+        );
+    }
+
+    #[cfg(not(feature = "channel-nextcloud"))]
+    #[tokio::test]
+    async fn api_channels_marks_configured_uncompiled_channel_unavailable() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.nextcloud_talk.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NextcloudTalkConfig {
+                enabled: true,
+                base_url: "https://cloud.example.com".to_string(),
+                app_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channels = json["channels"].as_array().expect("channels array");
+        let nextcloud = channels
+            .iter()
+            .find(|channel| channel["alias"] == "default")
+            .expect("configured channel is listed");
+
+        assert!(
+            matches!(
+                nextcloud["type"].as_str(),
+                Some("nextcloud-talk" | "nextcloud_talk")
+            ),
+            "unexpected channel type: {}",
+            nextcloud["type"]
+        );
+        assert_eq!(nextcloud["enabled"], true);
+        assert_eq!(nextcloud["compiled"], false);
+        assert_eq!(nextcloud["status"], "not_compiled");
+        assert_eq!(nextcloud["health"], "unavailable");
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
@@ -2267,7 +2412,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_channels_serializes_readiness_without_duplicate_summary_fields() {
-        let config = config_with_telegram("ops");
+        let config = config_with_webhook("ops", true, true, 42617, Some("/webhook"));
         let state = test_state(config);
 
         let response = handle_api_channels(State(state), HeaderMap::new())
@@ -2277,11 +2422,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         let channel = &json["channels"][0];
-        assert_eq!(channel["name"], "telegram.ops");
-        assert_eq!(channel["status"], "unknown");
-        assert_eq!(channel["health"], "degraded");
+        let webhook_compiled = zeroclaw_channels::listing::is_channel_type_compiled("webhook");
+        assert_eq!(channel["name"], "webhook.ops");
+        assert_eq!(channel["compiled"], webhook_compiled);
+        if webhook_compiled {
+            assert_eq!(channel["status"], "error");
+            assert_eq!(channel["health"], "down");
+        } else {
+            assert_eq!(channel["status"], "not_compiled");
+            assert_eq!(channel["health"], "unavailable");
+        }
         assert_eq!(channel["readiness"]["enabled"], "ready");
-        assert_eq!(channel["readiness"]["authenticated"], "unknown");
+        assert_eq!(channel["readiness"]["authenticated"], "ready");
+        assert_eq!(channel["readiness"]["listening"], "missing");
         assert!(channel["readiness"].get("configured").is_none());
         assert!(channel["readiness"].get("status").is_none());
         assert!(channel["readiness"].get("health").is_none());
