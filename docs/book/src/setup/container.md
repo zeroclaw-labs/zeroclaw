@@ -55,6 +55,63 @@ docker compose exec zeroclaw zeroclaw onboard
 
 Drop `ZEROCLAW_ALLOW_PUBLIC_BIND` if you only need local access.
 
+## Podman & systemd quadlets
+
+On a Linux server, the cleanest way to run the container long-term is a Podman **quadlet** — a declarative unit file that systemd turns into a real service. You get `systemctl` lifecycle, journald logs, auto-restart, and boot ordering with no daemon and no `--restart` hack, and the unit file is config you commit to git. This is the recommended server pattern; `docker run`/Compose are fine for a laptop.
+
+A quadlet is a `*.container` file (siblings: `.pod`, `.volume`, `.network`, `.kube`, `.build`, `.image`). Podman's systemd generator reads it on every `daemon-reload` and writes a transient `.service` — you never author the `.service` yourself.
+
+Rootful units live in `/etc/containers/systemd/`; rootless in `~/.config/containers/systemd/`.
+
+`/etc/containers/systemd/zeroclaw.container`:
+
+```ini
+[Unit]
+Description=ZeroClaw agent runtime
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+# Pin a release in production; :latest is distroless (no shell — use :debian to exec a shell).
+Image=ghcr.io/zeroclaw-labs/zeroclaw:latest
+ContainerName=zeroclaw
+PublishPort=42617:42617
+Volume=zeroclaw-data:/zeroclaw-data
+# Only if the gateway must be reachable off-localhost (LAN):
+Environment=ZEROCLAW_ALLOW_PUBLIC_BIND=1
+# Optional rolling-upgrade path — re-pull a newer image on (re)start and opt into `podman auto-update`:
+Pull=newer
+AutoUpdate=registry
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target default.target
+```
+
+Deploy (idempotent — safe to re-run; re-applying converges the running container, never duplicates it):
+
+```bash
+sudo cp zeroclaw.container /etc/containers/systemd/
+sudo systemctl daemon-reload      # generator turns .container into zeroclaw.service
+sudo systemctl restart zeroclaw
+```
+
+Then onboard once, and manage it like any service:
+
+```bash
+sudo podman exec -it zeroclaw zeroclaw onboard
+systemctl status zeroclaw
+journalctl -u zeroclaw -f
+```
+
+There is no `systemctl enable` step for generated units — the `[Install] WantedBy=` line is what brings it up on boot.
+
+- **Version pinning vs `:latest`.** Pin a tag or digest (`Image=ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5` or `...@sha256:...`) for reproducible, auditable deploys — upgrading is then a reviewable tag bump in the committed `.container` file. `Pull=newer` + `AutoUpdate=registry` instead give rolling upgrades, driven by `podman-auto-update.timer` (`sudo systemctl enable --now podman-auto-update.timer`). Pick reproducibility or currency; the deploy loop is the same either way.
+- **Rootless variant.** Drop the file in `~/.config/containers/systemd/`, use `systemctl --user daemon-reload && systemctl --user restart zeroclaw`, and run `loginctl enable-linger $USER` so it survives logout (same lingering note as [Service & daemon](../ops/service.md)).
+- **WSL2.** Modern WSL2 runs systemd (`[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`), so this exact quadlet pattern works inside a WSL distro — no Windows-specific dialect.
+
 ## Config inside containers
 
 The image expects config at `/zeroclaw-data/.zeroclaw/config.toml`. Mount your local config in:
