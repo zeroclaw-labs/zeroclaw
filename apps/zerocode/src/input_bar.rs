@@ -1451,7 +1451,8 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("/detach");
         let action = bar.handle_enter();
-        assert!(matches!(action, InputBarAction::StatusMessage(ref m) if m.contains("No pending")));
+        let expected = crate::i18n::t("zc-input-no-pending-attachments");
+        assert!(matches!(action, InputBarAction::StatusMessage(ref m) if *m == expected));
     }
 
     #[test]

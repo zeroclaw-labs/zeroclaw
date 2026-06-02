@@ -1290,9 +1290,9 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(text.contains("preview fields only"));
+        assert!(text.contains(&crate::i18n::t("zc-logs-preview-only")));
         // And it must not sit on the "Loading…" placeholder.
-        assert!(!text.contains("Loading"));
+        assert!(!text.contains(&crate::i18n::t("zc-logs-loading")));
     }
 
     #[test]
@@ -1311,6 +1311,6 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!text.contains("preview fields only"));
+        assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
     }
 }
