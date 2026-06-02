@@ -444,7 +444,9 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_paste(&text),
                     Mode::Acp => acp_pane.handle_paste(&text),
                     Mode::Config => config_app.handle_paste(&text),
-                    _ => {}
+                    Mode::Quickstart => quickstart.handle_paste(&text),
+                    Mode::Dashboard => dashboard_pane.handle_paste(&text),
+                    Mode::Logs => logs_pane.handle_paste(&text),
                 }
             }
             _ => {} // Resize, etc. — just redraw on next iteration

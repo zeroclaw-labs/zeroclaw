@@ -1944,6 +1944,21 @@ impl<'a> Dashboard<'a> {
     pub(crate) fn wants_text_input(&self) -> bool {
         self.search_active
     }
+
+    /// Route a bracketed-paste payload into the search buffer when the
+    /// search bar is open. Mirrors the char-insertion path in
+    /// `handle_search_key`, including the live-filter refresh for
+    /// client-side tabs; server-side tabs (sessions, memories) still
+    /// wait for Enter. Ignored when search isn't active.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if !self.search_active {
+            return;
+        }
+        self.search_buf.push_str(text);
+        if !matches!(self.tab, Tab::Sessions | Tab::Memories) {
+            self.search_query = self.search_buf.clone();
+        }
+    }
 }
 
 impl crate::widgets::HelpContext for Dashboard<'_> {

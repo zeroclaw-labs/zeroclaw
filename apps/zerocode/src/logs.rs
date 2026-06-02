@@ -1191,6 +1191,16 @@ impl<'a> Logs<'a> {
     pub(crate) fn wants_text_input(&self) -> bool {
         self.search_active
     }
+
+    /// Route a bracketed-paste payload into the search buffer when the
+    /// search bar is open. Mirrors the char-insertion path in
+    /// `handle_search_key`; ignored when search isn't active so a stray
+    /// paste can't silently mutate hidden state.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if self.search_active {
+            self.search_buf.push_str(text);
+        }
+    }
 }
 
 impl crate::widgets::HelpContext for Logs<'_> {

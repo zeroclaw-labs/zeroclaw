@@ -714,6 +714,36 @@ impl QuickstartPane {
         }
     }
 
+    /// Route a bracketed-paste payload into the active modal's text
+    /// field. Mirrors the per-modal char-insertion rules in
+    /// `handle_modal_key` so paste lands in exactly the same buffer a
+    /// keystroke would: the TextInput buffer, the focused non-enum
+    /// FieldForm row (e.g. an `api_key`), or the Agent name row. Panes
+    /// without an active text target ignore the paste. Without this,
+    /// `app`'s `Event::Paste` had no Quickstart arm, so paste was
+    /// silently dropped on every Quickstart widget.
+    pub fn handle_paste(&mut self, text: &str) {
+        let Some(modal) = self.active_modal.as_mut() else {
+            return;
+        };
+        match modal {
+            Modal::TextInput(t) => t.buf.push_str(text),
+            Modal::FieldForm(f) => {
+                if let Some(row) = f.fields.get_mut(f.cursor)
+                    && row.descriptor.enum_variants.is_none()
+                {
+                    row.buf.push_str(text);
+                }
+            }
+            Modal::Agent(a) => {
+                if a.cursor == 0 {
+                    a.name.push_str(text);
+                }
+            }
+            Modal::Picker(_) | Modal::ChannelList(_) | Modal::PeerGroupList(_) => {}
+        }
+    }
+
     pub async fn dismiss_beacon(&self) {
         if self.applied_alias.is_some() {
             return;
