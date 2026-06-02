@@ -1071,19 +1071,20 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(reaction_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let ask_user_handle = Arc::new(RwLock::new(HashMap::new()));
     let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
+        AskUserTool::new(security.clone(), ask_user_handle);
     tool_arcs.push(Arc::new(ask_user_tool));
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        escalate_handle,
     );
     tool_arcs.push(Arc::new(escalate_tool));
+
 
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {

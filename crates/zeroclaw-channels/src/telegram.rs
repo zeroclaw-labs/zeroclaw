@@ -926,7 +926,7 @@ impl TelegramChannel {
         let voice_chats = self.voice_chats.clone();
         let api_base = self.api_base.clone();
         let bot_token = self.bot_token.clone();
-        let tts_manager = self.tts_manager.clone().unwrap();
+        let tts_manager = self.tts_manager.clone().expect("TTS manager not configured");
 
         if immediate {
             // Finalize path: text is already the final answer — no debounce.

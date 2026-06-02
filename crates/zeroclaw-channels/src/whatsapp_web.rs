@@ -988,7 +988,7 @@ impl Channel for WhatsAppWebChannel {
                 let client_clone = client.clone();
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
-                let tts_manager = self.tts_manager.clone().unwrap();
+                let tts_manager = self.tts_manager.clone().expect("TTS manager not configured");
                 zeroclaw_spawn::spawn!(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
