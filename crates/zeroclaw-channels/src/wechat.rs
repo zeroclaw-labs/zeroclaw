@@ -526,15 +526,17 @@ fn build_base_info() -> serde_json::Value {
 
 fn markdown_to_plain_text(text: &str) -> String {
     // TODO: Cache these Regex values instead of compiling them on every send path.
-    let code_block_re = regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap();
-    let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
-    let heading_re = regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap();
-    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
-    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
-    let emphasis_re = regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap();
-    let table_separator_re = regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap();
-    let table_row_re = regex::Regex::new(r"^\|(.+)\|$").unwrap();
+    let code_block_re =
+        regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").expect("code_block_re must compile");
+    let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").expect("image_re must compile");
+    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").expect("link_re must compile");
+    let heading_re = regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").expect("heading_re must compile");
+    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").expect("blockquote_re must compile");
+    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").expect("bullet_re must compile");
+    let emphasis_re = regex::Regex::new(r"(\*\*|__|~~|`|\*)").expect("emphasis_re must compile");
+    let table_separator_re =
+        regex::Regex::new(r"^\|[\s:|-]+\|$").expect("table_separator_re must compile");
+    let table_row_re = regex::Regex::new(r"^\|(.+)\|$").expect("table_row_re must compile");
 
     let mut result = code_block_re.replace_all(text, "$1").into_owned();
     result = image_re.replace_all(&result, "").into_owned();
@@ -602,7 +604,12 @@ fn build_headers(token: Option<&str>) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("Content-Type", "application/json".parse().unwrap());
     headers.insert("AuthorizationType", "ilink_bot_token".parse().unwrap());
-    headers.insert("X-WECHAT-UIN", random_wechat_uin().parse().unwrap());
+    headers.insert(
+        "X-WECHAT-UIN",
+        random_wechat_uin()
+            .parse()
+            .expect("X-WECHAT-UIN header value must be valid"),
+    );
     if let Some(t) = token
         && !t.is_empty()
         && let Ok(val) = format!("Bearer {t}").parse()
