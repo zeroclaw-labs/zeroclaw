@@ -31,6 +31,8 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    ChainTruncation,
+    ChainBoundary,
 }
 
 /// Actor information (who performed the action)
@@ -276,6 +278,8 @@ impl AuditLogger {
         )
         .context("Failed to create audit_events table")?;
 
+        Self::install_append_only_triggers(&conn)?;
+
         Ok(Self {
             db_path,
             config,
@@ -297,6 +301,22 @@ impl AuditLogger {
 
     fn connect(&self) -> Result<Connection> {
         Self::open_conn(&self.db_path)
+    }
+
+    fn install_append_only_triggers(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS audit_no_update
+                 BEFORE UPDATE ON audit_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'audit_events is append-only: UPDATE prohibited');
+                 END;
+             CREATE TRIGGER IF NOT EXISTS audit_no_delete
+                 BEFORE DELETE ON audit_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'audit_events is append-only: DELETE prohibited — use retention API');
+                 END;",
+        )
+        .context("Failed to install append-only triggers")
     }
 
     /// Path to the underlying database file.
@@ -368,11 +388,7 @@ impl AuditLogger {
             Ok(next_seq) => {
                 conn.execute_batch("COMMIT")?;
                 if next_seq % RETENTION_CHECK_INTERVAL == 0 {
-                    let _ = conn.execute(
-                        "DELETE FROM audit_events WHERE id NOT IN
-                         (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
-                        params![MAX_AUDIT_EVENTS],
-                    );
+                    let _ = self.run_retention();
                 }
                 Ok(())
             }
@@ -419,6 +435,87 @@ impl AuditLogger {
             success,
             duration_ms,
         })
+    }
+
+    /// Perform retention pruning as a recorded operation.
+    ///
+    /// Appends a `chain_truncation` event documenting the removed sequence
+    /// range, then temporarily drops the append-only trigger to execute the
+    /// DELETE, and reinstalls it. The chain always documents its own
+    /// truncation — a clean `verify_chain` cannot result from silent removal.
+    fn run_retention(&self) -> Result<()> {
+        let conn = self.connect()?;
+
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events",
+            [],
+            |r| r.get(0),
+        )?;
+        if total <= MAX_AUDIT_EVENTS {
+            return Ok(());
+        }
+
+        let to_remove = total - MAX_AUDIT_EVENTS;
+        let (min_seq, max_seq): (i64, i64) = conn.query_row(
+            "SELECT MIN(sequence), MAX(sequence) FROM audit_events
+             WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
+            params![MAX_AUDIT_EVENTS],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        let truncation_event = AuditEvent::new(AuditEventType::ChainTruncation)
+            .with_actor("system".to_string(), None, None)
+            .with_action(
+                format!("retention_prune: removed {to_remove} events, sequences {min_seq}..{max_seq}"),
+                "system".to_string(),
+                true,
+                true,
+            );
+        self.log(&truncation_event)?;
+
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let delete_result = (|| -> Result<()> {
+            conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_delete")?;
+            conn.execute(
+                "DELETE FROM audit_events WHERE id NOT IN
+                 (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
+                params![MAX_AUDIT_EVENTS + 1], // +1 for the truncation event we just added
+            )?;
+            Self::install_append_only_triggers(&conn)?;
+            Ok(())
+        })();
+
+        match delete_result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                tracing::info!(
+                    removed = to_remove,
+                    seq_range = format!("{min_seq}..{max_seq}").as_str(),
+                    "Audit retention: pruned old events (recorded in chain)"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                let _ = Self::install_append_only_triggers(&conn);
+                Err(e)
+            }
+        }
+    }
+
+    /// Record a chain boundary — a permanent note that specific sequences
+    /// were removed from the chain at a known point. Used to make past
+    /// deletions (like fork cleanup) honest rather than invisible.
+    pub fn record_chain_boundary(&self, description: &str) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::ChainBoundary)
+            .with_actor("system".to_string(), None, None)
+            .with_action(
+                description.to_string(),
+                "administrative".to_string(),
+                true,
+                true,
+            );
+        self.log(&event)
     }
 }
 
@@ -782,8 +879,9 @@ mod tests {
             logger.log(&event)?;
         }
 
-        // Tamper with the second entry (change the command text in event_json)
+        // Simulate external tampering (bypass triggers to set up tampered state)
         let conn = Connection::open(logger.db_path())?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_update")?;
         let json: String = conn.query_row(
             "SELECT event_json FROM audit_events WHERE sequence = 1",
             [],
@@ -828,8 +926,9 @@ mod tests {
             logger.log(&event)?;
         }
 
-        // Remove the second entry to create a sequence gap
+        // Simulate external tampering (bypass triggers to create a gap)
         let conn = Connection::open(logger.db_path())?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_delete")?;
         conn.execute("DELETE FROM audit_events WHERE sequence = 1", [])?;
 
         let result = verify_chain(logger.db_path());
@@ -1454,6 +1553,128 @@ mod tests {
         assert_eq!(daemon_count, events_per_writer as i64);
         assert_eq!(cli_count, events_per_writer as i64);
 
+        Ok(())
+    }
+
+    // ── Append-only enforcement tests ──────────────────────────
+
+    #[test]
+    fn direct_delete_is_rejected_by_trigger() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("shell".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        let conn = Connection::open(logger.db_path())?;
+        let result = conn.execute("DELETE FROM audit_events WHERE sequence = 0", []);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("append-only") && err.contains("DELETE prohibited"),
+            "expected append-only DELETE error, got: {err}"
+        );
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events", [], |r| r.get(0),
+        )?;
+        assert_eq!(count, 1, "row must survive the rejected DELETE");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_update_is_rejected_by_trigger() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("shell".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        let conn = Connection::open(logger.db_path())?;
+        let result = conn.execute(
+            "UPDATE audit_events SET event_json = 'TAMPERED' WHERE sequence = 0",
+            [],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("append-only") && err.contains("UPDATE prohibited"),
+            "expected append-only UPDATE error, got: {err}"
+        );
+
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events WHERE sequence = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            !json.contains("TAMPERED"),
+            "row content must be unchanged after rejected UPDATE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn log_still_works_with_triggers_installed() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..10 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution)
+                .with_action(format!("cmd-{i}"), "low".into(), false, true);
+            logger.log(&event)?;
+        }
+
+        let count = verify_chain(logger.db_path())?;
+        assert_eq!(count, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn record_chain_boundary_appends_event() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("shell".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        logger.record_chain_boundary(
+            "fork cleanup: seqs 34-37, 79-80, 116 removed — 6 daemon + 1 CLI proof event"
+        )?;
+
+        let count = verify_chain(logger.db_path())?;
+        assert_eq!(count, 2);
+
+        let conn = Connection::open(logger.db_path())?;
+        let event_type: String = conn.query_row(
+            "SELECT event_type FROM audit_events WHERE sequence = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(event_type, "chain_boundary");
         Ok(())
     }
 }
