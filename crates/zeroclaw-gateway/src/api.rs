@@ -2674,6 +2674,7 @@ mod tests {
 
     use crate::api_pairing::{
         DeviceInfo, DeviceRegistry, revoke_device, rotate_token as rotate_device_token,
+        submit_pairing_enhanced,
     };
     use chrono::Utc;
 
@@ -2772,6 +2773,45 @@ mod tests {
         assert!(
             !persisted.contains(&old_hash),
             "revoked token hash must not remain in gateway.paired_tokens"
+        );
+    }
+
+    /// Regression: `POST /api/pair` MUST persist the newly issued token to
+    /// `gateway.paired_tokens` before reporting success. The pre-fix handler
+    /// registered the device and returned "Pairing successful" but left the
+    /// token only in memory, so a restart after rotate/re-pair silently
+    /// dropped the replacement credential (GHSA-f385-f6h2-3gqj §5).
+    #[tokio::test]
+    async fn submit_pairing_enhanced_persists_new_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, _old_token, _device_id) = paired_state_with_device(&tmp).await;
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("require_pairing was enabled");
+
+        let response = submit_pairing_enhanced(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::json!({ "code": code, "device_name": "repaired" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(json["persisted"], true);
+        let new_token = json["token"].as_str().expect("token in response");
+        let new_hash = PairingGuard::token_hash(new_token);
+        assert!(
+            state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&new_hash),
+            "newly paired token hash must be persisted to gateway.paired_tokens"
         );
     }
 

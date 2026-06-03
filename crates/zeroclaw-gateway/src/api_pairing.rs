@@ -339,7 +339,27 @@ pub async fn submit_pairing_enhanced(
                     },
                 );
             }
+            if let Err(e) =
+                super::persist_pairing_tokens(state.config.clone(), &state.pairing).await
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "pairing succeeded but token persistence failed"
+                );
+                return Json(serde_json::json!({
+                    "paired": true,
+                    "persisted": false,
+                    "token": token,
+                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                }))
+                .into_response();
+            }
             Json(serde_json::json!({
+                "paired": true,
+                "persisted": true,
                 "token": token,
                 "message": "Pairing successful"
             }))

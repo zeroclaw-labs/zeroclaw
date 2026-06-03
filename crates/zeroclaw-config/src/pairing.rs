@@ -230,6 +230,11 @@ impl PairingGuard {
 
     /// Revoke a paired token by plaintext. Returns true if removed.
     ///
+    /// Test/convenience wrapper that hashes the plaintext, then defers to
+    /// [`revoke_token_hash`](Self::revoke_token_hash). Production revoke paths
+    /// already hold the hash (the device registry stores it) and should call
+    /// `revoke_token_hash` directly rather than re-hashing the plaintext.
+    ///
     /// In-memory only; the caller must persist `tokens()` to config or a
     /// restart will resurrect the token from disk.
     pub fn revoke_token(&self, token: &str) -> bool {
