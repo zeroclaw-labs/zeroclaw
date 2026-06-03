@@ -234,7 +234,7 @@ async fn zero_interval_passthrough_at_integration_layer() {
     let started = Instant::now();
     for n in 0..3 {
         paced
-            .send(&SendMessage::new(&format!("msg-{n}"), "any"))
+            .send(&SendMessage::new(format!("msg-{n}"), "any"))
             .await
             .unwrap();
     }

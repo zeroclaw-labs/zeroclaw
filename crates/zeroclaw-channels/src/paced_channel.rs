@@ -30,9 +30,57 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
-/// Per-recipient queued send waiting on its turn through the pacing floor.
+/// The outbound operation a queued slot will perform when its turn through
+/// the pacing floor arrives. Both `send` and `finalize_draft` are paced, but
+/// they dispatch to different inner-channel methods — normalizing both to a
+/// plain `send` would route a draft finalization (an edit of an existing
+/// message identified by `message_id`) through `send`, creating a new message
+/// and leaving the draft stale on channels that support drafts.
+enum PacedOp {
+    /// A final outbound message. Dispatches to `inner.send`.
+    Send(SendMessage),
+    /// A terminal draft write. Dispatches to `inner.finalize_draft` so the
+    /// channel edits the existing draft rather than posting a new message.
+    FinalizeDraft {
+        recipient: String,
+        message_id: String,
+        text: String,
+    },
+}
+
+impl PacedOp {
+    /// The recipient key this op paces against.
+    fn recipient(&self) -> &str {
+        match self {
+            Self::Send(message) => &message.recipient,
+            Self::FinalizeDraft { recipient, .. } => recipient,
+        }
+    }
+
+    /// Character count of the payload, for the overflow-drop log.
+    fn payload_chars(&self) -> usize {
+        match self {
+            Self::Send(message) => message.content.chars().count(),
+            Self::FinalizeDraft { text, .. } => text.chars().count(),
+        }
+    }
+
+    /// Dispatch to the correct inner-channel method for this op.
+    async fn dispatch(self, inner: &Arc<dyn Channel>) -> Result<()> {
+        match self {
+            Self::Send(message) => inner.send(&message).await,
+            Self::FinalizeDraft {
+                recipient,
+                message_id,
+                text,
+            } => inner.finalize_draft(&recipient, &message_id, &text).await,
+        }
+    }
+}
+
+/// Per-recipient queued operation waiting on its turn through the pacing floor.
 struct PendingSend {
-    message: SendMessage,
+    op: PacedOp,
     /// One-shot back-channel for delivering the eventual send result to
     /// the caller. The caller awaits this so a paced `send()` still
     /// returns the inner channel's result rather than swallowing it.
@@ -140,22 +188,22 @@ impl PacedChannel {
         })
     }
 
-    /// Enqueue or immediately dispatch a paced send. Returns the inner
-    /// channel's send result (immediate path) or the worker's send result
-    /// awaited on a oneshot (queued path). Drops the newest send with a
-    /// `WARN` when the queue is full and returns `Ok(())` — overflow is
-    /// intentional behaviour, not an error the agent loop should retry.
-    async fn paced_dispatch(&self, message: SendMessage) -> Result<()> {
-        let recipient_key = message.recipient.clone();
+    /// Enqueue or immediately dispatch a paced operation. Returns the inner
+    /// channel's result (immediate path) or the worker's result awaited on a
+    /// oneshot (queued path). Drops the newest op with a `WARN` when the queue
+    /// is full and returns `Ok(())` — overflow is intentional behaviour, not an
+    /// error the agent loop should retry.
+    async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
+        let recipient_key = op.recipient().to_string();
 
         // `decision` is built under the lock and consumed after release.
         // Three shapes share the same outcome carrier so the post-lock
         // section can use plain `if let` instead of branching on an enum.
         //
-        // - `(true, None, false)`  — immediate dispatch via inner channel
-        // - `(false, Some(rx), spawn)` — enqueued; await result; maybe spawn worker
-        // - `(false, None, false)` — overflow drop; return Ok
-        let decision: (bool, Option<oneshot::Receiver<Result<()>>>, bool) = {
+        // - `(Some(op), None, false)`  — immediate dispatch via inner channel
+        // - `(None, Some(rx), spawn)` — enqueued; await result; maybe spawn worker
+        // - `(None, None, false)` — overflow drop; return Ok
+        let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
             let mut map = self.recipients.lock().await;
             map.evict_if_over_cap();
             let now = Instant::now();
@@ -173,7 +221,7 @@ impl PacedChannel {
 
             if state.queue.is_empty() && !state.worker_running && now >= state.next_allowed_at {
                 state.next_allowed_at = now + self.min_interval;
-                (true, None, false)
+                (Some(op), None, false)
             } else if state.queue.len() >= self.queue_depth {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -184,28 +232,25 @@ impl PacedChannel {
                             "recipient": redact_recipient(&recipient_key),
                             "queue_depth": state.queue.len(),
                             "queue_max": self.queue_depth,
-                            "dropped_chars": message.content.chars().count(),
+                            "dropped_chars": op.payload_chars(),
                         })),
                     "paced channel queue full: dropping newest outbound message"
                 );
-                (false, None, false)
+                (None, None, false)
             } else {
                 let (tx, rx) = oneshot::channel();
-                state.queue.push_back(PendingSend {
-                    message: message.clone(),
-                    reply: tx,
-                });
+                state.queue.push_back(PendingSend { op, reply: tx });
                 let spawn = !state.worker_running;
                 if spawn {
                     state.worker_running = true;
                 }
-                (false, Some(rx), spawn)
+                (None, Some(rx), spawn)
             }
         };
 
         let (immediate, awaited, spawn_worker) = decision;
-        if immediate {
-            return self.inner.send(&message).await;
+        if let Some(op) = immediate {
+            return op.dispatch(&self.inner).await;
         }
         if let Some(rx) = awaited {
             if spawn_worker {
@@ -258,8 +303,8 @@ impl PacedChannel {
                     state.next_allowed_at = Instant::now() + min_interval;
                     state.queue.pop_front()
                 };
-                if let Some(PendingSend { message, reply }) = pending {
-                    let result = inner.send(&message).await;
+                if let Some(PendingSend { op, reply }) = pending {
+                    let result = op.dispatch(&inner).await;
                     let _ = reply.send(result);
                 }
             }
@@ -288,7 +333,7 @@ impl Channel for PacedChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        self.paced_dispatch(message.clone()).await
+        self.paced_dispatch(PacedOp::Send(message.clone())).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -341,11 +386,17 @@ impl Channel for PacedChannel {
     }
 
     async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
-        // Finalise is the terminal write to the draft — route it through
-        // the same queue as `send` so a burst of streamed replies still
-        // respects the floor and the overflow contract.
-        let synthesised = SendMessage::new(text, recipient).in_thread(Some(message_id.to_string()));
-        self.paced_dispatch(synthesised).await
+        // Finalise is the terminal write to the draft — route it through the
+        // same pacing queue as `send` so a burst of streamed replies respects
+        // the floor and the overflow contract. The op preserves its identity
+        // so the worker dispatches to `inner.finalize_draft` (editing the
+        // existing draft) rather than `inner.send` (posting a new message).
+        self.paced_dispatch(PacedOp::FinalizeDraft {
+            recipient: recipient.to_string(),
+            message_id: message_id.to_string(),
+            text: text.to_string(),
+        })
+        .await
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
@@ -426,6 +477,7 @@ mod tests {
 
     struct CountingChannel {
         sends: AtomicUsize,
+        finalize_drafts: AtomicUsize,
     }
 
     impl Attributable for CountingChannel {
@@ -450,12 +502,25 @@ mod tests {
         async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
             Ok(())
         }
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+        async fn finalize_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> Result<()> {
+            self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[tokio::test]
     async fn zero_interval_is_passthrough() {
         let inner = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
         });
         let cfg = PacingFixture {
             interval_secs: 0,
@@ -472,6 +537,7 @@ mod tests {
     async fn first_send_records_recipient_state() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // Use 1h to make the wait long enough that we can assert the
@@ -498,6 +564,7 @@ mod tests {
     async fn different_recipients_track_state_independently() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h interval again — we only ever send once per recipient, so
@@ -526,6 +593,7 @@ mod tests {
     async fn small_interval_sleeps_long_enough_between_repeats() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -554,6 +622,7 @@ mod tests {
     async fn queue_overflow_drops_newest_and_warns() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -595,6 +664,73 @@ mod tests {
             counting.sends.load(Ordering::SeqCst),
             3,
             "queue overflow must drop the newest send before the inner channel sees it",
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_dispatches_to_inner_finalize_not_send() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        // 1h floor: the first op fires immediately, so no real time elapses.
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        paced
+            .finalize_draft("alice", "msg-1", "final text")
+            .await
+            .unwrap();
+        // A draft finalization must edit the existing draft via the inner
+        // channel's finalize_draft — routing it through send would post a new
+        // message and leave the draft stale.
+        assert_eq!(
+            counting.finalize_drafts.load(Ordering::SeqCst),
+            1,
+            "finalize_draft must dispatch to inner.finalize_draft",
+        );
+        assert_eq!(
+            counting.sends.load(Ordering::SeqCst),
+            0,
+            "finalize_draft must not be routed through inner.send",
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_finalize_draft_preserves_op_through_worker() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let cfg = PacingFixture {
+            interval_secs: 1,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        // First op fires immediately and starts the floor.
+        paced
+            .send(&SendMessage::new("first", "alice"))
+            .await
+            .unwrap();
+        // Second op (a finalize) is queued behind the floor and drained by
+        // the worker — it must still dispatch as a finalize, not a send.
+        paced
+            .finalize_draft("alice", "msg-1", "final text")
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.finalize_drafts.load(Ordering::SeqCst),
+            1,
+            "queued finalize_draft must dispatch to inner.finalize_draft via the worker",
+        );
+        assert_eq!(
+            counting.sends.load(Ordering::SeqCst),
+            1,
+            "only the first send should reach inner.send; the finalize must not",
         );
     }
 }
