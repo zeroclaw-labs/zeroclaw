@@ -288,20 +288,57 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
 ///
 /// The daemon must start no matter what so the config can be repaired through
 /// the gateway, CLI, or dashboard. This function therefore degrades instead of
-/// failing:
+/// failing; see [`migrate_to_current_salvaged`] for the salvage contract and
+/// the security-section caveat. This thin wrapper discards the salvage report
+/// for callers that only need the `Config`.
+pub fn migrate_to_current_resilient(input: &str) -> Config {
+    migrate_to_current_salvaged(input).config
+}
+
+/// Top-level config keys whose silent loss could *weaken* the running
+/// security posture. "Secure by default" cuts both ways: if one of these
+/// sections is malformed, reverting it to its serde `Default` may grant a
+/// broader posture than the operator intended (e.g. a dropped `[security]`
+/// table loses hardening; a dropped `risk_profiles`/`peer_groups` loses
+/// authorization scoping). Salvage still drops them so the daemon can boot —
+/// but it logs at ERROR (not WARN) and reports them in
+/// [`ResilientLoad::dropped_security`] so the caller can refuse network
+/// exposure until the operator repairs the file.
+pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
+
+/// Result of a resilient (never-failing) config load.
+#[derive(Debug, Clone, Default)]
+pub struct ResilientLoad {
+    /// The loaded config — always present, carrying every section that
+    /// parsed and `Default` for every section that had to be dropped.
+    pub config: Config,
+    /// Dotted paths of non-security sections/aliases dropped during salvage
+    /// (logged at WARN). Empty on a clean load.
+    pub dropped: Vec<String>,
+    /// Top-level [`SECURITY_CRITICAL_KEYS`] sections that had to be dropped
+    /// to their `Default` (logged at ERROR). Non-empty means the running
+    /// posture may be weaker than intended; the caller should refuse
+    /// exposure until repaired.
+    pub dropped_security: Vec<String>,
+}
+
+/// Daemon load path with a full salvage report. Degrades instead of failing:
 ///
 /// 1. Strict deserialize (identical to [`migrate_to_current`]) — the common
 ///    case, zero behavior change for valid configs.
-/// 2. If that fails, drop each invalid `[channels.<type>.<alias>]` and each
-///    invalid top-level section, substituting the section's `Default`. Every
-///    drop is logged at WARN with the offending path.
+/// 2. If that fails, drop each invalid `[channels.<type>.<alias>]`, each
+///    invalid `[channels.<type>]` whole-type block (e.g. a scalar where a
+///    table is required), and each invalid top-level section — substituting
+///    the section's `Default`. Non-security drops log at WARN; security-
+///    critical drops ([`SECURITY_CRITICAL_KEYS`]) log at ERROR and surface in
+///    [`ResilientLoad::dropped_security`].
 /// 3. If even the migration/parse stage fails (not valid TOML, or an
 ///    unsupported future schema), fall back to `Config::default()` so the
 ///    process still boots. The original error is logged at ERROR.
 ///
 /// `Config::validate()` is intentionally NOT run here — a config that fails
 /// validation must still load so it can be fixed.
-pub fn migrate_to_current_resilient(input: &str) -> Config {
+pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
     let value = match migrate_value(input) {
         Ok(value) => value,
         Err(err) => {
@@ -313,7 +350,11 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
                 "config could not be parsed or migrated; starting on defaults so it \
                  can be repaired (gateway /api/config, `zeroclaw config migrate`)"
             );
-            return Config::default();
+            return ResilientLoad {
+                config: Config::default(),
+                dropped: Vec::new(),
+                dropped_security: Vec::new(),
+            };
         }
     };
     deserialize_resilient(value)
@@ -349,18 +390,23 @@ fn migrate_value(input: &str) -> Result<toml::Value> {
 /// Deserialize a migrated `toml::Value` into `Config`, never failing.
 ///
 /// Strict first; on failure, salvage broken `[channels.<type>.<alias>]`
-/// entries, then drop any remaining top-level section that blocks the load
-/// (substituting its `Default`). Every drop is logged at WARN. The returned
-/// `Config` always carries every section that parsed, so the operator only
-/// loses the specific broken blocks — which the repair surfaces can then fix.
-fn deserialize_resilient(value: toml::Value) -> Config {
+/// entries and broken `[channels.<type>]` whole-type blocks, then drop any
+/// remaining top-level section that blocks the load (substituting its
+/// `Default`). The returned `Config` always carries every section that
+/// parsed, so the operator only loses the specific broken blocks.
+fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     if let Ok(config) = value.clone().try_into::<Config>() {
-        return config;
+        return ResilientLoad {
+            config,
+            dropped: Vec::new(),
+            dropped_security: Vec::new(),
+        };
     }
 
     let mut salvaged = value;
     let mut dropped: Vec<String> = Vec::new();
     prune_bad_channel_aliases(&mut salvaged, &mut dropped);
+    prune_bad_channel_types(&mut salvaged, &mut dropped);
     prune_bad_top_level_sections(&mut salvaged, &mut dropped);
 
     let config = salvaged.try_into::<Config>().unwrap_or_else(|err| {
@@ -377,7 +423,17 @@ fn deserialize_resilient(value: toml::Value) -> Config {
         Config::default()
     });
 
-    for path in &dropped {
+    let mut dropped_security: Vec<String> = Vec::new();
+    let mut dropped_plain: Vec<String> = Vec::new();
+    for path in dropped {
+        if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) {
+            dropped_security.push(path);
+        } else {
+            dropped_plain.push(path);
+        }
+    }
+
+    for path in &dropped_plain {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -389,47 +445,96 @@ fn deserialize_resilient(value: toml::Value) -> Config {
             )
         );
     }
+    for path in &dropped_security {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "dropped_security_config": path })),
+            &format!(
+                "SECURITY-CRITICAL config section `{path}` is invalid and was reset to \
+                 its default so the daemon can boot; the running posture may be WEAKER \
+                 than intended — repair `{path}` and reload before trusting this instance"
+            )
+        );
+    }
 
-    config
+    ResilientLoad {
+        config,
+        dropped: dropped_plain,
+        dropped_security,
+    }
 }
 
-/// Drop any top-level `[section]` whose removal is required for the config to
-/// deserialize, substituting the section's `Default` via serde. Each candidate
-/// is tested by removing it from a clone and re-deserializing; a section is
-/// dropped only when its removal is what fixes the load, so valid sections are
-/// never touched. Removed paths are appended to `dropped`.
+/// Drop any top-level `[section]` that blocks the config from deserializing,
+/// substituting the section's `Default` via serde. A section is dropped when it
+/// is the offender; valid sections are never touched. Two complementary probes
+/// catch every reachable case:
+///
+/// 1. **Joint:** if removing a single key makes the whole config valid, that
+///    key was the sole offender — drop it and finish.
+/// 2. **Isolated:** otherwise drop every key that fails to deserialize *in
+///    isolation* (its own section, wrapped alone, will not parse). This catches
+///    multiple independent offenders in one pass — e.g. two unrelated malformed
+///    sections — which the joint probe alone cannot, since neither one's
+///    removal validates the config while the other remains broken.
+///
+/// Removed paths are appended to `dropped`.
 fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<String>) {
-    let Some(root) = value.as_table_mut() else {
+    if value.as_table().is_none() {
         return;
-    };
-    let keys: Vec<String> = root.keys().cloned().collect();
-    for key in keys {
-        if value.clone().try_into::<Config>().is_ok() {
-            break;
-        }
+    }
+    if value.clone().try_into::<Config>().is_ok() {
+        return;
+    }
+
+    let keys: Vec<String> = value
+        .as_table()
+        .expect("root is a table")
+        .keys()
+        .cloned()
+        .collect();
+    for key in &keys {
         let root = value.as_table_mut().expect("root is a table");
-        let Some(removed) = root.remove(&key) else {
+        let Some(removed) = root.remove(key) else {
             continue;
         };
         if value.clone().try_into::<Config>().is_ok() {
-            // Removing this key fixed (or advanced) the load — it was the
-            // offender. Leave it dropped; serde fills the section default.
+            dropped.push(key.clone());
+            return;
+        }
+        value
+            .as_table_mut()
+            .expect("root is a table")
+            .insert(key.clone(), removed);
+    }
+
+    for key in keys {
+        let still_present = value.as_table().and_then(|root| root.get(&key)).cloned();
+        let Some(section) = still_present else {
+            continue;
+        };
+        if top_level_section_is_invalid(&key, &section) {
+            value.as_table_mut().expect("root is a table").remove(&key);
             dropped.push(key);
-        } else {
-            // Removing it did not help; restore and keep probing. The real
-            // offender is a different key (handled on a later iteration).
-            value
-                .as_table_mut()
-                .expect("root is a table")
-                .insert(key, removed);
         }
     }
 }
 
-/// Remove every `[channels.<type>.<alias>]` entry that cannot deserialize
-/// into its concrete channel config type. Each alias is checked in isolation
-/// via [`channel_alias_is_invalid`]; valid aliases sharing a `[channels]`
-/// section with a broken sibling are preserved. Dropped paths
+/// True when a single top-level `[section]` cannot deserialize into `Config`
+/// when it is the only key present. Wraps `{ <key> = <section> }` and runs it
+/// through the strict deserializer, isolating the failure to this one section
+/// so independent offenders are each judged on their own.
+fn top_level_section_is_invalid(key: &str, section: &toml::Value) -> bool {
+    let mut root = toml::value::Table::new();
+    root.insert(key.to_string(), section.clone());
+    toml::Value::Table(root).try_into::<Config>().is_err()
+}
+
+/// Drop every `[channels.<type>.<alias>]` entry that cannot deserialize into
+/// its concrete channel config type. Each alias is checked in isolation via
+/// [`channel_alias_is_invalid`]; valid aliases sharing a `[channels]` section
+/// with a broken sibling are preserved. Dropped paths
 /// (`channels.<type>.<alias>`) are appended to `dropped`.
 fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
     let Some(channels) = value
@@ -454,6 +559,62 @@ fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>)
             dropped.push(format!("channels.{chan_type}.{alias}"));
         }
     }
+}
+
+/// Drop every `[channels.<type>]` whole-type block that still blocks the load
+/// after alias-level pruning — e.g. a scalar written where an alias table is
+/// required (`email = "oops"`), or a type whose remaining shape is invalid.
+/// Critically this drops ONLY the offending channel type, never the entire
+/// `[channels]` section, so valid sibling channel types survive. Dropped paths
+/// (`channels.<type>`) are appended to `dropped`.
+fn prune_bad_channel_types(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(channel_types) = value
+        .as_table()
+        .and_then(|root| root.get("channels"))
+        .and_then(toml::Value::as_table)
+        .map(|chans| chans.keys().cloned().collect::<Vec<_>>())
+    else {
+        return;
+    };
+
+    for chan_type in channel_types {
+        if channels_section_is_valid(value) {
+            return;
+        }
+        let Some(removed) = value
+            .as_table_mut()
+            .and_then(|root| root.get_mut("channels"))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|chans| chans.remove(&chan_type))
+        else {
+            continue;
+        };
+        if channels_section_is_valid(value) {
+            dropped.push(format!("channels.{chan_type}"));
+        } else {
+            value
+                .as_table_mut()
+                .and_then(|root| root.get_mut("channels"))
+                .and_then(toml::Value::as_table_mut)
+                .expect("channels is a table")
+                .insert(chan_type, removed);
+        }
+    }
+}
+
+/// True when the `[channels]` section of `value` deserializes cleanly,
+/// isolating channel-section validity from defects elsewhere in the config.
+fn channels_section_is_valid(value: &toml::Value) -> bool {
+    let Some(channels) = value
+        .as_table()
+        .and_then(|root| root.get("channels"))
+        .cloned()
+    else {
+        return true;
+    };
+    let mut root = toml::value::Table::new();
+    root.insert("channels".to_string(), channels);
+    toml::Value::Table(root).try_into::<Config>().is_ok()
 }
 
 /// True when a single `[channels.<type>.<alias>]` table cannot deserialize
@@ -969,6 +1130,92 @@ from_address = "a@example.com"
         assert!(
             migrate_to_current(raw).is_err(),
             "strict path must surface the defect for repair tooling"
+        );
+    }
+
+    #[test]
+    fn broken_security_section_is_reported_as_degraded() {
+        let raw = r#"
+schema_version = 3
+
+[security]
+audit = "should-be-a-table-not-a-string"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped_security.iter().any(|p| p == "security"),
+            "malformed [security] must be reported as a security-critical drop"
+        );
+        assert!(
+            load.dropped.is_empty(),
+            "security drop must not also appear in the plain dropped list"
+        );
+    }
+
+    #[test]
+    fn broken_non_security_section_is_plain_drop_not_security() {
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = "not-a-bool"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|p| p == "heartbeat"),
+            "malformed [heartbeat] must be a plain drop"
+        );
+        assert!(
+            load.dropped_security.is_empty(),
+            "a non-security section must never be flagged security-critical"
+        );
+    }
+
+    #[test]
+    fn broken_channel_type_block_is_dropped_not_fatal() {
+        let raw = r#"
+schema_version = 3
+
+[channels]
+email = "oops-this-should-be-a-table"
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|p| p == "channels.email"),
+            "the broken whole-type block must be dropped, got {:?}",
+            load.dropped
+        );
+        assert!(
+            load.config.channels.telegram.contains_key("main"),
+            "valid sibling channel type must survive a broken-type drop"
+        );
+    }
+
+    #[test]
+    fn multiple_independent_bad_sections_all_dropped() {
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = "not-a-bool"
+
+[backup]
+enabled = "also-not-a-bool"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|p| p == "heartbeat"),
+            "first offender must be dropped, got {:?}",
+            load.dropped
+        );
+        assert!(
+            load.dropped.iter().any(|p| p == "backup"),
+            "second offender must be dropped, got {:?}",
+            load.dropped
         );
     }
 

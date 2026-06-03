@@ -102,6 +102,14 @@ pub struct Config {
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
     pub dirty_paths: std::collections::HashSet<String>,
+    /// Top-level security-critical sections (`security`, `risk_profiles`,
+    /// `peer_groups`) that the resilient daemon loader had to reset to their
+    /// defaults because the on-disk block was malformed. Non-empty means the
+    /// running posture may be WEAKER than the operator intended; exposure-
+    /// gating code should refuse to trust the instance until the operator
+    /// repairs the file. Never serialized — purely a load-time signal.
+    #[serde(skip)]
+    pub degraded_security: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -13594,6 +13602,7 @@ impl Default for Config {
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -14429,9 +14438,14 @@ impl Config {
             // operator needs the process up to repair it (gateway
             // /api/config, `zeroclaw config migrate`, dashboard). The
             // resilient path degrades — dropping invalid channel aliases and
-            // sections to their defaults with a WARN — instead of aborting.
-            // Strict validation lives in `zeroclaw config migrate`.
-            let mut config: Config = crate::migration::migrate_to_current_resilient(&contents);
+            // sections to their defaults — instead of aborting. Non-security
+            // drops log at WARN; security-critical drops log at ERROR and are
+            // recorded on `config.degraded_security` so exposure-gating code
+            // can refuse to trust the instance until repaired. Strict
+            // validation lives in `zeroclaw config migrate`.
+            let salvage = crate::migration::migrate_to_current_salvaged(&contents);
+            let mut config: Config = salvage.config;
+            config.degraded_security = salvage.dropped_security;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -17012,6 +17026,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -17734,6 +17749,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
