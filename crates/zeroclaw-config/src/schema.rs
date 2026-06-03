@@ -18957,6 +18957,8 @@ bot_token = "xoxb-tok"
             auth_header: None,
             secret: None,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
             max_retries: Some(5),
             retry_base_delay_ms: Some(250),
             retry_max_delay_ms: Some(10_000),

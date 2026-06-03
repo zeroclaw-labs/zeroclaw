@@ -272,7 +272,7 @@ impl PacedChannel {
         let recipients = Arc::clone(&self.recipients);
         let inner = Arc::clone(&self.inner);
         let min_interval = self.min_interval;
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             loop {
                 // Wait until the floor has elapsed for this recipient.
                 let sleep_for = {
@@ -643,8 +643,14 @@ mod tests {
         // and the overflow path would never trigger.
         let paced_a = Arc::clone(&paced);
         let paced_b = Arc::clone(&paced);
-        let h_a = tokio::spawn(async move { paced_a.send(&SendMessage::new("a", "alice")).await });
-        let h_b = tokio::spawn(async move { paced_b.send(&SendMessage::new("b", "alice")).await });
+        let h_a =
+            zeroclaw_spawn::spawn!(
+                async move { paced_a.send(&SendMessage::new("a", "alice")).await }
+            );
+        let h_b =
+            zeroclaw_spawn::spawn!(
+                async move { paced_b.send(&SendMessage::new("b", "alice")).await }
+            );
         // Yield enough times for both spawned tasks to make it past the
         // lock acquire and into the queue. 50ms is well inside the 1s
         // pacing floor so the worker hasn't drained anything yet.

@@ -1625,6 +1625,8 @@ mod tests {
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config.channels.discord.insert(
@@ -1645,6 +1647,8 @@ mod tests {
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(!has_supervised_channels(&config));
