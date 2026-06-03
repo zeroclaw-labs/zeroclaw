@@ -154,8 +154,11 @@ because it is encrypted per-config-dir (below), that is where the pain starts.
 
 **Auth profiles are not portable.** `auth-profiles.json` is encrypted (`enc2:`)
 with the config-dir's `.secret_key`. You cannot copy one host's profile to
-another — the target cannot decrypt it (`enc2: decryption failed — wrong
-.secret_key`). Each host imports its own profile from a raw `~/.codex/auth.json`.
+another — the target cannot decrypt it; the runtime logs
+`` enc2: decryption failed (wrong `.secret_key` or tampered ciphertext) `` (the
+`or tampered ciphertext` clause shares this error path, so the message alone does
+not distinguish a foreign profile from a corrupt blob). Each host imports its own
+profile from a raw `~/.codex/auth.json`.
 If a foreign `auth-profiles.json` is already present, move it aside first or the
 import fails trying to load it:
 
