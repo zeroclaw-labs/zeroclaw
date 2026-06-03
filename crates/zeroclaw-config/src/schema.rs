@@ -15831,7 +15831,6 @@ impl Config {
         let _ = self.create_map_key(section, alias);
     }
 
-
     pub fn clear_dirty(&mut self) {
         self.dirty_paths.clear();
     }
