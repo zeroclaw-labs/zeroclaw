@@ -13142,6 +13142,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
+ "zeroclaw-spawn",
  "zeroclaw-tools",
 ]
 

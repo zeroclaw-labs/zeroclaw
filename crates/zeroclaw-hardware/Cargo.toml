@@ -52,6 +52,7 @@ dev-sim = []
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "macros"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+zeroclaw-spawn.workspace = true
 
 [[example]]
 name = "esp32_sim"

@@ -165,16 +165,14 @@ async fn main() -> Result<()> {
     let http_state = state.clone();
     let pty_state = state.clone();
 
-    let http_handle = tokio::spawn({
-        let bind_addr = bind_addr.clone();
-        async move {
-            if let Err(e) = run_http_server(http_state, bind_addr).await {
-                eprintln!("http server crashed: {}", e);
-            }
+    let bind_for_http = bind_addr.clone();
+    let http_handle = zeroclaw_spawn::spawn!(async move {
+        if let Err(e) = run_http_server(http_state, bind_for_http).await {
+            eprintln!("http server crashed: {}", e);
         }
     });
 
-    let pty_handle = tokio::spawn(async move {
+    let pty_handle = zeroclaw_spawn::spawn!(async move {
         if let Err(e) = run_pty_loop(port, pty_state).await {
             eprintln!("pty loop crashed: {}", e);
         }
