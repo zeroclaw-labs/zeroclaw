@@ -174,6 +174,14 @@ See `anthropic.rs` as a reference for a provider with a fully custom wire format
 - Firewall, proxy, egress rules? VPS providers sometimes block outbound high ports.
 - Vendor status page if it's a hosted service.
 
+### Gateway rejects `temperature`
+
+Some gateways (e.g. a LiteLLM proxy fronting `claude-opus-4-7`) return an error
+when a `temperature` field is present at all. ZeroClaw honors the `Option`
+contract: if you leave `temperature` unset in config, the field is **omitted**
+from the request body entirely and the backend picks its own default. Only set
+`temperature` explicitly when the endpoint accepts it.
+
 ## See also
 
 - [Overview](./overview.md) — provider model and how per-agent dispatch works
