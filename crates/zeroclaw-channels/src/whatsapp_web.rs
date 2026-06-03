@@ -272,20 +272,29 @@ impl WhatsAppWebChannel {
     }
 
     /// Check whether a phone number is allowed against a provided allowlist.
+    ///
+    /// The per-entry comparison is E.164 normalization, which the in-tree
+    /// `crate::allowlist::Match` modes can't express, so it goes through
+    /// `crate::allowlist::is_user_allowed_by` with a custom matcher. `phone`
+    /// is matched only after `normalize_phone_token`; a token with no canonical
+    /// form never matches. `allowed_numbers` is the caller's freshly-resolved
+    /// peer list, so no allowlist state is cached.
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
+        // This channel historically accepted a surrounding-whitespace wildcard
+        // (`entry.trim() == "*"`), which is broader than the shared helper's
+        // exact `"*"` check, so keep that pre-check here.
         if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
             return true;
         }
-
-        let Some(phone_norm) = Self::normalize_phone_token(phone) else {
-            return false;
-        };
-
-        allowed_numbers.iter().any(|entry| {
-            Self::normalize_phone_token(entry)
-                .as_deref()
-                .is_some_and(|allowed_norm| allowed_norm == phone_norm)
+        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
+            match (
+                Self::normalize_phone_token(entry),
+                Self::normalize_phone_token(phone),
+            ) {
+                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
+                _ => false,
+            }
         })
     }
 
