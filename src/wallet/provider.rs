@@ -15,7 +15,7 @@ impl EvmProvider {
     pub fn connect(rpc_url: &str, chain_id: u64) -> anyhow::Result<Self> {
         let parsed: reqwest::Url = rpc_url
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid RPC URL: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid RPC URL: {e}")))?;
         Ok(Self {
             rpc_url: parsed,
             chain_id,
@@ -35,7 +35,7 @@ impl EvmProvider {
         let balance = provider
             .get_balance(address)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get balance: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to get balance: {e}")))?;
         Ok(balance)
     }
 
@@ -54,7 +54,7 @@ impl EvmProvider {
         let pending = signer_provider
             .send_transaction(tx)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to send transaction: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to send transaction: {e}")))?;
 
         Ok(*pending.tx_hash())
     }
@@ -64,7 +64,7 @@ impl EvmProvider {
         let receipt = provider
             .get_transaction_receipt(hash)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get transaction receipt: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to get transaction receipt: {e}")))?;
         Ok(receipt)
     }
 
@@ -76,7 +76,7 @@ impl EvmProvider {
         let result = provider
             .call(tx)
             .await
-            .map_err(|e| anyhow::anyhow!("eth_call failed: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("eth_call failed: {e}")))?;
         Ok(result)
     }
 
@@ -95,7 +95,7 @@ impl EvmProvider {
         let pending = signer_provider
             .send_transaction(tx)
             .await
-            .map_err(|e| anyhow::anyhow!("Contract tx failed: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Contract tx failed: {e}")))?;
         Ok(*pending.tx_hash())
     }
 }

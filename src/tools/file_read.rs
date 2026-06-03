@@ -44,7 +44,7 @@ impl Tool for FileReadTool {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'path' parameter"))?;
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {

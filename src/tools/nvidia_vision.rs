@@ -65,7 +65,7 @@ impl Tool for NvidiaVisionTool {
         let image_url = args
             .get("image_url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'image_url' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'image_url' parameter"))?;
 
         if !image_url.starts_with("https://") {
             anyhow::bail!("image_url must use https:// scheme");
@@ -97,7 +97,7 @@ impl Tool for NvidiaVisionTool {
         let prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'prompt' parameter"))?;
 
         let model = args
             .get("model")

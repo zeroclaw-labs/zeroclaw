@@ -302,7 +302,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
-                return Err(anyhow::anyhow!(e)).context("Failed to migrate goals schema");
+                return Err(anyhow::Error::msg(e)).context("Failed to migrate goals schema");
             }
         }
     }

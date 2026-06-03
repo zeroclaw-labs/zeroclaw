@@ -118,7 +118,7 @@ impl Tool for DelegateTool {
             .get("agent")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("Missing 'agent' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'agent' parameter"))?;
 
         if agent_name.is_empty() {
             return Ok(ToolResult {
@@ -132,7 +132,7 @@ impl Tool for DelegateTool {
             .get("prompt")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'prompt' parameter"))?;
 
         if prompt.is_empty() {
             return Ok(ToolResult {

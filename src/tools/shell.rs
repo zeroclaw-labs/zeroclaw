@@ -73,7 +73,7 @@ impl Tool for ShellTool {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'command' parameter"))?;
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())

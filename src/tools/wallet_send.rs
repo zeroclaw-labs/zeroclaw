@@ -53,20 +53,20 @@ impl Tool for WalletSendTool {
         let to_str = args
             .get("to")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: to"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: to"))?;
 
         let amount_str = args
             .get("amount_wei")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: amount_wei"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: amount_wei"))?;
 
         let to: Address = to_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid recipient address: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid recipient address: {e}")))?;
 
         let value: U256 = amount_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid amount: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid amount: {e}")))?;
 
         if value.is_zero() {
             anyhow::bail!("Refusing to send zero-value transaction");
@@ -75,7 +75,7 @@ impl Tool for WalletSendTool {
         let keypair = self
             .store
             .load()
-            .map_err(|e| anyhow::anyhow!("Failed to load wallet: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to load wallet: {e}")))?;
 
         let from = keypair.address();
         let tx_hash = self.provider.send_eth(&keypair, to, value).await?;

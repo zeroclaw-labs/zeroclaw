@@ -71,7 +71,7 @@ impl Tool for NvidiaCosmosWorldModelTool {
         let scenario = args
             .get("scenario")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'scenario' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'scenario' parameter"))?;
 
         let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
 

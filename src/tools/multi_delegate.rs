@@ -467,7 +467,7 @@ impl Tool for MultiDelegateTool {
         let tasks_val = args
             .get("tasks")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'tasks' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing or invalid 'tasks' parameter"))?;
 
         if tasks_val.is_empty() {
             return Ok(ToolResult {

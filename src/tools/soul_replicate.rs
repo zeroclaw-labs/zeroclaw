@@ -48,11 +48,11 @@ impl Tool for SoulReplicateTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let child_id = args["child_id"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("child_id must be a string"))?;
+            .ok_or_else(|| anyhow::Error::msg("child_id must be a string"))?;
 
         let constitution_hash = args["constitution_hash"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("constitution_hash must be a string"))?;
+            .ok_or_else(|| anyhow::Error::msg("constitution_hash must be a string"))?;
 
         let mut mgr = self.manager.lock();
 

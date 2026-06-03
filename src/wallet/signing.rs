@@ -68,7 +68,7 @@ impl Eip712Signer {
             .signer()
             .sign_hash(&B256::from(signing_hash))
             .await
-            .map_err(|e| anyhow::anyhow!("EIP-712 signing failed: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("EIP-712 signing failed: {e}")))?;
 
         let sig_hex = format!("0x{}", hex::encode(signature.as_bytes()));
 

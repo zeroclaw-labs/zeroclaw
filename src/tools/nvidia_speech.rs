@@ -66,7 +66,7 @@ impl Tool for NvidiaRivaSpeechTool {
         let text = args
             .get("text")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'text' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'text' parameter"))?;
 
         if text.is_empty() {
             return Ok(ToolResult {

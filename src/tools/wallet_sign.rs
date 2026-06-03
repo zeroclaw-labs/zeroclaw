@@ -65,12 +65,12 @@ impl Tool for WalletSignTool {
         let recipient_str = args
             .get("recipient")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: recipient"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: recipient"))?;
 
         let amount_str = args
             .get("amount")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: amount"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: amount"))?;
 
         let chain_id = args
             .get("chain_id")
@@ -88,15 +88,15 @@ impl Tool for WalletSignTool {
         let keypair = self
             .store
             .load()
-            .map_err(|e| anyhow::anyhow!("Failed to load wallet: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to load wallet: {e}")))?;
 
         // Parse inputs
         let recipient: Address = recipient_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid recipient address: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid recipient address: {e}")))?;
         let amount: U256 = amount_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid amount: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid amount: {e}")))?;
 
         // Sign
         let signed =

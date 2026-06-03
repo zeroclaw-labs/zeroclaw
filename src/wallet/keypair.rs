@@ -38,7 +38,7 @@ impl WalletKeypair {
         let key = hex_key.strip_prefix("0x").unwrap_or(hex_key);
         let signer: PrivateKeySigner = key
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid private key hex: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid private key hex: {e}")))?;
         Ok(Self { signer })
     }
 

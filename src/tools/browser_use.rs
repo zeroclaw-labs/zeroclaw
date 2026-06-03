@@ -148,14 +148,14 @@ impl Tool for BrowserUseTool {
         let action_str = args
             .get("action")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Missing required field: action"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required field: action"))?;
 
         let action = BrowserUseAction::from_str(action_str)?;
 
         let goal = args
             .get("goal")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Missing required field: goal"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required field: goal"))?;
 
         let max_steps = args
             .get("max_steps")

@@ -89,7 +89,7 @@ impl X402Client {
             .head(url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HEAD request failed: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("HEAD request failed: {e}")))?;
 
         if head_resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
             return Ok(X402PaymentResult {
@@ -106,13 +106,13 @@ impl X402Client {
             .headers()
             .get("x-payment-recipient")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow::anyhow!("402 response missing x-payment-recipient header"))?;
+            .ok_or_else(|| anyhow::Error::msg("402 response missing x-payment-recipient header"))?;
 
         let amount_str = head_resp
             .headers()
             .get("x-payment-amount")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow::anyhow!("402 response missing x-payment-amount header"))?;
+            .ok_or_else(|| anyhow::Error::msg("402 response missing x-payment-amount header"))?;
 
         let chain_id: u64 = head_resp
             .headers()
@@ -138,10 +138,10 @@ impl X402Client {
         // Parse amounts
         let recipient: Address = recipient_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid recipient address: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid recipient address: {e}")))?;
         let amount: U256 = amount_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid payment amount: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid payment amount: {e}")))?;
 
         // Extract domain for treasury check
         let domain = reqwest::Url::parse(url)
@@ -177,7 +177,7 @@ impl X402Client {
             .header("x-payment", &payment_json)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Paid request failed: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Paid request failed: {e}")))?;
 
         Ok(X402PaymentResult {
             success: retry_resp.status().is_success(),

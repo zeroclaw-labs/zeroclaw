@@ -68,7 +68,7 @@ impl Tool for ScheduleTool {
         let action = args
             .get("action")
             .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'action' parameter"))?;
 
         match action {
             "list" => self.handle_list(),
@@ -76,7 +76,7 @@ impl Tool for ScheduleTool {
                 let id = args
                     .get("id")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for get action"))?;
+                    .ok_or_else(|| anyhow::Error::msg("Missing 'id' parameter for get action"))?;
                 self.handle_get(id)
             }
             "create" | "add" | "once" => {
@@ -92,7 +92,9 @@ impl Tool for ScheduleTool {
                 let id = args
                     .get("id")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for cancel action"))?;
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("Missing 'id' parameter for cancel action")
+                    })?;
                 Ok(self.handle_cancel(id))
             }
             "pause" => {
@@ -102,7 +104,7 @@ impl Tool for ScheduleTool {
                 let id = args
                     .get("id")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for pause action"))?;
+                    .ok_or_else(|| anyhow::Error::msg("Missing 'id' parameter for pause action"))?;
                 Ok(self.handle_pause_resume(id, true))
             }
             "resume" => {
@@ -112,7 +114,9 @@ impl Tool for ScheduleTool {
                 let id = args
                     .get("id")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for resume action"))?;
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("Missing 'id' parameter for resume action")
+                    })?;
                 Ok(self.handle_pause_resume(id, false))
             }
             other => Ok(ToolResult {
@@ -224,7 +228,7 @@ impl ScheduleTool {
             .get("command")
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing or empty 'command' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing or empty 'command' parameter"))?;
 
         let expression = args.get("expression").and_then(|value| value.as_str());
         let delay = args.get("delay").and_then(|value| value.as_str());
@@ -303,9 +307,10 @@ impl ScheduleTool {
             });
         }
 
-        let run_at_raw = run_at.ok_or_else(|| anyhow::anyhow!("Missing scheduling parameters"))?;
+        let run_at_raw =
+            run_at.ok_or_else(|| anyhow::Error::msg("Missing scheduling parameters"))?;
         let run_at_parsed: DateTime<Utc> = DateTime::parse_from_rfc3339(run_at_raw)
-            .map_err(|error| anyhow::anyhow!("Invalid run_at timestamp: {error}"))?
+            .map_err(|error| anyhow::Error::msg(format!("Invalid run_at timestamp: {error}")))?
             .with_timezone(&Utc);
 
         let job = cron::add_once_at(&self.config, run_at_parsed, command)?;

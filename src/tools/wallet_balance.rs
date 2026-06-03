@@ -48,16 +48,16 @@ impl Tool for WalletBalanceTool {
         {
             addr_str
                 .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid address: {e}"))?
+                .map_err(|e| anyhow::Error::msg(format!("Invalid address: {e}")))?
         } else {
             let addr_str = self
                 .store
                 .address()
-                .map_err(|e| anyhow::anyhow!("No wallet available: {e}"))?;
+                .map_err(|e| anyhow::Error::msg(format!("No wallet available: {e}")))?;
             addr_str
                 .as_str()
                 .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid wallet address: {e}"))?
+                .map_err(|e| anyhow::Error::msg(format!("Invalid wallet address: {e}")))?
         };
 
         let balance = self.provider.get_balance(address).await?;

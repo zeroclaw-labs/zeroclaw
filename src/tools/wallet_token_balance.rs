@@ -51,26 +51,26 @@ impl Tool for WalletTokenBalanceTool {
         let token_str = args
             .get("token_address")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: token_address"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: token_address"))?;
 
         let token_addr: Address = token_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid token address: {e}")))?;
 
         let account: Address = if let Some(addr_str) = args.get("address").and_then(|v| v.as_str())
         {
             addr_str
                 .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid address: {e}"))?
+                .map_err(|e| anyhow::Error::msg(format!("Invalid address: {e}")))?
         } else {
             let addr_str = self
                 .store
                 .address()
-                .map_err(|e| anyhow::anyhow!("No wallet available: {e}"))?;
+                .map_err(|e| anyhow::Error::msg(format!("No wallet available: {e}")))?;
             addr_str
                 .as_str()
                 .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid wallet address: {e}"))?
+                .map_err(|e| anyhow::Error::msg(format!("Invalid wallet address: {e}")))?
         };
 
         let balance_data = self

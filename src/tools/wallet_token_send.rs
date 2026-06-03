@@ -56,29 +56,29 @@ impl Tool for WalletTokenSendTool {
         let token_str = args
             .get("token_address")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: token_address"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: token_address"))?;
 
         let to_str = args
             .get("to")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: to"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: to"))?;
 
         let amount_str = args
             .get("amount")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: amount"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: amount"))?;
 
         let token_addr: Address = token_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid token address: {e}")))?;
 
         let to: Address = to_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid recipient address: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid recipient address: {e}")))?;
 
         let amount: U256 = amount_str
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid amount: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Invalid amount: {e}")))?;
 
         if amount.is_zero() {
             anyhow::bail!("Refusing to send zero-amount token transfer");
@@ -87,7 +87,7 @@ impl Tool for WalletTokenSendTool {
         let keypair = self
             .store
             .load()
-            .map_err(|e| anyhow::anyhow!("Failed to load wallet: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to load wallet: {e}")))?;
 
         let from = keypair.address();
         let data = erc20::encode_transfer(to, amount);

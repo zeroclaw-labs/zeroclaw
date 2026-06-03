@@ -83,13 +83,13 @@ impl Tool for WalletPayTool {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing required parameter: url"))?;
 
         // Load wallet
         let keypair = self
             .store
             .load()
-            .map_err(|e| anyhow::anyhow!("Failed to load wallet: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to load wallet: {e}")))?;
 
         let http_client = reqwest::Client::new();
         let limits = self.treasury_limits();

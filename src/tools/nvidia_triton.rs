@@ -114,7 +114,7 @@ impl Tool for NvidiaTritonInferenceTool {
         let model_name = args
             .get("model_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'model_name' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'model_name' parameter"))?;
 
         let action = args
             .get("action")
@@ -188,7 +188,7 @@ impl Tool for NvidiaTritonInferenceTool {
                 let inputs_val = args.get("inputs").cloned().unwrap_or(json!([]));
                 let inputs_arr = inputs_val
                     .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("'inputs' must be an array for inference"))?;
+                    .ok_or_else(|| anyhow::Error::msg("'inputs' must be an array for inference"))?;
 
                 if inputs_arr.is_empty() {
                     return Ok(ToolResult {
