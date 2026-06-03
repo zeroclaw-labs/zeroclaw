@@ -2,13 +2,14 @@ use crate::util::*;
 use std::path::Path;
 use std::process::Command;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     build_refs(&root)?;
     build_api(&root)?;
-    let api_dest = book_dir(&root).join("book/api");
-    std::fs::create_dir_all(book_dir(&root).join("book"))?;
+    let tag_dir = tag.unwrap_or("master");
+    let api_dest = book_dir(&root).join("book").join(tag_dir).join("api");
+    std::fs::create_dir_all(book_dir(&root).join("book").join(tag_dir))?;
     let _ = std::fs::remove_dir_all(&api_dest);
     copy_dir_all(root.join("target/doc"), &api_dest)?;
     println!(

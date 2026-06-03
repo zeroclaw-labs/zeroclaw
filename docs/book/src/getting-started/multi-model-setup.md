@@ -180,7 +180,7 @@ The `dev` agent runs from the CLI (no channel binding required — `zeroclaw age
 
 ## Cost tiering — heavy model when needed, fast model otherwise
 
-Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Each agent picks the risk profile that matches its trust surface: `frontline` faces public traffic, so it gets a stricter `hardened` profile; `heavy` is reached only via `delegate` from inside the trusted agent loop, so it can run on a looser `permissive` profile.
+Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"`, and **both agents must share the same risk profile** (delegation does not cross trust tiers). So the frontline and heavy agents below run on the *same* `trusted` risk profile — they differ in model and runtime profile (iteration budget), not in trust surface.
 
 ```toml
 [providers.models.anthropic.opus]
@@ -197,29 +197,28 @@ bot_token = "..."
 
 [agents.frontline]
 model_provider  = "anthropic.haiku"
-risk_profile    = "hardened"     # public-facing strictness
+risk_profile    = "trusted"      # shared trust tier (delegation requires a match)
 runtime_profile = "tight"        # low iteration cap, fast turn-around
 channels        = ["telegram.home"]
 
 [agents.heavy]
 model_provider  = "anthropic.opus"
-risk_profile    = "permissive"   # internal-delegate trust
+risk_profile    = "trusted"      # SAME profile as frontline — required to be delegable
 runtime_profile = "deep"         # high iteration cap for chain-of-thought work
 # No channels — invoked via the delegate tool from frontline
 
-# risk_profile and runtime_profile reference independent alias maps —
-# the names above intentionally differ between the two profile kinds
-# to make that clear.
+# runtime_profile references an independent alias map from risk_profile;
+# the two agents share one risk profile but differ in runtime profile.
 
-[risk_profiles.hardened]
+[risk_profiles.trusted]
 level                            = "supervised"
 workspace_only                   = true
 require_approval_for_medium_risk = true
 block_high_risk_commands         = true
-
-[risk_profiles.permissive]
-level          = "full"
-workspace_only = false
+# allow this profile's agents to delegate to each other; without this,
+# delegation is forbidden by default.
+delegation_policy                = { mode = "allow" }
+allowed_tools                    = ["shell", "file_read", "memory_recall", "delegate"]
 
 [runtime_profiles.tight]
 max_tool_iterations  = 5
@@ -230,7 +229,7 @@ max_tool_iterations  = 50
 max_actions_per_hour = 200
 ```
 
-The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = "heavy"` and the heavier agent picks up the sub-task.
+The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = "heavy"`; because both agents share the `trusted` risk profile and that profile allows delegation, the heavier agent picks up the sub-task on Opus.
 
 ## Error handling
 

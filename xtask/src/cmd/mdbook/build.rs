@@ -3,7 +3,9 @@ use crate::util::*;
 use std::path::Path;
 use std::process::Command;
 
-pub fn run() -> anyhow::Result<()> {
+const DEFAULT_TAG: &str = "master";
+
+pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     ensure_cargo_tool("mdbook", "mdbook")?;
@@ -13,16 +15,20 @@ pub fn run() -> anyhow::Result<()> {
 
     build_refs(&root)?;
     build_api(&root)?;
-    build_locales(&root)?;
-    assemble(&root)?;
+    build_locales(&root, tag)?;
+    assemble(&root, tag)?;
     println!(
         "==> Done. Open: {}",
-        book_dir(&root).join("book/index.html").display()
+        book_dir(&root)
+            .join("book")
+            .join(tag.unwrap_or(DEFAULT_TAG))
+            .join("index.html")
+            .display()
     );
     Ok(())
 }
 
-pub fn build_locales(root: &std::path::Path) -> anyhow::Result<()> {
+pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()> {
     let book = book_dir(root);
     let entries = locale_entries();
     println!(
@@ -34,11 +40,14 @@ pub fn build_locales(root: &std::path::Path) -> anyhow::Result<()> {
             .join(" ")
     );
     inject_lang_switcher_locales(&book, &entries)?;
+    crate::cmd::mdbook::themes::run(root)?;
     let mdbook = mdbook_program()?;
+    let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     for entry in &entries {
+        let dest = format!("book/{}/{}", tag_dir, entry.code);
         run_cmd(
             Command::new(&mdbook)
-                .args(["build", "-d", &format!("book/{}", entry.code)])
+                .args(["build", "-d", &dest])
                 .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
                 .current_dir(&book),
         )?;
@@ -85,20 +94,121 @@ pub fn print_locales() {
     println!("{}", codes.join(" "));
 }
 
-pub fn assemble(root: &std::path::Path) -> anyhow::Result<()> {
+pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()> {
     println!("==> Assembling site (rustdoc + locale redirect)");
     let book = book_dir(root);
-    let api_dest = book.join("book/api");
+    let tag_dir = tag.unwrap_or(DEFAULT_TAG);
+    let api_dest = book.join("book").join(tag_dir).join("api");
     let _ = std::fs::remove_dir_all(&api_dest);
     copy_dir_all(root.join("target/doc"), &api_dest)?;
 
-    const INDEX_HTML: &str = "\
-<!doctype html>
-<meta charset=\"utf-8\">
-<meta http-equiv=\"refresh\" content=\"0; url=./en/\">
-<link rel=\"canonical\" href=\"./en/\">
-<title>ZeroClaw Docs</title>
-";
-    std::fs::write(book.join("book/index.html"), INDEX_HTML)?;
+    const INDEX_HTML: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0; url=./en/\">\n<link rel=\"canonical\" href=\"./en/\">\n<title>ZeroClaw Docs</title>\n";
+    let out_dir = book.join("book").join(tag_dir);
+    std::fs::create_dir_all(&out_dir)?;
+    std::fs::write(out_dir.join("index.html"), INDEX_HTML)?;
+    // Write small metadata file with the version tag
+    let version_meta = format!("{}\n", tag.unwrap_or(DEFAULT_TAG));
+    std::fs::write(out_dir.join("_version.txt"), version_meta)?;
+
+    let version_dir = out_dir;
+    let shared_dir = book.join("book").join("_shared");
+    extract_shared_chrome(&version_dir, &shared_dir)?;
+    Ok(())
+}
+
+pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::Result<()> {
+    println!("==> Extracting shared chrome layer");
+
+    let first_locale = locale_entries()
+        .into_iter()
+        .next()
+        .map(|e| e.code)
+        .unwrap_or_else(|| "en".to_string());
+    let src_dir = version_dir.join(&first_locale);
+    if !src_dir.exists() {
+        return Ok(());
+    }
+
+    let mut replacements = Vec::new();
+    let prefixes = [
+        "css/chrome",
+        "theme/custom",
+        "theme/version-selector",
+        "theme/lang-switcher",
+        "favicon",
+        "theme/pc-themes",
+        "theme/pc-enhance",
+    ];
+
+    let walk_dir = |dir: &Path| -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    if let Ok(ty) = entry.file_type() {
+                        if ty.is_dir() {
+                            stack.push(entry.path());
+                        } else {
+                            paths.push(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+        paths
+    };
+
+    for file in walk_dir(&src_dir) {
+        if let Ok(rel) = file.strip_prefix(&src_dir) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !prefixes.iter().any(|p| rel_str.starts_with(p)) {
+                continue;
+            }
+            let file_name = file.file_name().unwrap().to_string_lossy();
+            if let Some(pos) = file_name.rfind('-')
+                && let Some(ext_pos) = file_name.rfind('.')
+                && pos < ext_pos
+            {
+                let hash = &file_name[pos + 1..ext_pos];
+                if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let unhashed_name = format!("{}{}", &file_name[..pos], &file_name[ext_pos..]);
+                    let dest_rel = rel.parent().unwrap().join(unhashed_name);
+                    let dest = shared_dir.join(&dest_rel);
+                    std::fs::create_dir_all(dest.parent().unwrap())?;
+                    std::fs::copy(&file, &dest)?;
+                    let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
+                    replacements.push((rel_str.clone(), format!("../../_shared/{}", dest_rel_str)));
+                }
+            }
+        }
+    }
+
+    for entry in locale_entries() {
+        let loc_dir = version_dir.join(&entry.code);
+        for file in walk_dir(&loc_dir) {
+            if file.extension().is_some_and(|e| e == "html")
+                && let Ok(mut content) = std::fs::read_to_string(&file)
+            {
+                let mut changed = false;
+                for (from, to) in &replacements {
+                    if content.contains(from) {
+                        content = content.replace(from, to);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = std::fs::write(&file, content);
+                }
+            }
+            if let Ok(rel) = file.strip_prefix(&loc_dir) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if replacements.iter().any(|(from, _)| from == &rel_str) {
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
