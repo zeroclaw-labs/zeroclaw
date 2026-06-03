@@ -1889,6 +1889,19 @@ pub async fn run_tool_call_loop(
                     call.name, result_output
                 );
                 detection_relevant_output.push_str(&outcome.output);
+                if let Some(logger) = audit_logger {
+                    if let Err(e) = logger.log_command_event(crate::security::audit::CommandExecutionLog {
+                        channel: channel_name,
+                        command: &call.name,
+                        risk_level: "standard",
+                        approved: true,
+                        allowed: true,
+                        success: outcome.success,
+                        duration_ms: outcome.duration.as_millis() as u64,
+                    }) {
+                        tracing::warn!(tool = %call.name, error = %e, "audit log failed");
+                    }
+                }
                 turn_tool_records.push(daemonclaw_api::agent::ToolCallRecord {
                     name: call.name.clone(),
                     arguments: serde_json::from_str(&call.arguments)
@@ -2204,7 +2217,7 @@ pub async fn run_tool_call_loop(
 
             // ── Audit: log tool execution ─────────────────────
             if let Some(logger) = audit_logger {
-                let _ = logger.log_command_event(crate::security::audit::CommandExecutionLog {
+                if let Err(e) = logger.log_command_event(crate::security::audit::CommandExecutionLog {
                     channel: channel_name,
                     command: &call.name,
                     risk_level: "standard",
@@ -2212,7 +2225,9 @@ pub async fn run_tool_call_loop(
                     allowed: true,
                     success: outcome.success,
                     duration_ms: outcome.duration.as_millis() as u64,
-                });
+                }) {
+                    tracing::warn!(tool = %call.name, error = %e, "audit log failed");
+                }
             }
 
             // ── Hook: after_tool_call (void) ─────────────────
