@@ -274,6 +274,9 @@ fn default_source_max_chars() -> usize {
 fn default_cc_timeout_secs() -> u64 {
     60
 }
+fn default_notify_on_compression() -> bool {
+    false
+}
 fn default_identifier_policy() -> String {
     "strict".to_string()
 }
@@ -301,6 +304,8 @@ pub struct ContextCompressionConfig {
     pub source_max_chars: usize,
     #[serde(default = "default_cc_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_notify_on_compression")]
+    pub notify_on_compression: bool,
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
@@ -322,6 +327,7 @@ impl Default for ContextCompressionConfig {
             summary_max_chars: default_summary_max_chars(),
             source_max_chars: default_source_max_chars(),
             timeout_secs: default_cc_timeout_secs(),
+            notify_on_compression: default_notify_on_compression(),
             summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
