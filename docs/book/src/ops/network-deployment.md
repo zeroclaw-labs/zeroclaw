@@ -69,6 +69,21 @@ agent.example.com {
 
 The gateway stays bound to `127.0.0.1` — the proxy does the listening.
 
+## Remote daemon reload
+
+`POST /admin/reload` re-reads `config.toml` and rebuilds every subsystem in place (same PID, sub-second downtime) — the supported way to apply config changes without a full restart. By default it only accepts **loopback** callers, so a remote dashboard or `curl` from another machine gets `403 Forbidden`.
+
+To allow authenticated remote reloads:
+
+```toml
+[gateway]
+allow_remote_admin = true    # off by default
+```
+
+With this enabled, a non-loopback caller may hit `/admin/reload` **only if it also passes pairing authentication** (`Authorization: Bearer <token>`). Loopback callers (the local CLI) are always allowed and need no token. `/admin/shutdown` and the pairing-code endpoints remain localhost-only regardless of this flag.
+
+**Safety:** leave `allow_remote_admin` off unless you specifically need to reload from another host, and only enable it alongside pairing (`require_pairing = true`) so reloads can't be triggered anonymously.
+
 ## Raspberry Pi deployment
 
 ### Prerequisites

@@ -5348,6 +5348,14 @@ pub struct GatewayConfig {
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// Allow authenticated remote callers to use admin endpoints that are
+    /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
+    /// When false (default), those endpoints reject any non-loopback peer.
+    /// When true, a non-loopback request is accepted only if it also passes
+    /// pairing authentication. `/admin/shutdown` and the pairing-code
+    /// endpoints stay localhost-only regardless. (default: false)
+    #[serde(default)]
+    pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -5476,6 +5484,7 @@ impl Default for GatewayConfig {
             host: default_gateway_host(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -19535,6 +19544,7 @@ allowed_numbers = ["+1", "+2"]
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,

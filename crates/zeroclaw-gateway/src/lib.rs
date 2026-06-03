@@ -3383,7 +3383,35 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/reload — reload the daemon in place (localhost only).
+/// Authorization decision for `POST /admin/reload`, derived purely from the
+/// caller's loopback status and the `gateway.allow_remote_admin` flag.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminReloadGate {
+    /// Loopback caller (the CLI) — allow without further checks.
+    Allow,
+    /// Non-loopback caller, opted in — allow only if pairing auth passes.
+    RequireAuth,
+    /// Non-loopback caller, not opted in — reject.
+    Forbidden,
+}
+
+/// Pure gate decision for `/admin/reload`. Auth enforcement (for the
+/// `RequireAuth` case) is handled separately by the caller.
+fn admin_reload_gate(is_loopback: bool, allow_remote_admin: bool) -> AdminReloadGate {
+    if is_loopback {
+        AdminReloadGate::Allow
+    } else if allow_remote_admin {
+        AdminReloadGate::RequireAuth
+    } else {
+        AdminReloadGate::Forbidden
+    }
+}
+
+/// POST /admin/reload — reload the daemon in place.
+///
+/// Loopback callers (the CLI) are always allowed. Non-loopback callers are
+/// rejected unless `gateway.allow_remote_admin` is enabled, in which case
+/// the request must also pass pairing authentication (`require_auth`).
 ///
 /// Sends `true` on the reload channel the daemon owns. The daemon's main
 /// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
@@ -3402,8 +3430,26 @@ async fn handle_admin_shutdown(
 async fn handle_admin_reload(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+    // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
+    // unless the operator opted in via `gateway.allow_remote_admin`, and even
+    // then must pass pairing auth.
+    let allow_remote = state.config.read().gateway.allow_remote_admin;
+    match admin_reload_gate(peer.ip().is_loopback(), allow_remote) {
+        AdminReloadGate::Allow => {}
+        AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
+        AdminReloadGate::Forbidden => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload is disabled. Call from localhost, \
+                              or set gateway.allow_remote_admin = true (and pair) to \
+                              allow authenticated remote reloads."
+                })),
+            ));
+        }
+    }
 
     let Some(reload_tx) = state.reload_tx.clone() else {
         return Err((
@@ -5808,6 +5854,31 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_reload_gate_loopback_always_allowed() {
+        // Loopback is allowed regardless of the opt-in flag.
+        assert_eq!(admin_reload_gate(true, false), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true), AdminReloadGate::Allow);
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_blocked_by_default() {
+        // Non-loopback caller with the flag off is rejected outright.
+        assert_eq!(admin_reload_gate(false, false), AdminReloadGate::Forbidden);
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_requires_auth() {
+        // Non-loopback caller with the flag on still must authenticate.
+        assert_eq!(admin_reload_gate(false, true), AdminReloadGate::RequireAuth);
+    }
+
+    #[test]
+    fn allow_remote_admin_defaults_off() {
+        // Security default: remote admin reload is disabled until opted in.
+        assert!(!zeroclaw_config::schema::GatewayConfig::default().allow_remote_admin);
     }
 
     #[test]
