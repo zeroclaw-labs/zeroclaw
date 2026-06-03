@@ -683,6 +683,25 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Ordered list of other provider aliases to try when every model on this
+    /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
+    /// `providers.models` and resolves with its own credentials, endpoint, and
+    /// model — a fallback never inherits this alias's key. The walk is
+    /// depth-first: this alias's models are exhausted first, then each fallback
+    /// alias is descended in turn (applying its own `fallback_models` and
+    /// `fallback`). Empty means no provider-level fallback.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<crate::providers::ModelProviderRef>,
+    /// Ordered alternate models to try on THIS provider before falling over to
+    /// the `fallback` aliases. Same endpoint, key, and headers as the primary
+    /// `model` — only the model identifier changes. Use this when a provider
+    /// serves a backup model (e.g. a smaller or older variant) that should be
+    /// tried before leaving the provider entirely. Empty means only `model` is
+    /// tried.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
     /// deterministic, near-verbatim output — fits code, routing, summarization.
     /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
@@ -14588,7 +14607,70 @@ impl Config {
     /// Adding a new warning: append a check here, pick a stable `code`,
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
-        Vec::new()
+        let mut warnings = Vec::new();
+        self.collect_fallback_warnings(&mut warnings);
+        warnings
+    }
+
+    /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
+    /// (a fallback naming an alias that is not configured) and cycles (a
+    /// fallback path that loops back onto itself). Both are warn-and-skip — the
+    /// chain still loads and runs with the offending edge pruned at build time.
+    fn collect_fallback_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (family, alias, cfg) in self.providers.models.iter_entries() {
+            if cfg.fallback.is_empty() {
+                continue;
+            }
+            let root = format!("{family}.{alias}");
+            let mut visited: Vec<String> = vec![root.clone()];
+            self.walk_fallback(&root, &cfg.fallback, &mut visited, warnings);
+        }
+    }
+
+    fn walk_fallback(
+        &self,
+        from: &str,
+        refs: &[crate::providers::ModelProviderRef],
+        visited: &mut Vec<String>,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (i, fallback_ref) in refs.iter().enumerate() {
+            let raw = fallback_ref.as_str().trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let path = format!("providers.models.{from}.fallback[{i}]");
+            let Some((family, alias, cfg)) = self.providers.models.find_by_name(raw) else {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "dangling_fallback_ref",
+                    format!(
+                        "fallback {raw:?} on {from} does not resolve to a configured \
+                         providers.models entry; this fallback link is skipped at runtime"
+                    ),
+                    path,
+                ));
+                continue;
+            };
+            let resolved = format!("{family}.{alias}");
+            if visited.iter().any(|v| v == &resolved) {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "fallback_cycle",
+                    format!(
+                        "fallback {raw:?} on {from} closes a cycle \
+                         ({} -> {resolved}); the cycle edge is pruned at runtime",
+                        visited.join(" -> ")
+                    ),
+                    path,
+                ));
+                continue;
+            }
+            visited.push(resolved.clone());
+            self.walk_fallback(&resolved, &cfg.fallback, visited, warnings);
+            visited.pop();
+        }
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -23423,5 +23505,101 @@ allowed_users = []
                 .classifier_provider
                 .is_empty()
         );
+    }
+
+    fn provider_entry_with_fallback(fallback: &[&str]) -> OpenAIModelProviderConfig {
+        OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                fallback: fallback
+                    .iter()
+                    .map(|s| crate::providers::ModelProviderRef::new(*s))
+                    .collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    async fn fallback_warns_on_dangling_ref() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            provider_entry_with_fallback(&["openai.ghost"]),
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "dangling_fallback_ref");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.openai.primary.fallback[0]"
+        );
+    }
+
+    #[test]
+    async fn fallback_no_warning_when_ref_resolves() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            provider_entry_with_fallback(&["openai.backup"]),
+        );
+        config
+            .providers
+            .models
+            .openai
+            .insert("backup".to_string(), provider_entry_with_fallback(&[]));
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn fallback_warns_on_two_node_cycle() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("a".to_string(), provider_entry_with_fallback(&["openai.b"]));
+        config
+            .providers
+            .models
+            .openai
+            .insert("b".to_string(), provider_entry_with_fallback(&["openai.a"]));
+
+        let cycle_warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "fallback_cycle")
+            .collect();
+        assert!(
+            !cycle_warnings.is_empty(),
+            "a->b->a must surface at least one fallback_cycle warning"
+        );
+    }
+
+    #[test]
+    async fn fallback_self_reference_is_a_cycle() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "loop".to_string(),
+            provider_entry_with_fallback(&["openai.loop"]),
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "fallback_cycle");
+    }
+
+    #[test]
+    async fn fallback_empty_ref_is_skipped() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), provider_entry_with_fallback(&[""]));
+
+        assert!(config.collect_warnings().is_empty());
     }
 }
