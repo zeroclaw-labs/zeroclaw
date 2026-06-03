@@ -243,6 +243,7 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
+    let persistent_writes = runtime.has_filesystem_access();
     vec![
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
@@ -253,7 +254,10 @@ pub fn default_tools_with_runtime(
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -473,6 +477,7 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
+    let persistent_writes = runtime.has_filesystem_access();
     let runtime_kind = root_config.runtime.kind.as_str();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
@@ -495,7 +500,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
