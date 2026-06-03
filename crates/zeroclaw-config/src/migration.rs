@@ -271,11 +271,62 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
 
 /// High-level: arbitrary versioned TOML → fully validated V3 `Config`.
 /// Runs migration if needed, then deserializes into the current `Config` type.
+///
+/// **Strict.** Any deserialization defect is returned as an error. This is the
+/// contract repair tooling depends on (`zeroclaw config migrate`,
+/// `model_routing_config`): they need to know precisely what is wrong. The
+/// daemon load path uses [`migrate_to_current_resilient`] instead, which never
+/// fails so the operator can always reach a repair surface.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
+    let final_value = migrate_value(input)?;
+    final_value
+        .try_into()
+        .context("migrated config failed to deserialize as current schema")
+}
+
+/// Daemon load path: arbitrary versioned TOML → a usable `Config`, **always**.
+///
+/// The daemon must start no matter what so the config can be repaired through
+/// the gateway, CLI, or dashboard. This function therefore degrades instead of
+/// failing:
+///
+/// 1. Strict deserialize (identical to [`migrate_to_current`]) — the common
+///    case, zero behavior change for valid configs.
+/// 2. If that fails, drop each invalid `[channels.<type>.<alias>]` and each
+///    invalid top-level section, substituting the section's `Default`. Every
+///    drop is logged at WARN with the offending path.
+/// 3. If even the migration/parse stage fails (not valid TOML, or an
+///    unsupported future schema), fall back to `Config::default()` so the
+///    process still boots. The original error is logged at ERROR.
+///
+/// `Config::validate()` is intentionally NOT run here — a config that fails
+/// validation must still load so it can be fixed.
+pub fn migrate_to_current_resilient(input: &str) -> Config {
+    let value = match migrate_value(input) {
+        Ok(value) => value,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{err:#}") })),
+                "config could not be parsed or migrated; starting on defaults so it \
+                 can be repaired (gateway /api/config, `zeroclaw config migrate`)"
+            );
+            return Config::default();
+        }
+    };
+    deserialize_resilient(value)
+}
+
+/// Parse + migrate to the current schema version as a `toml::Value`, without
+/// the final typed deserialize. Shared by the strict and resilient entry
+/// points so the version-detection and chain logic lives in one place.
+fn migrate_value(input: &str) -> Result<toml::Value> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
-    let final_value = if from == CURRENT_SCHEMA_VERSION {
-        value
+    if from == CURRENT_SCHEMA_VERSION {
+        Ok(value)
     } else if from > CURRENT_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             ERROR,
@@ -289,13 +340,135 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
         );
         anyhow::bail!(
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
-        );
+        )
     } else {
-        run_chain(value, from)?
+        run_chain(value, from)
+    }
+}
+
+/// Deserialize a migrated `toml::Value` into `Config`, never failing.
+///
+/// Strict first; on failure, salvage broken `[channels.<type>.<alias>]`
+/// entries, then drop any remaining top-level section that blocks the load
+/// (substituting its `Default`). Every drop is logged at WARN. The returned
+/// `Config` always carries every section that parsed, so the operator only
+/// loses the specific broken blocks — which the repair surfaces can then fix.
+fn deserialize_resilient(value: toml::Value) -> Config {
+    if let Ok(config) = value.clone().try_into::<Config>() {
+        return config;
+    }
+
+    let mut salvaged = value;
+    let mut dropped: Vec<String> = Vec::new();
+    prune_bad_channel_aliases(&mut salvaged, &mut dropped);
+    prune_bad_top_level_sections(&mut salvaged, &mut dropped);
+
+    let config = salvaged.try_into::<Config>().unwrap_or_else(|err| {
+        // Nothing in the root table is individually salvageable (e.g. a
+        // non-table root). Boot on defaults so repair surfaces are reachable.
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "error": format!("{err:#}") })),
+            "config could not be salvaged section-by-section; starting on defaults \
+             so it can be repaired"
+        );
+        Config::default()
+    });
+
+    for path in &dropped {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "dropped_config": path })),
+            &format!(
+                "config section `{path}` is invalid and was skipped so the daemon can \
+                 start; fix the block and reload to re-enable it"
+            )
+        );
+    }
+
+    config
+}
+
+/// Drop any top-level `[section]` whose removal is required for the config to
+/// deserialize, substituting the section's `Default` via serde. Each candidate
+/// is tested by removing it from a clone and re-deserializing; a section is
+/// dropped only when its removal is what fixes the load, so valid sections are
+/// never touched. Removed paths are appended to `dropped`.
+fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(root) = value.as_table_mut() else {
+        return;
     };
-    final_value
-        .try_into()
-        .context("migrated config failed to deserialize as current schema")
+    let keys: Vec<String> = root.keys().cloned().collect();
+    for key in keys {
+        if value.clone().try_into::<Config>().is_ok() {
+            break;
+        }
+        let root = value.as_table_mut().expect("root is a table");
+        let Some(removed) = root.remove(&key) else {
+            continue;
+        };
+        if value.clone().try_into::<Config>().is_ok() {
+            // Removing this key fixed (or advanced) the load — it was the
+            // offender. Leave it dropped; serde fills the section default.
+            dropped.push(key);
+        } else {
+            // Removing it did not help; restore and keep probing. The real
+            // offender is a different key (handled on a later iteration).
+            value
+                .as_table_mut()
+                .expect("root is a table")
+                .insert(key, removed);
+        }
+    }
+}
+
+/// Remove every `[channels.<type>.<alias>]` entry that cannot deserialize
+/// into its concrete channel config type. Each alias is checked in isolation
+/// via [`channel_alias_is_invalid`]; valid aliases sharing a `[channels]`
+/// section with a broken sibling are preserved. Dropped paths
+/// (`channels.<type>.<alias>`) are appended to `dropped`.
+fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(channels) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("channels"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    for (chan_type, aliases) in channels.iter_mut() {
+        let Some(alias_table) = aliases.as_table_mut() else {
+            continue;
+        };
+        let invalid: Vec<String> = alias_table
+            .iter()
+            .filter(|(_, v)| channel_alias_is_invalid(chan_type, v))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for alias in invalid {
+            alias_table.remove(&alias);
+            dropped.push(format!("channels.{chan_type}.{alias}"));
+        }
+    }
+}
+
+/// True when a single `[channels.<type>.<alias>]` table cannot deserialize
+/// into its concrete channel config type. Wraps the alias under a minimal
+/// `{ channels = { <type> = { probe = <alias> } } }` document and runs it
+/// through the strict `Config` deserializer, isolating the failure to this
+/// one alias.
+fn channel_alias_is_invalid(chan_type: &str, alias_value: &toml::Value) -> bool {
+    let mut inner = toml::value::Table::new();
+    inner.insert("probe".to_string(), alias_value.clone());
+    let mut type_table = toml::value::Table::new();
+    type_table.insert(chan_type.to_string(), toml::Value::Table(inner));
+    let mut channels = toml::value::Table::new();
+    channels.insert("channels".to_string(), toml::Value::Table(type_table));
+    toml::Value::Table(channels).try_into::<Config>().is_err()
 }
 
 /// File-API wrapper: read disk config, migrate, write `<file>.backup`
@@ -694,8 +867,112 @@ mod tests {
         assert!(detect_version(&v).is_err());
     }
 
-    // ── migrate_file_in_place atomic-write semantics ──
+    // ── resilient daemon load: starts no matter what, so config can be repaired ──
 
+    #[test]
+    fn broken_channel_alias_is_dropped_not_fatal() {
+        // Email alias missing required `imap_host` must not abort the load.
+        let raw = r#"
+schema_version = 3
+
+[channels.email.fakeemail]
+enabled = true
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+"#;
+        let cfg = migrate_to_current_resilient(raw);
+        assert!(
+            !cfg.channels.email.contains_key("fakeemail"),
+            "invalid alias must be pruned"
+        );
+    }
+
+    #[test]
+    fn valid_alias_survives_broken_sibling() {
+        let raw = r#"
+schema_version = 3
+
+[channels.email.broken]
+enabled = true
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+
+[channels.email.good]
+enabled = true
+imap_host = "imap.example.com"
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+"#;
+        let cfg = migrate_to_current_resilient(raw);
+        assert!(
+            cfg.channels.email.contains_key("good"),
+            "valid sibling must be kept"
+        );
+        assert!(
+            !cfg.channels.email.contains_key("broken"),
+            "invalid sibling must be pruned"
+        );
+    }
+
+    #[test]
+    fn broken_non_channel_section_falls_back_to_default() {
+        // A type mismatch outside the channel maps must NOT abort the daemon:
+        // the section is dropped to its default so the operator can repair it.
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = "not-a-bool"
+"#;
+        let cfg = migrate_to_current_resilient(raw);
+        // `[heartbeat]` reverted to its serde default; load did not panic.
+        assert!(!cfg.heartbeat.enabled);
+        assert_eq!(cfg.heartbeat.interval_minutes, 30);
+    }
+
+    #[test]
+    fn unparseable_config_falls_back_to_defaults() {
+        // Not even valid TOML — the daemon still boots on defaults so the
+        // operator can reach a repair surface and overwrite the file.
+        let cfg = migrate_to_current_resilient("this is not valid TOML {{{");
+        assert_eq!(cfg.schema_version, Config::default().schema_version);
+    }
+
+    #[test]
+    fn future_schema_version_falls_back_to_defaults() {
+        // A schema newer than this binary can't be migrated, but the daemon
+        // must still start rather than refuse to boot.
+        let raw = format!("schema_version = {}\n", CURRENT_SCHEMA_VERSION + 100);
+        let cfg = migrate_to_current_resilient(&raw);
+        assert_eq!(cfg.schema_version, Config::default().schema_version);
+    }
+
+    #[test]
+    fn strict_path_still_errors_for_tooling() {
+        // `migrate_to_current` stays strict — repair tooling needs the error.
+        let raw = r#"
+schema_version = 3
+
+[channels.email.fakeemail]
+enabled = true
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+"#;
+        assert!(
+            migrate_to_current(raw).is_err(),
+            "strict path must surface the defect for repair tooling"
+        );
+    }
+
+    // ── migrate_file_in_place atomic-write semantics ──
     fn setup_temp_config_dir() -> tempfile::TempDir {
         tempfile::TempDir::new().expect("temp dir")
     }

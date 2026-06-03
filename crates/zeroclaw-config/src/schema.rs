@@ -14425,8 +14425,13 @@ impl Config {
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
-            let mut config: Config = crate::migration::migrate_to_current(&contents)
-                .context("Failed to migrate config")?;
+            // Daemon load must never hard-fail on a malformed config: the
+            // operator needs the process up to repair it (gateway
+            // /api/config, `zeroclaw config migrate`, dashboard). The
+            // resilient path degrades — dropping invalid channel aliases and
+            // sections to their defaults with a WARN — instead of aborting.
+            // Strict validation lives in `zeroclaw config migrate`.
+            let mut config: Config = crate::migration::migrate_to_current_resilient(&contents);
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
