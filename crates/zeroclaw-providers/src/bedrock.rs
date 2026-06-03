@@ -615,14 +615,6 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-/// Some Bedrock models (the Claude opus-4-7 family) reject `temperature` in
-/// `inferenceConfig` with a 400 "temperature is deprecated for this model".
-/// Substring match covers region/profile prefixes (e.g. `us.anthropic.…`)
-/// and version suffixes (e.g. `-v1:0`).
-fn bedrock_model_omits_temperature(model: &str) -> bool {
-    model.contains("claude-opus-4-7")
-}
-
 /// Whether a Bedrock model accepts the fixed-budget native-thinking shape
 /// (`additionalModelRequestFields.thinking = {"type": "enabled", "budget_tokens": N}`).
 /// AWS's Opus 4.7 model card states the model only supports adaptive thinking
@@ -1491,7 +1483,6 @@ impl ModelProvider for BedrockModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let system = system_prompt.map(|text| {
@@ -1517,11 +1508,7 @@ impl ModelProvider for BedrockModelProvider {
             messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature: if bedrock_model_omits_temperature(model) {
-                    None
-                } else {
-                    Some(temperature)
-                },
+                temperature,
             }),
             tool_config: None,
             additional_model_request_fields: None,
@@ -1546,7 +1533,6 @@ impl ModelProvider for BedrockModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1580,13 +1566,9 @@ impl ModelProvider for BedrockModelProvider {
 
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
-        // Extended thinking support. Gate fixed-budget thinking off for
-        // models that only support adaptive thinking (e.g. Opus 4.7) — those
-        // requests would otherwise 400 at the provider. Caller-supplied
-        // `thinking` is treated as a hint; the agent loop's prompt-based
-        // reasoning prefix is already in the message list.
-        let native_thinking_active =
-            request.thinking.is_some() && bedrock_model_supports_native_thinking(model);
+        // Native thinking forces temperature=1.0 (Anthropic API requirement).
+        // Otherwise the caller's Option<f64> flows through verbatim; None
+        // omits the field via skip_serializing_if.
         let (effective_temperature, additional_fields, effective_max_tokens) = match request
             .thinking
         {
@@ -1603,10 +1585,9 @@ impl ModelProvider for BedrockModelProvider {
                         "budget_tokens": params.budget_tokens
                     }
                 });
-                // Bedrock requires max_tokens > budget_tokens (strictly greater).
                 let min_required = params.budget_tokens + 1;
                 let max_tokens = self.max_tokens.max(min_required);
-                (1.0, Some(fields), max_tokens)
+                (Some(1.0), Some(fields), max_tokens)
             }
             Some(_) => {
                 ::zeroclaw_log::record!(
@@ -1620,23 +1601,12 @@ impl ModelProvider for BedrockModelProvider {
             None => (temperature, None, self.max_tokens),
         };
 
-        // When native thinking is active, Anthropic requires temperature=1.0 and
-        // we must send it explicitly even on models that would otherwise omit it.
-        // Otherwise, respect the per-model omit list (e.g. Opus 4.7).
-        let serialized_temperature = if native_thinking_active {
-            Some(effective_temperature)
-        } else if bedrock_model_omits_temperature(model) {
-            None
-        } else {
-            Some(effective_temperature)
-        };
-
         let converse_request = ConverseRequest {
             system,
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: effective_max_tokens,
-                temperature: serialized_temperature,
+                temperature: effective_temperature,
             }),
             tool_config,
             additional_model_request_fields: additional_fields,
@@ -2087,31 +2057,6 @@ mod tests {
         assert!(!json.contains("system"));
         assert!(json.contains("Hello"));
         assert!(json.contains("maxTokens"));
-    }
-
-    // ── Opus 4.7 temperature-omission tests (issue #6095) ────────
-
-    #[test]
-    fn bedrock_model_omits_temperature_matches_opus_4_7() {
-        assert!(bedrock_model_omits_temperature(
-            "us.anthropic.claude-opus-4-7"
-        ));
-        assert!(bedrock_model_omits_temperature(
-            "anthropic.claude-opus-4-7-v1:0"
-        ));
-    }
-
-    #[test]
-    fn bedrock_model_omits_temperature_skips_other_models() {
-        assert!(!bedrock_model_omits_temperature(
-            "us.anthropic.claude-opus-4-6-v1"
-        ));
-        assert!(!bedrock_model_omits_temperature(
-            "us.anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(!bedrock_model_omits_temperature(
-            "us.anthropic.claude-haiku-4-5-v1"
-        ));
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! Returns a base64-encoded PNG. The agent (or the dashboard webview during
 //! testing) can render this directly via a `data:image/png;base64,…` URL.
 
+#[cfg(target_os = "macos")]
 use base64::Engine;
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 #[derive(Debug, Serialize)]

@@ -100,11 +100,15 @@ pub async fn execute_one_tool(
     // execute() impls add zero logging.
     let _start_guard = tool_span.clone().entered();
     ::zeroclaw_log::record!(
-        INFO,
+        DEBUG,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
             .with_category(::zeroclaw_log::EventCategory::Tool)
-            .with_attrs(::serde_json::json!({"input": call_arguments})),
-        "tool invocation start"
+            .with_attrs(::serde_json::json!({
+                "tool": call_name,
+                "tool_call_id": tool_call_id,
+                "input": call_arguments,
+            })),
+        format!("tool call: {call_name}")
     );
     drop(_start_guard);
 
@@ -126,16 +130,35 @@ pub async fn execute_one_tool(
             let duration = start.elapsed();
             if r.success {
                 ::zeroclaw_log::record!(
-                    INFO,
+                    DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                         .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Success)
                         .with_duration(duration.as_millis() as u64)
-                        .with_attrs(::serde_json::json!({"output": r.output})),
-                    "tool invocation complete"
+                        .with_attrs(::serde_json::json!({
+                            "tool": call_name,
+                            "tool_call_id": tool_call_id,
+                            "input": call_arguments,
+                            "output": r.output,
+                        })),
+                    format!("tool result: {call_name}")
                 );
             } else {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_duration(duration.as_millis() as u64).with_attrs(::serde_json::json!({"error": r.error.clone().unwrap_or_default(), "output": r.output})), "tool invocation failed");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(duration.as_millis() as u64)
+                        .with_attrs(::serde_json::json!({
+                            "tool": call_name,
+                            "tool_call_id": tool_call_id,
+                            "input": call_arguments,
+                            "error": r.error.clone().unwrap_or_default(),
+                            "output": r.output,
+                        })),
+                    format!("tool failed: {call_name}")
+                );
             }
             if r.success {
                 let normalized_output = if r.output.is_empty() {
@@ -190,8 +213,13 @@ pub async fn execute_one_tool(
                     .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_duration(duration.as_millis() as u64)
-                    .with_attrs(::serde_json::json!({"error": format!("{e:?}")})),
-                "tool invocation errored"
+                    .with_attrs(::serde_json::json!({
+                        "tool": call_name,
+                        "tool_call_id": tool_call_id,
+                        "input": call_arguments,
+                        "error": format!("{e:?}"),
+                    })),
+                format!("tool error: {call_name}")
             );
             let reason = format!("Error executing {call_name}: {e}");
             let scrubbed_reason = scrub_credentials(&reason);

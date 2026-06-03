@@ -1143,7 +1143,6 @@ mod tests {
             verify_tls: Some(true),
             mention_only: false,
             excluded_tools: vec![],
-            default_target: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

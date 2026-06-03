@@ -125,7 +125,8 @@ struct ModelInfo {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -164,7 +165,6 @@ impl ModelProvider for TelnyxModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -238,7 +238,6 @@ impl ModelProvider for TelnyxModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -404,7 +403,7 @@ mod tests {
                     content: "Hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
 
         let json = serde_json::to_string(&req).unwrap();

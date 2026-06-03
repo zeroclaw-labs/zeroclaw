@@ -33,7 +33,7 @@ const navItems: NavItem[] = [
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
 ];
 
-// The 6 onboarding sections (Workspace, Providers, Channels, Memory,
+// The 6 Quickstart sections (Workspace, Providers, Channels, Memory,
 // Hardware, Tunnel) live under /config now — they're the first group
 // inside the Config explorer's sidebar. The /setup/<section> deep-link
 // route still works for bookmarks, but no top-level nav entries point

@@ -17,6 +17,7 @@
 pub mod agent;
 pub mod attribution;
 pub mod channel;
+pub mod jsonrpc;
 pub mod media;
 pub mod memory_traits;
 pub mod model_provider;
