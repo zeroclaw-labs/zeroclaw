@@ -690,6 +690,7 @@ pub async fn agent_turn(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     channel: Option<&dyn Channel>,
+    audit_logger: Option<&crate::security::audit::AuditLogger>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -719,7 +720,7 @@ pub async fn agent_turn(
         channel,
         None, // receipt_generator
         None, // collected_receipts
-        None, // audit_logger
+        audit_logger,
     )
     .await
 }
@@ -2794,6 +2795,25 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
+    // ── Audit logger (shared with channel orchestrator path) ─────
+    let audit_logger = if config.security.audit.enabled {
+        match crate::security::audit::AuditLogger::new(
+            config.security.audit.clone(),
+            config.workspace_dir.clone(),
+        ) {
+            Ok(logger) => {
+                tracing::info!("🔒 Audit logger enabled (audit.db)");
+                Some(logger)
+            }
+            Err(e) => {
+                tracing::warn!("Audit logger init failed, continuing without: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
@@ -3221,7 +3241,7 @@ pub async fn run(
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
                         None, // collected_receipts
-                        None, // audit_logger
+                        audit_logger.as_ref(),
                     ),
                 )
                 .await
@@ -3537,7 +3557,7 @@ pub async fn run(
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
                             None, // collected_receipts
-                            None, // audit_logger
+                            audit_logger.as_ref(),
                         ),
                     )
                     .await
@@ -4039,6 +4059,16 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
+    let audit_logger = if config.security.audit.enabled {
+        crate::security::audit::AuditLogger::new(
+            config.security.audit.clone(),
+            config.workspace_dir.clone(),
+        )
+        .ok()
+    } else {
+        None
+    };
+
     agent_turn(
         provider.as_ref(),
         &mut history,
@@ -4058,6 +4088,7 @@ pub async fn process_message(
         activated_handle_pm.as_ref(),
         None,
         None, // channel: process_message path has no channel ref
+        audit_logger.as_ref(),
     )
     .await
 }
@@ -6825,6 +6856,7 @@ mod tests {
                 Some(&activated),
                 None,
                 None, // channel
+                None, // audit_logger
             )
             .await
             .expect("wrapper path should execute activated tools");
