@@ -419,7 +419,9 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
             &format!(
                 "SECURITY-CRITICAL config section `{path}` is invalid and was reset to \
                  its default so the daemon can boot; the running posture may be WEAKER \
-                 than intended — repair `{path}` and reload before trusting this instance"
+                 than intended — repair `{path}` and reload before trusting this instance. \
+                 Run `zeroclaw config migrate` to see the precise parse error, or fix it \
+                 via the gateway config editor at `/api/config`"
             )
         );
     }
@@ -446,6 +448,8 @@ fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<Strin
     let keys: Vec<String> = value
         .as_table()
         .expect("root is a table")
+        // toml::Value tables preserve insertion order, so drops are reported
+        // in TOML declaration order — predictable for operators reading logs.
         .keys()
         .cloned()
         .collect();
@@ -1157,6 +1161,34 @@ enabled = "also-not-a-bool"
             load.dropped.iter().any(|p| p == "backup"),
             "second offender must be dropped, got {:?}",
             load.dropped
+        );
+    }
+
+    #[test]
+    fn multiple_bad_sections_one_security_critical() {
+        let raw = r#"
+schema_version = 3
+
+[security]
+audit = "should-be-a-table-not-a-string"
+
+[heartbeat]
+enabled = "not-a-bool"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped_security.iter().any(|p| p == "security"),
+            "malformed [security] must be classified security-critical, got {:?}",
+            load.dropped_security
+        );
+        assert!(
+            load.dropped.iter().any(|p| p == "heartbeat"),
+            "malformed [heartbeat] must be a plain drop, got {:?}",
+            load.dropped
+        );
+        assert!(
+            !load.dropped.iter().any(|p| p == "security"),
+            "security drop must not also appear in the plain dropped list"
         );
     }
 

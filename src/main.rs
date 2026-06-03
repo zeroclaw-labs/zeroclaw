@@ -573,6 +573,13 @@ Examples:
         /// Self-terminate after all socket clients disconnect (with grace period)
         #[arg(long)]
         ephemeral: bool,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load. Without this, the daemon refuses to
+        /// start with a weakened posture; with it, the daemon boots so the
+        /// operator can reach repair surfaces, emitting a repeating warning.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -3497,7 +3504,55 @@ async fn main() -> Result<()> {
             port,
             host,
             ephemeral,
+            allow_degraded_security,
         } => {
+            // Security-critical config sections (`security`, `risk_profiles`,
+            // `peer_groups`) that failed to parse are dropped to their
+            // defaults during load and recorded on `degraded_security`. The
+            // running posture may then be WEAKER than intended, so the daemon
+            // refuses to boot by default — "secure by default" must fail loud
+            // here, not quiet. `--allow-degraded-security` lets the operator
+            // boot anyway to reach repair surfaces; the daemon then nags with
+            // a repeating warning until the config is fixed and reloaded.
+            if !config.degraded_security.is_empty() {
+                let sections = config.degraded_security.join(", ");
+                if !allow_degraded_security {
+                    anyhow::bail!(
+                        "Config contains malformed security-critical sections ({sections}); \
+                         they were reset to defaults, so the running posture may be weaker \
+                         than intended. The daemon will not start with a degraded security \
+                         posture. Repair these sections in {} and restart — run \
+                         `zeroclaw config migrate` to see the precise error. To boot anyway \
+                         (e.g. to reach the gateway config editor and repair from there), \
+                         re-run with `--allow-degraded-security`.",
+                        config.config_path.display()
+                    );
+                }
+                let config_path = config.config_path.display().to_string();
+                ::zeroclaw_spawn::spawn!(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                    loop {
+                        ticker.tick().await;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "degraded_security": sections
+                            })),
+                            &format!(
+                                "Running with DEGRADED security: sections ({sections}) were \
+                                 reset to defaults and `--allow-degraded-security` was set. \
+                                 The posture may be weaker than intended — repair {config_path} \
+                                 and reload (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                            )
+                        );
+                    }
+                });
+            }
             if let Ok(exe) = std::env::current_exe() {
                 let under_home = directories::UserDirs::new()
                     .map(|u| u.home_dir().to_path_buf())

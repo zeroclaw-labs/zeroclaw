@@ -20039,6 +20039,56 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_assigns_degraded_security_for_malformed_section() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // `[security] audit` must be a table; a scalar forces the security
+        // section to drop to its default on the resilient daemon path.
+        fs::write(
+            &config_path,
+            r#"schema_version = 3
+audit = "should-be-a-table-not-a-string"
+
+[security]
+audit = "should-be-a-table-not-a-string"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            config.degraded_security.iter().any(|s| s == "security"),
+            "load_or_init must surface a dropped [security] section on degraded_security, got {:?}",
+            config.degraded_security
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
         config.providers.models.openrouter.insert(
