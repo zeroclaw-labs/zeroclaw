@@ -71,6 +71,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.message_error': '消息错误',
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
+    'agent.clear_all': '清空全部',
+    'agent.delete_message': '删除消息',
+    'agent.compact_mode': '紧凑模式',
+    'agent.tool_activity_show': '显示工具活动',
+    'agent.tool_activity_hide': '隐藏工具活动',
+    'agent.running': '运行中...',
+    'agent.stop': '停止',
 
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': '需要授权工具调用',
@@ -902,6 +909,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Mesajı kopyala',
     'agent.connected_status': 'Bağlandı',
     'agent.disconnected_status': 'Bağlantı kesildi',
+    'agent.clear_all': 'Tümünü temizle',
+    'agent.delete_message': 'Mesajı sil',
+    'agent.compact_mode': 'Kompakt',
+    'agent.tool_activity_show': 'Araç etkinliğini göster',
+    'agent.tool_activity_hide': 'Araç etkinliğini gizle',
+    'agent.running': 'Çalışıyor…',
+    'agent.stop': 'Durdur',
 
     // Tools
     'tools.title': 'Mevcut Araçlar',
@@ -1224,6 +1238,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'نسخ الرسالة',
     'agent.connected_status': 'متصل',
     'agent.disconnected_status': 'غير متصل',
+    'agent.clear_all': 'مسح الكل',
+    'agent.delete_message': 'حذف الرسالة',
+    'agent.compact_mode': 'مضغوط',
+    'agent.tool_activity_show': 'إظهار نشاط الأداة',
+    'agent.tool_activity_hide': 'إخفاء نشاط الأداة',
+    'agent.running': 'جارٍ التشغيل…',
+    'agent.stop': 'إيقاف',
 
     // Tools
     'tools.title': 'الأدوات المتاحة',
@@ -1579,6 +1600,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'বার্তা কপি করুন',
     'agent.connected_status': 'সংযুক্ত',
     'agent.disconnected_status': 'সংযোগ বিচ্ছিন্ন',
+    'agent.clear_all': 'সব মুছুন',
+    'agent.delete_message': 'বার্তা মুছুন',
+    'agent.compact_mode': 'কম্প্যাক্ট',
+    'agent.tool_activity_show': 'টুল কার্যকলাপ দেখান',
+    'agent.tool_activity_hide': 'টুল কার্যকলাপ লুকান',
+    'agent.running': 'চলছে…',
+    'agent.stop': 'থামান',
 
     // Tools
     'tools.title': 'উপলব্ধ টুলস',
@@ -1934,6 +1962,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopírovat zprávu',
     'agent.connected_status': 'Připojeno',
     'agent.disconnected_status': 'Odpojeno',
+    'agent.clear_all': 'Vymazat vše',
+    'agent.delete_message': 'Smazat zprávu',
+    'agent.compact_mode': 'Kompaktní',
+    'agent.tool_activity_show': 'Zobrazit aktivitu nástrojů',
+    'agent.tool_activity_hide': 'Skrýt aktivitu nástrojů',
+    'agent.running': 'Běží…',
+    'agent.stop': 'Zastavit',
 
     // Tools
     'tools.title': 'Dostupné nástroje',
@@ -2289,6 +2324,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopiér besked',
     'agent.connected_status': 'Forbundet',
     'agent.disconnected_status': 'Afbrudt',
+    'agent.clear_all': 'Ryd alt',
+    'agent.delete_message': 'Slet besked',
+    'agent.compact_mode': 'Kompakt',
+    'agent.tool_activity_show': 'Vis værktøjsaktivitet',
+    'agent.tool_activity_hide': 'Skjul værktøjsaktivitet',
+    'agent.running': 'Kører…',
+    'agent.stop': 'Stop',
 
     // Tools
     'tools.title': 'Tilgængelige værktøjer',
@@ -2644,6 +2686,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Nachricht kopieren',
     'agent.connected_status': 'Verbunden',
     'agent.disconnected_status': 'Getrennt',
+    'agent.clear_all': 'Alle löschen',
+    'agent.delete_message': 'Nachricht löschen',
+    'agent.compact_mode': 'Kompakt',
+    'agent.tool_activity_show': 'Tool-Aktivität anzeigen',
+    'agent.tool_activity_hide': 'Tool-Aktivität ausblenden',
+    'agent.running': 'Läuft…',
+    'agent.stop': 'Stopp',
 
     // Tools
     'tools.title': 'Verfügbare Werkzeuge',
@@ -2999,6 +3048,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Αντιγραφή μηνύματος',
     'agent.connected_status': 'Συνδεδεμένο',
     'agent.disconnected_status': 'Αποσυνδεδεμένο',
+    'agent.clear_all': 'Εκκαθάριση όλων',
+    'agent.delete_message': 'Διαγραφή μηνύματος',
+    'agent.compact_mode': 'Συμπαγής',
+    'agent.tool_activity_show': 'Εμφάνιση δραστηριότητας εργαλείων',
+    'agent.tool_activity_hide': 'Απόκρυψη δραστηριότητας εργαλείων',
+    'agent.running': 'Εκτέλεση…',
+    'agent.stop': 'Διακοπή',
 
     // Tools
     'tools.title': 'Διαθέσιμα εργαλεία',
@@ -3354,6 +3410,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copiar mensaje',
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
+    'agent.clear_all': 'Limpiar todo',
+    'agent.delete_message': 'Eliminar mensaje',
+    'agent.compact_mode': 'Compacto',
+    'agent.tool_activity_show': 'Mostrar actividad de herramientas',
+    'agent.tool_activity_hide': 'Ocultar actividad de herramientas',
+    'agent.running': 'Ejecutando…',
+    'agent.stop': 'Detener',
 
     // Tools
     'tools.title': 'Herramientas disponibles',
@@ -3709,6 +3772,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopioi viesti',
     'agent.connected_status': 'Yhdistetty',
     'agent.disconnected_status': 'Yhteys katkaistu',
+    'agent.clear_all': 'Tyhjennä kaikki',
+    'agent.delete_message': 'Poista viesti',
+    'agent.compact_mode': 'Kompakti',
+    'agent.tool_activity_show': 'Näytä työkalujen toiminta',
+    'agent.tool_activity_hide': 'Piilota työkalujen toiminta',
+    'agent.running': 'Käynnissä…',
+    'agent.stop': 'Pysäytä',
 
     // Tools
     'tools.title': 'Käytettävissä olevat työkalut',
@@ -4064,6 +4134,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copier le message',
     'agent.connected_status': 'Connecté',
     'agent.disconnected_status': 'Déconnecté',
+    'agent.clear_all': 'Tout effacer',
+    'agent.delete_message': 'Supprimer le message',
+    'agent.compact_mode': 'Compact',
+    'agent.tool_activity_show': 'Afficher l\'activité des outils',
+    'agent.tool_activity_hide': 'Masquer l\'activité des outils',
+    'agent.running': 'En cours…',
+    'agent.stop': 'Arrêter',
 
     // Tools
     'tools.title': 'Outils disponibles',
@@ -4433,6 +4510,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'העתק הודעה',
     'agent.connected_status': 'מחובר',
     'agent.disconnected_status': 'מנותק',
+    'agent.clear_all': 'נקה הכל',
+    'agent.delete_message': 'מחק הודעה',
+    'agent.compact_mode': 'קומפקטי',
+    'agent.tool_activity_show': 'הצג פעילות כלים',
+    'agent.tool_activity_hide': 'הסתר פעילות כלים',
+    'agent.running': 'רץ…',
+    'agent.stop': 'עצור',
 
     // Tools
     'tools.title': 'כלים זמינים',
@@ -4788,6 +4872,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'संदेश कॉपी करें',
     'agent.connected_status': 'कनेक्टेड',
     'agent.disconnected_status': 'डिस्कनेक्टेड',
+    'agent.clear_all': 'सभी साफ़ करें',
+    'agent.delete_message': 'संदेश हटाएं',
+    'agent.compact_mode': 'कॉम्पैक्ट',
+    'agent.tool_activity_show': 'टूल गतिविधि दिखाएं',
+    'agent.tool_activity_hide': 'टूल गतिविधि छुपाएं',
+    'agent.running': 'चल रहा है…',
+    'agent.stop': 'रोकें',
 
     // Tools
     'tools.title': 'उपलब्ध उपकरण',
@@ -5143,6 +5234,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Üzenet másolása',
     'agent.connected_status': 'Csatlakoztatva',
     'agent.disconnected_status': 'Leválasztva',
+    'agent.clear_all': 'Összes törlése',
+    'agent.delete_message': 'Üzenet törlése',
+    'agent.compact_mode': 'Kompakt',
+    'agent.tool_activity_show': 'Eszköztevékenység mutatása',
+    'agent.tool_activity_hide': 'Eszköztevékenység elrejtése',
+    'agent.running': 'Fut…',
+    'agent.stop': 'Leállítás',
 
     // Tools
     'tools.title': 'Elérhető eszközök',
@@ -5498,6 +5596,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Salin pesan',
     'agent.connected_status': 'Terhubung',
     'agent.disconnected_status': 'Terputus',
+    'agent.clear_all': 'Hapus semua',
+    'agent.delete_message': 'Hapus pesan',
+    'agent.compact_mode': 'Ringkas',
+    'agent.tool_activity_show': 'Tampilkan aktivitas alat',
+    'agent.tool_activity_hide': 'Sembunyikan aktivitas alat',
+    'agent.running': 'Berjalan…',
+    'agent.stop': 'Hentikan',
 
     // Tools
     'tools.title': 'Alat yang Tersedia',
@@ -5853,6 +5958,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copia messaggio',
     'agent.connected_status': 'Connesso',
     'agent.disconnected_status': 'Disconnesso',
+    'agent.clear_all': 'Cancella tutto',
+    'agent.delete_message': 'Elimina messaggio',
+    'agent.compact_mode': 'Compatto',
+    'agent.tool_activity_show': 'Mostra attività strumenti',
+    'agent.tool_activity_hide': 'Nascondi attività strumenti',
+    'agent.running': 'In esecuzione…',
+    'agent.stop': 'Ferma',
 
     // Tools
     'tools.title': 'Strumenti disponibili',
@@ -6208,6 +6320,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'メッセージをコピー',
     'agent.connected_status': '接続済み',
     'agent.disconnected_status': '切断済み',
+    'agent.clear_all': 'すべてクリア',
+    'agent.delete_message': 'メッセージを削除',
+    'agent.compact_mode': 'コンパクト',
+    'agent.tool_activity_show': 'ツール操作を表示',
+    'agent.tool_activity_hide': 'ツール操作を非表示',
+    'agent.running': '実行中…',
+    'agent.stop': '停止',
 
     // Tools
     'tools.title': '利用可能なツール',
@@ -6577,6 +6696,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': '메시지 복사',
     'agent.connected_status': '연결됨',
     'agent.disconnected_status': '연결 끊김',
+    'agent.clear_all': '모두 지우기',
+    'agent.delete_message': '메시지 삭제',
+    'agent.compact_mode': '컴팩트',
+    'agent.tool_activity_show': '도구 활동 보기',
+    'agent.tool_activity_hide': '도구 활동 숨기기',
+    'agent.running': '실행 중…',
+    'agent.stop': '중지',
 
     // Tools
     'tools.title': '사용 가능한 도구',
@@ -6932,6 +7058,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopier melding',
     'agent.connected_status': 'Tilkoblet',
     'agent.disconnected_status': 'Frakoblet',
+    'agent.clear_all': 'Tøm alt',
+    'agent.delete_message': 'Slett melding',
+    'agent.compact_mode': 'Kompakt',
+    'agent.tool_activity_show': 'Vis verktøyaktivitet',
+    'agent.tool_activity_hide': 'Skjul verktøyaktivitet',
+    'agent.running': 'Kjører…',
+    'agent.stop': 'Stopp',
 
     // Tools
     'tools.title': 'Tilgjengelige verktøy',
@@ -7287,6 +7420,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Bericht kopiëren',
     'agent.connected_status': 'Verbonden',
     'agent.disconnected_status': 'Niet verbonden',
+    'agent.clear_all': 'Alles wissen',
+    'agent.delete_message': 'Bericht verwijderen',
+    'agent.compact_mode': 'Compact',
+    'agent.tool_activity_show': 'Toon tool-activiteit',
+    'agent.tool_activity_hide': 'Verberg tool-activiteit',
+    'agent.running': 'Bezig…',
+    'agent.stop': 'Stop',
 
     // Tools
     'tools.title': 'Beschikbare gereedschappen',
@@ -7642,6 +7782,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopiuj wiadomość',
     'agent.connected_status': 'Połączono',
     'agent.disconnected_status': 'Rozłączono',
+    'agent.clear_all': 'Wyczyść wszystko',
+    'agent.delete_message': 'Usuń wiadomość',
+    'agent.compact_mode': 'Kompaktowy',
+    'agent.tool_activity_show': 'Pokaż aktywność narzędzi',
+    'agent.tool_activity_hide': 'Ukryj aktywność narzędzi',
+    'agent.running': 'Uruchomiono…',
+    'agent.stop': 'Zatrzymaj',
 
     // Tools
     'tools.title': 'Dostępne narzędzia',
@@ -7997,6 +8144,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copiar mensagem',
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
+    'agent.clear_all': 'Limpar tudo',
+    'agent.delete_message': 'Excluir mensagem',
+    'agent.compact_mode': 'Compacto',
+    'agent.tool_activity_show': 'Mostrar atividade de ferramentas',
+    'agent.tool_activity_hide': 'Ocultar atividade de ferramentas',
+    'agent.running': 'Executando…',
+    'agent.stop': 'Parar',
 
     // Tools
     'tools.title': 'Ferramentas Disponíveis',
@@ -8352,6 +8506,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copiază mesajul',
     'agent.connected_status': 'Conectat',
     'agent.disconnected_status': 'Deconectat',
+    'agent.clear_all': 'Șterge tot',
+    'agent.delete_message': 'Șterge mesajul',
+    'agent.compact_mode': 'Compact',
+    'agent.tool_activity_show': 'Arată activitatea uneltelor',
+    'agent.tool_activity_hide': 'Ascunde activitatea uneltelor',
+    'agent.running': 'În execuție…',
+    'agent.stop': 'Oprește',
 
     // Tools
     'tools.title': 'Instrumente disponibile',
@@ -8707,6 +8868,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Скопировать сообщение',
     'agent.connected_status': 'Подключено',
     'agent.disconnected_status': 'Отключено',
+    'agent.clear_all': 'Очистить всё',
+    'agent.delete_message': 'Удалить сообщение',
+    'agent.compact_mode': 'Компактный',
+    'agent.tool_activity_show': 'Показать активность инструментов',
+    'agent.tool_activity_hide': 'Скрыть активность инструментов',
+    'agent.running': 'Выполняется…',
+    'agent.stop': 'Стоп',
 
     // Tools
     'tools.title': 'Доступные инструменты',
@@ -9076,6 +9244,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopiera meddelande',
     'agent.connected_status': 'Ansluten',
     'agent.disconnected_status': 'Frånkopplad',
+    'agent.clear_all': 'Rensa alla',
+    'agent.delete_message': 'Ta bort meddelande',
+    'agent.compact_mode': 'Kompakt',
+    'agent.tool_activity_show': 'Visa verktygsaktivitet',
+    'agent.tool_activity_hide': 'Dölj verktygsaktivitet',
+    'agent.running': 'Körs…',
+    'agent.stop': 'Stopp',
 
     // Tools
     'tools.title': 'Tillgängliga verktyg',
@@ -9431,6 +9606,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'คัดลอกข้อความ',
     'agent.connected_status': 'เชื่อมต่อแล้ว',
     'agent.disconnected_status': 'ตัดการเชื่อมต่อ',
+    'agent.clear_all': 'ล้างทั้งหมด',
+    'agent.delete_message': 'ลบข้อความ',
+    'agent.compact_mode': 'กะทัดรัด',
+    'agent.tool_activity_show': 'แสดงกิจกรรมเครื่องมือ',
+    'agent.tool_activity_hide': 'ซ่อนกิจกรรมเครื่องมือ',
+    'agent.running': 'กำลังทำงาน…',
+    'agent.stop': 'หยุด',
 
     // Tools
     'tools.title': 'เครื่องมือที่ใช้ได้',
@@ -9786,6 +9968,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopyahin ang mensahe',
     'agent.connected_status': 'Konektado',
     'agent.disconnected_status': 'Hindi Konektado',
+    'agent.clear_all': 'I-clear lahat',
+    'agent.delete_message': 'Tanggalin ang mensahe',
+    'agent.compact_mode': 'Compact',
+    'agent.tool_activity_show': 'Ipakita ang aktibidad ng tool',
+    'agent.tool_activity_hide': 'Itago ang aktibidad ng tool',
+    'agent.running': 'Tumatakbo…',
+    'agent.stop': 'Itigil',
 
     // Tools
     'tools.title': 'Mga Magagamit na Kagamitan',
@@ -10141,6 +10330,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Скопіювати повідомлення',
     'agent.connected_status': 'Підключено',
     'agent.disconnected_status': 'Відключено',
+    'agent.clear_all': 'Очистити все',
+    'agent.delete_message': 'Видалити повідомлення',
+    'agent.compact_mode': 'Компактний',
+    'agent.tool_activity_show': 'Показати активність інструментів',
+    'agent.tool_activity_hide': 'Приховати активність інструментів',
+    'agent.running': 'Виконується…',
+    'agent.stop': 'Стоп',
 
     // Tools
     'tools.title': 'Доступні інструменти',
@@ -10496,6 +10692,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'پیغام کاپی کریں',
     'agent.connected_status': 'جڑا ہوا',
     'agent.disconnected_status': 'منقطع',
+    'agent.clear_all': 'سب صاف کریں',
+    'agent.delete_message': 'پیغام حذف کریں',
+    'agent.compact_mode': 'کمپیکٹ',
+    'agent.tool_activity_show': 'ٹول سرگرمی دکھائیں',
+    'agent.tool_activity_hide': 'ٹول سرگرمی چھپائیں',
+    'agent.running': 'چل رہا ہے…',
+    'agent.stop': 'روکیں',
 
     // Tools
     'tools.title': 'دستیاب ٹولز',
@@ -10851,6 +11054,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Sao chép tin nhắn',
     'agent.connected_status': 'Đã kết nối',
     'agent.disconnected_status': 'Đã ngắt kết nối',
+    'agent.clear_all': 'Xóa tất cả',
+    'agent.delete_message': 'Xóa tin nhắn',
+    'agent.compact_mode': 'Gọn',
+    'agent.tool_activity_show': 'Hiện hoạt động công cụ',
+    'agent.tool_activity_hide': 'Ẩn hoạt động công cụ',
+    'agent.running': 'Đang chạy…',
+    'agent.stop': 'Dừng',
 
     // Tools
     'tools.title': 'Công cụ khả dụng',
