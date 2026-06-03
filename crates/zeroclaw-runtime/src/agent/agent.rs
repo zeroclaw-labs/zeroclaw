@@ -1075,27 +1075,7 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
-            .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                // Extras supplied by binary-local hook factories (e.g. the
-                // X0 conscience gate). Empty when no factory is registered,
-                // matching the default runtime-only build. See
-                // crates/zeroclaw-runtime/src/hooks/registry.rs.
-                for extra in crate::hooks::registry::build_extras(config) {
-                    runner.register(extra);
-                }
-                Some(Arc::new(runner))
-            } else {
-                None
-            })
+            .hook_runner(crate::hooks::build_runner(config))
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 

@@ -1258,10 +1258,13 @@ pub struct AgentTurn<'a> {
     pub model_switch_callback: Option<ModelSwitchCallback>,
     pub strict_tool_parsing: bool,
     pub channel: Option<&'a dyn Channel>,
+    /// Lifecycle hooks to run for this turn. `None` (or an empty runner)
+    /// means no hooks fire — the historical default for this entry point.
+    pub hooks: Option<&'a crate::hooks::HookRunner>,
 }
 
-/// Run a single agent turn with sensible defaults (no hooks, no streaming,
-/// no budget), forwarding into [`run_tool_call_loop_ctx`].
+/// Run a single agent turn with sensible defaults (no streaming, no
+/// budget), forwarding into [`run_tool_call_loop_ctx`].
 pub async fn agent_turn(turn: AgentTurn<'_>) -> Result<String> {
     let AgentTurn {
         model_provider,
@@ -1283,6 +1286,7 @@ pub async fn agent_turn(turn: AgentTurn<'_>) -> Result<String> {
         model_switch_callback,
         strict_tool_parsing,
         channel,
+        hooks,
     } = turn;
     run_tool_call_loop_ctx(LoopContext {
         model_provider,
@@ -1300,7 +1304,7 @@ pub async fn agent_turn(turn: AgentTurn<'_>) -> Result<String> {
         max_tool_iterations,
         cancellation_token: None,
         on_delta: None,
-        hooks: None,
+        hooks,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
@@ -4850,6 +4854,11 @@ pub async fn process_message(
             }
         }
 
+        // Build the same hook chain the Agent builder uses so conscience,
+        // continuity, and the built-in logging/audit hooks fire on the
+        // process_message path too. None / empty runner ⇒ no-op, so this is
+        // behaviour-neutral unless hooks are configured on.
+        let __zc_hook_runner = crate::hooks::build_runner(&config);
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
@@ -4873,6 +4882,7 @@ pub async fn process_message(
                     model_switch_callback: None,
                     strict_tool_parsing: agent.strict_tool_parsing,
                     channel: None, // process_message path has no channel ref
+                    hooks: __zc_hook_runner.as_deref(),
                 }),
             )
             .await
@@ -9903,6 +9913,7 @@ This is an example, not an invocation."#;
                 model_switch_callback: None,
                 strict_tool_parsing: false,
                 channel: None,
+                hooks: None,
             })
             .await
             .expect("wrapper path should execute activated tools");
@@ -9968,6 +9979,7 @@ This is an example, not an invocation."#;
                 model_switch_callback: None,
                 strict_tool_parsing: true,
                 channel: None,
+                hooks: None,
             })
             .await
             .expect("strict wrapper path should preserve fallback-looking text");

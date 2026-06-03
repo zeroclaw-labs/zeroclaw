@@ -40,6 +40,16 @@ impl HookRunner {
             .sort_by_key(|h| std::cmp::Reverse(h.priority()));
     }
 
+    /// Number of registered handlers.
+    pub fn len(&self) -> usize {
+        self.handlers.len()
+    }
+
+    /// Whether the runner has no handlers — dispatching against it is a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+
     // ---------------------------------------------------------------
     // Void dispatchers (parallel, fire-and-forget)
     // ---------------------------------------------------------------
