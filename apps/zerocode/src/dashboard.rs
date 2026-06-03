@@ -2078,8 +2078,9 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
 
 fn truncate(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
-    if first_line.len() > max {
-        format!("{}...", &first_line[..max])
+    if first_line.chars().count() > max {
+        let truncated: String = first_line.chars().take(max).collect();
+        format!("{truncated}...")
     } else {
         first_line.to_string()
     }
