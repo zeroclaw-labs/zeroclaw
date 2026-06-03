@@ -6,6 +6,9 @@ use xtask::cmd;
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
+    /// Optional tag for versioned docs output (e.g. v0.7.5). Falls back to TAG env var.
+    #[arg(long)]
+    tag: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -44,16 +47,25 @@ enum Cmd {
     Check,
     /// Print space-separated locale codes from locales.toml (for CI use)
     Locales,
+    /// Extract shared chrome layer into _shared directory
+    ExtractChrome {
+        version_dir: String,
+        shared_dir: String,
+    },
+    /// Generate versions.json list of deployed documentation versions
+    GenVersions,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let tag_owned = cli.tag.or_else(|| std::env::var("TAG").ok());
+    let tag = tag_owned.as_deref();
     match cli.command {
-        Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref()),
-        Cmd::Build => cmd::mdbook::build::run(),
-        Cmd::Refs => cmd::mdbook::refs::run(),
+        Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref(), tag),
+        Cmd::Build => cmd::mdbook::build::run(tag),
+        Cmd::Refs => cmd::mdbook::refs::run(tag),
         Cmd::Sync {
             locale,
             force,
@@ -73,6 +85,14 @@ fn main() -> anyhow::Result<()> {
             cmd::mdbook::build::print_locales();
             Ok(())
         }
+        Cmd::ExtractChrome {
+            version_dir,
+            shared_dir,
+        } => cmd::mdbook::build::extract_shared_chrome(
+            std::path::Path::new(&version_dir),
+            std::path::Path::new(&shared_dir),
+        ),
+        Cmd::GenVersions => cmd::mdbook::versions::run(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
     }
 }
