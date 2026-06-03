@@ -76,6 +76,8 @@ pub struct DelegateTool {
     /// Providers config for resolving per-provider credentials and default models
     /// when the delegate call specifies a provider override.
     providers_config: Option<Arc<daemonclaw_config::providers::ProvidersConfig>>,
+    /// Shared audit logger for recording sub-agent tool calls.
+    audit_logger: Option<Arc<crate::security::audit::AuditLogger>>,
 }
 
 impl DelegateTool {
@@ -111,6 +113,7 @@ impl DelegateTool {
             cancellation_token: CancellationToken::new(),
             memory: None,
             providers_config: None,
+            audit_logger: None,
         }
     }
 
@@ -152,6 +155,7 @@ impl DelegateTool {
             cancellation_token: CancellationToken::new(),
             memory: None,
             providers_config: None,
+            audit_logger: None,
         }
     }
 
@@ -211,6 +215,11 @@ impl DelegateTool {
         providers_config: Arc<daemonclaw_config::providers::ProvidersConfig>,
     ) -> Self {
         self.providers_config = Some(providers_config);
+        self
+    }
+
+    pub fn with_audit_logger(mut self, logger: Arc<crate::security::audit::AuditLogger>) -> Self {
+        self.audit_logger = Some(logger);
         self
     }
 
@@ -763,6 +772,7 @@ impl DelegateTool {
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
+        let audit_logger_clone = self.audit_logger.clone();
         let task_id_clone = task_id.clone();
 
         tokio::spawn(async move {
@@ -780,6 +790,7 @@ impl DelegateTool {
                 cancellation_token: child_token.clone(),
                 memory: None,
                 providers_config: None,
+                audit_logger: audit_logger_clone,
             };
 
             let args_inner = json!({
@@ -921,6 +932,7 @@ impl DelegateTool {
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
             let cancellation_token = self.cancellation_token.child_token();
+            let audit_logger_clone = self.audit_logger.clone();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -939,6 +951,7 @@ impl DelegateTool {
                     cancellation_token,
                     memory: None,
                     providers_config: None,
+                    audit_logger: audit_logger_clone,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1305,7 +1318,7 @@ impl DelegateTool {
                 None, // channel: delegate subagents don't support approval
                 None, // receipt_generator
                 None, // collected_receipts
-                None, // audit_logger
+                self.audit_logger.as_deref(),
             ),
         )
         .await;

@@ -909,6 +909,18 @@ pub fn all_tools_with_runtime(
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
         .with_providers_config(Arc::new(root_config.providers.clone()));
+        let delegate_tool = if root_config.security.audit.enabled {
+            if let Ok(logger) = crate::security::audit::AuditLogger::new(
+                root_config.security.audit.clone(),
+                root_config.workspace_dir.clone(),
+            ) {
+                delegate_tool.with_audit_logger(std::sync::Arc::new(logger))
+            } else {
+                delegate_tool
+            }
+        } else {
+            delegate_tool
+        };
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
