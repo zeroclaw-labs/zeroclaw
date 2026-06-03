@@ -73,7 +73,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "test.txt"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "cli",
         );
 
@@ -89,7 +89,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "cli",
         );
 
@@ -103,7 +103,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "cli",
         );
         assert!(mgr.needs_approval("file_write"));
@@ -118,13 +118,13 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "rm -rf ./build/"}),
-            ApprovalResponse::No,
+            &ApprovalResponse::No,
             "cli",
         );
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "out.txt", "content": "hello"}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "cli",
         );
 
@@ -142,7 +142,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "telegram",
         );
 
@@ -262,7 +262,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "test.txt"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "telegram",
         );
 
@@ -276,7 +276,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "telegram",
         );
 

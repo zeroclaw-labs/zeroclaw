@@ -3,15 +3,55 @@ use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Default maximum shell command execution time before kill.
-const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+/// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
+/// Disarmed after `child.wait()` returns so it never signals a recycled PID.
+#[cfg(unix)]
+struct ChildGroupGuard {
+    pgid: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(unix)]
+impl ChildGroupGuard {
+    fn new(child_pid: Option<u32>) -> Self {
+        let pgid = child_pid.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        Self {
+            pgid: std::sync::atomic::AtomicI32::new(pgid),
+        }
+    }
+
+    fn disarm(&self) {
+        self.pgid.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let pgid = self.pgid.load(std::sync::atomic::Ordering::Acquire);
+        if pgid <= 0 {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Kill)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "pgid": pgid, "signal": "SIGKILL" })),
+            "shell tool reaping child process group"
+        );
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
 
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
@@ -47,15 +87,22 @@ pub struct ShellTool {
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
     timeout_secs: u64,
+    /// Environment forwarded from the connected TUI client. When set, these
+    /// vars are overlaid on top of the safe-env snapshot, letting the user's
+    /// real shell environment (PATH, credentials, etc.) reach subprocesses
+    /// even though the daemon itself may have a stripped-down env.
+    tui_env: Option<HashMap<String, String>>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
+        let timeout_secs = security.shell_timeout_secs;
         Self {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
-            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+            timeout_secs,
+            tui_env: None,
         }
     }
 
@@ -64,17 +111,28 @@ impl ShellTool {
         runtime: Arc<dyn RuntimeAdapter>,
         sandbox: Arc<dyn Sandbox>,
     ) -> Self {
+        let timeout_secs = security.shell_timeout_secs;
         Self {
             security,
             runtime,
             sandbox,
-            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+            timeout_secs,
+            tui_env: None,
         }
     }
 
     /// Override the command execution timeout (in seconds).
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Overlay the TUI client's environment on top of the safe-env snapshot.
+    ///
+    /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
+    /// calling this method at all).
+    pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
+        self.tui_env = env;
         self
     }
 }
@@ -259,15 +317,60 @@ impl Tool for ShellTool {
             }
         }
 
+        // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
+        // conflict — the user's real PATH etc. should take precedence over
+        // whatever the daemon process inherited.
+        if let Some(ref tui_env) = self.tui_env {
+            for (k, v) in tui_env {
+                cmd.env(k, v);
+            }
+        }
+
         let timeout_secs = self.timeout_secs;
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+        // Run in own process group so `ChildGroupGuard` can reap the
+        // whole subtree (backgrounded jobs, subshells) on any exit path.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+        // `output()` pipes stdio implicitly; `spawn()` does not.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = decode_output(&output.stdout);
-                let mut stderr = decode_output(&output.stderr);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to spawn command: {e}")),
+                });
+            }
+        };
 
-                // Truncate output to prevent OOM
+        #[cfg(unix)]
+        let group_guard = ChildGroupGuard::new(child.id());
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let drain_stdout = drain_capped(stdout_handle, MAX_OUTPUT_BYTES);
+        let drain_stderr = drain_capped(stderr_handle, MAX_OUTPUT_BYTES);
+        let wait_fut = async {
+            let status = child.wait().await?;
+            #[cfg(unix)]
+            group_guard.disarm();
+            let (out, err) = tokio::join!(
+                tokio::time::timeout(POST_EXIT_DRAIN, drain_stdout),
+                tokio::time::timeout(POST_EXIT_DRAIN, drain_stderr),
+            );
+            Ok::<_, std::io::Error>((status, out.unwrap_or_default(), err.unwrap_or_default()))
+        };
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {
+            Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
+                let mut stdout = decode_output(&stdout_bytes);
+                let mut stderr = decode_output(&stderr_bytes);
+
                 if stdout.len() > MAX_OUTPUT_BYTES {
                     let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
                     while b > 0 && !stdout.is_char_boundary(b) {
@@ -286,7 +389,7 @@ impl Tool for ShellTool {
                 }
 
                 Ok(ToolResult {
-                    success: output.status.success(),
+                    success: status.success(),
                     output: stdout,
                     error: if stderr.is_empty() {
                         None
@@ -309,6 +412,32 @@ impl Tool for ShellTool {
             }),
         }
     }
+}
+
+async fn drain_capped<R>(reader: Option<R>, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let take = n.min(cap.saturating_sub(buf.len()).max(1));
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= cap {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
 }
 
 #[cfg(test)]
@@ -700,14 +829,6 @@ mod tests {
     // ── shell timeout enforcement tests ─────────────────
 
     #[test]
-    fn shell_timeout_default_is_reasonable() {
-        assert_eq!(
-            DEFAULT_SHELL_TIMEOUT_SECS, 60,
-            "default shell timeout must be 60 seconds"
-        );
-    }
-
-    #[test]
     fn shell_timeout_can_be_overridden() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
             .with_timeout_secs(120);
@@ -931,5 +1052,131 @@ mod tests {
             .expect("command with sandbox should succeed");
         assert!(result.success);
         assert!(result.output.contains("sandbox_test"));
+    }
+
+    // ── TUI env overlay tests ─────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_is_passed_to_subprocess() {
+        // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
+        // it should only appear if tui_env injects it.
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("ZC_TUI_TEST_VAR".to_string(), "tui_injected".to_string());
+                m
+            }));
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("ZC_TUI_TEST_VAR=tui_injected"),
+            "tui_env var should appear in subprocess env, got:\n{}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_without_tui_env_does_not_inject_extra_vars() {
+        // Without tui_env, a non-safe var must NOT appear.
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("ZC_TUI_TEST_VAR"),
+            "non-safe var must not leak without tui_env"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_overrides_safe_var() {
+        // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
+        // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
+        let _guard = EnvGuard::set("HOME", "/daemon-home");
+
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("HOME".to_string(), "/tui-home".to_string());
+                m
+            }));
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(
+            result.success,
+            "env should succeed, got output={:?} error={:?}",
+            result.output, result.error
+        );
+        assert!(
+            result.output.contains("HOME=/tui-home"),
+            "tui_env HOME should override daemon HOME, got:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("HOME=/daemon-home"),
+            "daemon HOME must not leak through when tui_env overrides it, got:\n{}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_none_behaves_like_existing() {
+        // with_tui_env(None) must be identical to no tui_env at all —
+        // only SAFE_ENV_VARS + passthrough reach the subprocess.
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("ZC_TUI_TEST_VAR"),
+            "None tui_env must not inject anything extra"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_secrets_reach_subprocess_but_not_safe_list() {
+        // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
+        // DO reach the subprocess via tui_env even though they are not
+        // in SAFE_ENV_VARS.
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("SSH_AUTH_SOCK".to_string(), "/tmp/fake.sock".to_string());
+                m
+            }));
+
+        // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
+        assert!(
+            !SAFE_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
+            "SSH_AUTH_SOCK must not be in SAFE_ENV_VARS"
+        );
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("SSH_AUTH_SOCK=/tmp/fake.sock"),
+            "SSH_AUTH_SOCK from tui_env must reach subprocess"
+        );
     }
 }

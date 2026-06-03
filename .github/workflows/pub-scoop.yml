@@ -103,7 +103,7 @@ jobs:
                   "64bit": {
                       "url": "${ZIP_URL}",
                       "hash": "${SHA256}",
-                      "bin": "zeroclaw.exe"
+                      "bin": ["zeroclaw.exe", "zerocode.exe"]
                   }
               },
               "checkver": {
