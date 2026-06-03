@@ -35,6 +35,7 @@
 | 1 | 2026-04-09 | Initial draft |
 | 2 | 2026-04-09 | Added §4.4.1 Versioning Policy (unified workspace inheritance, stability tiers, product-level breaking change definition); added §4.4.2 Release Artifacts (feature flag fate, canonical release binary profile, release artifact matrix); added Discussion Questions for versioning strategy and observability defaults |
 | 3 | 2026-04-10 | Terminology correction per implementation feedback from PR #5559: "kernel" → "runtime" for the agent orchestration layer throughout; "kernel" now refers specifically to the irreducible foundation (`--no-default-features` build); §4.1 updated to describe the explicit two-layer architecture (foundation + runtime); §4.2–§4.3 dependency diagram and component map updated to show `zeroclaw-runtime`; Phase 2 renamed from "The Kernel" to "The Runtime"; binary size targets reframed as aspirational north stars with measured progress tracking rather than hard gates; §7 updated with actual Phase 1 measurement (6.6 MB foundation build) and explicit note that architectural decomposition enables optimization but optimization is a dedicated second pass |
+| 4 | 2026-06-02 | Update §5.2 to correctly target `wasm32-wasip2` to enable WIT files. Update Phase 2 §D2 to replace Extism with wasmtime to enable ARM32 targets and WIT files |
 
 ---
 
