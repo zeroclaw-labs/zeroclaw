@@ -203,6 +203,7 @@ endpoint = "default"
 
 ```toml
 [providers.models.minimax.intl]
+model    = "MiniMax-M3"                       # or MiniMax-M2.7, MiniMax-M2.7-highspeed
 api_key  = "..."
 endpoint = "intl"                            # variants: cn, intl
 ```

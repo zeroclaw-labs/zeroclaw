@@ -253,7 +253,7 @@ mod tests {
     fn first_sighting_returns_true() {
         let seen = fresh_seen();
         assert!(
-            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3"),
             "first observation of a (model_provider, model) pair must report first-sighting"
         );
     }
@@ -264,10 +264,10 @@ mod tests {
         assert!(missing_pricing_first_sighting(
             &seen,
             "minimax",
-            "MiniMax-M2.7"
+            "MiniMax-M3"
         ));
         assert!(
-            !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3"),
             "second sighting of the same pair must NOT re-fire WARN"
         );
     }
@@ -278,10 +278,10 @@ mod tests {
         assert!(missing_pricing_first_sighting(
             &seen,
             "minimax",
-            "MiniMax-M2.7"
+            "MiniMax-M3"
         ));
         assert!(
-            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
             "different model under same model_provider is a distinct pair"
         );
     }
