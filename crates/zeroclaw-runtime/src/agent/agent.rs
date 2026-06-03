@@ -450,14 +450,7 @@ impl AgentBuilder {
         // replace the backend with NoneMemory, and force auto_save off.
         let exclude_memory = self.exclude_memory;
         if exclude_memory {
-            const MEMORY_TOOLS: &[&str] = &[
-                "memory_recall",
-                "memory_store",
-                "memory_forget",
-                "memory_export",
-                "memory_purge",
-            ];
-            tools.retain(|t| !MEMORY_TOOLS.contains(&t.name()));
+            tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
