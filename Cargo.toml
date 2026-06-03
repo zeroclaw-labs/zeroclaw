@@ -204,10 +204,10 @@ tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 regex = "1.10"
 hostname = { version = "0.4.2", optional = true }
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rustls-pki-types = { version = "1.14.0", optional = true }
-tokio-rustls = { version = "0.26.4", optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
