@@ -272,6 +272,77 @@ doas jexec zeroclaw service zeroclaw status
 - **Prefer the hardened `rc.d` script in a jail.** You'll typically drive `service` non-interactively via `jexec`/`ssh`, which is exactly where the basic script's `start` hang and orphan-stacking bite — see [Hardening](#4-hardening-for-unattended-and-remote-operation). It also keeps `/var/run/zeroclaw` root-owned inside the jail so the unprivileged service user can't forge the supervisor pidfile.
 - **Running several daemons in one jail** (e.g. a worker pool) follows the pool note in the hardening section: one pidfile/logfile per instance and a `pgrep` bound to the launcher retitle, since the jail shares one process table.
 
+## Running the Linux image under Podman + Linuxulator
+
+The native build above is the right path for ZeroClaw itself. But some Python-backed
+tools and skills depend on **manylinux-only wheels** — `polars`, `pyarrow`, and
+`oracledb`, for example, publish no FreeBSD wheels, so a tool that imports them can't
+run under the native FreeBSD `python3`. FreeBSD's [Linuxulator](https://docs.freebsd.org/en/books/handbook/linuxemu/)
+(Linux binary-compatibility layer) plus Podman lets you run the **official Linux
+container image** on a FreeBSD host, giving those tools the Linux ABI they expect.
+This complements the native `rc.d` daemon — you can run either, or both side by side.
+
+### 1. Prerequisites
+
+Load the Linuxulator modules and confirm they report a Linux release:
+
+```sh
+doas kldload linux linux64
+sysctl compat.linux.osrelease        # e.g. compat.linux.osrelease: 5.15.0
+```
+
+To load them on boot, add `linux_enable="YES"` to `/etc/rc.conf`. Then install Podman:
+
+```sh
+doas pkg install -y podman
+```
+
+### 2. Pull the image — force the Linux platform
+
+FreeBSD Podman defaults to `os=freebsd` when resolving a manifest list. ZeroClaw's
+images are published only for `linux/amd64` and `linux/arm64`, so a plain `podman pull`
+fails with `no image found in manifest list for architecture ..., OS freebsd`. Force
+the Linux platform explicitly:
+
+```sh
+doas podman pull --os linux --arch amd64 ghcr.io/zeroclaw-labs/zeroclaw:debian
+```
+
+> Use the `debian` tag rather than `latest`: the distroless `latest` image has no
+> shell, which makes it awkward to debug under emulation. See
+> [Docker & Containers](./container.md) for the full image list.
+
+### 3. Run the container
+
+The Linux image behaves exactly as documented in [Docker & Containers](./container.md) —
+it expects persistent state at `/zeroclaw-data` and bootstraps a config on first run:
+
+```sh
+doas podman run -d --name zeroclaw --restart=always \
+    --os linux --arch amd64 \
+    -p 42617:42617 \
+    -v /var/db/zeroclaw:/zeroclaw-data \
+    ghcr.io/zeroclaw-labs/zeroclaw:debian
+
+doas podman exec -it zeroclaw zeroclaw onboard
+```
+
+Keep the `--os linux --arch amd64` flags on every `run` (not just `pull`) so Podman
+doesn't re-resolve to the FreeBSD default.
+
+### Linuxulator notes
+
+- **Boot persistence.** Podman's own `--restart=always` only restarts the container
+  within a running Podman; it won't survive a host reboot on its own. Supervise the
+  `podman start` from an `rc.d` script (same pattern as the [native service](#running-as-a-service-rcd))
+  or a `@reboot` cron entry so the container comes back after the host restarts.
+- **Networking.** `-p 42617:42617` publishes the gateway through Podman's bridge. If
+  the bridge/CNI setup isn't configured on your host, `--network host` is the simplest
+  alternative — the container then shares the host's network stack directly.
+- **Not everything emulates cleanly.** Linuxulator covers the common syscall surface,
+  but exotic binaries may hit unimplemented calls. If a tool misbehaves, check
+  `dmesg` for `linux:` warnings before assuming a ZeroClaw bug.
+
 ## Logs
 
 ```sh
