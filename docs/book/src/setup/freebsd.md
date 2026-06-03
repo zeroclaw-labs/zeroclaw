@@ -158,6 +158,46 @@ doas service zeroclaw status
 
 `service zeroclaw stop` / `restart` work as expected. Because `zeroclaw_enable=YES` is in `/etc/rc.conf` (written by `sysrc`), the daemon also starts on boot.
 
+### 4. Hardening for unattended and remote operation
+
+The script above is correct for an interactive, single-instance install. Three `daemon(8)` behaviours will surprise you the moment you drive the service remotely (over `ssh`) or run more than one copy. All three bit a production deployment; the fixes are small.
+
+**Remote `service ... start` hangs.** `daemon -r` inherits and holds open whatever stdin/stdout/stderr it was launched with. Run `ssh host 'service zeroclaw start'` and the supervisor keeps your `ssh` session's stdout fd open forever, so `ssh` never sees EOF and the command hangs even though the daemon started fine. Detach the supervisor's own descriptors — `-o ${logfile}` already routes the *child's* output, so nothing is lost:
+
+```sh
+command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_user} ${launcher}"
+# ...invoke daemon with its own std{in,out,err} sent to /dev/null:
+/usr/sbin/daemon ${command_args} </dev/null >/dev/null 2>&1
+```
+
+If you use the stock `command`/`command_args` form, wrap the start in a custom `start_cmd` so you control the redirection. This one change is what makes `service zeroclaw start` safe to call from `ssh`, CI, or a config-management push.
+
+**Repeated `start` stacks orphan supervisors.** A plain `start` does not check whether a supervisor is already running, so a second `start` (or a `start` after a crash that left a stale pidfile) launches another `daemon` that fights the first over the gateway port. Make `start` idempotent by refusing when a live supervisor already exists. Match the supervisor by the launcher path, **not** the pidfile alone (the pidfile can be stale). Two FreeBSD-specific traps when you do this:
+
+- `daemon(8)` *retitles its supervisor* to `daemon: /usr/local/libexec/zeroclaw-run.sh[<childpid>] (daemon)`. So `pgrep -f zeroclaw-run.sh` matches the supervisor, but a `pgrep -f` for the binary name does not. Bind on the literal `daemon: ` prefix — that matches the supervisor and never the child, a hand-run of the launcher, or the rc shell itself.
+- FreeBSD `pgrep -f` does **not** honour a leading `^` anchor against that retitle string — `pgrep -f '^daemon: ...'` matches nothing. Drop the `^`; rely on the `daemon: ` prefix for specificity and escape the dot in `.sh` as `[.]` so it is literal.
+
+```sh
+launcher_pat="daemon: /usr/local/libexec/zeroclaw-run[.]sh"
+
+zeroclaw_running()
+{
+    pgrep -f "${launcher_pat}" >/dev/null 2>&1
+}
+```
+
+**`read` from a `daemon -P` pidfile reports a false negative.** `daemon -P` writes the pid with **no trailing newline**, so `IFS= read -r pid < "${pidfile}"` returns a *non-zero* status (EOF before newline) even though it set `pid` correctly. If you guard it as `read -r pid < "$pf" || return 1`, every running instance looks stopped and your idempotent `start` happily launches a duplicate. Don't key the success path on `read`'s exit status — validate the value instead:
+
+```sh
+pid=""
+IFS= read -r pid < "${pidfile}"     # do NOT `|| return 1` here
+case "${pid}" in
+    ''|*[!0-9]*) return 1 ;;        # empty or non-numeric → treat as not running
+esac
+```
+
+**Running a pool of instances.** To run N daemons (e.g. a worker pool), give each its own pidfile and logfile (`worker.$i.pid`, `worker.$i.log`) and loop the start/stop over `$i`. Because the supervisor retitle is identical for every instance and does not include per-instance arguments, the **pidfile is the only per-instance handle** — drive stop/status from the pidfile, and on a full stop sweep any leftover supervisor that no live pidfile points at (started by hand, or whose pidfile went stale).
+
 ## Logs
 
 ```sh
