@@ -126,7 +126,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         display_name,
         description,
         integration,
-        resource_key
+        resource_key,
+        tab
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -234,6 +235,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let tab_token = match extract_tab_variant(&field.attrs) {
+            Some(variant) => quote! { crate::config::ConfigTab::#variant },
+            None => quote! { crate::config::ConfigTab::None },
+        };
 
         // ── Secret handling ──
         //
@@ -1668,8 +1673,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             prop_field_entries.push(quote! {
                 {
                     let display_value: String = match #inner_value_expr {
-                        None => "<unset>".to_string(),
-                        Some(v) if v.is_empty() => "<unset>".to_string(),
+                        None => crate::config::UNSET_DISPLAY.to_string(),
+                        Some(v) if v.is_empty() => crate::config::UNSET_DISPLAY.to_string(),
                         Some(v) => match <#inner_ty as crate::config::HasPropKind>::PROP_KIND {
                             crate::config::PropKind::ObjectArray => {
                                 serde_json::to_string(v)
@@ -1691,6 +1696,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         enum_variants: #enum_variants_expr,
                         description: #description_lit,
                         derived_from_secret: #derived_from_secret,
+                        tab: #tab_token,
                     }
                 }
             });
@@ -1707,6 +1713,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #enum_variants_expr,
                     #description_lit,
                     #derived_from_secret,
+                    #tab_token,
                 )
             });
         }
@@ -1989,7 +1996,7 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
 }
 
 fn snake_to_kebab(s: &str) -> String {
-    s.replace('_', "-")
+    s.to_string()
 }
 
 /// Title-case a snake_case identifier for use as a default display name
@@ -2007,6 +2014,21 @@ fn snake_to_title(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Read the `#[tab(Variant)]` field-level attribute and return the variant
+/// ident (e.g. `Connection`), or `None` when the attribute is absent.
+fn extract_tab_variant(attrs: &[syn::Attribute]) -> Option<syn::Ident> {
+    for attr in attrs {
+        if !attr.path().is_ident("tab") {
+            continue;
+        }
+        // Parse #[tab(Ident)] — parenthesised single ident.
+        if let Ok(ident) = attr.parse_args::<syn::Ident>() {
+            return Some(ident);
+        }
+    }
+    None
 }
 
 /// Read the `&str` value of a `#[name = "value"]` field-level attribute,
@@ -2188,10 +2210,10 @@ mod tests {
     use syn::parse_quote;
 
     #[test]
-    fn snake_to_kebab_converts_underscores() {
-        assert_eq!(snake_to_kebab("access_token"), "access-token");
-        assert_eq!(snake_to_kebab("api_key"), "api-key");
-        assert_eq!(snake_to_kebab("bot_token"), "bot-token");
+    fn snake_to_kebab_is_identity_passthrough() {
+        assert_eq!(snake_to_kebab("access_token"), "access_token");
+        assert_eq!(snake_to_kebab("api_key"), "api_key");
+        assert_eq!(snake_to_kebab("bot_token"), "bot_token");
         assert_eq!(snake_to_kebab("simple"), "simple");
     }
 

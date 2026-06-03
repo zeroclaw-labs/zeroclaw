@@ -19,8 +19,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+use zeroclaw_config::field_visibility;
+use zeroclaw_config::sections::section_for_path;
 use zeroclaw_config::traits::MaskSecrets;
-use zeroclaw_runtime::onboard::{field_visibility, section_for_path};
 
 use super::AppState;
 use super::api::require_auth;
@@ -245,7 +246,13 @@ pub struct ListEntry {
     /// section. The dashboard groups list entries by this for per-section
     /// rendering — same source the CLI wizard uses, no schema attribute.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub onboard_section: Option<&'static str>,
+    pub section: Option<&'static str>,
+    /// Tab grouping label from the field's `#[tab(...)]` annotation
+    /// (`ConfigTab::label`). Absent for `ConfigTab::None`. Surfaces group
+    /// list entries into a tab bar by this; the agent edit form depends on
+    /// it to split General / Providers / Channels / etc.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub tab: &'static str,
 }
 
 /// Stable wire-form name for a `PropKind` variant. Matches the lower-kebab
@@ -500,8 +507,12 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
         }
         let mem = in_memory_props.get(name);
         let disk = on_disk_props.get(name);
-        let mem_display = mem.map(|p| p.display_value.as_str()).unwrap_or("<unset>");
-        let disk_display = disk.map(|p| p.display_value.as_str()).unwrap_or("<unset>");
+        let mem_display = mem
+            .map(|p| p.display_value.as_str())
+            .unwrap_or(zeroclaw_config::traits::UNSET_DISPLAY);
+        let disk_display = disk
+            .map(|p| p.display_value.as_str())
+            .unwrap_or(zeroclaw_config::traits::UNSET_DISPLAY);
         if mem_display == disk_display {
             continue;
         }
@@ -562,7 +573,7 @@ pub async fn handle_prop_get(
     };
 
     if info.is_secret || info.derived_from_secret {
-        let populated = info.display_value != "<unset>";
+        let populated = info.display_value != zeroclaw_config::traits::UNSET_DISPLAY;
         return axum::Json(SecretResponse {
             path: q.path,
             populated,
@@ -603,6 +614,7 @@ pub async fn handle_prop_put(
     }
 
     let mut new_config = state.config.read().clone();
+    new_config.ensure_map_key_for_path(&body.path);
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&body.path)),
@@ -612,6 +624,28 @@ pub async fn handle_prop_put(
         Ok(s) => s,
         Err(e) => return error_response(e.with_path(&body.path)),
     };
+
+    // Reject the masked sentinel for secrets — surfaces occasionally
+    // echo the masked display value back when no real edit happened.
+    // Letting that through would overwrite the live secret with the
+    // literal masked string.
+    let is_sensitive = info.is_secret || info.derived_from_secret;
+    if is_sensitive
+        && (value_str == zeroclaw_config::traits::MASKED_SECRET
+            || value_str == "****"
+            || value_str.is_empty())
+    {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!(
+                    "Refusing to overwrite secret `{}` with a masked or empty value",
+                    body.path
+                ),
+            )
+            .with_path(&body.path),
+        );
+    }
 
     if let Err(e) = new_config.set_prop_persistent(&body.path, &value_str) {
         return error_response(map_prop_error(e, &body.path));
@@ -744,7 +778,7 @@ pub async fn handle_list(
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
         .map(|info| {
-            let populated = info.display_value != "<unset>";
+            let populated = info.display_value != zeroclaw_config::traits::UNSET_DISPLAY;
             let is_sensitive = info.is_secret || info.derived_from_secret;
             let value = if is_sensitive {
                 None
@@ -764,7 +798,8 @@ pub async fn handle_list(
                 is_secret: is_sensitive,
                 is_env_overridden,
                 enum_variants,
-                onboard_section: section,
+                section,
+                tab: info.tab.label(),
             }
         })
         .collect();
@@ -1015,7 +1050,7 @@ pub async fn handle_map_key(
         // skill-bundles: materialize the bundle's resolved directory so
         // skills have a home immediately. Run before persist so a failed
         // mkdir surfaces in logs alongside the config write.
-        if path == "skill-bundles" || path == "skill_bundles" {
+        if path == "skill_bundles" {
             let install_root = working.install_root_dir();
             if let Ok(dir) =
                 zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &key)
@@ -1173,6 +1208,9 @@ pub async fn handle_patch(
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
+        if matches!(op.op.as_str(), "add" | "replace") {
+            working.ensure_map_key_for_path(&path);
+        }
         let info = lookup_prop_field(&working, &path);
         let is_sensitive = info
             .as_ref()
@@ -1847,10 +1885,10 @@ mod tests {
             "default".into(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        cfg.set_prop("risk-profiles.default.workspace-only", "true")
+        cfg.set_prop("risk_profiles.default.workspace_only", "true")
             .expect("set_prop bool");
         let actual = cfg
-            .get_prop("risk-profiles.default.workspace-only")
+            .get_prop("risk_profiles.default.workspace_only")
             .expect("get_prop");
         let want_typed = json_to_setprop_string(&serde_json::json!(true), Some(PropKind::Bool))
             .expect("coerce bool true");
@@ -1940,10 +1978,10 @@ mod tests {
             "default".into(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        cfg.set_prop("risk-profiles.default.workspace-only", "true")
+        cfg.set_prop("risk_profiles.default.workspace_only", "true")
             .expect("set_prop");
         let actual = cfg
-            .get_prop("risk-profiles.default.workspace-only")
+            .get_prop("risk_profiles.default.workspace_only")
             .expect("get_prop");
         let want = json_to_setprop_string(&serde_json::json!(false), Some(PropKind::Bool))
             .expect("coerce bool false");
@@ -2186,7 +2224,8 @@ mod tests {
             is_secret: true,
             is_env_overridden: false,
             enum_variants: vec![],
-            onboard_section: Some("providers.models"),
+            section: Some("providers.models"),
+            tab: "",
         };
         let json = serde_json::to_value(&entry).expect("serialize");
         let obj = json.as_object().expect("object");

@@ -59,7 +59,7 @@ Sync all other version references:
 bash scripts/release/bump-version.sh X.Y.Z
 ```
 
-This updates README badges, the Tauri config, marketplace templates, and
+This updates README badges, the Tauri config, and
 workflow description examples. Commit everything together:
 
 ```text
@@ -278,6 +278,46 @@ Once `publish` completes, confirm:
 You do not need to manually verify Docker, crates.io, or distribution channels
 unless a job in the workflow run shows red. Check the workflow run summary — if
 all jobs are green, you are done.
+
+---
+
+## Step 7 — Versioned documentation deployment
+
+ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is pushed, the `Deploy mdBook docs to Pages` workflow automatically builds and deploys the documentation for that version.
+
+### What happens automatically
+
+- Pushing a tag (e.g., `v0.8.0`) triggers a build that lands in `/v0.8.0/`.
+- If the tag is a GA release (no pre-release suffix), it is also copied to `/stable/`.
+- The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
+
+### Bootstrapping `gh-pages`
+
+If `gh-pages` is ever deleted or needs to be fully recreated, seed the versions in this specific order:
+
+1. **Oldest supported release:** `workflow_dispatch` with tag `v0.7.5`
+2. **Next releases:** `workflow_dispatch` with tag `v0.8.0-beta-1` etc.
+3. **Current master:** `workflow_dispatch` with tag `master`
+
+> [!IMPORTANT]
+> `master` must be deployed **last** during bootstrapping. It writes the definitive `_shared/` chrome layer that all other versions use.
+
+### Manual redeploys and the Version Floor
+
+To manually re-deploy a specific version:
+1. Go to **Actions** → **Deploy mdBook docs to Pages**
+2. Click **Run workflow**
+3. Enter the tag (e.g., `v0.7.5` or `master`)
+
+**The `DOCS_MIN_VERSION` floor:**
+To prevent accidentally deploying very old or unsupported versions, the workflow enforces a minimum version floor (currently `v0.7.5`).
+
+- Tags older than `DOCS_MIN_VERSION` (like `v0.7.4`) are rejected by the workflow.
+- `cargo mdbook gen-versions` (the xtask helper) ignores any directories on `gh-pages` below this floor, keeping them out of the version dropdown.
+
+If you need to raise the floor to drop support for an older version:
+1. Update the `DOCS_MIN_VERSION` environment variable in `.github/workflows/docs-deploy.yml`.
+2. (Optional) Delete the old version's directory from the `gh-pages` branch to save space.
 
 ---
 

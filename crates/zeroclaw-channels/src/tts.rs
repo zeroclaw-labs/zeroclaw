@@ -30,6 +30,11 @@ pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
     /// Synthesize `text` using the given `voice`, returning raw audio bytes.
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
 
+    /// The audio container/codec of the bytes returned by `synthesize`
+    /// (e.g. `"opus"`, `"wav"`, `"mp3"`). Used by `TtsManager::synthesize_opus`
+    /// to decide whether transcoding is necessary — only `"opus"` skips it.
+    fn output_format(&self) -> &str;
+
     /// Voices supported by this model_provider.
     fn supported_voices(&self) -> Vec<String>;
 
@@ -45,6 +50,13 @@ pub struct OpenAiTtsProvider {
     api_key: String,
     model: String,
     speed: f64,
+    /// Full endpoint URL. Defaults to the OpenAI production endpoint; can be
+    /// overridden via `[providers.tts.openai.<alias>].uri` to point at any
+    /// OpenAI-compatible TTS backend (Groq, Azure, self-hosted proxies).
+    base_url: String,
+    /// Audio response format. Defaults to `"opus"`; override to `"wav"` for
+    /// Orpheus-class models or `"mp3"` for broader compatibility.
+    response_format: String,
     client: reqwest::Client,
 }
 
@@ -74,6 +86,16 @@ impl OpenAiTtsProvider {
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or_else(|| "tts-1".to_string()),
             speed: config.speed.unwrap_or(1.0),
+            base_url: config
+                .uri
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".to_string()),
+            response_format: config
+                .response_format
+                .clone()
+                .filter(|f| !f.trim().is_empty())
+                .unwrap_or_else(|| "opus".to_string()),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -88,18 +110,22 @@ impl TtsProvider for OpenAiTtsProvider {
         "openai"
     }
 
+    fn output_format(&self) -> &str {
+        &self.response_format
+    }
+
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
         let body = serde_json::json!({
             "model": self.model,
             "input": text,
             "voice": voice,
             "speed": self.speed,
-            "response_format": "opus",
+            "response_format": self.response_format,
         });
 
         let resp = self
             .client
-            .post("https://api.openai.com/v1/audio/speech")
+            .post(&self.base_url)
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -188,6 +214,9 @@ impl ElevenLabsTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for ElevenLabsTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
     fn name(&self) -> &str {
         "elevenlabs"
     }
@@ -295,6 +324,10 @@ impl GoogleTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for GoogleTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
+
     fn name(&self) -> &str {
         "google"
     }
@@ -409,6 +442,10 @@ impl EdgeTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for EdgeTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
+
     fn name(&self) -> &str {
         "edge"
     }
@@ -501,6 +538,10 @@ impl PiperTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for PiperTtsProvider {
+    fn output_format(&self) -> &str {
+        "wav"
+    }
+
     fn name(&self) -> &str {
         "piper"
     }
@@ -554,6 +595,69 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
+/// Transcode raw audio bytes to OGG/Opus via an `ffmpeg` subprocess.
+///
+/// Pipes `audio` into ffmpeg's stdin and reads OGG/Opus from stdout.
+/// stdin and stdout are driven concurrently to avoid buffer-deadlocks on
+/// large inputs. Requires `ffmpeg` with `libopus` support installed.
+async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "ogg",
+            "-acodec",
+            "libopus",
+            "-b:a",
+            "32k",
+            "-vbr",
+            "on",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context(
+            "failed to spawn ffmpeg — ensure ffmpeg with libopus support is installed \
+             (e.g. `sudo dnf install ffmpeg` / `sudo apt install ffmpeg`)",
+        )?;
+
+    let mut stdin = child.stdin.take().expect("stdin configured above");
+
+    // Drive stdin and wait concurrently: if ffmpeg fills its stdout pipe
+    // before we finish writing stdin, sequential operation would deadlock.
+    let (write_result, output) = tokio::join!(
+        async move {
+            stdin.write_all(&audio).await?;
+            stdin.shutdown().await
+        },
+        child.wait_with_output()
+    );
+
+    write_result.context("failed to write audio to ffmpeg stdin")?;
+    let output = output.context("ffmpeg process error")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ffmpeg transcode to opus failed: {stderr}");
+    }
+
+    anyhow::ensure!(
+        !output.stdout.is_empty(),
+        "ffmpeg produced empty output — check that libopus is available"
+    );
+
+    Ok(output.stdout)
+}
+
 /// Central manager for per-agent TTS synthesis.
 ///
 /// `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
@@ -583,6 +687,19 @@ impl TtsManager {
     /// so when no agent-bound resolution is available the manager refuses
     /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_for_agent(config, None)
+    }
+
+    /// Build a `TtsManager` bound to a specific agent's `tts_provider`.
+    ///
+    /// `agent_alias` is the channel-owning agent (resolve via
+    /// [`Config::agent_for_channel`]). When `None`, falls back to the
+    /// runtime-active agent ([`Config::resolved_runtime_agent_alias`]) for
+    /// callers that cannot determine the owning agent. Binding to the
+    /// owning agent is what lets a channel owned by e.g. `primary` use
+    /// `primary`'s `tts_provider` instead of whichever enabled agent
+    /// happens to sort first.
+    pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
@@ -633,12 +750,12 @@ impl TtsManager {
             config.tts.max_text_length
         };
 
-        // Per-agent join: the runtime-active agent's `tts_provider` is the
-        // resolved alias for this manager instance. Empty (or no resolved
+        // Per-agent join: bind to the channel-owning agent's `tts_provider`
+        // when known, else the runtime-active agent. Empty (or no resolved
         // agent) = no TTS; `synthesize` fails loud rather than silently
         // pick a provider.
-        let agent_tts_provider = config
-            .resolved_runtime_agent_alias()
+        let agent_tts_provider = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
             .and_then(|alias| config.agents.get(alias))
             .map(|a| a.tts_provider.as_str().to_string())
             .unwrap_or_default();
@@ -650,6 +767,25 @@ impl TtsManager {
             default_voice: config.tts.default_voice.clone(),
             max_text_length,
         })
+    }
+
+    /// Synthesize `text` and return OGG/Opus audio suitable for Telegram
+    /// `sendVoice` and WhatsApp PTT voice notes. If the active provider
+    /// already outputs Opus (e.g. OpenAI with `response_format = "opus"`),
+    /// the bytes pass through unchanged; otherwise they are transcoded via an
+    /// `ffmpeg` subprocess. Requires `ffmpeg` with `libopus` support installed.
+    pub async fn synthesize_opus(&self, text: &str) -> Result<Vec<u8>> {
+        let audio = self.synthesize(text).await?;
+        let provider_alias = self.agent_tts_provider.as_str();
+        let format = self
+            .tts_providers
+            .get(provider_alias)
+            .map(|p| p.output_format())
+            .unwrap_or("unknown");
+        if format == "opus" {
+            return Ok(audio);
+        }
+        transcode_to_opus(audio).await
     }
 
     /// Synthesize text using the runtime-active agent's resolved
@@ -844,6 +980,47 @@ mod tests {
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
     }
 
+    /// Regression for #7001: a channel-owning agent's `tts_provider` must win
+    /// over a lexicographically-earlier enabled agent that has none. Binding
+    /// the manager to the owner (`from_config_for_agent(cfg, Some("primary"))`)
+    /// resolves `primary`'s provider, not the first-sorting agent's empty one.
+    #[test]
+    fn tts_manager_binds_owning_agent_provider() {
+        // Reuse the edge.default provider registration, but install two agents:
+        // `primary` (the channel owner, has the provider) and a
+        // lexicographically-earlier `background` agent with no `tts_provider`.
+        let mut cfg = config_with_edge_alias();
+        cfg.agents.clear();
+        cfg.agents.insert(
+            "primary".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                tts_provider: "edge.default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "background".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                ..Default::default()
+            },
+        );
+
+        // Owner-bound resolution picks primary's provider...
+        let owner_bound = TtsManager::from_config_for_agent(&cfg, Some("primary")).unwrap();
+        assert_eq!(
+            owner_bound.agent_tts_provider, "edge.default",
+            "owner-bound manager must resolve the channel owner's tts_provider"
+        );
+
+        // ...while binding to the provider-less first-sorting agent stays empty,
+        // proving the binding is per-agent and not a global/first-sorting pick.
+        let background_bound = TtsManager::from_config_for_agent(&cfg, Some("background")).unwrap();
+        assert!(
+            background_bound.agent_tts_provider.is_empty(),
+            "an agent with no tts_provider must not inherit another agent's provider"
+        );
+    }
+
     #[tokio::test]
     async fn tts_rejects_empty_text() {
         let cfg = config_with_edge_alias();
@@ -941,5 +1118,87 @@ mod tests {
         cfg.tts.max_text_length = 0;
         let manager = TtsManager::from_config(&cfg).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    #[tokio::test]
+    async fn synthesize_posts_to_configured_uri_with_response_format() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FAKE_WAV".to_vec()))
+            .mount(&server)
+            .await;
+
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            uri: Some(format!("{}/v1/audio/speech", server.uri())),
+            response_format: Some("wav".to_string()),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
+
+        let audio = provider.synthesize("hello world", "hannah").await.unwrap();
+        assert_eq!(
+            audio, b"FAKE_WAV",
+            "synthesize should return the bytes served by the configured endpoint"
+        );
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "exactly one POST should reach the configured uri"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["response_format"], "wav",
+            "configured response_format must reach the outgoing request body"
+        );
+        assert_eq!(body["input"], "hello world");
+        assert_eq!(body["voice"], "hannah");
+        assert_eq!(body["model"], "tts-1");
+    }
+
+    #[tokio::test]
+    async fn synthesize_defaults_response_format_to_opus_when_unset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
+            .mount(&server)
+            .await;
+
+        // uri points at the mock so we can inspect the body; response_format left unset.
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            uri: Some(format!("{}/v1/audio/speech", server.uri())),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
+        provider.synthesize("hi", "alloy").await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["response_format"], "opus",
+            "unset response_format must default to opus in the outgoing request"
+        );
+    }
+
+    #[test]
+    fn openai_defaults_to_production_endpoint_when_uri_unset() {
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
+        assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
+        assert_eq!(provider.response_format, "opus");
     }
 }

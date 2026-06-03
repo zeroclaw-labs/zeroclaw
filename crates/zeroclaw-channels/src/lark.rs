@@ -351,6 +351,9 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
+        ChannelApprovalResponse::DenyWithEdit { .. } => {
+            unreachable!("DenyWithEdit is only valid for ACP channels")
+        }
     };
 
     serde_json::json!({
@@ -1260,7 +1263,7 @@ impl LarkChannel {
                         random_lark_ack_reaction(Some(&event_payload), &text).to_string();
                     let reaction_channel = self.clone();
                     let reaction_message_id = lark_msg.message_id.clone();
-                    tokio::spawn(async move {
+                    zeroclaw_spawn::spawn!(async move {
                         reaction_channel
                             .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
                             .await;
@@ -2367,7 +2370,7 @@ impl LarkChannel {
         arguments_summary: &str,
         decision: zeroclaw_api::channel::ChannelApprovalResponse,
     ) {
-        let card = build_resolved_approval_card(tool_name, arguments_summary, decision);
+        let card = build_resolved_approval_card(tool_name, arguments_summary, decision.clone());
         let url = self.patch_message_url(message_id);
         let body = serde_json::json!({
             "content": card.to_string(),
@@ -2640,7 +2643,7 @@ impl LarkChannel {
             "Lark: card action received"
         );
 
-        let _ = pending.sender.send(decision);
+        let _ = pending.sender.send(decision.clone());
 
         if !pending.message_id.is_empty() {
             self.patch_approval_card_resolved(
@@ -2733,7 +2736,7 @@ impl LarkChannel {
                     random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
                 let reaction_channel = Arc::clone(&state.channel);
                 let reaction_message_id = message_id.to_string();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     reaction_channel
                         .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
                         .await;
@@ -4770,7 +4773,7 @@ mod tests {
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
         ] {
-            let card = build_resolved_approval_card("shell", "args", decision);
+            let card = build_resolved_approval_card("shell", "args", decision.clone());
             assert_eq!(
                 card.pointer("/header/template").and_then(|v| v.as_str()),
                 Some(expected_template),

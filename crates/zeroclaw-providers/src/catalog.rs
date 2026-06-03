@@ -3,8 +3,8 @@
 //! Reaches the model catalog for any provider family without constructing
 //! a live `ModelProvider` (which would require typed runtime context like
 //! Azure's `resource`/`deployment` or Bedrock's `region`). Used by the
-//! gateway's `/api/onboard/catalog/models` endpoint and the TUI's
-//! `onboard` flow when the operator hasn't supplied a credential yet.
+//! gateway's `/api/config/catalog/models` endpoint and the TUI's
+//! config flow when the operator hasn't supplied a credential yet.
 //!
 //! Each family maps to a tuple `(models_dev_key, openrouter_vendor_prefix)`;
 //! `list_models_for_family` walks them in that order, returning the first

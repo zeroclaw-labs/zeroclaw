@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 zeroclaw-log.workspace = true
@@ -154,16 +155,27 @@ md5 = { version = "0.8", optional = true }
 
 [features]
 default = [
+  "default-channels",
+]
+default-channels = [
   "channel-acp-server",
+  "channel-email",
+  "channel-telegram",
+  "channel-webhook",
+]
+channels-full = [
+  "default-channels",
   "channel-bluesky",
   "channel-clawdtalk",
   "channel-dingtalk",
   "channel-discord",
   "channel-imessage",
   "channel-irc",
+  "channel-lark",
   "channel-linq",
   "channel-mattermost",
   "channel-mochat",
+  "channel-mqtt",
   "channel-nextcloud",
   "channel-notion",
   "channel-qq",
@@ -173,7 +185,6 @@ default = [
   "channel-twitter",
   "channel-voice-call",
   "channel-wati",
-  "channel-webhook",
   "channel-wecom",
   "channel-wecom-ws",
   "channel-whatsapp-cloud",

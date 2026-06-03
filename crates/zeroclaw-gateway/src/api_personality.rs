@@ -14,8 +14,7 @@
 //!
 //! The `agent` query parameter is required and selects which agent's
 //! workspace the endpoint operates against. Each agent has its own
-//! `<install>/agents/<alias>/workspace/` per the v0.8.0 multi-agent
-//! layout.
+//! `<install>/agents/<alias>/workspace/` per the multi-agent layout.
 
 use axum::{
     Json,
@@ -28,24 +27,24 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use zeroclaw_runtime::agent::personality::{EDITABLE_PERSONALITY_FILES, MAX_FILE_CHARS};
 use zeroclaw_runtime::agent::personality_templates::{TemplateContext, render_preset_default};
+use zeroclaw_runtime::rpc::types::{
+    PersonalityFileEntry, PersonalityGetResult, PersonalityListResult, PersonalityPutResult,
+    PersonalityTemplatesResult, TemplateFileEntry,
+};
 
 use super::AppState;
 use super::api::require_auth;
 
-// ── Request / response shapes ───────────────────────────────────────
+// ── HTTP-specific request/response shapes (not shared) ──────────────
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AgentQuery {
-    /// Agent alias selecting which `agents/<alias>/workspace/` the
-    /// endpoint operates against. Required for read/write/index.
     #[serde(default)]
     pub agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct TemplateQuery {
-    /// Preset name. Only `default` is recognised today; unknown values
-    /// fall through to the default preset rather than 400-ing.
     #[serde(default)]
     pub preset: Option<String>,
     #[serde(default)]
@@ -56,66 +55,17 @@ pub struct TemplateQuery {
     pub timezone: Option<String>,
     #[serde(default)]
     pub communication_style: Option<String>,
-    /// When `false`, MEMORY.md is omitted and AGENTS.md is rendered for
-    /// a memory-disabled workspace.
     #[serde(default)]
     pub include_memory: Option<bool>,
-    /// Agent alias for which the template is being rendered. When
-    /// provided and present in `[agents]`, the agent's display name is
-    /// folded into the template context as the default for `agent_name`.
     #[serde(default)]
     pub agent: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TemplateFile {
-    pub filename: &'static str,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TemplateResponse {
-    pub preset: &'static str,
-    pub files: Vec<TemplateFile>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityIndexEntry {
-    pub filename: &'static str,
-    pub exists: bool,
-    pub size: u64,
-    pub mtime_ms: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityIndex {
-    pub files: Vec<PersonalityIndexEntry>,
-    pub max_chars: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityFileResponse {
-    pub filename: String,
-    pub content: String,
-    pub exists: bool,
-    pub truncated: bool,
-    pub mtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PersonalityPutBody {
     pub content: String,
-    /// Last `mtime_ms` the editor saw via GET. When provided and the
-    /// on-disk mtime differs, the server returns 409 with the current
-    /// content + mtime so the editor can resolve the conflict.
     #[serde(default)]
     pub expected_mtime_ms: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityPutResponse {
-    pub bytes_written: u64,
-    pub mtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,20 +166,20 @@ pub async fn handle_index(
         Err(resp) => return resp.into_response(),
     };
 
-    let files: Vec<PersonalityIndexEntry> = EDITABLE_PERSONALITY_FILES
+    let files: Vec<PersonalityFileEntry> = EDITABLE_PERSONALITY_FILES
         .iter()
         .copied()
         .map(|filename| {
             let path = workspace_dir.join(filename);
             match std::fs::metadata(&path) {
-                Ok(meta) => PersonalityIndexEntry {
-                    filename,
+                Ok(meta) => PersonalityFileEntry {
+                    filename: filename.to_string(),
                     exists: meta.is_file(),
                     size: meta.len(),
                     mtime_ms: mtime_ms_of(&meta),
                 },
-                Err(_) => PersonalityIndexEntry {
-                    filename,
+                Err(_) => PersonalityFileEntry {
+                    filename: filename.to_string(),
                     exists: false,
                     size: 0,
                     mtime_ms: None,
@@ -238,7 +188,7 @@ pub async fn handle_index(
         })
         .collect();
 
-    Json(PersonalityIndex {
+    Json(PersonalityListResult {
         files,
         max_chars: MAX_FILE_CHARS,
     })
@@ -271,18 +221,18 @@ pub async fn handle_get(
         Ok(raw) => {
             let (content, truncated) = truncate_to_chars(&raw, MAX_FILE_CHARS);
             let mtime_ms = std::fs::metadata(&path).ok().and_then(|m| mtime_ms_of(&m));
-            Json(PersonalityFileResponse {
+            Json(PersonalityGetResult {
                 filename: allowed.to_string(),
-                content,
+                content: Some(content),
                 exists: true,
                 truncated,
                 mtime_ms,
             })
             .into_response()
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Json(PersonalityFileResponse {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Json(PersonalityGetResult {
             filename: allowed.to_string(),
-            content: String::new(),
+            content: Some(String::new()),
             exists: false,
             truncated: false,
             mtime_ms: None,
@@ -382,7 +332,7 @@ pub async fn handle_put(
     let bytes_written = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime_ms = meta.as_ref().and_then(mtime_ms_of);
 
-    Json(PersonalityPutResponse {
+    Json(PersonalityPutResult {
         bytes_written,
         mtime_ms,
     })
@@ -432,11 +382,14 @@ pub async fn handle_templates(
 
     let files = render_preset_default(&ctx)
         .into_iter()
-        .map(|(filename, content)| TemplateFile { filename, content })
+        .map(|(filename, content)| TemplateFileEntry {
+            filename: filename.to_string(),
+            content,
+        })
         .collect();
 
-    Json(TemplateResponse {
-        preset: "default",
+    Json(PersonalityTemplatesResult {
+        preset: "default".to_string(),
         files,
     })
     .into_response()

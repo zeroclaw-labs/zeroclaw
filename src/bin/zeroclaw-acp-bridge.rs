@@ -11,7 +11,7 @@ use tokio_tungstenite::{
         http::{HeaderValue, header},
     },
 };
-use zeroclaw_config::schema::resolve_runtime_dirs_for_onboarding;
+use zeroclaw_config::schema::resolve_runtime_dirs;
 
 const CONFIG_NOT_FOUND_ERROR: &str = "ERROR: config.toml not found.  Are you sure the bridge and ZeroClaw are running on the same host?  Tool use will not work remotely!";
 const PAIRING_TOKEN_NOT_FOUND_ERROR: &str = "ERROR: Gateway pairing is active but no ACP bridge token is cached. Run `zeroclaw gateway get-paircode --new`, then run `zeroclaw-acp-bridge --pair-code <code>`, or set ZEROCLAW_ACP_BRIDGE_TOKEN.";
@@ -44,7 +44,7 @@ async fn run() -> Result<()> {
         .with_context(|| format!("failed to connect to {}", bridge_target.url))?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    let stdin_to_ws = tokio::spawn(async move {
+    let stdin_to_ws = zeroclaw_spawn::spawn!(async move {
         let stdin = io::stdin();
         let mut lines = BufReader::new(stdin).lines();
 
@@ -61,7 +61,7 @@ async fn run() -> Result<()> {
             .context("failed to close websocket")
     });
 
-    let ws_to_stdout = tokio::spawn(async move {
+    let ws_to_stdout = zeroclaw_spawn::spawn!(async move {
         let mut stdout = io::stdout();
 
         while let Some(message) = ws_read.next().await {
@@ -88,7 +88,7 @@ async fn load_acp_bridge_target() -> Result<BridgeTarget> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config_dir = match config_dir_from_args(args.iter().cloned())? {
         Some(dir) => PathBuf::from(dir),
-        None => resolve_runtime_dirs_for_onboarding().await?.0,
+        None => resolve_runtime_dirs().await?.0,
     };
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {

@@ -8,7 +8,8 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -206,9 +207,8 @@ pub async fn handle_api_status(
     let config = state.config.read().clone();
     let health = zeroclaw_runtime::health::snapshot();
 
-    // Per-alias map keyed by composite `<type>.<alias>` (v0.8.0). Every
-    // populated `[channels.<type>.<alias>]` is a separate dashboard row;
-    // collapsing them to one-per-type was a pre-v0.8.0 holdover.
+    // Per-alias map keyed by composite `<type>.<alias>`. Every
+    // populated `[channels.<type>.<alias>]` is a separate dashboard row.
     let mut channels = serde_json::Map::new();
     for info in config.channels_by_alias() {
         let composite = format!("{}.{}", info.channel_type, info.alias);
@@ -250,7 +250,12 @@ pub async fn handle_api_status(
                 (provider_ref, model, temperature, backend)
             }
             None => (
-                config.first_model_provider_alias(),
+                config
+                    .providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(ty, alias, _)| format!("{ty}.{alias}")),
                 state.model.clone(),
                 state.temperature,
                 state.mem.name().to_string(),
@@ -1128,28 +1133,246 @@ pub async fn handle_api_channels(
     }
 
     let config = state.config.read().clone();
-    // One entry per `[channels.<type>.<alias>]` block (v0.8.0). Owning
+    let health = zeroclaw_runtime::health::snapshot();
+    // One entry per `[channels.<type>.<alias>]` block. Owning
     // agent comes from the agents.<alias>.channels reverse lookup.
     let channels: Vec<serde_json::Value> = config
         .channels_by_alias()
         .into_iter()
         .map(|info| {
             let composite = format!("{}.{}", info.channel_type, info.alias);
+            let compiled_key = compiled_readiness_key_for_alias(&config, &info);
+            let compiled = zeroclaw_channels::listing::is_channel_type_compiled(compiled_key);
+            let readiness = channel_readiness(&config, &info, &health, &state);
+            let (status, health_status) = if compiled {
+                channel_readiness_summary(&readiness)
+            } else {
+                ("not_compiled", "unavailable")
+            };
             serde_json::json!({
                 "name": composite,
                 "type": info.channel_type,
                 "alias": info.alias,
                 "owning_agent": info.owning_agent,
                 "enabled": info.enabled,
-                "status": "active",
+                "compiled": compiled,
+                "status": status,
                 "message_count": 0,
                 "last_message_at": null,
-                "health": "healthy",
+                "health": health_status,
+                "readiness": readiness,
             })
         })
         .collect();
 
     Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
+/// GET /api/tuis — list connected TUI sessions
+pub async fn handle_api_tuis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let tuis: Vec<serde_json::Value> = state
+        .tui_registry
+        .as_ref()
+        .map(|r| {
+            r.list()
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "tui_id": e.tui_id,
+                        "connected_at": e.connected_at.to_rfc3339(),
+                        "peer_label": e.peer_label,
+                        "transport": e.transport,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Json(serde_json::json!({ "tuis": tuis })).into_response()
+}
+
+fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
+    if info.channel_type == "whatsapp"
+        && config
+            .channels
+            .whatsapp
+            .get(&info.alias)
+            .is_some_and(|whatsapp| whatsapp.backend_type() == "web")
+    {
+        "whatsapp-web"
+    } else {
+        info.channel_type.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ChannelReadinessState {
+    Ready,
+    Missing,
+    Unknown,
+}
+
+const CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Serialize)]
+struct ChannelReadiness {
+    enabled: ChannelReadinessState,
+    bound_to_agent: ChannelReadinessState,
+    authenticated: ChannelReadinessState,
+    listening: ChannelReadinessState,
+    requirements: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn channel_readiness(
+    config: &zeroclaw_config::schema::Config,
+    info: &zeroclaw_config::schema::ChannelAliasInfo,
+    health: &zeroclaw_runtime::health::HealthSnapshot,
+    state: &AppState,
+) -> ChannelReadiness {
+    let mut readiness = ChannelReadiness {
+        enabled: if info.enabled {
+            ChannelReadinessState::Ready
+        } else {
+            ChannelReadinessState::Missing
+        },
+        bound_to_agent: if info.owning_agent.is_some() {
+            ChannelReadinessState::Ready
+        } else {
+            ChannelReadinessState::Missing
+        },
+        authenticated: ChannelReadinessState::Unknown,
+        listening: ChannelReadinessState::Unknown,
+        requirements: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    if readiness.enabled == ChannelReadinessState::Missing {
+        readiness
+            .requirements
+            .push("Enable this channel alias.".to_string());
+    }
+    if readiness.bound_to_agent == ChannelReadinessState::Missing {
+        readiness
+            .requirements
+            .push("Bind this channel to an enabled agent.".to_string());
+    }
+
+    if readiness.enabled == ChannelReadinessState::Ready
+        && readiness.bound_to_agent == ChannelReadinessState::Ready
+    {
+        if info.channel_type == "webhook" {
+            apply_webhook_readiness(config, &info.alias, health, state, &mut readiness);
+        } else {
+            readiness.notes.push(format!(
+                "Live readiness is not checked for `{}` channels yet.",
+                info.channel_type
+            ));
+        }
+    }
+
+    readiness
+}
+
+fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'static str) {
+    if readiness.enabled == ChannelReadinessState::Missing
+        || readiness.bound_to_agent == ChannelReadinessState::Missing
+    {
+        return ("inactive", "degraded");
+    }
+
+    if readiness.authenticated == ChannelReadinessState::Unknown
+        && readiness.listening == ChannelReadinessState::Unknown
+    {
+        return ("unknown", "degraded");
+    }
+
+    if readiness.authenticated == ChannelReadinessState::Ready
+        && readiness.listening == ChannelReadinessState::Ready
+    {
+        ("active", "healthy")
+    } else {
+        ("error", "down")
+    }
+}
+
+fn apply_webhook_readiness(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    health: &zeroclaw_runtime::health::HealthSnapshot,
+    state: &AppState,
+    readiness: &mut ChannelReadiness,
+) {
+    let Some(webhook) = config.channels.webhook.get(alias) else {
+        readiness.authenticated = ChannelReadinessState::Missing;
+        readiness.listening = ChannelReadinessState::Missing;
+        readiness
+            .requirements
+            .push("Webhook config block is missing.".to_string());
+        return;
+    };
+
+    if state.pairing.require_pairing() && !state.pairing.is_paired() {
+        readiness.authenticated = ChannelReadinessState::Missing;
+        readiness
+            .requirements
+            .push("Pair the gateway before using the webhook endpoint.".to_string());
+    } else {
+        readiness.authenticated = ChannelReadinessState::Ready;
+    }
+
+    let component = format!("channel:webhook.{alias}");
+    let component_health = health.components.get(&component);
+    let component_status = component_health.map(|component| component.status.as_str());
+    let supervised_listener_ok = component_health.is_some_and(component_health_ok_and_fresh);
+    let listen_path = normalized_webhook_path(webhook.listen_path.as_deref());
+
+    if supervised_listener_ok {
+        readiness.listening = ChannelReadinessState::Ready;
+    } else if component_status == Some("error") {
+        readiness.listening = ChannelReadinessState::Missing;
+        readiness.requirements.push(format!(
+            "Resolve the listener error for `webhook.{alias}` before using this channel."
+        ));
+    } else {
+        readiness.listening = ChannelReadinessState::Missing;
+        readiness.requirements.push(format!(
+            "Start a channel listener for `webhook.{alias}` on port {}{}.",
+            webhook.port, listen_path
+        ));
+    }
+}
+
+fn component_health_ok_and_fresh(component: &zeroclaw_runtime::health::ComponentHealth) -> bool {
+    if component.status != "ok" {
+        return false;
+    }
+
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&component.updated_at) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(updated_at.with_timezone(&chrono::Utc));
+    age >= chrono::Duration::zero()
+        && age <= chrono::Duration::seconds(CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS)
+}
+
+fn normalized_webhook_path(path: Option<&str>) -> String {
+    let trimmed = path.unwrap_or("/webhook").trim();
+    if trimmed.is_empty() {
+        "/webhook".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 /// GET /api/health — component health snapshot
@@ -1186,8 +1409,8 @@ pub async fn handle_api_sessions_list(
         .into_response();
     };
 
-    // Include every session that's attributable in v0.8.0 (agent_alias
-    // stamped, or a channel_id that resolves to an owning agent).
+    // Include every session that's attributable (agent_alias stamped,
+    // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
     let all_metadata = backend.list_sessions_with_metadata();
@@ -1804,13 +2027,21 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: None,
+            #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
+            #[cfg(feature = "channel-linq")]
             linq: None,
+            #[cfg(feature = "channel-linq")]
             linq_signing_secret: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
+            #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: None,
+            #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
@@ -1828,6 +2059,7 @@ mod tests {
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
             reload_tx: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -1844,6 +2076,121 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
+    #[test]
+    fn api_channels_readiness_key_tracks_whatsapp_backend_type() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "cloud".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "ambiguous".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+
+        let web = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "web".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let cloud = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "cloud".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let ambiguous = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "ambiguous".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let discord = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "discord".to_string(),
+            alias: "default".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &web),
+            "whatsapp-web"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &cloud),
+            "whatsapp"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &ambiguous),
+            "whatsapp",
+            "ambiguous WhatsApp configs follow runtime Cloud precedence"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &discord),
+            "discord"
+        );
+    }
+
+    #[cfg(not(feature = "channel-nextcloud"))]
+    #[tokio::test]
+    async fn api_channels_marks_configured_uncompiled_channel_unavailable() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.nextcloud_talk.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NextcloudTalkConfig {
+                enabled: true,
+                base_url: "https://cloud.example.com".to_string(),
+                app_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channels = json["channels"].as_array().expect("channels array");
+        let nextcloud = channels
+            .iter()
+            .find(|channel| channel["alias"] == "default")
+            .expect("configured channel is listed");
+
+        assert!(
+            matches!(
+                nextcloud["type"].as_str(),
+                Some("nextcloud-talk" | "nextcloud_talk")
+            ),
+            "unexpected channel type: {}",
+            nextcloud["type"]
+        );
+        assert_eq!(nextcloud["enabled"], true);
+        assert_eq!(nextcloud["compiled"], false);
+        assert_eq!(nextcloud["status"], "not_compiled");
+        assert_eq!(nextcloud["health"], "unavailable");
+    }
+
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
         state
             .config
@@ -1853,6 +2200,244 @@ mod tests {
             .expect("test-agent configured by with_test_agent")
             .cron_jobs
             .push(job_id.to_string());
+    }
+
+    fn config_with_webhook(
+        alias: &str,
+        enabled: bool,
+        bound: bool,
+        port: u16,
+        listen_path: Option<&str>,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.port = 42617;
+        config.gateway.require_pairing = false;
+        config.channels.webhook.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled,
+                port,
+                listen_path: listen_path.map(ToString::to_string),
+                ..Default::default()
+            },
+        );
+        if bound {
+            config.agents.insert(
+                "rowan".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec![zeroclaw_config::providers::ChannelRef::new(format!(
+                        "webhook.{alias}"
+                    ))],
+                    ..Default::default()
+                },
+            );
+        }
+        config
+    }
+
+    fn config_with_telegram(alias: &str) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "rowan".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(format!(
+                    "telegram.{alias}"
+                ))],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn first_channel_info(
+        config: &zeroclaw_config::schema::Config,
+    ) -> zeroclaw_config::schema::ChannelAliasInfo {
+        config
+            .channels_by_alias()
+            .into_iter()
+            .next()
+            .expect("channel alias should be present")
+    }
+
+    #[test]
+    fn channel_readiness_webhook_does_not_call_gateway_route_healthy_without_listener() {
+        let config = config_with_webhook("default", true, true, 42617, Some("/webhook"));
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Ready);
+        assert_eq!(readiness.listening, ChannelReadinessState::Missing);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+        assert!(
+            readiness
+                .requirements
+                .iter()
+                .any(|item| item.contains("Start a channel listener"))
+        );
+    }
+
+    #[test]
+    fn channel_readiness_webhook_does_not_call_custom_path_healthy_without_listener() {
+        let config = config_with_webhook("custom_path", true, true, 42632, Some("/eyrie"));
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Ready);
+        assert_eq!(readiness.listening, ChannelReadinessState::Missing);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+        assert!(
+            readiness
+                .requirements
+                .iter()
+                .any(|item| item.contains("Start a channel listener"))
+        );
+    }
+
+    #[test]
+    fn channel_readiness_webhook_uses_supervised_listener_health_for_custom_path() {
+        let config = config_with_webhook("supervised", true, true, 42632, Some("/eyrie"));
+        zeroclaw_runtime::health::mark_component_ok("channel:webhook.supervised");
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.listening, ChannelReadinessState::Ready);
+        assert_eq!(channel_readiness_summary(&readiness), ("active", "healthy"));
+    }
+
+    #[test]
+    fn channel_readiness_webhook_rejects_stale_listener_health() {
+        let config = config_with_webhook("stale", true, true, 42632, Some("/eyrie"));
+        let component = "channel:webhook.stale".to_string();
+        let old = (chrono::Utc::now()
+            - chrono::Duration::seconds(CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS + 5))
+        .to_rfc3339();
+        let health = zeroclaw_runtime::health::HealthSnapshot {
+            pid: std::process::id(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            uptime_seconds: 1,
+            components: std::collections::BTreeMap::from([(
+                component,
+                zeroclaw_runtime::health::ComponentHealth {
+                    status: "ok".to_string(),
+                    updated_at: old,
+                    last_ok: None,
+                    last_error: None,
+                    restart_count: 0,
+                },
+            )]),
+        };
+        let state = test_state(config.clone());
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.listening, ChannelReadinessState::Missing);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+    }
+
+    #[test]
+    fn channel_readiness_webhook_uses_live_pairing_guard_for_auth() {
+        let config = config_with_webhook("paired", true, true, 42632, Some("/eyrie"));
+        zeroclaw_runtime::health::mark_component_ok("channel:webhook.paired");
+        let mut state = test_state(config.clone());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Missing);
+        assert_eq!(readiness.listening, ChannelReadinessState::Ready);
+        assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
+    }
+
+    #[test]
+    fn channel_readiness_unchecked_channel_types_are_unknown_not_down() {
+        let config = config_with_telegram("ops");
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.enabled, ChannelReadinessState::Ready);
+        assert_eq!(readiness.bound_to_agent, ChannelReadinessState::Ready);
+        assert_eq!(readiness.authenticated, ChannelReadinessState::Unknown);
+        assert_eq!(readiness.listening, ChannelReadinessState::Unknown);
+        assert_eq!(
+            channel_readiness_summary(&readiness),
+            ("unknown", "degraded")
+        );
+        assert!(readiness.requirements.is_empty());
+        assert!(
+            readiness
+                .notes
+                .iter()
+                .any(|item| item.contains("not checked"))
+        );
+    }
+
+    #[test]
+    fn channel_readiness_orphan_channel_reports_missing_agent_binding_without_broken_health() {
+        let config = config_with_webhook("orphan", true, false, 42617, Some("/webhook"));
+        let state = test_state(config.clone());
+        let health = zeroclaw_runtime::health::snapshot();
+        let info = first_channel_info(&config);
+        let readiness = channel_readiness(&config, &info, &health, &state);
+
+        assert_eq!(readiness.bound_to_agent, ChannelReadinessState::Missing);
+        assert_eq!(readiness.listening, ChannelReadinessState::Unknown);
+        assert_eq!(
+            channel_readiness_summary(&readiness),
+            ("inactive", "degraded")
+        );
+        assert!(
+            readiness
+                .requirements
+                .iter()
+                .any(|item| item.contains("Bind this channel"))
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channels_serializes_readiness_without_duplicate_summary_fields() {
+        let config = config_with_webhook("ops", true, true, 42617, Some("/webhook"));
+        let state = test_state(config);
+
+        let response = handle_api_channels(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let channel = &json["channels"][0];
+        let webhook_compiled = zeroclaw_channels::listing::is_channel_type_compiled("webhook");
+        assert_eq!(channel["name"], "webhook.ops");
+        assert_eq!(channel["compiled"], webhook_compiled);
+        if webhook_compiled {
+            assert_eq!(channel["status"], "error");
+            assert_eq!(channel["health"], "down");
+        } else {
+            assert_eq!(channel["status"], "not_compiled");
+            assert_eq!(channel["health"], "unavailable");
+        }
+        assert_eq!(channel["readiness"]["enabled"], "ready");
+        assert_eq!(channel["readiness"]["authenticated"], "ready");
+        assert_eq!(channel["readiness"]["listening"], "missing");
+        assert!(channel["readiness"].get("configured").is_none());
+        assert!(channel["readiness"].get("status").is_none());
+        assert!(channel["readiness"].get("health").is_none());
     }
 
     fn test_state_with_session_backend(
