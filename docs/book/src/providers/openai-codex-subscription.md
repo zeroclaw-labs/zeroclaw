@@ -46,10 +46,20 @@ fail with a `400`.
 Treat the served catalog as volatile. Query it rather than trusting any
 hardcoded list, including this one:
 
-```text
-GET https://chatgpt.com/backend-api/codex/models?client_version=<v>
-Authorization: Bearer <access_token from ~/.codex/auth.json>
+```bash
+# Field names match the live ~/.codex/auth.json (verify against the file itself;
+# the layout has shifted across Codex versions).
+AT=$(jq -r .tokens.access_token ~/.codex/auth.json)
+ACC=$(jq -r .tokens.account_id ~/.codex/auth.json)
+curl -s "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0" \
+  -H "Authorization: Bearer ${AT}" \
+  -H "chatgpt-account-id: ${ACC}" \
+  -H "originator: pi" | jq -r '.models[].slug'
 ```
+
+> `client_version` is required and gated: a stale or too-low value returns an
+> empty `{"models": []}` with no error. Use a current client version (for
+> example `1.0.0`) if the list comes back empty.
 
 Served catalog (2026-06-02 — verify against the endpoint before pinning):
 
