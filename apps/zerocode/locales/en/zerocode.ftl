@@ -86,6 +86,23 @@ zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
 zc-input-clipboard-error = Clipboard error: { $error }
 
+zc-queue-empty = Nothing to send.
+zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
+zc-queue-title = Queue ({ $count })
+zc-queue-empty-list = No queued messages.
+zc-queue-paused = Paused — press { $key } to resume
+zc-queue-item-injected = (inject)
+zc-queue-resumed = Queue resumed.
+zc-queue-help-toggle = Toggle queue
+zc-queue-help-resume = Resume queue
+zc-queue-help-nav = Select queued
+zc-queue-help-delete = Delete queued
+zc-queue-help-edit = Edit queued
+zc-queue-help-enqueue = Queue message
+zc-queue-help-inject = Send now (skip queue)
+zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
+zc-queue-dispatch-failed = Could not send queued message: { $error }
+
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity
 zc-logs-label-category = Category

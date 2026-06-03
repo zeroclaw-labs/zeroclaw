@@ -164,6 +164,12 @@ keyactions! {
         ApprovalApproveAll      [Chord::char('a')] => "approve all",
         ApprovalApproveEdit     [Chord::char('e')] => "approve + edit",
         DismissModal            [] => "dismiss",
+        ToggleQueue             [Chord::with(KeyCode::Char('q'), KeyModifiers::ALT)] => "toggle queue",
+        ResumeQueue             [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "resume queue",
+        QueueNavUp              [Chord::with(KeyCode::Up, KeyModifiers::ALT)] => "queue prev",
+        QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
+        QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
+        QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
     }
 }
 
@@ -247,6 +253,7 @@ keyactions! {
 keyactions! {
     pub enum InputBarAction ("input_bar") {
         Submit             [Chord::key(KeyCode::Enter)] => "send",
+        Inject             [Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",

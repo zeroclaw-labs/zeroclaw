@@ -48,6 +48,11 @@ pub(crate) enum InputBarAction {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
     },
+    /// User requested immediate injection (Ctrl+Enter) — skip the queue.
+    Inject {
+        text: Option<String>,
+        attachments: Vec<PendingAttachment>,
+    },
     /// Status message to show in conversation (e.g. "Attached: photo.png").
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
@@ -439,6 +444,10 @@ impl InputBarState {
         &self.input
     }
 
+    pub fn has_pending_attachments(&self) -> bool {
+        !self.pending_attachments.is_empty()
+    }
+
     #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
@@ -624,6 +633,15 @@ impl InputBarState {
         self.pending_attachments.push(att);
     }
 
+    pub fn load_for_edit(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        self.input = text;
+        self.cursor = self.input.len();
+        self.scroll_offset = 0;
+        self.clear_selection();
+        self.dismiss_autocomplete();
+        self.pending_attachments = attachments;
+    }
+
     pub fn remove_attachment(&mut self, index: usize) {
         if index < self.pending_attachments.len() {
             self.pending_attachments.remove(index);
@@ -658,10 +676,7 @@ impl InputBarState {
     // ── Key handling ─────────────────────────────────────────
 
     /// Process a key event. Returns an action for the parent pane.
-    ///
-    /// `turn_in_flight` tells us whether the agent is currently responding
-    /// (disables input).
-    pub fn handle_key(&mut self, key: KeyEvent, turn_in_flight: bool) -> InputBarAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -696,11 +711,6 @@ impl InputBarState {
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
-        }
-
-        // Don't handle input while agent is responding.
-        if turn_in_flight {
-            return InputBarAction::NotHandled;
         }
 
         // Reset blink on any keystroke.
@@ -756,6 +766,9 @@ impl InputBarState {
             }
             Some(IbWidgetAction::Submit) => {
                 return self.handle_enter();
+            }
+            Some(IbWidgetAction::Inject) => {
+                return self.handle_inject();
             }
             Some(IbWidgetAction::HistoryPrev) => {
                 self.move_cursor_up();
@@ -1015,6 +1028,30 @@ impl InputBarState {
             // Empty text but has attachments: send attachments only.
             let attachments = self.take_attachments();
             InputBarAction::Submit {
+                text: None,
+                attachments,
+            }
+        } else {
+            InputBarAction::Consumed
+        }
+    }
+
+    fn handle_inject(&mut self) -> InputBarAction {
+        let msg = self.take_input();
+        if !msg.is_empty() {
+            if matches!(parse_slash_command(&msg), SlashCommand::NotACommand) {
+                let attachments = self.take_attachments();
+                InputBarAction::Inject {
+                    text: Some(msg),
+                    attachments,
+                }
+            } else {
+                self.insert_text(&msg);
+                self.handle_enter()
+            }
+        } else if !self.pending_attachments.is_empty() {
+            let attachments = self.take_attachments();
+            InputBarAction::Inject {
                 text: None,
                 attachments,
             }

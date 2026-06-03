@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use ratatui::{
 };
 use tokio::sync::{broadcast, mpsc};
 
-use crate::attachment::build_attachments_json;
+use crate::attachment::{PendingAttachment, build_attachments_json, cleanup_attachment_temps};
 use crate::client::{
     ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, TurnEndOutcome,
     method, parse_session_update,
@@ -236,6 +237,7 @@ impl Chat {
     // ── Drain channels (called from draw) ────────────────────────
 
     fn drain_notifications(&mut self) {
+        let mut applied = false;
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == "session/update" => {
@@ -243,12 +245,91 @@ impl Chat {
                         && let Some(update) = parse_session_update(&notif.params)
                     {
                         state.apply_update(update);
+                        applied = true;
                     }
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                 _ => break,
             }
         }
+        if applied {
+            self.pump_queue();
+        }
+    }
+
+    fn after_enqueue(&mut self, enq: Result<(), String>) {
+        match enq {
+            Ok(()) => self.pump_queue(),
+            Err(msg) => {
+                if let ChatPhase::Active(ref mut state) = self.phase {
+                    state
+                        .entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(msg)));
+                    state.mark_dirty_append();
+                }
+            }
+        }
+    }
+
+    fn pump_queue(&mut self) {
+        let next = match self.phase {
+            ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
+            _ => None,
+        };
+        let Some(msg) = next else { return };
+        let sid = match self.phase {
+            ChatPhase::Active(ref state) => state.session_id.clone(),
+            _ => return,
+        };
+
+        let transport = self.rpc.transport();
+        let attachments_json = if msg.attachments.is_empty() {
+            Vec::new()
+        } else {
+            match build_attachments_json(&msg.attachments, transport) {
+                Ok(json) => json,
+                Err(e) => {
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                crate::i18n::t_args(
+                                    "zc-queue-dispatch-failed",
+                                    &[("error", &e.to_string())],
+                                ),
+                            )));
+                        state.mark_dirty_append();
+                    }
+                    return;
+                }
+            }
+        };
+
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            let att_names: Vec<String> =
+                msg.attachments.iter().map(|a| a.filename.clone()).collect();
+            let text = if msg.text.is_empty() {
+                None
+            } else {
+                Some(msg.text.clone())
+            };
+            state.push_user_message(text, att_names);
+        }
+        self.spawn_prompt(sid, msg.text, attachments_json);
+    }
+
+    fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
+        let rpc_arc = self.rpc_out.clone();
+        tokio::spawn(async move {
+            let mut params = serde_json::json!({
+                "session_id": sid,
+                "prompt": prompt,
+            });
+            if !attachments_json.is_empty() {
+                params["attachments"] = serde_json::Value::Array(attachments_json);
+            }
+            rpc_arc.notify(method::SESSION_PROMPT, params).await;
+        });
     }
 
     fn drain_git_branch_results(&mut self) {
@@ -528,38 +609,75 @@ impl Chat {
             SessionOverlay::None => { /* handled below */ }
         }
 
+        {
+            use crate::keymap::ChatTabAction as QAction;
+            let qaction = QAction::from_chord(&key);
+            match qaction {
+                Some(QAction::ToggleQueue) => {
+                    state.toggle_queue_sidebar();
+                    return false;
+                }
+                Some(QAction::ResumeQueue) if state.queue_paused() => {
+                    state.resume_queue();
+                    self.pump_queue();
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                "zc-queue-resumed",
+                            ))));
+                        state.mark_dirty_append();
+                    }
+                    return false;
+                }
+                Some(QAction::QueueNavUp) if state.show_queue_sidebar => {
+                    state.queue_select_step(-1);
+                    return false;
+                }
+                Some(QAction::QueueNavDown) if state.show_queue_sidebar => {
+                    state.queue_select_step(1);
+                    return false;
+                }
+                Some(QAction::QueueDelete) if state.show_queue_sidebar => {
+                    state.delete_selected_queued();
+                    return false;
+                }
+                Some(QAction::QueueEdit) if state.show_queue_sidebar => {
+                    let bar_busy = !state.input_bar.input().trim().is_empty()
+                        || state.input_bar.has_pending_attachments();
+                    if bar_busy {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                "zc-queue-edit-busy",
+                            ))));
+                        state.mark_dirty_append();
+                    } else if let Some((text, attachments)) = state.take_selected_for_edit() {
+                        state.input_bar.load_for_edit(text, attachments);
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         // ── Delegate to input bar first ─────────────────────────
         // The input bar handles: file explorer, Ctrl+A, Ctrl+V,
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
         if state.pending_approval().is_none() && !state.in_browse_mode() {
-            let action = state.input_bar.handle_key(key, state.turn_in_flight);
+            let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
-                    let prompt = text.clone().unwrap_or_default();
-                    let att_names: Vec<String> =
-                        attachments.iter().map(|a| a.filename.clone()).collect();
-                    state.push_user_message(text, att_names);
-                    let sid = state.session_id.clone();
-                    let rpc_arc = self.rpc_out.clone();
-                    let transport = self.rpc.transport();
-                    // Fire-and-forget. Turn end arrives via TurnComplete
-                    // notification handled in apply_update.
-                    tokio::spawn(async move {
-                        let mut params = serde_json::json!({
-                            "session_id": sid,
-                            "prompt": prompt,
-                        });
-                        if !attachments.is_empty() {
-                            match build_attachments_json(&attachments, transport) {
-                                Ok(att_json) => {
-                                    params["attachments"] = serde_json::Value::Array(att_json);
-                                }
-                                Err(_) => return,
-                            }
-                        }
-                        rpc_arc.notify(method::SESSION_PROMPT, params).await;
-                    });
+                    let prompt = text.unwrap_or_default();
+                    let enq = state.enqueue_message(prompt, attachments);
+                    self.after_enqueue(enq);
+                    return false;
+                }
+                InputBarAction::Inject { text, attachments } => {
+                    let prompt = text.unwrap_or_default();
+                    let enq = state.inject_message(prompt, attachments);
+                    self.after_enqueue(enq);
                     return false;
                 }
                 InputBarAction::StatusMessage(msg) => {
@@ -1073,10 +1191,15 @@ impl crate::widgets::HelpContext for Chat {
                     ]);
                 }
                 if state.turn_in_flight {
-                    return HelpNode::entries(vec![E::new(
-                        vec!["Ctrl+C", "Esc"],
-                        crate::i18n::t("zc-chat-help-cancel-turn"),
-                    )]);
+                    return HelpNode::entries(vec![
+                        E::new(
+                            vec!["Ctrl+C", "Esc"],
+                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                        ),
+                        E::key("Enter", crate::i18n::t("zc-queue-help-enqueue")),
+                        E::key("Ctrl+Enter", crate::i18n::t("zc-queue-help-inject")),
+                        E::key("Alt+Q", crate::i18n::t("zc-queue-help-toggle")),
+                    ]);
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let pane = HelpNode::entries(vec![
@@ -1094,6 +1217,12 @@ impl crate::widgets::HelpContext for Chat {
                     E::key("Ctrl+N", crate::i18n::t("zc-chat-help-new-session")),
                     E::key("Ctrl+S", crate::i18n::t("zc-chat-help-session-list")),
                     E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
+                    E::spacer(),
+                    E::key("Alt+Q", crate::i18n::t("zc-queue-help-toggle")),
+                    E::key("Alt+P", crate::i18n::t("zc-queue-help-resume")),
+                    E::key("Alt+↑/↓", crate::i18n::t("zc-queue-help-nav")),
+                    E::key("Alt+X", crate::i18n::t("zc-queue-help-delete")),
+                    E::key("Alt+E", crate::i18n::t("zc-queue-help-edit")),
                 ]);
                 pane.with_child(state.input_bar.help_context())
             }
@@ -1192,6 +1321,20 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 // ── Active chat rendering ────────────────────────────────────────
 
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
+    let area = if state.show_queue_sidebar {
+        let sidebar_w = (area.width / 3)
+            .clamp(24, 48)
+            .min(area.width.saturating_sub(20));
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20), Constraint::Length(sidebar_w)])
+            .split(area);
+        render_queue_sidebar(f, state, cols[1]);
+        cols[0]
+    } else {
+        area
+    };
+
     let show_cursor = state.pending_approval().is_none();
     let turn_status = state.turn_status.clone();
     let turn_started_at = state.turn_started_at;
@@ -1273,6 +1416,83 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     state.input_bar.render_explorer_overlay(f, area);
+}
+
+fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
+    let title = crate::i18n::t_args(
+        "zc-queue-title",
+        &[("count", &state.queue_len().to_string())],
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(format!(" {title} "), theme::title_style()));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if state.queue_paused() {
+        let key = crate::keymap::ChatTabAction::ResumeQueue
+            .default_chords()
+            .first()
+            .map(|c| c.display())
+            .unwrap_or_else(|| "Alt+P".to_string());
+        rows.push(Line::from(Span::styled(
+            crate::i18n::t_args("zc-queue-paused", &[("key", &key)]),
+            theme::warn_style(),
+        )));
+        rows.push(Line::from(""));
+    }
+
+    if state.message_queue.is_empty() {
+        rows.push(Line::from(Span::styled(
+            crate::i18n::t("zc-queue-empty-list"),
+            theme::dim_style(),
+        )));
+    } else {
+        for (idx, msg) in state.message_queue.iter().enumerate() {
+            let selected = state.queue_sel == Some(msg.id);
+            let marker = if selected { "▶ " } else { "  " };
+            let head_style = if selected {
+                theme::title_style()
+            } else {
+                Style::default()
+            };
+            let preview = first_line_preview(&msg.text, inner.width.saturating_sub(4) as usize);
+            let tag = if msg.status == QueueItemStatus::Injected {
+                format!(" {}", crate::i18n::t("zc-queue-item-injected"))
+            } else {
+                String::new()
+            };
+            rows.push(Line::from(vec![
+                Span::styled(format!("{marker}{}.", idx + 1), head_style),
+                Span::styled(format!(" {preview}"), head_style),
+                Span::styled(tag, theme::dim_style()),
+            ]));
+            for att in &msg.attachments {
+                rows.push(Line::from(Span::styled(
+                    format!("    📎 {}", att.filename),
+                    theme::dim_style(),
+                )));
+            }
+        }
+    }
+
+    let para = Paragraph::new(rows).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+fn first_line_preview(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    let truncated = truncate_utf8(line, max.max(1));
+    if truncated.len() < line.len() {
+        format!("{truncated}…")
+    } else {
+        truncated.to_string()
+    }
 }
 
 /// Extract the file extension from the `"path"` field of a tool's input JSON.
@@ -2259,6 +2479,20 @@ struct ScrollbarDrag {
     start_row: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueItemStatus {
+    Pending,
+    Injected,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedMessage {
+    pub id: u64,
+    pub text: String,
+    pub attachments: Vec<PendingAttachment>,
+    pub status: QueueItemStatus,
+}
+
 #[derive(Debug)]
 pub struct ChatState {
     pub session_id: String,
@@ -2328,6 +2562,16 @@ pub struct ChatState {
     pub context_input_tokens: Option<u64>,
     /// Configured context limit for this session's model.
     pub context_max_tokens: Option<u64>,
+    /// Outbound message queue; the front dispatches when the session is free.
+    message_queue: VecDeque<QueuedMessage>,
+    /// Monotonic id source for queued messages.
+    next_queue_id: u64,
+    /// Set on Cancel/Fail; freezes auto-dispatch until the user resumes.
+    queue_paused: bool,
+    /// Whether the queue sidebar is visible.
+    show_queue_sidebar: bool,
+    /// Selected queued message id for sidebar edit/delete.
+    queue_sel: Option<u64>,
 }
 
 impl ChatState {
@@ -2368,6 +2612,11 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            message_queue: VecDeque::new(),
+            next_queue_id: 0,
+            queue_paused: false,
+            show_queue_sidebar: false,
+            queue_sel: None,
         }
     }
 
@@ -2807,49 +3056,30 @@ impl ChatState {
                 // and commit_turn handles it.
                 match outcome {
                     TurnEndOutcome::Completed => {
-                        self.commit_turn(content);
+                        self.commit_turn(content, true);
                     }
                     TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
                         self.entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
                         self.mark_dirty_append();
-                        self.commit_turn(String::new());
+                        self.commit_turn(String::new(), false);
                     }
                 }
             }
         }
     }
 
-    pub fn commit_turn(&mut self, full_text: String) {
-        // Flush any remaining streaming text as a final AgentMessage.
-        // `flush_streaming_text` takes the buffer, so after this call
-        // `streaming_text` is empty. If the buffer was non-empty (i.e. the
-        // turn ended with trailing text that was never interrupted by a tool
-        // call), the entry is committed here. If the buffer was already empty
-        // (all text was flushed at ToolCall boundaries mid-turn), nothing is
-        // pushed and we avoid duplicating already-committed entries.
-        //
-        // We do NOT use `full_text` to push a final entry: the full turn text
-        // is the concatenation of all chunks, which have already been
-        // committed in order (pre-tool, post-tool, …). Using `full_text` here
-        // would duplicate text that was flushed earlier.
+    pub fn commit_turn(&mut self, full_text: String, clean: bool) {
         self.flush_streaming_text();
-        // Flush any trailing thought not yet committed (e.g. thinking-only turn).
         self.flush_streaming_thought();
-        // If the turn produced text but no tool calls interrupted it, the
-        // buffer was non-empty and flush_streaming_text already committed it.
-        // If the turn produced only tool calls (no trailing text) or all text
-        // was flushed mid-turn, nothing more to push.
-        // Legacy path: if streaming_text was empty AND full_text is non-empty
-        // AND no AgentMessage was committed this turn (pure tool-only turn
-        // with a final summary), push full_text.  This preserves behaviour
-        // for turns that have no chunks at all (e.g. instant responses from
-        // tests that call commit_turn directly without apply_update).
-        let _ = full_text; // consumed by flush above; kept as parameter for API stability
+        let _ = full_text;
         self.mark_dirty_append();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.input_bar.cleanup_temps();
+        if !clean {
+            self.queue_paused = true;
+        }
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
@@ -2863,6 +3093,168 @@ impl ChatState {
         // first chunk (thought / message / tool-call) tells us otherwise.
         self.turn_status = TurnStatus::Working;
         self.turn_started_at = Instant::now();
+    }
+
+    const QUEUE_CAP: usize = 32;
+
+    fn alloc_queue_id(&mut self) -> u64 {
+        let id = self.next_queue_id;
+        self.next_queue_id = self.next_queue_id.wrapping_add(1);
+        id
+    }
+
+    pub fn enqueue_message(
+        &mut self,
+        text: String,
+        attachments: Vec<PendingAttachment>,
+    ) -> Result<(), String> {
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err(crate::i18n::t("zc-queue-empty"));
+        }
+        let pending = self.message_queue.len();
+        if pending >= Self::QUEUE_CAP {
+            return Err(crate::i18n::t_args(
+                "zc-queue-full",
+                &[("cap", &Self::QUEUE_CAP.to_string())],
+            ));
+        }
+        let id = self.alloc_queue_id();
+        self.message_queue.push_back(QueuedMessage {
+            id,
+            text,
+            attachments,
+            status: QueueItemStatus::Pending,
+        });
+        Ok(())
+    }
+
+    pub fn inject_message(
+        &mut self,
+        text: String,
+        attachments: Vec<PendingAttachment>,
+    ) -> Result<(), String> {
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err(crate::i18n::t("zc-queue-empty"));
+        }
+        if self.message_queue.len() >= Self::QUEUE_CAP {
+            return Err(crate::i18n::t_args(
+                "zc-queue-full",
+                &[("cap", &Self::QUEUE_CAP.to_string())],
+            ));
+        }
+        let id = self.alloc_queue_id();
+        let insert_at = self
+            .message_queue
+            .iter()
+            .position(|m| m.status == QueueItemStatus::Pending)
+            .unwrap_or(self.message_queue.len());
+        self.message_queue.insert(
+            insert_at,
+            QueuedMessage {
+                id,
+                text,
+                attachments,
+                status: QueueItemStatus::Injected,
+            },
+        );
+        Ok(())
+    }
+
+    fn next_dispatch_index(&self) -> Option<usize> {
+        if self.turn_in_flight {
+            return None;
+        }
+        if let Some(idx) = self
+            .message_queue
+            .iter()
+            .position(|m| m.status == QueueItemStatus::Injected)
+        {
+            return Some(idx);
+        }
+        if self.queue_paused {
+            return None;
+        }
+        self.message_queue
+            .iter()
+            .position(|m| m.status == QueueItemStatus::Pending)
+    }
+
+    pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
+        let idx = self.next_dispatch_index()?;
+        let msg = self.message_queue.remove(idx)?;
+        if self.queue_sel == Some(msg.id) {
+            self.queue_sel = None;
+        }
+        Some(msg)
+    }
+
+    pub fn resume_queue(&mut self) {
+        self.queue_paused = false;
+    }
+
+    pub fn queue_paused(&self) -> bool {
+        self.queue_paused
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.message_queue.len()
+    }
+
+    pub fn toggle_queue_sidebar(&mut self) {
+        self.show_queue_sidebar = !self.show_queue_sidebar;
+        if self.show_queue_sidebar && self.queue_sel.is_none() {
+            self.queue_sel = self.message_queue.front().map(|m| m.id);
+        }
+        self.mark_dirty_full();
+    }
+
+    fn editable_ids(&self) -> Vec<u64> {
+        self.message_queue.iter().map(|m| m.id).collect()
+    }
+
+    pub fn queue_select_step(&mut self, delta: isize) {
+        let ids = self.editable_ids();
+        if ids.is_empty() {
+            self.queue_sel = None;
+            return;
+        }
+        let cur = self
+            .queue_sel
+            .and_then(|id| ids.iter().position(|&x| x == id))
+            .unwrap_or(0) as isize;
+        let next = (cur + delta).rem_euclid(ids.len() as isize) as usize;
+        self.queue_sel = Some(ids[next]);
+        self.mark_dirty_full();
+    }
+
+    pub fn delete_selected_queued(&mut self) {
+        let Some(id) = self.queue_sel else { return };
+        if let Some(pos) = self.message_queue.iter().position(|m| m.id == id) {
+            if let Some(msg) = self.message_queue.remove(pos) {
+                cleanup_attachment_temps(&msg.attachments);
+            }
+            let ids = self.editable_ids();
+            self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
+            self.mark_dirty_full();
+        }
+    }
+
+    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
+        let id = self.queue_sel?;
+        let pos = self.message_queue.iter().position(|m| m.id == id)?;
+        let msg = self.message_queue.remove(pos)?;
+        self.queue_sel = self.editable_ids().first().copied();
+        self.mark_dirty_full();
+        Some((msg.text, msg.attachments))
+    }
+
+    fn clear_queue(&mut self) {
+        for msg in self.message_queue.drain(..) {
+            cleanup_attachment_temps(&msg.attachments);
+        }
+        self.next_queue_id = 0;
+        self.queue_paused = false;
+        self.queue_sel = None;
     }
 
     /// Reset conversational state for a new or switched session.
@@ -2892,6 +3284,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.clear_queue();
     }
 }
 
@@ -3323,7 +3716,7 @@ mod tests {
         assert_eq!(s.current_agent_text(), "Done.");
 
         // commit_turn: only the post-tool text should become a new AgentMessage.
-        s.commit_turn("Done.".to_string());
+        s.commit_turn("Done.".to_string(), true);
 
         // Final order: AgentMessage("Running ls.") | Tool | AgentMessage("Done.")
         assert_eq!(
@@ -3388,7 +3781,7 @@ mod tests {
             raw_input: serde_json::json!({"command": "ls"}),
         });
         // No post-tool text; commit_turn receives the full text but streaming_text is empty.
-        s.commit_turn("Before tool.".to_string());
+        s.commit_turn("Before tool.".to_string(), true);
 
         // Must be exactly: AgentMessage("Before tool.") | Tool
         // NOT: AgentMessage | Tool | AgentMessage (duplicate)
@@ -3410,7 +3803,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             text: "Done".to_string(),
         });
-        s.commit_turn("Done".to_string());
+        s.commit_turn("Done".to_string(), true);
         assert_eq!(s.current_agent_text(), "");
         assert!(
             s.entries()
@@ -3501,5 +3894,157 @@ mod tests {
         // padding. The truncation rule collapses every column to `…`.
         let out = markdown_to_lines("| A |\n|---|\n| 1 |\n", 0);
         assert!(!out.is_empty());
+    }
+
+    fn att(name: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: std::path::PathBuf::from(format!("/tmp/{name}")),
+            mime_type: "text/plain".to_string(),
+            filename: name.to_string(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        }
+    }
+
+    #[test]
+    fn enqueue_dispatches_immediately_when_idle() {
+        let mut s = state();
+        s.enqueue_message("hello".to_string(), Vec::new()).unwrap();
+        assert_eq!(s.queue_len(), 1);
+        let msg = s
+            .take_next_dispatchable()
+            .expect("idle queue must dispatch");
+        assert_eq!(msg.text, "hello");
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn no_dispatch_while_turn_in_flight() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        assert!(s.take_next_dispatchable().is_none());
+        assert_eq!(s.queue_len(), 2);
+    }
+
+    #[test]
+    fn fifo_order_preserved() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("first".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("second".to_string(), Vec::new()).unwrap();
+        s.turn_in_flight = false;
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "first");
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "second");
+    }
+
+    #[test]
+    fn injection_jumps_ahead_of_pending() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("pending1".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("pending2".to_string(), Vec::new())
+            .unwrap();
+        s.inject_message("urgent".to_string(), Vec::new()).unwrap();
+        s.turn_in_flight = false;
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "urgent");
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "pending1");
+    }
+
+    #[test]
+    fn cancel_pauses_pending_but_injection_overrides() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
+        s.commit_turn(String::new(), false);
+        assert!(s.queue_paused());
+        assert!(
+            s.take_next_dispatchable().is_none(),
+            "paused queue must not dispatch pending items"
+        );
+        s.inject_message("override".to_string(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            s.take_next_dispatchable().unwrap().text,
+            "override",
+            "injected item dispatches through a pause"
+        );
+        s.resume_queue();
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "queued");
+    }
+
+    #[test]
+    fn clean_completion_does_not_pause() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.commit_turn(String::new(), true);
+        assert!(!s.queue_paused());
+    }
+
+    #[test]
+    fn empty_enqueue_rejected() {
+        let mut s = state();
+        assert!(s.enqueue_message("   ".to_string(), Vec::new()).is_err());
+        assert!(s.inject_message(String::new(), Vec::new()).is_err());
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn attachment_only_enqueue_accepted() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message(String::new(), vec![att("a.txt")])
+            .unwrap();
+        assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn delete_selected_removes_item() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.toggle_queue_sidebar();
+        s.delete_selected_queued();
+        assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn edit_pull_removes_from_queue_and_returns_content() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("draft".to_string(), vec![att("x.txt")])
+            .unwrap();
+        s.toggle_queue_sidebar();
+        let (text, atts) = s.take_selected_for_edit().expect("selected item");
+        assert_eq!(text, "draft");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn reset_clears_queue() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.queue_paused = true;
+        s.reset_for_session("sess-2".to_string(), None);
+        assert_eq!(s.queue_len(), 0);
+        assert!(!s.queue_paused());
+    }
+
+    #[test]
+    fn queue_cap_enforced() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        for i in 0..ChatState::QUEUE_CAP {
+            s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
+        }
+        assert!(
+            s.enqueue_message("overflow".to_string(), Vec::new())
+                .is_err()
+        );
     }
 }
