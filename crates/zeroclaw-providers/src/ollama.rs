@@ -410,10 +410,6 @@ impl OllamaModelProvider {
         "I couldn't get a complete response from Ollama. Please try again or switch to a different model."
             .to_string()
     }
-
-    // Only used by tests; kept for direct build_chat_request access without
-    // the reasoning-parameter variant.
-    #[allow(dead_code)]
     fn build_chat_request(
         &self,
         messages: Vec<Message>,
