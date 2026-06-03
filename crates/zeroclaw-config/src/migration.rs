@@ -269,14 +269,9 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
     Ok(())
 }
 
-/// High-level: arbitrary versioned TOML → fully validated V3 `Config`.
-/// Runs migration if needed, then deserializes into the current `Config` type.
-///
-/// **Strict.** Any deserialization defect is returned as an error. This is the
-/// contract repair tooling depends on (`zeroclaw config migrate`,
-/// `model_routing_config`): they need to know precisely what is wrong. The
-/// daemon load path uses [`migrate_to_current_resilient`] instead, which never
-/// fails so the operator can always reach a repair surface.
+/// Versioned TOML → validated V3 `Config`, strict: any defect errors.
+/// Used by repair tooling (`zeroclaw config migrate`, `model_routing_config`)
+/// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
     let final_value = migrate_value(input)?;
     final_value
@@ -284,60 +279,35 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
         .context("migrated config failed to deserialize as current schema")
 }
 
-/// Daemon load path: arbitrary versioned TOML → a usable `Config`, **always**.
-///
-/// The daemon must start no matter what so the config can be repaired through
-/// the gateway, CLI, or dashboard. This function therefore degrades instead of
-/// failing; see [`migrate_to_current_salvaged`] for the salvage contract and
-/// the security-section caveat. This thin wrapper discards the salvage report
-/// for callers that only need the `Config`.
+/// Daemon load path: versioned TOML → usable `Config`, never failing.
+/// Thin wrapper over [`migrate_to_current_salvaged`] that drops the report.
 pub fn migrate_to_current_resilient(input: &str) -> Config {
     migrate_to_current_salvaged(input).config
 }
 
-/// Top-level config keys whose silent loss could *weaken* the running
-/// security posture. "Secure by default" cuts both ways: if one of these
-/// sections is malformed, reverting it to its serde `Default` may grant a
-/// broader posture than the operator intended (e.g. a dropped `[security]`
-/// table loses hardening; a dropped `risk_profiles`/`peer_groups` loses
-/// authorization scoping). Salvage still drops them so the daemon can boot —
-/// but it logs at ERROR (not WARN) and reports them in
-/// [`ResilientLoad::dropped_security`] so the caller can refuse network
-/// exposure until the operator repairs the file.
+/// Top-level keys whose silent loss could *weaken* security posture: dropping
+/// a malformed one to its `Default` may grant a broader posture than intended.
+/// Salvage still drops them (so the daemon boots) but logs ERROR and reports
+/// them in [`ResilientLoad::dropped_security`] for exposure gating.
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
 
 /// Result of a resilient (never-failing) config load.
 #[derive(Debug, Clone, Default)]
 pub struct ResilientLoad {
-    /// The loaded config — always present, carrying every section that
-    /// parsed and `Default` for every section that had to be dropped.
+    /// Loaded config: every section that parsed, `Default` for any dropped.
     pub config: Config,
-    /// Dotted paths of non-security sections/aliases dropped during salvage
-    /// (logged at WARN). Empty on a clean load.
+    /// Non-security paths dropped during salvage (logged WARN).
     pub dropped: Vec<String>,
-    /// Top-level [`SECURITY_CRITICAL_KEYS`] sections that had to be dropped
-    /// to their `Default` (logged at ERROR). Non-empty means the running
-    /// posture may be weaker than intended; the caller should refuse
-    /// exposure until repaired.
+    /// [`SECURITY_CRITICAL_KEYS`] sections dropped to `Default` (logged ERROR).
+    /// Non-empty means the running posture may be weaker than intended.
     pub dropped_security: Vec<String>,
 }
 
-/// Daemon load path with a full salvage report. Degrades instead of failing:
-///
-/// 1. Strict deserialize (identical to [`migrate_to_current`]) — the common
-///    case, zero behavior change for valid configs.
-/// 2. If that fails, drop each invalid `[channels.<type>.<alias>]`, each
-///    invalid `[channels.<type>]` whole-type block (e.g. a scalar where a
-///    table is required), and each invalid top-level section — substituting
-///    the section's `Default`. Non-security drops log at WARN; security-
-///    critical drops ([`SECURITY_CRITICAL_KEYS`]) log at ERROR and surface in
-///    [`ResilientLoad::dropped_security`].
-/// 3. If even the migration/parse stage fails (not valid TOML, or an
-///    unsupported future schema), fall back to `Config::default()` so the
-///    process still boots. The original error is logged at ERROR.
-///
-/// `Config::validate()` is intentionally NOT run here — a config that fails
-/// validation must still load so it can be fixed.
+/// Daemon load path with a salvage report. Degrades instead of failing:
+/// strict deserialize first; else drop each invalid channel alias, channel
+/// type, and top-level section (substituting `Default`); else fall back to
+/// `Config::default()`. Security-critical drops log ERROR and surface in
+/// `dropped_security`. `Config::validate()` is intentionally not run.
 pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
     let value = match migrate_value(input) {
         Ok(value) => value,
@@ -361,8 +331,7 @@ pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
 }
 
 /// Parse + migrate to the current schema version as a `toml::Value`, without
-/// the final typed deserialize. Shared by the strict and resilient entry
-/// points so the version-detection and chain logic lives in one place.
+/// the final typed deserialize. Shared by the strict and resilient entries.
 fn migrate_value(input: &str) -> Result<toml::Value> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
@@ -388,12 +357,8 @@ fn migrate_value(input: &str) -> Result<toml::Value> {
 }
 
 /// Deserialize a migrated `toml::Value` into `Config`, never failing.
-///
-/// Strict first; on failure, salvage broken `[channels.<type>.<alias>]`
-/// entries and broken `[channels.<type>]` whole-type blocks, then drop any
-/// remaining top-level section that blocks the load (substituting its
-/// `Default`). The returned `Config` always carries every section that
-/// parsed, so the operator only loses the specific broken blocks.
+/// Strict first; on failure prune broken channel aliases, channel types, then
+/// top-level sections (each → `Default`), so only the broken blocks are lost.
 fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     if let Ok(config) = value.clone().try_into::<Config>() {
         return ResilientLoad {
@@ -466,20 +431,10 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     }
 }
 
-/// Drop any top-level `[section]` that blocks the config from deserializing,
-/// substituting the section's `Default` via serde. A section is dropped when it
-/// is the offender; valid sections are never touched. Two complementary probes
-/// catch every reachable case:
-///
-/// 1. **Joint:** if removing a single key makes the whole config valid, that
-///    key was the sole offender — drop it and finish.
-/// 2. **Isolated:** otherwise drop every key that fails to deserialize *in
-///    isolation* (its own section, wrapped alone, will not parse). This catches
-///    multiple independent offenders in one pass — e.g. two unrelated malformed
-///    sections — which the joint probe alone cannot, since neither one's
-///    removal validates the config while the other remains broken.
-///
-/// Removed paths are appended to `dropped`.
+/// Drop top-level `[section]`s that block deserialization (each → `Default`).
+/// Two probes: drop a single key if its removal validates the whole config;
+/// else drop every key that fails to deserialize in isolation (catches
+/// multiple independent offenders the joint probe can't). Appends to `dropped`.
 fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<String>) {
     if value.as_table().is_none() {
         return;
@@ -521,21 +476,15 @@ fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<Strin
     }
 }
 
-/// True when a single top-level `[section]` cannot deserialize into `Config`
-/// when it is the only key present. Wraps `{ <key> = <section> }` and runs it
-/// through the strict deserializer, isolating the failure to this one section
-/// so independent offenders are each judged on their own.
+/// True when top-level `[<key>]`, wrapped alone, fails to deserialize.
 fn top_level_section_is_invalid(key: &str, section: &toml::Value) -> bool {
     let mut root = toml::value::Table::new();
     root.insert(key.to_string(), section.clone());
     toml::Value::Table(root).try_into::<Config>().is_err()
 }
 
-/// Drop every `[channels.<type>.<alias>]` entry that cannot deserialize into
-/// its concrete channel config type. Each alias is checked in isolation via
-/// [`channel_alias_is_invalid`]; valid aliases sharing a `[channels]` section
-/// with a broken sibling are preserved. Dropped paths
-/// (`channels.<type>.<alias>`) are appended to `dropped`.
+/// Drop each `[channels.<type>.<alias>]` that fails to deserialize, checked in
+/// isolation so valid siblings survive. Appends `channels.<type>.<alias>`.
 fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
     let Some(channels) = value
         .as_table_mut()
@@ -561,12 +510,9 @@ fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>)
     }
 }
 
-/// Drop every `[channels.<type>]` whole-type block that still blocks the load
-/// after alias-level pruning — e.g. a scalar written where an alias table is
-/// required (`email = "oops"`), or a type whose remaining shape is invalid.
-/// Critically this drops ONLY the offending channel type, never the entire
-/// `[channels]` section, so valid sibling channel types survive. Dropped paths
-/// (`channels.<type>`) are appended to `dropped`.
+/// Drop each `[channels.<type>]` block still blocking the load after alias
+/// pruning (e.g. a scalar where a table is required). Drops only the offending
+/// type, never the whole `[channels]` section. Appends `channels.<type>`.
 fn prune_bad_channel_types(value: &mut toml::Value, dropped: &mut Vec<String>) {
     let Some(channel_types) = value
         .as_table()
@@ -602,8 +548,7 @@ fn prune_bad_channel_types(value: &mut toml::Value, dropped: &mut Vec<String>) {
     }
 }
 
-/// True when the `[channels]` section of `value` deserializes cleanly,
-/// isolating channel-section validity from defects elsewhere in the config.
+/// True when `value`'s `[channels]` section deserializes cleanly in isolation.
 fn channels_section_is_valid(value: &toml::Value) -> bool {
     let Some(channels) = value
         .as_table()
@@ -617,11 +562,7 @@ fn channels_section_is_valid(value: &toml::Value) -> bool {
     toml::Value::Table(root).try_into::<Config>().is_ok()
 }
 
-/// True when a single `[channels.<type>.<alias>]` table cannot deserialize
-/// into its concrete channel config type. Wraps the alias under a minimal
-/// `{ channels = { <type> = { probe = <alias> } } }` document and runs it
-/// through the strict `Config` deserializer, isolating the failure to this
-/// one alias.
+/// True when `[channels.<type>.<alias>]`, wrapped alone, fails to deserialize.
 fn channel_alias_is_invalid(chan_type: &str, alias_value: &toml::Value) -> bool {
     let mut inner = toml::value::Table::new();
     inner.insert("probe".to_string(), alias_value.clone());

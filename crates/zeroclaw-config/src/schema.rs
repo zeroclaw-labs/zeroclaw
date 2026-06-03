@@ -102,12 +102,10 @@ pub struct Config {
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
     pub dirty_paths: std::collections::HashSet<String>,
-    /// Top-level security-critical sections (`security`, `risk_profiles`,
-    /// `peer_groups`) that the resilient daemon loader had to reset to their
-    /// defaults because the on-disk block was malformed. Non-empty means the
-    /// running posture may be WEAKER than the operator intended; exposure-
-    /// gating code should refuse to trust the instance until the operator
-    /// repairs the file. Never serialized — purely a load-time signal.
+    /// Security-critical sections the resilient loader reset to `Default`
+    /// because the on-disk block was malformed. Non-empty = posture may be
+    /// weaker than intended; exposure gating should refuse to trust the
+    /// instance until repaired. Never serialized — a load-time signal.
     #[serde(skip)]
     pub degraded_security: Vec<String>,
     /// Config file schema version.
@@ -14434,15 +14432,11 @@ impl Config {
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
-            // Daemon load must never hard-fail on a malformed config: the
-            // operator needs the process up to repair it (gateway
-            // /api/config, `zeroclaw config migrate`, dashboard). The
-            // resilient path degrades — dropping invalid channel aliases and
-            // sections to their defaults — instead of aborting. Non-security
-            // drops log at WARN; security-critical drops log at ERROR and are
-            // recorded on `config.degraded_security` so exposure-gating code
-            // can refuse to trust the instance until repaired. Strict
-            // validation lives in `zeroclaw config migrate`.
+            // Daemon load must never hard-fail on a malformed config — the
+            // operator needs the process up to repair it. The resilient path
+            // degrades (dropping invalid blocks to defaults); security-critical
+            // drops are recorded on `degraded_security` for exposure gating.
+            // Strict validation lives in `zeroclaw config migrate`.
             let salvage = crate::migration::migrate_to_current_salvaged(&contents);
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
