@@ -1418,10 +1418,15 @@ impl SlackChannel {
     /// - Allow-list filtering: messages from users not on the channel's
     ///   allow-list are dropped; the count is surfaced as a visible gap
     ///   marker so the agent knows context is missing for policy reasons.
-    ///   Messages with no `user` field (webhooks / other bots) and the
-    ///   bot's own past replies are NOT subject to the allow-list filter
-    ///   and pass through — the bot's prior turns are useful self-context,
-    ///   and webhook content is already trusted at ingest.
+    ///   Messages with no `user` field (webhook posts, integration bots)
+    ///   are also dropped and folded into the same gap counter — the
+    ///   normal Socket Mode and polling paths skip these under a
+    ///   restricted allow-list, and the backfill path matches that
+    ///   boundary so historical webhook content can't be smuggled in
+    ///   via `conversations.replies`. The bot's own past replies
+    ///   (`user == bot_user_id`, non-empty) are the only positively-
+    ///   identified passthrough — they're useful self-context and don't
+    ///   widen the channel's privacy boundary.
     /// - Reply cap: only the most recent `SLACK_PERMALINK_THREAD_MAX_REPLIES`
     ///   allow-listed messages are rendered, with a `… N earlier thread
     ///   messages omitted …` prefix marker when the cap activates.
