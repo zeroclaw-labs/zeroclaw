@@ -30,6 +30,19 @@ pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
 
+/// Public helper for other crates (e.g. channels orchestrator) to load
+/// peripheral tools through the registered factory. Returns empty vec
+/// when nothing is registered (hardware feature off or not yet wired).
+pub async fn load_peripheral_tools(
+    config: zeroclaw_config::schema::PeripheralsConfig,
+) -> Vec<Box<dyn Tool>> {
+    if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
+        f(config).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
 /// Injected by the binary so `zeroclaw-runtime` doesn't depend on
 /// `zeroclaw-channels`.

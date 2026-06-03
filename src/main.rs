@@ -3246,6 +3246,15 @@ async fn main() -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
+            // Wire peripheral tools (gpio_read/gpio_write etc.) for `zeroclaw agent`.
+            // Mirrors the registration done for the daemon command.
+            #[cfg(feature = "hardware")]
+            zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                Box::pin(async move {
+                    zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                })
+            }));
+
             // Register channel map factory for late-bound tool handle population.
             zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
                 let config_clone = config.clone();

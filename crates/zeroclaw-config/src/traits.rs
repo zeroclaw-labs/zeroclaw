@@ -111,6 +111,9 @@ impl HasPropKind for crate::multi_agent::AccessMode {
 impl HasPropKind for crate::multi_agent::MemoryBackendKind {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
+impl HasPropKind for crate::multi_agent::OutputModality {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
 impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }

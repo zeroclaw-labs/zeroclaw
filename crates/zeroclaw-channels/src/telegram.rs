@@ -393,6 +393,10 @@ pub struct TelegramChannel {
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Peers that always receive voice replies, sourced from peer-group
+    /// `output_modality = "voice"` config. Populated once at startup by
+    /// `with_voice_peer_prefs`; never mutated by session events.
+    static_voice_peers: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
@@ -462,6 +466,7 @@ impl TelegramChannel {
             ack_reactions: true,
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            static_voice_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             tool_command_specs: Vec::new(),
@@ -568,7 +573,13 @@ impl TelegramChannel {
     /// or when the manager fails to construct (logged at warn).
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            match super::tts::TtsManager::from_config(config) {
+            // Bind the TTS manager to the agent that owns THIS channel so the
+            // voice reply uses that agent's `tts_provider`. Without this the
+            // shared manager resolves the lexicographically-smallest enabled
+            // agent, which silently breaks TTS when that agent has no
+            // `tts_provider` set (e.g. a background/delegate agent).
+            let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
+            match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -638,7 +649,37 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// Wire the shared Config handle so `persist_allowed_identity` can
+    /// Pre-seed static voice preferences from peer-group config.
+    ///
+    /// Iterates `[peer_groups.*]` entries that reference this channel and
+    /// carry `output_modality = "voice"`, then records every `external_peers`
+    /// entry in `static_voice_peers`. These peers always receive TTS replies —
+    /// including cron/proactive messages with no inbound voice note to mirror.
+    ///
+    /// Unlike the session `voice_chats` set, `static_voice_peers` is never
+    /// cleared by voice-send or text-message events.
+    pub fn with_voice_peer_prefs(
+        self,
+        config: &zeroclaw_config::schema::Config,
+        channel_type: &str,
+        alias: impl AsRef<str>,
+    ) -> Self {
+        use zeroclaw_config::multi_agent::OutputModality;
+        let alias = alias.as_ref();
+        let dotted = format!("{channel_type}.{alias}");
+        if let Ok(mut sp) = self.static_voice_peers.lock() {
+            for group in config.peer_groups.values() {
+                let matches = group.channel == channel_type || group.channel == dotted;
+                if matches && group.output_modality == OutputModality::Voice {
+                    for peer in &group.external_peers {
+                        sp.insert(peer.to_string());
+                    }
+                }
+            }
+        }
+        self
+    }
+
     /// write a paired user into `peer_groups` and save. The long-running
     /// daemon sets this from the orchestrator; tests and one-shot
     /// callers leave it unset (pairing works at runtime, doesn't persist).
@@ -845,14 +886,24 @@ impl TelegramChannel {
     /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
     /// debounce is skipped and `synthesize_and_send_voice` is called directly,
     /// since the text is already the final response.
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
-        let is_voice_chat = self
-            .voice_chats
+    /// Returns true if this recipient should receive a TTS voice reply —
+    /// either because they triggered a voice-note session (`voice_chats`) or
+    /// because their peer group has `output_modality = "voice"` in config
+    /// (`static_voice_peers`).
+    fn is_voice_chat(&self, recipient: &str) -> bool {
+        self.voice_chats
             .lock()
             .map(|vs| vs.contains(recipient))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self
+                .static_voice_peers
+                .lock()
+                .map(|sp| sp.contains(recipient))
+                .unwrap_or(false)
+    }
 
-        if !is_voice_chat || self.tts_manager.is_none() {
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
+        if !self.is_voice_chat(recipient) || self.tts_manager.is_none() {
             return;
         }
 
@@ -997,7 +1048,7 @@ impl TelegramChannel {
         text: &str,
         tts_manager: &crate::tts::TtsManager,
     ) -> anyhow::Result<()> {
-        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
         ::zeroclaw_log::record!(
             INFO,
@@ -1019,7 +1070,7 @@ impl TelegramChannel {
                 "voice",
                 reqwest::multipart::Part::bytes(audio_bytes)
                     .file_name("voice.ogg")
-                    .mime_str("audio/ogg")?,
+                    .mime_str("audio/ogg; codecs=opus")?,
             );
 
         if let Some(tid) = thread_id {
@@ -3864,6 +3915,105 @@ Ensure only one `zeroclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_voice_peer_prefs_seeds_static_voice_peers_for_matching_groups_only() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        // Voice group on this channel type — should be seeded.
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                external_peers: vec![PeerUsername::new("@alice"), PeerUsername::new("@bob")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+        // Voice group on a different channel — must NOT leak into telegram.
+        config.peer_groups.insert(
+            "other".to_string(),
+            PeerGroupConfig {
+                channel: "signal".to_string(),
+                external_peers: vec![PeerUsername::new("@carol")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+        // Mirror group on this channel — not a voice preference, skip.
+        config.peer_groups.insert(
+            "mirrorers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                external_peers: vec![PeerUsername::new("@dave")],
+                output_modality: OutputModality::Mirror,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_prefs(&config, "telegram", "default");
+
+        // Peers go into static_voice_peers, not into the session voice_chats set.
+        let sp = ch.static_voice_peers.lock().unwrap();
+        assert!(sp.contains("@alice"), "voice peer should be in static set");
+        assert!(sp.contains("@bob"), "voice peer should be in static set");
+        assert!(
+            !sp.contains("@carol"),
+            "peers on another channel must not be seeded"
+        );
+        assert!(
+            !sp.contains("@dave"),
+            "mirror-modality peers must not be seeded"
+        );
+        drop(sp);
+
+        let vc = ch.voice_chats.lock().unwrap();
+        assert!(
+            !vc.contains("@alice"),
+            "static peers must not pollute the session voice_chats set"
+        );
+    }
+
+    #[test]
+    fn static_voice_peers_survive_session_voice_chats_removal() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                external_peers: vec![PeerUsername::new("@alice")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_prefs(&config, "telegram", "default");
+
+        // Simulate a voice-send removing @alice from voice_chats (even though
+        // she was never in it — this proves static peers are checked separately).
+        ch.voice_chats.lock().unwrap().remove("@alice");
+
+        // is_voice_chat must still return true via static_voice_peers.
+        assert!(
+            ch.is_voice_chat("@alice"),
+            "static voice peer must remain active after voice_chats removal"
+        );
+    }
 
     #[test]
     fn telegram_channel_name() {
