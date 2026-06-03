@@ -71,32 +71,28 @@ pub fn is_version_dir(name: &str) -> bool {
     name == "master" || name == "stable" || parse_version(name).is_some()
 }
 
-/// Root-level entries that are not version dirs but must survive pruning.
-const ROOT_KEEP_FILES: &[&str] = &["index.html", "CNAME", "versions.json", ".nojekyll"];
+/// Root-level directories that are not version dirs but must survive pruning.
 const ROOT_KEEP_DIRS: &[&str] = &["_shared", ".git"];
 
-/// Remove orphaned root entries left over from the pre-versioned docs layout
-/// (e.g. top-level `en/`, `fr/`, `api/`). Keeps allowlisted files, the shared
-/// chrome dir, and every recognized version dir. Operates on the current
-/// working directory (the gh-pages clone root).
+/// Remove orphaned root *directories* left over from the pre-versioned docs
+/// layout (e.g. top-level `en/`, `fr/`, `api/`). Keeps the shared chrome dir
+/// and every recognized version dir. Root *files* are never touched — the
+/// orphans are all directories, and a closed file allowlist would silently
+/// delete legitimate root files a future deploy might add (`404.html`,
+/// `robots.txt`, `sitemap.xml`, ...). Operates on the current working
+/// directory (the gh-pages clone root).
 pub fn prune_root() -> anyhow::Result<()> {
     let entries = fs::read_dir(".")?;
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            if ROOT_KEEP_DIRS.contains(&name.as_str()) || is_version_dir(&name) {
-                continue;
-            }
-            println!("prune-root: removing orphaned dir {name}/");
-            fs::remove_dir_all(entry.path())?;
-        } else {
-            if ROOT_KEEP_FILES.contains(&name.as_str()) {
-                continue;
-            }
-            println!("prune-root: removing orphaned file {name}");
-            fs::remove_file(entry.path())?;
+        if !entry.file_type()?.is_dir() {
+            continue;
         }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ROOT_KEEP_DIRS.contains(&name.as_str()) || is_version_dir(&name) {
+            continue;
+        }
+        println!("prune-root: removing orphaned dir {name}/");
+        fs::remove_dir_all(entry.path())?;
     }
     Ok(())
 }
