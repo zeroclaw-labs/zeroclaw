@@ -237,8 +237,8 @@ keyactions! {
 
 keyactions! {
     pub enum QuickstartTabAction ("quickstart") {
-        Up     [Chord::key(KeyCode::Up)] => "prev",
-        Down   [Chord::key(KeyCode::Down)] => "next",
+        Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter  [Chord::key(KeyCode::Enter)] => "open",
         Create [Chord::char('c'), Chord::char('C')] => "create agent",
     }

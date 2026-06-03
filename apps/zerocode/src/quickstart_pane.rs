@@ -643,7 +643,10 @@ impl QuickstartPane {
 
     pub fn help_context(&self) -> HelpNode {
         HelpNode::entries(vec![
-            HelpEntry::new(vec!["↑/↓"], crate::i18n::t("zc-quickstart-help-move")),
+            HelpEntry::new(
+                vec!["j", "k", "↑/↓"],
+                crate::i18n::t("zc-quickstart-help-move"),
+            ),
             HelpEntry::new(vec!["Enter"], crate::i18n::t("zc-quickstart-help-open")),
             HelpEntry::key(
                 "c",
