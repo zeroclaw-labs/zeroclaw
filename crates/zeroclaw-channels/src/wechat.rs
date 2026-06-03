@@ -906,7 +906,7 @@ impl WeChatChannel {
             let mut cfg = config.write();
             if !cfg.channels.wechat.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app_id=<id>` to configure.",
+                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app-id=<id>` to configure.",
                     self.alias
                 );
             }
