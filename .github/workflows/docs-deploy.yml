@@ -199,17 +199,37 @@ jobs:
           echo "docs.zeroclawlabs.ai" > CNAME
 
           SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
-          
-          # Sync shared chrome — new xtask produces book/_shared/
-          if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
-            mkdir -p "$CLONE_DIR/_shared"
-            rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
-          else
-            # Old-tag fallback: extract chrome from the deployed version content
+
+          # Shared chrome (_shared/) is owned by master only. Every deployed
+          # version's pages reference /_shared/, so letting an older tag's build
+          # overwrite it would regress the chrome (CSS/JS) for ALL versions —
+          # the beta-2-clobbers-master bug. Tag deploys sync their own <tag>/
+          # dir but leave _shared untouched; master is the single writer.
+          if [ "$TAG" = "master" ]; then
+            if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
+              mkdir -p "$CLONE_DIR/_shared"
+              rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
+            else
+              # master build predates the _shared layout: extract chrome from it.
+              cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
+            fi
+          elif [ ! -d "$CLONE_DIR/_shared" ]; then
+            # Bootstrap only: a tag is the very first deploy and no master has
+            # populated _shared yet. Seed it from this tag so its pages aren't
+            # broken; the next master deploy takes ownership and overwrites it.
             cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
           fi
 
           cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
+
+          # Remove orphaned root entries left by the pre-versioned layout
+          # (top-level en/, fr/, api/, ...). Keeps version dirs, _shared, and
+          # the allowlisted root files. Single source of truth: is_version_dir.
+          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- prune-root
+
+          # Retrofit the version-selector into any deployed version whose pages
+          # predate the selector (e.g. tags cut before it shipped). Idempotent.
+          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- retrofit-selector
 
           # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
           if [ -d "stable" ]; then
@@ -220,5 +240,39 @@ jobs:
 
           git add --all
           git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit -m "docs: update docs for $TAG (from $GITHUB_SHA)" || true
-          git push "$REPO" gh-pages
+
+          # Concurrent deploy runs each clone, mutate, and push gh-pages. A run
+          # that cloned before a sibling's push would otherwise clobber it (or
+          # be rejected). Rebase onto the latest remote tip and retry so every
+          # deployed version and an up-to-date versions.json survive the race.
+          push_attempts=0
+          until git push "$REPO" gh-pages; do
+            push_attempts=$((push_attempts + 1))
+            if [ "$push_attempts" -ge 5 ]; then
+              echo "::error::gh-pages push failed after ${push_attempts} attempts"
+              exit 1
+            fi
+            echo "Push rejected (attempt ${push_attempts}); rebasing onto latest gh-pages and retrying"
+            git fetch --depth=50 "$REPO" gh-pages
+            git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" rebase FETCH_HEAD || {
+              echo "::error::rebase onto gh-pages failed"
+              git rebase --abort || true
+              exit 1
+            }
+            # Re-run finalizers after rebase: a sibling run may have added or
+            # removed a version dir, so versions.json / prune / retrofit must
+            # reflect the merged tree before we push.
+            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
+            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- prune-root
+            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- retrofit-selector
+            if [ -d "stable" ]; then
+              bash "${SCRIPTS}/gen-index-stable.sh"
+            else
+              bash "${SCRIPTS}/gen-index-master.sh"
+            fi
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              git add --all
+              git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit --amend --no-edit
+            fi
+          done
           popd >/dev/null
