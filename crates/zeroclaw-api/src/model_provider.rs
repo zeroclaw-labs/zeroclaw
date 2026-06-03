@@ -483,10 +483,12 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// pricing. Concrete providers that receive pricing from their `/models`
     /// endpoint override this to return enriched data.
     async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        Ok(self.list_models().await?.into_iter().map(|id| ModelInfo {
-            id,
-            pricing: None,
-        }).collect())
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|id| ModelInfo { id, pricing: None })
+            .collect())
     }
 
     /// Multi-turn conversation. See `simple_chat` for the `temperature`

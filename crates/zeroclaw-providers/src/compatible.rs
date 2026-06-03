@@ -172,7 +172,9 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
 
 /// Extract model IDs with pricing from a ModelsResponse.
 /// Returns sorted list of `ModelInfo` with pricing data where available.
-fn normalize_models_with_pricing(body: ModelsResponse) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+fn normalize_models_with_pricing(
+    body: ModelsResponse,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
     let mut models: Vec<ModelInfo> = body
         .data
@@ -2213,7 +2215,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
-    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
+    async fn list_models_with_pricing(
+        &self,
+    ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
         use zeroclaw_api::model_provider::ModelInfo;
         // When a credential is present, hit the provider's native /models
         // endpoint — this returns pricing data that we can capture.
@@ -2270,10 +2274,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if let Some(key) = &self.models_dev_key {
             match crate::models_dev::list_models_for(key).await {
                 Ok(models) if !models.is_empty() => {
-                    return Ok(models.into_iter().map(|id| ModelInfo {
-                        id,
-                        pricing: None,
-                    }).collect());
+                    return Ok(models
+                        .into_iter()
+                        .map(|id| ModelInfo { id, pricing: None })
+                        .collect());
                 }
                 Ok(_) => {} // empty → fall through to openrouter
                 Err(_) if self.openrouter_vendor_prefix.is_none() => {
@@ -2283,7 +2287,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
         }
         match &self.openrouter_vendor_prefix {
-            Some(prefix) => crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await,
+            Some(prefix) => {
+                crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await
+            }
             None => Ok(Vec::new()),
         }
     }
