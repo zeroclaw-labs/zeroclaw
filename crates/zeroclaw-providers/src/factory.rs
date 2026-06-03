@@ -1189,6 +1189,17 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
                  `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p =
+                crate::openai::OpenAiResponsesModelProvider::new(alias, Some(base_url), key);
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
             "Custom",
@@ -1218,6 +1229,17 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
                  `[model_providers.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
+        if self.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p =
+                crate::openai::OpenAiResponsesModelProvider::new(alias, Some(base_url), key);
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
             "OpenAI Compatible",
@@ -1436,5 +1458,65 @@ mod tests {
             )
             .unwrap();
         assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn custom_factory_routes_to_responses_provider_when_wire_api_responses() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                None,
+                Some("http://10.0.0.15:8000/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn custom_factory_defaults_to_chat_completions_without_wire_api() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                None,
+                Some("http://10.0.0.15:8000/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn openai_compatible_factory_routes_to_responses_when_wire_api_responses() {
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+        let cfg = ModelProviderConfig {
+            uri: Some("http://10.0.0.15:8000/v1".to_string()),
+            wire_api: Some(WireApi::Responses),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                Some("http://10.0.0.15:8000/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
     }
 }
