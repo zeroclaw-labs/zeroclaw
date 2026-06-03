@@ -14,11 +14,7 @@ Keep the daemon bound to localhost unless you have put it behind your own authen
 
 ## Configure the channel
 
-The easiest path is the channels onboarding flow:
-
-```bash
-zeroclaw onboard channels
-```
+Set the required Signal channel fields with `zeroclaw config set` (see the manual config block below for the full field list), or create the block directly in `~/.zeroclaw/config.toml`.
 
 For manual config, create or update a Signal channel block:
 
