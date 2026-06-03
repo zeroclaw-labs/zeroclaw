@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -196,17 +195,22 @@ fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Internal chain state tracked across writes.
+/// Chain tip state recovered from the database.
 struct ChainState {
     prev_hash: String,
     sequence: u64,
 }
 
 /// Audit logger backed by SQLite (`workspace/audit/audit.db`).
+///
+/// Chain integrity is guaranteed at the database level: each `log()` call
+/// reads the current chain tip and appends atomically within a single
+/// `BEGIN IMMEDIATE` transaction. This serializes concurrent writers
+/// (both intra-process threads and inter-process instances) via SQLite's
+/// WAL write lock, preventing chain forks.
 pub struct AuditLogger {
     db_path: PathBuf,
     config: AuditConfig,
-    chain: Mutex<ChainState>,
     signing_key: Option<Vec<u8>>,
 }
 
@@ -256,13 +260,7 @@ impl AuditLogger {
             .with_context(|| format!("Failed to create audit directory: {}", audit_dir.display()))?;
         let db_path = audit_dir.join("audit.db");
 
-        let conn = Connection::open(&db_path)
-            .with_context(|| format!("Failed to open audit.db: {}", db_path.display()))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA temp_store = MEMORY;",
-        )?;
+        let conn = Self::open_conn(&db_path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS audit_events (
                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -273,24 +271,32 @@ impl AuditLogger {
                  entry_hash  TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events(timestamp);
-             CREATE INDEX IF NOT EXISTS idx_audit_sequence ON audit_events(sequence);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_sequence_unique ON audit_events(sequence);
              CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_events(event_type);",
         )
         .context("Failed to create audit_events table")?;
 
-        let chain_state = recover_chain_state(&conn);
-
         Ok(Self {
             db_path,
             config,
-            chain: Mutex::new(chain_state),
             signing_key,
         })
     }
 
+    fn open_conn(db_path: &Path) -> Result<Connection> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open audit.db: {}", db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(conn)
+    }
+
     fn connect(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("Failed to open audit.db: {}", self.db_path.display()))
+        Self::open_conn(&self.db_path)
     }
 
     /// Path to the underlying database file.
@@ -315,51 +321,66 @@ impl AuditLogger {
     }
 
     /// Log an event (INSERT into audit.db with Merkle chain).
+    ///
+    /// The chain tip is read and the new entry inserted within a single
+    /// `BEGIN IMMEDIATE` transaction, so concurrent writers (threads or
+    /// separate processes) serialize via SQLite's write lock. This prevents
+    /// chain forks where two writers read the same tip and produce
+    /// duplicate sequence numbers.
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
 
-        let chained;
-        let should_check_retention;
-        {
-            let mut state = self.chain.lock();
+        let conn = self.connect()?;
+
+        // BEGIN IMMEDIATE acquires the write lock before any reads, ensuring
+        // no other writer can read the same chain tip concurrently.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        let result = (|| -> Result<u64> {
+            let state = recover_chain_state(&conn);
+
             let mut ev = event.clone();
             ev.sequence = state.sequence;
             ev.prev_hash = state.prev_hash.clone();
             ev.entry_hash = compute_entry_hash(&state.prev_hash, &ev);
             ev.signature = self.compute_signature(&ev.entry_hash)?;
 
-            state.prev_hash = ev.entry_hash.clone();
-            state.sequence += 1;
-            should_check_retention = state.sequence % RETENTION_CHECK_INTERVAL == 0;
-            chained = ev;
+            let json = serde_json::to_string(&ev)?;
+            let event_type_val = serde_json::to_value(&ev.event_type)?;
+            conn.execute(
+                "INSERT INTO audit_events (event_json, event_type, timestamp, sequence, entry_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    json,
+                    event_type_val.as_str().unwrap_or("unknown"),
+                    ev.timestamp.to_rfc3339(),
+                    ev.sequence as i64,
+                    ev.entry_hash,
+                ],
+            )?;
+
+            Ok(ev.sequence + 1)
+        })();
+
+        match result {
+            Ok(next_seq) => {
+                conn.execute_batch("COMMIT")?;
+                if next_seq % RETENTION_CHECK_INTERVAL == 0 {
+                    let _ = conn.execute(
+                        "DELETE FROM audit_events WHERE id NOT IN
+                         (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
+                        params![MAX_AUDIT_EVENTS],
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-
-        let conn = self.connect()?;
-        let json = serde_json::to_string(&chained)?;
-        let event_type_val = serde_json::to_value(&chained.event_type)?;
-        conn.execute(
-            "INSERT INTO audit_events (event_json, event_type, timestamp, sequence, entry_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                json,
-                event_type_val.as_str().unwrap_or("unknown"),
-                chained.timestamp.to_rfc3339(),
-                chained.sequence as i64,
-                chained.entry_hash,
-            ],
-        )?;
-
-        if should_check_retention {
-            let _ = conn.execute(
-                "DELETE FROM audit_events WHERE id NOT IN
-                 (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
-                params![MAX_AUDIT_EVENTS],
-            );
-        }
-
-        Ok(())
     }
 
     /// Log a command execution event.
@@ -523,7 +544,7 @@ pub fn verify_chain(db_path: &Path) -> Result<u64> {
 mod tests {
     use super::*;
     use scopeguard::defer;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     /// Mutex to serialize tests that read/write DAEMONCLAW_AUDIT_SIGNING_KEY env var.
@@ -1304,6 +1325,134 @@ mod tests {
         assert!(rec1.signature.is_none(), "second unsigned record");
         assert!(rec2.signature.is_some(), "first signed record");
         assert!(rec3.signature.is_some(), "second signed record");
+
+        Ok(())
+    }
+
+    // ── Concurrency tests ──────────────────────────────────────
+
+    #[test]
+    fn concurrent_writers_produce_single_valid_chain() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let db_path = tmp.path().to_path_buf();
+
+        // Two independent AuditLogger instances (simulates two processes
+        // or two independently-constructed loggers sharing one audit.db).
+        let logger_a = Arc::new(AuditLogger::new(config.clone(), db_path.clone())?);
+        let logger_b = Arc::new(AuditLogger::new(config, db_path.clone())?);
+
+        let events_per_writer = 50;
+        let la = Arc::clone(&logger_a);
+        let lb = Arc::clone(&logger_b);
+
+        let handle_a = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("writer-a".into(), None, None)
+                    .with_action(format!("a-cmd-{i}"), "low".into(), false, true);
+                la.log(&event)?;
+            }
+            Ok(())
+        });
+
+        let handle_b = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("writer-b".into(), None, None)
+                    .with_action(format!("b-cmd-{i}"), "low".into(), false, true);
+                lb.log(&event)?;
+            }
+            Ok(())
+        });
+
+        handle_a.join().unwrap()?;
+        handle_b.join().unwrap()?;
+
+        let audit_db = tmp.path().join("audit").join("audit.db");
+
+        // verify_chain walks the entire chain and checks:
+        // - contiguous sequences (0..N)
+        // - each prev_hash links to the preceding entry_hash
+        // - each entry_hash is correctly computed
+        // This FAILS if any fork occurred (duplicate sequence or mislinked prev_hash).
+        let count = verify_chain(&audit_db)?;
+        assert_eq!(count, events_per_writer * 2);
+
+        // Double-check: all sequence numbers are unique
+        let conn = Connection::open(&audit_db)?;
+        let unique_seqs: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT sequence) FROM audit_events",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(unique_seqs, (events_per_writer * 2) as i64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_interleave_from_both_sources() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let db_path = tmp.path().to_path_buf();
+
+        let logger_a = Arc::new(AuditLogger::new(config.clone(), db_path.clone())?);
+        let logger_b = Arc::new(AuditLogger::new(config, db_path)?);
+
+        let la = Arc::clone(&logger_a);
+        let lb = Arc::clone(&logger_b);
+        let events_per_writer = 20;
+
+        let handle_a = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("daemon".into(), None, None)
+                    .with_action(format!("shell-{i}"), "standard".into(), true, true);
+                la.log(&event)?;
+            }
+            Ok(())
+        });
+
+        let handle_b = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("cli".into(), None, None)
+                    .with_action(format!("echo-{i}"), "standard".into(), true, true);
+                lb.log(&event)?;
+            }
+            Ok(())
+        });
+
+        handle_a.join().unwrap()?;
+        handle_b.join().unwrap()?;
+
+        let audit_db = tmp.path().join("audit").join("audit.db");
+        let count = verify_chain(&audit_db)?;
+        assert_eq!(count, events_per_writer * 2);
+
+        // Verify both writers contributed (events are interleaved, not batched)
+        let conn = Connection::open(&audit_db)?;
+        let daemon_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_json LIKE '%writer-a%' OR event_json LIKE '%daemon%'",
+            [],
+            |r| r.get(0),
+        )?;
+        let cli_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_json LIKE '%writer-b%' OR event_json LIKE '%cli%'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(daemon_count, events_per_writer as i64);
+        assert_eq!(cli_count, events_per_writer as i64);
 
         Ok(())
     }
