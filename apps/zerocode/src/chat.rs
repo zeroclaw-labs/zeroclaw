@@ -1018,6 +1018,7 @@ impl Chat {
 
 impl crate::widgets::HelpContext for Chat {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ChatTabAction;
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
@@ -1091,9 +1092,30 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
                     ),
                     E::spacer(),
-                    E::key("Ctrl+N", crate::i18n::t("zc-chat-help-new-session")),
-                    E::key("Ctrl+S", crate::i18n::t("zc-chat-help-session-list")),
-                    E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::NewSession.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-chat-help-new-session"),
+                    ),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::SwitchSession.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-chat-help-session-list"),
+                    ),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::RenameSession.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-chat-help-rename-session"),
+                    ),
                 ]);
                 pane.with_child(state.input_bar.help_context())
             }

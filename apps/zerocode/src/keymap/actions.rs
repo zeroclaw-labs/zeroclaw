@@ -156,7 +156,7 @@ keyactions! {
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
-        RenameSession           [Chord::ctrl('r')] => "rename session",
+        RenameSession           [Chord::ctrl('t')] => "rename session",
         DeleteSession           [] => "delete session",
         CancelTurn              [Chord::ctrl('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",
