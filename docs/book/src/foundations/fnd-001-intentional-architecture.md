@@ -621,9 +621,11 @@ The binary crate becomes a thin wiring layer that reads config and calls `run`.
 
 **D2: Complete the WASM execution bridge**
 
-Wire Extism into `WasmTool::execute` and `WasmChannel`. The `PluginHost` already handles discovery and installation. The execution bridge is the missing piece. With WIT interfaces defined in v0.7.0, use `wit-bindgen` to generate the host-side bindings.
+The `extism` dependency is incompatible with WASM Component Model (`.wit` files) and requires the `cranelift` feature of `wasmtime`, which blocks ARM32 targets from compiling. Remove Extism and replace it with direct usage of `wasmtime`. During the transition, Extism should be left as an option until the final deprecation PR.
 
-A complete `WasmTool::execute` implementation using Extism is approximately 30–50 lines. The bulk of the work is defining the host functions that WASM plugins can call (HTTP requests, memory access, logging) within the permission model already defined in `PluginPermission`.
+Wire `wasmtime` into `zeroclaw-plugins` with optional dependencies on `cranelift` (for most build targets) or `pulley` (for ARM32). With WIT interfaces defined in v0.7.0, use `wit-bindgen` to generate the host-side bindings.
+
+A complete WASM execution bridge implementation defines the WASI host functions that WASM plugins can call (HTTP requests, memory access, logging) within the permission model already defined in `PluginPermission`. Where possible, the WASI Preview 2 APIs should be used (`wasi:io`, `wasi:http`, `wasi:filesystem`, etc) to provide a consistent standards-based API for plugins.
 
 **D3: Component registry client**
 
