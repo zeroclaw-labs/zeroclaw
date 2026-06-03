@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
 use anyhow::Result;
@@ -135,8 +136,8 @@ impl ConfigSection {
 
 // ── App state ────────────────────────────────────────────────────
 
-pub(crate) struct App<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct App {
+    rpc: Arc<RpcClient>,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
     section_tab_area: Option<Rect>,
@@ -191,8 +192,8 @@ pub(crate) struct App<'a> {
     double_click: crate::mouse::DoubleClickTracker,
 }
 
-impl<'a> App<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, config_dir: &Path) -> Self {
+impl App {
+    pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
         Self {
             rpc,
             section: ConfigSection::Zeroclaw,
@@ -3184,7 +3185,7 @@ impl<'a> App<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for App<'_> {
+impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::HelpEntry as E;
         // Section switch is available in either sub-tab.
@@ -3203,7 +3204,7 @@ impl crate::widgets::HelpContext for App<'_> {
     }
 }
 
-impl App<'_> {
+impl App {
     fn zeroclaw_help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.screen {
@@ -3400,7 +3401,7 @@ impl App<'_> {
     }
 }
 
-impl App<'_> {
+impl App {
     fn field_list_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
         let has_tabs = !self.tab_names.is_empty();
