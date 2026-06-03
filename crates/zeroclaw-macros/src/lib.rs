@@ -32,6 +32,30 @@ fn has_serde_flatten(field: &syn::Field) -> bool {
     has_serde_meta(field, "flatten")
 }
 
+/// Check if the field carries `#[configurable(skip)]`.
+///
+/// Excludes the field from the Configurable *property* surface (config
+/// templates, dashboard, get/set/secret enumeration) while leaving serde
+/// free to deserialize it. Use for config sections wired directly in code
+/// — e.g. soak-gated X0 features whose `[section]` an operator may set in
+/// `config.toml` but which aren't yet surfaced in the generated config UI.
+fn has_configurable_skip(field: &syn::Field) -> bool {
+    for attr in &field.attrs {
+        if attr.path().is_ident("configurable")
+            && let Ok(nested) = attr.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            )
+        {
+            for meta in &nested {
+                if meta.path().is_ident("skip") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
     for attr in &field.attrs {
         if attr.path().is_ident("serde")
@@ -122,6 +146,7 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         nested,
         prefix,
         serde,
+        configurable,
         derived_from_secret,
         display_name,
         description,
@@ -231,7 +256,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_secret = has_attr(field, "secret");
         let is_nested = has_attr(field, "nested");
         let is_serde_flatten = has_serde_flatten(field);
-        let serde_skip = has_serde_skip(field);
+        // `#[configurable(skip)]` excludes a field from the property surface
+        // just like `#[serde(skip)]` does, but without suppressing serde —
+        // the section stays deserializable from config.toml.
+        let serde_skip = has_serde_skip(field) || has_configurable_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
 

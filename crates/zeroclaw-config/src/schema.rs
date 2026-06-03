@@ -565,9 +565,16 @@ pub struct Config {
     pub cognitive: crate::x0_extensions::CognitiveConfig,
     #[serde(skip)]
     pub life: crate::x0_extensions::LifeConfig,
-    #[serde(skip)]
+    /// Conscience gate (X0). Soak-gated and wired in code, not yet in the
+    /// generated config UI — operators opt in via `[conscience]` in
+    /// config.toml (e.g. `gate_enabled = true`).
+    #[serde(default)]
+    #[configurable(skip)]
     pub conscience: crate::x0_extensions::ConscienceConfig,
-    #[serde(skip)]
+    /// Cross-session continuity persistence (X0). Opt in via `[continuity]`
+    /// in config.toml (e.g. `enabled = true`).
+    #[serde(default)]
+    #[configurable(skip)]
     pub continuity: crate::x0_extensions::ContinuityConfig,
     #[serde(skip)]
     pub cosmic_brain: crate::x0_extensions::CosmicBrainConfig,
@@ -15859,6 +15866,37 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::sync::MutexGuard;
+
+    #[test]
+    async fn conscience_and_continuity_are_config_toggleable() {
+        // Regression: both sections were `#[serde(skip)]`, so config.toml
+        // could never enable them — only a code change could. They now
+        // deserialize from `[conscience]` / `[continuity]` (kept out of the
+        // generated config UI via `#[configurable(skip)]`, not serde).
+        let mut cfg = Config::default();
+        cfg.conscience.gate_enabled = true;
+        cfg.continuity.enabled = true;
+
+        let toml = toml::to_string(&cfg).expect("Config serializes to TOML");
+        assert!(
+            toml.contains("[conscience]"),
+            "conscience section must be serialized, not skipped"
+        );
+        assert!(
+            toml.contains("[continuity]"),
+            "continuity section must be serialized, not skipped"
+        );
+
+        let parsed: Config = toml::from_str(&toml).expect("Config round-trips from TOML");
+        assert!(
+            parsed.conscience.gate_enabled,
+            "conscience.gate_enabled must survive a config.toml round-trip"
+        );
+        assert!(
+            parsed.continuity.enabled,
+            "continuity.enabled must survive a config.toml round-trip"
+        );
+    }
     use tokio::test;
 
     // ── Agent gateway-port (Plans/binary-seeking-umbrella.md Phase 1) ──
