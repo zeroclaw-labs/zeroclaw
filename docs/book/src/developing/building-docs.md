@@ -17,6 +17,8 @@ cargo mdbook stats                       # show translated/fuzzy/untranslated pe
 cargo mdbook check                       # validate .po format (run before a translation PR)
 ```
 
+> Always go through the `cargo mdbook …` wrapper. Running `mdbook build` directly from `docs/book/` skips the xtask step that renders `theme/lang-switcher.js` from `locales.toml`, which fails the build with `failed to open theme/lang-switcher.js for hashing`.
+
 ## Required tools
 
 `cargo mdbook` will fail fast and tell you what's missing, but for reference:

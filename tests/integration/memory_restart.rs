@@ -318,7 +318,7 @@ async fn sqlite_memory_concurrent_stores_no_data_loss() {
     let mut handles = Vec::new();
     for i in 0..5 {
         let mem_clone = mem.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             mem_clone
                 .store(
                     &format!("concurrent_{i}"),

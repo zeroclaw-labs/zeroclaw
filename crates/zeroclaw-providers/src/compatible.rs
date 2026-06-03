@@ -3,6 +3,7 @@
 //! This module provides a single implementation that works for all of them.
 
 use crate::multimodal;
+use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult, TokenUsage,
@@ -1335,7 +1336,7 @@ fn sse_bytes_to_chunks(
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-    tokio::spawn(async move {
+    let handle = ::zeroclaw_spawn::spawn!(async move {
         let mut buffer = String::new();
 
         match response.error_for_status_ref() {
@@ -1416,8 +1417,9 @@ fn sse_bytes_to_chunks(
         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
     });
 
-    stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|chunk| (chunk, rx))
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    stream::unfold((rx, guard), |(mut rx, guard)| async {
+        rx.recv().await.map(|chunk| (chunk, (rx, guard)))
     })
     .boxed()
 }
@@ -1437,7 +1439,7 @@ fn sse_bytes_to_events_for_contract(
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-    tokio::spawn(async move {
+    let handle = ::zeroclaw_spawn::spawn!(async move {
         let mut buffer = String::new();
         let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
         let mut used_tool_call_ids = std::collections::HashSet::new();
@@ -1599,8 +1601,9 @@ fn sse_bytes_to_events_for_contract(
         let _ = tx.send(Ok(StreamEvent::Final)).await;
     });
 
-    stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|event| (event, rx))
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        rx.recv().await.map(|event| (event, (rx, guard)))
     })
     .boxed()
 }
@@ -2637,7 +2640,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        tokio::spawn(async move {
+        let handle = ::zeroclaw_spawn::spawn!(async move {
             let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
                 Ok(n) => n,
                 Err(err) => {
@@ -2760,8 +2763,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
         });
 
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
+        let guard = AbortOnDrop::new(handle.abort_handle());
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|event| (event, (rx, guard)))
         })
         .boxed()
     }
@@ -2789,7 +2793,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        tokio::spawn(async move {
+        let handle = ::zeroclaw_spawn::spawn!(async move {
             // Normalize image markers in the user-supplied message before
             // forwarding upstream — see issue #6399 for the OpenAI-compatible
             // remote-vs-local file path problem.
@@ -2902,8 +2906,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         });
 
         // Convert channel receiver to stream
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|chunk| (chunk, rx))
+        let guard = AbortOnDrop::new(handle.abort_handle());
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|chunk| (chunk, (rx, guard)))
         })
         .boxed()
     }
@@ -2928,7 +2933,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        tokio::spawn(async move {
+        let handle = ::zeroclaw_spawn::spawn!(async move {
             let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
                 Ok(n) => n,
                 Err(err) => {
@@ -3007,8 +3012,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
         });
 
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|chunk| (chunk, rx))
+        let guard = AbortOnDrop::new(handle.abort_handle());
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|chunk| (chunk, (rx, guard)))
         })
         .boxed()
     }
@@ -5432,6 +5438,94 @@ mod tests {
             vec!["user", "assistant"]
         );
         assert_eq!(stripped[1].content, "Here are the results");
+    }
+
+    /// Integration regression: dropping the `stream_chat` result must abort the
+    /// forwarding task and close the upstream socket. A bare `unfold(rx)` leaks
+    /// it; the isolated guard unit test would not catch that.
+    #[tokio::test]
+    async fn dropping_stream_aborts_forwarder_and_closes_upstream_socket() {
+        use axum::Router;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use futures_util::StreamExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        let handler_dropped = Arc::new(AtomicBool::new(false));
+        let handler_dropped_for_route = Arc::clone(&handler_dropped);
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let dropped = Arc::clone(&handler_dropped_for_route);
+                async move {
+                    let sentinel = scopeguard::guard((), move |()| {
+                        dropped.store(true, Ordering::SeqCst);
+                    });
+                    let first = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                        ))
+                    });
+                    let park = futures_util::stream::poll_fn(move |_cx| {
+                        let _ = &sentinel;
+                        std::task::Poll::Pending
+                    });
+                    axum::body::Body::from_stream(first.chain(park)).into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::new(
+            "test",
+            "test",
+            &format!("http://{addr}"),
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "gpt-test",
+            Some(0.0),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream.next().await;
+        assert!(first.is_some(), "expected at least the first SSE chunk");
+
+        drop(stream);
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if handler_dropped.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        server.abort();
+        assert!(
+            observed.is_ok(),
+            "dropped stream must abort the forwarder and close the upstream socket"
+        );
     }
 
     #[test]

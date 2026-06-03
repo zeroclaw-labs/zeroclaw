@@ -809,13 +809,13 @@ memory_monitoring = true
 #[test]
 fn t14a_max_iterations_renamed_to_max_tool_iterations() {
     let cfg = v3_config();
-    let agent = cfg
-        .agents
-        .get("complex_agent")
-        .expect("agents.complex_agent present");
+    let runtime = cfg
+        .runtime_profiles
+        .get("agent_complex_agent")
+        .expect("synthesized runtime_profiles.agent_complex_agent");
     assert_eq!(
-        agent.max_tool_iterations, 25,
-        "V2 max_iterations=25 must land at V3 max_tool_iterations on the agent"
+        runtime.max_tool_iterations, 25,
+        "V2 max_iterations=25 must land on the synthesized runtime profile's max_tool_iterations"
     );
 }
 
@@ -1890,7 +1890,7 @@ allowed_rooms = ["!ops:matrix.org"]
 
 #[test]
 fn v2_channels_voice_duplex_block_alias_wraps() {
-    // Reproduces the user-reported migration error in v0.8.0:
+    // Reproduces a user-reported migration error:
     //   invalid type: boolean `false`, expected struct VoiceDuplexConfig
     //   in `channels.voice_duplex.enabled`
     // Cause: voice_duplex was missing from V3_CHANNEL_TYPES and went

@@ -19,7 +19,7 @@
 /crates/zeroclaw-config/**           @Audacity88 @singlerider
 /crates/zeroclaw-memory/**           @Audacity88
 /crates/zeroclaw-tool-call-parser/** @Audacity88
-/crates/zeroclaw-tui/**              @Audacity88
+/apps/tui/**                         @singlerider @Audacity88
 /src/runtime/**                      @Audacity88
 /src/agent/**                        @Audacity88
 /src/gateway/**                      @Audacity88

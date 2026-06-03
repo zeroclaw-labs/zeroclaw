@@ -18,7 +18,7 @@ pub struct ChannelApprovalRequest {
 }
 
 /// The operator's response to a channel-presented approval prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelApprovalResponse {
     /// Execute this one call.
@@ -28,6 +28,9 @@ pub enum ChannelApprovalResponse {
     /// Execute and add tool to session-scoped allowlist.
     #[serde(rename = "always")]
     AlwaysApprove,
+    /// Deny this call and supply an edited replacement for the arguments.
+    #[serde(rename = "deny_with_edit")]
+    DenyWithEdit { replacement: String },
 }
 
 /// A message received from or sent to a channel
@@ -558,5 +561,17 @@ mod tests {
             handle: Some("@".into()),
         };
         assert!(!channel.drop_self_messages(&msg_from("@anyone")));
+    }
+
+    #[test]
+    fn deny_with_edit_round_trips_through_serde() {
+        let r = ChannelApprovalResponse::DenyWithEdit {
+            replacement: "new content".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ChannelApprovalResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, ChannelApprovalResponse::DenyWithEdit { replacement } if replacement == "new content")
+        );
     }
 }

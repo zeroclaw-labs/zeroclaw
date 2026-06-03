@@ -275,7 +275,7 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 kind="peer-group"
                 id={pg}
                 className={CHIP_CLASS}
-                title={`Open peer-groups.${pg} config`}
+                title={`Open peer_groups.${pg} config`}
               >
                 <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
                   {pg}
