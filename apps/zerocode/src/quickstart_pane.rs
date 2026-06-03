@@ -609,6 +609,7 @@ pub struct QuickstartPane {
     /// `open_modal_for`.
     selector_list_rect: Option<Rect>,
     selector_row_rects: Vec<Rect>,
+    leave_requested: bool,
 }
 
 impl QuickstartPane {
@@ -631,7 +632,12 @@ impl QuickstartPane {
             modal_row_rects: Vec::new(),
             selector_list_rect: None,
             selector_row_rects: Vec::new(),
+            leave_requested: false,
         }
+    }
+
+    pub fn take_leave_request(&mut self) -> bool {
+        std::mem::take(&mut self.leave_requested)
     }
 
     pub async fn init(&mut self) -> anyhow::Result<()> {
@@ -652,7 +658,7 @@ impl QuickstartPane {
                 "c",
                 crate::i18n::t_args("zc-quickstart-help-create", &[("enter", "Enter")]),
             ),
-            HelpEntry::key("Esc", crate::i18n::t("zc-quickstart-help-leave")),
+            HelpEntry::new(vec!["q", "Esc"], crate::i18n::t("zc-quickstart-help-leave")),
         ])
     }
 
@@ -732,6 +738,10 @@ impl QuickstartPane {
                 if self.can_create() {
                     self.submit().await;
                 }
+                false
+            }
+            Some(QuickstartTabAction::Back) => {
+                self.leave_requested = true;
                 false
             }
             _ => false,

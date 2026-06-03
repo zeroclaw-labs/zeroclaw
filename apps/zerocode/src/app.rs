@@ -394,6 +394,17 @@ pub async fn run(
                 if quit {
                     break;
                 }
+                if mode == Mode::Quickstart && quickstart.take_leave_request() {
+                    switch_mode(
+                        &mut mode,
+                        Mode::Dashboard,
+                        &conn_state,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                    )
+                    .await;
+                }
             }
             Event::Mouse(mouse) => {
                 // Dismiss help on any click

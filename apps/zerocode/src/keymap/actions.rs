@@ -240,6 +240,7 @@ keyactions! {
         Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter  [Chord::key(KeyCode::Enter)] => "open",
+        Back   [Chord::char('q'), Chord::key(KeyCode::Esc)] => "leave",
         Create [Chord::char('c'), Chord::char('C')] => "create agent",
     }
 }
