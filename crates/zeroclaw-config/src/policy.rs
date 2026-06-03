@@ -1094,7 +1094,9 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if body.starts_with('-') || body.len() < 2 {
         return None;
     }
-    let value = body[1..].trim_start_matches('=').trim();
+    let mut chars = body.chars();
+    chars.next();
+    let value = chars.as_str().trim_start_matches('=').trim();
     if value.is_empty() { None } else { Some(value) }
 }
 
@@ -5502,5 +5504,22 @@ mod tests {
         let t = PerSenderTracker::new();
         // Key "ghost" has never been recorded — should not be exhausted at max=1
         assert!(!t.is_exhausted("ghost", 1));
+    }
+
+    #[test]
+    fn attached_short_option_value_handles_multibyte_token() {
+        // A multibyte char immediately after the dash must not panic on a
+        // byte-index slice. Regression for a char-boundary abort.
+        assert_eq!(
+            attached_short_option_value("-é/etc/passwd"),
+            Some("/etc/passwd")
+        );
+        assert_eq!(attached_short_option_value("-—"), None);
+        assert_eq!(
+            attached_short_option_value("-f/etc/passwd"),
+            Some("/etc/passwd")
+        );
+        assert_eq!(attached_short_option_value("-f"), None);
+        assert_eq!(attached_short_option_value("--long"), None);
     }
 }
