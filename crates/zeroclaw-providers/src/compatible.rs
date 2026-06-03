@@ -71,7 +71,7 @@ pub struct OpenAiCompatibleModelProvider {
     /// providers so missing credentials still fall through to catalog sources.
     unauthenticated_model_listing: bool,
     /// Raw PEM bytes of a custom CA certificate for TLS connections.
-    /// Loaded from disk once at construction; no per-request I/O.
+    /// Loaded from disk once at construction; not refreshed across config reloads.
     tls_ca_cert_pem: Option<Vec<u8>>,
 }
 
