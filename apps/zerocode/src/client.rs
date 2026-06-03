@@ -1650,6 +1650,8 @@ pub struct SessionCancelResult {}
 pub struct SessionGitBranchResult {
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1858,6 +1860,37 @@ pub struct SessionMessagesResult {
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+}
+
+impl MessageEntry {
+    /// Classify the wire `role` string into the closed set the UI renders.
+    /// Unknown roles map to [`MessageRole::Other`] so surfaces can fall back
+    /// without string-matching at the call site.
+    pub fn role(&self) -> MessageRole {
+        MessageRole::from_wire(&self.role)
+    }
+}
+
+/// Closed taxonomy of persisted message roles, as they arrive over the
+/// `session/messages` wire. The daemon emits these as strings; this is the
+/// single place that maps the wire form into a type the UI matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Other,
+}
+
+impl MessageRole {
+    fn from_wire(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "system" => Self::System,
+            _ => Self::Other,
+        }
+    }
 }
 
 // ── TUI identity types ───────────────────────────────────────────

@@ -298,6 +298,7 @@ zc-chat-thinking-hidden = Thinking output: hidden
 
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
+zc-chat-first-message-label = First message of session:
 
 zc-chat-loading-agents = Loading agents…
 zc-chat-loading-agents-msg = Loading agents...
