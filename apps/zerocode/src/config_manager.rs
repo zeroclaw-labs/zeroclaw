@@ -2095,9 +2095,9 @@ impl<'a> App<'a> {
             Some(FilterEditAction::Accept)
         } else if Chord::key(KeyCode::Backspace).matches(&key) {
             Some(FilterEditAction::Backspace)
-        } else if Chord::key(KeyCode::Up).matches(&key) || Chord::char('k').matches(&key) {
+        } else if Chord::key(KeyCode::Up).matches(&key) {
             Some(FilterEditAction::CursorUp)
-        } else if Chord::key(KeyCode::Down).matches(&key) || Chord::char('j').matches(&key) {
+        } else if Chord::key(KeyCode::Down).matches(&key) {
             Some(FilterEditAction::CursorDown)
         } else {
             None
