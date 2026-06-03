@@ -5012,7 +5012,11 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
 
     let mut updated = config.clone();
     if !updated.channels.telegram.contains_key("default") {
-        anyhow::bail!("Telegram channel is not configured. Run `zeroclaw onboard channels` first");
+        anyhow::bail!(
+            "Telegram channel is not configured. Run \
+             `zeroclaw config set channels.telegram.<alias>.bot_token=<token>` \
+             (see docs/book/src/channels/overview.md for the full field list)."
+        );
     }
 
     // Locate (or create) the peer group bound to telegram.default. The
@@ -7315,6 +7319,10 @@ fn collect_configured_channels(
     channels
 }
 
+fn no_real_time_channels_message() -> &'static str {
+    "No real-time channels configured. Run `zeroclaw quickstart` to set one up."
+}
+
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
@@ -7373,7 +7381,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No real-time channels configured. Run `zeroclaw onboard` first.");
+        println!("{}", no_real_time_channels_message());
         return Ok(());
     }
 
@@ -8739,6 +8747,22 @@ mod tests {
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[test]
+    fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
+        // The "no channels configured" message must point operators at the
+        // current command (zeroclaw quickstart), not the deleted `zeroclaw onboard`.
+        // Source of truth: the string at orchestrator/mod.rs:~7376.
+        let msg = super::no_real_time_channels_message();
+        assert!(
+            !msg.contains("zeroclaw onboard"),
+            "stale `zeroclaw onboard` reference in message: {msg}"
+        );
+        assert!(
+            msg.contains("zeroclaw quickstart"),
+            "expected `zeroclaw quickstart` reference, got: {msg}"
+        );
+    }
     use zeroclaw_runtime::observability::NoopObserver;
     use zeroclaw_runtime::tools::{Tool, ToolResult};
 
