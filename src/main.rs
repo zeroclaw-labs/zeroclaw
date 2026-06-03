@@ -3335,7 +3335,12 @@ async fn main() -> Result<()> {
 
         Commands::Gateway { gateway_command } => {
             match gateway_command {
-                Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
+                Some(zeroclaw::GatewayCommands::Restart {
+                    port,
+                    host,
+                    allow_degraded_security,
+                }) => {
+                    let _nag = gate_security_posture(&config, allow_degraded_security)?;
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let addr = format!("{host}:{port}");
                     ::zeroclaw_log::record!(
@@ -3486,12 +3491,20 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                Some(zeroclaw::GatewayCommands::Start { port, host }) => {
+                Some(zeroclaw::GatewayCommands::Start {
+                    port,
+                    host,
+                    allow_degraded_security,
+                }) => {
+                    let _nag = gate_security_posture(&config, allow_degraded_security)?;
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
                 None => {
+                    // Bare `zeroclaw gateway` has no flag, so degraded security
+                    // is never auto-allowed here — fail closed.
+                    let _nag = gate_security_posture(&config, false)?;
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
@@ -3506,52 +3519,12 @@ async fn main() -> Result<()> {
             ephemeral,
             allow_degraded_security,
         } => {
-            // Security-critical config sections (`security`, `risk_profiles`,
-            // `peer_groups`) that failed to parse are dropped to their
-            // defaults during load and recorded on `degraded_security`. The
-            // running posture may then be WEAKER than intended, so the daemon
-            // refuses to boot by default — "secure by default" must fail loud
-            // here, not quiet. `--allow-degraded-security` lets the operator
-            // boot anyway to reach repair surfaces; the daemon then nags with
-            // a repeating warning until the config is fixed and reloaded.
-            if !config.degraded_security.is_empty() {
-                let sections = config.degraded_security.join(", ");
-                if !allow_degraded_security {
-                    anyhow::bail!(
-                        "Config contains malformed security-critical sections ({sections}); \
-                         they were reset to defaults, so the running posture may be weaker \
-                         than intended. The daemon will not start with a degraded security \
-                         posture. Repair these sections in {} and restart — run \
-                         `zeroclaw config migrate` to see the precise error. To boot anyway \
-                         (e.g. to reach the gateway config editor and repair from there), \
-                         re-run with `--allow-degraded-security`.",
-                        config.config_path.display()
-                    );
-                }
-                let config_path = config.config_path.display().to_string();
-                ::zeroclaw_spawn::spawn!(async move {
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-                    loop {
-                        ticker.tick().await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "degraded_security": sections
-                            })),
-                            &format!(
-                                "Running with DEGRADED security: sections ({sections}) were \
-                                 reset to defaults and `--allow-degraded-security` was set. \
-                                 The posture may be weaker than intended — repair {config_path} \
-                                 and reload (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
-                            )
-                        );
-                    }
-                });
+            // Fail closed before any setup work: refuse to serve with a
+            // degraded security posture unless explicitly allowed. This branch
+            // never spawns the nag (the `!allow` path only bails); the nag is
+            // managed per reload-iteration in the loop below.
+            if !config.degraded_security.is_empty() && !allow_degraded_security {
+                gate_security_posture(&config, allow_degraded_security)?;
             }
             if let Ok(exe) = std::env::current_exe() {
                 let under_home = directories::UserDirs::new()
@@ -3664,6 +3637,11 @@ async fn main() -> Result<()> {
             // the same across reloads — only the in-process subsystems
             // tear down + re-instantiate.
             let mut current_config = config;
+            // Nag task for the degraded-security warning, scoped to the
+            // current config. Re-evaluated each reload iteration so a repaired
+            // config stops the warning and a freshly-degraded one starts it.
+            let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
+                gate_security_posture(&current_config, allow_degraded_security)?;
             loop {
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
@@ -3788,9 +3766,22 @@ async fn main() -> Result<()> {
                             "🔄 Daemon reload — re-reading config from disk"
                         );
                         current_config = Box::pin(Config::load_or_init()).await?;
+                        // Stop the stale nag and re-gate against the fresh
+                        // config: a repaired posture silences the warning, a
+                        // newly-degraded one (still allowed) restarts it. A
+                        // newly-degraded posture without the allow flag set
+                        // hard-fails the reload, same as first boot.
+                        if let Some(handle) = degraded_nag.take() {
+                            handle.abort();
+                        }
+                        degraded_nag =
+                            gate_security_posture(&current_config, allow_degraded_security)?;
                         // Continue loop: fresh subsystems with the new config.
                     }
                 }
+            }
+            if let Some(handle) = degraded_nag.take() {
+                handle.abort();
             }
             Ok(())
         }
@@ -6068,6 +6059,61 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Gate every serving entry point on the loaded security posture.
+///
+/// `Config.degraded_security` lists security-critical sections (`security`,
+/// `risk_profiles`, `peer_groups`) that failed to parse and were reset to
+/// their defaults during load — the running posture may then be WEAKER than
+/// intended. "Secure by default" must fail loud here (FND-006 §4.5), so every
+/// path that brings up the serving surface (daemon, `gateway start`,
+/// `gateway restart`) routes through this before binding.
+///
+/// Returns `Err` when degraded and `allow_degraded` is false (the caller
+/// propagates and the process never serves). When degraded and explicitly
+/// allowed, boots but returns the `JoinHandle` of a repeating-WARN nag task so
+/// the caller can abort it on reload; `Ok(None)` means a clean posture.
+fn gate_security_posture(
+    config: &zeroclaw::config::Config,
+    allow_degraded: bool,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    if config.degraded_security.is_empty() {
+        return Ok(None);
+    }
+    let sections = config.degraded_security.join(", ");
+    if !allow_degraded {
+        anyhow::bail!(
+            "Config contains malformed security-critical sections ({sections}); \
+             they were reset to defaults, so the running posture may be weaker \
+             than intended. Refusing to serve with a degraded security posture. \
+             Repair these sections in {} and restart — run `zeroclaw config \
+             migrate` to see the precise error. To boot anyway (e.g. to reach \
+             the gateway config editor and repair from there), re-run with \
+             `--allow-degraded-security`.",
+            config.config_path.display()
+        );
+    }
+    let config_path = config.config_path.display().to_string();
+    let handle = ::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "degraded_security": sections })),
+                &format!(
+                    "Running with DEGRADED security: sections ({sections}) were reset to \
+                     defaults and `--allow-degraded-security` was set. The posture may be \
+                     weaker than intended — repair {config_path} and reload \
+                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                )
+            );
+        }
+    });
+    Ok(Some(handle))
+}
+
 #[cfg(feature = "gateway")]
 async fn run_gateway_if_enabled(
     host: &str,
@@ -6765,5 +6811,31 @@ mod tests {
         });
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gate_security_posture_fails_closed_unless_allowed() {
+        use crate::config::schema::Config;
+
+        // Clean posture: no gate, no nag.
+        let clean = Config::default();
+        assert!(clean.degraded_security.is_empty());
+        let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
+        assert!(handle.is_none(), "clean posture must not spawn a nag");
+
+        // Degraded posture, not allowed: must refuse to serve.
+        let mut degraded = Config::default();
+        degraded.degraded_security = vec!["security".to_string()];
+        assert!(
+            gate_security_posture(&degraded, false).is_err(),
+            "degraded posture must fail closed when not explicitly allowed"
+        );
+
+        // Degraded posture, explicitly allowed: boots and returns a nag handle.
+        let nag = gate_security_posture(&degraded, true)
+            .expect("degraded posture must boot when allowed")
+            .expect("allowed degraded posture must spawn a nag task");
+        nag.abort();
     }
 }
