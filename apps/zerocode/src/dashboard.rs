@@ -750,11 +750,15 @@ impl<'a> Dashboard<'a> {
             )));
             lines.push(Line::from(""));
             for msg in &self.session_messages {
-                let role_style = match msg.role.as_str() {
-                    "user" => theme::user_label_style(),
-                    "assistant" => theme::agent_label_style(),
-                    "system" => theme::dim_style().add_modifier(Modifier::BOLD),
-                    _ => theme::body_style().add_modifier(Modifier::BOLD),
+                let role_style = match msg.role() {
+                    crate::client::MessageRole::User => theme::user_label_style(),
+                    crate::client::MessageRole::Assistant => theme::agent_label_style(),
+                    crate::client::MessageRole::System => {
+                        theme::dim_style().add_modifier(Modifier::BOLD)
+                    }
+                    crate::client::MessageRole::Other => {
+                        theme::body_style().add_modifier(Modifier::BOLD)
+                    }
                 };
                 lines.push(Line::from(Span::styled(
                     format!("[{}]", msg.role),

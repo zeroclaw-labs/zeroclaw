@@ -261,6 +261,7 @@ zc-chat-thinking-visible = Salida de razonamiento: visible
 zc-chat-thinking-hidden = Salida de razonamiento: oculta
 zc-chat-label-you = Tú:
 zc-chat-label-agent = Agente:
+zc-chat-first-message-label = Primer mensaje de la sesión:
 zc-chat-loading-agents = Cargando agentes…
 zc-chat-loading-agents-msg = Cargando agentes...
 zc-chat-picker-header = Selecciona un agente
