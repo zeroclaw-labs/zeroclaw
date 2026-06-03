@@ -68,11 +68,30 @@ pub struct ToolCall {
 }
 
 /// Raw token counts from a single LLM API response.
+///
+/// Contract: `input_tokens` is the **total prompt size** sent to the model
+/// (every token the model saw, regardless of cache state).
+/// `cached_input_tokens` is the **subset** of `input_tokens` that was served
+/// from the prompt cache. So `cached_input_tokens <= input_tokens`, and the
+/// billable uncached portion is `input_tokens - cached_input_tokens`.
+///
+/// Providers normalize to this shape:
+/// - OpenAI/Compatible: `prompt_tokens` is already total, `cached_tokens` is
+///   already a subset — used directly.
+/// - Anthropic: the API reports three DISJOINT buckets per
+///   <https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>:
+///   `total_input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens`,
+///   where Anthropic's `input_tokens` is *only* the tokens after the last
+///   cache breakpoint. The adapter sums all three to produce the total here.
+///   `cached_input_tokens` is set to `cache_read_input_tokens` (the
+///   discount-billed subset).
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    /// Total prompt size: uncached + cached input tokens.
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    /// Tokens served from the model_provider's prompt cache (Anthropic `cache_read_input_tokens`,
+    /// Subset of `input_tokens` that was served from the model_provider's
+    /// prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `prompt_tokens_details.cached_tokens`).
     pub cached_input_tokens: Option<u64>,
 }
@@ -352,13 +371,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     }
 
     // ── ModelProvider-family defaults ────────────────────────────────────────────
-    // Called by every chat/stream method's `temperature.unwrap_or(self.default_temperature())`
-    // and by `zeroclaw onboard` to prefill prompts with a visible default.
-    // Baselines are the industry-neutral fallback; override per family where
-    // the API docs disagree (Anthropic → 1.0, Ollama → 0.0 for deterministic
-    // local inference).
+    // `temperature` is `Option<f64>` end-to-end on the wire. `None` from the
+    // caller means "do not send a `temperature` field"; serialization handles
+    // that via `#[serde(skip_serializing_if)]`. The `default_temperature()`
+    // method below documents the family's preferred default for non-wire uses
+    // (introspection, tests). It is NOT consulted to substitute a value for
+    // `None` in chat methods.
 
-    /// Temperature used when the caller passes `None`. Override per family.
+    /// Family-preferred temperature default. Override per family. Documented
+    /// for introspection only; never use to convert `None` into a wire value.
     fn default_temperature(&self) -> f64 {
         BASELINE_TEMPERATURE
     }
@@ -397,8 +418,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
-    /// `temperature == None` means "use `self.default_temperature()`". The
-    /// unwrap lives inside each model_provider impl, not at every call site.
+    /// `temperature == None` means the field is omitted on the wire.
     async fn simple_chat(
         &self,
         message: &str,
@@ -606,12 +626,12 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         self.as_ref().capabilities()
     }
 
-    fn default_temperature(&self) -> f64 {
-        self.as_ref().default_temperature()
-    }
-
     fn default_max_tokens(&self) -> u32 {
         self.as_ref().default_max_tokens()
+    }
+
+    fn default_temperature(&self) -> f64 {
+        self.as_ref().default_temperature()
     }
 
     fn default_timeout_secs(&self) -> u64 {

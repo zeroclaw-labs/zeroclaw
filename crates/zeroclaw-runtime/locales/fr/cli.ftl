@@ -1,7 +1,7 @@
 cli-about = L'assistant IA le plus rapide et le plus léger.
 cli-no-command-provided = Aucune commande fournie.
-cli-try-onboard = Essayez `zeroclaw onboard` pour initialiser votre espace de travail.
-cli-onboard-about = Initialiser votre espace de travail et votre configuration
+cli-try-quickstart = Essayez `zeroclaw quickstart` pour créer votre premier agent.
+cli-quickstart-about = Créez votre premier agent de bout en bout
 cli-agent-about = Démarrer la boucle de l'agent IA
 cli-gateway-about = Gérer le serveur de passerelle (webhooks, websockets)
 cli-acp-about = Démarrer le serveur ACP (JSON-RPC 2.0 sur stdio)
@@ -46,11 +46,58 @@ cli-channel-doctor-about = Exécuter des vérifications de santé pour les canau
 cli-channel-add-about = Ajouter une nouvelle configuration de canal
 cli-channel-remove-about = Supprimer une configuration de canal
 cli-channel-send-about = Envoyer un message ponctuel à un canal configuré
+cli-wechat-pairing-required = 🔐 Appairage WeChat requis. Code de liaison à usage unique : {$code}
+cli-wechat-send-bind-command = Envoyez `{$command} <code>` depuis votre WeChat.
+cli-wechat-qr-login = 📱 Connexion QR WeChat ({$attempt}/{$max})
+cli-wechat-scan-to-connect = Scannez avec WeChat pour vous connecter.
+cli-wechat-qr-url = URL du QR : {$url}
+cli-wechat-qr-expired-giving-up = Le code QR WeChat a expiré {$max} fois, abandon.
+cli-wechat-qr-fetch-failed = Échec de la récupération du code QR WeChat.
+cli-wechat-qr-fetch-status-failed = Échec de la récupération du code QR WeChat ({$status}) : {$body}
+cli-wechat-missing-response-field = {$field} manquant dans la réponse WeChat.
+cli-wechat-scanned-confirm = 👀 Scanné ! Confirmez sur votre téléphone...
+cli-wechat-qr-expired-refreshing = ⏳ Code QR expiré, actualisation...
+cli-wechat-login-confirmed-missing-field = Connexion confirmée mais {$field} manquant.
+cli-wechat-connected = ✅ WeChat connecté !
+cli-wechat-bound-success = ✅ Compte WeChat lié avec succès. Vous pouvez maintenant parler à ZeroClaw.
+cli-wechat-invalid-bind-code = ❌ Code de liaison invalide. Veuillez réessayer.
 cli-skills-list-about = Lister toutes les compétences installées
 cli-skills-audit-about = Auditer un répertoire source de compétence ou une compétence installée
 cli-skills-install-about = Installer une nouvelle compétence à partir d'une URL ou d'un chemin local
 cli-skills-remove-about = Supprimer une compétence installée
 cli-skills-test-about = Exécuter la validation TEST.sh pour une compétence (ou toutes les compétences)
+cli-skills-install-start = Installation du skill depuis : {$source}
+cli-skills-install-resolving-registry = { "  " }Résolution de '{$source}' depuis le registre de skills...
+cli-skills-install-installed-audited = { "  " }{$status} Skill installé et audité : {$path} ({$files} fichiers analysés)
+cli-skills-install-security-audit-completed = { "  " }Audit de sécurité terminé avec succès.
+cli-skills-install-tier-official = Installation de {$name} v{$version} — Officiel (maintenu par zeroclaw-labs)
+cli-skills-install-tier-community =
+    Installation de {$name} v{$version} — Soumission communautaire
+    Ce skill n'est pas audité par ZeroClaw. Examinez le contenu du skill
+    et exécutez `zeroclaw skills audit {$name}` avant d'accorder des
+    permissions ou de l'exécuter en production.
+cli-skills-add-scaffolded = Skill {$target} échafaudé dans {$dir}
+cli-skills-bundle-add-prompt =
+    Pour créer le skill-bundle '{$alias}' avec le répertoire '{$dir}', exécutez :
+    zeroclaw config map-key skill-bundles {$alias}
+    zeroclaw config set skill-bundles.{$alias}.directory {$dir}
+
+    (La création directe de bundle via `zeroclaw skills bundle add` dupliquerait la surface de mutation de configuration.)
+cli-skills-bundle-remove-prompt =
+    Pour supprimer le skill-bundle '{$alias}', exécutez :
+    zeroclaw config map-key-delete skill-bundles {$alias}
+
+    (Supprime l'entrée de configuration ; le répertoire du bundle sur le disque reste en place.)
+cli-skills-bundle-list-empty =
+    Aucun bundle de skills configuré.
+    Créez-en un : zeroclaw config set skill-bundles.default.directory shared/skills/default
+cli-skills-bundle-list-header = Bundles de skills ({$count}) :
+cli-skills-bundle-entry = {$alias} -> {$dir}
+cli-skills-bundle-include = inclure : {$values}
+cli-skills-bundle-exclude = exclure : {$values}
+cli-skills-bundle-show-no-skills = (aucun skill installé)
+cli-skills-bundle-show-skills-header = skills ({$count}) :
+cli-skills-bundle-show-skill = {$name} : {$description}
 cli-cron-list-about = Lister toutes les tâches planifiées
 cli-cron-add-about = Ajouter une nouvelle tâche planifiée récurrente
 cli-cron-add-at-about = Ajouter une tâche unique qui se déclenche à un moment UTC spécifique
@@ -70,6 +117,7 @@ cli-memory-list-about = Lister les entrées de mémoire avec des filtres optionn
 cli-memory-get-about = Obtenir une entrée de mémoire spécifique par clé
 cli-memory-stats-about = Afficher les statistiques et l'état de santé du backend mémoire
 cli-memory-clear-about = Effacer les mémoires par catégorie, par clé, ou tout effacer
+cli-memory-clear-unsupported-backend = memory clear n'est pas pris en charge pour le backend en ajout seul '{$backend}' ; passez à un backend supprimable (sqlite, lucid ou postgres)
 cli-estop-status-about = Imprimer le statut actuel d'arrêt d'urgence
 cli-estop-resume-about = Reprendre depuis un niveau d'arrêt d'urgence engagé
 cli-models-refresh-about = Actualiser et mettre en cache les modèles du fournisseur
@@ -235,6 +283,11 @@ cli-self-test-long-about =
     Exemples :
     zeroclaw self-test             # ensemble complet de tests
     zeroclaw self-test --quick     # tests rapides uniquement (pas de réseau)
+cli-skills-install-suggestion =
+    Il semble que cette requête nécessite le skill `{$name}`, mais il n'est pas installé.
+
+    Capacité correspondante : {$matched}
+    Étape suivante : Exécutez `{$install_command}` pour l'installer.
 cli-completions-long-about =
     Génère les scripts de complétion de shell pour `zeroclaw`.
 
@@ -254,6 +307,246 @@ cli-desktop-long-about =
     Exemples :
     zeroclaw desktop              # lancer l'application compagnon
     zeroclaw desktop --install    # télécharger et l'installer
+channel-needs-quickstart-reply = Cet agent n'est pas encore entièrement configuré. L'opérateur doit exécuter Quickstart avant que je puisse répondre.
+channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web est configuré mais la fonctionnalité 'whatsapp-web' n'est pas compilée.
+channel-whatsapp-web-feature-missing-build = Compilez/exécutez avec : cargo build --features whatsapp-web
+channel-whatsapp-web-feature-missing-install = Si installé dans le PATH, réinstallez avec : cargo install --path . --force --locked --features whatsapp-web
+channel-whatsapp-web-feature-missing-error = Le canal WhatsApp Web nécessite la fonctionnalité 'whatsapp-web'. Activez-la avec : cargo build --features whatsapp-web (ou, si installé dans le PATH : cargo install --path . --force --locked --features whatsapp-web)
+channel-wecom-ws-stream-bootstrap = Je m'en occupe, veuillez patienter.
+channel-wecom-ws-stop-ack = Message en cours arrêté.
+channel-wecom-ws-voice-unavailable = Je ne peux pas traiter les messages vocaux pour le moment {$emoji}
+channel-wecom-ws-unsupported-message = Ce type de message n'est pas encore pris en charge.
+channel-wecom-ws-welcome = Bonjour, bienvenue dans cette discussion avec moi {$emoji}
+channel-wecom-ws-supplemental-message =
+    {"["}Message complémentaire]
+    {$extra}
+channel-wecom-ws-group-allowlist-missing =
+    La liste d'autorisation WeCom n'est pas configurée, donc ce bot n'accepte pas les messages de groupe.
+
+    chatid du groupe : {$chatid}
+    userid de l'expéditeur : {$userid}
+
+    Ajoutez une entrée autorisée à {$allowed_groups_path} ou {$allowed_users_path}. Vous pouvez aussi temporairement la définir sur ["*"] pour les tests.
+channel-wecom-ws-group-access-denied =
+    Ce groupe n'est pas autorisé à utiliser ce bot.
+
+    chatid du groupe : {$chatid}
+    userid de l'expéditeur : {$userid}
+
+    Demandez à un administrateur d'ajouter ce groupe à {$allowed_groups_path}, ou ajoutez votre userid à {$allowed_users_path}.
+channel-wecom-ws-dm-allowlist-missing =
+    La liste d'autorisation WeCom n'est pas configurée, donc ce bot n'accepte pas les messages.
+
+    Votre userid : {$userid}
+
+    Ajoutez une entrée autorisée à {$allowed_users_path}. Vous pouvez aussi temporairement la définir sur ["*"] pour les tests.
+channel-wecom-ws-dm-access-denied =
+    Vous n'êtes pas autorisé à utiliser ce bot.
+
+    Votre userid : {$userid}
+
+    Demandez à un administrateur d'ajouter votre userid à {$allowed_users_path}.
+channel-discord-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)
+channel-discord-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} fichiers.)
+onboard-openai-auth-note =
+    Authentification OpenAI :
+    • Clé API — accès API standard via platform.openai.com (sk-...)
+    • Abonnement Codex — utilise votre compte ChatGPT Plus/Pro (aucune clé API requise)
+onboard-openai-auth-prompt = Authentification
+onboard-openai-auth-api-key = Clé API
+onboard-openai-auth-codex = Abonnement Codex
+onboard-openai-codex-followup =
+    L'authentification par abonnement Codex utilise votre compte ChatGPT.
+    Exécutez `zeroclaw auth login --provider openai-codex` pour vous authentifier avant de démarrer votre agent.
+cli-peripherals-none = Aucun périphérique configuré.
+cli-peripherals-add-hint = Ajoutez-en un avec : zeroclaw peripheral add <board> <path>
+cli-peripherals-add-example = {"  "}Exemple : zeroclaw peripheral add nucleo-f401re <serial-path>
+cli-peripherals-config-hint = Ou ajoutez à config.toml :
+cli-peripherals-configured = Périphériques configurés :
+cli-peripherals-already-configured = La carte {$board} à {$path} est déjà configurée.
+cli-peripherals-added = {$board} ajouté à {$path}. Redémarrez le démon pour appliquer.
+cli-peripherals-flash-needs-hardware = Le flash Arduino nécessite la fonctionnalité « hardware ».
+cli-peripherals-unoq-needs-hardware = La configuration Uno Q nécessite la fonctionnalité « hardware ».
+cli-peripherals-nucleo-needs-hardware = Le flash Nucleo nécessite la fonctionnalité « hardware ».
+cli-skills-none-installed = Aucune compétence installée.
+cli-skills-create-hint = {"  "}Créez-en une : mkdir -p ~/.zeroclaw/workspace/skills/my-skill
+cli-skills-install-hint = {"  "}Ou installez : zeroclaw skills install <source>
+cli-skills-installed-header = Compétences installées ({$count}) :
+cli-skills-tags = Étiquettes :  {$tags}
+cli-sop-none = Aucun SOP trouvé.
+cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
+cli-sop-loaded-header = SOP chargés ({$count}) :
+cli-sop-none-to-validate = Aucun SOP trouvé à valider.
+cli-sop-valid = ✅ {$name} — valide
+cli-sop-warnings = ⚠️  {$name} — {$count} avertissement(s) :
+cli-sop-all-passed = Tous les SOP ont réussi la validation.
+cli-sop-priority = {"  "}Priorité :      {$value}
+cli-sop-execution-mode = {"  "}Mode d'exécution : {$value}
+cli-sop-deterministic = {"  "}Déterministe :  {$value}
+cli-sop-cooldown = {"  "}Délai :         {$value}s
+cli-sop-max-concurrent = {"  "}Max simultanés : {$value}
+cli-sop-location = {"  "}Emplacement :   {$value}
+cli-sop-triggers = {"  "}Déclencheurs :
+cli-sop-steps = {"  "}Étapes :
+cli-sop-step-tools = Outils : {$tools}
+cli-memory-reindexing = Réindexation du backend mémoire...
+cli-memory-none = Aucune entrée mémoire trouvée.
+cli-memory-none-at-offset = Aucune entrée à la position {$offset} (total : {$total}).
+cli-memory-next-page = Utilisez --offset {$offset} pour voir la page suivante.
+cli-memory-key-not-found = Aucune entrée mémoire trouvée pour la clé : {$key}
+cli-memory-prefix-matched = Le préfixe « {$key} » correspond à {$n} entrées :
+cli-memory-narrow-prefix = Spécifiez un préfixe plus long pour affiner la correspondance.
+cli-memory-key = Clé :       {$value}
+cli-memory-category = Catégorie :  {$value}
+cli-memory-timestamp = Horodatage : {$value}
+cli-memory-session = Session :   {$value}
+cli-memory-stats-header = Statistiques mémoire :
+cli-memory-backend = {"  "}Backend :  {$value}
+cli-memory-total = {"  "}Total :    {$value}
+cli-memory-by-category = {"  "}Par catégorie :
+cli-memory-none-to-clear = Aucune entrée à effacer.
+cli-memory-found-in-scope = {$count} entrées trouvées dans « {$scope} ».
+cli-memory-aborted = Abandonné.
+cli-memory-deleted-key = Clé supprimée : {$key}
+cli-cron-none = Aucune tâche planifiée pour l'instant.
+cli-cron-usage = Utilisation :
+cli-cron-jobs-header = 🕒 Tâches planifiées ({$count}) :
+cli-cron-list-cmd = {"    "}cmd : {$cmd}
+cli-cron-list-prompt = {"    "}invite : {$prompt}
+cli-cron-added-agent = ✅ Tâche cron d'agent {$id} ajoutée
+cli-cron-added = ✅ Tâche cron {$id} ajoutée
+cli-cron-added-oneshot-agent = ✅ Tâche cron d'agent à exécution unique {$id} ajoutée
+cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
+cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
+cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
+cli-cron-updated = ✅ Tâche cron {$id} mise à jour
+cli-cron-paused = ⏸️  Tâche cron {$id} en pause
+cli-cron-resumed = ▶️  Tâche cron {$id} reprise
+cli-cron-expr = {"  "}Expr  : {$v}
+cli-cron-expr2 = {"  "}Expr: {$v}
+cli-cron-next = {"  "}Suivant : {$v}
+cli-cron-next2 = {"  "}Suivant : {$v}
+cli-cron-next3 = {"  "}Suivant  : {$v}
+cli-cron-prompt = {"  "}Invite : {$v}
+cli-cron-prompt3 = {"  "}Invite   : {$v}
+cli-cron-cmd = {"  "}Cmd : {$v}
+cli-cron-cmd3 = {"  "}Cmd      : {$v}
+cli-cron-at = {"  "}À     : {$v}
+cli-cron-at2 = {"  "}À   : {$v}
+cli-cron-every = {"  "}Toutes(ms): {$v}
+cli-no-command = Aucune commande fournie.
+cli-press-enter = Appuyez sur Entrée pour quitter...
+cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
+cli-quickstart-cancelled = Quickstart annulé. Aucune configuration écrite.
+cli-quickstart-incomplete = {"  "}Tous les sélecteurs ne sont pas encore renseignés.
+cli-no-channels-compiled = {"  "}Aucun type de canal n'est compilé dans ce binaire.
+cli-quickstart-complete = Quickstart terminé. Agent `{$alias}` créé.
+cli-next-steps = Étapes suivantes :
+cli-agent-not-created = Votre agent n'a pas été créé — et rien n'a été modifié sur le disque.
+cli-onboard-deprecated = `zeroclaw onboard` est obsolète — utilisez `zeroclaw quickstart`.
+cli-otp-initialized = Secret OTP initialisé pour ZeroClaw.
+cli-otp-enrollment-uri = URI d'enregistrement : {$uri}
+cli-pairing-enabled = 🔐 L'appairage de la passerelle est activé.
+cli-pairing-use-code = {"  "}Utilisez ce code à usage unique pour appairer un nouvel appareil :
+cli-pairing-post = {"    "}POST /pair avec l'en-tête X-Pairing-Code: {$code}
+cli-pairing-restart = {"   "}Redémarrez la passerelle pour générer un nouveau code d'appairage.
+cli-pairing-disabled = ⚠️  L'appairage de la passerelle est désactivé dans la configuration.
+cli-gateway-running-q = {"   "}La passerelle est-elle en cours d'exécution ? Démarrez-la avec :
+cli-status-title = 🦀 État de ZeroClaw
+cli-status-provider-none = 🤖 ModelProvider :      (aucun configuré)
+cli-status-agents-none = 🛡️  Agents :        (aucun configuré)
+cli-status-service-running = 🟢 Service :       en cours d'exécution
+cli-status-service-stopped = 🔴 Service :       arrêté
+cli-status-channels = Canaux :
+cli-status-cli-always = {"  "}CLI :      ✅ toujours
+cli-status-peripherals = Périphériques :
+cli-desktop-download = Téléchargez l'application compagnon ZeroClaw :
+cli-desktop-homebrew = Ou installez via Homebrew (bientôt disponible) :
+cli-desktop-linux-pkg = {"  "}Téléchargez le fichier .deb ou .AppImage pour votre architecture.
+cli-desktop-launching = Lancement de l'application compagnon ZeroClaw...
+cli-status-version = Version :     {$v}
+cli-status-workspace = Espace de travail :   {$v}
+cli-status-config = Config :      {$v}
+cli-status-provider-indent = {"   "}ModelProvider :      {$family}.{$alias}
+cli-status-provider = 🤖 ModelProvider :      {$family}.{$alias}
+cli-status-model = {"   "}Modèle :         {$model}
+cli-status-observability = 📊 Observabilité :  {$v}
+cli-status-agents = 🛡️  Agents :        {$v}
+cli-status-runtime = ⚙️  Runtime :       {$v}
+cli-status-security-noprofile = Sécurité ({$alias}) : <aucun risk_profile>
+cli-status-security = Sécurité ({$alias}) :
+cli-status-workspace-only = {"  "}Espace de travail uniquement :    {$v}
+cli-status-max-actions = {"  "}Actions max/heure :  {$v}
+cli-status-max-cost-day = {"  "}Coût max/jour :      ${$v}
+cli-status-max-cost-month = {"  "}Coût max/mois :    ${$v}
+cli-status-otp = {"  "}OTP activé :       {$v}
+cli-status-estop = {"  "}Arrêt d'urgence activé :    {$v}
+cli-status-boards = {"  "}Cartes :    {$v}
+cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installée.
+cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
+cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
+cli-config-all-configured = Toutes les sections sont déjà configurées.
+cli-config-schema-current = La configuration est déjà à la version actuelle du schéma.
+cli-config-applied-ops = {$count} opération(s) appliquée(s) :
+cli-plugins-none = Aucun plugin installé.
+cli-plugins-installed = Plugins installés :
+cli-plugin-installed-from = Plugin installé depuis {$source}
+cli-plugin-removed = Plugin « {$name} » supprimé.
+cli-plugin-not-found = Plugin « {$name} » introuvable.
+cli-estop-resume-done = Reprise après arrêt d'urgence terminée.
+cli-estop-engaged = Arrêt d'urgence engagé.
+cli-estop-status = État de l'arrêt d'urgence :
+cli-auth-none = Aucun profil d'authentification configuré.
+cli-auth-active = Profils actifs :
+cli-warn-crypto-provider = Avertissement : Échec de l'installation du fournisseur de cryptographie par défaut : {$err}
+cli-error-label = {"   "}Erreur : {$err}
+cli-warn-cost-usage = {"  "}⚠ Impossible de charger l'utilisation des coûts : {$err}
+cli-warn-cost-tracker = {"  "}⚠ Impossible d'initialiser le suivi des coûts : {$err}
+cli-desktop-download-at = {"  "}Téléchargez-la sur : {$url}
+cli-config-legend = Légende : 💉 remplacé par env  🔒 secret
+cli-config-secret-set = {$path} est défini (secret chiffré — valeur non affichée)
+cli-config-secret-unset = {$path} n'est pas défini (secret chiffré)
+cli-config-updated = {$path} mis à jour.
+cli-config-review-hint = Exécutez `zeroclaw config list` pour vérifier, puis définissez les champs requis.
+cli-config-backed-up = Sauvegardé vers { $path }
+cli-plugin-name-version = Plugin : { $name } v{ $version }
+cli-plugin-description = Description : { $desc }
+cli-plugin-capabilities = Capacités : { $v }
+cli-plugin-permissions = Permissions : { $v }
+cli-plugin-wasm = WASM : { $path }
+cli-plugin-wasm-none = WASM : (plugin compétence uniquement)
+cli-estop-domains-none = {"  "}domain_blocks:  (aucun)
+cli-estop-domains = {"  "}domain_blocks:  { $v }
+cli-estop-tools-none = {"  "}tool_freeze:    (aucun)
+cli-estop-tools = {"  "}tool_freeze:    { $v }
+cli-estop-updated-at = {"  "}updated_at:     { $v }
+cli-auth-saved = Profil { $profile } enregistré
+cli-auth-active-for = Profil actif pour { $provider } : { $profile }
+cli-auth-refresh-ok = ✓ Actualisation du jeton OK (profil { $profile })
+cli-auth-removed = Profil d'authentification supprimé { $provider }:{ $profile }
+cli-auth-not-found = Profil d'authentification introuvable : { $provider }:{ $profile }
+cli-locales-fetched = {"  "}récupéré {$name} -> {$path}
+cli-locales-skipped = {"  "}ignoré {$name} : absent en amont ({$path} ; essayé {$refs})
+cli-locales-installed = {$count} catalogue(s) installé(s) pour « {$locale} » dans {$dir}
+cli-browse-header = { $path } ({ $count } entrées)
+cli-browse-empty = (vide)
+cli-browse-file-bytes = { $name } ({ $bytes } octets)
+cli-hardware-feature-required = La découverte du matériel nécessite la fonctionnalité « hardware ».
+cli-hardware-feature-build = Compiler avec : cargo build --features hardware
+cli-hardware-unsupported-platform = La découverte USB du matériel n'est pas prise en charge sur cette plateforme.
+cli-hardware-supported-platforms = Plateformes prises en charge : Linux, macOS, Windows.
+cli-update-already-current = Déjà à jour (v{ $version }).
+cli-update-success = Mise à jour réussie vers la v{ $version } !
+cli-selftest-all-passed = Les { $total } vérifications ont toutes réussi.
+cli-selftest-some-failed = { $failed }/{ $total } vérifications ont échoué.
+cli-channels-header = Canaux :
+cli-channels-cli-always = {"  "}✅ CLI (toujours disponible)
+cli-channels-notion = {"  "}{ $status } Notion
+cli-channels-start-hint = Pour démarrer les canaux : zeroclaw channel start
+cli-channels-doctor-hint = Pour vérifier l'état :    zeroclaw channel doctor
+cli-channels-configure-hint = Pour configurer :      zeroclaw onboard
+cli-onboard-about = Initialiser votre espace de travail et votre configuration
 cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
 cli-memory-remove-about = Supprimer une entrée de mémoire par clé
 cli-note-show-about = Afficher un contenu de note par nom

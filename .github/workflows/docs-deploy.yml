@@ -8,6 +8,9 @@ name: Deploy mdBook docs to Pages
 # (see docs/book/src/maintainers/docs-and-translations.md) and committed to
 # the repo — this workflow does not call any translation provider.
 
+env:
+  DOCS_MIN_VERSION: v0.7.5
+
 on:
   push:
     branches: [master]
@@ -20,7 +23,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/docs-deploy.yml"
+    tags:
+      - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "The version tag to deploy (e.g. v0.7.5, master). If omitted, builds 'master'."
+        required: false
+        default: "master"
 
 permissions:
   contents: write
@@ -33,9 +43,56 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04-arm
     steps:
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            # Validate: must be 'master' or a semver tag like v0.7.5 / v0.8.0-beta-1.
+            if ! [[ "$TAG" =~ ^(master|v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?)$ ]]; then
+              echo "::error::Invalid tag input '${TAG}'. Must be 'master' or match v<major>.<minor>.<patch>[-<pre>]."
+              exit 1
+            fi
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="master"
+          fi
+
+          # Enforce version floor (skip for master)
+          if [[ "$TAG" =~ ^v ]]; then
+            OLDEST=$(printf '%s\n' "$TAG" "$DOCS_MIN_VERSION" | sort -V | head -n1)
+            if [ "$OLDEST" = "$TAG" ] && [ "$TAG" != "$DOCS_MIN_VERSION" ]; then
+              echo "::error::Tag '${TAG}' is below minimum deployable version '${DOCS_MIN_VERSION}'."
+              exit 1
+            fi
+          fi
+
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "Building docs for TAG=$TAG"
+
+      # Checks out the version being built. For workflow_dispatch with an old
+      # release tag, this replaces the workspace with that tag's source tree,
+      # which may predate the deploy helpers introduced in this PR.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 1
+
+      # Always fetch the deploy-helper scripts from the commit that triggered
+      # this workflow run (github.sha). For workflow_dispatch, github.sha is
+      # master's HEAD — regardless of which tag input was chosen — so the
+      # helpers are always present even when the target ref predates this PR.
+      # For tag-push events, github.sha is the tag commit, which will contain
+      # the helpers because pre-PR tags don't carry this workflow file and
+      # cannot trigger a tag-push run.
+      - name: Fetch deploy helpers from current workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: .workflow-scripts
+          fetch-depth: 1
+
 
       # MDBOOK_BIN_VERSION is scoped to this step only. Workflow-level
       # `MDBOOK_*` env vars leak into `cargo mdbook build` below — mdbook 0.5.0
@@ -59,8 +116,14 @@ jobs:
           shared-key: docs-deploy
           cache-all-crates: true
 
+      - name: Update package lists
+        run: sudo apt-get update
+
       - name: Install gettext tools
         run: sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Install rsync
+        run: sudo apt-get install -y --no-install-recommends rsync
 
       - name: Validate .po format
         run: |
@@ -79,14 +142,83 @@ jobs:
       #   - Assembles the final artifact (copies rustdoc to book/api, writes
       #     root index.html that redirects to /en/)
       - name: Build docs (refs + rustdoc + all locales)
-        run: cargo mdbook build
+        env:
+          TAG: ${{ steps.version.outputs.TAG }}
+        run: |
+          echo "Building docs for TAG=$TAG"
+          cargo mdbook build
 
-      - name: Deploy to gh-pages branch
-        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/book/book
-          publish_branch: gh-pages
-          force_orphan: true
-          cname: docs.zeroclawlabs.ai
-          commit_message: "deploy: ${{ github.event.head_commit.message }}"
+      - name: Update gh-pages branch (merge build output)
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.TAG }}
+        run: |
+          set -euo pipefail
+          REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          CLONE_DIR=$(mktemp -d)
+          echo "Cloning gh-pages into ${CLONE_DIR}"
+          if git ls-remote --exit-code origin gh-pages > /dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "$REPO" "$CLONE_DIR"
+          else
+            # gh-pages does not exist yet — bootstrap an orphan branch.
+            git clone --depth 1 "$REPO" "$CLONE_DIR"
+            pushd "$CLONE_DIR" > /dev/null
+            if ! git switch --orphan gh-pages 2>/dev/null; then
+              # Fallback for older Git versions (< 2.23).
+              git checkout --orphan gh-pages || { echo "::error::Failed to create orphan gh-pages branch"; exit 1; }
+            fi
+            git rm -rf . > /dev/null 2>&1 || true
+            popd > /dev/null
+          fi
+
+          # Copy built tag docs into gh-pages under '<tag>/'
+          mkdir -p "$CLONE_DIR/$TAG"
+          if [ -d "docs/book/book/$TAG" ]; then
+            rsync -a --delete "docs/book/book/$TAG/" "$CLONE_DIR/$TAG/"
+          else
+            echo "Old docs layout detected (unversioned). Restructuring to $TAG/..."
+            mkdir -p "docs/book/book_temp/$TAG"
+            rsync -a docs/book/book/ "docs/book/book_temp/$TAG/"
+            rsync -a --delete "docs/book/book_temp/$TAG/" "$CLONE_DIR/$TAG/"
+            rm -rf docs/book/book_temp
+          fi
+
+          # If this is a stable release (no pre-release suffix), also copy to /stable/
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            mkdir -p "$CLONE_DIR/stable"
+            rsync -a --delete "$CLONE_DIR/$TAG/" "$CLONE_DIR/stable/"
+          fi
+
+          # Generate versions.json by scanning gh-pages root for version directories
+          pushd "$CLONE_DIR" > /dev/null
+
+          # Persist custom domain — must be present on every push to gh-pages
+          # or GitHub Pages will remove it (re-introduced fix from #6142).
+          echo "docs.zeroclawlabs.ai" > CNAME
+
+          SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
+          
+          # Sync shared chrome — new xtask produces book/_shared/
+          if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
+            mkdir -p "$CLONE_DIR/_shared"
+            rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
+          else
+            # Old-tag fallback: extract chrome from the deployed version content
+            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
+          fi
+
+          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
+
+          # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
+          if [ -d "stable" ]; then
+            bash "${SCRIPTS}/gen-index-stable.sh"
+          else
+            bash "${SCRIPTS}/gen-index-master.sh"
+          fi
+
+          git add --all
+          git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit -m "docs: update docs for $TAG (from $GITHUB_SHA)" || true
+          git push "$REPO" gh-pages
+          popd >/dev/null

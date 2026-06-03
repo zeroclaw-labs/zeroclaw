@@ -381,7 +381,7 @@ async fn handle_socket(
             &agent_alias,
             Some(&session_cwd),
             true,
-            Some(state.canvas_store.clone()),
+            false,
         )
         .await
         {
@@ -448,7 +448,6 @@ async fn handle_socket(
         &Some(ch.reaction.clone()),
         &ch.poll,
         &ch.escalate,
-        &ch.channel_send,
     );
     if !channel_names.is_empty() {
         ::zeroclaw_log::record!(
@@ -735,12 +734,12 @@ fn needs_onboarding_ws_error(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<serde_json::Value> {
     let model = config.resolve_default_model().unwrap_or_default();
-    crate::needs_onboarding_for(&model)?;
+    crate::needs_quickstart_for(&model)?;
     Some(serde_json::json!({
         "type": "error",
         "error": "needs_onboarding",
         "code": "NEEDS_ONBOARDING",
-        "message": crate::needs_onboarding_channel_reply(),
+        "message": crate::needs_quickstart_channel_reply(),
         "url": "/onboard",
     }))
 }
@@ -769,12 +768,15 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
-    let provider_label = state
-        .config
-        .read()
-        .first_model_provider_type()
-        .unwrap_or("unknown")
-        .to_string();
+    let provider_label = {
+        let cfg = state.config.read();
+        cfg.providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -813,15 +815,28 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let turn_fut = async {
+        use ::zeroclaw_log::Instrument as _;
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %session_key_owned,
+            agent_alias = %turn_alias,
+            model_provider = %turn_provider,
+            model = %turn_model,
+            channel = "wss",
+        );
         zeroclaw_runtime::agent::loop_::scope_session_key(
-            Some(session_key_owned),
-            agent.turn_streamed_with_steering_state(
-                &content_owned,
-                event_tx,
-                Some(cancel_token.clone()),
-                Some(&mut steering_rx),
-            ),
+            Some(session_key_owned.clone()),
+            agent
+                .turn_streamed_with_steering_state(
+                    &content_owned,
+                    event_tx,
+                    Some(cancel_token.clone()),
+                    Some(&mut steering_rx),
+                )
+                .instrument(span),
         )
         .await
     };
@@ -962,14 +977,20 @@ async fn process_chat_message(
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
-                event_opt = event_rx.recv() => {
+                    event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
                         TurnEvent::Usage {
                             input_tokens,
+                            cached_input_tokens: _,
                             output_tokens,
                             cost_usd: _,
                         } => {
+                            // `input_tokens` per TokenUsage contract is
+                            // the *total* prompt size (uncached + cached).
+                            // `cached_input_tokens` is a subset and must
+                            // NOT be added — that would double-count
+                            // cache reads.
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                             }
@@ -1110,7 +1131,7 @@ async fn process_chat_message(
                 let temperature = state.temperature;
                 let user_msg = content.to_string();
                 let assistant_resp = outcome.response.clone();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                         model_provider.as_ref(),
                         &model,
@@ -1496,8 +1517,8 @@ mod tests {
             "missing Fluent key fallback leaked into WS error message: {message:?}"
         );
         assert!(
-            message.to_lowercase().contains("onboarding"),
-            "WS onboarding message must explain the setup gap: {message:?}"
+            message.to_lowercase().contains("quickstart"),
+            "WS setup-gap message must explain the setup gap: {message:?}"
         );
     }
 

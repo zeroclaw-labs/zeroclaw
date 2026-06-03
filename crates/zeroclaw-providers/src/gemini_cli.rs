@@ -263,8 +263,9 @@ impl ModelProvider for GeminiCliModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        Self::validate_temperature(temperature)?;
+        if let Some(t) = temperature {
+            Self::validate_temperature(t)?;
+        }
 
         let full_message = match system_prompt {
             Some(system) if !system.is_empty() => {

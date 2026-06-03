@@ -414,7 +414,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logs',
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
-    'nav.onboard': 'Onboard',
+    'nav.quickstart': 'Quickstart',
 
     // Dashboard
     'dashboard.title': 'Dashboard',

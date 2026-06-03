@@ -538,15 +538,20 @@ pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
         let _ = run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]));
-        // Remove the wrapper script
-        let wrapper = config
+        // Remove the wrapper script. It now lives in the config dir root, but
+        // older installs left it under logs/ — clean up both so an upgrade
+        // doesn't strand the legacy copy.
+        let base_dir = config
             .config_path
             .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-            .join("zeroclaw-daemon.cmd");
-        if wrapper.exists() {
-            fs::remove_file(&wrapper).ok();
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        for wrapper in [
+            base_dir.join("zeroclaw-daemon.cmd"),
+            base_dir.join("logs").join("zeroclaw-daemon.cmd"),
+        ] {
+            if wrapper.exists() {
+                fs::remove_file(&wrapper).ok();
+            }
         }
         println!("✅ Service uninstalled");
         return Ok(());
@@ -1392,15 +1397,18 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
 fn install_windows(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let logs_dir = config
+    let base_dir = config
         .config_path
         .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("logs");
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let logs_dir = base_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    // Create a wrapper script that redirects output to log files
-    let wrapper = logs_dir.join("zeroclaw-daemon.cmd");
+    // The launch wrapper is an install artifact, not log output — keep it in
+    // the config dir root so the logs dir holds only `.log` files. (Previously
+    // it landed in logs/, where a `.cmd` next to the daemon's log files reads
+    // as misplaced.)
+    let wrapper = base_dir.join("zeroclaw-daemon.cmd");
     let stdout_log = logs_dir.join("daemon.stdout.log");
     let stderr_log = logs_dir.join("daemon.stderr.log");
 
@@ -1419,6 +1427,12 @@ fn install_windows(config: &Config) -> Result<()> {
         .args(["/Delete", "/TN", task_name, "/F"])
         .output();
 
+    // Run at the invoking user's normal privilege (LIMITED), not HIGHEST.
+    // This is a per-user ONLOGON task driving a user-level daemon; running it
+    // elevated makes the daemon's RPC pipe owned by an elevated token, so a
+    // non-elevated `zerocode` can't connect unless it too is run as admin.
+    // Matching the user's standard token keeps the pipe reachable from the
+    // normal desktop session.
     run_checked(Command::new("schtasks").args([
         "/Create",
         "/TN",
@@ -1428,7 +1442,7 @@ fn install_windows(config: &Config) -> Result<()> {
         "/TR",
         &format!("\"{}\"", wrapper.display().to_string()),
         "/RL",
-        "HIGHEST",
+        "LIMITED",
         "/F",
     ]))?;
 
