@@ -76,7 +76,7 @@ pub trait CompatFamilySpec {
     /// will query the live endpoint even when no credential is configured.
     /// Defaults to `false`; set to `true` for providers like Kilo Gateway
     /// whose model catalog is public.
-    const UNAUTHENTICATED_MODEL_LISTING: bool = false;
+    const PUBLIC_MODEL_LISTING: bool = false;
 
     /// Build the base compat provider with both catalog consts applied. Use
     /// this from inside `build_compat` overrides so the catalog hooks ride
@@ -100,8 +100,8 @@ pub trait CompatFamilySpec {
         if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
             p = p.with_openrouter_vendor_prefix(prefix);
         }
-        if Self::UNAUTHENTICATED_MODEL_LISTING {
-            p = p.with_unauthenticated_model_listing();
+        if Self::PUBLIC_MODEL_LISTING {
+            p = p.with_public_model_listing();
         }
         p
     }
@@ -261,18 +261,18 @@ use zeroclaw_config::schema::{
     FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
-    KiloModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotEndpoint, MoonshotModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    KiloModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, MinimaxModelProviderConfig,
+    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -780,7 +780,7 @@ fn build_ollama_compat_provider(
         true,
     )
     .with_local_model_tool_sanitize()
-    .with_unauthenticated_model_listing();
+    .with_public_model_listing();
     if opts.merge_system_into_user {
         p = p.with_merge_system_into_user();
     }
@@ -1075,7 +1075,7 @@ impl CompatFamilySpec for KiloModelProviderConfig {
     const DISPLAY: &'static str = "Kilo";
     const DEFAULT_URL: &'static str = "https://app.kilo.ai/api/gateway";
     const AUTH: AuthStyle = AuthStyle::Bearer;
-    const UNAUTHENTICATED_MODEL_LISTING: bool = true;
+    const PUBLIC_MODEL_LISTING: bool = true;
 }
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {

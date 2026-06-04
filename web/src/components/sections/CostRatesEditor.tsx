@@ -65,6 +65,44 @@ function basePathFor(category: CostRatesCategory, providerType: string) {
   return `cost.rates.providers.${category}.${providerType}`;
 }
 
+/** Apply catalog pricing to a resource's rate entry. Fetches from the API
+ *  if the in-memory cache is empty, then builds and submits PATCH ops.
+ *  Silent-fail on errors — pricing pre-fill is a nice-to-have. */
+async function applyCatalogPricingToResource(
+  basePath: string,
+  resource: string,
+  catalogPricing: Record<string, ModelPricing> | null,
+  providerType: string,
+): Promise<void> {
+  let pricing: ModelPricing | undefined = catalogPricing
+    ? catalogPricing[resource]
+    : undefined;
+  if (!pricing) {
+    try {
+      const resp = await getCatalogModels(providerType);
+      pricing = resp.pricing?.[resource];
+    } catch { /* silent fail */ }
+  }
+  if (!pricing) return;
+  const fullPath = `${basePath}.${resource}`;
+  const ops: { op: 'replace'; path: string; value: number }[] = [];
+  if (pricing.prompt !== undefined) {
+    const v = parseFloat(pricing.prompt);
+    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.input_per_mtok`, value: v * 1_000_000 });
+  }
+  if (pricing.completion !== undefined) {
+    const v = parseFloat(pricing.completion);
+    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.output_per_mtok`, value: v * 1_000_000 });
+  }
+  if (pricing.input_cache_read !== undefined) {
+    const v = parseFloat(pricing.input_cache_read);
+    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.cached_input_per_mtok`, value: v * 1_000_000 });
+  }
+  if (ops.length > 0) {
+    await patchConfig(ops);
+  }
+}
+
 // Embedded mode — providers.<category>.<alias> "Costs" tab. The resource
 // id (e.g. `claude-opus-4-7`) is fixed by the bound model/voice on the
 // alias; on first visit there's no rate entry yet, so the widget shows a
@@ -114,34 +152,8 @@ function SingleResourceEditor({
     setError(null);
     try {
       await createMapKey(basePath, fixedResource);
-      // Fetch pricing on-demand if not already loaded, then patch.
-      let pricing: ModelPricing | undefined = catalogPricing
-        ? catalogPricing[fixedResource]
-        : undefined;
-      if (!pricing) {
-        try {
-          const resp = await getCatalogModels(providerType);
-          pricing = resp.pricing?.[fixedResource];
-        } catch { /* silent fail */ }
-      }
-      if (pricing) {
-        const ops: { op: 'replace'; path: string; value: number }[] = [];
-        if (pricing.prompt !== undefined) {
-          const v = parseFloat(pricing.prompt);
-          if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.input_per_mtok`, value: v * 1_000_000 });
-        }
-        if (pricing.completion !== undefined) {
-          const v = parseFloat(pricing.completion);
-          if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.output_per_mtok`, value: v * 1_000_000 });
-        }
-        if (pricing.input_cache_read !== undefined) {
-          const v = parseFloat(pricing.input_cache_read);
-          if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.cached_input_per_mtok`, value: v * 1_000_000 });
-        }
-        if (ops.length > 0) {
-          await patchConfig(ops);
-        }
-      }
+      // Pre-fill rates from catalog pricing.
+      await applyCatalogPricingToResource(basePath, fixedResource, catalogPricing, providerType);
       setExists(true);
       setReloadKey((n) => n + 1);
       onSaved?.();
@@ -248,33 +260,7 @@ function ResourceListEditor({
 
   /** Apply catalog pricing to a newly-created resource, if available. */
   const applyPricing = async (resource: string) => {
-    let pricing: ModelPricing | undefined = catalogPricing
-      ? catalogPricing[resource]
-      : undefined;
-    if (!pricing) {
-      try {
-        const resp = await getCatalogModels(providerType);
-        pricing = resp.pricing?.[resource];
-      } catch { /* silent fail */ }
-    }
-    if (!pricing) return;
-    const fullPath = `${basePath}.${resource}`;
-    const ops: { op: 'replace'; path: string; value: number }[] = [];
-    if (pricing.prompt !== undefined) {
-      const v = parseFloat(pricing.prompt);
-      if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.input_per_mtok`, value: v * 1_000_000 });
-    }
-    if (pricing.completion !== undefined) {
-      const v = parseFloat(pricing.completion);
-      if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.output_per_mtok`, value: v * 1_000_000 });
-    }
-    if (pricing.input_cache_read !== undefined) {
-      const v = parseFloat(pricing.input_cache_read);
-      if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.cached_input_per_mtok`, value: v * 1_000_000 });
-    }
-    if (ops.length > 0) {
-      await patchConfig(ops);
-    }
+    await applyCatalogPricingToResource(basePath, resource, catalogPricing, providerType);
   };
 
   const addResource = async () => {

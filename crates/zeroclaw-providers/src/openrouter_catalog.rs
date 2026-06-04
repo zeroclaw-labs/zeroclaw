@@ -33,7 +33,8 @@ struct ModelEntry {
 /// Flat catalog — model IDs only (used by `list_models`).
 static CACHED_CATALOG: OnceCell<Arc<Vec<String>>> = OnceCell::const_new();
 /// Enriched catalog — model IDs with pricing (used by `list_models_with_pricing`).
-static CACHED_CATALOG_WITH_PRICING: OnceCell<Arc<Vec<ModelEntryWithPricing>>> = OnceCell::const_new();
+static CACHED_CATALOG_WITH_PRICING: OnceCell<Arc<Vec<ModelEntryWithPricing>>> =
+    OnceCell::const_new();
 
 #[derive(Clone)]
 struct ModelEntryWithPricing {

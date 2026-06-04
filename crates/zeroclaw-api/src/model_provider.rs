@@ -363,23 +363,25 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 /// classic chat completions shape.
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
-/// Per-token pricing for a model. All values are per-token rates as strings.
-/// e.g. "0.000005" = $5.00 per 1M tokens.
+/// Per-token pricing for a model. All values are per-token rates as strings
+/// expressed in USD per token — e.g. `"0.000005"` = $5.00 per 1M tokens.
 ///
 /// Deserialized from the `pricing` object in OpenAI-compatible `/models`
 /// responses (Kilo Gateway, OpenRouter, etc.).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelPricing {
-    /// Input/prompt tokens per-token rate.
+    /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    /// Output/completion tokens per-token rate.
+    /// Output/completion tokens per-token rate (USD per token, e.g. `"0.000020"` = $20/1M tokens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<String>,
-    /// Cached input read rate (Kilo Gateway).
+    /// Cached input read rate — per-token charge for reading cached prompt data
+    /// (USD per token, e.g. `"0.000001"` = $1/1M tokens). Kilo Gateway specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_cache_read: Option<String>,
-    /// Cached input write rate (Kilo Gateway).
+    /// Cached input write rate — per-token charge for writing prompt data to cache
+    /// (USD per token, e.g. `"0.000001"` = $1/1M tokens). Kilo Gateway specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_cache_write: Option<String>,
 }
@@ -483,10 +485,12 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// pricing. Concrete providers that receive pricing from their `/models`
     /// endpoint override this to return enriched data.
     async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        Ok(self.list_models().await?.into_iter().map(|id| ModelInfo {
-            id,
-            pricing: None,
-        }).collect())
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|id| ModelInfo { id, pricing: None })
+            .collect())
     }
 
     /// Multi-turn conversation. See `simple_chat` for the `temperature`
