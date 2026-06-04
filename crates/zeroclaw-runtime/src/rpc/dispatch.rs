@@ -58,6 +58,7 @@ pub enum Method {
     SessionDelete,
     SessionRename,
     SessionApprove,
+    SessionKill,
 
     // Memory
     MemoryList,
@@ -159,6 +160,7 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionRename, "session/rename"),
         (Method::SessionApprove, "session/approve"),
+        (Method::SessionKill, "session/kill"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -420,6 +422,7 @@ impl RpcDispatcher {
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
             Method::SessionRename => self.handle_session_rename(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params),
+            Method::SessionKill => self.handle_session_kill(&req.params).await,
 
             // Memory
             Method::MemoryList => self.handle_memory_list(&req.params).await,
@@ -866,6 +869,58 @@ impl RpcDispatcher {
         to_result(SessionCloseResult {
             session_id: req.session_id,
             closed: true,
+        })
+    }
+
+    async fn handle_session_kill(&self, params: &Value) -> RpcResult {
+        let req: SessionKillParams = parse_params(params)?;
+        let sid = &req.session_id;
+
+        if self.ctx.sessions.get_agent(sid).await.is_none() {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+
+        // If a turn is in flight, emit TurnComplete(cancelled) so any connected
+        // client exits the working state before the session disappears.
+        if self.ctx.sessions.has_inflight_turn(sid) {
+            self.emit_turn_complete(
+                sid,
+                crate::rpc::types::TurnCompletionOutcome::Cancelled,
+                "turn cancelled by daemon: admin_kill".to_string(),
+            )
+            .await;
+        }
+
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .unwrap_or_default();
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %sid,
+            agent_alias = %agent_alias,
+            channel = "rpc",
+        );
+        let _guard = span.enter();
+
+        let killed = self.ctx.sessions.kill_session(sid).await;
+        if killed {
+            crate::util::release_freed_heap();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "session/kill: session terminated by admin"
+            );
+        }
+
+        to_result(SessionKillResult {
+            session_id: req.session_id,
+            killed,
         })
     }
 
