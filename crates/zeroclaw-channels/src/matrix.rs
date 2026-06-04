@@ -598,6 +598,7 @@ mod client {
     use matrix_sdk::{
         Client, SessionMeta, SessionTokens,
         authentication::matrix::MatrixSession,
+        config::RequestConfig,
         ruma::{OwnedRoomId, RoomAliasId},
     };
     use serde::Deserialize;
@@ -607,6 +608,14 @@ mod client {
     use zeroclaw_config::schema::MatrixConfig;
 
     const WHOAMI_ENDPOINT: &str = "_matrix/client/v3/account/whoami";
+
+    /// Per-request HTTP timeout for the Matrix client. Must stay strictly
+    /// greater than [`super::inbound::SYNC_LONGPOLL_TIMEOUT`] so an idle
+    /// `/sync` long-poll always completes server-side before the HTTP layer's
+    /// own deadline fires. Without this, `Client::builder()` falls back to the
+    /// SDK's 30s default request timeout, which races the (unbounded-by-default)
+    /// long-poll and makes every idle sync error out at exactly 30 seconds.
+    pub(super) const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
     const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
     const WHOAMI_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
     const WHOAMI_ERROR_BODY_DISPLAY_CHARS: usize = 256;
@@ -788,6 +797,10 @@ mod client {
         let client = Client::builder()
             .homeserver_url(&config.homeserver)
             .sqlite_store(&store, None)
+            // Widen the per-request timeout past the sync long-poll window so
+            // an idle `/sync` never trips the SDK's default 30s request
+            // deadline before the homeserver's own long-poll returns.
+            .request_config(RequestConfig::new().timeout(CLIENT_REQUEST_TIMEOUT))
             .build()
             .await
             .context("build matrix client")?;
@@ -1415,7 +1428,7 @@ mod inbound {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
 
     use matrix_sdk::{
@@ -1446,6 +1459,16 @@ mod inbound {
         media::MediaAttachment,
     };
     use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+
+    /// Server-side long-poll window for `/sync`. Sent as the `?timeout=`
+    /// parameter so the homeserver holds an idle sync open for this long
+    /// (returning early the moment new events arrive) instead of replying
+    /// immediately and busy-looping. Must stay strictly below
+    /// [`super::client::CLIENT_REQUEST_TIMEOUT`] so the HTTP request deadline
+    /// never fires before the long-poll completes. `SyncSettings::default()`
+    /// leaves this unset, which — combined with the SDK's 30s default request
+    /// timeout — makes every idle sync error out at exactly 30 seconds.
+    pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Clone)]
     pub(super) struct HandlerCtx {
@@ -1526,7 +1549,11 @@ mod inbound {
         );
         // Run an initial sync once so the sync token + state are populated,
         // then flip the health flag and enter the long-running sync loop.
-        if let Err(e) = client.sync_once(SyncSettings::default()).await {
+        // Both calls pin an explicit long-poll timeout (see
+        // `SYNC_LONGPOLL_TIMEOUT`) so an idle server doesn't leave the request
+        // hanging until the HTTP client's own deadline trips.
+        let sync_settings = SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT);
+        if let Err(e) = client.sync_once(sync_settings.clone()).await {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1542,7 +1569,7 @@ mod inbound {
             )));
         }
         ctx.initial_sync_done.store(true, Ordering::SeqCst);
-        client.sync(SyncSettings::default()).await.map_err(|e| {
+        client.sync(sync_settings).await.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -4406,7 +4433,7 @@ mod tests {
         use zeroclaw_api::channel::{Channel, SendMessage};
         use zeroclaw_config::schema::{MatrixConfig, StreamMode};
 
-        use super::super::{MatrixChannel, streaming_key};
+        use super::super::{MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming_key};
 
         fn env_first(primary: &str, fallback: &str) -> String {
             env::var(primary)
@@ -4455,7 +4482,7 @@ mod tests {
 
             let client = channel.ensure_client().await.expect("matrix client");
             client
-                .sync_once(SyncSettings::default())
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
                 .await
                 .expect("initial Matrix sync");
 
