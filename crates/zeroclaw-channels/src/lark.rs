@@ -230,8 +230,8 @@ const LARK_DRAFT_RATE_LIMIT_CODE: i64 = 230_020;
 /// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
 const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
 
-/// Maximum image size we will download and inline (5 MiB).
-const LARK_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum image size we will download and inline (10 MiB).
+const LARK_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum file size we will download and present as text (512 KiB).
 const LARK_FILE_MAX_BYTES: usize = 512 * 1024;
@@ -790,8 +790,11 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
-    fn image_download_url(&self, image_key: &str) -> String {
-        format!("{}/im/v1/images/{image_key}", self.api_base())
+    fn image_resource_url(&self, message_id: &str, image_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{image_key}?type=image",
+            self.api_base()
+        )
     }
 
     fn file_download_url(&self, message_id: &str, file_key: &str) -> String {
@@ -1194,7 +1197,7 @@ impl LarkChannel {
                                 Some(k) => k.to_string(),
                                 None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: image message missing image_key"); continue; }
                             };
-                            match self.download_image_as_marker(&image_key).await {
+                            match self.download_image_as_marker(&lark_msg.message_id, &image_key).await {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
@@ -1371,119 +1374,137 @@ impl LarkChannel {
     }
 
     /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(&self, image_key: &str) -> Option<String> {
-        let token = match self.get_tenant_access_token().await {
-            Ok(t) => t,
-            Err(e) => {
+    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
+        let url = self.image_resource_url(message_id, image_key);
+        let mut retried_token = false;
+
+        loop {
+            let token = match self.get_tenant_access_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "failed to get token for image download"
+                    );
+                    return None;
+                }
+            };
+
+            let resp = match self
+                .http_client()
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
+                            ),
+                        "image download request failed for"
+                    );
+                    return None;
+                }
+            };
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !retried_token {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "failed to get token for image download"
+                        .with_attrs(::serde_json::json!({"image_key": image_key})),
+                    "image download 401, refreshing token and retrying once"
+                );
+                drop(resp);
+                self.invalidate_token().await;
+                retried_token = true;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "image download failed for {image_key}: status={}",
+                        resp.status()
+                    )
                 );
                 return None;
             }
-        };
 
-        let url = self.image_download_url(image_key);
-        let resp = match self
-            .http_client()
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+            if let Some(cl) = resp.content_length()
+                && cl > LARK_IMAGE_MAX_BYTES as u64
+            {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
-                        ),
-                    "image download request failed for"
+                        .with_attrs(::serde_json::json!({"image_key": image_key, "cl": cl})),
+                    "image too large for : bytes exceeds limit"
                 );
                 return None;
             }
-        };
 
-        if !resp.status().is_success() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "image download failed for {image_key}: status={}",
-                    resp.status()
-                )
-            );
-            return None;
-        }
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
 
-        if let Some(cl) = resp.content_length()
-            && cl > LARK_IMAGE_MAX_BYTES as u64
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"image_key": image_key, "cl": cl})),
-                "image too large for : bytes exceeds limit"
-            );
-            return None;
-        }
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
+                            ),
+                        "image body read failed for"
+                    );
+                    return None;
+                }
+            };
 
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+            if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "image body empty or too large for {image_key}: {} bytes",
+                        bytes.len()
+                    )
+                );
+                return None;
+            }
 
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
+            let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
+            if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
-                        ),
-                    "image body read failed for"
+                        .with_attrs(::serde_json::json!({"image_key": image_key, "mime": mime})),
+                    "unsupported image MIME for"
                 );
                 return None;
             }
-        };
 
-        if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "image body empty or too large for {image_key}: {} bytes",
-                    bytes.len()
-                )
-            );
-            return None;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
         }
-
-        let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
-        if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"image_key": image_key, "mime": mime})),
-                "unsupported image MIME for"
-            );
-            return None;
-        }
-
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
     }
 
     /// Download a file from the Lark API and return a text content marker.
@@ -2068,7 +2089,8 @@ impl LarkChannel {
                     });
                 match image_key {
                     Some(key) => {
-                        let marker = match self.download_image_as_marker(&key).await {
+                        let marker = match self.download_image_as_marker(evt_message_id, &key).await
+                        {
                             Some(m) => m,
                             None => {
                                 ::zeroclaw_log::record!(
@@ -4152,12 +4174,8 @@ mod tests {
     }
 
     #[test]
-    fn lark_image_download_url_matches_region() {
-        let ch = make_channel();
-        assert_eq!(
-            ch.image_download_url("img_abc123"),
-            "https://open.larksuite.com/open-apis/im/v1/images/img_abc123"
-        );
+    fn lark_image_max_bytes_is_10_mib() {
+        assert_eq!(LARK_IMAGE_MAX_BYTES, 10 * 1024 * 1024);
     }
 
     #[test]
