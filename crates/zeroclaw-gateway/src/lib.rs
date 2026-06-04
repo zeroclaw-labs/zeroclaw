@@ -1817,24 +1817,28 @@ pub async fn run_gateway(
     Ok(())
 }
 
-fn format_paircode_recovery_command(host: &str, port: u16) -> String {
-    let mut cmd = format!("zeroclaw gateway get-paircode --new --port {port}");
-    if let Some(host_arg) = paircode_recovery_host_arg(host) {
-        cmd.push_str(" --host ");
-        cmd.push_str(host_arg);
-    }
-    cmd
-}
-
-fn paircode_recovery_host_arg(host: &str) -> Option<&str> {
-    match host {
-        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => None,
-        _ => Some(host),
-    }
+/// Admin paircode routes are localhost-only ([`require_localhost`]), so the
+/// recovery hint must never advertise a non-loopback `--host`: the CLI would
+/// then target an address the admin guard rejects with `403`. We omit `--host`
+/// entirely and let the CLI fall back to its loopback default. (`_host` is kept
+/// for call-site symmetry with [`format_paircode_recovery_curl`].)
+fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
+    format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
 fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
-    format!("curl -s -X POST http://{host}:{port}{path_prefix}/admin/paircode/new")
+    // Admin paircode routes are localhost-only, so the curl fallback must point
+    // at loopback. When the gateway is bound non-loopback the advertised host is
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    let recovery_host = paircode_recovery_curl_host(host);
+    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+}
+
+fn paircode_recovery_curl_host(host: &str) -> &str {
+    match host {
+        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => host,
+        _ => "127.0.0.1",
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3512,9 +3516,43 @@ mod tests {
 
     #[test]
     fn paircode_recovery_command_includes_specific_host_when_needed() {
+        // Admin paircode routes are localhost-only, so the recovery hint must
+        // not advertise a non-loopback `--host` (the admin guard would 403 it).
+        // The CLI is left to fall back to its loopback default.
         assert_eq!(
             format_paircode_recovery_command("192.168.1.20", 42617),
-            "zeroclaw gateway get-paircode --new --port 42617 --host 192.168.1.20"
+            "zeroclaw gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_uses_loopback_for_nonloopback_host() {
+        // Regression for #6561: a gateway bound to a non-loopback interface must
+        // not surface a recovery hint that the localhost-only admin guard rejects.
+        let cmd = format_paircode_recovery_command("192.168.1.20", 42617);
+        assert!(
+            !cmd.contains("192.168.1.20"),
+            "recovery command must not advertise the non-loopback bound host: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--host"),
+            "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
+        );
+
+        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        assert_eq!(
+            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            "curl fallback must target loopback, not the non-loopback bound host"
+        );
+        assert!(
+            !curl.contains("192.168.1.20"),
+            "curl fallback must not advertise the non-loopback bound host: {curl}"
+        );
+
+        // Path prefix is still preserved while the host is normalized.
+        assert_eq!(
+            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
