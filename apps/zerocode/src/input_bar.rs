@@ -483,6 +483,11 @@ impl InputBarState {
     }
 
     #[cfg(test)]
+    pub fn clipboard_temps(&self) -> &[PathBuf] {
+        &self.clipboard_temps
+    }
+
+    #[cfg(test)]
     pub fn has_file_explorer(&self) -> bool {
         self.file_explorer.is_some()
     }
@@ -663,6 +668,13 @@ impl InputBarState {
         self.scroll_offset = 0;
         self.clear_selection();
         self.dismiss_autocomplete();
+        for att in &attachments {
+            if att.source == crate::attachment::AttachmentSource::Clipboard
+                && !self.clipboard_temps.contains(&att.path)
+            {
+                self.clipboard_temps.push(att.path.clone());
+            }
+        }
         self.pending_attachments = attachments;
     }
 
@@ -673,7 +685,13 @@ impl InputBarState {
     }
 
     pub fn take_attachments(&mut self) -> Vec<PendingAttachment> {
-        std::mem::take(&mut self.pending_attachments)
+        let taken = std::mem::take(&mut self.pending_attachments);
+        for att in &taken {
+            if att.source == crate::attachment::AttachmentSource::Clipboard {
+                self.clipboard_temps.retain(|p| p != &att.path);
+            }
+        }
+        taken
     }
 
     // ── Lifecycle ────────────────────────────────────────────
@@ -1506,6 +1524,44 @@ mod tests {
         assert_eq!(bar.cursor(), 0);
         assert!(bar.pending_attachments().is_empty());
         assert!(!bar.has_file_explorer());
+    }
+
+    #[test]
+    fn taking_attachments_releases_clipboard_temp_ownership() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_release.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.add_attachment(PendingAttachment {
+            path: tmp.clone(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        });
+
+        let taken = bar.take_attachments();
+        assert_eq!(taken.len(), 1);
+        assert!(bar.clipboard_temps().is_empty());
+
+        bar.cleanup_temps();
+        assert!(tmp.exists(), "queued clipboard temp must survive cleanup");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn loading_for_edit_retakes_clipboard_temp_ownership() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_retake.png");
+        let att = PendingAttachment {
+            path: tmp.clone(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        };
+        bar.load_for_edit("edit".into(), vec![att]);
+        assert!(bar.clipboard_temps().contains(&tmp));
     }
 
     #[test]
