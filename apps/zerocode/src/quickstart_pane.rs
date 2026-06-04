@@ -113,6 +113,20 @@ fn synth_enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
 }
 
+/// The character a key press contributes to a free-text buffer (the
+/// agent-name field), or `None` for control chords and non-character
+/// keys. Letters that double as modal hotkeys on file rows — `e` (edit
+/// in $EDITOR), `t` (from template), `c` (clear), `d` (delete) — are
+/// still plain text on a text row, so this deliberately ignores the
+/// chord mapping: the hotkey arms are gated on `on_file` and never fire
+/// while the cursor is on the name field.
+fn typed_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
+        _ => None,
+    }
+}
+
 fn action_row_line(label: &str, is_cursor: bool) -> Line<'static> {
     let glyph = if is_cursor { " › " } else { "   " };
     let style = if is_cursor {
@@ -1018,7 +1032,7 @@ impl QuickstartPane {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
         };
-        use crate::keymap::{Chord, QuickstartModalAction};
+        use crate::keymap::QuickstartModalAction;
         let action = QuickstartModalAction::from_chord(&key);
         match modal {
             Modal::Picker(p) => match action {
@@ -1120,9 +1134,7 @@ impl QuickstartPane {
                     t.buf.pop();
                 }
                 _ => {
-                    if let KeyCode::Char(c) = key.code
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
+                    if let Some(c) = typed_char(&key) {
                         t.buf.push(c);
                     }
                 }
@@ -1335,15 +1347,8 @@ impl QuickstartPane {
                         a.files.insert(filename, String::new());
                     }
                     _ => {
-                        if on_name
-                            && let KeyCode::Char(c) = key.code
-                            && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            if action.is_none() {
-                                a.name.push(c);
-                            } else {
-                                let _ = Chord::char(c);
-                            }
+                        if on_name && let Some(c) = typed_char(&key) {
+                            a.name.push(c);
                         }
                     }
                 }
@@ -2312,6 +2317,34 @@ mod tests {
         let mut f = complete_form();
         f.agent_name.clear();
         assert!(!f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn name_field_accepts_hotkey_letters() {
+        // Regression: e/t/c/d double as Agent-modal hotkeys (edit in
+        // $EDITOR, from template, clear, delete) on file rows. On the
+        // name row they are plain text, but the old handler routed every
+        // keypress through the chord mapping and dropped any char that
+        // resolved to an action — so agent names could not contain those
+        // letters. `typed_char` is the text-buffer path; assert it keeps
+        // them, and that they really are bound actions (bug was reachable).
+        use crate::keymap::QuickstartModalAction;
+        for ch in ['e', 'c', 't', 'd', 'E', 'C', 'T', 'D'] {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            assert_eq!(typed_char(&key), Some(ch), "name field must accept '{ch}'");
+            assert!(
+                QuickstartModalAction::from_chord(&key).is_some(),
+                "'{ch}' must be a modal hotkey for this regression to be real"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_char_ignores_control_and_non_char_keys() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(typed_char(&ctrl_c), None);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(typed_char(&enter), None);
     }
 
     #[test]

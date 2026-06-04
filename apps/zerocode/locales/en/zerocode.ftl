@@ -211,6 +211,7 @@ zc-dashboard-help-jump-bottom = Jump to bottom
 zc-dashboard-help-jump-top = Jump to top
 zc-dashboard-help-open-detail = Open detail pane
 zc-dashboard-help-search-filter = Search / filter
+zc-dashboard-help-kill-session = Kill session
 
 zc-dashboard-yes = yes
 zc-dashboard-no = no
