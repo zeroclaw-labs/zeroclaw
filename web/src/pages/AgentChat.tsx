@@ -6,6 +6,14 @@ import remarkGfm from 'remark-gfm';
 import { AgentProvider, useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
+import {
+  COMMANDS,
+  helpText,
+  isSlashCommand,
+  matchCommands,
+  parseCommand,
+  type CommandSpec,
+} from '@/lib/slashCommands';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
@@ -45,6 +53,7 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
     modelLoading,
     deleteMessage,
     clearAllMessages,
+    addLocalMessage,
     abortSession,
     pendingApproval,
     respondToApproval,
@@ -53,6 +62,9 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
   const [input, setInput] = useState(draft);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
+  // Slash-command autocomplete popover (#7137). Shown while the input begins
+  // with a single '/' and the token still matches at least one command.
+  const [showCommandHint, setShowCommandHint] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
@@ -95,11 +107,77 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  /**
+   * Slash-command dispatcher (#7137). Returns true when `trimmed` was handled
+   * as a command (and therefore must NOT be sent to the model as a prompt).
+   * Commands drive existing session primitives — clear/reset and model switch —
+   * and surface their feedback as local info messages, never to the gateway.
+   */
+  const runCommand = useCallback((trimmed: string): boolean => {
+    if (!isSlashCommand(trimmed)) return false;
+
+    const { command, args } = parseCommand(trimmed);
+    switch (command) {
+      case 'help':
+        addLocalMessage(helpText());
+        return true;
+
+      case 'clear':
+      case 'new':
+        clearAllMessages();
+        addLocalMessage(t('agent.cmd_cleared'));
+        return true;
+
+      case 'model': {
+        const name = args.trim();
+        if (!name) {
+          const current = currentModel
+            ? t('agent.cmd_model_current').replace('{model}', currentModel)
+            : t('agent.cmd_model_none');
+          const list = availableModels.length > 0
+            ? `\n${t('agent.cmd_model_available').replace('{models}', availableModels.join(', '))}`
+            : '';
+          addLocalMessage(`${current}${list}`);
+          return true;
+        }
+        if (name === currentModel) {
+          addLocalMessage(t('agent.cmd_model_current').replace('{model}', name));
+          return true;
+        }
+        if (availableModels.length > 0 && !availableModels.includes(name)) {
+          addLocalMessage(
+            t('agent.cmd_model_unknown')
+              .replace('{model}', name)
+              .replace('{models}', availableModels.join(', ')),
+          );
+          return true;
+        }
+        addLocalMessage(t('agent.cmd_model_switching').replace('{model}', name));
+        // Reuse the existing model-switch path (config write + socket rebuild).
+        void switchModel(name).catch(() => {
+          // switchModel surfaces its own error via context `error` state.
+        });
+        return true;
+      }
+
+      default:
+        addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
+        return true;
+    }
+  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel]);
+
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed || !connected) return;
 
-    sendMessage(trimmed);
+    // A leading '/' is a command, not a prompt. Reset the input regardless so
+    // the field clears on dispatch, but never forward the raw text to the model.
+    if (isSlashCommand(trimmed)) {
+      runCommand(trimmed);
+    } else {
+      sendMessage(trimmed);
+    }
+    setShowCommandHint(false);
     setInput('');
     clearDraft();
     if (inputRef.current) {
@@ -111,6 +189,10 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   const isComposingRef = useRef(false);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape' && showCommandHint) {
+      setShowCommandHint(false);
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isComposingRef.current) {
       e.preventDefault();
       handleSend();
@@ -118,10 +200,30 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   };
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(e.target.value);
+    const value = e.target.value;
+    setInput(value);
+    // Show the command popover while typing the command token (a single
+    // leading '/' with no space yet). Hide once the user moves to arguments or
+    // the token no longer matches any command.
+    const showHint = /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1)).length > 0;
+    setShowCommandHint(showHint);
     e.target.style.height = 'auto';
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
   };
+
+  // Apply a command from the autocomplete popover: fill the input with the
+  // command and a trailing space (for arg-taking commands) or dispatch it
+  // immediately when it takes no further input.
+  const applyCommandHint = useCallback((spec: CommandSpec) => {
+    setShowCommandHint(false);
+    const takesArgs = spec.usage.includes('[');
+    setInput(`/${spec.name}${takesArgs ? ' ' : ''}`);
+    inputRef.current?.focus();
+  }, []);
+
+  const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
+    ? matchCommands(input.slice(1))
+    : COMMANDS.slice();
 
   const handleCopy = useCallback((msgId: string, content: string) => {
     const onSuccess = () => {
@@ -389,6 +491,36 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
 
       {/* Input area */}
       <div className="border-t p-4" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+        {/* Slash-command autocomplete popover (#7137) */}
+        {showCommandHint && matchedCommands.length > 0 && (
+          <div className="relative max-w-4xl mx-auto">
+            <div
+              className="absolute bottom-1 left-0 rounded-xl border shadow-lg z-50 py-1 min-w-[260px] overflow-hidden"
+              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
+            >
+              <div
+                className="px-3 py-1 text-[10px] uppercase tracking-wide"
+                style={{ color: 'var(--pc-text-faint)' }}
+              >
+                {t('agent.cmd_hint_title')}
+              </div>
+              {matchedCommands.map((spec) => (
+                <button
+                  key={spec.name}
+                  type="button"
+                  onMouseDown={(e) => { e.preventDefault(); applyCommandHint(spec); }}
+                  className="w-full text-left px-3 py-2 text-xs transition-colors flex items-center gap-2"
+                  style={{ color: 'var(--pc-text-primary)' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--pc-bg-surface)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                  <span className="font-mono font-medium" style={{ color: 'var(--pc-accent)' }}>{spec.usage}</span>
+                  <span className="truncate" style={{ color: 'var(--pc-text-muted)' }}>{t(spec.descriptionKey)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="flex items-center gap-3 max-w-4xl mx-auto">
           <textarea
             ref={inputRef}
