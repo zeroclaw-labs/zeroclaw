@@ -678,6 +678,11 @@ impl Chat {
             match action {
                 InputBarAction::Submit { text, attachments } => {
                     state.clear_info_notice();
+                    // Enter always resumes: a deliberate keystroke in the
+                    // input box is an unambiguous send intent, so a silently
+                    // paused queue must never swallow it — even if the queue
+                    // or the submitted text is empty.
+                    state.resume_queue();
                     let prompt = text.unwrap_or_default();
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
@@ -721,6 +726,15 @@ impl Chat {
                         .entries
                         .push(ChatEntry::SystemMessage(Arc::<str>::from(status)));
                     state.mark_dirty_append();
+                    return false;
+                }
+                InputBarAction::ResumeQueue => {
+                    // Empty Enter: no message to enqueue, but still resume a
+                    // paused queue and pump so any backlog dispatches.
+                    state.clear_info_notice();
+                    if state.resume_queue() {
+                        self.pump_queue();
+                    }
                     return false;
                 }
                 InputBarAction::Consumed => return false,
@@ -1379,16 +1393,33 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // pane, separate from the input box — so attach/detach/clipboard feedback
     // renders below the input box instead of polluting the conversation
     // history above it.
-    let input_area = if let Some(ref notice) = state.info_notice {
+    // Resolve what the one-row info bar shows. A transient notice (status
+    // message, attach result, etc.) takes the row when present and may
+    // freely overwrite the paused indicator. When no transient is up, a
+    // paused queue claims the row persistently with the resume chord — the
+    // paused state is sticky context, not a fire-once notice.
+    let info_line: Option<(String, Style)> = if let Some(ref notice) = state.info_notice {
+        Some((format!(" {notice}"), theme::accent_style()))
+    } else if state.queue_paused() {
+        let key = resume_queue_chord_label();
+        Some((
+            format!(
+                " {}",
+                crate::i18n::t_args("zc-queue-auto-paused", &[("key", &key)])
+            ),
+            theme::warn_style(),
+        ))
+    } else {
+        None
+    };
+
+    let input_area = if let Some((text, style)) = info_line {
         if area.height > 1 {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(area);
-            let bar = Paragraph::new(Line::from(Span::styled(
-                format!(" {notice}"),
-                theme::accent_style(),
-            )));
+            let bar = Paragraph::new(Line::from(Span::styled(text, style)));
             f.render_widget(bar, rows[1]);
             rows[0]
         } else {
@@ -1474,6 +1505,14 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.input_bar.render_explorer_overlay(f, area);
 }
 
+fn resume_queue_chord_label() -> String {
+    crate::keymap::ChatTabAction::PauseResumeQueue
+        .default_chords()
+        .first()
+        .map(|c| c.display())
+        .unwrap_or_else(|| "Alt+P".to_string())
+}
+
 fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
     let title = crate::i18n::t_args(
         "zc-queue-title",
@@ -1491,11 +1530,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
 
     let mut rows: Vec<Line<'static>> = Vec::new();
     if state.queue_paused() {
-        let key = crate::keymap::ChatTabAction::PauseResumeQueue
-            .default_chords()
-            .first()
-            .map(|c| c.display())
-            .unwrap_or_else(|| "Alt+P".to_string());
+        let key = resume_queue_chord_label();
         rows.push(Line::from(Span::styled(
             crate::i18n::t_args("zc-queue-paused", &[("key", &key)]),
             theme::warn_style(),
@@ -3149,6 +3184,9 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.input_bar.cleanup_temps();
         if !clean {
+            // Auto-pause on a non-clean turn end (cancel/fail). The paused
+            // indicator is surfaced persistently by the info-bar render, so
+            // no one-shot notice is needed here.
             self.queue_paused = true;
         }
     }
@@ -3276,6 +3314,16 @@ impl ChatState {
 
     pub fn queue_paused(&self) -> bool {
         self.queue_paused
+    }
+
+    /// Force the queue out of the paused state. Returns true if it was paused.
+    /// Enter (Submit) always resumes — a deliberate keystroke in the input box
+    /// is an unambiguous "I want this to go," and a silently-paused queue
+    /// swallowing it is the failure mode this guards against.
+    pub fn resume_queue(&mut self) -> bool {
+        let was_paused = self.queue_paused;
+        self.queue_paused = false;
+        was_paused
     }
 
     pub fn queue_len(&self) -> usize {
@@ -4148,6 +4196,36 @@ mod tests {
         assert_eq!(text, "draft");
         assert_eq!(atts.len(), 1);
         assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn resume_queue_unpauses_and_reports_prior_state() {
+        let mut s = state();
+        s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
+        s.commit_turn(String::new(), false);
+        assert!(s.queue_paused(), "non-clean turn end must pause");
+        assert!(
+            s.resume_queue(),
+            "resume_queue returns true when it was paused"
+        );
+        assert!(!s.queue_paused());
+        assert!(
+            !s.resume_queue(),
+            "resume_queue returns false when already running"
+        );
+    }
+
+    #[test]
+    fn resume_then_dispatch_after_auto_pause() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
+        // Turn cancelled/failed mid-flight -> auto-pause.
+        s.commit_turn(String::new(), false);
+        assert!(s.take_next_dispatchable().is_none(), "paused: no dispatch");
+        // Enter resumes; backlog now dispatches.
+        s.resume_queue();
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "queued");
     }
 
     #[test]

@@ -53,6 +53,10 @@ pub(crate) enum InputBarAction {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
     },
+    /// Empty Enter (no text, no attachments). Carries no payload but is still
+    /// a deliberate keystroke — the parent uses it to resume a paused queue so
+    /// a silent pause can never trap the user.
+    ResumeQueue,
     /// Status message to show in conversation (e.g. "Attached: photo.png").
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
@@ -1032,7 +1036,7 @@ impl InputBarState {
                 attachments,
             }
         } else {
-            InputBarAction::Consumed
+            InputBarAction::ResumeQueue
         }
     }
 
@@ -1493,11 +1497,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_enter_with_no_attachments_consumed() {
-        let _bar = InputBarState::new();
-        // Empty input, no attachments -> Consumed (nothing to do)
-        // Can't easily test handle_enter directly without take_input side effects,
-        // but we test the handle_key path.
+    fn empty_enter_resumes_queue() {
+        let mut bar = InputBarState::new();
+        // Empty input, no attachments -> ResumeQueue: a deliberate Enter must
+        // never be silently swallowed; the parent uses it to unpause.
+        assert!(matches!(bar.handle_enter(), InputBarAction::ResumeQueue));
     }
 
     #[test]

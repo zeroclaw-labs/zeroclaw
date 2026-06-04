@@ -94,6 +94,7 @@ zc-queue-paused = Paused — press { $key } to resume
 zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
 zc-queue-paused-notice = Queue paused.
+zc-queue-auto-paused = Turn ended early — queue paused. Press { $key } to resume.
 zc-queue-help-toggle = Toggle queue
 zc-queue-help-resume = Pause/resume queue
 zc-queue-help-nav = Select queued
