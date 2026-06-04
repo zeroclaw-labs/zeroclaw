@@ -2473,6 +2473,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_options_from_config_propagates_tls_ca_cert_path() {
+        // Regression guard: tls_ca_cert_path on a ModelProviderConfig entry must
+        // reach ModelProviderRuntimeOptions so apply_compat_options can call
+        // with_tls_ca_cert_path on the provider. Same pattern as native_tools above.
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "corp".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    tls_ca_cert_path: Some("/tmp/example-ca.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let entry = config.providers.models.find("openai", "corp");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
+        assert_eq!(
+            options.tls_ca_cert_path.as_deref(),
+            Some("/tmp/example-ca.pem"),
+            "tls_ca_cert_path must propagate from ModelProviderConfig to ModelProviderRuntimeOptions"
+        );
+    }
+
+    #[test]
     fn provider_runtime_options_from_config_propagates_provider_kind() {
         use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
         let mut config = zeroclaw_config::schema::Config::default();
