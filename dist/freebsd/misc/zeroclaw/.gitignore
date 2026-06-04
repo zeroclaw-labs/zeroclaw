@@ -1,0 +1,5 @@
+# distinfo and the CARGO_CRATES list are generated from Cargo.lock on a FreeBSD
+# host (`make cargo-crates-merge` + `make makesum`), never hand-authored. Do not
+# commit them — they would rot on every release.
+distinfo
+Makefile.crates

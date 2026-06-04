@@ -1,0 +1,116 @@
+name: Pub FreeBSD Port
+
+# FreeBSD ports are not auto-pushed like AUR/scoop — submission goes through the
+# FreeBSD bugzilla/maintainer flow. On release this job regenerates the port's
+# distinfo + CARGO_CRATES from the tag's Cargo.lock using the real ports
+# framework in a FreeBSD VM, bumps DISTVERSION, validates with portlint, and
+# uploads the bumped port as a release artifact for the maintainer to submit.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate + validate only (no artifact upload)"
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate + validate only (no artifact upload)"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: freebsd-publish-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish-freebsd:
+    name: Generate FreeBSD Port
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_tag must be vX.Y.Z (optional pre-release suffix)."
+            exit 1
+          fi
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate port in a FreeBSD VM
+        uses: vmactions/freebsd-vm@a6de9343ef5747433d9c25784c90e84998b9d69a # v1.4.6
+        with:
+          release: "14.2"
+          usesh: true
+          prepare: |
+            pkg install -y rust git gmake ports-mgmt/portlint ports-mgmt/portfmt
+            portsnap --interactive fetch extract || true
+          run: |
+            set -eu
+            version="${RELEASE_TAG#v}"
+            portdir=/usr/ports/misc/zeroclaw
+            mkdir -p "$portdir"
+            cp dist/freebsd/misc/zeroclaw/Makefile "$portdir/"
+            cp dist/freebsd/misc/zeroclaw/pkg-descr "$portdir/"
+
+            # Bump DISTVERSION to the released tag.
+            sed -i '' -E "s|^DISTVERSION=[[:space:]]+.*|DISTVERSION=	${version}|" \
+              "$portdir/Makefile"
+
+            # Regenerate CARGO_CRATES + distinfo from the tag's Cargo.lock using
+            # the framework's own target — the port carries no committed list.
+            make -C "$portdir" cargo-crates-merge
+
+            # Validate.
+            portfmt -i "$portdir/Makefile"
+            portlint -AC "$portdir"
+
+            # Stage the generated artifacts back into the workspace for upload.
+            cp "$portdir/Makefile" dist/freebsd/misc/zeroclaw/Makefile
+            cp "$portdir/distinfo" dist/freebsd/misc/zeroclaw/distinfo
+
+      - name: Package the port artifact
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          tarball="zeroclaw-freebsd-port-${version}.tar.gz"
+          tar -czf "$tarball" -C dist/freebsd/misc zeroclaw
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          {
+            echo "### FreeBSD port for ${RELEASE_TAG}"
+            echo "Generated \`distinfo\` + \`CARGO_CRATES\` from the tag's Cargo.lock."
+            echo "Submit via the FreeBSD ports bugzilla (maintainer flow)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to the release
+        if: ${{ inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "${{ steps.pkg.outputs.tarball }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber

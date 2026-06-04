@@ -21,8 +21,12 @@ Last verified: **May 2026** (v0.7.4 cycle).
 6. Verify the release exists and assets are downloadable
 
 That is the entire process. Everything else (Docker, crates.io, Scoop, AUR,
-Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
-need to do anything for those unless a job explicitly fails.
+Homebrew, FreeBSD, Discord, tweet) runs automatically as downstream jobs. You do
+not need to do anything for those unless a job explicitly fails. FreeBSD is the
+one exception that needs a manual final step: its job generates and validates
+the bumped port and uploads it as a release artifact, but submission to the
+FreeBSD ports tree goes through the bugzilla/maintainer flow (it cannot be
+auto-pushed like AUR/Scoop).
 
 ---
 
@@ -339,10 +343,12 @@ git commit -m "chore: remove CHANGELOG-next.md after vX.Y.Z release"
 git push origin master
 ```
 
-**A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
+**A distribution channel job failed (Scoop, AUR, Homebrew, FreeBSD):** Each has a
 corresponding manually-triggerable sub-workflow. Re-run the specific one with
 `dry_run: true` first to confirm the fix, then `dry_run: false`. These are
-nice-to-have — a failed Scoop job does not invalidate the release itself.
+nice-to-have — a failed Scoop job does not invalidate the release itself. For
+FreeBSD, the workflow only produces a release artifact; actual ports-tree
+submission is the maintainer's bugzilla step.
 
 ---
 

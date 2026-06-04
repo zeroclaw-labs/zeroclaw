@@ -56,6 +56,7 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 | Workflow | What it does |
 |---|---|
 | `pub-aur.yml` | Updates the Arch User Repository `PKGBUILD` and pushes to the AUR |
+| `pub-freebsd.yml` | Regenerates the FreeBSD port's `distinfo`/`CARGO_CRATES` in a FreeBSD VM and uploads the bumped port as a release artifact (ports-tree submission is the maintainer's bugzilla step — no auto-push) |
 | `pub-homebrew-core.yml` | Opens a PR against `homebrew/homebrew-core` with the new version |
 | `pub-scoop.yml` | Updates the Scoop manifest for Windows |
 

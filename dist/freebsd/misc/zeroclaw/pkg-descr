@@ -1,0 +1,3 @@
+ZeroClaw is a fast, small, 100% Rust AI assistant and agent CLI. It drives
+local and hosted model providers, supports multi-agent workflows, pluggable
+chat channels, and a local gateway.

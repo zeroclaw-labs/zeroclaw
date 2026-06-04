@@ -63,7 +63,7 @@ The duplication has a subtler cost beyond compute minutes: when a check fails in
 
 ### 2.2 Single-Binary Assumptions Are Baked In Everywhere
 
-The release automation — `release-stable-manual.yml`, `release-beta-on-push.yml`, `publish-crates.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` — was designed around the assumption that a release is one binary. You build it, sign it, push it to package managers, and announce it.
+The release automation — `release-stable-manual.yml`, `release-beta-on-push.yml`, `publish-crates.yml`, `pub-aur.yml`, `pub-freebsd.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` — was designed around the assumption that a release is one binary. You build it, sign it, push it to package managers, and announce it.
 
 The architecture RFC defines a distribution model with five distinct artifact types: the kernel binary (multiple platform targets), the hardware-variant kernel binary, the gateway binary, WASM plugin files, and the Tauri desktop installer. None of the current release workflows account for this structure. When the architecture transition reaches Phase 3 and Phase 4, every one of these workflows will need to change — unless they are redesigned now with that model in mind.
 
@@ -286,6 +286,7 @@ version-bump (release-plz PR merged)
             ├── publish-github-release (attaches all kernel + gateway binaries)
             ├── publish-plugin-registry (uploads WASM files)
             ├── publish-aur (kernel binary for Arch Linux)
+            ├── publish-freebsd (port artifact for FreeBSD ports tree)
             ├── publish-homebrew (kernel binary for macOS)
             ├── publish-scoop (kernel binary for Windows)
             └── announce (Discord, social)
@@ -493,7 +494,7 @@ Add `actions/attest-build-provenance` to each build job. Provenance attestations
 
 **D4: Retire redundant release workflows**
 
-Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` into the structured `release.yml` pipeline. These workflows grew independently; the structured pipeline replaces them with a single, auditable flow.
+Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.yml`, `pub-freebsd.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` into the structured `release.yml` pipeline. These workflows grew independently; the structured pipeline replaces them with a single, auditable flow.
 
 #### Success Metrics for Phase 3
 
