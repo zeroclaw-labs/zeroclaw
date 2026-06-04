@@ -1095,6 +1095,20 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("llama.cpp");
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p = crate::openai::OpenAiResponsesModelProvider::new(
+                alias,
+                Some(base_url),
+                Some(llama_cpp_key),
+            );
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
             "llama.cpp",
@@ -1387,5 +1401,40 @@ mod tests {
         );
 
         assert_eq!(provider.credential.as_deref(), Some("ollama-key"));
+    }
+
+    #[test]
+    fn llamacpp_factory_routes_to_responses_provider_when_wire_api_responses() {
+        use zeroclaw_config::schema::{LlamacppModelProviderConfig, ModelProviderConfig, WireApi};
+        let cfg = LlamacppModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                Some("http://localhost:8080/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn llamacpp_factory_defaults_to_chat_completions_without_wire_api() {
+        use zeroclaw_config::schema::LlamacppModelProviderConfig;
+        let cfg = LlamacppModelProviderConfig::default();
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                Some("http://localhost:8080/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
     }
 }
