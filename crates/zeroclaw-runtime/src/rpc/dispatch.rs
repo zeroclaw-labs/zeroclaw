@@ -552,28 +552,6 @@ impl RpcDispatcher {
         };
 
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
-        let reclaimed = self.ctx.sessions.reclaim(&tui_id).await;
-        for (session_key, agent_alias) in &reclaimed {
-            use ::zeroclaw_log::Instrument as _;
-            let span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                session_key = %session_key,
-                agent_alias = %agent_alias,
-                owner_tui_id = %tui_id,
-                channel = "rpc",
-            );
-            async {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Agent),
-                    "TUI reconnected within grace; session reclaimed"
-                );
-            }
-            .instrument(span)
-            .await;
-        }
         self.ctx
             .tui_registry
             .register(super::tui_identity::TuiEntry {
