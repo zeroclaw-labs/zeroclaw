@@ -1039,6 +1039,22 @@ impl Chat {
             use crossterm::event::{KeyModifiers as KM, MouseButton};
             let col = mouse.column;
             let row = mouse.row;
+
+            // Queue sidebar intercepts mouse events over its area before the
+            // conversation handler, so clicks select queued items and the wheel
+            // scrolls the queue rather than the transcript.
+            if state.show_queue_sidebar && state.point_in_queue_sidebar(col, row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
+                    MouseEventKind::ScrollDown => state.queue_scroll_by(3),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        state.queue_click_at(col, row);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
@@ -1571,7 +1587,7 @@ fn chord_label_pair(
     Box::leak(format!("{}/{}", render(a), render(b)).into_boxed_str())
 }
 
-fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let title = crate::i18n::t_args(
         "zc-queue-title",
         &[("count", &state.queue_len().to_string())],
@@ -1582,18 +1598,26 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
+    state.queue_item_rects.clear();
+    state.queue_sidebar_rect = None;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    state.queue_sidebar_rect = Some(inner);
 
+    // Build the row list, recording which rendered row index owns which queued
+    // message id so a click can be mapped back to an item after scrolling.
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row_owner: Vec<Option<u64>> = Vec::new();
     if state.queue_paused() {
         let key = resume_queue_chord_label();
         rows.push(Line::from(Span::styled(
             crate::i18n::t_args("zc-queue-paused", &[("key", &key)]),
             theme::warn_style(),
         )));
+        row_owner.push(None);
         rows.push(Line::from(""));
+        row_owner.push(None);
     }
 
     if state.message_queue.is_empty() {
@@ -1601,6 +1625,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
             crate::i18n::t("zc-queue-empty-list"),
             theme::dim_style(),
         )));
+        row_owner.push(None);
     } else {
         for (idx, msg) in state.message_queue.iter().enumerate() {
             let selected = state.queue_sel == Some(msg.id);
@@ -1621,12 +1646,38 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
                 Span::styled(format!(" {preview}"), head_style),
                 Span::styled(tag, theme::dim_style()),
             ]));
+            row_owner.push(Some(msg.id));
             for att in &msg.attachments {
                 rows.push(Line::from(Span::styled(
                     format!("    📎 {}", att.filename),
                     theme::dim_style(),
                 )));
+                row_owner.push(Some(msg.id));
             }
+        }
+    }
+
+    // Clamp the scroll offset to the content that overflows the inner height,
+    // then record on-screen rects for the visible item rows.
+    let total = rows.len() as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    if state.queue_scroll > max_scroll {
+        state.queue_scroll = max_scroll;
+    }
+    let scroll = state.queue_scroll;
+    for (i, owner) in row_owner.iter().enumerate() {
+        let row_i = i as u16;
+        if row_i < scroll {
+            continue;
+        }
+        let screen_y = inner.y + (row_i - scroll);
+        if screen_y >= inner.y + inner.height {
+            break;
+        }
+        if let Some(id) = owner {
+            state
+                .queue_item_rects
+                .push((*id, Rect::new(inner.x, screen_y, inner.width, 1)));
         }
     }
 
@@ -1634,7 +1685,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
     // width hard-truncates. Wrapping made long messages spill onto extra rows
     // and pushed the queue out of alignment; the preview is already clipped to
     // the inner width above, and ratatui truncates anything still too wide.
-    let para = Paragraph::new(rows);
+    let para = Paragraph::new(rows).scroll((scroll, 0));
     f.render_widget(para, inner);
 }
 
@@ -2729,6 +2780,13 @@ pub struct ChatState {
     queue_sidebar_pct: u16,
     /// Selected queued message id for sidebar edit/delete.
     queue_sel: Option<u64>,
+    /// Per-item clickable rects from the last sidebar draw, mapping a queued
+    /// message id to its header-row rect. Drives left-click selection.
+    queue_item_rects: Vec<(u64, ratatui::layout::Rect)>,
+    /// Inner sidebar rect from the last draw, for scroll-wheel hit-testing.
+    queue_sidebar_rect: Option<ratatui::layout::Rect>,
+    /// Scroll offset (in rendered rows) into the queue sidebar.
+    queue_scroll: u16,
     /// Transient one-row info notice rendered in a dedicated bar below the
     /// input box. Holds short user-facing feedback (attach/detach/clipboard)
     /// that does not belong in the persisted conversation history. Cleared on
@@ -2780,6 +2838,9 @@ impl ChatState {
             show_queue_sidebar: false,
             queue_sidebar_pct: 30,
             queue_sel: None,
+            queue_item_rects: Vec::new(),
+            queue_sidebar_rect: None,
+            queue_scroll: 0,
             info_notice: None,
         }
     }
@@ -3407,6 +3468,48 @@ impl ChatState {
             self.queue_sel = self.message_queue.front().map(|m| m.id);
         }
         self.mark_dirty_full();
+    }
+
+    /// Select a queued item by id (mouse left-click in the sidebar). Ignores
+    /// ids no longer present. Returns true when the selection changed.
+    pub fn select_queued_by_id(&mut self, id: u64) -> bool {
+        if self.message_queue.iter().any(|m| m.id == id) && self.queue_sel != Some(id) {
+            self.queue_sel = Some(id);
+            self.mark_dirty_full();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hit-test a screen point against the last sidebar draw and select the
+    /// queued item under it, if any. Returns true when something was selected.
+    pub fn queue_click_at(&mut self, col: u16, row: u16) -> bool {
+        let hit = self
+            .queue_item_rects
+            .iter()
+            .find(|(_, r)| mouse::in_rect(col, row, *r))
+            .map(|(id, _)| *id);
+        match hit {
+            Some(id) => self.select_queued_by_id(id),
+            None => false,
+        }
+    }
+
+    /// True when the point lies within the last drawn sidebar inner rect.
+    pub fn point_in_queue_sidebar(&self, col: u16, row: u16) -> bool {
+        self.queue_sidebar_rect
+            .is_some_and(|r| mouse::in_rect(col, row, r))
+    }
+
+    /// Scroll the queue sidebar by `delta` rows (negative = up). Clamped to the
+    /// content overflow recorded on the last draw.
+    pub fn queue_scroll_by(&mut self, delta: i16) {
+        let new = (self.queue_scroll as i32 + delta as i32).max(0) as u16;
+        if new != self.queue_scroll {
+            self.queue_scroll = new;
+            self.mark_dirty_full();
+        }
     }
 
     /// Widen the queue sidebar (Shift+Left). Clamped so the chat column keeps a
@@ -4184,6 +4287,33 @@ mod tests {
             .expect("idle queue must dispatch");
         assert_eq!(msg.text, "hello");
         assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn select_queued_by_id_sets_selection() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        let second = s.message_queue[1].id;
+        assert!(s.select_queued_by_id(second));
+        assert_eq!(s.queue_sel, Some(second));
+        // Re-selecting the same id reports no change.
+        assert!(!s.select_queued_by_id(second));
+        // Unknown id is ignored.
+        assert!(!s.select_queued_by_id(9999));
+        assert_eq!(s.queue_sel, Some(second));
+    }
+
+    #[test]
+    fn queue_scroll_by_clamps_at_zero() {
+        let mut s = state();
+        s.queue_scroll_by(-5);
+        assert_eq!(s.queue_scroll, 0);
+        s.queue_scroll_by(4);
+        assert_eq!(s.queue_scroll, 4);
+        s.queue_scroll_by(-10);
+        assert_eq!(s.queue_scroll, 0);
     }
 
     #[test]
