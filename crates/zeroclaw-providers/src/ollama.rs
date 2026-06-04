@@ -410,6 +410,7 @@ impl OllamaModelProvider {
         "I couldn't get a complete response from Ollama. Please try again or switch to a different model."
             .to_string()
     }
+    #[cfg(any(test, doc))]
     fn build_chat_request(
         &self,
         messages: Vec<Message>,
