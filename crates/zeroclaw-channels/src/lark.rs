@@ -742,6 +742,13 @@ impl LarkChannel {
         ch
     }
 
+    /// Override the default approval timeout (300s) — set by the
+    /// orchestrator from `[channels.lark.<alias>].approval_timeout_secs`.
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
+    }
+
     pub fn with_transcription(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
@@ -4117,6 +4124,7 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -4140,6 +4148,7 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -4174,6 +4183,7 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
@@ -4200,6 +4210,7 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
         };
 
         let ch =
@@ -4208,6 +4219,31 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+    }
+
+    #[test]
+    fn lark_with_approval_timeout_secs_propagates_value() {
+        use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
+
+        let cfg = LarkConfig {
+            enabled: true,
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            mention_only: false,
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+            excluded_tools: vec![],
+            approval_timeout_secs: 456,
+        };
+
+        let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]))
+            .with_approval_timeout_secs(cfg.approval_timeout_secs);
+
+        assert_eq!(ch.approval_timeout_secs, 456);
     }
 
     #[tokio::test]
@@ -4407,6 +4443,7 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
         };
         let ch_feishu = LarkChannel::from_config(
             &feishu_cfg,
@@ -5337,6 +5374,7 @@ mod tests {
             use_feishu: false,
             app_id: "cli_test_app_id".to_string(),
             app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
             ..Default::default()
         };
         let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
@@ -5371,6 +5409,7 @@ mod tests {
             use_feishu: true,
             app_id: "cli_test_app_id".to_string(),
             app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
             ..Default::default()
         };
         let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));

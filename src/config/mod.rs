@@ -134,6 +134,7 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
         };
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
