@@ -35,7 +35,13 @@ const MAX_INPUT_ROWS: u16 = 5;
 const CURSOR_BLINK_MS: u128 = 500;
 
 /// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &["/attach", "/attachments", "/detach", "/toggle-thinking"];
+const SLASH_COMMANDS: &[&str] = &[
+    "/attach",
+    "/attachments",
+    "/clear-queue",
+    "/detach",
+    "/toggle-thinking",
+];
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -57,6 +63,10 @@ pub(crate) enum InputBarAction {
     /// a deliberate keystroke — the parent uses it to resume a paused queue so
     /// a silent pause can never trap the user.
     ResumeQueue,
+    /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
+    /// it hands removal up to the parent. None = clear all; Some(N) = the
+    /// 1-based queue position (Some(0) is an invalid-index sentinel).
+    ClearQueue(Option<usize>),
     /// Status message to show in conversation (e.g. "Attached: photo.png").
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
@@ -71,6 +81,10 @@ enum SlashCommand<'a> {
     Attach(&'a str),
     Detach(Option<usize>),
     ListAttachments,
+    /// `/clear-queue` (None = clear all) or `/clear-queue N` (Some(N), 1-based).
+    /// A malformed index parses to `Some(0)` so the handler can reject it
+    /// rather than silently clearing the whole queue.
+    ClearQueue(Option<usize>),
     ToggleThinking,
     NotACommand,
 }
@@ -85,6 +99,12 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::Detach(idx.trim().parse().ok())
     } else if trimmed == "/detach" {
         SlashCommand::Detach(None)
+    } else if let Some(arg) = trimmed.strip_prefix("/clear-queue ") {
+        // Malformed index -> Some(0): an invalid index, never a clear-all, so a
+        // typo cannot wipe the whole queue. Only the bare form clears all.
+        SlashCommand::ClearQueue(Some(arg.trim().parse().unwrap_or(0)))
+    } else if trimmed == "/clear-queue" {
+        SlashCommand::ClearQueue(None)
     } else if trimmed == "/attachments" {
         SlashCommand::ListAttachments
     } else if trimmed == "/toggle-thinking" {
@@ -1019,6 +1039,7 @@ impl InputBarState {
                         ))
                     }
                 }
+                SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::NotACommand => {
                     let attachments = self.take_attachments();
@@ -1539,6 +1560,18 @@ mod tests {
         assert!(matches!(
             parse_slash_command("/attachments"),
             SlashCommand::ListAttachments
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue"),
+            SlashCommand::ClearQueue(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue 2"),
+            SlashCommand::ClearQueue(Some(2))
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue xyz"),
+            SlashCommand::ClearQueue(Some(0))
         ));
         assert!(matches!(
             parse_slash_command("/toggle-thinking"),

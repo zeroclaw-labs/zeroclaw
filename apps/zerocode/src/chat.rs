@@ -728,6 +728,11 @@ impl Chat {
                     state.mark_dirty_append();
                     return false;
                 }
+                InputBarAction::ClearQueue(idx) => {
+                    let notice = state.clear_queue_cmd(idx);
+                    state.set_info_notice(notice);
+                    return false;
+                }
                 InputBarAction::ResumeQueue => {
                     // Empty Enter: no message to enqueue, but still resume a
                     // paused queue and pump so any backlog dispatches.
@@ -1225,7 +1230,7 @@ impl crate::widgets::HelpContext for Chat {
                     ]);
                 }
                 if state.turn_in_flight {
-                    return HelpNode::entries(vec![
+                    let mut entries = vec![
                         E::new(
                             vec!["Ctrl+C", "Esc"],
                             crate::i18n::t("zc-chat-help-cancel-turn"),
@@ -1233,10 +1238,17 @@ impl crate::widgets::HelpContext for Chat {
                         E::key("Enter", crate::i18n::t("zc-queue-help-enqueue")),
                         E::key("Ctrl+Enter", crate::i18n::t("zc-queue-help-inject")),
                         E::key("Alt+Q", crate::i18n::t("zc-queue-help-toggle")),
-                    ]);
+                    ];
+                    // Queue-management keys are only live while the sidebar is
+                    // open — surface them here too so a mid-turn open queue is
+                    // not left without its own controls.
+                    if state.show_queue_sidebar {
+                        entries.extend(queue_sidebar_help_entries());
+                    }
+                    return HelpNode::entries(entries);
                 }
                 // Idle: compose pane-level bindings + input bar as child.
-                let pane = HelpNode::entries(vec![
+                let mut pane_entries = vec![
                     E::key("Ctrl+↑", crate::i18n::t("zc-chat-help-browse-mode")),
                     E::key(
                         "Shift+↑/↓",
@@ -1253,26 +1265,16 @@ impl crate::widgets::HelpContext for Chat {
                     E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
                     E::spacer(),
                     E::key(
-                        Box::leak(
-                            ChatTabAction::ToggleQueue.default_chords()[0]
-                                .display()
-                                .into_boxed_str(),
-                        ),
+                        chord_label(ChatTabAction::ToggleQueue),
                         crate::i18n::t("zc-queue-help-toggle"),
                     ),
                     E::key(
-                        Box::leak(
-                            ChatTabAction::PauseResumeQueue.default_chords()[0]
-                                .display()
-                                .into_boxed_str(),
-                        ),
+                        chord_label(ChatTabAction::PauseResumeQueue),
                         crate::i18n::t("zc-queue-help-resume"),
                     ),
-                    E::key("Alt+↑/↓", crate::i18n::t("zc-queue-help-nav")),
-                    E::key("Alt+X", crate::i18n::t("zc-queue-help-delete")),
-                    E::key("Alt+E", crate::i18n::t("zc-queue-help-edit")),
-                    E::key("Shift+←/→", crate::i18n::t("zc-queue-help-resize")),
-                ]);
+                ];
+                pane_entries.extend(queue_sidebar_help_entries());
+                let pane = HelpNode::entries(pane_entries);
                 pane.with_child(state.input_bar.help_context())
             }
         }
@@ -1511,6 +1513,62 @@ fn resume_queue_chord_label() -> String {
         .first()
         .map(|c| c.display())
         .unwrap_or_else(|| "Alt+P".to_string())
+}
+
+/// Queue-management help entries shown whenever the queue sidebar is open —
+/// both mid-turn and idle. Keeping this in one place stops the two call sites
+/// from drifting apart. Every key label is derived from the keymap registry,
+/// never hardcoded, so rebinds stay reflected in help.
+fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
+    use crate::keymap::ChatTabAction as A;
+    use crate::widgets::HelpEntry as E;
+    vec![
+        E::key(
+            chord_label_pair(A::QueueNavUp, A::QueueNavDown),
+            crate::i18n::t("zc-queue-help-nav"),
+        ),
+        E::key(
+            chord_label(A::QueueDelete),
+            crate::i18n::t("zc-queue-help-delete"),
+        ),
+        E::key("/clear-queue", crate::i18n::t("zc-queue-help-clear")),
+        E::key(
+            chord_label(A::QueueEdit),
+            crate::i18n::t("zc-queue-help-edit"),
+        ),
+        E::key(
+            chord_label_pair(A::QueueWiden, A::QueueNarrow),
+            crate::i18n::t("zc-queue-help-resize"),
+        ),
+    ]
+}
+
+/// Render an action's primary bound chord as a `&'static str` for help entries.
+/// `HelpEntry::key` requires `'static`, and chord display is computed at
+/// runtime, so the label is leaked — help is built once per popup open.
+fn chord_label(action: crate::keymap::ChatTabAction) -> &'static str {
+    let label = action
+        .default_chords()
+        .first()
+        .map(|c| c.display())
+        .unwrap_or_default();
+    Box::leak(label.into_boxed_str())
+}
+
+/// Like `chord_label` but joins two actions' chords as `A/B` (e.g. the up/down
+/// or widen/narrow pairs that share one help row).
+fn chord_label_pair(
+    a: crate::keymap::ChatTabAction,
+    b: crate::keymap::ChatTabAction,
+) -> &'static str {
+    let render = |action: crate::keymap::ChatTabAction| {
+        action
+            .default_chords()
+            .first()
+            .map(|c| c.display())
+            .unwrap_or_default()
+    };
+    Box::leak(format!("{}/{}", render(a), render(b)).into_boxed_str())
 }
 
 fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -3419,6 +3477,45 @@ impl ChatState {
         Some((msg.text, msg.attachments))
     }
 
+    /// Slash-command queue removal. `None` clears the whole queue; `Some(n)`
+    /// removes the 1-based item shown in the sidebar. Returns a user-facing
+    /// info-bar message. `Some(0)` is the invalid-index sentinel from a
+    /// malformed `/clear-queue` arg.
+    pub fn clear_queue_cmd(&mut self, index: Option<usize>) -> String {
+        let count = self.message_queue.len();
+        match index {
+            None => {
+                if count == 0 {
+                    return crate::i18n::t("zc-queue-clear-empty");
+                }
+                self.clear_queue();
+                self.mark_dirty_full();
+                crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())])
+            }
+            Some(n) => {
+                if count == 0 {
+                    return crate::i18n::t("zc-queue-clear-empty");
+                }
+                if n == 0 || n > count {
+                    return crate::i18n::t_args(
+                        "zc-queue-clear-invalid",
+                        &[("index", &n.to_string()), ("count", &count.to_string())],
+                    );
+                }
+                let pos = n - 1;
+                if let Some(msg) = self.message_queue.remove(pos) {
+                    cleanup_attachment_temps(&msg.attachments);
+                    if self.queue_sel == Some(msg.id) {
+                        let ids = self.editable_ids();
+                        self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
+                    }
+                }
+                self.mark_dirty_full();
+                crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())])
+            }
+        }
+    }
+
     fn clear_queue(&mut self) {
         for msg in self.message_queue.drain(..) {
             cleanup_attachment_temps(&msg.attachments);
@@ -4196,6 +4293,42 @@ mod tests {
         assert_eq!(text, "draft");
         assert_eq!(atts.len(), 1);
         assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn clear_queue_cmd_removes_one_by_index() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("c".to_string(), Vec::new()).unwrap();
+        // 1-based: remove the second item ("b").
+        s.clear_queue_cmd(Some(2));
+        assert_eq!(s.queue_len(), 2);
+        s.turn_in_flight = false;
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "a");
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "c");
+    }
+
+    #[test]
+    fn clear_queue_cmd_none_clears_all() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.clear_queue_cmd(None);
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn clear_queue_cmd_invalid_index_is_a_noop() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        // Out of range and the Some(0) sentinel must not remove anything.
+        s.clear_queue_cmd(Some(9));
+        s.clear_queue_cmd(Some(0));
+        assert_eq!(s.queue_len(), 1);
     }
 
     #[test]

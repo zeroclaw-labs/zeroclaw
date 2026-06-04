@@ -95,10 +95,15 @@ zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
 zc-queue-paused-notice = Queue paused.
 zc-queue-auto-paused = Turn ended early — queue paused. Press { $key } to resume.
+zc-queue-clear-empty = Queue is already empty.
+zc-queue-cleared-all = Cleared { $count } queued message(s).
+zc-queue-cleared-one = Cleared queued message { $index }.
+zc-queue-clear-invalid = No queued message at index { $index } (queue has { $count }).
 zc-queue-help-toggle = Toggle queue
 zc-queue-help-resume = Pause/resume queue
 zc-queue-help-nav = Select queued
 zc-queue-help-delete = Delete queued
+zc-queue-help-clear = Clear queue ([N] = position)
 zc-queue-help-edit = Edit queued
 zc-queue-help-resize = Resize queue
 zc-queue-help-enqueue = Queue message
