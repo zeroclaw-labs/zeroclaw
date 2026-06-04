@@ -1414,6 +1414,33 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
+        // A model_provider override needs a live provider-box rebuild, which
+        // requires Config — held here, not in the session store. Resolve the
+        // model from the (already-merged) model override or the configured
+        // entry, build the box, and swap it onto the session's agent.
+        if let Some(ref model_provider_ref) = merged.model_provider {
+            let built = {
+                let config = self.ctx.config.read();
+                crate::agent::agent::build_session_model_provider(
+                    &config,
+                    model_provider_ref,
+                    merged.model.as_deref(),
+                )
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
+            };
+            let (model_provider, model_provider_name, model_name) = built;
+            self.ctx
+                .sessions
+                .apply_model_provider(&req.session_id, model_provider, model_provider_name)
+                .await
+                .then_some(())
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            // Keep the agent's model name aligned with the model_provider it now holds.
+            if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+                agent.lock().await.set_model_name(model_name);
+            }
+        }
+
         to_result(SessionConfigureResult {
             session_id: req.session_id,
             overrides: merged,

@@ -419,6 +419,105 @@ impl Chat {
             return false;
         };
 
+        // ── Model / model_provider picker overlay key handling ───
+        // Takes priority over all other Active-phase keys while open.
+        if state.model_picker.is_open() {
+            use crate::keymap::{Chord, ModalAction};
+            use crossterm::event::KeyCode;
+
+            let up = Chord::key(KeyCode::Up).matches(&key);
+            let down = Chord::key(KeyCode::Down).matches(&key);
+            let modal = ModalAction::from_chord(&key);
+
+            // Movement first.
+            if up || down {
+                match &mut state.model_picker {
+                    ModelPickerOverlay::Model(p)
+                    | ModelPickerOverlay::ProviderStage(p)
+                    | ModelPickerOverlay::ProviderModelStage { picker: p, .. } => {
+                        if up {
+                            p.move_up();
+                        } else {
+                            p.move_down();
+                        }
+                    }
+                    ModelPickerOverlay::None => {}
+                }
+                state.mark_dirty_full();
+                return false;
+            }
+
+            match modal {
+                Some(ModalAction::Cancel) => {
+                    state.model_picker = ModelPickerOverlay::None;
+                    state.mark_dirty_full();
+                    return false;
+                }
+                Some(ModalAction::Confirm) => {
+                    // Resolve the selection, then act. Stage transitions and the
+                    // final switch need async + `rpc`, so extract owned values
+                    // before releasing the overlay borrow.
+                    let rpc = self.rpc.clone();
+                    match &state.model_picker {
+                        ModelPickerOverlay::Model(p) => {
+                            let choice = p.selected().map(str::to_string);
+                            state.model_picker = ModelPickerOverlay::None;
+                            if let Some(model) = choice {
+                                Self::apply_session_override(
+                                    &rpc,
+                                    state,
+                                    crate::client::SessionOverrides {
+                                        model: Some(model),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                            }
+                            return false;
+                        }
+                        ModelPickerOverlay::ProviderStage(p) => {
+                            let choice = p.selected().map(str::to_string);
+                            if let Some(model_provider) = choice {
+                                // Advance to stage 2 (fetch that family's models).
+                                Self::advance_provider_picker(&rpc, state, model_provider).await;
+                            } else {
+                                state.model_picker = ModelPickerOverlay::None;
+                                state.mark_dirty_full();
+                            }
+                            return false;
+                        }
+                        ModelPickerOverlay::ProviderModelStage {
+                            model_provider,
+                            picker,
+                        } => {
+                            let model_provider = model_provider.clone();
+                            let model = picker.selected().map(str::to_string);
+                            state.model_picker = ModelPickerOverlay::None;
+                            // Switch model_provider and model together.
+                            Self::apply_session_override(
+                                &rpc,
+                                state,
+                                crate::client::SessionOverrides {
+                                    model_provider: Some(model_provider),
+                                    model,
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                            return false;
+                        }
+                        ModelPickerOverlay::None => {}
+                    }
+                    return false;
+                }
+                _ => {
+                    // Any other key while the picker is open is swallowed so it
+                    // doesn't leak into the input bar.
+                    return false;
+                }
+            }
+        }
+
         // ── Session overlay key handling ─────────────────────────
         match &mut state.session_overlay {
             SessionOverlay::List {
@@ -581,6 +680,42 @@ impl Chat {
                         .entries
                         .push(ChatEntry::SystemMessage(Arc::<str>::from(status)));
                     state.mark_dirty_append();
+                    return false;
+                }
+                InputBarAction::SetModel(model) => {
+                    let rpc = self.rpc.clone();
+                    Self::apply_session_override(
+                        &rpc,
+                        state,
+                        crate::client::SessionOverrides {
+                            model: Some(model),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    return false;
+                }
+                InputBarAction::SetModelProvider(model_provider) => {
+                    let rpc = self.rpc.clone();
+                    Self::apply_session_override(
+                        &rpc,
+                        state,
+                        crate::client::SessionOverrides {
+                            model_provider: Some(model_provider),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    return false;
+                }
+                InputBarAction::OpenModelPicker => {
+                    let rpc = self.rpc.clone();
+                    Self::open_model_picker(&rpc, state).await;
+                    return false;
+                }
+                InputBarAction::OpenModelProviderPicker => {
+                    let rpc = self.rpc.clone();
+                    Self::open_provider_picker(&rpc, state).await;
                     return false;
                 }
                 InputBarAction::Consumed => return false,
@@ -824,6 +959,197 @@ impl Chat {
         false
     }
 
+    /// Apply a session override (model and/or model_provider) to the active
+    /// session via `session/configure`, reporting the outcome on the info bar.
+    /// On a model_provider switch the daemon rebuilds the provider box live.
+    async fn apply_session_override(
+        rpc: &RpcClient,
+        state: &mut ChatState,
+        overrides: crate::client::SessionOverrides,
+    ) {
+        let waiting = crate::widgets::InfoMessage::info(crate::i18n::t("zc-model-switch-applying"));
+        state.info_message = Some(waiting);
+        state.mark_dirty_full();
+
+        match rpc.session_configure(&state.session_id, overrides).await {
+            Ok(result) => {
+                let model = result.overrides.model.unwrap_or_default();
+                let model_provider = result.overrides.model_provider.unwrap_or_default();
+                let summary = if !model_provider.is_empty() {
+                    crate::i18n::t_args(
+                        "zc-model-switch-provider-ok",
+                        &[("provider", &model_provider), ("model", &model)],
+                    )
+                } else {
+                    crate::i18n::t_args("zc-model-switch-model-ok", &[("model", &model)])
+                };
+                state.info_message = Some(crate::widgets::InfoMessage::note(summary));
+                // A model_provider switch changes the catalog — drop the cache so
+                // the next `/model` use refetches.
+                if !model_provider.is_empty() {
+                    state.input_bar.set_model_catalog(String::new(), Vec::new());
+                }
+            }
+            Err(e) => {
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-model-switch-failed",
+                    &[("error", &e.to_string())],
+                )));
+            }
+        }
+        state.mark_dirty_full();
+    }
+
+    /// Resolve the agent's configured model_provider reference (`<type>.<alias>`)
+    /// from config.
+    async fn resolve_model_provider_ref(rpc: &RpcClient, agent_alias: &str) -> Option<String> {
+        let prop = format!("agents.{agent_alias}.model_provider");
+        let entries = rpc.config_list(Some(&prop)).await.ok()?;
+        entries.into_iter().find(|e| e.path == prop).and_then(|e| {
+            e.value
+                .as_ref()
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
+    }
+
+    /// Read the model configured for a dotted model_provider ref
+    /// (`providers.models.<family>.<alias>.model`), used to pre-select the
+    /// current model in the picker.
+    async fn configured_model(rpc: &RpcClient, model_provider_ref: &str) -> Option<String> {
+        let prop = format!("providers.models.{model_provider_ref}.model");
+        let entries = rpc.config_list(Some(&prop)).await.ok()?;
+        entries.into_iter().find(|e| e.path == prop).and_then(|e| {
+            e.value
+                .as_ref()
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
+    }
+
+    /// Fetch the model catalog for a model_provider family. Returns an empty vec
+    /// on failure; the caller surfaces the error on the info bar.
+    async fn fetch_models(rpc: &RpcClient, family: &str) -> Vec<String> {
+        match rpc.catalog_models(family).await {
+            Ok(res) => res.models,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Open the single-stage model picker for the active agent's model_provider,
+    /// pre-selecting the currently-configured model.
+    async fn open_model_picker(rpc: &RpcClient, state: &mut ChatState) {
+        state.info_message = Some(crate::widgets::InfoMessage::info(crate::i18n::t(
+            "zc-model-switch-applying",
+        )));
+        state.mark_dirty_full();
+
+        let Some(model_provider_ref) =
+            Self::resolve_model_provider_ref(rpc, &state.agent_alias).await
+        else {
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                "zc-model-catalog-no-provider",
+            )));
+            state.mark_dirty_full();
+            return;
+        };
+        let family = model_provider_ref
+            .split('.')
+            .next()
+            .unwrap_or(&model_provider_ref)
+            .to_string();
+        // Lazy: reuse the cached catalog when it is already warm for this
+        // model_provider family; otherwise fetch.
+        let models = if state.input_bar.model_catalog_provider() == Some(family.as_str())
+            && !state.input_bar.model_catalog().is_empty()
+        {
+            state.input_bar.model_catalog().to_vec()
+        } else {
+            Self::fetch_models(rpc, &family).await
+        };
+        if models.is_empty() {
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                "zc-model-catalog-empty",
+            )));
+            state.mark_dirty_full();
+            return;
+        }
+        // Keep the input-bar autocomplete cache aligned with what we just fetched.
+        state.input_bar.set_model_catalog(family, models.clone());
+        let current = Self::configured_model(rpc, &model_provider_ref).await;
+        state.model_picker =
+            ModelPickerOverlay::Model(crate::widgets::PickerState::new(models, current.as_deref()));
+        state.info_message = None;
+        state.mark_dirty_full();
+    }
+
+    /// Open stage 1 of the two-stage model_provider picker.
+    async fn open_provider_picker(rpc: &RpcClient, state: &mut ChatState) {
+        match rpc.quickstart_state().await {
+            Ok(snap) => {
+                let providers: Vec<String> = snap
+                    .model_provider_types
+                    .into_iter()
+                    .map(|t| t.kind)
+                    .collect();
+                if providers.is_empty() {
+                    state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                        "zc-model-catalog-no-provider",
+                    )));
+                    state.mark_dirty_full();
+                    return;
+                }
+                state.input_bar.set_provider_catalog(providers.clone());
+                // Pre-select the agent's current model_provider family if known.
+                let current = Self::resolve_model_provider_ref(rpc, &state.agent_alias)
+                    .await
+                    .and_then(|r| r.split('.').next().map(str::to_string));
+                state.model_picker = ModelPickerOverlay::ProviderStage(
+                    crate::widgets::PickerState::new(providers, current.as_deref()),
+                );
+                state.mark_dirty_full();
+            }
+            Err(e) => {
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-model-provider-catalog-failed",
+                    &[("error", &e.to_string())],
+                )));
+                state.mark_dirty_full();
+            }
+        }
+    }
+
+    /// Advance the model_provider picker from stage 1 (family chosen) to stage 2
+    /// (model list for that family), pre-selecting that family's configured
+    /// model. Falls back to an info-bar error if the catalog is empty.
+    async fn advance_provider_picker(
+        rpc: &RpcClient,
+        state: &mut ChatState,
+        model_provider: String,
+    ) {
+        state.info_message = Some(crate::widgets::InfoMessage::info(crate::i18n::t(
+            "zc-model-switch-applying",
+        )));
+        state.mark_dirty_full();
+
+        let models = Self::fetch_models(rpc, &model_provider).await;
+        if models.is_empty() {
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                "zc-model-catalog-empty",
+            )));
+            state.model_picker = ModelPickerOverlay::None;
+            state.mark_dirty_full();
+            return;
+        }
+        // Pre-select that family's default-aliased configured model if present.
+        let default_ref = format!("{model_provider}.default");
+        let current = Self::configured_model(rpc, &default_ref).await;
+        state.model_picker = ModelPickerOverlay::ProviderModelStage {
+            model_provider,
+            picker: crate::widgets::PickerState::new(models, current.as_deref()),
+        };
+        state.info_message = None;
+        state.mark_dirty_full();
+    }
+
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
@@ -992,11 +1318,28 @@ impl Chat {
         }
     }
 
+    /// The active session's current info-bar message, if any. Clears it first if
+    /// it has outlived [`crate::widgets::INFO_BAR_TTL`] so the bar auto-hides.
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        if let ChatPhase::Active(s) = &mut self.phase {
+            if s.info_message.as_ref().is_some_and(|m| m.is_expired()) {
+                s.info_message = None;
+            }
+            return s.info_message.as_ref();
+        }
+        None
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
             ChatPhase::PickCwd { .. } => true,
             ChatPhase::Active(s) => {
+                // The model picker is modal: claim text-input so global keys
+                // (`?`, reload) are suppressed; its own handler swallows keys.
+                if s.model_picker.is_open() {
+                    return true;
+                }
                 // Overlay has its own key handling (Rename captures chars).
                 if matches!(s.session_overlay, SessionOverlay::Rename { .. }) {
                     return true;
@@ -1270,6 +1613,35 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             render_rename_overlay(f, area, buf);
         }
         SessionOverlay::None => {}
+    }
+
+    // Model / model_provider picker overlay (drawn on top of content).
+    match &state.model_picker {
+        ModelPickerOverlay::Model(picker) => {
+            crate::widgets::PickerModal::new(
+                &crate::i18n::t("zc-model-picker-title"),
+                &picker.items,
+                picker.cursor,
+            )
+            .render(f, area);
+        }
+        ModelPickerOverlay::ProviderStage(picker) => {
+            crate::widgets::PickerModal::new(
+                &crate::i18n::t("zc-model-provider-picker-title"),
+                &picker.items,
+                picker.cursor,
+            )
+            .render(f, area);
+        }
+        ModelPickerOverlay::ProviderModelStage { picker, .. } => {
+            crate::widgets::PickerModal::new(
+                &crate::i18n::t("zc-model-picker-title"),
+                &picker.items,
+                picker.cursor,
+            )
+            .render(f, area);
+        }
+        ModelPickerOverlay::None => {}
     }
 
     state.input_bar.render_explorer_overlay(f, area);
@@ -2239,6 +2611,33 @@ enum SessionOverlay {
     },
 }
 
+/// Active model / model_provider picker overlay. `None` when no picker is open.
+/// The model_provider variant is two-stage: pick a model_provider, then (after a
+/// catalog fetch) pick a model from it.
+#[derive(Debug, Clone, Default)]
+enum ModelPickerOverlay {
+    /// No picker open.
+    #[default]
+    None,
+    /// Single-stage model picker over the active model_provider's catalog.
+    Model(crate::widgets::PickerState),
+    /// Stage 1 of the model_provider flow: choosing a model_provider family.
+    ProviderStage(crate::widgets::PickerState),
+    /// Stage 2 of the model_provider flow: choosing a model from the chosen
+    /// model_provider's freshly fetched catalog. Carries the chosen
+    /// model_provider so the eventual switch sets both.
+    ProviderModelStage {
+        model_provider: String,
+        picker: crate::widgets::PickerState,
+    },
+}
+
+impl ModelPickerOverlay {
+    fn is_open(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// Tracks what kind of update has invalidated the rendered lines cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinesDirty {
@@ -2328,6 +2727,12 @@ pub struct ChatState {
     pub context_input_tokens: Option<u64>,
     /// Configured context limit for this session's model.
     pub context_max_tokens: Option<u64>,
+    /// Latest info-bar message (model-switch op notes / errors). `None` hides the
+    /// bar. Auto-cleared in the tick loop once [`crate::widgets::INFO_BAR_TTL`]
+    /// elapses.
+    pub info_message: Option<crate::widgets::InfoMessage>,
+    /// Active model / model_provider picker overlay.
+    model_picker: ModelPickerOverlay,
 }
 
 impl ChatState {
@@ -2368,6 +2773,8 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            info_message: None,
+            model_picker: ModelPickerOverlay::None,
         }
     }
 
@@ -2995,6 +3402,47 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[test]
+    fn model_picker_overlay_default_is_closed() {
+        let s = state();
+        assert!(!s.model_picker.is_open());
+    }
+
+    #[test]
+    fn model_picker_overlay_open_states_report_open() {
+        let model =
+            ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
+        assert!(model.is_open());
+        let stage1 = ModelPickerOverlay::ProviderStage(crate::widgets::PickerState::new(
+            vec!["anthropic".into()],
+            None,
+        ));
+        assert!(stage1.is_open());
+        let stage2 = ModelPickerOverlay::ProviderModelStage {
+            model_provider: "anthropic".into(),
+            picker: crate::widgets::PickerState::new(vec!["m".into()], None),
+        };
+        assert!(stage2.is_open());
+    }
+
+    #[tokio::test]
+    async fn open_picker_makes_chat_claim_text_input() {
+        // While the picker is open the pane is modal (claims text-input so
+        // global keys are suppressed and routed to the picker handler).
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
+                vec!["a".into(), "b".into()],
+                None,
+            ));
+        }
+        assert!(chat.wants_text_input());
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {

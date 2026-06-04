@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use zeroclaw_infra::session_queue::SessionActorQueue;
+use zeroclaw_providers::ModelProvider;
 
 /// Grace period between a TUI / zerocode transport disconnect and the
 /// daemon dropping that connection's sessions. Long enough to ride out
@@ -90,6 +91,8 @@ pub struct EvictedSession {
 pub struct SessionOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
 }
@@ -190,6 +193,11 @@ impl SessionStore {
 
     /// Apply overrides to the session and immediately mutate the agent.
     /// Returns the merged overrides for confirmation.
+    ///
+    /// Note: `model_provider` is recorded here but the live provider swap is
+    /// driven by the dispatcher via [`Self::apply_model_provider`], because
+    /// rebuilding the `ModelProvider` box needs `Config` access that the
+    /// session store deliberately does not hold.
     pub async fn set_overrides(
         &self,
         id: &str,
@@ -199,6 +207,9 @@ impl SessionStore {
         let session = sessions.get_mut(id)?;
         if let Some(ref m) = patch.model {
             session.overrides.model = Some(m.clone());
+        }
+        if let Some(ref p) = patch.model_provider {
+            session.overrides.model_provider = Some(p.clone());
         }
         if let Some(t) = patch.temperature {
             session.overrides.temperature = Some(t);
@@ -215,6 +226,28 @@ impl SessionStore {
             guard.set_temperature(overrides.temperature);
         }
         Some(overrides)
+    }
+
+    /// Swap a freshly built `ModelProvider` box (and its name) onto the
+    /// session's agent. Called by the dispatcher after it constructs the
+    /// box from config, keeping model_provider-build logic out of the store.
+    pub async fn apply_model_provider(
+        &self,
+        id: &str,
+        model_provider: Box<dyn ModelProvider>,
+        model_provider_name: String,
+    ) -> bool {
+        let agent = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(id) {
+                Some(s) => s.agent.clone(),
+                None => return false,
+            }
+        };
+        let mut guard = agent.lock().await;
+        guard.set_model_provider(model_provider);
+        guard.set_model_provider_name(model_provider_name);
+        true
     }
 
     pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {
@@ -676,6 +709,75 @@ mod tests {
             .unwrap();
         assert!(store.get_agent("s1").await.is_some());
         assert!(store.get_agent("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_overrides_applies_model_and_temperature_live() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        let merged = store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model: Some("model-x".into()),
+                    temperature: Some(0.42),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(merged.model.as_deref(), Some("model-x"));
+        assert_eq!(merged.temperature, Some(0.42));
+
+        // The override is applied to the live agent immediately.
+        let agent = store.get_agent("s1").await.unwrap();
+        let (_, _, model_name) = agent.lock().await.attribution_fields();
+        assert_eq!(model_name, "model-x");
+    }
+
+    #[tokio::test]
+    async fn set_overrides_records_model_provider_without_rebuilding() {
+        // The store records the model_provider override but does NOT rebuild the
+        // provider box — that is the dispatcher's job (needs Config). Here we
+        // only assert the field round-trips through the merge.
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        let merged = store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model_provider: Some("anthropic.default".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(merged.model_provider.as_deref(), Some("anthropic.default"));
+    }
+
+    #[tokio::test]
+    async fn set_overrides_missing_session_is_none() {
+        let store = make_store(4);
+        assert!(
+            store
+                .set_overrides("ghost", SessionOverrides::default())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

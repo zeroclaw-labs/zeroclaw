@@ -295,6 +295,19 @@ zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
 
+# Model picker slash commands
+zc-model-picker-hint = Type a model name after /model, or Tab to autocomplete.
+zc-model-provider-picker-hint = Type a model_provider after /model-provider, then pick a model with /model.
+zc-model-picker-title = Select model
+zc-model-provider-picker-title = Select model_provider
+zc-model-switch-applying = Applying model change…
+zc-model-switch-model-ok = Model switched to { $model }.
+zc-model-switch-provider-ok = model_provider switched to { $provider } (model: { $model }).
+zc-model-switch-failed = Model switch failed: { $error }
+zc-model-catalog-no-provider = Could not resolve this agent's model_provider from config.
+zc-model-catalog-empty = No models available for the active model_provider.
+zc-model-provider-catalog-failed = Could not load model_providers: { $error }
+
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
 
