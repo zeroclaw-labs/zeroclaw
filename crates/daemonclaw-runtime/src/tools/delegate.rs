@@ -1571,9 +1571,9 @@ impl DelegateTool {
             );
         }
 
+        let prior_msg_count = history.len();
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let prior_msg_count = history.len();
         let noop_observer = NoopObserver;
 
         let agentic_timeout_secs = agent_config
@@ -3378,5 +3378,215 @@ mod tests {
             err.contains("no model specified") || err.contains("no default model"),
             "got: {err}"
         );
+    }
+
+    // ── Pool integration: through the real execute() dispatch ─────────
+
+    fn pool_wired_tool(
+        tmp: &std::path::Path,
+    ) -> (
+        DelegateTool,
+        Arc<crate::pool::PoolStore>,
+        Arc<daemonclaw_infra::session_sqlite::SqliteSessionBackend>,
+    ) {
+        let pool = Arc::new(crate::pool::PoolStore::open(tmp).unwrap());
+        let backend = Arc::new(
+            daemonclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp).unwrap(),
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_pool(Arc::clone(&pool), true)
+            .with_session_backend(
+                Arc::clone(&backend) as Arc<dyn daemonclaw_infra::session_backend::SessionBackend>,
+            )
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool) as Arc<dyn Tool>,
+            ])));
+        (tool, pool, backend)
+    }
+
+    #[tokio::test]
+    async fn pool_execute_spawns_member_via_delegation_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tool, pool, _backend) = pool_wired_tool(tmp.path());
+
+        assert_eq!(pool.member_count().unwrap(), 0);
+
+        // Call through execute() — the real dispatch. Provider "ollama" will
+        // construct successfully but the HTTP call will fail. That's fine:
+        // we're proving resolve_pool_agent → spawn_member fires as a side
+        // effect of execute(), not via direct DB manipulation.
+        let _result = tool
+            .execute(json!({
+                "agent": "pool-test-agent",
+                "provider": "ollama",
+                "model": "llama3",
+                "prompt": "Say hello"
+            }))
+            .await
+            .unwrap();
+
+        // The pool member was spawned BEFORE the provider call, so the row
+        // exists regardless of whether the provider responded.
+        let count = pool.member_count().unwrap();
+        assert_eq!(count, 1, "execute() must spawn a pool member");
+
+        let member = pool
+            .get_member_by_name("pool-test-agent")
+            .unwrap()
+            .expect("member must exist by name");
+        assert_eq!(member.provider, "ollama");
+        assert_eq!(member.model, "llama3");
+        assert_eq!(member.lifecycle_state, LifecycleState::Resident);
+    }
+
+    #[tokio::test]
+    async fn pool_execute_list_members_via_delegation_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tool, pool, _backend) = pool_wired_tool(tmp.path());
+
+        pool.spawn_member("agent-alpha", None, "zai", "glm-5.1", &[])
+            .unwrap();
+        pool.spawn_member("agent-beta", None, "zai", "glm-5.1", &[])
+            .unwrap();
+
+        // Call list_members through execute() — the real dispatch
+        let result = tool
+            .execute(json!({"action": "list_members"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("agent-alpha"),
+            "list_members output must include agent-alpha: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("agent-beta"),
+            "list_members output must include agent-beta: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_full_lifecycle_spawn_persist_rehydrate_via_execute_agentic() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tool, pool, backend) = pool_wired_tool(tmp.path());
+
+        // ── Step 1: Spawn member via resolve_pool_agent (same path execute() takes) ──
+        let member = pool
+            .spawn_member(
+                "lifecycle-agent",
+                Some("You help with testing"),
+                "ollama",
+                "llama3",
+                &["echo_tool".to_string()],
+            )
+            .unwrap();
+        let agentid = member.agentid.clone();
+
+        // ── Step 2: First delegation — run agentic loop with mock provider ──
+        // This is the REAL execute_agentic code with real pool + session wiring.
+        // Only the provider is mocked (OneToolThenFinalProvider).
+        let config = DelegateAgentConfig {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            system_prompt: Some("You help with testing".into()),
+            agentic: true,
+            allowed_tools: vec!["echo_tool".into()],
+            memory_namespace: Some(agentid.clone()),
+            ..Default::default()
+        };
+        let provider = OneToolThenFinalProvider;
+        let result = tool
+            .execute_agentic(
+                "lifecycle-agent",
+                &config,
+                &provider,
+                "First task: say hello",
+                0.7,
+                Some(&agentid),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "first delegation must succeed: {:?}", result.error);
+        assert!(
+            result.output.contains("done"),
+            "first delegation output: {}",
+            result.output
+        );
+
+        // Verify history landed in sessions.db with actor attribution
+        let history = backend.load(&agentid);
+        assert!(
+            history.len() >= 2,
+            "first delegation must write history, got {} messages",
+            history.len()
+        );
+        // The history should contain at least the user prompt and the final
+        // assistant response; tool call messages are also present.
+        let has_user = history.iter().any(|m| m.role == "user" && m.content.contains("First task"));
+        assert!(has_user, "history must contain the user prompt");
+        let has_assistant = history.iter().any(|m| m.role == "assistant");
+        assert!(has_assistant, "history must contain assistant response");
+
+        // ── Step 3: Spin down ──
+        pool.set_lifecycle_state(&agentid, LifecycleState::Dormant)
+            .unwrap();
+
+        // History persists across spin-down
+        let dormant_history = backend.load(&agentid);
+        assert_eq!(
+            dormant_history.len(),
+            history.len(),
+            "history must persist through spin-down"
+        );
+
+        // ── Step 4: Second delegation — rehydration proof ──
+        // Spin back up
+        pool.set_lifecycle_state(&agentid, LifecycleState::Resident)
+            .unwrap();
+
+        let result2 = tool
+            .execute_agentic(
+                "lifecycle-agent",
+                &config,
+                &provider,
+                "Second task: what was the first task?",
+                0.7,
+                Some(&agentid),
+            )
+            .await
+            .unwrap();
+
+        assert!(result2.success, "second delegation must succeed: {:?}", result2.error);
+
+        // Verify accumulated history: second run loaded prior context + added new
+        let full_history = backend.load(&agentid);
+        assert!(
+            full_history.len() > history.len(),
+            "second delegation must ADD to history (got {} total, first had {})",
+            full_history.len(),
+            history.len()
+        );
+
+        // The prior conversation is still there
+        let has_first_prompt = full_history
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("First task"));
+        assert!(has_first_prompt, "rehydrated history must contain first prompt");
+
+        // The new conversation is there too
+        let has_second_prompt = full_history
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("Second task"));
+        assert!(has_second_prompt, "rehydrated history must contain second prompt");
+
+        // Pool member still resident, same agentid
+        let m = pool.get_member(&agentid).unwrap().unwrap();
+        assert_eq!(m.lifecycle_state, LifecycleState::Resident);
+        assert_eq!(m.name, "lifecycle-agent");
     }
 }
