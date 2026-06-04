@@ -948,7 +948,7 @@ impl ZerocodePane {
         }
         entries.push(E::spacer());
         entries.push(E::new(
-            vec![],
+            Vec::<String>::new(),
             format!(
                 "{}: {}",
                 crate::i18n::t("zc-zerocode-help-mouse-label"),

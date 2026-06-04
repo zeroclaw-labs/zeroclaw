@@ -692,6 +692,29 @@ impl InputBarState {
         self.cursor = self.input.len();
     }
 
+    /// Enter pressed while the autocomplete popup is open: accept the
+    /// highlighted match. A command completion that still expects an argument
+    /// (`/model `, `/model-provider `) only fills the input so the user can keep
+    /// typing or pick from the argument popup; any other accepted completion is
+    /// a runnable line, so submit it in the same keystroke.
+    fn accept_completion_on_submit(&mut self) -> InputBarAction {
+        let Some(idx) = self.autocomplete_index else {
+            return self.handle_enter();
+        };
+        let Some(choice) = self.autocomplete_matches.get(idx).cloned() else {
+            return self.handle_enter();
+        };
+        let target = self.autocomplete_target;
+        self.apply_autocomplete_choice(&choice);
+        self.dismiss_autocomplete();
+        let fills_only = target == AutocompleteTarget::Command
+            && (choice == "/model" || choice == "/model-provider");
+        if fills_only {
+            return InputBarAction::Consumed;
+        }
+        self.handle_enter()
+    }
+
     // ── Text editing ─────────────────────────────────────────
 
     /// Insert `c` at the cursor position and advance the cursor.
@@ -918,6 +941,9 @@ impl InputBarState {
                     self.autocomplete_index = Some((idx + 1).min(max));
                 }
                 return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::Submit) if self.autocomplete_active => {
+                return self.accept_completion_on_submit();
             }
             Some(IbWidgetAction::NewLine) => {
                 self.push_input_char('\n');
@@ -1526,13 +1552,25 @@ impl crate::widgets::HelpContext for InputBarState {
             return explorer.help_context();
         }
         if self.autocomplete_active {
+            use crate::keymap::{InputBarAction as Ib, action_key_labels};
+            // Both Enter (Submit, contextual) and the dedicated accept
+            // chord (Tab by default) accept the highlighted completion —
+            // advertise whatever the live registry has them bound to.
+            let mut accept_keys = action_key_labels(Ib::Submit);
+            accept_keys.extend(action_key_labels(Ib::AutocompleteAccept));
             return HelpNode::entries(vec![
                 E::new(
                     vec!["↑", "↓"],
                     crate::i18n::t("zc-input-help-completions-navigate"),
                 ),
-                E::key("Tab", crate::i18n::t("zc-input-help-completions-accept")),
-                E::key("Esc", crate::i18n::t("zc-input-help-completions-dismiss")),
+                E::new(
+                    accept_keys,
+                    crate::i18n::t("zc-input-help-completions-accept"),
+                ),
+                E::new(
+                    action_key_labels(Ib::AutocompleteCancel),
+                    crate::i18n::t("zc-input-help-completions-dismiss"),
+                ),
             ]);
         }
         HelpNode::entries(vec![
@@ -1786,6 +1824,66 @@ mod tests {
             bar.handle_enter(),
             InputBarAction::OpenModelPicker
         ));
+    }
+
+    #[test]
+    fn enter_accepts_highlighted_model_arg_and_submits() {
+        let mut bar = InputBarState::new();
+        bar.set_model_catalog(
+            "anthropic.default".into(),
+            vec!["claude-opus-4-8".into(), "claude-sonnet-4-6".into()],
+        );
+        bar.insert_text("/model ");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        // First catalog entry is accepted and the line is submitted in one
+        // keystroke — no picker modal.
+        assert!(matches!(action, InputBarAction::SetModel(m) if m == "claude-opus-4-8"));
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn enter_on_model_command_completion_fills_without_submitting() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/mod");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        // `/model` still needs an argument: accept-and-fill, do not open the
+        // picker or submit.
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "/model ");
+    }
+
+    #[test]
+    fn enter_accepts_highlighted_provider_arg_and_submits() {
+        let mut bar = InputBarState::new();
+        bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);
+        bar.insert_text("/model-provider open");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        assert!(matches!(action, InputBarAction::SetModelProvider(p) if p == "openai"));
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn completion_help_keys_come_from_keymap_registry() {
+        use crate::keymap::{Chord, InputBarAction as Ib, action_key_labels};
+        use crate::widgets::HelpContext;
+        let mut bar = InputBarState::new();
+        bar.insert_text("/mod");
+        assert!(bar.autocomplete_active);
+        let node = bar.help_context();
+        let accept = node
+            .entries
+            .iter()
+            .find(|e| e.action == crate::i18n::t("zc-input-help-completions-accept"))
+            .expect("accept entry present");
+        // Labels track the live bindings for Submit + AutocompleteAccept,
+        // not hardcoded literals.
+        assert!(accept.keys.contains(&Chord::key(KeyCode::Tab).display()));
+        let mut expected = action_key_labels(Ib::Submit);
+        expected.extend(action_key_labels(Ib::AutocompleteAccept));
+        assert_eq!(accept.keys, expected);
     }
 
     #[test]

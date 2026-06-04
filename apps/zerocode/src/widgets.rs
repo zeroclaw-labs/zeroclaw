@@ -6,24 +6,26 @@
 /// An entry with all-empty keys/action renders as a blank spacer row.
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
-    /// Keys that trigger this action, e.g. ["↑", "k"].
-    pub keys: Vec<&'static str>,
+    /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
+    /// owned so registry-derived chord labels (`Chord::display`) can be
+    /// used alongside static literals.
+    pub keys: Vec<String>,
     /// Human-readable description of the action.
     pub action: String,
 }
 
 impl HelpEntry {
-    pub fn new(keys: Vec<&'static str>, action: impl Into<String>) -> Self {
+    pub fn new(keys: Vec<impl Into<String>>, action: impl Into<String>) -> Self {
         Self {
-            keys,
+            keys: keys.into_iter().map(Into::into).collect(),
             action: action.into(),
         }
     }
 
     /// Convenience: single key.
-    pub fn key(key: &'static str, action: impl Into<String>) -> Self {
+    pub fn key(key: impl Into<String>, action: impl Into<String>) -> Self {
         Self {
-            keys: vec![key],
+            keys: vec![key.into()],
             action: action.into(),
         }
     }

@@ -1250,7 +1250,7 @@ impl crate::widgets::HelpContext for Logs<'_> {
                 E::key("?", crate::i18n::t("zc-logs-help-this-help")),
                 E::spacer(),
                 E::new(
-                    vec![],
+                    Vec::<String>::new(),
                     format!(
                         "{}: {}",
                         crate::i18n::t("zc-logs-help-mouse-label"),
