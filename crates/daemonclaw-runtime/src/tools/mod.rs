@@ -881,7 +881,7 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Add delegation tool when agents are configured
+    // Add delegation tool when agents are configured OR pool is enabled
     let delegate_fallback_credential = fallback_api_key.and_then(|value| {
         let trimmed_value = value.trim();
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
@@ -889,41 +889,65 @@ pub fn all_tools_with_runtime(
     let provider_runtime_options =
         daemonclaw_providers::provider_runtime_options_from_config(root_config);
 
-    let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
-        None
-    } else {
-        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
-        let delegate_tool = DelegateTool::new_with_options(
-            delegate_agents,
-            delegate_fallback_credential.clone(),
-            security.clone(),
-            provider_runtime_options.clone(),
-        )
-        .with_parent_tools(Arc::clone(&parent_tools))
-        .with_multimodal_config(root_config.multimodal.clone())
-        .with_delegate_config(root_config.delegate.clone())
-        .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone())
-        .with_providers_config(Arc::new(root_config.providers.clone()));
-        let delegate_tool = if root_config.security.audit.enabled {
-            if let Ok(logger) = crate::security::audit::AuditLogger::new(
-                root_config.security.audit.clone(),
-                root_config.workspace_dir.clone(),
-            ) {
-                delegate_tool.with_audit_logger(std::sync::Arc::new(logger))
+    let delegate_handle: Option<DelegateParentToolsHandle> =
+        if agents.is_empty() && !root_config.pool.enabled {
+            None
+        } else {
+            let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.clone()))
+                .collect();
+            let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
+            let mut delegate_tool = DelegateTool::new_with_options(
+                delegate_agents,
+                delegate_fallback_credential.clone(),
+                security.clone(),
+                provider_runtime_options.clone(),
+            )
+            .with_parent_tools(Arc::clone(&parent_tools))
+            .with_multimodal_config(root_config.multimodal.clone())
+            .with_delegate_config(root_config.delegate.clone())
+            .with_workspace_dir(workspace_dir.to_path_buf())
+            .with_memory(memory.clone())
+            .with_providers_config(Arc::new(root_config.providers.clone()));
+
+            // Wire pool store and session backend when pool is enabled
+            if root_config.pool.enabled {
+                match crate::pool::PoolStore::open(workspace_dir) {
+                    Ok(store) => {
+                        delegate_tool =
+                            delegate_tool.with_pool(std::sync::Arc::new(store), true);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Pool store init failed (delegation will use legacy path): {e}");
+                    }
+                }
+                match daemonclaw_infra::session_sqlite::SqliteSessionBackend::new(workspace_dir) {
+                    Ok(backend) => {
+                        delegate_tool =
+                            delegate_tool.with_session_backend(std::sync::Arc::new(backend));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Session SQLite backend init failed (pool rehydration disabled): {e}");
+                    }
+                }
+            }
+
+            let delegate_tool = if root_config.security.audit.enabled {
+                if let Ok(logger) = crate::security::audit::AuditLogger::new(
+                    root_config.security.audit.clone(),
+                    root_config.workspace_dir.clone(),
+                ) {
+                    delegate_tool.with_audit_logger(std::sync::Arc::new(logger))
+                } else {
+                    delegate_tool
+                }
             } else {
                 delegate_tool
-            }
-        } else {
-            delegate_tool
+            };
+            tool_arcs.push(Arc::new(delegate_tool));
+            Some(parent_tools)
         };
-        tool_arcs.push(Arc::new(delegate_tool));
-        Some(parent_tools)
-    };
 
     // Add swarm tool when swarms are configured
     if !root_config.swarms.is_empty() {

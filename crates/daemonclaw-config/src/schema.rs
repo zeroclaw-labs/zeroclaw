@@ -323,13 +323,6 @@ pub struct Config {
     #[nested]
     pub delegate: DelegateToolConfig,
 
-    /// Delegate agent configurations for multi-agent workflows.
-    /// DEPRECATED: Use [pool] for persistent agents. This field is retained
-    /// for backward compatibility during migration.
-    #[serde(default)]
-    #[nested]
-    pub agents: HashMap<String, DelegateAgentConfig>,
-
     /// Swarm configurations for multi-agent orchestration.
     #[serde(default)]
     pub swarms: HashMap<String, SwarmConfig>,
@@ -9477,7 +9470,6 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
-            agents: HashMap::new(),
             swarms: HashMap::new(),
             pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
@@ -10813,31 +10805,6 @@ impl Config {
             anyhow::bail!("security.nevis: {msg}");
         }
 
-        // Delegate agent timeouts
-        const MAX_DELEGATE_TIMEOUT_SECS: u64 = 3600;
-        for (name, agent) in &self.agents {
-            if let Some(timeout) = agent.timeout_secs {
-                if timeout == 0 {
-                    anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
-                }
-                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
-                    anyhow::bail!(
-                        "agents.{name}.timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
-                    );
-                }
-            }
-            if let Some(timeout) = agent.agentic_timeout_secs {
-                if timeout == 0 {
-                    anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
-                }
-                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
-                    anyhow::bail!(
-                        "agents.{name}.agentic_timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
-                    );
-                }
-            }
-        }
-
         // Transcription
         {
             let dp = self.transcription.default_provider.trim();
@@ -10857,20 +10824,6 @@ impl Config {
         }
         if self.delegate.agentic_timeout_secs == 0 {
             anyhow::bail!("delegate.agentic_timeout_secs must be greater than 0");
-        }
-
-        // Per-agent delegate timeout overrides
-        for (name, agent) in &self.agents {
-            if let Some(t) = agent.timeout_secs
-                && t == 0
-            {
-                anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
-            }
-            if let Some(t) = agent.agentic_timeout_secs
-                && t == 0
-            {
-                anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
-            }
         }
 
         Ok(())
@@ -12106,7 +12059,6 @@ auto_save = true
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
-            agents: HashMap::new(),
             swarms: HashMap::new(),
             pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
@@ -12674,7 +12626,6 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
-            agents: HashMap::new(),
             swarms: HashMap::new(),
             pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
@@ -12768,24 +12719,6 @@ default_temperature = 0.7
             proxy_url: None,
         });
 
-        config.agents.insert(
-            "worker".into(),
-            DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
-                system_prompt: None,
-                api_key: Some("agent-credential".into()),
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(config.config_path.clone())
@@ -12829,11 +12762,6 @@ default_temperature = 0.7
             store.decrypt(web_search_encrypted).unwrap(),
             "brave-credential"
         );
-
-        let worker = stored.agents.get("worker").unwrap();
-        let worker_encrypted = worker.api_key.as_deref().unwrap();
-        assert!(crate::secrets::SecretStore::is_encrypted(worker_encrypted));
-        assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
         let storage_db_url = stored.storage.provider.config.db_url.as_deref().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(storage_db_url));
@@ -16473,20 +16401,11 @@ require_otp_to_resume = true
     #[test]
     async fn config_with_swarms_section_deserializes() {
         let toml_str = r#"
-            [agents.researcher]
-            provider = "ollama"
-            model = "llama3"
-
-            [agents.writer]
-            provider = "openrouter"
-            model = "claude-sonnet"
-
             [swarms.pipeline]
             agents = ["researcher", "writer"]
             strategy = "sequential"
         "#;
         let config = parse_test_config(toml_str);
-        assert_eq!(config.agents.len(), 2);
         assert_eq!(config.swarms.len(), 1);
         assert!(config.swarms.contains_key("pipeline"));
     }
@@ -17548,31 +17467,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(
             config.channels.matrix.as_ref().unwrap().homeserver,
             "https://new.org"
-        );
-    }
-
-    #[test]
-    async fn hashmap_nested_encrypt_decrypt_traverses_values() {
-        let dir = TempDir::new().unwrap();
-        let store = crate::secrets::SecretStore::new(dir.path(), true);
-
-        let mut config = Config::default();
-        config.agents.insert(
-            "test-agent".into(),
-            DelegateAgentConfig {
-                api_key: Some("secret-key".into()),
-                ..Default::default()
-            },
-        );
-
-        config.encrypt_secrets(&store).unwrap();
-        let encrypted_key = config.agents["test-agent"].api_key.as_ref().unwrap();
-        assert!(crate::secrets::SecretStore::is_encrypted(encrypted_key));
-
-        config.decrypt_secrets(&store).unwrap();
-        assert_eq!(
-            config.agents["test-agent"].api_key.as_deref(),
-            Some("secret-key")
         );
     }
 

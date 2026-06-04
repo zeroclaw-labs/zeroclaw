@@ -2657,7 +2657,7 @@ pub async fn run(
         &config.http_request,
         &config.web_fetch,
         &config.workspace_dir,
-        &config.agents,
+        &std::collections::HashMap::new(),
         fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
@@ -2932,10 +2932,10 @@ pub async fn run(
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
-    if !config.agents.is_empty() {
+    if config.pool.enabled {
         tool_descs.push((
             "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
+            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work. Use action='list_members' to see available pool members.",
         ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
@@ -3772,7 +3772,7 @@ pub async fn process_message(
         &config.http_request,
         &config.web_fetch,
         &config.workspace_dir,
-        &config.agents,
+        &std::collections::HashMap::new(),
         fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
         &config,
         None,

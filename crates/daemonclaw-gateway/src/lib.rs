@@ -489,7 +489,7 @@ pub async fn run_gateway(
         &config.http_request,
         &config.web_fetch,
         &config.workspace_dir,
-        &config.agents,
+        &std::collections::HashMap::new(),
         config
             .providers
             .fallback_provider()

@@ -437,7 +437,7 @@ impl Agent {
             &config.http_request,
             &config.web_fetch,
             &config.workspace_dir,
-            &config.agents,
+            &std::collections::HashMap::new(),
             fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             config,
             None,

@@ -363,4 +363,215 @@ mod tests {
         store.set_lifecycle_state(&m1.agentid, LifecycleState::Dormant).unwrap();
         assert_eq!(store.resident_count().unwrap(), 1);
     }
+
+    #[test]
+    fn rehydration_round_trip_context_survives_down_up_cycle() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let store = PoolStore::open(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let member = store
+            .spawn_member("researcher", Some("You are a researcher"), "zai", "glm-5.1", &[])
+            .unwrap();
+        assert_eq!(member.lifecycle_state, LifecycleState::Resident);
+
+        // Simulate conversation: write history keyed by agentid
+        let msg1 = ChatMessage::user("Summarize the paper".to_string());
+        let msg2 = ChatMessage::assistant("The paper discusses...".to_string());
+        backend
+            .append_with_actor(&member.agentid, &msg1, Some(&member.agentid), Some("pool_member"))
+            .unwrap();
+        backend
+            .append_with_actor(&member.agentid, &msg2, Some(&member.agentid), Some("pool_member"))
+            .unwrap();
+
+        // Spin down — durable context in sessions.db, pool flag flipped
+        store
+            .set_lifecycle_state(&member.agentid, LifecycleState::Dormant)
+            .unwrap();
+        let dormant = store.get_member(&member.agentid).unwrap().unwrap();
+        assert_eq!(dormant.lifecycle_state, LifecycleState::Dormant);
+
+        // Spin up — reload from sessions.db
+        store
+            .set_lifecycle_state(&member.agentid, LifecycleState::Resident)
+            .unwrap();
+        let restored = store.get_member(&member.agentid).unwrap().unwrap();
+        assert_eq!(restored.lifecycle_state, LifecycleState::Resident);
+        assert_eq!(restored.agentid, member.agentid);
+
+        // THE CRITERION: context survives the full down→up cycle
+        let loaded_history = backend.load(&member.agentid);
+        assert_eq!(loaded_history.len(), 2, "history must survive spin-down→up");
+        assert_eq!(loaded_history[0].role, "user");
+        assert_eq!(loaded_history[0].content, "Summarize the paper");
+        assert_eq!(loaded_history[1].role, "assistant");
+        assert_eq!(loaded_history[1].content, "The paper discusses...");
+    }
+
+    #[test]
+    fn eviction_under_pressure_spins_down_coldest_preserves_context() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let store = PoolStore::open(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Spawn two residents; old is colder
+        let old = store
+            .spawn_member("old-agent", None, "zai", "glm-5.1", &[])
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _new = store
+            .spawn_member("new-agent", None, "zai", "glm-5.1", &[])
+            .unwrap();
+
+        // Give old some conversation context
+        backend
+            .append_with_actor(
+                &old.agentid,
+                &ChatMessage::user("important context".to_string()),
+                Some(&old.agentid),
+                Some("pool_member"),
+            )
+            .unwrap();
+
+        // Simulate eviction: coldest resident → dormant
+        let coldest = store.coldest_resident().unwrap().unwrap();
+        assert_eq!(coldest.agentid, old.agentid);
+        store
+            .set_lifecycle_state(&coldest.agentid, LifecycleState::Dormant)
+            .unwrap();
+
+        // Verify: evicted, not deleted
+        let evicted = store.get_member(&old.agentid).unwrap().unwrap();
+        assert_eq!(evicted.lifecycle_state, LifecycleState::Dormant);
+        assert_eq!(store.resident_count().unwrap(), 1);
+
+        // Context preserved and re-loadable
+        let history = backend.load(&old.agentid);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "important context");
+    }
+
+    #[test]
+    fn pool_off_produces_no_row() {
+        let (store, _tmp) = test_store();
+        // Pool OFF: no spawn_member call → no rows
+        assert_eq!(store.member_count().unwrap(), 0);
+        assert_eq!(store.list_members().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn pool_on_delegation_creates_persistent_member() {
+        let (store, _tmp) = test_store();
+        let member = store
+            .spawn_member("delegate-target", Some("Do research"), "zai", "glm-5.1", &["shell".to_string()])
+            .unwrap();
+
+        // Row exists after spawn
+        let loaded = store.get_member(&member.agentid).unwrap();
+        assert!(loaded.is_some(), "pool member must persist after spawn");
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.name, "delegate-target");
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Resident);
+        assert_eq!(loaded.allowed_tools, vec!["shell"]);
+    }
+
+    #[test]
+    fn member_retargetable_by_agentid_across_delegations() {
+        let (store, _tmp) = test_store();
+        let member = store
+            .spawn_member("researcher", None, "zai", "glm-5.1", &[])
+            .unwrap();
+        let agentid = member.agentid.clone();
+
+        // First "delegation": touch
+        store.touch_last_active(&agentid).unwrap();
+
+        // Second "delegation": same agentid resolves to same member
+        let found = store.get_member(&agentid).unwrap().unwrap();
+        assert_eq!(found.name, "researcher");
+        assert_eq!(found.agentid, agentid);
+    }
+
+    #[test]
+    fn actor_attribution_on_sessions() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let agentid_a = "agent-aaa";
+        let agentid_b = "agent-bbb";
+
+        // Actor A writes to its session
+        backend
+            .append_with_actor(
+                agentid_a,
+                &ChatMessage::assistant("Result from A".to_string()),
+                Some(agentid_a),
+                Some("pool_member"),
+            )
+            .unwrap();
+
+        // Actor B writes to its session
+        backend
+            .append_with_actor(
+                agentid_b,
+                &ChatMessage::assistant("Result from B".to_string()),
+                Some(agentid_b),
+                Some("pool_member"),
+            )
+            .unwrap();
+
+        // Main agent queries each member's session
+        let history_a = backend.load(agentid_a);
+        assert_eq!(history_a.len(), 1);
+        assert_eq!(history_a[0].content, "Result from A");
+
+        let history_b = backend.load(agentid_b);
+        assert_eq!(history_b.len(), 1);
+        assert_eq!(history_b[0].content, "Result from B");
+    }
+
+    #[test]
+    fn destruction_purges_pool_member_row() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let store = PoolStore::open(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let member = store
+            .spawn_member("doomed", None, "zai", "glm-5.1", &[])
+            .unwrap();
+        backend
+            .append_with_actor(
+                &member.agentid,
+                &ChatMessage::user("hello".to_string()),
+                Some(&member.agentid),
+                Some("pool_member"),
+            )
+            .unwrap();
+
+        // Destroy member
+        assert!(store.destroy_member(&member.agentid).unwrap());
+        assert!(store.get_member(&member.agentid).unwrap().is_none());
+
+        // Sessions also cleaned up by session backend
+        let _ = backend.delete_session(&member.agentid);
+        let history = backend.load(&member.agentid);
+        assert!(history.is_empty(), "sessions must be purged after destruction");
+    }
 }

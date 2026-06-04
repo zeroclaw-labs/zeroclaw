@@ -1,9 +1,11 @@
 use crate::agent::loop_::run_tool_call_loop;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
+use crate::pool::{LifecycleState, PoolMember, PoolStore};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
+use daemonclaw_infra::session_backend::SessionBackend;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
@@ -78,6 +80,12 @@ pub struct DelegateTool {
     providers_config: Option<Arc<daemonclaw_config::providers::ProvidersConfig>>,
     /// Shared audit logger for recording sub-agent tool calls.
     audit_logger: Option<Arc<crate::security::audit::AuditLogger>>,
+    /// Pool store for persistent agent members (state.db).
+    pool_store: Option<Arc<PoolStore>>,
+    /// Session backend for rehydrating pool member conversation history.
+    session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Whether the pool system is enabled.
+    pool_enabled: bool,
 }
 
 impl DelegateTool {
@@ -114,6 +122,9 @@ impl DelegateTool {
             memory: None,
             providers_config: None,
             audit_logger: None,
+            pool_store: None,
+            session_backend: None,
+            pool_enabled: false,
         }
     }
 
@@ -156,6 +167,9 @@ impl DelegateTool {
             memory: None,
             providers_config: None,
             audit_logger: None,
+            pool_store: None,
+            session_backend: None,
+            pool_enabled: false,
         }
     }
 
@@ -218,6 +232,19 @@ impl DelegateTool {
         self
     }
 
+    /// Attach pool store and enable pool-based delegation.
+    pub fn with_pool(mut self, store: Arc<PoolStore>, enabled: bool) -> Self {
+        self.pool_store = Some(store);
+        self.pool_enabled = enabled;
+        self
+    }
+
+    /// Attach session backend for pool member history rehydration.
+    pub fn with_session_backend(mut self, backend: Arc<dyn SessionBackend>) -> Self {
+        self.session_backend = Some(backend);
+        self
+    }
+
     pub fn with_audit_logger(mut self, logger: Arc<crate::security::audit::AuditLogger>) -> Self {
         self.audit_logger = Some(logger);
         self
@@ -235,6 +262,122 @@ impl DelegateTool {
                 mem.clone()
             }
         })
+    }
+
+    fn pool_member_to_config(member: &PoolMember) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: member.provider.clone(),
+            model: member.model.clone(),
+            system_prompt: member.system_prompt.clone(),
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: !member.allowed_tools.is_empty(),
+            allowed_tools: member.allowed_tools.clone(),
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+            memory_namespace: Some(member.agentid.clone()),
+        }
+    }
+
+    /// Resolve an agent from the pool store. If not found and provider/model
+    /// are given, spawns a new persistent member. Returns (config, agentid).
+    fn resolve_pool_agent(
+        &self,
+        agent_name: &str,
+        provider_hint: Option<&str>,
+        model_hint: Option<&str>,
+        system_prompt_hint: Option<&str>,
+        allowed_tools_hint: &[String],
+    ) -> Result<(DelegateAgentConfig, String), String> {
+        let pool = self
+            .pool_store
+            .as_ref()
+            .ok_or("Pool enabled but store not initialized")?;
+
+        // Try by agentid first, then by name
+        for lookup in [pool.get_member(agent_name), pool.get_member_by_name(agent_name)] {
+            if let Ok(Some(member)) = lookup {
+                if member.lifecycle_state == LifecycleState::Dormant {
+                    let _ = pool.set_lifecycle_state(&member.agentid, LifecycleState::Resident);
+                }
+                let _ = pool.touch_last_active(&member.agentid);
+                let agentid = member.agentid.clone();
+                return Ok((Self::pool_member_to_config(&member), agentid));
+            }
+        }
+
+        // Not found — spawn if we have provider + model
+        let provider = provider_hint.ok_or_else(|| {
+            let members = pool.list_members().unwrap_or_default();
+            let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+            let joined = names.join(", ");
+            format!(
+                "Pool member '{agent_name}' not found. Available: {}. \
+                 Specify 'provider' and 'model' to spawn a new member.",
+                if names.is_empty() { "(none)" } else { &joined }
+            )
+        })?;
+        let model = model_hint.ok_or_else(|| {
+            format!("Cannot spawn pool member '{agent_name}': 'model' is required")
+        })?;
+
+        match pool.spawn_member(
+            agent_name,
+            system_prompt_hint,
+            provider,
+            model,
+            allowed_tools_hint,
+        ) {
+            Ok(member) => {
+                let agentid = member.agentid.clone();
+                Ok((Self::pool_member_to_config(&member), agentid))
+            }
+            Err(e) => Err(format!(
+                "Failed to spawn pool member '{agent_name}': {e}"
+            )),
+        }
+    }
+
+    /// Evict the coldest (least-recently-active) resident member by spinning
+    /// it down to dormant. Returns the evicted member's agentid, if any.
+    pub fn evict_coldest(&self) -> Option<String> {
+        let pool = self.pool_store.as_ref()?;
+        let member = pool.coldest_resident().ok()??;
+        pool.set_lifecycle_state(&member.agentid, LifecycleState::Dormant)
+            .ok()?;
+        Some(member.agentid)
+    }
+
+    /// List pool members action handler.
+    async fn handle_list_members(&self) -> anyhow::Result<ToolResult> {
+        let pool = match &self.pool_store {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Pool is not enabled".into()),
+                });
+            }
+        };
+        match pool.list_members() {
+            Ok(members) => {
+                let output = serde_json::to_string_pretty(&members)
+                    .unwrap_or_else(|_| format!("{members:?}"));
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to list pool members: {e}")),
+            }),
+        }
     }
 
     /// Directory where background delegate results are stored.
@@ -268,30 +411,44 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let agent_desc = if self.pool_enabled {
+            let members = self
+                .pool_store
+                .as_ref()
+                .and_then(|p| p.list_members().ok())
+                .unwrap_or_default();
+            let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+            let joined = names.join(", ");
+            format!(
+                "Name or agentid of the pool member to delegate to. Pool members: {}. \
+                 Specify 'provider' and 'model' to spawn a new member.",
+                if names.is_empty() { "(none yet)" } else { joined.as_str() }
+            )
+        } else {
+            let agent_names: Vec<&str> =
+                self.agents.keys().map(|s: &String| s.as_str()).collect();
+            let joined = agent_names.join(", ");
+            format!(
+                "Name of the agent to delegate to. Available: {}",
+                if agent_names.is_empty() { "(none configured)" } else { joined.as_str() }
+            )
+        };
         json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["delegate", "check_result", "list_results", "cancel_task"],
-                    "description": "Action to perform. Default: 'delegate'. Use 'check_result' to \
-                                    retrieve a background task result, 'list_results' to list all \
-                                    background tasks, 'cancel_task' to cancel a running background task.",
+                    "enum": ["delegate", "check_result", "list_results", "cancel_task", "list_members"],
+                    "description": "Action to perform. Default: 'delegate'. Use 'list_members' to \
+                                    see pool members, 'check_result' to retrieve a background task \
+                                    result, 'list_results' for background tasks, 'cancel_task' to cancel.",
                     "default": "delegate"
                 },
                 "agent": {
                     "type": "string",
                     "minLength": 1,
-                    "description": format!(
-                        "Name of the agent to delegate to. Available: {}",
-                        if agent_names.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            agent_names.join(", ")
-                        }
-                    )
+                    "description": agent_desc
                 },
                 "prompt": {
                     "type": "string",
@@ -343,6 +500,7 @@ impl Tool for DelegateTool {
         match action {
             "check_result" => return self.handle_check_result(&args).await,
             "list_results" => return self.handle_list_results().await,
+            "list_members" => return self.handle_list_members().await,
             "cancel_task" => return self.handle_cancel_task(&args).await,
             "delegate" => {} // fall through to delegation logic
             other => {
@@ -476,15 +634,61 @@ impl DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
-        // Resolve agent config: either from named agents or from a provider override.
+        // Resolve agent config.
+        // Pool ON + agent name → pool_members is the source (lookup or spawn).
+        // Provider override without agent name → transient (not persisted).
+        // Pool OFF → legacy config.agents HashMap.
         let provider_override = args
             .get("provider")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let model_arg = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim);
 
+        let pool_config;
         let transient_config;
-        let agent_config: &DelegateAgentConfig = if let Some(provider_name) = provider_override {
+        let mut member_agentid: Option<String> = None;
+        let agent_config: &DelegateAgentConfig = if self.pool_enabled
+            && agent_name != "_transient"
+        {
+            // Pool-first resolution
+            let system_prompt_arg = args
+                .get("system_prompt")
+                .and_then(|v| v.as_str())
+                .map(str::trim);
+            let allowed_tools_arg: Vec<String> = args
+                .get("allowed_tools")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match self.resolve_pool_agent(
+                agent_name,
+                provider_override,
+                model_arg,
+                system_prompt_arg,
+                &allowed_tools_arg,
+            ) {
+                Ok((config, agentid)) => {
+                    member_agentid = Some(agentid);
+                    pool_config = config;
+                    &pool_config
+                }
+                Err(msg) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(msg),
+                    });
+                }
+            }
+        } else if let Some(provider_name) = provider_override {
             let providers = match &self.providers_config {
                 Some(pc) => pc,
                 None => {
@@ -498,10 +702,6 @@ impl DelegateTool {
                     });
                 }
             };
-            let model_arg = args
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(str::trim);
             match Self::resolve_provider_override(
                 provider_name,
                 model_arg,
@@ -611,6 +811,7 @@ impl DelegateTool {
                     &*provider,
                     &full_prompt,
                     temperature,
+                    member_agentid.as_deref(),
                 )
                 .await;
         }
@@ -655,6 +856,27 @@ impl DelegateTool {
                     rendered = "[Empty response]".to_string();
                 }
 
+                // Persist the exchange for pool members
+                if let (Some(agentid), Some(backend)) =
+                    (&member_agentid, &self.session_backend)
+                {
+                    let _ = backend.append_with_actor(
+                        agentid,
+                        &ChatMessage::user(full_prompt.clone()),
+                        Some(agentid),
+                        Some("pool_member"),
+                    );
+                    let _ = backend.append_with_actor(
+                        agentid,
+                        &ChatMessage::assistant(rendered.clone()),
+                        Some(agentid),
+                        Some("pool_member"),
+                    );
+                    if let Some(pool) = &self.pool_store {
+                        let _ = pool.touch_last_active(agentid);
+                    }
+                }
+
                 Ok(ToolResult {
                     success: true,
                     output: format!(
@@ -685,24 +907,37 @@ impl DelegateTool {
         prompt: &str,
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
-        // Validate agent exists and check depth/security before spawning
-        let agent_config = match self.agents.get(agent_name) {
-            Some(cfg) => cfg.clone(),
-            None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Unknown agent '{agent_name}'. Available agents: {}",
-                        if available.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    )),
-                });
+        // Validate agent exists (pool or legacy) and check depth/security
+        let agent_config = if self.pool_enabled {
+            match self.resolve_pool_agent(agent_name, None, None, None, &[]) {
+                Ok((config, _agentid)) => config,
+                Err(msg) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(msg),
+                    });
+                }
+            }
+        } else {
+            match self.agents.get(agent_name) {
+                Some(cfg) => cfg.clone(),
+                None => {
+                    let available: Vec<&str> =
+                        self.agents.keys().map(|s: &String| s.as_str()).collect();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Unknown agent '{agent_name}'. Available agents: {}",
+                            if available.is_empty() {
+                                "(none configured)".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        )),
+                    });
+                }
             }
         };
 
@@ -773,6 +1008,11 @@ impl DelegateTool {
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
         let audit_logger_clone = self.audit_logger.clone();
+        let pool_store_clone = self.pool_store.clone();
+        let session_backend_clone = self.session_backend.clone();
+        let pool_enabled = self.pool_enabled;
+        let memory_clone = self.memory.clone();
+        let providers_config_clone = self.providers_config.clone();
         let task_id_clone = task_id.clone();
 
         tokio::spawn(async move {
@@ -788,9 +1028,12 @@ impl DelegateTool {
                 delegate_config,
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
-                memory: None,
-                providers_config: None,
+                memory: memory_clone,
+                providers_config: providers_config_clone,
                 audit_logger: audit_logger_clone,
+                pool_store: pool_store_clone,
+                session_backend: session_backend_clone,
+                pool_enabled,
             };
 
             let args_inner = json!({
@@ -900,22 +1143,48 @@ impl DelegateTool {
         }
 
         // Validate all agents exist before starting any
-        for name in &agent_names {
-            if !self.agents.contains_key(name) {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Unknown agent '{name}' in parallel list. Available: {}",
-                        if available.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    )),
-                });
+        if self.pool_enabled {
+            if let Some(pool) = &self.pool_store {
+                for name in &agent_names {
+                    let found = pool
+                        .get_member(name)
+                        .ok()
+                        .flatten()
+                        .or_else(|| pool.get_member_by_name(name).ok().flatten());
+                    if found.is_none() {
+                        let members = pool.list_members().unwrap_or_default();
+                        let names: Vec<String> =
+                            members.iter().map(|m| m.name.clone()).collect();
+                        let joined = names.join(", ");
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Pool member '{name}' not found in parallel list. Available: {}",
+                                if names.is_empty() { "(none)" } else { &joined }
+                            )),
+                        });
+                    }
+                }
+            }
+        } else {
+            for name in &agent_names {
+                if !self.agents.contains_key(name) {
+                    let available: Vec<&str> =
+                        self.agents.keys().map(|s: &String| s.as_str()).collect();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Unknown agent '{name}' in parallel list. Available: {}",
+                            if available.is_empty() {
+                                "(none configured)".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        )),
+                    });
+                }
             }
         }
 
@@ -933,6 +1202,11 @@ impl DelegateTool {
             let workspace_dir = self.workspace_dir.clone();
             let cancellation_token = self.cancellation_token.child_token();
             let audit_logger_clone = self.audit_logger.clone();
+            let pool_store_clone = self.pool_store.clone();
+            let session_backend_clone = self.session_backend.clone();
+            let pool_enabled = self.pool_enabled;
+            let memory_clone = self.memory.clone();
+            let providers_config_clone = self.providers_config.clone();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -949,9 +1223,12 @@ impl DelegateTool {
                     delegate_config,
                     workspace_dir,
                     cancellation_token,
-                    memory: None,
-                    providers_config: None,
+                    memory: memory_clone,
+                    providers_config: providers_config_clone,
                     audit_logger: audit_logger_clone,
+                    pool_store: pool_store_clone,
+                    session_backend: session_backend_clone,
+                    pool_enabled,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1234,6 +1511,7 @@ impl DelegateTool {
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
+        member_agentid: Option<&str>,
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -1281,8 +1559,21 @@ impl DelegateTool {
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
+
+        // Rehydrate: load prior conversation from sessions.db for pool members.
+        // Skip system messages from prior sessions (we have a fresh one above).
+        if let (Some(agentid), Some(backend)) = (member_agentid, &self.session_backend) {
+            let prior = backend.load(agentid);
+            history.extend(
+                prior
+                    .into_iter()
+                    .filter(|m| m.role != "system"),
+            );
+        }
+
         history.push(ChatMessage::user(full_prompt.to_string()));
 
+        let prior_msg_count = history.len();
         let noop_observer = NoopObserver;
 
         let agentic_timeout_secs = agent_config
@@ -1322,6 +1613,21 @@ impl DelegateTool {
             ),
         )
         .await;
+
+        // Persist new messages for pool members (only messages added during this run)
+        if let (Some(agentid), Some(backend)) = (member_agentid, &self.session_backend) {
+            for msg in &history[prior_msg_count..] {
+                let _ = backend.append_with_actor(
+                    agentid,
+                    msg,
+                    Some(agentid),
+                    Some("pool_member"),
+                );
+            }
+            if let Some(pool) = &self.pool_store {
+                let _ = pool.touch_last_active(agentid);
+            }
+        }
 
         match result {
             Ok(Ok(response)) => {
@@ -1983,7 +2289,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -2005,7 +2311,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -2027,7 +2333,7 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -2125,7 +2431,7 @@ mod tests {
 
         let provider = McpToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2, None)
             .await
             .unwrap();
 
@@ -2376,166 +2682,6 @@ mod tests {
         let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeout_secs, Some(45));
         assert_eq!(config.agentic_timeout_secs, Some(900));
-    }
-
-    #[test]
-    fn config_validation_rejects_zero_timeout() {
-        let mut config = daemonclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: Some(0),
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("timeout_secs must be greater than 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_zero_agentic_timeout() {
-        let mut config = daemonclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: Some(0),
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("agentic_timeout_secs must be greater than 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_excessive_timeout() {
-        let mut config = daemonclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: Some(7200),
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("exceeds max 3600"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_excessive_agentic_timeout() {
-        let mut config = daemonclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: Some(5000),
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("exceeds max 3600"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_accepts_max_boundary_timeout() {
-        let mut config = daemonclaw_config::schema::Config::default();
-        config.agents.insert(
-            "ok".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: Some(3600),
-                agentic_timeout_secs: Some(3600),
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn config_validation_accepts_none_timeouts() {
-        let mut config = daemonclaw_config::schema::Config::default();
-        config.agents.insert(
-            "ok".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        assert!(config.validate().is_ok());
     }
 
     #[test]

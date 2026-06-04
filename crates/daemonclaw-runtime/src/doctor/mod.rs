@@ -604,21 +604,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Delegate agents: provider validity
-    let mut agent_names: Vec<_> = config.agents.keys().collect();
-    agent_names.sort();
-    for name in agent_names {
-        let agent = config.agents.get(name).unwrap();
-        if let Some(reason) = provider_validation_error(&agent.provider) {
-            items.push(DiagItem::warn(
-                cat,
-                format!(
-                    "agent \"{name}\" uses invalid provider \"{}\": {}",
-                    agent.provider, reason
-                ),
-            ));
-        }
-    }
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
@@ -1324,57 +1309,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn config_validation_reports_delegate_agents_in_sorted_order() {
-        let mut config = Config::default();
-        config.agents.insert(
-            "zeta".into(),
-            daemonclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-z".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        config.agents.insert(
-            "alpha".into(),
-            daemonclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-a".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-
-        let agent_messages: Vec<_> = items
-            .iter()
-            .filter(|item| item.message.starts_with("agent \""))
-            .map(|item| item.message.as_str())
-            .collect();
-
-        assert_eq!(agent_messages.len(), 2);
-        assert!(agent_messages[0].contains("agent \"alpha\""));
-        assert!(agent_messages[1].contains("agent \"zeta\""));
-    }
 }

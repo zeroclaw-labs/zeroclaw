@@ -5147,7 +5147,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.http_request,
         &config.web_fetch,
         &workspace,
-        &config.agents,
+        &std::collections::HashMap::new(),
         config
             .providers
             .fallback_provider()
@@ -5304,10 +5304,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
-    if !config.agents.is_empty() {
+    if config.pool.enabled {
         tool_descs.push((
             "delegate",
-            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
+            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). Use action='list_members' to see pool members.",
         ));
     }
 
