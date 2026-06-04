@@ -745,39 +745,58 @@ fn needs_onboarding_ws_error(
     }))
 }
 
+/// Returns true when a broadcast frame should be forwarded to the chat
+/// WebSocket subscribed to `session_id`.
+///
+/// Contract (mirrors `sse.rs::is_public_sse_event`): broadcast events must
+/// not include `session_id` unless they are intentionally scoped to that
+/// session. Frames without a `session_id` are therefore **global
+/// monitoring/observability events** — they belong on `/api/events`, not in
+/// per-session chat channels. The chat WebSocket only forwards a frame when
+/// it is either:
+///
+/// * explicitly scoped to this session via `session_id == session`, or
+/// * a global system event the chat UI is known to render (whitelisted in
+///   [`is_global_chat_event`]) — currently just `cron_result`.
+///
+/// Everything else (observability telemetry, log records, error broadcasts
+/// from unrelated subsystems, …) is dropped. Before #7151 this defaulted to
+/// `None => true`, which leaked `BroadcastObserver` telemetry — including a
+/// red `error` bubble — into every active chat user's view.
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
-        None => true,
+        None => is_global_chat_event(event),
     }
 }
 
-/// Returns true for monitoring/observability telemetry frames that share the
-/// shared broadcast bus with chat events but must never reach the chat
-/// WebSocket client.
+/// Whitelist of broadcast event `type` values that all chat WebSockets
+/// should receive even without a `session_id` scope.
 ///
-/// The chat protocol streams its real tool frames out-of-band over the
-/// per-turn channel (`{"type":"tool_call","id","name","args"}` and
-/// `{"type":"tool_result","id","name","output"}`, emitted directly by
-/// `process_chat_message`), so any `tool_call`/`tool_result`/`tool_call_start`
-/// frame arriving over the *broadcast* bus is observability telemetry emitted
-/// by `BroadcastObserver` with a different shape (`tool`/`duration_ms`/
-/// `success`, and crucially no `name`). Forwarding it would make the frontend
-/// render a permanent "unknown" tool card (issue #7151).
+/// Today this is just `cron_result` (the scheduler's automatic cron output
+/// and the manual `/api/cron/<id>/trigger` rebroadcast, both rendered by
+/// `AgentContext.tsx` as a markdown bubble). New entries must be backed by
+/// a matching `case` in the frontend message dispatcher — otherwise the
+/// frame is dead weight on the wire.
+fn is_global_chat_event(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("cron_result")
+    )
+}
+
+/// Defense-in-depth check for observability telemetry frames that leak onto
+/// the chat broadcast bus.
 ///
-/// Discriminator: drop tool frames that lack the chat tool-frame `name` field.
-/// This keeps the filter targeted — legitimate chat frames always carry `name`
-/// — while catching the telemetry shape regardless of which observability
-/// fields it happens to include.
+/// After #7151 the primary defense is [`event_matches_session`]'s inverted
+/// default — any frame without `session_id` is dropped unless explicitly
+/// whitelisted. This helper exists as a belt-and-braces guard for the case
+/// where a future emitter forgets `session_id` *and* its event type collides
+/// with a global-whitelisted one (e.g. someone adding `cron_result`-shaped
+/// telemetry). The discriminator is the `"source": "observability"` tag
+/// that `BroadcastObserver` (sse.rs) stamps on every emission.
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
-    match event.get("type").and_then(serde_json::Value::as_str) {
-        Some("tool_call" | "tool_call_start" | "tool_result") => {
-            // Chat tool frames always carry a `name`; observability telemetry
-            // uses `tool` instead and has no `name`.
-            event.get("name").and_then(serde_json::Value::as_str).is_none()
-        }
-        _ => false,
-    }
+    event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -1487,61 +1506,126 @@ mod tests {
             "session_id": "operator-2",
             "content": "different session"
         });
-        let global_event = serde_json::json!({
+        // No session_id and not on the global whitelist → dropped.
+        let nameless_observability = serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model": "gpt-4o"
+        });
+        // No session_id but on the global whitelist (`cron_result`) → forwarded.
+        let cron = serde_json::json!({
             "type": "cron_result",
-            "content": "global notification"
+            "output": "global notification"
         });
 
         assert!(event_matches_session(&target_event, "operator-1"));
         assert!(!event_matches_session(&other_event, "operator-1"));
-        assert!(event_matches_session(&global_event, "operator-1"));
+        assert!(!event_matches_session(
+            &nameless_observability,
+            "operator-1"
+        ));
+        assert!(event_matches_session(&cron, "operator-1"));
     }
 
     #[test]
-    fn observability_tool_call_telemetry_is_filtered() {
-        // BroadcastObserver telemetry shape (sse.rs): `tool`/`duration_ms`/
-        // `success`, no `name`. This must never reach the chat WS (#7151).
-        let telemetry = serde_json::json!({
+    fn event_matches_session_defaults_drops_unwhitelisted_no_session_frames() {
+        // The pre-#7151 contract was `None => true`, which silently leaked
+        // every BroadcastObserver telemetry frame (including `error`) into
+        // every chat WebSocket. The fix flips the default; verify each
+        // observed-in-the-wild leak shape is now blocked.
+        for ty in [
+            "agent_start",
+            "agent_end",
+            "llm_request",
+            "tool_call",
+            "tool_call_start",
+            "error",
+        ] {
+            let frame = serde_json::json!({
+                "type": ty,
+                "source": "observability",
+                "timestamp": "2026-06-04T00:00:00Z",
+            });
+            assert!(
+                !event_matches_session(&frame, "operator-1"),
+                "{ty} observability frame must be dropped from chat WS"
+            );
+        }
+    }
+
+    #[test]
+    fn event_matches_session_passes_session_scoped_chat_messages() {
+        // /api/sessions/{id}/messages broadcasts a session-scoped assistant
+        // injection — that frame must reach the chat for its session.
+        let assistant_inject = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "role": "assistant",
+            "content": "hello",
+        });
+        assert!(event_matches_session(&assistant_inject, "operator-1"));
+        assert!(!event_matches_session(&assistant_inject, "operator-2"));
+    }
+
+    #[test]
+    fn observability_tagged_frames_are_filtered() {
+        // The defense-in-depth helper: any frame with source="observability"
+        // is telemetry, regardless of type or session_id presence.
+        let obs = serde_json::json!({
             "type": "tool_call",
-            "tool": "file_write",
-            "duration_ms": 10611,
-            "success": true,
-            "timestamp": "2026-06-04T00:00:00Z",
-        });
-        assert!(is_observability_telemetry(&telemetry));
-
-        // tool_call_start telemetry leaks the same way.
-        let telemetry_start = serde_json::json!({
-            "type": "tool_call_start",
+            "source": "observability",
             "tool": "shell",
-            "timestamp": "2026-06-04T00:00:00Z",
         });
-        assert!(is_observability_telemetry(&telemetry_start));
-    }
+        assert!(is_observability_telemetry(&obs));
 
-    #[test]
-    fn chat_tool_frames_are_not_filtered() {
-        // Real chat tool frames (ws.rs process_chat_message) always carry
-        // `name`; they must pass through.
-        let chat_tool_call = serde_json::json!({
+        let chat = serde_json::json!({
             "type": "tool_call",
             "id": "call-1",
             "name": "file_write",
             "args": {"path": "/tmp/x"},
         });
-        assert!(!is_observability_telemetry(&chat_tool_call));
+        assert!(!is_observability_telemetry(&chat));
+    }
 
-        let chat_tool_result = serde_json::json!({
-            "type": "tool_result",
+    #[test]
+    fn observability_telemetry_filter_handles_malformed_source_field() {
+        // Edge cases the previous tool-frame discriminator covered: ensure
+        // the source-tag check doesn't false-positive on weird `source`
+        // values that happen to coexist with chat-shaped frames.
+        for source in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(42),
+            serde_json::json!("api"),
+            serde_json::json!({"nested": "x"}),
+        ] {
+            let frame = serde_json::json!({
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "file_write",
+                "source": source,
+            });
+            assert!(
+                !is_observability_telemetry(&frame),
+                "frame with source={frame:?} must not be flagged as observability telemetry",
+            );
+        }
+    }
+
+    #[test]
+    fn chat_tool_frames_pass_through_when_session_scoped() {
+        // Real chat tool frames (ws.rs process_chat_message) are streamed
+        // over the per-turn channel, not the broadcast bus, but if anything
+        // ever rebroadcasts one with the right session_id it must pass.
+        let chat_tool_call = serde_json::json!({
+            "type": "tool_call",
+            "session_id": "operator-1",
             "id": "call-1",
             "name": "file_write",
-            "output": "ok",
+            "args": {"path": "/tmp/x"},
         });
-        assert!(!is_observability_telemetry(&chat_tool_result));
-
-        // Unrelated event types are never treated as telemetry.
-        let cron = serde_json::json!({ "type": "cron_result", "output": "done" });
-        assert!(!is_observability_telemetry(&cron));
+        assert!(event_matches_session(&chat_tool_call, "operator-1"));
+        assert!(!is_observability_telemetry(&chat_tool_call));
     }
 
     #[test]

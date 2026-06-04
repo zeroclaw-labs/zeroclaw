@@ -283,6 +283,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_result': {
+        // Defense in depth (issue #7151): mirrors the `tool_call` guard
+        // above. Observability `tool_result`-shaped telemetry would otherwise
+        // overwrite the most recent pending tool card with an empty output.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
@@ -301,7 +308,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
+              toolCall: { name: toolName, output: msg.output ?? '' },
               timestamp: new Date(),
             },
           ];
