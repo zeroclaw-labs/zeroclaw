@@ -259,7 +259,12 @@ impl Chat {
 
     fn after_enqueue(&mut self, enq: Result<(), String>) {
         match enq {
-            Ok(()) => self.pump_queue(),
+            Ok(()) => {
+                if let ChatPhase::Active(ref mut state) = self.phase {
+                    state.ensure_queue_selection();
+                }
+                self.pump_queue();
+            }
             Err(msg) => {
                 if let ChatPhase::Active(ref mut state) = self.phase {
                     state
@@ -613,10 +618,6 @@ impl Chat {
             use crate::keymap::ChatTabAction as QAction;
             let qaction = QAction::from_chord(&key);
             match qaction {
-                Some(QAction::ToggleQueue) => {
-                    state.toggle_queue_sidebar();
-                    return false;
-                }
                 Some(QAction::PauseResumeQueue) => {
                     let paused = state.toggle_queue_pause();
                     let notice = if paused {
@@ -630,19 +631,19 @@ impl Chat {
                     }
                     return false;
                 }
-                Some(QAction::QueueNavUp) if state.show_queue_sidebar => {
+                Some(QAction::QueueNavUp) if state.queue_sidebar_open() => {
                     state.queue_select_step(-1);
                     return false;
                 }
-                Some(QAction::QueueNavDown) if state.show_queue_sidebar => {
+                Some(QAction::QueueNavDown) if state.queue_sidebar_open() => {
                     state.queue_select_step(1);
                     return false;
                 }
-                Some(QAction::QueueDelete) if state.show_queue_sidebar => {
+                Some(QAction::QueueDelete) if state.queue_sidebar_open() => {
                     state.delete_selected_queued();
                     return false;
                 }
-                Some(QAction::QueueEdit) if state.show_queue_sidebar => {
+                Some(QAction::QueueEdit) if state.queue_sidebar_open() => {
                     let bar_busy = !state.input_bar.input().trim().is_empty()
                         || state.input_bar.has_pending_attachments();
                     if bar_busy {
@@ -657,11 +658,11 @@ impl Chat {
                     }
                     return false;
                 }
-                Some(QAction::QueueWiden) if state.show_queue_sidebar => {
+                Some(QAction::QueueWiden) if state.queue_sidebar_open() => {
                     state.widen_queue_sidebar();
                     return false;
                 }
-                Some(QAction::QueueNarrow) if state.show_queue_sidebar => {
+                Some(QAction::QueueNarrow) if state.queue_sidebar_open() => {
                     state.narrow_queue_sidebar();
                     return false;
                 }
@@ -1043,7 +1044,7 @@ impl Chat {
             // Queue sidebar intercepts mouse events over its area before the
             // conversation handler, so clicks select queued items and the wheel
             // scrolls the queue rather than the transcript.
-            if state.show_queue_sidebar && state.point_in_queue_sidebar(col, row) {
+            if state.queue_sidebar_open() && state.point_in_queue_sidebar(col, row) {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
                     MouseEventKind::ScrollDown => state.queue_scroll_by(3),
@@ -1253,12 +1254,11 @@ impl crate::widgets::HelpContext for Chat {
                         ),
                         E::key("Enter", crate::i18n::t("zc-queue-help-enqueue")),
                         E::key("Ctrl+Enter", crate::i18n::t("zc-queue-help-inject")),
-                        E::key("Alt+Q", crate::i18n::t("zc-queue-help-toggle")),
                     ];
                     // Queue-management keys are only live while the sidebar is
                     // open — surface them here too so a mid-turn open queue is
                     // not left without its own controls.
-                    if state.show_queue_sidebar {
+                    if state.queue_sidebar_open() {
                         entries.extend(queue_sidebar_help_entries());
                     }
                     return HelpNode::entries(entries);
@@ -1280,10 +1280,6 @@ impl crate::widgets::HelpContext for Chat {
                     E::key("Ctrl+S", crate::i18n::t("zc-chat-help-session-list")),
                     E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
                     E::spacer(),
-                    E::key(
-                        chord_label(ChatTabAction::ToggleQueue),
-                        crate::i18n::t("zc-queue-help-toggle"),
-                    ),
                     E::key(
                         chord_label(ChatTabAction::PauseResumeQueue),
                         crate::i18n::t("zc-queue-help-resume"),
@@ -1388,7 +1384,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 // ── Active chat rendering ────────────────────────────────────────
 
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
-    let area = if state.show_queue_sidebar {
+    let area = if state.queue_sidebar_open() {
         let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -2772,8 +2768,6 @@ pub struct ChatState {
     next_queue_id: u64,
     /// Set on Cancel/Fail; freezes auto-dispatch until the user resumes.
     queue_paused: bool,
-    /// Whether the queue sidebar is visible.
-    show_queue_sidebar: bool,
     /// Queue sidebar width as a percent of the chat area (clamped). Adjusted
     /// with Shift+Left (widen) / Shift+Right (narrow), mirroring the logs
     /// detail pane's resize.
@@ -2835,7 +2829,6 @@ impl ChatState {
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
-            show_queue_sidebar: false,
             queue_sidebar_pct: 30,
             queue_sel: None,
             queue_item_rects: Vec::new(),
@@ -3462,12 +3455,22 @@ impl ChatState {
         }
     }
 
-    pub fn toggle_queue_sidebar(&mut self) {
-        self.show_queue_sidebar = !self.show_queue_sidebar;
-        if self.show_queue_sidebar && self.queue_sel.is_none() {
-            self.queue_sel = self.message_queue.front().map(|m| m.id);
+    /// The queue sidebar is open exactly when the queue is non-empty. There is
+    /// no manual toggle: it appears with the first queued message and closes
+    /// when the queue drains, so its presence always reflects real state.
+    pub fn queue_sidebar_open(&self) -> bool {
+        !self.message_queue.is_empty()
+    }
+
+    /// Default the sidebar selection to the front item when nothing is selected
+    /// yet (e.g. the first message just opened the sidebar). Keeps keyboard
+    /// delete/edit working without a manual open step.
+    pub fn ensure_queue_selection(&mut self) {
+        if self.queue_sel.is_none()
+            && let Some(front) = self.message_queue.front()
+        {
+            self.queue_sel = Some(front.id);
         }
-        self.mark_dirty_full();
     }
 
     /// Select a queued item by id (mouse left-click in the sidebar). Ignores
@@ -4402,12 +4405,28 @@ mod tests {
     }
 
     #[test]
+    fn queue_sidebar_open_tracks_contents() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        assert!(!s.queue_sidebar_open(), "empty queue → sidebar closed");
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        assert!(s.queue_sidebar_open(), "non-empty queue → sidebar open");
+        s.ensure_queue_selection();
+        assert!(s.queue_sel.is_some(), "first enqueue seeds a selection");
+        s.delete_selected_queued();
+        assert!(
+            !s.queue_sidebar_open(),
+            "draining the queue closes the sidebar"
+        );
+    }
+
+    #[test]
     fn delete_selected_removes_item() {
         let mut s = state();
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         s.enqueue_message("b".to_string(), Vec::new()).unwrap();
-        s.toggle_queue_sidebar();
+        s.ensure_queue_selection();
         s.delete_selected_queued();
         assert_eq!(s.queue_len(), 1);
     }
@@ -4418,7 +4437,7 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("draft".to_string(), vec![att("x.txt")])
             .unwrap();
-        s.toggle_queue_sidebar();
+        s.ensure_queue_selection();
         let (text, atts) = s.take_selected_for_edit().expect("selected item");
         assert_eq!(text, "draft");
         assert_eq!(atts.len(), 1);

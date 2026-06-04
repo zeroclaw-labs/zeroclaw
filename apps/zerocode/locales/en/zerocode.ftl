@@ -99,7 +99,6 @@ zc-queue-clear-empty = Queue is already empty.
 zc-queue-cleared-all = Cleared { $count } queued message(s).
 zc-queue-cleared-one = Cleared queued message { $index }.
 zc-queue-clear-invalid = No queued message at index { $index } (queue has { $count }).
-zc-queue-help-toggle = Toggle queue
 zc-queue-help-resume = Pause/resume queue
 zc-queue-help-nav = Select queued
 zc-queue-help-delete = Delete queued
