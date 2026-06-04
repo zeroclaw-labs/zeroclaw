@@ -261,7 +261,6 @@ zc-chat-thinking-visible = 思考出力: 表示
 zc-chat-thinking-hidden = 思考出力: 非表示
 zc-chat-label-you = あなた:
 zc-chat-label-agent = エージェント:
-zc-chat-first-message-label = セッションの最初のメッセージ:
 zc-chat-loading-agents = エージェントを読み込み中…
 zc-chat-loading-agents-msg = エージェントを読み込み中...
 zc-chat-picker-header = エージェントを選択
