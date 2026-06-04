@@ -443,7 +443,9 @@ async fn persist_and_swap(
 /// banner the operator can't act on. Add new entries here when a similar
 /// gateway-managed field lands (e.g. webhook secret rotation).
 fn is_gateway_managed_field(name: &str) -> bool {
-    matches!(name, "gateway.paired-tokens")
+    // Match the prop-field name actually emitted by the `Configurable` derive,
+    // which preserves the Rust field's snake_case (`paired_tokens`), not kebab.
+    matches!(name, "gateway.paired_tokens")
 }
 
 /// Compute drift between the in-memory config and what's on disk right now.
@@ -2237,6 +2239,50 @@ mod tests {
         // is_secret marker must be present so the dashboard can render it as locked.
         assert_eq!(obj.get("is_secret"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(obj.get("populated"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn gateway_paired_tokens_is_gateway_managed() {
+        // The `Configurable` derive emits prop-field names in the field's
+        // snake_case form, so the canonical name is `gateway.paired_tokens`
+        // (underscore). The matcher must use that exact string, otherwise the
+        // guard never fires and the secret keeps surfacing as drift.
+        assert!(
+            is_gateway_managed_field("gateway.paired_tokens"),
+            "gateway.paired_tokens must be treated as gateway-managed"
+        );
+        // The old hyphenated form never matched a real prop-field name.
+        assert!(!is_gateway_managed_field("gateway.paired-tokens"));
+
+        // Guard against the field being renamed or the derive changing its
+        // naming convention out from under the matcher.
+        let cfg = zeroclaw_config::schema::Config::default();
+        assert!(
+            cfg.prop_fields()
+                .iter()
+                .any(|p| p.name == "gateway.paired_tokens"),
+            "expected a prop-field named gateway.paired_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_drift_excludes_gateway_paired_tokens() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.save().await.expect("initial save");
+
+        // Mutate the gateway-managed secret in memory without saving. Drift
+        // detection must not surface it because the gateway owns it.
+        cfg.gateway.paired_tokens = vec!["minted-by-the-gateway".into()];
+
+        let drift = compute_drift(&cfg).await;
+        assert!(
+            !drift.iter().any(|d| d.path == "gateway.paired_tokens"),
+            "gateway.paired_tokens must never appear in drift, got {drift:?}"
+        );
     }
 
     #[test]
