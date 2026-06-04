@@ -82,6 +82,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.approval_always': '始终批准',
     'agent.approval_always_hint': '本会话内自动批准此工具',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': '未知命令：{cmd}。输入 /help 查看可用命令。',
+    'agent.cmd_help_header': '可用命令：',
+    'agent.cmd_help_help': '显示此命令列表',
+    'agent.cmd_help_clear': '清空对话',
+    'agent.cmd_help_new': '开始新对话（清空消息）',
+    'agent.cmd_help_model': '查看或切换当前模型',
+    'agent.cmd_cleared': '已清空对话。',
+    'agent.cmd_model_current': '当前模型：{model}',
+    'agent.cmd_model_none': '当前未选择任何模型。',
+    'agent.cmd_model_available': '可用模型：{models}',
+    'agent.cmd_model_unknown': '未知模型：{model}。可用模型：{models}',
+    'agent.cmd_model_switching': '正在切换至模型：{model}…',
+    'agent.cmd_model_busy': '已有模型切换正在进行中，请稍候。',
+    'agent.cmd_model_failed': '切换至模型 {model} 失败。',
+    'agent.cmd_hint_title': '命令',
+
     // Tools
     'tools.title': '可用工具',
     'tools.name': '名称',
@@ -481,6 +498,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_available': 'Available models: {models}',
     'agent.cmd_model_unknown': 'Unknown model: {model}. Available models: {models}',
     'agent.cmd_model_switching': 'Switching to model: {model}…',
+    'agent.cmd_model_busy': 'A model switch is already in progress. Please wait for it to finish.',
+    'agent.cmd_model_failed': 'Failed to switch to model: {model}.',
     'agent.cmd_hint_title': 'Commands',
     'agent.compact_mode': 'Compact',
     'agent.tool_activity_show': 'Show tool activity',
@@ -917,6 +936,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Bağlandı',
     'agent.disconnected_status': 'Bağlantı kesildi',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Bilinmeyen komut: {cmd}. Kullanılabilir komutları görmek için /help yazın.',
+    'agent.cmd_help_header': 'Kullanılabilir komutlar:',
+    'agent.cmd_help_help': 'bu komut listesini göster',
+    'agent.cmd_help_clear': 'sohbeti temizle',
+    'agent.cmd_help_new': 'yeni bir sohbet başlat (mesajları temizler)',
+    'agent.cmd_help_model': 'aktif modeli göster veya değiştir',
+    'agent.cmd_cleared': 'Sohbet temizlendi.',
+    'agent.cmd_model_current': 'Mevcut model: {model}',
+    'agent.cmd_model_none': 'Şu anda seçili bir model yok.',
+    'agent.cmd_model_available': 'Kullanılabilir modeller: {models}',
+    'agent.cmd_model_unknown': 'Bilinmeyen model: {model}. Kullanılabilir modeller: {models}',
+    'agent.cmd_model_switching': 'Modele geçiliyor: {model}…',
+    'agent.cmd_model_busy': 'Bir model değişikliği zaten devam ediyor. Lütfen bitmesini bekleyin.',
+    'agent.cmd_model_failed': 'Modele geçiş başarısız: {model}.',
+    'agent.cmd_hint_title': 'Komutlar',
+
     // Tools
     'tools.title': 'Mevcut Araçlar',
     'tools.name': 'Ad',
@@ -1238,6 +1274,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'نسخ الرسالة',
     'agent.connected_status': 'متصل',
     'agent.disconnected_status': 'غير متصل',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'أمر غير معروف: {cmd}. اكتب /help لرؤية الأوامر المتاحة.',
+    'agent.cmd_help_header': 'الأوامر المتاحة:',
+    'agent.cmd_help_help': 'عرض قائمة الأوامر هذه',
+    'agent.cmd_help_clear': 'مسح المحادثة',
+    'agent.cmd_help_new': 'بدء محادثة جديدة (يمسح الرسائل)',
+    'agent.cmd_help_model': 'عرض النموذج الحالي أو تغييره',
+    'agent.cmd_cleared': 'تم مسح المحادثة.',
+    'agent.cmd_model_current': 'النموذج الحالي: {model}',
+    'agent.cmd_model_none': 'لا يوجد نموذج محدد حاليًا.',
+    'agent.cmd_model_available': 'النماذج المتاحة: {models}',
+    'agent.cmd_model_unknown': 'نموذج غير معروف: {model}. النماذج المتاحة: {models}',
+    'agent.cmd_model_switching': 'يتم التبديل إلى النموذج: {model}…',
+    'agent.cmd_model_busy': 'هناك تبديل نموذج قيد التنفيذ بالفعل. يرجى الانتظار حتى ينتهي.',
+    'agent.cmd_model_failed': 'فشل التبديل إلى النموذج: {model}.',
+    'agent.cmd_hint_title': 'الأوامر',
 
     // Tools
     'tools.title': 'الأدوات المتاحة',
@@ -1594,6 +1647,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'সংযুক্ত',
     'agent.disconnected_status': 'সংযোগ বিচ্ছিন্ন',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'অজানা কমান্ড: {cmd}। উপলব্ধ কমান্ড দেখতে /help টাইপ করুন।',
+    'agent.cmd_help_header': 'উপলব্ধ কমান্ড:',
+    'agent.cmd_help_help': 'এই কমান্ড তালিকা দেখান',
+    'agent.cmd_help_clear': 'কথোপকথন পরিষ্কার করুন',
+    'agent.cmd_help_new': 'নতুন কথোপকথন শুরু করুন (বার্তা পরিষ্কার করে)',
+    'agent.cmd_help_model': 'সক্রিয় মডেল দেখান বা পরিবর্তন করুন',
+    'agent.cmd_cleared': 'কথোপকথন পরিষ্কার করা হয়েছে।',
+    'agent.cmd_model_current': 'বর্তমান মডেল: {model}',
+    'agent.cmd_model_none': 'বর্তমানে কোনো মডেল নির্বাচিত নেই।',
+    'agent.cmd_model_available': 'উপলব্ধ মডেল: {models}',
+    'agent.cmd_model_unknown': 'অজানা মডেল: {model}। উপলব্ধ মডেল: {models}',
+    'agent.cmd_model_switching': 'মডেলে স্যুইচ করা হচ্ছে: {model}…',
+    'agent.cmd_model_busy': 'একটি মডেল পরিবর্তন ইতিমধ্যে চলছে। অনুগ্রহ করে শেষ হওয়ার জন্য অপেক্ষা করুন।',
+    'agent.cmd_model_failed': 'মডেলে স্যুইচ ব্যর্থ: {model}।',
+    'agent.cmd_hint_title': 'কমান্ড',
+
     // Tools
     'tools.title': 'উপলব্ধ টুলস',
     'tools.name': 'নাম',
@@ -1948,6 +2018,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopírovat zprávu',
     'agent.connected_status': 'Připojeno',
     'agent.disconnected_status': 'Odpojeno',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Neznámý příkaz: {cmd}. Napište /help pro zobrazení dostupných příkazů.',
+    'agent.cmd_help_header': 'Dostupné příkazy:',
+    'agent.cmd_help_help': 'zobrazit tento seznam příkazů',
+    'agent.cmd_help_clear': 'vymazat konverzaci',
+    'agent.cmd_help_new': 'zahájit novou konverzaci (vymaže zprávy)',
+    'agent.cmd_help_model': 'zobrazit nebo přepnout aktivní model',
+    'agent.cmd_cleared': 'Konverzace vymazána.',
+    'agent.cmd_model_current': 'Aktuální model: {model}',
+    'agent.cmd_model_none': 'Aktuálně není vybrán žádný model.',
+    'agent.cmd_model_available': 'Dostupné modely: {models}',
+    'agent.cmd_model_unknown': 'Neznámý model: {model}. Dostupné modely: {models}',
+    'agent.cmd_model_switching': 'Přepínání na model: {model}…',
+    'agent.cmd_model_busy': 'Přepnutí modelu již probíhá. Počkejte prosím na jeho dokončení.',
+    'agent.cmd_model_failed': 'Přepnutí na model selhalo: {model}.',
+    'agent.cmd_hint_title': 'Příkazy',
 
     // Tools
     'tools.title': 'Dostupné nástroje',
@@ -2304,6 +2391,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Forbundet',
     'agent.disconnected_status': 'Afbrudt',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Ukendt kommando: {cmd}. Skriv /help for at se tilgængelige kommandoer.',
+    'agent.cmd_help_header': 'Tilgængelige kommandoer:',
+    'agent.cmd_help_help': 'vis denne liste over kommandoer',
+    'agent.cmd_help_clear': 'ryd samtalen',
+    'agent.cmd_help_new': 'start en ny samtale (rydder beskeder)',
+    'agent.cmd_help_model': 'vis eller skift den aktive model',
+    'agent.cmd_cleared': 'Samtale ryddet.',
+    'agent.cmd_model_current': 'Aktuel model: {model}',
+    'agent.cmd_model_none': 'Ingen model er valgt i øjeblikket.',
+    'agent.cmd_model_available': 'Tilgængelige modeller: {models}',
+    'agent.cmd_model_unknown': 'Ukendt model: {model}. Tilgængelige modeller: {models}',
+    'agent.cmd_model_switching': 'Skifter til model: {model}…',
+    'agent.cmd_model_busy': 'Et modelskift er allerede i gang. Vent venligst, til det er færdigt.',
+    'agent.cmd_model_failed': 'Kunne ikke skifte til model: {model}.',
+    'agent.cmd_hint_title': 'Kommandoer',
+
     // Tools
     'tools.title': 'Tilgængelige værktøjer',
     'tools.name': 'Navn',
@@ -2658,6 +2762,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Nachricht kopieren',
     'agent.connected_status': 'Verbunden',
     'agent.disconnected_status': 'Getrennt',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Unbekannter Befehl: {cmd}. Geben Sie /help ein, um verfügbare Befehle zu sehen.',
+    'agent.cmd_help_header': 'Verfügbare Befehle:',
+    'agent.cmd_help_help': 'diese Befehlsliste anzeigen',
+    'agent.cmd_help_clear': 'die Unterhaltung löschen',
+    'agent.cmd_help_new': 'eine neue Unterhaltung beginnen (löscht Nachrichten)',
+    'agent.cmd_help_model': 'aktives Modell anzeigen oder wechseln',
+    'agent.cmd_cleared': 'Unterhaltung gelöscht.',
+    'agent.cmd_model_current': 'Aktuelles Modell: {model}',
+    'agent.cmd_model_none': 'Derzeit ist kein Modell ausgewählt.',
+    'agent.cmd_model_available': 'Verfügbare Modelle: {models}',
+    'agent.cmd_model_unknown': 'Unbekanntes Modell: {model}. Verfügbare Modelle: {models}',
+    'agent.cmd_model_switching': 'Wechsle zum Modell: {model}…',
+    'agent.cmd_model_busy': 'Ein Modellwechsel läuft bereits. Bitte warten Sie, bis er abgeschlossen ist.',
+    'agent.cmd_model_failed': 'Modellwechsel fehlgeschlagen: {model}.',
+    'agent.cmd_hint_title': 'Befehle',
 
     // Tools
     'tools.title': 'Verfügbare Werkzeuge',
@@ -3014,6 +3135,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Συνδεδεμένο',
     'agent.disconnected_status': 'Αποσυνδεδεμένο',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Άγνωστη εντολή: {cmd}. Πληκτρολογήστε /help για να δείτε τις διαθέσιμες εντολές.',
+    'agent.cmd_help_header': 'Διαθέσιμες εντολές:',
+    'agent.cmd_help_help': 'εμφάνιση αυτής της λίστας εντολών',
+    'agent.cmd_help_clear': 'εκκαθάριση της συνομιλίας',
+    'agent.cmd_help_new': 'έναρξη νέας συνομιλίας (διαγράφει τα μηνύματα)',
+    'agent.cmd_help_model': 'εμφάνιση ή αλλαγή του ενεργού μοντέλου',
+    'agent.cmd_cleared': 'Η συνομιλία εκκαθαρίστηκε.',
+    'agent.cmd_model_current': 'Τρέχον μοντέλο: {model}',
+    'agent.cmd_model_none': 'Κανένα μοντέλο δεν είναι επιλεγμένο αυτή τη στιγμή.',
+    'agent.cmd_model_available': 'Διαθέσιμα μοντέλα: {models}',
+    'agent.cmd_model_unknown': 'Άγνωστο μοντέλο: {model}. Διαθέσιμα μοντέλα: {models}',
+    'agent.cmd_model_switching': 'Μετάβαση στο μοντέλο: {model}…',
+    'agent.cmd_model_busy': 'Μια αλλαγή μοντέλου είναι ήδη σε εξέλιξη. Παρακαλώ περιμένετε να ολοκληρωθεί.',
+    'agent.cmd_model_failed': 'Η μετάβαση στο μοντέλο απέτυχε: {model}.',
+    'agent.cmd_hint_title': 'Εντολές',
+
     // Tools
     'tools.title': 'Διαθέσιμα εργαλεία',
     'tools.name': 'Όνομα',
@@ -3368,6 +3506,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copiar mensaje',
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Comando desconocido: {cmd}. Escribe /help para ver los comandos disponibles.',
+    'agent.cmd_help_header': 'Comandos disponibles:',
+    'agent.cmd_help_help': 'mostrar esta lista de comandos',
+    'agent.cmd_help_clear': 'borrar la conversación',
+    'agent.cmd_help_new': 'iniciar una nueva conversación (borra los mensajes)',
+    'agent.cmd_help_model': 'mostrar o cambiar el modelo activo',
+    'agent.cmd_cleared': 'Conversación borrada.',
+    'agent.cmd_model_current': 'Modelo actual: {model}',
+    'agent.cmd_model_none': 'Actualmente no hay ningún modelo seleccionado.',
+    'agent.cmd_model_available': 'Modelos disponibles: {models}',
+    'agent.cmd_model_unknown': 'Modelo desconocido: {model}. Modelos disponibles: {models}',
+    'agent.cmd_model_switching': 'Cambiando al modelo: {model}…',
+    'agent.cmd_model_busy': 'Ya hay un cambio de modelo en curso. Por favor, espera a que termine.',
+    'agent.cmd_model_failed': 'No se pudo cambiar al modelo: {model}.',
+    'agent.cmd_hint_title': 'Comandos',
 
     // Tools
     'tools.title': 'Herramientas disponibles',
@@ -3724,6 +3879,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Yhdistetty',
     'agent.disconnected_status': 'Yhteys katkaistu',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Tuntematon komento: {cmd}. Kirjoita /help nähdäksesi käytettävissä olevat komennot.',
+    'agent.cmd_help_header': 'Käytettävissä olevat komennot:',
+    'agent.cmd_help_help': 'näytä tämä komentoluettelo',
+    'agent.cmd_help_clear': 'tyhjennä keskustelu',
+    'agent.cmd_help_new': 'aloita uusi keskustelu (tyhjentää viestit)',
+    'agent.cmd_help_model': 'näytä tai vaihda aktiivinen malli',
+    'agent.cmd_cleared': 'Keskustelu tyhjennetty.',
+    'agent.cmd_model_current': 'Nykyinen malli: {model}',
+    'agent.cmd_model_none': 'Mitään mallia ei ole valittuna tällä hetkellä.',
+    'agent.cmd_model_available': 'Käytettävissä olevat mallit: {models}',
+    'agent.cmd_model_unknown': 'Tuntematon malli: {model}. Käytettävissä olevat mallit: {models}',
+    'agent.cmd_model_switching': 'Vaihdetaan malliin: {model}…',
+    'agent.cmd_model_busy': 'Mallin vaihto on jo käynnissä. Odota, kunnes se on valmis.',
+    'agent.cmd_model_failed': 'Malliin vaihto epäonnistui: {model}.',
+    'agent.cmd_hint_title': 'Komennot',
+
     // Tools
     'tools.title': 'Käytettävissä olevat työkalut',
     'tools.name': 'Nimi',
@@ -4078,6 +4250,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copier le message',
     'agent.connected_status': 'Connecté',
     'agent.disconnected_status': 'Déconnecté',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Commande inconnue : {cmd}. Tapez /help pour voir les commandes disponibles.',
+    'agent.cmd_help_header': 'Commandes disponibles :',
+    'agent.cmd_help_help': 'afficher cette liste de commandes',
+    'agent.cmd_help_clear': 'effacer la conversation',
+    'agent.cmd_help_new': 'démarrer une nouvelle conversation (efface les messages)',
+    'agent.cmd_help_model': 'afficher ou changer le modèle actif',
+    'agent.cmd_cleared': 'Conversation effacée.',
+    'agent.cmd_model_current': 'Modèle actuel : {model}',
+    'agent.cmd_model_none': 'Aucun modèle n\'est actuellement sélectionné.',
+    'agent.cmd_model_available': 'Modèles disponibles : {models}',
+    'agent.cmd_model_unknown': 'Modèle inconnu : {model}. Modèles disponibles : {models}',
+    'agent.cmd_model_switching': 'Changement vers le modèle : {model}…',
+    'agent.cmd_model_busy': 'Un changement de modèle est déjà en cours. Veuillez attendre qu\'il se termine.',
+    'agent.cmd_model_failed': 'Échec du changement vers le modèle : {model}.',
+    'agent.cmd_hint_title': 'Commandes',
 
     // Tools
     'tools.title': 'Outils disponibles',
@@ -4448,6 +4637,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'מחובר',
     'agent.disconnected_status': 'מנותק',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'פקודה לא ידועה: {cmd}. הקלד /help כדי לראות פקודות זמינות.',
+    'agent.cmd_help_header': 'פקודות זמינות:',
+    'agent.cmd_help_help': 'הצג רשימת פקודות זו',
+    'agent.cmd_help_clear': 'נקה את השיחה',
+    'agent.cmd_help_new': 'התחל שיחה חדשה (מנקה הודעות)',
+    'agent.cmd_help_model': 'הצג או החלף את המודל הפעיל',
+    'agent.cmd_cleared': 'השיחה נוקתה.',
+    'agent.cmd_model_current': 'מודל נוכחי: {model}',
+    'agent.cmd_model_none': 'אין מודל שנבחר כעת.',
+    'agent.cmd_model_available': 'מודלים זמינים: {models}',
+    'agent.cmd_model_unknown': 'מודל לא ידוע: {model}. מודלים זמינים: {models}',
+    'agent.cmd_model_switching': 'מחליף למודל: {model}…',
+    'agent.cmd_model_busy': 'החלפת מודל כבר מתבצעת. אנא המתן לסיומה.',
+    'agent.cmd_model_failed': 'ההחלפה למודל נכשלה: {model}.',
+    'agent.cmd_hint_title': 'פקודות',
+
     // Tools
     'tools.title': 'כלים זמינים',
     'tools.name': 'שם',
@@ -4802,6 +5008,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'संदेश कॉपी करें',
     'agent.connected_status': 'कनेक्टेड',
     'agent.disconnected_status': 'डिस्कनेक्टेड',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'अज्ञात कमांड: {cmd}. उपलब्ध कमांड देखने के लिए /help टाइप करें।',
+    'agent.cmd_help_header': 'उपलब्ध कमांड:',
+    'agent.cmd_help_help': 'यह कमांड सूची दिखाएं',
+    'agent.cmd_help_clear': 'बातचीत साफ़ करें',
+    'agent.cmd_help_new': 'नई बातचीत शुरू करें (संदेश साफ़ करता है)',
+    'agent.cmd_help_model': 'सक्रिय मॉडल दिखाएं या बदलें',
+    'agent.cmd_cleared': 'बातचीत साफ़ कर दी गई।',
+    'agent.cmd_model_current': 'वर्तमान मॉडल: {model}',
+    'agent.cmd_model_none': 'वर्तमान में कोई मॉडल चयनित नहीं है।',
+    'agent.cmd_model_available': 'उपलब्ध मॉडल: {models}',
+    'agent.cmd_model_unknown': 'अज्ञात मॉडल: {model}. उपलब्ध मॉडल: {models}',
+    'agent.cmd_model_switching': 'मॉडल पर स्विच कर रहा है: {model}…',
+    'agent.cmd_model_busy': 'एक मॉडल स्विच पहले से ही चल रहा है। कृपया इसके समाप्त होने की प्रतीक्षा करें।',
+    'agent.cmd_model_failed': 'मॉडल पर स्विच विफल: {model}।',
+    'agent.cmd_hint_title': 'कमांड',
 
     // Tools
     'tools.title': 'उपलब्ध उपकरण',
@@ -5158,6 +5381,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Csatlakoztatva',
     'agent.disconnected_status': 'Leválasztva',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Ismeretlen parancs: {cmd}. Írja be a /help parancsot az elérhető parancsok megtekintéséhez.',
+    'agent.cmd_help_header': 'Elérhető parancsok:',
+    'agent.cmd_help_help': 'parancsok listájának megjelenítése',
+    'agent.cmd_help_clear': 'beszélgetés törlése',
+    'agent.cmd_help_new': 'új beszélgetés indítása (törli az üzeneteket)',
+    'agent.cmd_help_model': 'aktív modell megjelenítése vagy váltása',
+    'agent.cmd_cleared': 'Beszélgetés törölve.',
+    'agent.cmd_model_current': 'Jelenlegi modell: {model}',
+    'agent.cmd_model_none': 'Jelenleg nincs kiválasztott modell.',
+    'agent.cmd_model_available': 'Elérhető modellek: {models}',
+    'agent.cmd_model_unknown': 'Ismeretlen modell: {model}. Elérhető modellek: {models}',
+    'agent.cmd_model_switching': 'Váltás a modellre: {model}…',
+    'agent.cmd_model_busy': 'Modellváltás már folyamatban van. Kérjük, várjon, amíg befejeződik.',
+    'agent.cmd_model_failed': 'Nem sikerült váltani a modellre: {model}.',
+    'agent.cmd_hint_title': 'Parancsok',
+
     // Tools
     'tools.title': 'Elérhető eszközök',
     'tools.name': 'Név',
@@ -5512,6 +5752,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Salin pesan',
     'agent.connected_status': 'Terhubung',
     'agent.disconnected_status': 'Terputus',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Perintah tidak dikenal: {cmd}. Ketik /help untuk melihat perintah yang tersedia.',
+    'agent.cmd_help_header': 'Perintah yang tersedia:',
+    'agent.cmd_help_help': 'tampilkan daftar perintah ini',
+    'agent.cmd_help_clear': 'hapus percakapan',
+    'agent.cmd_help_new': 'mulai percakapan baru (menghapus pesan)',
+    'agent.cmd_help_model': 'tampilkan atau ganti model aktif',
+    'agent.cmd_cleared': 'Percakapan dihapus.',
+    'agent.cmd_model_current': 'Model saat ini: {model}',
+    'agent.cmd_model_none': 'Tidak ada model yang dipilih saat ini.',
+    'agent.cmd_model_available': 'Model yang tersedia: {models}',
+    'agent.cmd_model_unknown': 'Model tidak dikenal: {model}. Model yang tersedia: {models}',
+    'agent.cmd_model_switching': 'Beralih ke model: {model}…',
+    'agent.cmd_model_busy': 'Pergantian model sudah berlangsung. Harap tunggu hingga selesai.',
+    'agent.cmd_model_failed': 'Gagal beralih ke model: {model}.',
+    'agent.cmd_hint_title': 'Perintah',
 
     // Tools
     'tools.title': 'Alat yang Tersedia',
@@ -5868,6 +6125,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Connesso',
     'agent.disconnected_status': 'Disconnesso',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Comando sconosciuto: {cmd}. Digita /help per vedere i comandi disponibili.',
+    'agent.cmd_help_header': 'Comandi disponibili:',
+    'agent.cmd_help_help': 'mostra questo elenco di comandi',
+    'agent.cmd_help_clear': 'cancella la conversazione',
+    'agent.cmd_help_new': 'avvia una nuova conversazione (cancella i messaggi)',
+    'agent.cmd_help_model': 'mostra o cambia il modello attivo',
+    'agent.cmd_cleared': 'Conversazione cancellata.',
+    'agent.cmd_model_current': 'Modello corrente: {model}',
+    'agent.cmd_model_none': 'Nessun modello attualmente selezionato.',
+    'agent.cmd_model_available': 'Modelli disponibili: {models}',
+    'agent.cmd_model_unknown': 'Modello sconosciuto: {model}. Modelli disponibili: {models}',
+    'agent.cmd_model_switching': 'Passaggio al modello: {model}…',
+    'agent.cmd_model_busy': 'Un cambio di modello è già in corso. Attendi che termini.',
+    'agent.cmd_model_failed': 'Impossibile passare al modello: {model}.',
+    'agent.cmd_hint_title': 'Comandi',
+
     // Tools
     'tools.title': 'Strumenti disponibili',
     'tools.name': 'Nome',
@@ -6222,6 +6496,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'メッセージをコピー',
     'agent.connected_status': '接続済み',
     'agent.disconnected_status': '切断済み',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': '不明なコマンド: {cmd}。利用可能なコマンドを見るには /help と入力してください。',
+    'agent.cmd_help_header': '利用可能なコマンド:',
+    'agent.cmd_help_help': 'コマンド一覧を表示する',
+    'agent.cmd_help_clear': '会話をクリアする',
+    'agent.cmd_help_new': '新しい会話を開始する（メッセージをクリアします）',
+    'agent.cmd_help_model': 'アクティブなモデルを表示または切り替える',
+    'agent.cmd_cleared': '会話をクリアしました。',
+    'agent.cmd_model_current': '現在のモデル: {model}',
+    'agent.cmd_model_none': '現在選択されているモデルはありません。',
+    'agent.cmd_model_available': '利用可能なモデル: {models}',
+    'agent.cmd_model_unknown': '不明なモデル: {model}。利用可能なモデル: {models}',
+    'agent.cmd_model_switching': 'モデルに切り替え中: {model}…',
+    'agent.cmd_model_busy': 'モデルの切り替えが既に進行中です。完了をお待ちください。',
+    'agent.cmd_model_failed': 'モデルへの切り替えに失敗しました: {model}。',
+    'agent.cmd_hint_title': 'コマンド',
 
     // Tools
     'tools.title': '利用可能なツール',
@@ -6592,6 +6883,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': '연결됨',
     'agent.disconnected_status': '연결 끊김',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': '알 수 없는 명령: {cmd}. 사용 가능한 명령을 보려면 /help을 입력하세요.',
+    'agent.cmd_help_header': '사용 가능한 명령:',
+    'agent.cmd_help_help': '이 명령 목록 표시',
+    'agent.cmd_help_clear': '대화 지우기',
+    'agent.cmd_help_new': '새 대화 시작 (메시지를 지웁니다)',
+    'agent.cmd_help_model': '활성 모델 표시 또는 전환',
+    'agent.cmd_cleared': '대화가 지워졌습니다.',
+    'agent.cmd_model_current': '현재 모델: {model}',
+    'agent.cmd_model_none': '현재 선택된 모델이 없습니다.',
+    'agent.cmd_model_available': '사용 가능한 모델: {models}',
+    'agent.cmd_model_unknown': '알 수 없는 모델: {model}. 사용 가능한 모델: {models}',
+    'agent.cmd_model_switching': '모델로 전환 중: {model}…',
+    'agent.cmd_model_busy': '모델 전환이 이미 진행 중입니다. 완료될 때까지 기다려 주세요.',
+    'agent.cmd_model_failed': '모델로 전환 실패: {model}.',
+    'agent.cmd_hint_title': '명령',
+
     // Tools
     'tools.title': '사용 가능한 도구',
     'tools.name': '이름',
@@ -6946,6 +7254,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopier melding',
     'agent.connected_status': 'Tilkoblet',
     'agent.disconnected_status': 'Frakoblet',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Ukjent kommando: {cmd}. Skriv /help for å se tilgjengelige kommandoer.',
+    'agent.cmd_help_header': 'Tilgjengelige kommandoer:',
+    'agent.cmd_help_help': 'vis denne listen over kommandoer',
+    'agent.cmd_help_clear': 'tøm samtalen',
+    'agent.cmd_help_new': 'start en ny samtale (tømmer meldinger)',
+    'agent.cmd_help_model': 'vis eller bytt aktiv modell',
+    'agent.cmd_cleared': 'Samtale tømt.',
+    'agent.cmd_model_current': 'Gjeldende modell: {model}',
+    'agent.cmd_model_none': 'Ingen modell er valgt for øyeblikket.',
+    'agent.cmd_model_available': 'Tilgjengelige modeller: {models}',
+    'agent.cmd_model_unknown': 'Ukjent modell: {model}. Tilgjengelige modeller: {models}',
+    'agent.cmd_model_switching': 'Bytter til modell: {model}…',
+    'agent.cmd_model_busy': 'Et modellbytte pågår allerede. Vennligst vent til det er ferdig.',
+    'agent.cmd_model_failed': 'Kunne ikke bytte til modell: {model}.',
+    'agent.cmd_hint_title': 'Kommandoer',
 
     // Tools
     'tools.title': 'Tilgjengelige verktøy',
@@ -7302,6 +7627,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Verbonden',
     'agent.disconnected_status': 'Niet verbonden',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Onbekend commando: {cmd}. Typ /help om beschikbare commando\'s te zien.',
+    'agent.cmd_help_header': 'Beschikbare commando\'s:',
+    'agent.cmd_help_help': 'toon deze lijst met commando\'s',
+    'agent.cmd_help_clear': 'wis het gesprek',
+    'agent.cmd_help_new': 'start een nieuw gesprek (wist berichten)',
+    'agent.cmd_help_model': 'toon of wijzig het actieve model',
+    'agent.cmd_cleared': 'Gesprek gewist.',
+    'agent.cmd_model_current': 'Huidig model: {model}',
+    'agent.cmd_model_none': 'Er is momenteel geen model geselecteerd.',
+    'agent.cmd_model_available': 'Beschikbare modellen: {models}',
+    'agent.cmd_model_unknown': 'Onbekend model: {model}. Beschikbare modellen: {models}',
+    'agent.cmd_model_switching': 'Overschakelen naar model: {model}…',
+    'agent.cmd_model_busy': 'Een modelwissel is al bezig. Wacht tot deze is voltooid.',
+    'agent.cmd_model_failed': 'Kon niet overschakelen naar model: {model}.',
+    'agent.cmd_hint_title': 'Commando\'s',
+
     // Tools
     'tools.title': 'Beschikbare gereedschappen',
     'tools.name': 'Naam',
@@ -7656,6 +7998,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Kopiuj wiadomość',
     'agent.connected_status': 'Połączono',
     'agent.disconnected_status': 'Rozłączono',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Nieznane polecenie: {cmd}. Wpisz /help, aby zobaczyć dostępne polecenia.',
+    'agent.cmd_help_header': 'Dostępne polecenia:',
+    'agent.cmd_help_help': 'pokaż tę listę poleceń',
+    'agent.cmd_help_clear': 'wyczyść rozmowę',
+    'agent.cmd_help_new': 'rozpocznij nową rozmowę (czyści wiadomości)',
+    'agent.cmd_help_model': 'pokaż lub zmień aktywny model',
+    'agent.cmd_cleared': 'Rozmowa wyczyszczona.',
+    'agent.cmd_model_current': 'Bieżący model: {model}',
+    'agent.cmd_model_none': 'Obecnie nie wybrano żadnego modelu.',
+    'agent.cmd_model_available': 'Dostępne modele: {models}',
+    'agent.cmd_model_unknown': 'Nieznany model: {model}. Dostępne modele: {models}',
+    'agent.cmd_model_switching': 'Przełączanie na model: {model}…',
+    'agent.cmd_model_busy': 'Zmiana modelu jest już w toku. Poczekaj, aż się zakończy.',
+    'agent.cmd_model_failed': 'Nie udało się przełączyć na model: {model}.',
+    'agent.cmd_hint_title': 'Polecenia',
 
     // Tools
     'tools.title': 'Dostępne narzędzia',
@@ -8012,6 +8371,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Comando desconhecido: {cmd}. Digite /help para ver os comandos disponíveis.',
+    'agent.cmd_help_header': 'Comandos disponíveis:',
+    'agent.cmd_help_help': 'mostrar esta lista de comandos',
+    'agent.cmd_help_clear': 'limpar a conversa',
+    'agent.cmd_help_new': 'iniciar uma nova conversa (limpa as mensagens)',
+    'agent.cmd_help_model': 'mostrar ou alternar o modelo ativo',
+    'agent.cmd_cleared': 'Conversa limpa.',
+    'agent.cmd_model_current': 'Modelo atual: {model}',
+    'agent.cmd_model_none': 'Nenhum modelo está selecionado no momento.',
+    'agent.cmd_model_available': 'Modelos disponíveis: {models}',
+    'agent.cmd_model_unknown': 'Modelo desconhecido: {model}. Modelos disponíveis: {models}',
+    'agent.cmd_model_switching': 'Alternando para o modelo: {model}…',
+    'agent.cmd_model_busy': 'Uma troca de modelo já está em andamento. Aguarde até que termine.',
+    'agent.cmd_model_failed': 'Falha ao alternar para o modelo: {model}.',
+    'agent.cmd_hint_title': 'Comandos',
+
     // Tools
     'tools.title': 'Ferramentas Disponíveis',
     'tools.name': 'Nome',
@@ -8367,6 +8743,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Conectat',
     'agent.disconnected_status': 'Deconectat',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Comandă necunoscută: {cmd}. Tastați /help pentru a vedea comenzile disponibile.',
+    'agent.cmd_help_header': 'Comenzi disponibile:',
+    'agent.cmd_help_help': 'afișează această listă de comenzi',
+    'agent.cmd_help_clear': 'șterge conversația',
+    'agent.cmd_help_new': 'începe o conversație nouă (șterge mesajele)',
+    'agent.cmd_help_model': 'afișează sau schimbă modelul activ',
+    'agent.cmd_cleared': 'Conversație ștearsă.',
+    'agent.cmd_model_current': 'Model curent: {model}',
+    'agent.cmd_model_none': 'În prezent nu este selectat niciun model.',
+    'agent.cmd_model_available': 'Modele disponibile: {models}',
+    'agent.cmd_model_unknown': 'Model necunoscut: {model}. Modele disponibile: {models}',
+    'agent.cmd_model_switching': 'Se trece la modelul: {model}…',
+    'agent.cmd_model_busy': 'O schimbare de model este deja în curs. Așteptați să se termine.',
+    'agent.cmd_model_failed': 'Trecerea la model a eșuat: {model}.',
+    'agent.cmd_hint_title': 'Comenzi',
+
     // Tools
     'tools.title': 'Instrumente disponibile',
     'tools.name': 'Nume',
@@ -8721,6 +9114,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Скопировать сообщение',
     'agent.connected_status': 'Подключено',
     'agent.disconnected_status': 'Отключено',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Неизвестная команда: {cmd}. Введите /help, чтобы увидеть доступные команды.',
+    'agent.cmd_help_header': 'Доступные команды:',
+    'agent.cmd_help_help': 'показать этот список команд',
+    'agent.cmd_help_clear': 'очистить разговор',
+    'agent.cmd_help_new': 'начать новый разговор (очищает сообщения)',
+    'agent.cmd_help_model': 'показать или сменить активную модель',
+    'agent.cmd_cleared': 'Разговор очищен.',
+    'agent.cmd_model_current': 'Текущая модель: {model}',
+    'agent.cmd_model_none': 'В настоящее время модель не выбрана.',
+    'agent.cmd_model_available': 'Доступные модели: {models}',
+    'agent.cmd_model_unknown': 'Неизвестная модель: {model}. Доступные модели: {models}',
+    'agent.cmd_model_switching': 'Переключение на модель: {model}…',
+    'agent.cmd_model_busy': 'Переключение модели уже выполняется. Дождитесь его завершения.',
+    'agent.cmd_model_failed': 'Не удалось переключиться на модель: {model}.',
+    'agent.cmd_hint_title': 'Команды',
 
     // Tools
     'tools.title': 'Доступные инструменты',
@@ -9091,6 +9501,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Ansluten',
     'agent.disconnected_status': 'Frånkopplad',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Okänt kommando: {cmd}. Skriv /help för att se tillgängliga kommandon.',
+    'agent.cmd_help_header': 'Tillgängliga kommandon:',
+    'agent.cmd_help_help': 'visa denna kommandolista',
+    'agent.cmd_help_clear': 'rensa konversationen',
+    'agent.cmd_help_new': 'starta en ny konversation (rensar meddelanden)',
+    'agent.cmd_help_model': 'visa eller byt aktiv modell',
+    'agent.cmd_cleared': 'Konversation rensad.',
+    'agent.cmd_model_current': 'Nuvarande modell: {model}',
+    'agent.cmd_model_none': 'Ingen modell är vald för tillfället.',
+    'agent.cmd_model_available': 'Tillgängliga modeller: {models}',
+    'agent.cmd_model_unknown': 'Okänd modell: {model}. Tillgängliga modeller: {models}',
+    'agent.cmd_model_switching': 'Byter till modell: {model}…',
+    'agent.cmd_model_busy': 'Ett modellbyte pågår redan. Vänligen vänta tills det är klart.',
+    'agent.cmd_model_failed': 'Det gick inte att byta till modell: {model}.',
+    'agent.cmd_hint_title': 'Kommandon',
+
     // Tools
     'tools.title': 'Tillgängliga verktyg',
     'tools.name': 'Namn',
@@ -9445,6 +9872,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'คัดลอกข้อความ',
     'agent.connected_status': 'เชื่อมต่อแล้ว',
     'agent.disconnected_status': 'ตัดการเชื่อมต่อ',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'คำสั่งที่ไม่รู้จัก: {cmd} พิมพ์ /help เพื่อดูคำสั่งที่ใช้ได้',
+    'agent.cmd_help_header': 'คำสั่งที่ใช้ได้:',
+    'agent.cmd_help_help': 'แสดงรายการคำสั่งนี้',
+    'agent.cmd_help_clear': 'ล้างการสนทนา',
+    'agent.cmd_help_new': 'เริ่มการสนทนาใหม่ (ล้างข้อความ)',
+    'agent.cmd_help_model': 'แสดงหรือเปลี่ยนโมเดลที่ใช้งานอยู่',
+    'agent.cmd_cleared': 'ล้างการสนทนาแล้ว',
+    'agent.cmd_model_current': 'โมเดลปัจจุบัน: {model}',
+    'agent.cmd_model_none': 'ขณะนี้ไม่ได้เลือกโมเดลใด',
+    'agent.cmd_model_available': 'โมเดลที่ใช้ได้: {models}',
+    'agent.cmd_model_unknown': 'โมเดลที่ไม่รู้จัก: {model} โมเดลที่ใช้ได้: {models}',
+    'agent.cmd_model_switching': 'กำลังเปลี่ยนเป็นโมเดล: {model}…',
+    'agent.cmd_model_busy': 'กำลังเปลี่ยนโมเดลอยู่ โปรดรอจนกว่าจะเสร็จสิ้น',
+    'agent.cmd_model_failed': 'ไม่สามารถเปลี่ยนเป็นโมเดล: {model}',
+    'agent.cmd_hint_title': 'คำสั่ง',
 
     // Tools
     'tools.title': 'เครื่องมือที่ใช้ได้',
@@ -9801,6 +10245,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Konektado',
     'agent.disconnected_status': 'Hindi Konektado',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Hindi kilalang utos: {cmd}. I-type ang /help para makita ang mga available na utos.',
+    'agent.cmd_help_header': 'Mga available na utos:',
+    'agent.cmd_help_help': 'ipakita ang listahan ng mga utos na ito',
+    'agent.cmd_help_clear': 'i-clear ang pag-uusap',
+    'agent.cmd_help_new': 'magsimula ng bagong pag-uusap (kine-clear ang mga mensahe)',
+    'agent.cmd_help_model': 'ipakita o palitan ang aktibong modelo',
+    'agent.cmd_cleared': 'Na-clear ang pag-uusap.',
+    'agent.cmd_model_current': 'Kasalukuyang modelo: {model}',
+    'agent.cmd_model_none': 'Walang napiling modelo sa kasalukuyan.',
+    'agent.cmd_model_available': 'Mga available na modelo: {models}',
+    'agent.cmd_model_unknown': 'Hindi kilalang modelo: {model}. Mga available na modelo: {models}',
+    'agent.cmd_model_switching': 'Lumilipat sa modelo: {model}…',
+    'agent.cmd_model_busy': 'May kasalukuyang paglipat ng modelo. Maghintay hanggang matapos ito.',
+    'agent.cmd_model_failed': 'Nabigong lumipat sa modelo: {model}.',
+    'agent.cmd_hint_title': 'Mga Utos',
+
     // Tools
     'tools.title': 'Mga Magagamit na Kagamitan',
     'tools.name': 'Pangalan',
@@ -10155,6 +10616,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Скопіювати повідомлення',
     'agent.connected_status': 'Підключено',
     'agent.disconnected_status': 'Відключено',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Невідома команда: {cmd}. Введіть /help, щоб побачити доступні команди.',
+    'agent.cmd_help_header': 'Доступні команди:',
+    'agent.cmd_help_help': 'показати цей список команд',
+    'agent.cmd_help_clear': 'очистити розмову',
+    'agent.cmd_help_new': 'почати нову розмову (очищає повідомлення)',
+    'agent.cmd_help_model': 'показати або змінити активну модель',
+    'agent.cmd_cleared': 'Розмову очищено.',
+    'agent.cmd_model_current': 'Поточна модель: {model}',
+    'agent.cmd_model_none': 'Зараз модель не вибрана.',
+    'agent.cmd_model_available': 'Доступні моделі: {models}',
+    'agent.cmd_model_unknown': 'Невідома модель: {model}. Доступні моделі: {models}',
+    'agent.cmd_model_switching': 'Перехід до моделі: {model}…',
+    'agent.cmd_model_busy': 'Зміна моделі вже виконується. Зачекайте, доки вона завершиться.',
+    'agent.cmd_model_failed': 'Не вдалося перейти до моделі: {model}.',
+    'agent.cmd_hint_title': 'Команди',
 
     // Tools
     'tools.title': 'Доступні інструменти',
@@ -10511,6 +10989,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'جڑا ہوا',
     'agent.disconnected_status': 'منقطع',
 
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'نامعلوم کمانڈ: {cmd}۔ دستیاب کمانڈز دیکھنے کے لیے /help ٹائپ کریں۔',
+    'agent.cmd_help_header': 'دستیاب کمانڈز:',
+    'agent.cmd_help_help': 'کمانڈز کی یہ فہرست دکھائیں',
+    'agent.cmd_help_clear': 'گفتگو صاف کریں',
+    'agent.cmd_help_new': 'نئی گفتگو شروع کریں (پیغامات صاف کرتا ہے)',
+    'agent.cmd_help_model': 'فعال ماڈل دکھائیں یا تبدیل کریں',
+    'agent.cmd_cleared': 'گفتگو صاف کر دی گئی۔',
+    'agent.cmd_model_current': 'موجودہ ماڈل: {model}',
+    'agent.cmd_model_none': 'فی الحال کوئی ماڈل منتخب نہیں ہے۔',
+    'agent.cmd_model_available': 'دستیاب ماڈلز: {models}',
+    'agent.cmd_model_unknown': 'نامعلوم ماڈل: {model}۔ دستیاب ماڈلز: {models}',
+    'agent.cmd_model_switching': 'ماڈل پر سوئچ ہو رہا ہے: {model}…',
+    'agent.cmd_model_busy': 'ماڈل کی تبدیلی پہلے سے جاری ہے۔ براہ کرم اس کے ختم ہونے کا انتظار کریں۔',
+    'agent.cmd_model_failed': 'ماڈل پر سوئچ ناکام: {model}۔',
+    'agent.cmd_hint_title': 'کمانڈز',
+
     // Tools
     'tools.title': 'دستیاب ٹولز',
     'tools.name': 'نام',
@@ -10865,6 +11360,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Sao chép tin nhắn',
     'agent.connected_status': 'Đã kết nối',
     'agent.disconnected_status': 'Đã ngắt kết nối',
+
+    // Slash commands (#7137)
+    'agent.cmd_unknown': 'Lệnh không xác định: {cmd}. Gõ /help để xem các lệnh khả dụng.',
+    'agent.cmd_help_header': 'Các lệnh khả dụng:',
+    'agent.cmd_help_help': 'hiển thị danh sách lệnh này',
+    'agent.cmd_help_clear': 'xóa cuộc trò chuyện',
+    'agent.cmd_help_new': 'bắt đầu cuộc trò chuyện mới (xóa các tin nhắn)',
+    'agent.cmd_help_model': 'hiển thị hoặc chuyển đổi mô hình đang hoạt động',
+    'agent.cmd_cleared': 'Đã xóa cuộc trò chuyện.',
+    'agent.cmd_model_current': 'Mô hình hiện tại: {model}',
+    'agent.cmd_model_none': 'Hiện không có mô hình nào được chọn.',
+    'agent.cmd_model_available': 'Các mô hình khả dụng: {models}',
+    'agent.cmd_model_unknown': 'Mô hình không xác định: {model}. Các mô hình khả dụng: {models}',
+    'agent.cmd_model_switching': 'Đang chuyển sang mô hình: {model}…',
+    'agent.cmd_model_busy': 'Quá trình chuyển đổi mô hình đang diễn ra. Vui lòng đợi cho đến khi hoàn tất.',
+    'agent.cmd_model_failed': 'Không thể chuyển sang mô hình: {model}.',
+    'agent.cmd_hint_title': 'Lệnh',
 
     // Tools
     'tools.title': 'Công cụ khả dụng',

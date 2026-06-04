@@ -107,15 +107,21 @@ export function uiMessagesToPersisted(
     markdown?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
+    local?: boolean;
   }>,
 ): PersistedChatBubble[] {
-  return messages.map((m) => ({
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    thinking: m.thinking,
-    markdown: m.markdown,
-    toolCall: m.toolCall,
-    timestamp: m.timestamp.toISOString(),
-  }));
+  return messages
+    // Skip messages flagged `local: true` (web slash-command output like /help,
+    // /model banners, unknown-command notices). They are ephemeral UI feedback
+    // and must not be re-hydrated as fake assistant replies on reload. #7137
+    .filter((m) => !m.local)
+    .map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      thinking: m.thinking,
+      markdown: m.markdown,
+      toolCall: m.toolCall,
+      timestamp: m.timestamp.toISOString(),
+    }));
 }

@@ -152,10 +152,18 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
           );
           return true;
         }
+        // switchModel silently no-ops while another switch is in flight, which
+        // looks like the command was ignored. Surface that state explicitly. #7137
+        if (modelLoading) {
+          addLocalMessage(t('agent.cmd_model_busy'));
+          return true;
+        }
         addLocalMessage(t('agent.cmd_model_switching').replace('{model}', name));
         // Reuse the existing model-switch path (config write + socket rebuild).
         void switchModel(name).catch(() => {
-          // switchModel surfaces its own error via context `error` state.
+          // switchModel surfaces its own error via context `error` state, but
+          // the user just typed a command and expects inline feedback there too.
+          addLocalMessage(t('agent.cmd_model_failed').replace('{model}', name));
         });
         return true;
       }
@@ -164,17 +172,20 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
         addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
         return true;
     }
-  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel]);
+  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel, modelLoading]);
 
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || !connected) return;
+    if (!trimmed) return;
 
-    // A leading '/' is a command, not a prompt. Reset the input regardless so
-    // the field clears on dispatch, but never forward the raw text to the model.
+    // Slash commands are dispatched BEFORE the connectivity check so purely
+    // local commands like /help still work during transient disconnects.
+    // Network-dependent commands (/clear, /model) self-recover via their own
+    // reconnect paths inside the context. #7137
     if (isSlashCommand(trimmed)) {
       runCommand(trimmed);
     } else {
+      if (!connected) return;
       sendMessage(trimmed);
     }
     setShowCommandHint(false);

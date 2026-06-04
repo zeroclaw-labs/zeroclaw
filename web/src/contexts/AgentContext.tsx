@@ -21,6 +21,13 @@ export interface ChatMessage {
   markdown?: boolean;
   toolCall?: ToolCallInfo;
   timestamp: Date;
+  /**
+   * Locally-generated info/system message produced by web slash-command
+   * handlers (`/help`, `/model`, unknown-command notices). Excluded from
+   * persistence so command output does not pollute localStorage and reappear
+   * as fake assistant replies on reload. See #7137.
+   */
+  local?: boolean;
 }
 
 interface AgentContextValue {
@@ -630,6 +637,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         content,
         markdown: true,
         timestamp: new Date(),
+        local: true,
       },
     ]);
   }, []);
