@@ -218,6 +218,7 @@ keyactions! {
         Refresh          [Chord::char('r')] => "refresh",
         JumpStart        [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd          [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
+        KillSession      [Chord::char('X')] => "kill session",
     }
 }
 
