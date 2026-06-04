@@ -677,12 +677,14 @@ impl Chat {
             let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
+                    state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
                     return false;
                 }
                 InputBarAction::Inject { text, attachments } => {
+                    state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
                     let enq = state.inject_message(prompt, attachments);
                     // An inject is an explicit "send now": if a turn is live,
@@ -704,10 +706,7 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::StatusMessage(msg) => {
-                    state
-                        .entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(msg)));
-                    state.mark_dirty_append();
+                    state.set_info_notice(msg);
                     return false;
                 }
                 InputBarAction::ToggleThinking => {
@@ -1112,10 +1111,7 @@ impl Chat {
         }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
-            state
-                .entries
-                .push(ChatEntry::SystemMessage(Arc::<str>::from(msg)));
-            state.mark_dirty_append();
+            state.set_info_notice(msg);
         }
     }
 
@@ -1362,7 +1358,30 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let turn_started_at = state.turn_started_at;
 
     let _live_input_tokens = state.context_input_tokens;
-    let input_area = area;
+
+    // Reserve a dedicated one-row info bar at the very bottom of the pane when
+    // a transient notice is active. It is its own widget — owned by the chat
+    // pane, separate from the input box — so attach/detach/clipboard feedback
+    // renders below the input box instead of polluting the conversation
+    // history above it.
+    let input_area = if let Some(ref notice) = state.info_notice {
+        if area.height > 1 {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(area);
+            let bar = Paragraph::new(Line::from(Span::styled(
+                format!(" {notice}"),
+                theme::accent_style(),
+            )));
+            f.render_widget(bar, rows[1]);
+            rows[0]
+        } else {
+            area
+        }
+    } else {
+        area
+    };
 
     let conv_area = state.input_bar.render(
         f,
@@ -2602,6 +2621,11 @@ pub struct ChatState {
     queue_sidebar_pct: u16,
     /// Selected queued message id for sidebar edit/delete.
     queue_sel: Option<u64>,
+    /// Transient one-row info notice rendered in a dedicated bar below the
+    /// input box. Holds short user-facing feedback (attach/detach/clipboard)
+    /// that does not belong in the persisted conversation history. Cleared on
+    /// the next submit, inject, or turn start.
+    info_notice: Option<Arc<str>>,
 }
 
 impl ChatState {
@@ -2648,6 +2672,7 @@ impl ChatState {
             show_queue_sidebar: false,
             queue_sidebar_pct: 30,
             queue_sel: None,
+            info_notice: None,
         }
     }
 
@@ -3237,6 +3262,19 @@ impl ChatState {
 
     pub fn queue_len(&self) -> usize {
         self.message_queue.len()
+    }
+
+    /// Store a transient one-row notice for the info bar below the input box.
+    pub fn set_info_notice(&mut self, msg: String) {
+        self.info_notice = Some(Arc::<str>::from(msg));
+        self.mark_dirty_full();
+    }
+
+    /// Drop the active info notice (on submit, inject, or turn start).
+    pub fn clear_info_notice(&mut self) {
+        if self.info_notice.take().is_some() {
+            self.mark_dirty_full();
+        }
     }
 
     pub fn toggle_queue_sidebar(&mut self) {
@@ -4089,6 +4127,25 @@ mod tests {
         assert_eq!(text, "draft");
         assert_eq!(atts.len(), 1);
         assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn info_notice_set_and_cleared_without_touching_entries() {
+        let mut s = state();
+        let before = s.entries.len();
+        s.set_info_notice("Detached: clipboard_123.png".to_string());
+        assert_eq!(
+            s.info_notice.as_deref(),
+            Some("Detached: clipboard_123.png")
+        );
+        assert_eq!(
+            s.entries.len(),
+            before,
+            "info notice must not enter history"
+        );
+        s.clear_info_notice();
+        assert!(s.info_notice.is_none());
+        assert_eq!(s.entries.len(), before);
     }
 
     #[test]
