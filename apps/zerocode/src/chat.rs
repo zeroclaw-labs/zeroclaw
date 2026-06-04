@@ -620,13 +620,12 @@ impl Chat {
             match qaction {
                 Some(QAction::PauseResumeQueue) => {
                     let paused = state.toggle_queue_pause();
-                    let notice = if paused {
-                        crate::i18n::t("zc-queue-paused-notice")
+                    if paused {
+                        // The paused state is shown as ghost text in the empty
+                        // input bar, so no info-bar notice is needed here.
+                        state.clear_info_notice();
                     } else {
-                        crate::i18n::t("zc-queue-resumed")
-                    };
-                    state.set_info_notice(notice);
-                    if !paused {
+                        state.set_info_notice(crate::i18n::t("zc-queue-resumed"));
                         self.pump_queue();
                     }
                     return false;
@@ -1443,6 +1442,15 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
         area
     };
 
+    let queue_paused_hint = if state.queue_paused() {
+        Some(crate::i18n::t_args(
+            "zc-queue-paused-ghost",
+            &[("key", &resume_queue_chord_label())],
+        ))
+    } else {
+        None
+    };
+
     let conv_area = state.input_bar.render(
         f,
         input_area,
@@ -1450,6 +1458,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
         show_cursor,
         &turn_status,
         turn_started_at,
+        queue_paused_hint.as_deref(),
     );
 
     // Optional CWD line just above the input bar (bottom of conv_area).
@@ -1605,16 +1614,6 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // message id so a click can be mapped back to an item after scrolling.
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut row_owner: Vec<Option<u64>> = Vec::new();
-    if state.queue_paused() {
-        let key = resume_queue_chord_label();
-        rows.push(Line::from(Span::styled(
-            crate::i18n::t_args("zc-queue-paused", &[("key", &key)]),
-            theme::warn_style(),
-        )));
-        row_owner.push(None);
-        rows.push(Line::from(""));
-        row_owner.push(None);
-    }
 
     if state.message_queue.is_empty() {
         rows.push(Line::from(Span::styled(

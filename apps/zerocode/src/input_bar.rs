@@ -1216,6 +1216,7 @@ impl InputBarState {
         show_cursor: bool,
         turn_status: &TurnStatus,
         turn_started_at: Instant,
+        queue_paused_hint: Option<&str>,
     ) -> Rect {
         let has_attachments = !self.pending_attachments.is_empty();
 
@@ -1274,12 +1275,20 @@ impl InputBarState {
             .title_bottom(Span::styled("?=help", theme::dim_style()));
 
         if self.input.is_empty() && !turn_in_flight {
-            let placeholder: String = if self.file_explorer.is_some() {
-                String::new()
+            // A paused queue takes the empty input line as ghost text in the
+            // action colour, so the paused state and how to clear it are shown
+            // exactly where the user would act on it.
+            let (text, style) = if let Some(hint) = queue_paused_hint {
+                (hint.to_string(), theme::accent_style())
+            } else if self.file_explorer.is_some() {
+                (String::new(), theme::dim_style())
             } else {
-                crate::i18n::t("zc-input-placeholder-chat")
+                (
+                    crate::i18n::t("zc-input-placeholder-chat"),
+                    theme::dim_style(),
+                )
             };
-            let p = Paragraph::new(Span::styled(placeholder, theme::dim_style())).block(block);
+            let p = Paragraph::new(Span::styled(text, style)).block(block);
             f.render_widget(p, input_area);
         } else {
             // Wrapped input content with optional selection highlighting.
