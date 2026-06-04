@@ -677,6 +677,21 @@ impl Chat {
                 InputBarAction::Inject { text, attachments } => {
                     let prompt = text.unwrap_or_default();
                     let enq = state.inject_message(prompt, attachments);
+                    // An inject is an explicit "send now": if a turn is live,
+                    // interrupt it so the injected message dispatches as soon
+                    // as the turn settles. Without this the inject only jumps
+                    // the queue and still waits for the live turn to finish on
+                    // its own — the opposite of immediate.
+                    if enq.is_ok()
+                        && state.turn_in_flight
+                        && !matches!(state.turn_status, TurnStatus::Cancelling)
+                    {
+                        let sid = state.session_id.clone();
+                        let _ = self.rpc.session_cancel(&sid).await;
+                        if let ChatPhase::Active(ref mut state) = self.phase {
+                            state.turn_status = TurnStatus::Cancelling;
+                        }
+                    }
                     self.after_enqueue(enq);
                     return false;
                 }
