@@ -2780,10 +2780,7 @@ pub struct ChatState {
     queue_paused: bool,
     resume_override: bool,
     cancel_started_at: Option<Instant>,
-    /// Queue sidebar width as a percent of the chat area (clamped). Adjusted
-    /// with Shift+Left (widen) / Shift+Right (narrow), mirroring the logs
-    /// detail pane's resize.
-    queue_sidebar_pct: u16,
+    queue_sidebar_cols: u16,
     /// Selected queued message id for sidebar edit/delete.
     queue_sel: Option<u64>,
     /// Per-item clickable rects from the last sidebar draw, mapping a queued
@@ -2842,7 +2839,7 @@ impl ChatState {
             queue_paused: false,
             resume_override: false,
             cancel_started_at: None,
-            queue_sidebar_pct: 30,
+            queue_sidebar_cols: 36,
             queue_sel: None,
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
@@ -3341,13 +3338,9 @@ impl ChatState {
     }
 
     const QUEUE_CAP: usize = 32;
-    /// Queue sidebar resize bounds (percent of chat area).
-    const QUEUE_SIDEBAR_PCT_MIN: u16 = 15;
-    const QUEUE_SIDEBAR_PCT_MAX: u16 = 60;
-    /// Absolute column clamps so the sidebar stays readable on tiny terminals
-    /// and never starves the chat column.
     const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
     const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
+    const QUEUE_SIDEBAR_COLS_STEP: u16 = 4;
     const QUEUE_CHAT_COLS_MIN: u16 = 20;
 
     fn alloc_queue_id(&mut self) -> u64 {
@@ -3545,32 +3538,28 @@ impl ChatState {
         }
     }
 
-    /// Widen the queue sidebar (Shift+Left). Clamped so the chat column keeps a
-    /// usable minimum.
     pub fn widen_queue_sidebar(&mut self) {
-        self.queue_sidebar_pct = (self.queue_sidebar_pct + 5).min(Self::QUEUE_SIDEBAR_PCT_MAX);
+        self.queue_sidebar_cols = (self.queue_sidebar_cols + Self::QUEUE_SIDEBAR_COLS_STEP)
+            .min(Self::QUEUE_SIDEBAR_COLS_MAX);
         self.mark_dirty_full();
     }
 
-    /// Narrow the queue sidebar (Shift+Right).
     pub fn narrow_queue_sidebar(&mut self) {
-        self.queue_sidebar_pct = self
-            .queue_sidebar_pct
-            .saturating_sub(5)
-            .max(Self::QUEUE_SIDEBAR_PCT_MIN);
+        self.queue_sidebar_cols = self
+            .queue_sidebar_cols
+            .saturating_sub(Self::QUEUE_SIDEBAR_COLS_STEP)
+            .max(Self::QUEUE_SIDEBAR_COLS_MIN);
         self.mark_dirty_full();
     }
 
-    /// Queue sidebar width in columns for a given chat area width, derived from
-    /// the current percent and clamped to a sane absolute range. On a terminal
-    /// too narrow to honour the absolute minimum while keeping the chat column
-    /// floor, the chat floor wins and the sidebar takes whatever remains.
+    /// Queue sidebar width in columns for a given chat area width. The stored
+    /// column width is clamped to the absolute range, then to whatever leaves
+    /// the chat column its floor on a terminal too narrow for both.
     pub fn queue_sidebar_width(&self, area_width: u16) -> u16 {
-        let pct = (area_width as u32 * self.queue_sidebar_pct as u32 / 100) as u16;
         let upper =
             Self::QUEUE_SIDEBAR_COLS_MAX.min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
         let lower = Self::QUEUE_SIDEBAR_COLS_MIN.min(upper);
-        pct.clamp(lower, upper)
+        self.queue_sidebar_cols.clamp(lower, upper)
     }
 
     fn editable_ids(&self) -> Vec<u64> {
@@ -4672,22 +4661,32 @@ mod tests {
     #[test]
     fn queue_sidebar_resize_clamps_to_bounds() {
         let mut s = state();
-        // Widen far past the cap; percent must saturate at the max.
         for _ in 0..40 {
             s.widen_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_pct, ChatState::QUEUE_SIDEBAR_PCT_MAX);
-        // Narrow far past the floor; percent must saturate at the min.
+        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MAX);
         for _ in 0..40 {
             s.narrow_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_pct, ChatState::QUEUE_SIDEBAR_PCT_MIN);
+        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MIN);
+    }
+
+    #[test]
+    fn queue_sidebar_narrow_then_widen_responds_immediately() {
+        let mut s = state();
+        s.narrow_queue_sidebar();
+        s.narrow_queue_sidebar();
+        let narrowed = s.queue_sidebar_width(200);
+        s.widen_queue_sidebar();
+        assert!(
+            s.queue_sidebar_width(200) > narrowed,
+            "one widen after narrowing must increase width, not burn a banked deficit"
+        );
     }
 
     #[test]
     fn queue_sidebar_width_respects_absolute_clamps() {
         let s = state();
-        // Wide terminal: capped at the absolute column max, never the raw pct.
         let wide = s.queue_sidebar_width(400);
         assert!(
             wide <= ChatState::QUEUE_SIDEBAR_COLS_MAX,
