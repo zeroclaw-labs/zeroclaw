@@ -173,3 +173,171 @@ fn fmt_tokens(n: u64) -> String {
     }
     out.chars().rev().collect()
 }
+
+// ── InfoBar ─────────────────────────────────────────────────────────────────
+
+use std::time::{Duration, Instant};
+
+/// How long an info message stays on the bar before it auto-clears. Named so
+/// the timeout is not a bare literal at the clear site.
+pub const INFO_BAR_TTL: Duration = Duration::from_secs(10);
+
+/// Severity of an info-bar message. Drives the colour; never matched on as a
+/// string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoKind {
+    /// Neutral operational note (e.g. "Fetching models for anthropic…").
+    Info,
+    /// A completed action worth confirming (e.g. "Model switched to …").
+    Note,
+    /// A failure the user should see (e.g. an RPC error).
+    Error,
+}
+
+/// A single user-facing message shown on the info bar. Owned by the app layer
+/// as `Option<InfoMessage>`; `None` means the bar is hidden. `set_at` drives the
+/// [`INFO_BAR_TTL`] auto-clear in the app tick loop.
+#[derive(Debug, Clone)]
+pub struct InfoMessage {
+    pub kind: InfoKind,
+    pub text: String,
+    pub set_at: Instant,
+}
+
+impl InfoMessage {
+    pub fn new(kind: InfoKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            set_at: Instant::now(),
+        }
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Self::new(InfoKind::Info, text)
+    }
+
+    pub fn note(text: impl Into<String>) -> Self {
+        Self::new(InfoKind::Note, text)
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self::new(InfoKind::Error, text)
+    }
+
+    /// `true` once the message has been visible for at least [`INFO_BAR_TTL`].
+    pub fn is_expired(&self) -> bool {
+        self.set_at.elapsed() >= INFO_BAR_TTL
+    }
+}
+
+/// A one-row, single-line info bar. Renders the current message truncated to the
+/// available width; stores the full text untruncated so a wider window shows
+/// more without any state change.
+pub struct InfoBar<'a> {
+    message: Option<&'a InfoMessage>,
+}
+
+impl<'a> InfoBar<'a> {
+    pub fn new(message: Option<&'a InfoMessage>) -> Self {
+        Self { message }
+    }
+
+    pub fn has_content(&self) -> bool {
+        self.message.is_some()
+    }
+
+    /// Build the `Paragraph`, or `None` when there is no message. `width` is the
+    /// available column count; the text is truncated (with an ellipsis) to fit.
+    pub fn widget(&self, width: usize) -> Option<Paragraph<'static>> {
+        let msg = self.message?;
+        let palette = crate::theme::active();
+        let color = match msg.kind {
+            InfoKind::Info => palette.dim,
+            InfoKind::Note => palette.accent,
+            InfoKind::Error => palette.warn,
+        };
+        let text = truncate_to_width(&msg.text, width);
+        Some(Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(color),
+        ))))
+    }
+}
+
+/// Truncate `s` to at most `width` display columns, appending an ellipsis when
+/// it overflows. Approximates width by `char` count — adequate for the
+/// single-line status text the info bar carries.
+fn truncate_to_width(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 1 {
+        return "\u{2026}".to_string();
+    }
+    let keep = width - 1;
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('\u{2026}');
+    out
+}
+
+#[cfg(test)]
+mod info_bar_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_shorter_than_width_is_unchanged() {
+        assert_eq!(truncate_to_width("model", 10), "model");
+    }
+
+    #[test]
+    fn truncate_exact_width_is_unchanged() {
+        assert_eq!(truncate_to_width("model", 5), "model");
+    }
+
+    #[test]
+    fn truncate_overflow_appends_ellipsis() {
+        assert_eq!(truncate_to_width("anthropic", 5), "anth\u{2026}");
+    }
+
+    #[test]
+    fn truncate_zero_width_is_empty() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_width_one_is_ellipsis() {
+        assert_eq!(truncate_to_width("anything", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn fresh_message_is_not_expired() {
+        let m = InfoMessage::info("hi");
+        assert!(!m.is_expired());
+    }
+
+    #[test]
+    fn ttl_aged_message_is_expired() {
+        let mut m = InfoMessage::error("boom");
+        m.set_at = Instant::now() - INFO_BAR_TTL - Duration::from_secs(1);
+        assert!(m.is_expired());
+    }
+
+    #[test]
+    fn no_message_renders_nothing() {
+        let bar = InfoBar::new(None);
+        assert!(!bar.has_content());
+        assert!(bar.widget(80).is_none());
+    }
+
+    #[test]
+    fn message_renders_widget() {
+        let m = InfoMessage::note("switched");
+        let bar = InfoBar::new(Some(&m));
+        assert!(bar.has_content());
+        assert!(bar.widget(80).is_some());
+    }
+}

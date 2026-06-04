@@ -93,7 +93,6 @@ zc-queue-empty-list = No queued messages.
 zc-queue-paused-ghost = Queue paused — press { $key } or send a message to resume
 zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
-zc-queue-auto-paused = Turn ended early — queue paused. Press { $key } to resume.
 zc-queue-clear-empty = Queue is already empty.
 zc-queue-cleared-all = Cleared { $count } queued message(s).
 zc-queue-cleared-one = Cleared queued message { $index }.

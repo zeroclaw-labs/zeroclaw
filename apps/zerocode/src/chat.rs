@@ -1164,6 +1164,18 @@ impl Chat {
         }
     }
 
+    /// Active info-bar message for the app-level `InfoBar`, expiring it first if
+    /// it has outlived [`crate::widgets::INFO_BAR_TTL`] so the bar auto-hides.
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        if let ChatPhase::Active(s) = &mut self.phase {
+            if s.info_message.as_ref().is_some_and(|m| m.is_expired()) {
+                s.info_message = None;
+            }
+            return s.info_message.as_ref();
+        }
+        None
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
@@ -1401,46 +1413,11 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     let _live_input_tokens = state.context_input_tokens;
 
-    // Reserve a dedicated one-row info bar at the very bottom of the pane when
-    // a transient notice is active. It is its own widget — owned by the chat
-    // pane, separate from the input box — so attach/detach/clipboard feedback
-    // renders below the input box instead of polluting the conversation
-    // history above it.
-    // Resolve what the one-row info bar shows. A transient notice (status
-    // message, attach result, etc.) takes the row when present and may
-    // freely overwrite the paused indicator. When no transient is up, a
-    // paused queue claims the row persistently with the resume chord — the
-    // paused state is sticky context, not a fire-once notice.
-    let info_line: Option<(String, Style)> = if let Some(ref notice) = state.info_notice {
-        Some((format!(" {notice}"), theme::accent_style()))
-    } else if state.queue_paused() {
-        let key = resume_queue_chord_label();
-        Some((
-            format!(
-                " {}",
-                crate::i18n::t_args("zc-queue-auto-paused", &[("key", &key)])
-            ),
-            theme::warn_style(),
-        ))
-    } else {
-        None
-    };
-
-    let input_area = if let Some((text, style)) = info_line {
-        if area.height > 1 {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
-            let bar = Paragraph::new(Line::from(Span::styled(text, style)));
-            f.render_widget(bar, rows[1]);
-            rows[0]
-        } else {
-            area
-        }
-    } else {
-        area
-    };
+    // Transient info-bar messages (queue/attach notices, model-switch notes)
+    // render at the app level via InfoBar from `state.info_message`. The paused
+    // queue shows as ghost text in the empty input box below, so the chat pane
+    // hands its full area to the input bar here.
+    let input_area = area;
 
     let queue_paused_hint = if state.queue_paused() {
         Some(crate::i18n::t_args(
@@ -2780,11 +2757,10 @@ pub struct ChatState {
     queue_sidebar_rect: Option<ratatui::layout::Rect>,
     /// Scroll offset (in rendered rows) into the queue sidebar.
     queue_scroll: u16,
-    /// Transient one-row info notice rendered in a dedicated bar below the
-    /// input box. Holds short user-facing feedback (attach/detach/clipboard)
-    /// that does not belong in the persisted conversation history. Cleared on
-    /// the next submit, inject, or turn start.
-    info_notice: Option<Arc<str>>,
+    /// Latest info-bar message (queue/attach notices, model-switch op notes,
+    /// errors). `None` hides the bar. Auto-cleared in the tick loop once
+    /// [`crate::widgets::INFO_BAR_TTL`] elapses.
+    pub info_message: Option<crate::widgets::InfoMessage>,
 }
 
 impl ChatState {
@@ -2833,7 +2809,7 @@ impl ChatState {
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
             queue_scroll: 0,
-            info_notice: None,
+            info_message: None,
         }
     }
 
@@ -3441,15 +3417,17 @@ impl ChatState {
         self.message_queue.len()
     }
 
-    /// Store a transient one-row notice for the info bar below the input box.
+    /// Store a transient note for the info bar (queue/attach/detach feedback).
+    /// Routes through the shared `info_message` bar so it inherits TTL auto-clear
+    /// and consistent rendering with model-switch notes.
     pub fn set_info_notice(&mut self, msg: String) {
-        self.info_notice = Some(Arc::<str>::from(msg));
+        self.info_message = Some(crate::widgets::InfoMessage::note(msg));
         self.mark_dirty_full();
     }
 
-    /// Drop the active info notice (on submit, inject, or turn start).
+    /// Drop the active info-bar message (on submit, inject, or turn start).
     pub fn clear_info_notice(&mut self) {
-        if self.info_notice.take().is_some() {
+        if self.info_message.take().is_some() {
             self.mark_dirty_full();
         }
     }
@@ -4515,7 +4493,7 @@ mod tests {
         let before = s.entries.len();
         s.set_info_notice("Detached: clipboard_123.png".to_string());
         assert_eq!(
-            s.info_notice.as_deref(),
+            s.info_message.as_ref().map(|m| m.text.as_str()),
             Some("Detached: clipboard_123.png")
         );
         assert_eq!(
@@ -4524,7 +4502,7 @@ mod tests {
             "info notice must not enter history"
         );
         s.clear_info_notice();
-        assert!(s.info_notice.is_none());
+        assert!(s.info_message.is_none());
         assert_eq!(s.entries.len(), before);
     }
 
