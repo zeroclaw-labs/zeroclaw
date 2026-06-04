@@ -90,6 +90,11 @@ pub(crate) struct Chat {
     git_branch_inflight: bool,
     phase: ChatPhase,
     pane_kind: PaneKind,
+    /// One-shot session id to reattach to on the next session start, set by
+    /// the app layer across a reconnect so the rebuilt pane resumes the
+    /// pre-disconnect session (the daemon retains it, #7182) instead of
+    /// minting a fresh one. Cleared once consumed by `start_session`.
+    resume_session_id: Option<String>,
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -112,6 +117,24 @@ impl Chat {
                 loading: true,
             },
             pane_kind,
+            resume_session_id: None,
+        }
+    }
+
+    /// Seed a session id to reattach to on the next session start. Used by the
+    /// app layer right before `init()` on a reconnect rebuild so the new pane
+    /// resumes the prior session rather than starting a new one. One-shot:
+    /// consumed by the first `start_session`.
+    pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
+        self.resume_session_id = sid;
+    }
+
+    /// The active session id, if a session is live. Read by the app layer
+    /// before a reconnect rebuild to carry the session across.
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        match &self.phase {
+            ChatPhase::Active(state) => Some(state.session_id.as_str()),
+            _ => None,
         }
     }
 
@@ -146,6 +169,10 @@ impl Chat {
 
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        // Multi-agent picker: the user may choose a different agent than the
+        // pre-disconnect one, so a carried-over resume id must not bleed into a
+        // mismatched agent's session. Drop it; manual pick starts fresh.
+        self.resume_session_id = None;
         self.phase = ChatPhase::PickAgent {
             agents,
             list_state,
@@ -208,12 +235,18 @@ impl Chat {
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
         };
+        // Reattach to a carried-over session on reconnect (one-shot); else a
+        // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
+        // the daemon-retained session and its persisted history.
+        let resume = self.resume_session_id.take();
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
-                .session_new_acp(agent_alias, cwd_str.as_deref(), None)
+                .session_new_acp(agent_alias, cwd_str.as_deref(), resume.as_deref())
                 .await
         } else {
-            self.rpc.session_new(agent_alias, cwd_str.as_deref()).await
+            self.rpc
+                .session_new_with_id(agent_alias, cwd_str.as_deref(), resume.as_deref())
+                .await
         };
         match result {
             Ok(session) => {
@@ -2995,6 +3028,60 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[tokio::test]
+    async fn current_session_id_reports_active_session() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        // No session yet → None.
+        assert_eq!(chat.current_session_id(), None);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        // Active → the live session id (the `state()` helper's id).
+        assert!(chat.current_session_id().is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_session_id_dropped_when_init_lands_in_multi_agent_picker() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.set_resume_session_id(Some("sess-prev".to_string()));
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("init should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = request["id"].as_str().unwrap().to_string();
+        // Two enabled agents → multi-agent picker, no auto-start.
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
+                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                ]
+            })),
+            None,
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        // A carried resume id must not survive into the picker, or a manual
+        // pick of a different agent would reattach a mismatched session.
+        assert_eq!(chat.resume_session_id, None);
+        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {

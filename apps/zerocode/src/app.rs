@@ -153,7 +153,7 @@ pub async fn run(
     // again) as a transient disconnect and stays in the loop rather than
     // tearing down the TUI.
     macro_rules! build_panes {
-        () => {
+        ($resume_chat:expr, $resume_acp:expr) => {
             async {
                 let mut dashboard_pane =
                     dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
@@ -161,8 +161,13 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let mut acp_pane = acp::Acp::new(rpc.clone());
+                // Carry the pre-disconnect session across a reconnect rebuild so
+                // the rebuilt pane resumes the daemon-retained session (#7182)
+                // instead of minting a fresh one. None on first build.
+                acp_pane.set_resume_session_id($resume_acp);
                 acp_pane.init().await?;
                 let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                chat_pane.set_resume_session_id($resume_chat);
                 chat_pane.init().await?;
                 let pending_start_chat = {
                     let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
@@ -197,7 +202,7 @@ pub async fn run(
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
-    ) = build_panes!()?;
+    ) = build_panes!(None, None)?;
 
     loop {
         // Draw
@@ -340,7 +345,12 @@ pub async fn run(
                         // daemon rehydrates the session from its durable row
                         // on the next prompt.
                         rpc = Arc::new(new_client);
-                        match build_panes!() {
+                        // Carry the live sessions across the rebuild so the
+                        // recovered panes reattach to the daemon-retained
+                        // sessions instead of starting fresh.
+                        let resume_chat = chat_pane.current_session_id().map(String::from);
+                        let resume_acp = acp_pane.current_session_id().map(String::from);
+                        match build_panes!(resume_chat, resume_acp) {
                             Ok(panes) => {
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
