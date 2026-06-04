@@ -328,8 +328,19 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
         </div>
       )}
 
-      {/* Messages area */}
-      <div className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}>
+      {/* Messages area.
+          translate="no" / notranslate (#7057): browser auto-translation (e.g.
+          Chrome → Google Translate) rewrites text nodes into <font> wrappers.
+          React-managed streaming output and ReactMarkdown emit/replace bare
+          text nodes many times/sec; reconciling translator-moved nodes throws
+          "Failed to execute 'removeChild' on 'Node'" and unmounts the view.
+          Excluding this dynamic region from translation keeps React's text
+          nodes untouched. Scoped to the conversation only — static UI chrome
+          elsewhere can still translate. */}
+      <div
+        translate="no"
+        className={`notranslate flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+      >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
             <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
