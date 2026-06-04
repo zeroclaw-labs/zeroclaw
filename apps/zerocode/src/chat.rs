@@ -222,6 +222,7 @@ impl Chat {
                 if self.pane_kind == PaneKind::Acp {
                     state.cwd = session.workspace_dir;
                 }
+                Self::refresh_model_identity(&self.rpc, &mut state).await;
                 self.phase = ChatPhase::Active(Box::new(state));
             }
             Err(e) => {
@@ -544,6 +545,7 @@ impl Chat {
                             {
                                 state.cwd = rehydrated.workspace_dir;
                             }
+                            Self::refresh_model_identity(&self.rpc, state).await;
                             // Load persisted message history.
                             if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
                                 for m in msgs.messages {
@@ -825,6 +827,7 @@ impl Chat {
                         if self.pane_kind == PaneKind::Acp {
                             state.cwd = s.workspace_dir;
                         }
+                        Self::refresh_model_identity(&self.rpc, state).await;
                     }
                 }
             }
@@ -970,9 +973,18 @@ impl Chat {
                     crate::i18n::t_args("zc-model-switch-model-ok", &[("model", &model)])
                 };
                 state.info_message = Some(crate::widgets::InfoMessage::note(summary));
-                // A model_provider switch changes the catalog — drop the cache so
-                // the next `/model` use refetches.
-                if !model_provider.is_empty() {
+                let provider_ref = (!model_provider.is_empty()).then_some(model_provider.as_str());
+                let resolved_model = if !model.is_empty() {
+                    Some(model.clone())
+                } else if let Some(r) = provider_ref {
+                    Self::configured_model(rpc, r).await
+                } else {
+                    None
+                };
+                state.set_model_identity(provider_ref, resolved_model.as_deref());
+                // A model_provider switch changes the catalog — drop the cache
+                // so the next `/model` use refetches.
+                if provider_ref.is_some() {
                     state.input_bar.set_model_catalog(String::new(), Vec::new());
                 }
             }
@@ -984,6 +996,14 @@ impl Chat {
             }
         }
         state.mark_dirty_full();
+    }
+
+    async fn refresh_model_identity(rpc: &RpcClient, state: &mut ChatState) {
+        if let Some(provider_ref) = Self::resolve_model_provider_ref(rpc, &state.agent_alias).await
+        {
+            let model = Self::configured_model(rpc, &provider_ref).await;
+            state.set_model_identity(Some(&provider_ref), model.as_deref());
+        }
     }
 
     /// Resolve the agent's configured model_provider reference (`<type>.<alias>`)
@@ -2593,6 +2613,8 @@ pub struct ChatState {
     pub session_id: String,
     pub agent_alias: String,
     session_name: Option<String>,
+    model_provider_ref: Option<String>,
+    model: Option<String>,
     /// Working directory for this session (shown above input bar).
     pub cwd: Option<String>,
     /// Cached git branch for `cwd`, refreshed by the daemon on a polling
@@ -2671,6 +2693,8 @@ impl ChatState {
             session_id,
             agent_alias,
             session_name: None,
+            model_provider_ref: None,
+            model: None,
             cwd: None,
             git_branch: None,
             git_branch_last_fetch: None,
@@ -2947,11 +2971,29 @@ impl ChatState {
         }
     }
 
-    /// Display title: session name if set, otherwise agent alias.
     pub fn title(&self) -> String {
-        match &self.session_name {
-            Some(name) => format!("{} — {}", self.agent_alias, name),
-            None => self.agent_alias.clone(),
+        let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
+        let mut parts: Vec<String> = Vec::with_capacity(4);
+        parts.push(self.agent_alias.clone());
+        if let Some(ref name) = self.session_name {
+            parts.push(format!("— {name}"));
+        }
+        parts.push(short.to_string());
+        if let Some(ref provider) = self.model_provider_ref {
+            parts.push(provider.clone());
+        }
+        if let Some(ref model) = self.model {
+            parts.push(model.clone());
+        }
+        parts.join("  ")
+    }
+
+    pub fn set_model_identity(&mut self, model_provider_ref: Option<&str>, model: Option<&str>) {
+        if let Some(r) = model_provider_ref {
+            self.model_provider_ref = Some(r.to_string());
+        }
+        if let Some(m) = model {
+            self.model = Some(m.to_string());
         }
     }
 
@@ -3206,6 +3248,8 @@ impl ChatState {
     pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
         self.session_id = session_id;
         self.session_name = name;
+        self.model_provider_ref = None;
+        self.model = None;
         self.input_bar.reset();
         self.entries.clear();
         self.streaming_text.clear();
@@ -3332,6 +3376,39 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[test]
+    fn title_shows_agent_uid_provider_model() {
+        let mut s = ChatState::new(
+            "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
+            "personal_code".to_string(),
+        );
+        s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
+        assert_eq!(
+            s.title(),
+            "personal_code  9caf2a1  anthropic.personal_code  claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn title_falls_back_before_identity_resolved() {
+        let s = ChatState::new("abcdef1234".to_string(), "myagent".to_string());
+        assert_eq!(s.title(), "myagent  abcdef1");
+    }
+
+    #[test]
+    fn set_model_identity_keeps_full_ref_and_updates_live() {
+        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+        s.set_model_identity(Some("openai.work"), Some("gpt-5"));
+        assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5");
+        s.set_model_identity(None, Some("gpt-5-mini"));
+        assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5-mini");
+        s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
+        assert_eq!(
+            s.title(),
+            "ag  abcdef1  anthropic.personal_code  claude-opus-4-8"
+        );
     }
 
     #[test]
