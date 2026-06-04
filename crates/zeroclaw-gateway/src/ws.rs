@@ -635,6 +635,7 @@ async fn handle_socket(
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event
                     && event_matches_session(&event, &session_id)
+                    && !is_observability_telemetry(&event)
                 {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
@@ -748,6 +749,34 @@ fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
         None => true,
+    }
+}
+
+/// Returns true for monitoring/observability telemetry frames that share the
+/// shared broadcast bus with chat events but must never reach the chat
+/// WebSocket client.
+///
+/// The chat protocol streams its real tool frames out-of-band over the
+/// per-turn channel (`{"type":"tool_call","id","name","args"}` and
+/// `{"type":"tool_result","id","name","output"}`, emitted directly by
+/// `process_chat_message`), so any `tool_call`/`tool_result`/`tool_call_start`
+/// frame arriving over the *broadcast* bus is observability telemetry emitted
+/// by `BroadcastObserver` with a different shape (`tool`/`duration_ms`/
+/// `success`, and crucially no `name`). Forwarding it would make the frontend
+/// render a permanent "unknown" tool card (issue #7151).
+///
+/// Discriminator: drop tool frames that lack the chat tool-frame `name` field.
+/// This keeps the filter targeted — legitimate chat frames always carry `name`
+/// — while catching the telemetry shape regardless of which observability
+/// fields it happens to include.
+fn is_observability_telemetry(event: &serde_json::Value) -> bool {
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("tool_call" | "tool_call_start" | "tool_result") => {
+            // Chat tool frames always carry a `name`; observability telemetry
+            // uses `tool` instead and has no `name`.
+            event.get("name").and_then(serde_json::Value::as_str).is_none()
+        }
+        _ => false,
     }
 }
 
@@ -1466,6 +1495,53 @@ mod tests {
         assert!(event_matches_session(&target_event, "operator-1"));
         assert!(!event_matches_session(&other_event, "operator-1"));
         assert!(event_matches_session(&global_event, "operator-1"));
+    }
+
+    #[test]
+    fn observability_tool_call_telemetry_is_filtered() {
+        // BroadcastObserver telemetry shape (sse.rs): `tool`/`duration_ms`/
+        // `success`, no `name`. This must never reach the chat WS (#7151).
+        let telemetry = serde_json::json!({
+            "type": "tool_call",
+            "tool": "file_write",
+            "duration_ms": 10611,
+            "success": true,
+            "timestamp": "2026-06-04T00:00:00Z",
+        });
+        assert!(is_observability_telemetry(&telemetry));
+
+        // tool_call_start telemetry leaks the same way.
+        let telemetry_start = serde_json::json!({
+            "type": "tool_call_start",
+            "tool": "shell",
+            "timestamp": "2026-06-04T00:00:00Z",
+        });
+        assert!(is_observability_telemetry(&telemetry_start));
+    }
+
+    #[test]
+    fn chat_tool_frames_are_not_filtered() {
+        // Real chat tool frames (ws.rs process_chat_message) always carry
+        // `name`; they must pass through.
+        let chat_tool_call = serde_json::json!({
+            "type": "tool_call",
+            "id": "call-1",
+            "name": "file_write",
+            "args": {"path": "/tmp/x"},
+        });
+        assert!(!is_observability_telemetry(&chat_tool_call));
+
+        let chat_tool_result = serde_json::json!({
+            "type": "tool_result",
+            "id": "call-1",
+            "name": "file_write",
+            "output": "ok",
+        });
+        assert!(!is_observability_telemetry(&chat_tool_result));
+
+        // Unrelated event types are never treated as telemetry.
+        let cron = serde_json::json!({ "type": "cron_result", "output": "done" });
+        assert!(!is_observability_telemetry(&cron));
     }
 
     #[test]
