@@ -14974,7 +14974,7 @@ impl Config {
             }
         }
 
-        for (type_key, alias_key, profile) in self.providers.models.iter_entries() {
+        for (type_key, alias_key, has_family_extras, profile) in self.providers.models.iter_entries_with_family_extras() {
             let profile_name = format!("{type_key}.{alias_key}");
 
             let has_uri = profile
@@ -15002,9 +15002,24 @@ impl Config {
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
             if !has_uri && !has_api_key && !has_model {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
-                     Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
-                     to make this model_provider usable.");
+                // If family-specific fields (like `endpoint`) survived but
+                // the flattened base fields (model, api_key, wire_api) did
+                // not, this almost always means serde's `#[serde(flatten)]`
+                // silently dropped them — typically from using the nested
+                // TOML format `[providers.models.<type>.<alias>]` instead
+                // of the flat `[providers.models.<type>]` that the v2→v3
+                // migration normalises. Emit a targeted hint so the operator
+                // can fix the config instead of getting a cryptic 401.
+                if has_family_extras {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models.{profile_name} has family-specific fields (e.g. endpoint) but no model or api_key — \
+                         flattened ModelProviderConfig fields were likely silently dropped by serde. \
+                         Use the flat TOML format [providers.models.{type_key}] instead of \
+                         [providers.models.{type_key}.{alias_key}], or set model/api_key explicitly.");
+                } else {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
+                         Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
+                         to make this model_provider usable.");
+                }
                 continue;
             }
 
@@ -23762,5 +23777,67 @@ allowed_users = []
                 .classifier_provider
                 .is_empty()
         );
+    }
+
+    /// Verify that a provider entry with family-specific fields (like
+    /// `endpoint`) but no flattened base fields (model, api_key) is
+    /// detected as a likely serde flatten data-loss case. This happens
+    /// when the nested TOML format `[providers.models.<type>.<alias>]`
+    /// is used instead of the flat `[providers.models.<type>]`.
+    #[tokio::test]
+    async fn config_validate_warns_on_provider_with_endpoint_but_no_model() {
+        let toml = r#"
+            [providers.models.zai.default]
+            endpoint = "global"
+
+            [agents.default]
+            model_provider = "zai.default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // Validate should succeed (it's a warning, not an error),
+        // but the zai.default entry should have no model or api_key
+        // while having a family-specific endpoint — the flatten-loss
+        // pattern.
+        let entry = cfg.providers.models.find("zai", "default");
+        assert!(entry.is_some(), "zai.default should exist");
+        let base = entry.unwrap();
+        assert!(
+            base.model.is_none() || base.model.as_deref() == Some(""),
+            "flattened model field should be absent — this is the bug we're detecting"
+        );
+        assert!(
+            base.api_key.is_none(),
+            "flattened api_key field should be absent — this is the bug we're detecting"
+        );
+    }
+
+    /// Verify that a provider entry populated with both family-specific and
+    /// base fields (model, api_key) validates without the flatten-loss
+    /// warning. This uses the V2-migrated format where the migration
+    /// correctly populates the typed struct (the flat format `[providers.models.<type>]`
+    /// only works via the V2 migration path, not direct V3 TOML parsing).
+    #[tokio::test]
+    async fn config_validate_populated_provider_with_endpoint_passes() {
+        let mut cfg = Config::default();
+        let base = ModelProviderConfig {
+            api_key: Some("test-key".to_string()),
+            model: Some("glm-5.1".to_string()),
+            temperature: Some(0.7),
+            timeout_secs: Some(120),
+            wire_api: Some(WireApi::ChatCompletions),
+            ..Default::default()
+        };
+        cfg.providers.models.ensure("zai", "default");
+        // Set the base fields directly (simulating what V2 migration does).
+        if let Some(slot) = cfg.providers.models.ensure("zai", "default") {
+            *slot = base;
+        }
+        // Validate should not emit the flatten-loss warning for this entry
+        // since it has both model and api_key.
+        let entry = cfg.providers.models.find("zai", "default");
+        assert!(entry.is_some());
+        let base = entry.unwrap();
+        assert_eq!(base.model.as_deref(), Some("glm-5.1"));
+        assert_eq!(base.api_key.as_deref(), Some("test-key"));
     }
 }

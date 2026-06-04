@@ -452,6 +452,35 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_is_empty)
     }
 
+    /// Iterate every entry and report whether the typed wrapper carries
+    /// non-default family-specific fields (e.g. `endpoint` on ZAI/GLM,
+    /// `auth_mode` on OpenAI) while the flattened `ModelProviderConfig`
+    /// base lacks essential fields (`model`, `api_key`). This pattern
+    /// indicates `#[serde(flatten)]` silently dropped the base fields
+    /// during TOML deserialization — typically caused by using the nested
+    /// TOML format `[providers.models.zai.default]` instead of the flat
+    /// `[providers.models.zai]` that the v2→v3 migration normalises.
+    ///
+    /// Returns `(type_key, alias_key, has_family_extras, &base)`.
+    pub fn iter_entries_with_family_extras(
+        &self,
+    ) -> Vec<(&str, &str, bool, &ModelProviderConfig)> {
+        use super::schema::FamilyEndpoint;
+        let mut out: Vec<(&str, &str, bool, &ModelProviderConfig)> = Vec::new();
+        macro_rules! emit_extra_check {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                $(
+                    for (alias, cfg) in &self.$field {
+                        let has_extras = cfg.endpoint_uri().is_some();
+                        out.push(($type_str, alias.as_str(), has_extras, &cfg.base));
+                    }
+                )+
+            };
+        }
+        for_each_model_provider_slot!(emit_extra_check);
+        out
+    }
+
     /// Total number of (provider_type, alias) entries across all slots.
     pub fn len(&self) -> usize {
         macro_rules! emit_len {
