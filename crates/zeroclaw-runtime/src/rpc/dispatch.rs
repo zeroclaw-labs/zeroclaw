@@ -880,17 +880,6 @@ impl RpcDispatcher {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
 
-        // If a turn is in flight, emit TurnComplete(cancelled) so any connected
-        // client exits the working state before the session disappears.
-        if self.ctx.sessions.has_inflight_turn(sid) {
-            self.emit_turn_complete(
-                sid,
-                crate::rpc::types::TurnCompletionOutcome::Cancelled,
-                "turn cancelled by daemon: admin_kill".to_string(),
-            )
-            .await;
-        }
-
         let agent_alias = self
             .ctx
             .sessions
@@ -915,6 +904,14 @@ impl RpcDispatcher {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success),
                 "session/kill: session terminated by admin"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "session/kill: session vanished between existence check and kill (concurrent close?)"
             );
         }
 
