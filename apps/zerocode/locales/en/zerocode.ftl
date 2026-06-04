@@ -98,6 +98,7 @@ zc-queue-help-resume = Resume queue
 zc-queue-help-nav = Select queued
 zc-queue-help-delete = Delete queued
 zc-queue-help-edit = Edit queued
+zc-queue-help-resize = Resize queue
 zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.

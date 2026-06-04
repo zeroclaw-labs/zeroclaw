@@ -170,6 +170,8 @@ keyactions! {
         QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
         QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
         QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
+        QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",
+        QueueNarrow             [Chord::shift(KeyCode::Right)] => "narrow queue",
     }
 }
 

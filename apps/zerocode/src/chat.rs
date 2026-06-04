@@ -657,6 +657,14 @@ impl Chat {
                     }
                     return false;
                 }
+                Some(QAction::QueueWiden) if state.show_queue_sidebar => {
+                    state.widen_queue_sidebar();
+                    return false;
+                }
+                Some(QAction::QueueNarrow) if state.show_queue_sidebar => {
+                    state.narrow_queue_sidebar();
+                    return false;
+                }
                 _ => {}
             }
         }
@@ -1238,6 +1246,7 @@ impl crate::widgets::HelpContext for Chat {
                     E::key("Alt+↑/↓", crate::i18n::t("zc-queue-help-nav")),
                     E::key("Alt+X", crate::i18n::t("zc-queue-help-delete")),
                     E::key("Alt+E", crate::i18n::t("zc-queue-help-edit")),
+                    E::key("Shift+←/→", crate::i18n::t("zc-queue-help-resize")),
                 ]);
                 pane.with_child(state.input_bar.help_context())
             }
@@ -1337,9 +1346,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let area = if state.show_queue_sidebar {
-        let sidebar_w = (area.width / 3)
-            .clamp(24, 48)
-            .min(area.width.saturating_sub(20));
+        let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(20), Constraint::Length(sidebar_w)])
@@ -1496,7 +1503,11 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
         }
     }
 
-    let para = Paragraph::new(rows).wrap(Wrap { trim: false });
+    // No soft wrap: a queued message renders on a single line that the pane
+    // width hard-truncates. Wrapping made long messages spill onto extra rows
+    // and pushed the queue out of alignment; the preview is already clipped to
+    // the inner width above, and ratatui truncates anything still too wide.
+    let para = Paragraph::new(rows);
     f.render_widget(para, inner);
 }
 
@@ -2585,6 +2596,10 @@ pub struct ChatState {
     queue_paused: bool,
     /// Whether the queue sidebar is visible.
     show_queue_sidebar: bool,
+    /// Queue sidebar width as a percent of the chat area (clamped). Adjusted
+    /// with Shift+Left (widen) / Shift+Right (narrow), mirroring the logs
+    /// detail pane's resize.
+    queue_sidebar_pct: u16,
     /// Selected queued message id for sidebar edit/delete.
     queue_sel: Option<u64>,
 }
@@ -2631,6 +2646,7 @@ impl ChatState {
             next_queue_id: 0,
             queue_paused: false,
             show_queue_sidebar: false,
+            queue_sidebar_pct: 30,
             queue_sel: None,
         }
     }
@@ -3111,6 +3127,14 @@ impl ChatState {
     }
 
     const QUEUE_CAP: usize = 32;
+    /// Queue sidebar resize bounds (percent of chat area).
+    const QUEUE_SIDEBAR_PCT_MIN: u16 = 15;
+    const QUEUE_SIDEBAR_PCT_MAX: u16 = 60;
+    /// Absolute column clamps so the sidebar stays readable on tiny terminals
+    /// and never starves the chat column.
+    const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
+    const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
+    const QUEUE_CHAT_COLS_MIN: u16 = 20;
 
     fn alloc_queue_id(&mut self) -> u64 {
         let id = self.next_queue_id;
@@ -3221,6 +3245,34 @@ impl ChatState {
             self.queue_sel = self.message_queue.front().map(|m| m.id);
         }
         self.mark_dirty_full();
+    }
+
+    /// Widen the queue sidebar (Shift+Left). Clamped so the chat column keeps a
+    /// usable minimum.
+    pub fn widen_queue_sidebar(&mut self) {
+        self.queue_sidebar_pct = (self.queue_sidebar_pct + 5).min(Self::QUEUE_SIDEBAR_PCT_MAX);
+        self.mark_dirty_full();
+    }
+
+    /// Narrow the queue sidebar (Shift+Right).
+    pub fn narrow_queue_sidebar(&mut self) {
+        self.queue_sidebar_pct = self
+            .queue_sidebar_pct
+            .saturating_sub(5)
+            .max(Self::QUEUE_SIDEBAR_PCT_MIN);
+        self.mark_dirty_full();
+    }
+
+    /// Queue sidebar width in columns for a given chat area width, derived from
+    /// the current percent and clamped to a sane absolute range. On a terminal
+    /// too narrow to honour the absolute minimum while keeping the chat column
+    /// floor, the chat floor wins and the sidebar takes whatever remains.
+    pub fn queue_sidebar_width(&self, area_width: u16) -> u16 {
+        let pct = (area_width as u32 * self.queue_sidebar_pct as u32 / 100) as u16;
+        let upper =
+            Self::QUEUE_SIDEBAR_COLS_MAX.min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
+        let lower = Self::QUEUE_SIDEBAR_COLS_MIN.min(upper);
+        pct.clamp(lower, upper)
     }
 
     fn editable_ids(&self) -> Vec<u64> {
@@ -4060,6 +4112,38 @@ mod tests {
         assert!(
             s.enqueue_message("overflow".to_string(), Vec::new())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn queue_sidebar_resize_clamps_to_bounds() {
+        let mut s = state();
+        // Widen far past the cap; percent must saturate at the max.
+        for _ in 0..40 {
+            s.widen_queue_sidebar();
+        }
+        assert_eq!(s.queue_sidebar_pct, ChatState::QUEUE_SIDEBAR_PCT_MAX);
+        // Narrow far past the floor; percent must saturate at the min.
+        for _ in 0..40 {
+            s.narrow_queue_sidebar();
+        }
+        assert_eq!(s.queue_sidebar_pct, ChatState::QUEUE_SIDEBAR_PCT_MIN);
+    }
+
+    #[test]
+    fn queue_sidebar_width_respects_absolute_clamps() {
+        let s = state();
+        // Wide terminal: capped at the absolute column max, never the raw pct.
+        let wide = s.queue_sidebar_width(400);
+        assert!(
+            wide <= ChatState::QUEUE_SIDEBAR_COLS_MAX,
+            "sidebar exceeded absolute column cap"
+        );
+        // Narrow terminal: chat column keeps its minimum, sidebar shrinks.
+        let tight = s.queue_sidebar_width(40);
+        assert!(
+            tight <= 40u16.saturating_sub(ChatState::QUEUE_CHAT_COLS_MIN),
+            "sidebar starved the chat column on a narrow terminal"
         );
     }
 }
