@@ -9948,7 +9948,8 @@ pub struct CronJobDecl {
     /// Model override for agent jobs.
     #[serde(default)]
     pub model: Option<String>,
-    /// Allowlist of tool names for agent jobs.
+    /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
+    /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.

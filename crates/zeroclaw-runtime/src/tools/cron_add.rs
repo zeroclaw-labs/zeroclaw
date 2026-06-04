@@ -163,7 +163,7 @@ impl Tool for CronAddTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional allowlist of tool names for agent jobs. When omitted, all tools remain available."
+                    "description": "Optional allowlist of tool names for agent jobs. When omitted, cron-launched agent runs keep non-scheduler tools available but exclude scheduler mutation tools such as cron_add, cron_update, cron_remove, cron_run, and schedule. Include those names explicitly to opt back in."
                 },
                 "delivery": {
                     "type": "object",
@@ -936,6 +936,22 @@ mod tests {
             jobs[0].allowed_tools, None,
             "empty allowed_tools should be stored as None"
         );
+    }
+
+    #[tokio::test]
+    async fn allowed_tools_schema_documents_scheduler_mutation_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let schema = tool.parameters_schema();
+        let description = schema["properties"]["allowed_tools"]["description"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(description.contains("exclude scheduler mutation tools"));
+        assert!(description.contains("cron_add"));
+        assert!(description.contains("opt back in"));
     }
 
     #[tokio::test]
