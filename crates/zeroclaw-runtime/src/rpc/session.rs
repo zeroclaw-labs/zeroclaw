@@ -734,7 +734,11 @@ mod tests {
             .await
             .unwrap();
         // Simulate transport disconnect — store must still hold the session.
-        assert_eq!(store.count().await, 1, "session must survive transport disconnect");
+        assert_eq!(
+            store.count().await,
+            1,
+            "session must survive transport disconnect"
+        );
     }
 
     /// kill_session fires the cancel token and removes the session.
@@ -753,7 +757,10 @@ mod tests {
 
         let removed = store.kill_session("live").await;
         assert!(removed, "kill_session must return true for a real session");
-        assert!(token.is_cancelled(), "kill_session must fire the cancel token");
+        assert!(
+            token.is_cancelled(),
+            "kill_session must fire the cancel token"
+        );
         assert_eq!(store.count().await, 0, "session must be removed");
     }
 

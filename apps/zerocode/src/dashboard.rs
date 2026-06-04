@@ -2040,7 +2040,10 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
             ];
             if self.tab == Tab::Sessions {
-                entries.push(E::key("X", crate::i18n::t("zc-dashboard-help-kill-session")));
+                entries.push(E::key(
+                    "X",
+                    crate::i18n::t("zc-dashboard-help-kill-session"),
+                ));
             }
             return HelpNode::entries(entries);
         }
