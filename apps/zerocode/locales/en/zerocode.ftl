@@ -87,6 +87,7 @@ zc-input-pending-attachments-header = Pending attachments:
 zc-input-clipboard-error = Clipboard error: { $error }
 
 zc-queue-empty = Nothing to send.
+zc-cancel-timed-out = Cancel timed out; turn settled locally.
 zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
 zc-queue-title = Queue ({ $count })
 zc-queue-empty-list = No queued messages.

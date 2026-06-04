@@ -35,6 +35,7 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -257,6 +258,26 @@ impl Chat {
         }
     }
 
+    fn settle_stuck_cancel(&mut self) {
+        let expired = matches!(
+            self.phase,
+            ChatPhase::Active(ref s) if s.cancel_watchdog_expired()
+        );
+        if !expired {
+            return;
+        }
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            state
+                .entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                    "zc-cancel-timed-out",
+                ))));
+            state.mark_dirty_append();
+            state.commit_turn(String::new(), false);
+        }
+        self.pump_queue();
+    }
+
     fn after_enqueue(&mut self, enq: Result<(), String>) {
         match enq {
             Ok(()) => {
@@ -387,6 +408,7 @@ impl Chat {
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
+        self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.maybe_refresh_git_branch();
 
@@ -702,9 +724,13 @@ impl Chat {
                         && !matches!(state.turn_status, TurnStatus::Cancelling)
                     {
                         let sid = state.session_id.clone();
-                        let _ = self.rpc.session_cancel(&sid).await;
+                        let res = self.rpc.session_cancel(&sid).await;
                         if let ChatPhase::Active(ref mut state) = self.phase {
-                            state.turn_status = TurnStatus::Cancelling;
+                            if res.is_ok() {
+                                state.enter_cancelling();
+                            } else {
+                                state.commit_turn(String::new(), false);
+                            }
                         }
                     }
                     self.after_enqueue(enq);
@@ -753,8 +779,12 @@ impl Chat {
         if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
             if state.turn_in_flight {
                 if !matches!(state.turn_status, TurnStatus::Cancelling) {
-                    let _ = self.rpc.session_cancel(&state.session_id).await;
-                    state.turn_status = TurnStatus::Cancelling;
+                    let res = self.rpc.session_cancel(&state.session_id).await;
+                    if res.is_ok() {
+                        state.enter_cancelling();
+                    } else {
+                        state.commit_turn(String::new(), false);
+                    }
                 }
             } else {
                 return true;
@@ -768,8 +798,12 @@ impl Chat {
                 } else if state.turn_in_flight
                     && !matches!(state.turn_status, TurnStatus::Cancelling)
                 {
-                    let _ = self.rpc.session_cancel(&state.session_id).await;
-                    state.turn_status = TurnStatus::Cancelling;
+                    let res = self.rpc.session_cancel(&state.session_id).await;
+                    if res.is_ok() {
+                        state.enter_cancelling();
+                    } else {
+                        state.commit_turn(String::new(), false);
+                    }
                 }
             }
             Some(ChatTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
@@ -2744,6 +2778,8 @@ pub struct ChatState {
     next_queue_id: u64,
     /// Set on Cancel/Fail; freezes auto-dispatch until the user resumes.
     queue_paused: bool,
+    resume_override: bool,
+    cancel_started_at: Option<Instant>,
     /// Queue sidebar width as a percent of the chat area (clamped). Adjusted
     /// with Shift+Left (widen) / Shift+Right (narrow), mirroring the logs
     /// detail pane's resize.
@@ -2804,6 +2840,8 @@ impl ChatState {
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
+            resume_override: false,
+            cancel_started_at: None,
             queue_sidebar_pct: 30,
             queue_sel: None,
             queue_item_rects: Vec::new(),
@@ -3269,13 +3307,24 @@ impl ChatState {
         self.mark_dirty_append();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
+        self.cancel_started_at = None;
         self.input_bar.cleanup_temps();
-        if !clean {
-            // Auto-pause on a non-clean turn end (cancel/fail). The paused
-            // indicator is surfaced persistently by the info-bar render, so
-            // no one-shot notice is needed here.
+        if !clean && !self.resume_override {
             self.queue_paused = true;
         }
+        self.resume_override = false;
+    }
+
+    pub fn enter_cancelling(&mut self) {
+        self.turn_status = TurnStatus::Cancelling;
+        self.cancel_started_at = Some(Instant::now());
+    }
+
+    pub fn cancel_watchdog_expired(&self) -> bool {
+        matches!(self.turn_status, TurnStatus::Cancelling)
+            && self
+                .cancel_started_at
+                .is_some_and(|t| t.elapsed() >= CANCEL_WATCHDOG)
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
@@ -3386,6 +3435,7 @@ impl ChatState {
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
         let idx = self.next_dispatch_index()?;
         let msg = self.message_queue.remove(idx)?;
+        self.resume_override = false;
         if self.queue_sel == Some(msg.id) {
             self.queue_sel = None;
         }
@@ -3410,6 +3460,9 @@ impl ChatState {
     pub fn resume_queue(&mut self) -> bool {
         let was_paused = self.queue_paused;
         self.queue_paused = false;
+        if self.turn_in_flight {
+            self.resume_override = true;
+        }
         was_paused
     }
 
@@ -3605,6 +3658,7 @@ impl ChatState {
         }
         self.next_queue_id = 0;
         self.queue_paused = false;
+        self.resume_override = false;
         self.queue_sel = None;
     }
 
@@ -3624,6 +3678,7 @@ impl ChatState {
         self.pending_approval = None;
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
+        self.cancel_started_at = None;
         self.browse_cursor = None;
         self.browse_anchor = None;
         self.browse_multi.clear();
@@ -4485,6 +4540,80 @@ mod tests {
         // Enter resumes; backlog now dispatches.
         s.resume_queue();
         assert_eq!(s.take_next_dispatchable().unwrap().text, "queued");
+    }
+
+    #[test]
+    fn enter_during_cancel_survives_non_clean_commit() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.resume_queue();
+        s.enqueue_message("hello".to_string(), Vec::new()).unwrap();
+        s.commit_turn(String::new(), false);
+        assert!(
+            !s.queue_paused(),
+            "explicit Enter-resume mid-turn must survive the cancel auto-pause"
+        );
+        assert_eq!(
+            s.take_next_dispatchable().unwrap().text,
+            "hello",
+            "the just-submitted message must dispatch, not sit re-paused"
+        );
+    }
+
+    #[test]
+    fn resume_override_is_one_shot() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.resume_queue();
+        s.enqueue_message("a".to_string(), Vec::new()).unwrap();
+        s.commit_turn(String::new(), false);
+        assert_eq!(s.take_next_dispatchable().unwrap().text, "a");
+        s.turn_in_flight = true;
+        s.enqueue_message("b".to_string(), Vec::new()).unwrap();
+        s.commit_turn(String::new(), false);
+        assert!(
+            s.queue_paused(),
+            "a stale resume must not leak into the next cancelled turn"
+        );
+    }
+
+    #[test]
+    fn enter_cancelling_arms_watchdog_and_commit_disarms() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enter_cancelling();
+        assert!(matches!(s.turn_status, TurnStatus::Cancelling));
+        assert!(s.cancel_started_at.is_some());
+        s.commit_turn(String::new(), false);
+        assert!(matches!(s.turn_status, TurnStatus::Idle));
+        assert!(
+            s.cancel_started_at.is_none(),
+            "commit must disarm the cancel watchdog"
+        );
+        assert!(!s.cancel_watchdog_expired());
+    }
+
+    #[test]
+    fn cancel_watchdog_expires_after_bound() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enter_cancelling();
+        assert!(!s.cancel_watchdog_expired(), "fresh cancel is not expired");
+        s.cancel_started_at = Some(Instant::now() - CANCEL_WATCHDOG);
+        assert!(
+            s.cancel_watchdog_expired(),
+            "a cancel with no TurnComplete past the bound must be reported stuck"
+        );
+    }
+
+    #[test]
+    fn idle_session_never_reports_stuck_cancel() {
+        let mut s = state();
+        s.cancel_started_at = Some(Instant::now() - CANCEL_WATCHDOG);
+        assert!(
+            !s.cancel_watchdog_expired(),
+            "watchdog only fires while status is Cancelling"
+        );
     }
 
     #[test]
