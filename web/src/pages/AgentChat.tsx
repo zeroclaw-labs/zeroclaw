@@ -453,6 +453,23 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   );
 }
 
+const SERVER_TIMESTAMP_RE = /\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+)\]\s*/;
+
+function extractServerTimestamp(content: string): {
+  cleanContent: string;
+  serverTimestamp: Date | null;
+} {
+  const m = content.match(SERVER_TIMESTAMP_RE);
+  if (!m) return { cleanContent: content, serverTimestamp: null };
+  const tsStr = m[1];
+  if (!tsStr) return { cleanContent: content, serverTimestamp: null };
+  const ts = new Date(tsStr);
+  if (isNaN(ts.getTime())) return { cleanContent: content, serverTimestamp: null };
+  const prefix = content.slice(0, m.index!);
+  const suffix = content.slice(m.index! + m[0].length);
+  return { cleanContent: prefix + suffix, serverTimestamp: ts };
+}
+
 // Each chat message is rendered through this memoized component so that
 // typing into the input does not re-render every existing message (and
 // re-run ReactMarkdown on each one). Keep the prop surface small and pass
@@ -475,6 +492,8 @@ const MessageItem = memo(function MessageItem({
   onCopy,
   onDelete,
 }: MessageItemProps) {
+  const { cleanContent } = extractServerTimestamp(msg.content);
+
   return (
     <div
       className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
@@ -515,9 +534,9 @@ const MessageItem = memo(function MessageItem({
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
           ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent}</ReactMarkdown></div>
           ) : (
-            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{msg.content}</p>
+            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}
           {!compact && (
             <p
@@ -528,7 +547,7 @@ const MessageItem = memo(function MessageItem({
         </div>
         <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
-            onClick={() => onCopy(msg.id, msg.content)}
+            onClick={() => onCopy(msg.id, cleanContent)}
             aria-label={t('agent.copy_message')}
             className="p-1 rounded-lg"
             style={{ color: 'var(--pc-text-muted)' }}
