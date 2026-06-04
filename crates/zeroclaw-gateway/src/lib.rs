@@ -17,6 +17,7 @@ pub mod api;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
+pub mod api_mcp;
 pub mod api_pairing;
 pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
@@ -57,7 +58,7 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -433,6 +434,10 @@ pub struct AppState {
     pub observer: Arc<dyn zeroclaw_runtime::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Live MCP registry from gateway startup, retained so the dashboard's
+    /// `/api/mcp/status` endpoint can report per-server connection state and
+    /// discovered tools. `None` when MCP is disabled or failed to initialize.
+    pub mcp_registry: Option<Arc<tools::McpRegistry>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -821,6 +826,9 @@ pub async fn run_gateway(
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
     // Without this, the `/api/tools` endpoint misses MCP tools.
+    // Retained for the dashboard's `/api/mcp/status` endpoint so it can report
+    // per-server connection state and discovered tools without re-probing.
+    let mut mcp_registry_for_state: Option<Arc<tools::McpRegistry>> = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -833,6 +841,7 @@ pub async fn run_gateway(
         match tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
+                mcp_registry_for_state = Some(std::sync::Arc::clone(&registry));
                 if config.mcp.deferred_loading {
                     let deferred_set =
                         tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
@@ -1398,6 +1407,7 @@ pub async fn run_gateway(
         gmail_push: gmail_push_channel,
         observer: state_observer,
         tools_registry,
+        mcp_registry: mcp_registry_for_state,
         cost_tracker,
         event_tx,
         event_buffer,
@@ -1572,6 +1582,9 @@ pub async fn run_gateway(
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/mcp/status", get(api_mcp::handle_mcp_status))
+        .route("/api/mcp/servers", put(api_mcp::handle_mcp_servers_put))
+        .route("/api/mcp/test", post(api_mcp::handle_mcp_test))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
         .route(
@@ -3751,6 +3764,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -3830,6 +3844,7 @@ mod tests {
             gmail_push: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4392,6 +4407,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4484,6 +4500,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4588,6 +4605,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4664,6 +4682,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4745,6 +4764,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4833,6 +4853,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -4918,6 +4939,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
@@ -5055,6 +5077,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            mcp_registry: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),

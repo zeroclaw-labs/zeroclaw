@@ -99,13 +99,6 @@ export interface CronRun {
   duration_ms: number | null;
 }
 
-export interface Integration {
-  name: string;
-  description: string;
-  category: string;
-  status: "Available" | "Active";
-}
-
 export interface DiagResult {
   severity: "ok" | "warn" | "error";
   category: string;

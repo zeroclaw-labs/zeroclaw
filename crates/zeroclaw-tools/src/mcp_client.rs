@@ -230,10 +230,31 @@ impl McpServer {
 // ── McpRegistry ───────────────────────────────────────────────────────────
 
 /// Registry of all connected MCP servers, with a flat tool index.
+/// Connection outcome for one configured MCP server.
+///
+/// Captured for every server in `mcp.servers`, including those that failed to
+/// connect — so the dashboard can show per-server status and discovered tools
+/// without re-probing. `connect_all` is non-fatal, so a failed server is
+/// recorded here with `connected = false` and the error message rather than
+/// being silently dropped.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub connected: bool,
+    pub tool_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Tools discovered on this server (empty when the connection failed).
+    pub tools: Vec<McpToolDef>,
+}
+
 pub struct McpRegistry {
     servers: Vec<McpServer>,
     /// prefixed_name → (server_index, original_tool_name)
     tool_index: HashMap<String, (usize, String)>,
+    /// Per-server connection outcome, one entry per configured server
+    /// (preserves the order of `mcp.servers`, including failed connections).
+    statuses: Vec<McpServerStatus>,
 }
 
 impl McpRegistry {
@@ -241,6 +262,7 @@ impl McpRegistry {
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
+        let mut statuses = Vec::with_capacity(configs.len());
 
         for config in configs {
             match McpServer::connect(config.clone()).await {
@@ -253,6 +275,13 @@ impl McpRegistry {
                         let prefixed = format!("{}__{}", config.name, tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
+                    statuses.push(McpServerStatus {
+                        name: config.name.clone(),
+                        connected: true,
+                        tool_count: tools.len(),
+                        error: None,
+                        tools,
+                    });
                     servers.push(server);
                 }
                 // Non-fatal — log and continue with remaining servers
@@ -263,6 +292,13 @@ impl McpRegistry {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                         &format!("Failed to connect to MCP server `{}`: {:#}", config.name, e)
                     );
+                    statuses.push(McpServerStatus {
+                        name: config.name.clone(),
+                        connected: false,
+                        tool_count: 0,
+                        error: Some(format!("{e:#}")),
+                        tools: Vec::new(),
+                    });
                 }
             }
         }
@@ -270,7 +306,15 @@ impl McpRegistry {
         Ok(Self {
             servers,
             tool_index,
+            statuses,
         })
+    }
+
+    /// Per-server connection outcomes, one entry per configured server
+    /// (including those that failed to connect). Used by the dashboard's
+    /// MCP status endpoint.
+    pub fn statuses(&self) -> &[McpServerStatus] {
+        &self.statuses
     }
 
     /// All prefixed tool names across all connected servers.
@@ -373,6 +417,14 @@ mod tests {
             .expect("connect_all should not fail");
         assert!(registry.is_empty());
         assert_eq!(registry.tool_count(), 0);
+        // A failed server is still recorded in statuses (not silently dropped),
+        // so the dashboard can surface the connection error.
+        let statuses = registry.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].name, "bad");
+        assert!(!statuses[0].connected);
+        assert_eq!(statuses[0].tool_count, 0);
+        assert!(statuses[0].error.is_some());
     }
 
     #[test]
@@ -447,5 +499,6 @@ mod tests {
         assert_eq!(registry.server_count(), 0);
         assert_eq!(registry.tool_count(), 0);
         assert!(registry.is_empty());
+        assert!(registry.statuses().is_empty());
     }
 }

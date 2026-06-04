@@ -3,7 +3,6 @@ import type {
   ToolSpec,
   CronJob,
   CronRun,
-  Integration,
   DiagResult,
   MemoryEntry,
   CostSummary,
@@ -356,6 +355,146 @@ export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
     method: "PATCH",
     body: JSON.stringify(ops),
   });
+}
+
+// ── MCP (Model Context Protocol) live status + connectivity test ─────────────
+//
+// Server CRUD reuses the generic config API (listProps('mcp') /
+// patchConfig('mcp.servers' …) / createMapKey). These two endpoints add the
+// *live* layer the config API can't provide: connection state, discovered
+// tools, and an on-demand probe. Backed by `crates/zeroclaw-gateway/src/api_mcp.rs`.
+
+/** Transport discriminator, matching the TOML `serde(rename_all = "lowercase")`. */
+export type McpTransport = "stdio" | "http" | "sse";
+
+/** A single MCP tool as surfaced by the status/test endpoints (name + description;
+ *  the full input schema is available via `/api/tools`). */
+export interface McpToolSummary {
+  name: string;
+  description?: string | null;
+}
+
+/** Per-server live status merged from config + the registry built at startup.
+ *  Carries the full editable config (with `env`/`headers` values masked) so the
+ *  dashboard can render and edit a server from a single fetch. */
+export interface McpServerStatus {
+  name: string;
+  transport: McpTransport;
+  url?: string | null;
+  command: string;
+  args: string[];
+  tool_timeout_secs?: number | null;
+  /** Configured env vars with values masked to `***MASKED***`. */
+  env: Record<string, string>;
+  /** Configured headers with values masked to `***MASKED***`. */
+  headers: Record<string, string>;
+  /** True when this server was connected at the last gateway startup/reload. */
+  connected: boolean;
+  tool_count: number;
+  error?: string | null;
+  tools: McpToolSummary[];
+}
+
+export interface McpStatusResponse {
+  enabled: boolean;
+  deferred_loading: boolean;
+  /** True once the registry was built at startup (running config == saved). */
+  registry_initialized: boolean;
+  servers: McpServerStatus[];
+}
+
+export interface McpTestResult {
+  ok: boolean;
+  tool_count?: number;
+  tools?: McpToolSummary[];
+  error?: string;
+}
+
+/** A single MCP server config as stored under `mcp.servers[]`. Secret fields
+ *  (`env`, `headers`) come back masked from the config API and must only be
+ *  re-sent when actually changed. */
+export interface McpServerConfig {
+  name: string;
+  transport: McpTransport;
+  url?: string | null;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  headers: Record<string, string>;
+  tool_timeout_secs?: number | null;
+}
+
+/** GET /api/mcp/status — live connection state + discovered tools per server. */
+export function getMcpStatus(): Promise<McpStatusResponse> {
+  return apiFetch<McpStatusResponse>("/api/mcp/status");
+}
+
+/** POST /api/mcp/test — probe a single server on demand without saving. Masked
+ *  secrets are merged back from the in-memory config server-side (by name). */
+export function testMcpServer(server: McpServerConfig): Promise<McpTestResult> {
+  return apiFetch<McpTestResult>("/api/mcp/test", {
+    method: "POST",
+    body: JSON.stringify(server),
+  });
+}
+
+/** PUT /api/mcp/servers — replace the whole `mcp.servers` list. This is the only
+ *  way to configure server fields (the config prop API can't edit list-element
+ *  fields). Untouched masked secrets are restored server-side by name. */
+export function putMcpServers(servers: McpServerConfig[]): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>("/api/mcp/servers", {
+    method: "PUT",
+    body: JSON.stringify(servers),
+  });
+}
+
+// ── Plugins (WASM/Extism) — read-only listing ────────────────────────────────
+//
+// `GET /api/plugins` is only registered when the gateway is built with the
+// `plugins-wasm` feature (off in the default build). `getPlugins()` returns
+// `null` on 404 so callers can hide the Plugins tab when the backend lacks it.
+
+export type PluginCapability = "tool" | "channel" | "memory" | "observer" | "skill";
+
+export interface PluginInfo {
+  name: string;
+  version: string;
+  description?: string | null;
+  capabilities: PluginCapability[];
+  /** True when the plugin's WASM (or skills/) is present and discoverable. */
+  loaded: boolean;
+}
+
+export interface PluginsResponse {
+  /** Whether `[plugins].enabled` is set in config. */
+  plugins_enabled: boolean;
+  plugins_dir: string;
+  plugins: PluginInfo[];
+}
+
+/** GET /api/plugins — list discovered plugins. Returns `null` when the gateway
+ *  was built without the `plugins-wasm` feature, so the dashboard can hide the
+ *  Plugins tab entirely. The route is simply absent in that build, and the
+ *  gateway's SPA catch-all answers unknown `/api/*` paths with `200 text/html`
+ *  (not a 404) — so we detect "unsupported" by a non-JSON content type rather
+ *  than by status code. Real errors (auth, network) still propagate. */
+export async function getPlugins(): Promise<PluginsResponse | null> {
+  const token = getToken();
+  const headers = new Headers();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${apiOrigin}${basePath}/api/plugins`, { headers });
+
+  if (response.status === 401) {
+    clearToken();
+    window.dispatchEvent(new Event("zeroclaw-unauthorized"));
+    throw new UnauthorizedError();
+  }
+  // Route absent (feature off) → SPA fallback serves HTML. Treat as unsupported.
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!response.ok || !contentType.includes("application/json")) {
+    return null;
+  }
+  return (await response.json()) as PluginsResponse;
 }
 
 export function initSection(
@@ -979,14 +1118,15 @@ export function createMapKey(
 // ── Curated section catalog (provider + model picker source of truth) ────────
 
 export interface CatalogProvider {
+  /** Canonical family name (e.g. `anthropic`, `openai`, `ollama`). */
   name: string;
   display_name: string;
+  /** True for self-hosted/local providers (Ollama, vLLM, LM Studio, …). */
   local: boolean;
-  aliases: string[];
 }
 
 export interface CatalogResponse {
-  providers: CatalogProvider[];
+  model_providers: CatalogProvider[];
 }
 
 export function getCatalog(): Promise<CatalogResponse> {
@@ -1500,19 +1640,6 @@ export function patchCronSettings(
   return apiFetch<CronSettings & { status: string }>("/api/cron/settings", {
     method: "PATCH",
     body: JSON.stringify(patch),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Integrations
-// ---------------------------------------------------------------------------
-
-export function getIntegrations(): Promise<Integration[]> {
-  return apiFetch<Integration[] | { integrations: Integration[] }>(
-    "/api/integrations",
-  ).then((data) => {
-    const result = unwrapField(data, "integrations");
-    return Array.isArray(result) ? result : [];
   });
 }
 

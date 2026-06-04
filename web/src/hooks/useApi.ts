@@ -3,7 +3,6 @@ import {
   getStatus,
   getTools,
   getCronJobs,
-  getIntegrations,
   getMemory,
   getCliTools,
   getHealth,
@@ -13,7 +12,6 @@ import type {
   StatusResponse,
   ToolSpec,
   CronJob,
-  Integration,
   MemoryEntry,
   CliTool,
   HealthSnapshot,
@@ -94,11 +92,6 @@ export function useTools(): UseApiResult<ToolSpec[]> {
 /** Fetch cron jobs from /api/cron. */
 export function useCronJobs(): UseApiResult<CronJob[]> {
   return useApiCall(getCronJobs);
-}
-
-/** Fetch integrations from /api/integrations. */
-export function useIntegrations(): UseApiResult<Integration[]> {
-  return useApiCall(getIntegrations);
 }
 
 /** Fetch memory entries, optionally filtered by query and category. */

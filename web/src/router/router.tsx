@@ -10,10 +10,13 @@ import {
   Cron,
   Dashboard,
   Doctor,
-  Integrations,
   Logs,
+  Mcp,
   Pairing,
+  Plugins,
+  Providers,
   Quickstart,
+  Skills,
   Tools,
 } from './lazyPages';
 
@@ -39,7 +42,12 @@ export const Router = () => (
         <Route path="/agent/:alias/workspace" element={<AgentWorkspaceExplorer />} />
         <Route path="/tools" element={<Tools />} />
         <Route path="/cron" element={<Cron />} />
-        <Route path="/integrations" element={<Integrations />} />
+        <Route path="/providers" element={<Providers />} />
+        {/* Back-compat: the tab was briefly shipped as /models. */}
+        <Route path="/models" element={<Navigate to="/providers" replace />} />
+        <Route path="/mcp" element={<Mcp />} />
+        <Route path="/skills" element={<Skills />} />
+        <Route path="/plugins" element={<Plugins />} />
         <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />
         <Route path="/config/:section" element={<Config />} />

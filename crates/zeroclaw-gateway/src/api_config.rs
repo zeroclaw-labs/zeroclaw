@@ -313,7 +313,7 @@ fn is_false(b: &bool) -> bool {
 // ── Error helpers ───────────────────────────────────────────────────
 
 /// Convert a `ConfigApiError` into an axum `Response` with the correct status.
-fn error_response(err: ConfigApiError) -> Response {
+pub(crate) fn error_response(err: ConfigApiError) -> Response {
     let status =
         StatusCode::from_u16(err.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, axum::Json(err)).into_response()
@@ -403,7 +403,7 @@ fn scoped_validate(
     Ok(Vec::new())
 }
 
-async fn persist_and_swap(
+pub(crate) async fn persist_and_swap(
     state: &AppState,
     mut new_config: zeroclaw_config::schema::Config,
 ) -> Result<(), ConfigApiError> {

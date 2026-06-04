@@ -2,23 +2,28 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
+  Boxes,
   Clock,
+  Cpu,
   LayoutDashboard,
   MessageSquare,
   Monitor,
-  Puzzle,
+  Plug,
   Settings,
   Stethoscope,
+  Wand2,
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import { useEffect, useState } from 'react';
-import { getStatus } from '@/lib/api';
+import { getStatus, getPlugins } from '@/lib/api';
 
 interface NavItem {
   to: string;
   icon: typeof LayoutDashboard;
   labelKey: string;
+  /** Only shown when the gateway was built with the `plugins-wasm` feature. */
+  requiresPlugins?: boolean;
 }
 
 const navItems: NavItem[] = [
@@ -26,7 +31,10 @@ const navItems: NavItem[] = [
   { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
+  { to: '/providers', icon: Cpu, labelKey: 'nav.providers' },
+  { to: '/mcp', icon: Plug, labelKey: 'nav.mcp' },
+  { to: '/skills', icon: Wand2, labelKey: 'nav.skills' },
+  { to: '/plugins', icon: Boxes, labelKey: 'nav.plugins', requiresPlugins: true },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
@@ -95,6 +103,19 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
+  // Probe whether the gateway exposes /api/plugins (built with `plugins-wasm`).
+  // `getPlugins()` resolves to null on 404 → hide the Plugins nav item.
+  const [pluginsSupported, setPluginsSupported] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getPlugins()
+      .then((r) => { if (!cancelled) setPluginsSupported(r !== null); })
+      .catch(() => { /* keep hidden on error */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const items = navItems.filter((i) => !i.requiresPlugins || pluginsSupported);
+
   return (
     <>
       {/* Backdrop — mobile only */}
@@ -117,7 +138,7 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
       >
         <SidebarLogo collapsed={collapsed} />
         <nav className="flex-1 overflow-y-auto py-4 px-2 space-y-1">
-          {navItems.map((item) => (
+          {items.map((item) => (
             <SidebarNavItem
               key={item.to}
               item={item}
@@ -141,7 +162,7 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
       >
         <SidebarLogo collapsed={false} />
         <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {navItems.map((item) => (
+          {items.map((item) => (
             <SidebarNavItem
               key={item.to}
               item={item}
