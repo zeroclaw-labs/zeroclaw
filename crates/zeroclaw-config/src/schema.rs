@@ -11164,6 +11164,7 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// Port to listen on for incoming webhooks.
     #[tab(Advanced)]
+    #[serde(default = "default_webhook_channel_port")]
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
     #[tab(Advanced)]
@@ -11207,6 +11208,10 @@ pub struct WebhookConfig {
     /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_max_delay_ms: Option<u64>,
+}
+
+fn default_webhook_channel_port() -> u16 {
+    8090
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -18632,6 +18637,12 @@ bot_token = "xoxb-tok"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    #[test]
+    async fn webhook_config_port_defaults_when_omitted() {
+        let p: WebhookConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.port, 8090);
     }
 
     #[test]
