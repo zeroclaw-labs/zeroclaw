@@ -6,6 +6,7 @@ use std::fs;
 use std::sync::Arc;
 use daemonclaw_api::tool::{Tool, ToolResult};
 use daemonclaw_config::policy::SecurityPolicy;
+use daemonclaw_config::provider_store::provider_store;
 use daemonclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
@@ -226,7 +227,8 @@ impl ModelRoutingConfigTool {
     }
 
     fn snapshot(cfg: &Config) -> Value {
-        let mut routes = cfg.providers.model_routes.clone();
+        let store = provider_store();
+        let mut routes = store.model_routes();
         routes.sort_by(|a, b| a.hint.cmp(&b.hint));
 
         let mut rules = cfg.query_classification.rules.clone();
@@ -257,11 +259,14 @@ impl ModelRoutingConfigTool {
             })
             .collect();
 
+        let fallback_name = store.fallback_name();
+        let fallback_provider = store.fallback_provider();
+
         json!({
             "default": {
-                "provider": cfg.providers.fallback,
-                "model": cfg.providers.fallback_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.providers.fallback_provider().and_then(|e| e.temperature).unwrap_or(0.7),
+                "provider": fallback_name,
+                "model": fallback_provider.as_ref().and_then(|e| e.model.as_deref()),
+                "temperature": fallback_provider.as_ref().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
@@ -310,9 +315,8 @@ impl ModelRoutingConfigTool {
 
     fn handle_list_hints(&self) -> anyhow::Result<ToolResult> {
         let cfg = self.load_config_without_env()?;
-        let mut route_hints: Vec<String> = cfg
-            .providers
-            .model_routes
+        let mut route_hints: Vec<String> = provider_store()
+            .model_routes()
             .iter()
             .map(|r| r.hint.clone())
             .collect();
@@ -370,34 +374,31 @@ impl ModelRoutingConfigTool {
             anyhow::bail!("set_default requires at least one of: provider, model, temperature");
         }
 
-        let mut cfg = self.load_config_without_env()?;
+        let store = provider_store();
 
-        // Capture previous values for rollback on probe failure.
-        let previous_provider = cfg.providers.fallback.clone();
-        let previous_fallback_provider = cfg
-            .providers
-            .fallback
+        let previous_provider = store.fallback_name();
+        let previous_fallback_provider = previous_provider
             .as_deref()
-            .and_then(|name| cfg.providers.models.get(name))
-            .cloned();
+            .and_then(|name| store.get_provider(name));
 
         let fallback_name = match &provider_update {
             MaybeSet::Set(provider) => {
-                cfg.providers.fallback = Some(provider.clone());
+                store.set_fallback_name(provider)?;
                 provider.clone()
             }
             MaybeSet::Null => {
-                cfg.providers.fallback = None;
-                "default".to_string()
-            }
-            MaybeSet::Unset => cfg.providers.fallback.clone().unwrap_or_else(|| {
                 let name = "default".to_string();
-                cfg.providers.fallback = Some(name.clone());
+                store.set_fallback_name(&name)?;
+                name
+            }
+            MaybeSet::Unset => store.fallback_name().unwrap_or_else(|| {
+                let name = "default".to_string();
+                let _ = store.set_fallback_name(&name);
                 name
             }),
         };
 
-        let entry = cfg.providers.models.entry(fallback_name).or_default();
+        let mut entry = store.get_provider(&fallback_name).unwrap_or_default();
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -418,15 +419,10 @@ impl ModelRoutingConfigTool {
             MaybeSet::Unset => {}
         }
 
-        cfg.save().await?;
+        store.upsert_provider(&fallback_name, &entry)?;
 
-        // Probe the new model with a minimal API call to catch invalid model IDs
-        // before the channel hot-reload picks up the change.
-        let current_provider = cfg.providers.fallback.clone();
-        let current_model = cfg
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.model.clone());
+        let current_provider = store.fallback_name();
+        let current_model = store.fallback_provider().and_then(|e| e.model.clone());
         if let (Some(provider_name), Some(model_name)) = (current_provider, current_model)
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
@@ -437,14 +433,12 @@ impl ModelRoutingConfigTool {
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback to previous config.
-                cfg.providers.fallback = previous_provider;
-                if let Some(prev_entry) = previous_fallback_provider
-                    && let Some(fb) = cfg.providers.fallback.as_deref()
-                {
-                    cfg.providers.models.insert(fb.to_string(), prev_entry);
+                if let Some(ref prev_name) = previous_provider {
+                    store.set_fallback_name(prev_name)?;
+                    if let Some(ref prev_entry) = previous_fallback_provider {
+                        store.upsert_provider(prev_name, prev_entry)?;
+                    }
                 }
-                cfg.save().await?;
 
                 return Ok(ToolResult {
                     success: false,
@@ -454,14 +448,13 @@ impl ModelRoutingConfigTool {
                     error: None,
                 });
             }
-            // Retryable errors (e.g. transient network issues) — keep the
-            // new config and let the resilient wrapper handle retries.
             tracing::warn!(
                 model = %model_name,
                 "Model probe returned retryable error (keeping new config): {probe_err}"
             );
         }
 
+        let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
@@ -477,13 +470,9 @@ impl ModelRoutingConfigTool {
     /// (the probe would fail with an auth error unrelated to model validity).
     /// Provider construction failures are also treated as non-fatal.
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
-        // Use the runtime config's API key (which includes env-sourced keys),
-        // not the on-disk config (which may have no key at all).
-        let api_key = self
-            .config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref());
+        let store = provider_store();
+        let fallback = store.fallback_provider();
+        let api_key = fallback.as_ref().and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
         }
@@ -491,10 +480,7 @@ impl ModelRoutingConfigTool {
         let provider = match daemonclaw_providers::create_provider_with_url(
             provider_name,
             api_key,
-            self.config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.as_deref()),
+            fallback.as_ref().and_then(|e| e.base_url.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),
@@ -535,14 +521,10 @@ impl ModelRoutingConfigTool {
             || !matches!(max_length_update, MaybeSet::Unset)
             || !matches!(priority_update, MaybeSet::Unset);
 
-        let mut cfg = self.load_config_without_env()?;
+        let store = provider_store();
 
-        let existing_route = cfg
-            .providers
-            .model_routes
-            .iter()
-            .find(|route| route.hint == hint)
-            .cloned();
+        let existing_routes = store.model_routes();
+        let existing_route = existing_routes.iter().find(|route| route.hint == hint).cloned();
 
         let mut next_route = existing_route.unwrap_or(ModelRouteConfig {
             hint: hint.clone(),
@@ -561,11 +543,15 @@ impl ModelRoutingConfigTool {
             MaybeSet::Unset => {}
         }
 
-        cfg.providers
-            .model_routes
-            .retain(|route| route.hint != hint);
-        cfg.providers.model_routes.push(next_route);
-        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
+        let mut new_routes: Vec<ModelRouteConfig> = existing_routes
+            .into_iter()
+            .filter(|route| route.hint != hint)
+            .collect();
+        new_routes.push(next_route);
+        Self::normalize_and_sort_routes(&mut new_routes);
+        store.set_model_routes(&new_routes)?;
+
+        let mut cfg = self.load_config_without_env()?;
 
         if should_touch_rule {
             if matches!(classification_enabled, Some(false)) {
@@ -650,13 +636,10 @@ impl ModelRoutingConfigTool {
             .and_then(Value::as_bool)
             .unwrap_or(true);
 
-        let mut cfg = self.load_config_without_env()?;
+        let store = provider_store();
+        let routes_removed = store.remove_model_route(&hint)?;
 
-        let before_routes = cfg.providers.model_routes.len();
-        cfg.providers
-            .model_routes
-            .retain(|route| route.hint != hint);
-        let routes_removed = before_routes.saturating_sub(cfg.providers.model_routes.len());
+        let mut cfg = self.load_config_without_env()?;
 
         let mut rules_removed = 0usize;
         if remove_classification {
@@ -671,7 +654,6 @@ impl ModelRoutingConfigTool {
             anyhow::bail!("No scenario found for hint '{hint}'");
         }
 
-        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
         Self::normalize_and_sort_rules(&mut cfg.query_classification.rules);
         cfg.query_classification.enabled = !cfg.query_classification.rules.is_empty();
 

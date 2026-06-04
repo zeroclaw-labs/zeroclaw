@@ -400,14 +400,11 @@ pub fn all_tools_with_runtime(
 
     // LLM task tool — always registered when a provider is configured
     {
-        let llm_task_provider = root_config
-            .providers
-            .fallback
-            .clone()
+        use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name};
+        let fp_tools = oni_fallback_provider();
+        let llm_task_provider = oni_fallback_name()
             .unwrap_or_else(|| "openrouter".to_string());
-        let llm_task_model = root_config
-            .providers
-            .fallback_provider()
+        let llm_task_model = fp_tools.as_ref()
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
@@ -416,14 +413,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            root_config
-                .providers
-                .fallback_provider()
+            fp_tools.as_ref()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7),
-            root_config
-                .providers
-                .fallback_provider()
+            fp_tools.as_ref()
                 .and_then(|e| e.api_key.clone()),
             llm_task_runtime_options,
         )));
@@ -451,13 +444,11 @@ pub fn all_tools_with_runtime(
 
         let mut manage_tool = SkillManageTool::new(skill_store);
         if root_config.skills.curator.enabled {
-            if let Some(fp) = root_config.providers.fallback_provider() {
+            let fp_curator = daemonclaw_config::provider_store::oni_fallback_provider();
+            if let Some(ref fp) = fp_curator {
                 if let Some(ref api_key) = fp.api_key {
                     let llm_config = crate::hooks::builtin::background_llm::BackgroundLlmConfig {
-                        provider_name: root_config
-                            .providers
-                            .fallback
-                            .clone()
+                        provider_name: daemonclaw_config::provider_store::oni_fallback_name()
                             .unwrap_or_else(|| "openrouter".to_string()),
                         api_key: Some(api_key.clone()),
                         model: fp
@@ -909,7 +900,15 @@ pub fn all_tools_with_runtime(
             .with_delegate_config(root_config.delegate.clone())
             .with_workspace_dir(workspace_dir.to_path_buf())
             .with_memory(memory.clone())
-            .with_providers_config(Arc::new(root_config.providers.clone()));
+            .with_providers_config(Arc::new({
+                use daemonclaw_config::provider_store::{oni_fallback_name, oni_providers, oni_model_routes, oni_embedding_routes};
+                daemonclaw_config::providers::ProvidersConfig {
+                    fallback: oni_fallback_name(),
+                    models: oni_providers(),
+                    model_routes: oni_model_routes(),
+                    embedding_routes: oni_embedding_routes(),
+                }
+            }));
 
             // Wire pool store and session backend when pool is enabled
             if root_config.pool.enabled {

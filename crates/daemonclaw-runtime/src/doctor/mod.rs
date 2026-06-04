@@ -434,8 +434,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Provider validity
-    let fallback_provider = config.providers.fallback.as_deref();
-    let fallback_provider_doc = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{oni_fallback_name, oni_fallback_provider, oni_model_routes, oni_embedding_routes};
+    let fallback_name_doc = oni_fallback_name();
+    let fallback_provider = fallback_name_doc.as_deref();
+    let fallback_provider_doc = oni_fallback_provider();
     if let Some(provider) = fallback_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
@@ -455,6 +457,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     // API key presence
     if fallback_provider != Some("ollama") {
         if fallback_provider_doc
+            .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .is_some()
         {
@@ -468,7 +471,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model configured
-    let default_model = fallback_provider_doc.and_then(|e| e.model.as_deref());
+    let default_model = fallback_provider_doc.as_ref().and_then(|e| e.model.as_deref());
     if default_model.is_some() {
         items.push(DiagItem::ok(
             cat,
@@ -480,6 +483,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Temperature range
     let default_temperature = fallback_provider_doc
+        .as_ref()
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     if (0.0..=2.0).contains(&default_temperature) {
@@ -519,7 +523,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model routes validation
-    for route in &config.providers.model_routes {
+    let model_routes_doc = oni_model_routes();
+    for route in &model_routes_doc {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
@@ -541,7 +546,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Embedding routes validation
-    for route in &config.providers.embedding_routes {
+    let embedding_routes_doc = oni_embedding_routes();
+    for route in &embedding_routes_doc {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));
         }
@@ -577,9 +583,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         .strip_prefix("hint:")
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && !config
-            .providers
-            .embedding_routes
+        && !embedding_routes_doc
             .iter()
             .any(|route| route.hint.trim() == hint)
     {

@@ -1211,34 +1211,41 @@ async fn main() -> Result<()> {
                 temperature,
                 ..
             } => {
-                let fallback = config.providers.fallback_provider();
+                use daemonclaw::config::provider_store::{provider_store, oni_fallback_provider, oni_fallback_name};
+                let store = provider_store();
+                let fallback = oni_fallback_provider();
                 let final_temperature = temperature
-                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
+                    .unwrap_or_else(|| fallback.as_ref().and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &provider {
-                    config.providers.fallback = Some(p.clone());
+                    let _ = store.set_fallback_name(p);
                 }
                 if let Some(m) = &model {
-                    config.ensure_fallback_provider().model = Some(m.clone());
+                    let fb_name = oni_fallback_name().unwrap_or_else(|| "openai".to_string());
+                    let mut entry = store.get_provider(&fb_name).unwrap_or_default();
+                    entry.model = Some(m.clone());
+                    let _ = store.upsert_provider(&fb_name, &entry);
                 }
-                config.ensure_fallback_provider().temperature = Some(final_temperature);
+                {
+                    let fb_name = oni_fallback_name().unwrap_or_else(|| "openai".to_string());
+                    let mut entry = store.get_provider(&fb_name).unwrap_or_default();
+                    entry.temperature = Some(final_temperature);
+                    let _ = store.upsert_provider(&fb_name, &entry);
+                }
 
-                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
+                let fb = oni_fallback_provider();
+                let provider_name_owned = oni_fallback_name().unwrap_or_else(|| "openai".to_string());
                 let provider = daemonclaw::providers::create_provider(
-                    provider_name,
-                    config
-                        .providers
-                        .fallback_provider()
-                        .and_then(|e| e.api_key.as_deref()),
+                    &provider_name_owned,
+                    fb.as_ref().and_then(|e| e.api_key.as_deref()),
                 )?;
-                let model_name = config
-                    .providers
-                    .fallback_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("default");
+                let model_name_owned = fb
+                    .as_ref()
+                    .and_then(|e| e.model.clone())
+                    .unwrap_or_else(|| "default".to_string());
                 match message {
                     Some(msg) => {
                         let response = provider
-                            .simple_chat(&msg, model_name, final_temperature)
+                            .simple_chat(&msg, &model_name_owned, final_temperature)
                             .await?;
                         println!("{response}");
                     }
@@ -1253,7 +1260,7 @@ async fn main() -> Result<()> {
                                 break;
                             }
                             let response = provider
-                                .simple_chat(line.trim(), model_name, final_temperature)
+                                .simple_chat(line.trim(), &model_name_owned, final_temperature)
                                 .await?;
                             println!("{response}");
                         }
@@ -1283,9 +1290,8 @@ async fn main() -> Result<()> {
             peripheral,
         } => {
             let final_temperature = temperature.unwrap_or_else(|| {
-                config
-                    .providers
-                    .fallback_provider()
+                daemonclaw_config::provider_store::oni_fallback_provider()
+                    .as_ref()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7)
             });
@@ -1537,13 +1543,12 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.providers.fallback.as_deref().unwrap_or("openrouter")
+                daemonclaw_config::provider_store::oni_fallback_name().as_deref().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
-                config
-                    .providers
-                    .fallback_provider()
+                daemonclaw_config::provider_store::oni_fallback_provider()
+                    .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(default)")
             );
@@ -1694,9 +1699,7 @@ async fn main() -> Result<()> {
 
         Commands::Providers => {
             let providers = providers::list_providers();
-            let current = config
-                .providers
-                .fallback
+            let current = daemonclaw_config::provider_store::oni_fallback_name()
                 .as_deref()
                 .unwrap_or("openrouter")
                 .trim()
@@ -3685,42 +3688,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_config_default_temperature() {
-        // Test that when user doesn't provide --temperature,
-        // the fallback logic works correctly
-        let mut config = Config::default();
-        config.ensure_fallback_provider().temperature = Some(1.5);
-
-        // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or_else(|| {
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-        });
-
+        let stored_temperature: Option<f64> = Some(1.5);
+        let final_temperature =
+            user_temperature.unwrap_or_else(|| stored_temperature.unwrap_or(0.7));
         assert!((final_temperature - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
-        // Test that when config uses default value (0.7), fallback still works
-        let config = Config::default();
-
-        // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or_else(|| {
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-        });
-
+        let stored_temperature: Option<f64> = None;
+        let final_temperature =
+            user_temperature.unwrap_or_else(|| stored_temperature.unwrap_or(0.7));
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
     }
 }

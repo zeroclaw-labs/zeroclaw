@@ -1,6 +1,5 @@
 use crate::autonomy::AutonomyLevel;
 use crate::domain_matcher::DomainMatcher;
-use crate::provider_aliases::{is_glm_alias, is_zai_alias};
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -77,11 +76,6 @@ pub struct Config {
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-
-    /// Provider configuration (`[providers]`).
-    #[serde(default)]
-    #[nested]
-    pub providers: crate::providers::ProvidersConfig,
 
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
@@ -297,11 +291,6 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub google_workspace: GoogleWorkspaceConfig,
-
-    /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
-    #[serde(default)]
-    #[nested]
-    pub proxy: ProxyConfig,
 
     /// Identity format configuration: OpenClaw or AIEOS (`[identity]`).
     #[serde(default)]
@@ -9427,7 +9416,6 @@ impl Default for Config {
             workspace_dir: daemonclaw_dir.join("workspace"),
             config_path: daemonclaw_dir.join("config.toml"),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
-            providers: crate::providers::ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
@@ -9465,7 +9453,6 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
-            proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
@@ -9805,34 +9792,6 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
-fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
-    let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
-    };
-
-    reqwest::Url::parse(raw)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
-}
-
-fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
-    let config_key_present = config_api_key
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    if config_key_present {
-        return true;
-    }
-
-    ["OLLAMA_API_KEY", "DAEMONCLAW_API_KEY", "API_KEY"]
-        .iter()
-        .any(|name| {
-            std::env::var(name)
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-        })
-}
-
 /// Parse the `DAEMONCLAW_EXTRA_HEADERS` environment variable value.
 ///
 /// Format: `Key:Value,Key2:Value2`
@@ -9861,35 +9820,23 @@ pub fn parse_extra_headers_env(raw: &str) -> Vec<(String, String)> {
     result
 }
 
-fn normalize_wire_api(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "responses" | "openai-responses" | "open-ai-responses" => Some("responses"),
-        "chat_completions"
-        | "chat-completions"
-        | "chat"
-        | "chatcompletions"
-        | "openai-chat-completions"
-        | "open-ai-chat-completions" => Some("chat_completions"),
-        _ => None,
-    }
-}
-
-fn read_codex_openai_api_key() -> Option<String> {
-    let home = UserDirs::new()?.home_dir().to_path_buf();
-    let auth_path = home.join(".codex").join("auth.json");
-    let raw = std::fs::read_to_string(auth_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-
-    parsed
-        .get("OPENAI_API_KEY")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 /// Ensure that essential bootstrap files exist in the workspace directory.
-///
+async fn strip_providers_proxy_from_toml(config_path: &Path) -> Result<()> {
+    let raw = fs::read_to_string(config_path).await?;
+    let mut doc: toml_edit::DocumentMut = raw.parse().context("Failed to parse config.toml")?;
+    let mut changed = false;
+    for key in &["providers", "proxy"] {
+        if doc.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    if changed {
+        fs::write(config_path, doc.to_string()).await?;
+        tracing::info!("Stripped [providers] and [proxy] sections from config.toml (migrated to state.db)");
+    }
+    Ok(())
+}
+
 /// When the workspace is created outside of `daemonclaw onboard` (e.g., non-tty
 /// daemon/cron sessions), these files would otherwise be missing. This function
 /// creates sensible defaults that allow the agent to operate with a basic identity.
@@ -10030,7 +9977,7 @@ impl Config {
                 toml::to_string(&table).context("Failed to re-serialize prepared table")?;
             let compat: crate::migration::V1Compat =
                 toml::from_str(&table_str).context("Failed to deserialize config file")?;
-            let mut config: Config = compat.into_config();
+            let (mut config, toml_providers, toml_proxy) = compat.into_config_with_providers();
 
             // Ensure the built-in default auto_approve entries are always
             // present.  When a user specifies `auto_approve` in their TOML
@@ -10067,6 +10014,26 @@ impl Config {
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config.decrypt_secrets(&store)?;
 
+            // Initialize the provider store and migrate TOML providers/proxy into it.
+            crate::provider_store::init_provider_store(
+                &config.workspace_dir,
+                &daemonclaw_dir,
+                config.secrets.encrypt,
+            )?;
+            match crate::provider_store::provider_store()
+                .migrate_from_config(&toml_providers, &toml_proxy)
+            {
+                Ok(true) => {
+                    if let Err(e) = strip_providers_proxy_from_toml(&config_path).await {
+                        tracing::warn!("Failed to strip providers/proxy from config.toml: {e}");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("Provider store migration from config.toml failed: {e}");
+                }
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -10092,6 +10059,13 @@ impl Config {
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
+            // Initialize the provider store for a fresh config.
+            let _ = crate::provider_store::init_provider_store(
+                &config.workspace_dir,
+                &daemonclaw_dir,
+                config.secrets.encrypt,
+            );
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -10102,138 +10076,6 @@ impl Config {
                 "Config loaded"
             );
             Ok(config)
-        }
-    }
-
-    fn lookup_model_provider_profile(
-        &self,
-        provider_name: &str,
-    ) -> Option<(String, ModelProviderConfig)> {
-        let needle = provider_name.trim();
-        if needle.is_empty() {
-            return None;
-        }
-
-        self.providers
-            .models
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(needle))
-            .map(|(name, profile)| (name.clone(), profile.clone()))
-    }
-
-    fn apply_named_model_provider_profile(&mut self) {
-        let Some(current_provider) = self.providers.fallback.clone() else {
-            return;
-        };
-
-        let Some((profile_key, profile)) = self.lookup_model_provider_profile(&current_provider)
-        else {
-            return;
-        };
-
-        let base_url = profile
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-
-        {
-            let fallback_provider = self.providers.fallback_provider();
-            let current_url = fallback_provider
-                .and_then(|e| e.base_url.as_deref())
-                .map(str::trim);
-            if current_url.is_none_or(|value| value.is_empty())
-                && let Some(base_url) = base_url.as_ref()
-                && let Some(entry) = self.providers.fallback_provider_mut()
-            {
-                entry.base_url = Some(base_url.clone());
-            }
-        }
-
-        // Propagate api_path from the profile when not already set on fallback entry.
-        {
-            let has_api_path = self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_path.as_ref())
-                .is_some();
-            if !has_api_path && let Some(ref path) = profile.api_path {
-                let trimmed = path.trim();
-                if !trimmed.is_empty()
-                    && let Some(entry) = self.providers.fallback_provider_mut()
-                {
-                    entry.api_path = Some(trimmed.to_string());
-                }
-            }
-        }
-
-        // Propagate max_tokens from the profile when not already set on fallback entry.
-        {
-            let has_max_tokens = self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.max_tokens)
-                .is_some();
-            if !has_max_tokens
-                && let Some(max_tokens) = profile.max_tokens
-                && let Some(entry) = self.providers.fallback_provider_mut()
-            {
-                entry.max_tokens = Some(max_tokens);
-            }
-        }
-
-        if profile.requires_openai_auth {
-            let needs_key = self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref())
-                .map(str::trim)
-                .is_none_or(|value| value.is_empty());
-            if needs_key {
-                let codex_key = std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .or_else(read_codex_openai_api_key);
-                if let Some(codex_key) = codex_key
-                    && let Some(entry) = self.providers.fallback_provider_mut()
-                {
-                    entry.api_key = Some(codex_key);
-                }
-            }
-        }
-
-        let normalized_wire_api = profile.wire_api.as_deref().and_then(normalize_wire_api);
-        let profile_name = profile
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        if normalized_wire_api == Some("responses") {
-            self.providers.fallback = Some("openai-codex".to_string());
-            return;
-        }
-
-        if let Some(profile_name) = profile_name
-            && !profile_name.eq_ignore_ascii_case(&profile_key)
-        {
-            self.providers.fallback = Some(profile_name.to_string());
-            return;
-        }
-
-        if let Some(base_url) = base_url {
-            let canonical_key = format!("custom:{base_url}");
-            // Mirror the profile under the canonical key so runtime
-            // `fallback_provider()` lookups resolve — without this the rename
-            // would orphan the entry still keyed under the original profile name.
-            if !self.providers.models.contains_key(&canonical_key)
-                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
-            {
-                self.providers.models.insert(canonical_key.clone(), entry);
-            }
-            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -10347,138 +10189,6 @@ impl Config {
         }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
-        }
-
-        // Model routes
-        for (i, route) in self.providers.model_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
-                anyhow::bail!("model_routes[{i}].hint must not be empty");
-            }
-            if route.provider.trim().is_empty() {
-                anyhow::bail!("model_routes[{i}].provider must not be empty");
-            }
-            if route.model.trim().is_empty() {
-                anyhow::bail!("model_routes[{i}].model must not be empty");
-            }
-        }
-
-        // Embedding routes
-        for (i, route) in self.providers.embedding_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
-                anyhow::bail!("embedding_routes[{i}].hint must not be empty");
-            }
-            if route.provider.trim().is_empty() {
-                anyhow::bail!("embedding_routes[{i}].provider must not be empty");
-            }
-            if route.model.trim().is_empty() {
-                anyhow::bail!("embedding_routes[{i}].model must not be empty");
-            }
-        }
-
-        for (profile_key, profile) in &self.providers.models {
-            let profile_name = profile_key.trim();
-            if profile_name.is_empty() {
-                anyhow::bail!("model_providers contains an empty profile name");
-            }
-
-            let has_name = profile
-                .name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
-            let has_base_url = profile
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
-
-            // Entries created by migration from top-level fields use the provider
-            // name as the map key and may not have explicit `name` or `base_url`
-            // (the provider factory resolves known names). Only reject entries that
-            // have no identifying information at all.
-            let has_api_key = profile
-                .api_key
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty());
-            let has_model = profile
-                .model
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty());
-            if !has_name && !has_base_url && !has_api_key && !has_model {
-                anyhow::bail!(
-                    "providers.models.{profile_name} must define at least one of `name`, `base_url`, `api_key`, or `model`"
-                );
-            }
-
-            if let Some(base_url) = profile.base_url.as_deref().map(str::trim)
-                && !base_url.is_empty()
-            {
-                let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                    format!("model_providers.{profile_name}.base_url is not a valid URL")
-                })?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    anyhow::bail!("model_providers.{profile_name}.base_url must use http/https");
-                }
-            }
-
-            if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
-                && !wire_api.is_empty()
-                && normalize_wire_api(wire_api).is_none()
-            {
-                anyhow::bail!(
-                    "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
-                );
-            }
-
-            if let Some(temp) = profile.temperature {
-                validate_temperature(temp).map_err(|e| {
-                    anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
-                })?;
-            }
-        }
-
-        // Providers — fallback reference check
-        if let Some(ref fallback_key) = self.providers.fallback
-            && !self.providers.models.contains_key(fallback_key)
-        {
-            tracing::warn!(
-                "providers.fallback references '{}' which does not exist in providers.models; \
-                 provider resolution will fail at runtime",
-                fallback_key
-            );
-        }
-
-        // Ollama cloud-routing safety checks
-        if self
-            .providers
-            .fallback
-            .as_deref()
-            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("ollama"))
-            && self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref())
-                .is_some_and(|model| model.trim().ends_with(":cloud"))
-        {
-            if is_local_ollama_endpoint(
-                self.providers
-                    .fallback_provider()
-                    .and_then(|e| e.base_url.as_deref()),
-            ) {
-                anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset. Set api_url to a remote Ollama endpoint (for example https://ollama.com)."
-                );
-            }
-
-            if !has_ollama_cloud_credential(
-                self.providers
-                    .fallback_provider()
-                    .and_then(|e| e.api_key.as_deref()),
-            ) {
-                anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
-                );
-            }
         }
 
         // Microsoft 365
@@ -10732,8 +10442,6 @@ impl Config {
             }
         }
 
-        // Proxy (delegate to existing validation)
-        self.proxy.validate()?;
         self.cloud_ops.validate()?;
 
         // Notion
@@ -10829,94 +10537,10 @@ impl Config {
         Ok(())
     }
 
-    /// Ensure the fallback provider entry exists, creating it if necessary.
-    pub fn ensure_fallback_provider(&mut self) -> &mut ModelProviderConfig {
-        let fallback = self
-            .providers
-            .fallback
-            .clone()
-            .unwrap_or_else(|| "default".into());
-        if self.providers.fallback.is_none() {
-            self.providers.fallback = Some(fallback.clone());
-        }
-        self.providers.models.entry(fallback).or_default()
-    }
-
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: DAEMONCLAW_API_KEY or API_KEY (generic)
-        if let Ok(key) = std::env::var("DAEMONCLAW_API_KEY").or_else(|_| std::env::var("API_KEY"))
-            && !key.is_empty()
-        {
-            self.ensure_fallback_provider().api_key = Some(key);
-        }
-        // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
-        if self.providers.fallback.as_deref().is_some_and(is_glm_alias)
-            && let Ok(key) = std::env::var("GLM_API_KEY")
-            && !key.is_empty()
-        {
-            self.ensure_fallback_provider().api_key = Some(key);
-        }
-
-        // API Key: ZAI_API_KEY overrides when provider is a Z.AI variant.
-        if self.providers.fallback.as_deref().is_some_and(is_zai_alias)
-            && let Ok(key) = std::env::var("ZAI_API_KEY")
-            && !key.is_empty()
-        {
-            self.ensure_fallback_provider().api_key = Some(key);
-        }
-
-        // Provider override precedence:
-        // 1) DAEMONCLAW_PROVIDER always wins when set.
-        // 2) DAEMONCLAW_MODEL_PROVIDER/MODEL_PROVIDER (Codex app-server style).
-        // 3) Legacy PROVIDER is honored only when config still uses default provider.
-        if let Ok(provider) = std::env::var("DAEMONCLAW_PROVIDER")
-            && !provider.is_empty()
-        {
-            self.providers.fallback = Some(provider);
-        } else if let Ok(provider) =
-            std::env::var("DAEMONCLAW_MODEL_PROVIDER").or_else(|_| std::env::var("MODEL_PROVIDER"))
-            && !provider.is_empty()
-        {
-            self.providers.fallback = Some(provider);
-        } else if let Ok(provider) = std::env::var("PROVIDER") {
-            let should_apply_legacy_provider = self
-                .providers
-                .fallback
-                .as_deref()
-                .is_none_or(|configured| configured.trim().eq_ignore_ascii_case("openrouter"));
-            if should_apply_legacy_provider && !provider.is_empty() {
-                self.providers.fallback = Some(provider);
-            }
-        }
-
-        // Model: DAEMONCLAW_MODEL or MODEL
-        if let Ok(model) = std::env::var("DAEMONCLAW_MODEL").or_else(|_| std::env::var("MODEL"))
-            && !model.is_empty()
-        {
-            self.ensure_fallback_provider().model = Some(model);
-        }
-
-        // Provider HTTP timeout: DAEMONCLAW_PROVIDER_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("DAEMONCLAW_PROVIDER_TIMEOUT_SECS")
-            && let Ok(timeout_secs) = timeout_secs.parse::<u64>()
-            && timeout_secs > 0
-        {
-            self.ensure_fallback_provider().timeout_secs = Some(timeout_secs);
-        }
-
-        // Extra provider headers: DAEMONCLAW_EXTRA_HEADERS
-        // Format: "Key:Value,Key2:Value2"
-        // Env var headers override config file headers with the same name.
-        if let Ok(raw) = std::env::var("DAEMONCLAW_EXTRA_HEADERS") {
-            let entry = self.ensure_fallback_provider();
-            for header in parse_extra_headers_env(&raw) {
-                entry.extra_headers.insert(header.0, header.1);
-            }
-        }
-
-        // Apply named provider profile remapping (Codex app-server compatibility).
-        self.apply_named_model_provider_profile();
+        // Provider/model env overrides are now handled by ProviderStore::EnvOverrides
+        // at read time. See provider_store.rs.
 
         // Workspace directory: DAEMONCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("DAEMONCLAW_WORKSPACE")
@@ -11004,28 +10628,6 @@ impl Config {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.gateway.web_dist_dir = Some(trimmed.to_string());
-            }
-        }
-
-        // Temperature: DAEMONCLAW_TEMPERATURE
-        if let Ok(temp_str) = std::env::var("DAEMONCLAW_TEMPERATURE") {
-            match temp_str.parse::<f64>() {
-                Ok(temp) if TEMPERATURE_RANGE.contains(&temp) => {
-                    self.ensure_fallback_provider().temperature = Some(temp);
-                }
-                Ok(temp) => {
-                    tracing::warn!(
-                        "Ignoring DAEMONCLAW_TEMPERATURE={temp}: \
-                         value out of range (expected {}..={})",
-                        TEMPERATURE_RANGE.start(),
-                        TEMPERATURE_RANGE.end()
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Ignoring DAEMONCLAW_TEMPERATURE={temp_str:?}: not a valid number"
-                    );
-                }
             }
         }
 
@@ -11129,74 +10731,79 @@ impl Config {
         {
             self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
         }
-        // Proxy enabled flag: DAEMONCLAW_PROXY_ENABLED
-        let explicit_proxy_enabled = std::env::var("DAEMONCLAW_PROXY_ENABLED")
-            .ok()
-            .as_deref()
-            .and_then(parse_proxy_enabled);
-        if let Some(enabled) = explicit_proxy_enabled {
-            self.proxy.enabled = enabled;
-        }
+        // Proxy env overrides and runtime cache are now handled via ProviderStore.
+        // Apply proxy from the store into the runtime cache.
+        {
+            use crate::provider_store::oni_proxy;
+            let mut proxy = oni_proxy();
 
-        // Proxy URLs: DAEMONCLAW_* wins, then generic *PROXY vars.
-        let mut proxy_url_overridden = false;
-        if let Ok(proxy_url) =
-            std::env::var("DAEMONCLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
-        {
-            self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(proxy_url) =
-            std::env::var("DAEMONCLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
-        {
-            self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(proxy_url) =
-            std::env::var("DAEMONCLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
-        {
-            self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(no_proxy) =
-            std::env::var("DAEMONCLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
-        {
-            self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
-        }
-
-        if explicit_proxy_enabled.is_none()
-            && proxy_url_overridden
-            && self.proxy.has_any_proxy_url()
-        {
-            self.proxy.enabled = true;
-        }
-
-        // Proxy scope and service selectors.
-        if let Ok(scope_raw) = std::env::var("DAEMONCLAW_PROXY_SCOPE") {
-            if let Some(scope) = parse_proxy_scope(&scope_raw) {
-                self.proxy.scope = scope;
-            } else {
-                tracing::warn!(
-                    scope = %scope_raw,
-                    "Ignoring invalid DAEMONCLAW_PROXY_SCOPE (valid: environment|daemonclaw|services)"
-                );
+            // Apply env overrides on top of the DB-stored proxy config.
+            let explicit_proxy_enabled = std::env::var("DAEMONCLAW_PROXY_ENABLED")
+                .ok()
+                .as_deref()
+                .and_then(parse_proxy_enabled);
+            if let Some(enabled) = explicit_proxy_enabled {
+                proxy.enabled = enabled;
             }
-        }
 
-        if let Ok(services_raw) = std::env::var("DAEMONCLAW_PROXY_SERVICES") {
-            self.proxy.services = normalize_service_list(vec![services_raw]);
-        }
+            let mut proxy_url_overridden = false;
+            if let Ok(proxy_url) =
+                std::env::var("DAEMONCLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
+            {
+                proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
+                proxy_url_overridden = true;
+            }
+            if let Ok(proxy_url) =
+                std::env::var("DAEMONCLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
+            {
+                proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
+                proxy_url_overridden = true;
+            }
+            if let Ok(proxy_url) =
+                std::env::var("DAEMONCLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
+            {
+                proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
+                proxy_url_overridden = true;
+            }
+            if let Ok(no_proxy) =
+                std::env::var("DAEMONCLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
+            {
+                proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
+            }
 
-        if let Err(error) = self.proxy.validate() {
-            tracing::warn!("Invalid proxy configuration ignored: {error}");
-            self.proxy.enabled = false;
-        }
+            if explicit_proxy_enabled.is_none()
+                && proxy_url_overridden
+                && proxy.has_any_proxy_url()
+            {
+                proxy.enabled = true;
+            }
 
-        if self.proxy.enabled && self.proxy.scope == ProxyScope::Environment {
-            self.proxy.apply_to_process_env();
-        }
+            if let Ok(scope_raw) = std::env::var("DAEMONCLAW_PROXY_SCOPE") {
+                if let Some(scope) = parse_proxy_scope(&scope_raw) {
+                    proxy.scope = scope;
+                } else {
+                    tracing::warn!(
+                        scope = %scope_raw,
+                        "Ignoring invalid DAEMONCLAW_PROXY_SCOPE (valid: environment|daemonclaw|services)"
+                    );
+                }
+            }
 
-        set_runtime_proxy_config(self.proxy.clone());
+            if let Ok(services_raw) = std::env::var("DAEMONCLAW_PROXY_SERVICES") {
+                proxy.services = normalize_service_list(vec![services_raw]);
+            }
+
+            if let Err(error) = proxy.validate() {
+                tracing::warn!("Invalid proxy configuration ignored: {error}");
+                proxy.enabled = false;
+            }
+
+            if proxy.enabled && proxy.scope == ProxyScope::Environment {
+                proxy.apply_to_process_env();
+            }
+
+            set_runtime_proxy_config(proxy);
+        }
 
         if self.conversational_ai.enabled {
             tracing::warn!(
@@ -11588,9 +11195,7 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        // V2: no fallback provider by default — set during onboarding.
-        assert!(c.providers.fallback.is_none());
-        assert!(c.providers.fallback_provider().is_none());
+        // Providers are now in ProviderStore, not Config.
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert_eq!(
@@ -11657,7 +11262,9 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .expect("schema should expose top-level properties");
 
-        assert!(properties.contains_key("providers"));
+        // providers and proxy are now in ProviderStore, not Config schema.
+        assert!(!properties.contains_key("providers"));
+        assert!(!properties.contains_key("proxy"));
         assert!(properties.contains_key("skills"));
         assert!(properties.contains_key("gateway"));
         assert!(properties.contains_key("channels"));
@@ -11912,25 +11519,6 @@ auto_save = true
     async fn config_toml_roundtrip() {
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
-            providers: crate::providers::ProvidersConfig {
-                fallback: Some("openrouter".into()),
-                models: {
-                    let mut m = HashMap::new();
-                    m.insert(
-                        "openrouter".into(),
-                        ModelProviderConfig {
-                            api_key: Some("sk-test-key".into()),
-                            model: Some("gpt-4o".into()),
-                            temperature: Some(0.5),
-                            timeout_secs: Some(120),
-                            ..Default::default()
-                        },
-                    );
-                    m
-                },
-                model_routes: Vec::new(),
-                embedding_routes: Vec::new(),
-            },
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             observability: ObservabilityConfig {
@@ -12052,7 +11640,6 @@ auto_save = true
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
-            proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             identity: IdentityConfig::default(),
@@ -12085,12 +11672,10 @@ auto_save = true
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
         };
-        // Provider fields are now resolved directly — no cache needed.
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
 
-        assert_eq!(parsed.providers.fallback, config.providers.fallback);
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
@@ -12116,13 +11701,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed = parse_test_config(minimal);
-        assert!(
-            parsed
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref())
-                .is_none()
-        );
+        // Provider fields (api_key, temperature, timeout) are now in ProviderStore.
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
@@ -12133,25 +11712,6 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
-        // Temperature migrated to the fallback provider entry
-        assert!(
-            (parsed
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - 0.7)
-                .abs()
-                < f64::EPSILON
-        );
-        assert_eq!(
-            parsed
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.timeout_secs)
-                .unwrap_or(120),
-            DEFAULT_DELEGATE_TIMEOUT_SECS
-        );
     }
 
     /// Regression test for #4171: the `[autonomy]` section must not be
@@ -12291,22 +11851,8 @@ auto_approve = ["weather", "file_read"]
         assert_eq!(file_read_count, 1, "file_read must not be duplicated");
     }
 
-    #[test]
-    async fn provider_timeout_secs_parses_from_toml() {
-        let raw = r#"
-default_temperature = 0.7
-provider_timeout_secs = 300
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.timeout_secs)
-                .unwrap_or(120),
-            300
-        );
-    }
+    // provider_timeout_secs_parses_from_toml removed — provider fields
+    // are now migrated into ProviderStore, not Config.
 
     #[test]
     async fn parse_extra_headers_env_basic() {
@@ -12375,40 +11921,8 @@ provider_timeout_secs = 300
         assert_eq!(headers[0], ("X-Title".to_string(), "daemonclaw".to_string()));
     }
 
-    #[test]
-    async fn extra_headers_parses_from_toml() {
-        let raw = r#"
-default_temperature = 0.7
-
-[extra_headers]
-User-Agent = "MyApp/1.0"
-X-Title = "daemonclaw"
-"#;
-        let parsed = parse_test_config(raw);
-        let headers = &parsed
-            .providers
-            .fallback_provider()
-            .expect("fallback provider")
-            .extra_headers;
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get("User-Agent").unwrap(), "MyApp/1.0");
-        assert_eq!(headers.get("X-Title").unwrap(), "daemonclaw");
-    }
-
-    #[test]
-    async fn extra_headers_defaults_to_empty() {
-        let raw = r#"
-default_temperature = 0.7
-"#;
-        let parsed = parse_test_config(raw);
-        assert!(
-            parsed
-                .providers
-                .fallback_provider()
-                .map(|e| e.extra_headers.is_empty())
-                .unwrap_or(true)
-        );
-    }
+    // extra_headers_parses_from_toml and extra_headers_defaults_to_empty removed —
+    // extra_headers are now on provider entries in ProviderStore.
 
     #[test]
     async fn storage_provider_dburl_alias_deserializes() {
@@ -12564,118 +12078,19 @@ default_temperature = 0.7
         fs::create_dir_all(&dir).await.unwrap();
 
         let config_path = dir.join("config.toml");
-        let mut providers = crate::providers::ProvidersConfig {
-            fallback: Some("openrouter".into()),
-            ..Default::default()
-        };
-        providers.models.insert(
-            "openrouter".into(),
-            ModelProviderConfig {
-                api_key: Some("sk-roundtrip".into()),
-                model: Some("test-model".into()),
-                temperature: Some(0.9),
-                timeout_secs: Some(120),
-                ..Default::default()
-            },
-        );
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
-            providers,
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
-            observability: ObservabilityConfig::default(),
-            autonomy: AutonomyConfig::default(),
-            trust: crate::scattered_types::TrustConfig::default(),
-            backup: BackupConfig::default(),
-            data_retention: DataRetentionConfig::default(),
-            cloud_ops: CloudOpsConfig::default(),
-            conversational_ai: ConversationalAiConfig::default(),
-            security: SecurityConfig::default(),
-            security_ops: SecurityOpsConfig::default(),
-            runtime: RuntimeConfig::default(),
-            reliability: ReliabilityConfig::default(),
-            scheduler: SchedulerConfig::default(),
-            skills: SkillsConfig::default(),
-            pipeline: PipelineConfig::default(),
-            query_classification: QueryClassificationConfig::default(),
-            heartbeat: HeartbeatConfig::default(),
-            cron: CronConfig::default(),
-            channels: ChannelsConfig::default(),
-            memory: MemoryConfig::default(),
-            storage: StorageConfig::default(),
-            tunnel: TunnelConfig::default(),
-            gateway: GatewayConfig::default(),
-            composio: ComposioConfig::default(),
-            microsoft365: Microsoft365Config::default(),
-            secrets: SecretsConfig::default(),
-            browser: BrowserConfig::default(),
-            browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
-            http_request: HttpRequestConfig::default(),
-            multimodal: MultimodalConfig::default(),
-            media_pipeline: MediaPipelineConfig::default(),
-            web_fetch: WebFetchConfig::default(),
-            link_enricher: LinkEnricherConfig::default(),
-            text_browser: TextBrowserConfig::default(),
-            web_search: WebSearchConfig::default(),
-            project_intel: ProjectIntelConfig::default(),
-            google_workspace: GoogleWorkspaceConfig::default(),
-            proxy: ProxyConfig::default(),
-            agent: AgentConfig::default(),
-            pacing: PacingConfig::default(),
-            identity: IdentityConfig::default(),
-            cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
-            delegate: DelegateToolConfig::default(),
-            swarms: HashMap::new(),
-            pool: PoolConfig::default(),
-            hooks: HooksConfig::default(),
-            hardware: HardwareConfig::default(),
-            transcription: TranscriptionConfig::default(),
-            tts: TtsConfig::default(),
-            mcp: McpConfig::default(),
-            nodes: NodesConfig::default(),
-            workspace: WorkspaceConfig::default(),
-            notion: NotionConfig::default(),
-            jira: JiraConfig::default(),
-            node_transport: NodeTransportConfig::default(),
-            knowledge: KnowledgeConfig::default(),
-            linkedin: LinkedInConfig::default(),
-            image_gen: ImageGenConfig::default(),
-            plugins: PluginsConfig::default(),
-            locale: None,
-            verifiable_intent: VerifiableIntentConfig::default(),
-            claude_code: ClaudeCodeConfig::default(),
-            claude_code_runner: ClaudeCodeRunnerConfig::default(),
-            codex_cli: CodexCliConfig::default(),
-            gemini_cli: GeminiCliConfig::default(),
-            opencode_cli: OpenCodeCliConfig::default(),
-            sop: SopConfig::default(),
-            shell_tool: ShellToolConfig::default(),
+            ..Default::default()
         };
 
-        // Provider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
         assert!(config_path.exists());
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let compat: crate::migration::V1Compat = toml::from_str(&contents).unwrap();
-        let loaded = compat.into_config();
-        let entry = &loaded.providers.models["openrouter"];
-        assert!(
-            entry
-                .api_key
-                .as_deref()
-                .is_some_and(crate::secrets::SecretStore::is_encrypted)
-        );
-        let store = crate::secrets::SecretStore::new(&dir, true);
-        let decrypted = store.decrypt(entry.api_key.as_deref().unwrap()).unwrap();
-        assert_eq!(decrypted, "sk-roundtrip");
-        assert_eq!(entry.model.as_deref(), Some("test-model"));
-        assert!(
-            entry
-                .temperature
-                .is_some_and(|t| (t - 0.9).abs() < f64::EPSILON)
-        );
+        let _loaded = compat.into_config();
 
         let _ = fs::remove_dir_all(&dir).await;
     }
@@ -12693,15 +12108,7 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("default".into());
-        config.providers.models.insert(
-            "default".into(),
-            ModelProviderConfig {
-                api_key: Some("root-credential".into()),
-                ..Default::default()
-            },
-        );
-        // Provider fields are now resolved directly — no cache needed.
+        // Provider credentials are now in ProviderStore, not Config.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
@@ -12728,15 +12135,6 @@ default_temperature = 0.7
             .unwrap()
             .into_config();
         let store = crate::secrets::SecretStore::new(&dir, true);
-
-        let root_encrypted = stored
-            .providers
-            .models
-            .get("default")
-            .and_then(|m| m.api_key.as_deref())
-            .unwrap();
-        assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
-        assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
 
         let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(
@@ -12815,22 +12213,15 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                model: Some("model-a".into()),
-                ..Default::default()
-            },
-        );
+        config.observability.backend = "log".into();
         config.save().await.unwrap();
         assert!(config_path.exists());
 
-        config.providers.models.get_mut("test").unwrap().model = Some("model-b".into());
+        config.observability.backend = "otlp".into();
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
-        assert!(contents.contains("model-b"));
+        assert!(contents.contains("otlp"));
 
         let mut names: Vec<String> = Vec::new();
         let mut read_dir = fs::read_dir(&dir).await.unwrap();
@@ -13869,116 +13260,8 @@ default_temperature = 0.7
         }
     }
 
-    #[test]
-    async fn env_override_api_key() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_ref())
-                .is_none()
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_API_KEY", "sk-test-env-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("sk-test-env-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_api_key_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_API_KEY") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("API_KEY", "sk-fallback-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("sk-fallback-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_PROVIDER", "anthropic") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_model_provider_alias() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_MODEL_PROVIDER", "openai-codex") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai-codex"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_MODEL_PROVIDER") };
-    }
-
-    #[test]
-    async fn toml_supports_model_provider_and_model_alias_fields() {
-        let raw = r#"
-default_temperature = 0.7
-model_provider = "sub2api"
-model = "gpt-5.3-codex"
-
-[model_providers.sub2api]
-name = "sub2api"
-base_url = "https://api.tonsof.blue/v1"
-wire_api = "responses"
-requires_openai_auth = true
-"#;
-
-        let parsed = parse_test_config(raw);
-        assert_eq!(parsed.providers.fallback.as_deref(), Some("sub2api"));
-        assert_eq!(
-            parsed
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("gpt-5.3-codex")
-        );
-        let profile = parsed
-            .providers
-            .models
-            .get("sub2api")
-            .expect("profile should exist");
-        assert_eq!(profile.wire_api.as_deref(), Some("responses"));
-        assert!(profile.requires_openai_auth);
-    }
+    // Provider/model env override tests have been removed — those overrides
+    // are now handled by ProviderStore and tested in provider_store tests.
 
     #[test]
     async fn env_override_open_skills_enabled_and_dir() {
@@ -14053,209 +13336,6 @@ requires_openai_auth = true
     }
 
     #[test]
-    async fn env_override_provider_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PROVIDER", "openai") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_provider_fallback_does_not_replace_non_default_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://proxy.example.com/v1".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PROVIDER", "openrouter") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config.providers.fallback.as_deref(),
-            Some("custom:https://proxy.example.com/v1")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_zero_claw_provider_overrides_non_default_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://proxy.example.com/v1".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_PROVIDER", "openrouter") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PROVIDER", "anthropic") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_glm_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("glm-cn".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("GLM_API_KEY", "glm-regional-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("glm-regional-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("GLM_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_zai_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("zai-cn".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZAI_API_KEY", "zai-regional-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("zai-regional-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZAI_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_model() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_MODEL", "gpt-4o") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("gpt-4o")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_MODEL") };
-    }
-
-    #[test]
-    async fn model_provider_profile_maps_to_custom_endpoint() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("sub2api".to_string());
-        config.providers.models.insert(
-            "sub2api".to_string(),
-            ModelProviderConfig {
-                name: Some("sub2api".to_string()),
-                base_url: Some("https://api.tonsof.blue/v1".to_string()),
-                wire_api: None,
-                requires_openai_auth: false,
-                azure_openai_resource: None,
-                azure_openai_deployment: None,
-                azure_openai_api_version: None,
-                api_path: None,
-                max_tokens: None,
-                ..Default::default()
-            },
-        );
-
-        config.apply_env_overrides();
-        assert_eq!(
-            config.providers.fallback.as_deref(),
-            Some("custom:https://api.tonsof.blue/v1")
-        );
-        // The original entry is still stored under its config key.
-        assert_eq!(
-            config
-                .providers
-                .models
-                .get("sub2api")
-                .and_then(|e| e.base_url.as_deref()),
-            Some("https://api.tonsof.blue/v1")
-        );
-        // The entry is also mirrored under the canonical fallback key so
-        // runtime fallback_provider() lookups resolve.
-        assert_eq!(
-            config
-                .providers
-                .models
-                .get("custom:https://api.tonsof.blue/v1")
-                .and_then(|e| e.base_url.as_deref()),
-            Some("https://api.tonsof.blue/v1")
-        );
-        assert!(config.providers.fallback_provider().is_some());
-    }
-
-    #[test]
-    async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("sub2api".to_string());
-        config.providers.models.insert(
-            "sub2api".to_string(),
-            ModelProviderConfig {
-                name: Some("sub2api".to_string()),
-                base_url: Some("https://api.tonsof.blue".to_string()),
-                wire_api: Some("responses".to_string()),
-                requires_openai_auth: true,
-                azure_openai_resource: None,
-                azure_openai_deployment: None,
-                azure_openai_api_version: None,
-                api_path: None,
-                max_tokens: None,
-                ..Default::default()
-            },
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key") };
-        config.apply_env_overrides();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
-
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai-codex"));
-        // The original entry is still stored under its config key.
-        let entry = config
-            .providers
-            .models
-            .get("sub2api")
-            .expect("sub2api entry");
-        assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
-        assert_eq!(entry.api_key.as_deref(), Some("sk-test-codex-key"));
-    }
-
-    #[test]
     async fn save_repairs_bare_config_filename_using_runtime_resolution() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -14269,37 +13349,14 @@ requires_openai_auth = true
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("DAEMONCLAW_WORKSPACE", &workspace_dir) };
 
-        let mut config = Config {
+        let config = Config {
             workspace_dir,
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("default".into());
-        config.providers.models.insert(
-            "default".into(),
-            ModelProviderConfig {
-                temperature: Some(0.5),
-                ..Default::default()
-            },
-        );
-        // Provider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
 
         assert!(resolved_config_path.exists());
-        let saved = tokio::fs::read_to_string(&resolved_config_path)
-            .await
-            .unwrap();
-        let parsed = parse_test_config(&saved);
-        assert!(
-            (parsed
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - 0.5)
-                .abs()
-                < f64::EPSILON
-        );
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("DAEMONCLAW_WORKSPACE") };
@@ -14313,101 +13370,8 @@ requires_openai_auth = true
         let _ = tokio::fs::remove_dir_all(temp_home).await;
     }
 
-    #[test]
-    async fn validate_ollama_cloud_model_requires_remote_api_url() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("ollama".to_string());
-        config.providers.models.insert(
-            "ollama".to_string(),
-            ModelProviderConfig {
-                model: Some("glm-5:cloud".to_string()),
-                base_url: None,
-                api_key: Some("ollama-key".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let error = config.validate().expect_err("expected validation to fail");
-        assert!(error.to_string().contains(
-            "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset"
-        ));
-    }
-
-    #[test]
-    async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("ollama".to_string());
-        config.providers.models.insert(
-            "ollama".to_string(),
-            ModelProviderConfig {
-                model: Some("glm-5:cloud".to_string()),
-                base_url: Some("https://ollama.com/api".to_string()),
-                api_key: None,
-                ..Default::default()
-            },
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("OLLAMA_API_KEY", "ollama-env-key") };
-        let result = config.validate();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("OLLAMA_API_KEY") };
-
-        assert!(result.is_ok(), "expected validation to pass: {result:?}");
-    }
-
-    #[test]
-    async fn validate_rejects_unknown_model_provider_wire_api() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("sub2api".to_string());
-        config.providers.models.insert(
-            "sub2api".to_string(),
-            ModelProviderConfig {
-                name: Some("sub2api".to_string()),
-                base_url: Some("https://api.tonsof.blue/v1".to_string()),
-                wire_api: Some("ws".to_string()),
-                requires_openai_auth: false,
-                azure_openai_resource: None,
-                azure_openai_deployment: None,
-                azure_openai_api_version: None,
-                api_path: None,
-                max_tokens: None,
-                ..Default::default()
-            },
-        );
-
-        let error = config.validate().expect_err("expected validation failure");
-        assert!(
-            error
-                .to_string()
-                .contains("wire_api must be one of: responses, chat_completions")
-        );
-    }
-
-    #[test]
-    async fn env_override_model_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_MODEL") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("anthropic/claude-3.5-sonnet")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("MODEL") };
-    }
+    // Provider validation tests (ollama cloud, wire_api, model fallback) have been
+    // removed — validation is now in ProviderStore.
 
     #[test]
     async fn env_override_workspace() {
@@ -14627,13 +13591,7 @@ default_model = "legacy-model"
 
         assert_eq!(config.workspace_dir, workspace_dir);
         assert_eq!(config.config_path, legacy_config_path);
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("legacy-model")
-        );
+        // Provider fields (model, api_key, etc.) are now in ProviderStore, not Config.
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("DAEMONCLAW_WORKSPACE") };
@@ -14738,13 +13696,7 @@ default_model = "legacy-model"
 
         assert_eq!(config.config_path, custom_config_dir.join("config.toml"));
         assert_eq!(config.workspace_dir, custom_config_dir.join("workspace"));
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("persisted-profile")
-        );
+        // Provider fields are now in ProviderStore.
 
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
@@ -14866,13 +13818,7 @@ default_model = "persisted-profile"
 
         assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
         assert_eq!(config.config_path, config_path);
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("persisted-profile")
-        );
+        // Provider fields are now in ProviderStore.
         assert!(logs.contains("Config loaded"), "{logs}");
         assert!(logs.contains("initialized=true"), "{logs}");
         assert!(!logs.contains("initialized=false"), "{logs}");
@@ -14887,21 +13833,6 @@ default_model = "persisted-profile"
             unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
-    async fn env_override_empty_values_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_provider = config.providers.fallback.clone();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_PROVIDER", "") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback, original_provider);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_PROVIDER") };
     }
 
     #[test]
@@ -14986,115 +13917,8 @@ default_model = "persisted-profile"
         unsafe { std::env::remove_var("DAEMONCLAW_REQUIRE_PAIRING") };
     }
 
-    #[test]
-    async fn env_override_temperature() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_TEMPERATURE", "0.5") };
-        config.apply_env_overrides();
-        assert!(
-            (config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - 0.5)
-                .abs()
-                < f64::EPSILON
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_TEMPERATURE") };
-    }
-
-    #[test]
-    async fn env_override_temperature_out_of_range_ignored() {
-        let _env_guard = env_override_lock().await;
-        // Clean up any leftover env vars from other tests
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_TEMPERATURE") };
-
-        let mut config = Config::default();
-        let original_temp = config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7);
-
-        // Temperature > 2.0 should be ignored
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("DAEMONCLAW_TEMPERATURE", "3.0") };
-        config.apply_env_overrides();
-        assert!(
-            (config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - original_temp)
-                .abs()
-                < f64::EPSILON,
-            "Temperature 3.0 should be ignored (out of range)"
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("DAEMONCLAW_TEMPERATURE") };
-    }
-
-    #[test]
-    async fn validate_rejects_out_of_range_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                name: Some("test-provider".into()),
-                temperature: Some(99.0),
-                ..Default::default()
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("temperature"),
-            "expected temperature validation error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn validate_rejects_negative_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                name: Some("test-provider".into()),
-                temperature: Some(-0.5),
-                ..Default::default()
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("temperature"),
-            "expected temperature validation error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn validate_accepts_valid_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                name: Some("test-provider".into()),
-                temperature: Some(0.7),
-                ..Default::default()
-            },
-        );
-        assert!(config.validate().is_ok());
-    }
+    // Temperature env override and validation tests have been removed —
+    // temperature validation is now in ProviderStore.
 
     #[test]
     async fn env_override_reasoning_enabled() {
@@ -15307,15 +14131,17 @@ default_model = "persisted-profile"
 
         config.apply_env_overrides();
 
-        assert!(config.proxy.enabled);
-        assert_eq!(config.proxy.scope, ProxyScope::Services);
+        // Proxy env overrides now write to the runtime proxy config, not config.proxy.
+        let proxy = runtime_proxy_config();
+        assert!(proxy.enabled);
+        assert_eq!(proxy.scope, ProxyScope::Services);
         assert_eq!(
-            config.proxy.http_proxy.as_deref(),
+            proxy.http_proxy.as_deref(),
             Some("http://127.0.0.1:7890")
         );
-        assert!(config.proxy.should_apply_to_service("provider.openai"));
-        assert!(config.proxy.should_apply_to_service("tool.http_request"));
-        assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
+        assert!(proxy.should_apply_to_service("provider.openai"));
+        assert!(proxy.should_apply_to_service("tool.http_request"));
+        assert!(!proxy.should_apply_to_service("provider.anthropic"));
 
         clear_proxy_env_test_vars();
     }
@@ -15339,7 +14165,9 @@ default_model = "persisted-profile"
 
         config.apply_env_overrides();
 
-        assert_eq!(config.proxy.scope, ProxyScope::Environment);
+        // Proxy env overrides now write to the runtime proxy config, not config.proxy.
+        let proxy = runtime_proxy_config();
+        assert_eq!(proxy.scope, ProxyScope::Environment);
         assert_eq!(
             std::env::var("HTTP_PROXY").ok().as_deref(),
             Some("http://127.0.0.1:7890")
@@ -15874,9 +14702,8 @@ group_policy = "disabled"
             "test setup requires world-readable config"
         );
 
-        if let Some(entry) = config.providers.fallback_provider_mut() {
-            entry.temperature = Some(0.6);
-        }
+        // Modify a field so save() writes the file again.
+        config.observability.backend = "otlp".into();
         config.save().await.unwrap();
 
         let hardened_mode = std::fs::metadata(&config_path)
@@ -17030,21 +15857,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn config_tree_traversal_discovers_nested_secrets() {
         let mut config = Config::default();
-        // Set api_key on fallback provider
-        if let Some(name) = config.providers.fallback.clone() {
-            if let Some(entry) = config.providers.models.get_mut(&name) {
-                entry.api_key = Some("test-key".into());
-            }
-        } else {
-            config.providers.fallback = Some("default".into());
-            config.providers.models.insert(
-                "default".into(),
-                ModelProviderConfig {
-                    api_key: Some("test-key".into()),
-                    ..Default::default()
-                },
-            );
-        }
+        // Provider secrets are now in ProviderStore, not Config.
         config.channels.matrix = Some(MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),

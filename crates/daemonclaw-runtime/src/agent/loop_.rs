@@ -2610,15 +2610,17 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
-    let fallback_provider_loop = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
+    let fallback_provider_loop = oni_fallback_provider();
+    let embedding_routes_loop = oni_embedding_routes();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_loop,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2658,7 +2660,7 @@ pub async fn run(
         &config.web_fetch,
         &config.workspace_dir,
         &std::collections::HashMap::new(),
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
         None,
@@ -2763,15 +2765,17 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
+    let fallback_name_loop = oni_fallback_name();
+    let model_routes_loop = oni_model_routes();
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.providers.fallback.as_deref())
+        .or(fallback_name_loop.as_deref())
         .unwrap_or("openrouter")
         .to_string();
 
     let mut model_name = model_override
         .as_deref()
-        .or(fallback_provider_loop.and_then(|e| e.model.as_deref()))
+        .or(fallback_provider_loop.as_ref().and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
@@ -2780,10 +2784,10 @@ pub async fn run(
 
     let mut provider: Box<dyn Provider> = daemonclaw_providers::create_routed_provider_with_options(
         &provider_name,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &config.providers.model_routes,
+        &model_routes_loop,
         &model_name,
         &provider_runtime_options,
     )?;
@@ -3046,6 +3050,7 @@ pub async fn run(
             let bg_llm_config = crate::hooks::builtin::BackgroundLlmConfig {
                 provider_name: provider_name.clone(),
                 api_key: fallback_provider_loop
+                    .as_ref()
                     .and_then(|e| e.api_key.as_deref())
                     .map(String::from),
                 model: model_name.clone(),
@@ -3262,10 +3267,10 @@ pub async fn run(
 
                         provider = daemonclaw_providers::create_routed_provider_with_options(
                             &new_provider,
-                            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                            fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+                            fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
-                            &config.providers.model_routes,
+                            &oni_model_routes(),
                             &new_model,
                             &provider_runtime_options,
                         )?;
@@ -3579,10 +3584,10 @@ pub async fn run(
 
                             provider = daemonclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
-                                fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                                fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                                fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+                                fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
-                                &config.providers.model_routes,
+                                &oni_model_routes(),
                                 &new_model,
                                 &provider_runtime_options,
                             )?;
@@ -3736,14 +3741,16 @@ pub async fn process_message(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let fallback_provider_pm = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
+    let fallback_provider_pm = oni_fallback_provider();
+    let embedding_routes_pm = oni_embedding_routes();
     let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_pm,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3773,7 +3780,7 @@ pub async fn process_message(
         &config.web_fetch,
         &config.workspace_dir,
         &std::collections::HashMap::new(),
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
         None,
@@ -3852,18 +3859,20 @@ pub async fn process_message(
         }
     }
 
-    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    let fallback_name_pm = oni_fallback_name();
+    let provider_name = fallback_name_pm.as_deref().unwrap_or("openrouter");
     let model_name = fallback_provider_pm
+        .as_ref()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let provider_runtime_options =
         daemonclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = daemonclaw_providers::create_routed_provider_with_options(
         provider_name,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_pm.and_then(|e| e.base_url.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &config.providers.model_routes,
+        &oni_model_routes(),
         &model_name,
         &provider_runtime_options,
     )?;
@@ -4008,9 +4017,8 @@ pub async fn process_message(
     );
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
-        config
-            .providers
-            .fallback_provider()
+        oni_fallback_provider()
+            .as_ref()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             + thinking_params.temperature_adjustment,

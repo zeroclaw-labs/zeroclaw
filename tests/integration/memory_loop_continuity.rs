@@ -228,7 +228,7 @@ async fn compressor_with_memory_saves_summary() {
     };
 
     // Create compressor with memory handle
-    let compressor = ContextCompressor::new(config, 100) // Tiny context window
+    let mut compressor = ContextCompressor::new(config, 100) // Tiny context window
         .with_memory(mem.clone());
 
     // Build a long history that will trigger compression

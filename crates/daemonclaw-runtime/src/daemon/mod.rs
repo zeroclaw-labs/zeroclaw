@@ -515,9 +515,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             daemonclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,
-                config
-                    .providers
-                    .fallback_provider()
+                daemonclaw_config::provider_store::oni_fallback_provider()
+                    .as_ref()
                     .and_then(|e| e.api_key.as_deref()),
             )
             .ok();
@@ -562,9 +561,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
                 (None, None) => task_prompt,
             };
-            let temp = config
-                .providers
-                .fallback_provider()
+            let temp = daemonclaw_config::provider_store::oni_fallback_provider()
+                .as_ref()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7);
             let phase2_fut = Box::pin(crate::agent::run(

@@ -433,25 +433,29 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes};
+    let fallback = oni_fallback_provider();
+    let fallback_name_gw = oni_fallback_name();
+    let embedding_routes_gw = oni_embedding_routes();
     let provider: Arc<dyn Provider> =
         Arc::from(daemonclaw_providers::create_resilient_provider_with_options(
-            config.providers.fallback.as_deref().unwrap_or("openrouter"),
-            fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.base_url.as_deref()),
+            fallback_name_gw.as_deref().unwrap_or("openrouter"),
+            fallback.as_ref().and_then(|e| e.api_key.as_deref()),
+            fallback.as_ref().and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &daemonclaw_providers::provider_runtime_options_from_config(&config),
         )?);
     let model = fallback
+        .as_ref()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
-    let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
+    let temperature = fallback.as_ref().and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_gw,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback.and_then(|e| e.api_key.as_deref()),
+        fallback.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
@@ -490,10 +494,7 @@ pub async fn run_gateway(
         &config.web_fetch,
         &config.workspace_dir,
         &std::collections::HashMap::new(),
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        fallback.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
         None,
@@ -1559,12 +1560,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .lock()
-        .providers
-        .fallback
-        .clone()
+    let provider_label = daemonclaw_config::provider_store::oni_fallback_name()
         .unwrap_or_else(|| "unknown".to_string());
     let model_label = state.model.clone();
     let started_at = Instant::now();

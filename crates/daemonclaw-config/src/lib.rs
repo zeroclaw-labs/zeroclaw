@@ -9,6 +9,7 @@ pub mod pairing;
 pub mod platform;
 pub mod policy;
 pub mod provider_aliases;
+pub mod provider_store;
 pub mod providers;
 pub mod scattered_types;
 pub mod schema;

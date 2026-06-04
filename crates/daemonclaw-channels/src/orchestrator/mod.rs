@@ -807,38 +807,28 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
     None
 }
 
-fn resolved_default_provider(config: &Config) -> String {
-    config
-        .providers
-        .fallback
-        .clone()
+fn resolved_default_provider(_config: &Config) -> String {
+    daemonclaw_config::provider_store::oni_fallback_name()
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
-fn resolved_default_model(config: &Config) -> String {
-    config
-        .providers
-        .fallback_provider()
+fn resolved_default_model(_config: &Config) -> String {
+    daemonclaw_config::provider_store::oni_fallback_provider()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
+    let fp = daemonclaw_config::provider_store::oni_fallback_provider();
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
-        temperature: config
-            .providers
-            .fallback_provider()
+        temperature: fp.as_ref()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7),
-        api_key: config
-            .providers
-            .fallback_provider()
+        api_key: fp.as_ref()
             .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .fallback_provider()
+        api_url: fp.as_ref()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
     }
@@ -908,13 +898,7 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(daemonclaw_dir) = path.parent() {
         let store =
             daemonclaw_runtime::security::SecretStore::new(daemonclaw_dir, parsed.secrets.encrypt);
-        if let Some(fallback_entry) = parsed.providers.fallback_provider_mut() {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut fallback_entry.api_key,
-                "config.providers.fallback.api_key",
-            )?;
-        }
+        // Provider API keys are now decrypted by the provider_store directly.
         // Decrypt TTS provider API keys for runtime reload
         if let Some(ref mut openai) = parsed.tts.openai {
             decrypt_optional_secret_for_runtime_reload(
@@ -5058,17 +5042,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         daemonclaw_providers::provider_runtime_options_from_config(&config);
+    let fp_start = oni_fallback_provider();
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.clone()),
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.clone()),
+            fp_start.as_ref().and_then(|e| e.api_key.clone()),
+            fp_start.as_ref().and_then(|e| e.base_url.clone()),
             config.reliability.clone(),
             provider_runtime_options.clone(),
         )
@@ -5103,21 +5082,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
+    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
+    let fallback_provider_orch = oni_fallback_provider();
+    let embedding_routes_orch = oni_embedding_routes();
     let model = resolved_default_model(&config);
-    let temperature = config
-        .providers
-        .fallback_provider()
+    let temperature = fallback_provider_orch
+        .as_ref()
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_orch,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        fallback_provider_orch.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -5148,10 +5126,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.web_fetch,
         &workspace,
         &std::collections::HashMap::new(),
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        fallback_provider_orch.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
         None,
@@ -5516,14 +5491,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
-        api_key: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.base_url.clone()),
+        api_key: fallback_provider_orch.as_ref().and_then(|e| e.api_key.clone()),
+        api_url: fallback_provider_orch.as_ref().and_then(|e| e.base_url.clone()),
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
@@ -5559,7 +5528,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         autonomy_level: config.autonomy.level,
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
-        model_routes: Arc::new(config.providers.model_routes.clone()),
+        model_routes: Arc::new(oni_model_routes()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,

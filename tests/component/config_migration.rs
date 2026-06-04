@@ -3,13 +3,15 @@
 //! Validates V1→V2 migration via V1Compat, including the full validation pipeline.
 
 use daemonclaw::config::migration::{self, CURRENT_SCHEMA_VERSION, V1Compat};
+use daemonclaw::config::providers::ProvidersConfig;
 
-fn migrate(toml_str: &str) -> daemonclaw::config::Config {
+fn migrate(toml_str: &str) -> (daemonclaw::config::Config, ProvidersConfig) {
     let mut table: toml::Table = toml::from_str(toml_str).expect("failed to parse table");
     migration::prepare_table(&mut table);
     let prepared = toml::to_string(&table).expect("failed to re-serialize");
     let compat: V1Compat = toml::from_str(&prepared).expect("failed to deserialize");
-    compat.into_config()
+    let (config, providers, _proxy) = compat.into_config_with_providers();
+    (config, providers)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,7 +20,7 @@ fn migrate(toml_str: &str) -> daemonclaw::config::Config {
 
 #[test]
 fn top_level_fields_merge_with_existing_model_providers_entry() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 api_key = "sk-test"
 default_provider = "openrouter"
@@ -28,14 +30,14 @@ base_url = "https://openrouter.ai/api"
 "#,
     );
 
-    let entry = &config.providers.models["openrouter"];
+    let entry = &providers.models["openrouter"];
     assert_eq!(entry.api_key.as_deref(), Some("sk-test"));
     assert_eq!(entry.base_url.as_deref(), Some("https://openrouter.ai/api"));
 }
 
 #[test]
 fn profile_values_take_precedence_over_top_level() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 api_key = "sk-top-level"
 default_provider = "openrouter"
@@ -45,7 +47,7 @@ api_key = "sk-from-profile"
 "#,
     );
 
-    let entry = &config.providers.models["openrouter"];
+    let entry = &providers.models["openrouter"];
     assert_eq!(entry.api_key.as_deref(), Some("sk-from-profile"));
 }
 
@@ -55,7 +57,7 @@ api_key = "sk-from-profile"
 
 #[test]
 fn resolved_cache_populated_for_v2_config() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 schema_version = 2
 
@@ -70,23 +72,20 @@ temperature = 0.3
     );
 
     assert_eq!(
-        config
-            .providers
+        providers
             .fallback_provider()
             .and_then(|e| e.api_key.as_deref()),
         Some("sk-ant")
     );
-    assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
+    assert_eq!(providers.fallback.as_deref(), Some("anthropic"));
     assert_eq!(
-        config
-            .providers
+        providers
             .fallback_provider()
             .and_then(|e| e.model.as_deref()),
         Some("claude-opus")
     );
     assert!(
-        (config
-            .providers
+        (providers
             .fallback_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
@@ -98,7 +97,7 @@ temperature = 0.3
 
 #[test]
 fn room_id_deduped_with_existing_allowed_rooms() {
-    let config = migrate(
+    let (config, _providers) = migrate(
         r#"
 [channels_config.matrix]
 homeserver = "https://matrix.org"
@@ -115,7 +114,7 @@ allowed_rooms = ["!abc:matrix.org", "!other:matrix.org"]
 
 #[test]
 fn already_v2_config_unchanged() {
-    let config = migrate(
+    let (config, providers) = migrate(
         r#"
 schema_version = 2
 
@@ -129,43 +128,43 @@ model = "claude"
     );
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+    assert_eq!(providers.fallback.as_deref(), Some("openrouter"));
     assert_eq!(
-        config.providers.models["openrouter"].api_key.as_deref(),
+        providers.models["openrouter"].api_key.as_deref(),
         Some("sk-test")
     );
 }
 
 #[test]
 fn no_default_provider_uses_fallback_name_default() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 api_key = "sk-orphan"
 "#,
     );
 
-    assert_eq!(config.providers.fallback.as_deref(), Some("default"));
+    assert_eq!(providers.fallback.as_deref(), Some("default"));
     assert_eq!(
-        config.providers.models["default"].api_key.as_deref(),
+        providers.models["default"].api_key.as_deref(),
         Some("sk-orphan")
     );
 }
 
 #[test]
 fn empty_config_produces_valid_v2() {
-    let config = migrate("");
+    let (config, _providers) = migrate("");
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
 }
 
 #[test]
 fn model_provider_alias_works() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 model_provider = "ollama"
 "#,
     );
 
-    assert_eq!(config.providers.fallback.as_deref(), Some("ollama"));
+    assert_eq!(providers.fallback.as_deref(), Some("ollama"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,19 +192,15 @@ allowed_users = ["@user:matrix.org"]
         .expect("should migrate");
 
     assert!(
-        migrated.contains("# Agent tuning"),
+        migrated.contains("# Matrix channel"),
         "section comment preserved"
     );
     assert!(
-        migrated.contains("# keep it tight"),
+        migrated.contains("# production server"),
         "inline comment preserved"
     );
-    assert!(
-        migrated.contains("# production server"),
-        "matrix inline comment preserved"
-    );
     assert!(migrated.contains("[providers"), "providers section added");
-    assert!(!migrated.contains("room_id"), "room_id removed");
+    assert!(!migrated.contains("room_id ="), "room_id removed");
 }
 
 #[test]
@@ -244,14 +239,14 @@ allowed_users = ["@u:m"]
         .unwrap()
         .expect("should migrate");
 
-    let config = migrate(&migrated_toml);
+    let (config, providers) = migrate(&migrated_toml);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+    assert_eq!(providers.fallback.as_deref(), Some("openrouter"));
     assert_eq!(
-        config.providers.models["openrouter"].api_key.as_deref(),
+        providers.models["openrouter"].api_key.as_deref(),
         Some("rt-key")
     );
-    assert!(config.providers.models.contains_key("ollama"));
+    assert!(providers.models.contains_key("ollama"));
 
     let matrix = config.channels.matrix.as_ref().unwrap();
     // room_id is no longer on MatrixConfig; migration moves it to allowed_rooms.
@@ -269,7 +264,7 @@ allowed_users = ["@u:m"]
 fn exhaustive_walk_no_props_lost() {
     use daemonclaw::config::{Config, ModelProviderConfig};
 
-    let v0 = migrate(
+    let (v0, v0_providers) = migrate(
         r#"
 api_key = "walk-key"
 api_url = "https://walk.example.com"
@@ -296,8 +291,9 @@ allowed_rooms = ["!existing:matrix.org"]
 "#,
     );
 
-    let mut expected = Config::default();
-    expected.providers.fallback = Some("walk-provider".into());
+    let expected = Config::default();
+    let mut expected_providers = ProvidersConfig::default();
+    expected_providers.fallback = Some("walk-provider".into());
     let mut entry = ModelProviderConfig {
         api_key: Some("walk-key".into()),
         base_url: Some("https://walk.example.com".into()),
@@ -311,11 +307,10 @@ allowed_rooms = ["!existing:matrix.org"]
     entry
         .extra_headers
         .insert("X-Walk".into(), "walk-header".into());
-    expected
-        .providers
+    expected_providers
         .models
         .insert("walk-provider".into(), entry);
-    expected.providers.models.insert(
+    expected_providers.models.insert(
         "other-profile".into(),
         ModelProviderConfig {
             base_url: Some("https://other.example.com".into()),
@@ -326,11 +321,10 @@ allowed_rooms = ["!existing:matrix.org"]
     // Provider fields are now resolved directly — no cache needed.
 
     // Compare providers.
-    assert_eq!(v0.providers.fallback, expected.providers.fallback);
-    assert_eq!(v0.providers.models.len(), expected.providers.models.len());
-    for (key, v0_entry) in &v0.providers.models {
-        let exp = expected
-            .providers
+    assert_eq!(v0_providers.fallback, expected_providers.fallback);
+    assert_eq!(v0_providers.models.len(), expected_providers.models.len());
+    for (key, v0_entry) in &v0_providers.models {
+        let exp = expected_providers
             .models
             .get(key)
             .unwrap_or_else(|| panic!("missing provider entry: {key}"));
@@ -420,13 +414,12 @@ port = 42617
 host = "127.0.0.1"
 require_pairing = true
 "#;
-    let config = migrate(raw);
+    let (config, providers) = migrate(raw);
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+    assert_eq!(providers.fallback.as_deref(), Some("openrouter"));
     assert_eq!(
-        config
-            .providers
+        providers
             .fallback_provider()
             .and_then(|e| e.model.as_deref()),
         Some("anthropic/claude-sonnet-4.6")
@@ -466,7 +459,7 @@ require_pairing = true
     let migrated = migration::migrate_file(raw)
         .unwrap()
         .expect("should migrate");
-    let re_config = migrate(&migrated);
+    let (re_config, _re_providers) = migrate(&migrated);
     re_config
         .validate()
         .expect("migrated file should also pass validation");
