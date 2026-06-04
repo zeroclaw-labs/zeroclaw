@@ -373,24 +373,21 @@ impl SessionStore {
             .contains_key(id)
     }
 
-    /// Force-terminate a session: record `AdminKill`, fire the cancel token
-    /// if a turn is in flight, then remove the session from the store.
+    /// Force-terminate a session: if a turn is in flight, record `AdminKill`
+    /// and fire the cancel token so the verdict site can attribute the cause;
+    /// then remove the session from the store.
     /// Returns `true` if the session existed and was removed, `false` if not found.
     /// History on disk is NOT touched — this is an in-memory eviction only.
     pub async fn kill_session(&self, id: &str) -> bool {
-        self.record_cancel_cause(id, CancelCause::AdminKill);
         if let Some(token) = self
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id)
         {
+            self.record_cancel_cause(id, CancelCause::AdminKill);
             token.cancel();
         }
-        self.cancel_causes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
         self.sessions.lock().await.remove(id).is_some()
     }
 
@@ -782,5 +779,29 @@ mod tests {
     async fn kill_session_missing_returns_false() {
         let store = make_store(4);
         assert!(!store.kill_session("ghost").await);
+    }
+
+    /// kill_session must record AdminKill so the turn-verdict site can attribute
+    /// the cancel. The cause must survive until take_cancel_cause drains it.
+    #[tokio::test]
+    async fn kill_session_cause_is_admin_kill() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        store.register_cancel_token("s", token.clone());
+
+        store.kill_session("s").await;
+        // The verdict site must see AdminKill, not None.
+        assert_eq!(
+            store.take_cancel_cause("s"),
+            Some(CancelCause::AdminKill),
+            "kill_session must preserve AdminKill cause for verdict-site attribution"
+        );
     }
 }
