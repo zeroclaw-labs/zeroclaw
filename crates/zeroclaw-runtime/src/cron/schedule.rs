@@ -130,6 +130,42 @@ fn translate_weekday_value(val: u8) -> Result<u8> {
     }
 }
 
+/// Expand a standard-crontab weekday range whose endpoints involve a Sunday
+/// alias (0 or 7) into an ascending, comma-separated list of cron-crate
+/// values. Translating each endpoint independently would produce a
+/// non-ascending range (e.g. `6-7` → `7-1`) that the cron crate rejects, or
+/// silently drop days (e.g. `0-7` → `1-1`). Enumerating each standard day in
+/// the range, translating it, then sorting and de-duplicating yields a valid
+/// fragment that fires on exactly the intended days.
+fn expand_weekday_range(start: u8, end: u8) -> Result<String> {
+    // Enumerate the standard weekday values covered by the range, wrapping
+    // around the week (Sun=0..=6=Sat) when `end < start` (e.g. `5-0`).
+    let mut standard_days: Vec<u8> = Vec::new();
+    let mut day = start;
+    loop {
+        standard_days.push(day);
+        if day == end {
+            break;
+        }
+        // Step through the 0..=7 numbering used by standard crontab, treating 7
+        // as the Sunday alias so that a `…-7` endpoint terminates the loop.
+        day = if day >= 7 { 0 } else { day + 1 };
+    }
+
+    let mut translated: Vec<u8> = standard_days
+        .into_iter()
+        .map(translate_weekday_value)
+        .collect::<Result<Vec<u8>>>()?;
+    translated.sort_unstable();
+    translated.dedup();
+
+    Ok(translated
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 /// Normalize the weekday field of a 5-field cron expression from standard
 /// crontab numbering to cron-crate numbering. Passes through `*`, named days
 /// (e.g. `MON`, `MON-FRI`), and already-valid tokens unchanged.
@@ -168,7 +204,18 @@ fn normalize_weekday_field(field: &str) -> Result<String> {
                 .with_context(|| format!("Invalid weekday in range: {end_s}"))?;
             let new_start = translate_weekday_value(start)?;
             let new_end = translate_weekday_value(end)?;
-            format!("{new_start}-{new_end}")
+            if new_start < new_end || (new_start == new_end && start == end) {
+                format!("{new_start}-{new_end}")
+            } else {
+                // The endpoints involve a Sunday alias (0 or 7), so translating
+                // each endpoint independently either yields a non-ascending range
+                // the cron crate rejects (e.g. `6-7` → `7-1`) or collapses a
+                // multi-day range to a single day (e.g. `0-7` → `1-1`). Expand the
+                // standard range into an explicit, ascending list of translated
+                // single values instead. (A genuine single-day range such as
+                // `3-3` keeps `new_start == new_end` because `start == end`.)
+                expand_weekday_range(start, end)?
+            }
         } else if range_part == "*" {
             "*".to_string()
         } else {
@@ -233,6 +280,29 @@ mod tests {
         // 1-5 (Mon-Fri) → 2-6
         assert_eq!(normalize_weekday_field("1-5").unwrap(), "2-6");
         // 0-6 (Sun-Sat) → 1-7
+        assert_eq!(normalize_weekday_field("0-6").unwrap(), "1-7");
+    }
+
+    #[test]
+    fn normalize_weekday_field_handles_sunday_alias_in_range() {
+        // Ranges whose endpoints hit a Sunday alias (0 or 7) cannot be
+        // expressed as a simple translated range: translating each endpoint
+        // independently yields a non-ascending range that cron 0.15 rejects
+        // (`6-7` → `7-1`) or one that silently drops days (`0-7` → `1-1`).
+        // These must expand into an ascending list of single values instead.
+
+        // 0-7 (Sun..Sun = the full week) → every cron-crate weekday.
+        assert_eq!(normalize_weekday_field("0-7").unwrap(), "1,2,3,4,5,6,7");
+        // 6-7 (Sat,Sun) → cron-crate 7 (Sat) + 1 (Sun).
+        assert_eq!(normalize_weekday_field("6-7").unwrap(), "1,7");
+        // 5-7 (Fri,Sat,Sun) → cron-crate 6,7,1.
+        assert_eq!(normalize_weekday_field("5-7").unwrap(), "1,6,7");
+        // 5-0 (Fri,Sat,Sun, wrapping through Sunday) → cron-crate 6,7,1.
+        assert_eq!(normalize_weekday_field("5-0").unwrap(), "1,6,7");
+
+        // Ascending ranges that do not touch a Sunday alias keep the compact
+        // range form (regression guard for the unchanged path).
+        assert_eq!(normalize_weekday_field("1-5").unwrap(), "2-6");
         assert_eq!(normalize_weekday_field("0-6").unwrap(), "1-7");
     }
 
@@ -328,6 +398,32 @@ mod tests {
         };
         let next = next_run_for_schedule(&schedule, monday).unwrap();
         assert_eq!(next.weekday(), chrono::Weekday::Sun);
+    }
+
+    #[test]
+    fn weekend_range_6_7_fires_sat_and_sun() {
+        // `6-7` is the standard-crontab weekend range (Sat,Sun). Before the
+        // Sunday-alias fix it normalized to the non-ascending `7-1`, which
+        // cron 0.15 rejects, so this would have errored (and the `.unwrap()`
+        // below would panic) instead of producing the next weekend run.
+        let monday = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
+        let schedule = Schedule::Cron {
+            expr: "0 10 * * 6-7".into(),
+            tz: Some("UTC".into()),
+        };
+
+        // First run is Saturday 2026-02-21 at 10:00 UTC.
+        let saturday = next_run_for_schedule(&schedule, monday).unwrap();
+        assert_eq!(
+            saturday,
+            Utc.with_ymd_and_hms(2026, 2, 21, 10, 0, 0).unwrap()
+        );
+        assert_eq!(saturday.weekday(), chrono::Weekday::Sat);
+
+        // The following run is the very next day, Sunday 2026-02-22.
+        let sunday = next_run_for_schedule(&schedule, saturday).unwrap();
+        assert_eq!(sunday, Utc.with_ymd_and_hms(2026, 2, 22, 10, 0, 0).unwrap());
+        assert_eq!(sunday.weekday(), chrono::Weekday::Sun);
     }
 
     #[test]
