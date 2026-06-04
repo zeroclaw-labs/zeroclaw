@@ -20,6 +20,7 @@ pub mod nodes;
 pub mod observability;
 pub mod onboard;
 pub mod platform;
+pub mod pool;
 pub mod rag;
 pub mod routines;
 pub mod security;

@@ -257,26 +257,6 @@ impl ModelRoutingConfigTool {
             })
             .collect();
 
-        let mut agents: BTreeMap<String, Value> = BTreeMap::new();
-        for (name, agent) in &cfg.agents {
-            agents.insert(
-                name.clone(),
-                json!({
-                    "provider": agent.provider,
-                    "model": agent.model,
-                    "system_prompt": agent.system_prompt,
-                    "api_key_configured": agent
-                        .api_key
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "temperature": agent.temperature,
-                    "max_depth": agent.max_depth,
-                    "agentic": agent.agentic,
-                    "allowed_tools": agent.allowed_tools,
-                }),
-            );
-        }
-
         json!({
             "default": {
                 "provider": cfg.providers.fallback,
@@ -289,7 +269,6 @@ impl ModelRoutingConfigTool {
             },
             "scenarios": scenarios,
             "classification_only_rules": classification_only_rules,
-            "agents": agents,
         })
     }
 
@@ -711,6 +690,7 @@ impl ModelRoutingConfigTool {
         })
     }
 
+    #[allow(dead_code)]
     async fn handle_upsert_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
         let provider = Self::parse_non_empty_string(args, "provider")?;
@@ -813,6 +793,7 @@ impl ModelRoutingConfigTool {
         })
     }
 
+    #[allow(dead_code)]
     async fn handle_remove_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
 
@@ -842,7 +823,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
+        "Manage default model settings, scenario-based provider/model routes, and classification rules"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -856,9 +837,7 @@ impl Tool for ModelRoutingConfigTool {
                         "list_hints",
                         "set_default",
                         "upsert_scenario",
-                        "remove_scenario",
-                        "upsert_agent",
-                        "remove_agent"
+                        "remove_scenario"
                     ],
                     "default": "get"
                 },
@@ -868,11 +847,11 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Provider for set_default/upsert_scenario/upsert_agent"
+                    "description": "Provider for set_default/upsert_scenario"
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario/upsert_agent"
+                    "description": "Model for set_default/upsert_scenario"
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -920,27 +899,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Delegate sub-agent name for upsert_agent/remove_agent"
-                },
-                "system_prompt": {
-                    "type": ["string", "null"],
-                    "description": "Optional system prompt override for delegate agent"
-                },
-                "max_depth": {
-                    "type": ["integer", "null"],
-                    "minimum": 1,
-                    "description": "Delegate max recursion depth"
-                },
-                "agentic": {
-                    "type": "boolean",
-                    "description": "Enable tool-call loop mode for delegate agent"
-                },
-                "allowed_tools": {
-                    "description": "Allowed tools for agentic delegate mode (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "description": "Scenario name for upsert_scenario/remove_scenario"
                 },
             },
             "additionalProperties": false
@@ -957,8 +916,7 @@ impl Tool for ModelRoutingConfigTool {
         let result = match action.as_str() {
             "get" => self.handle_get(),
             "list_hints" => self.handle_list_hints(),
-            "set_default" | "upsert_scenario" | "remove_scenario" | "upsert_agent"
-            | "remove_agent" => {
+            "set_default" | "upsert_scenario" | "remove_scenario" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
@@ -967,13 +925,22 @@ impl Tool for ModelRoutingConfigTool {
                     "set_default" => Box::pin(self.handle_set_default(&args)).await,
                     "upsert_scenario" => Box::pin(self.handle_upsert_scenario(&args)).await,
                     "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
-                    "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
-                    "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
                     _ => unreachable!("validated above"),
                 }
             }
+            "upsert_agent" | "remove_agent" => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Agent config-write actions (upsert_agent/remove_agent) have been removed. \
+                         Use the pool system to manage persistent agent members."
+                            .to_string(),
+                    ),
+                });
+            }
             _ => anyhow::bail!(
-                "Unknown action '{action}'. Valid: get, list_hints, set_default, upsert_scenario, remove_scenario, upsert_agent, remove_agent"
+                "Unknown action '{action}'. Valid: get, list_hints, set_default, upsert_scenario, remove_scenario"
             ),
         };
 
@@ -1120,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_and_remove_delegate_agent() {
+    async fn agent_config_write_actions_are_rejected() {
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -1129,19 +1096,16 @@ mod tests {
                 "action": "upsert_agent",
                 "name": "coder",
                 "provider": "openai",
-                "model": "gpt-5.3-codex",
-                "agentic": true,
-                "allowed_tools": ["file_read", "file_write", "shell"]
+                "model": "gpt-5.3-codex"
             }))
             .await
             .unwrap();
-        assert!(upsert.success, "{:?}", upsert.error);
-
-        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
-        let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert_eq!(output["agents"]["coder"]["provider"], json!("openai"));
-        assert_eq!(output["agents"]["coder"]["model"], json!("gpt-5.3-codex"));
-        assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
+        assert!(!upsert.success);
+        assert!(
+            upsert.error.as_deref().unwrap_or("").contains("removed"),
+            "upsert_agent should be rejected: {:?}",
+            upsert.error
+        );
 
         let remove = tool
             .execute(json!({
@@ -1150,11 +1114,12 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(remove.success, "{:?}", remove.error);
-
-        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
-        let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert!(output["agents"]["coder"].is_null());
+        assert!(!remove.success);
+        assert!(
+            remove.error.as_deref().unwrap_or("").contains("removed"),
+            "remove_agent should be rejected: {:?}",
+            remove.error
+        );
     }
 
     #[tokio::test]

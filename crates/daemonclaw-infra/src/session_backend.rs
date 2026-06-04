@@ -41,6 +41,17 @@ pub trait SessionBackend: Send + Sync {
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
 
+    /// Append a message with actor attribution (pool members).
+    fn append_with_actor(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        _actor_id: Option<&str>,
+        _actor_type: Option<&str>,
+    ) -> std::io::Result<()> {
+        self.append(session_key, message)
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 

@@ -324,6 +324,8 @@ pub struct Config {
     pub delegate: DelegateToolConfig,
 
     /// Delegate agent configurations for multi-agent workflows.
+    /// DEPRECATED: Use [pool] for persistent agents. This field is retained
+    /// for backward compatibility during migration.
     #[serde(default)]
     #[nested]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -331,6 +333,11 @@ pub struct Config {
     /// Swarm configurations for multi-agent orchestration.
     #[serde(default)]
     pub swarms: HashMap<String, SwarmConfig>,
+
+    /// Agent pool configuration (persistent sub-agents with lifecycle).
+    #[serde(default)]
+    #[nested]
+    pub pool: PoolConfig,
 
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
@@ -686,6 +693,25 @@ const DEFAULT_SWARM_TIMEOUT_SECS: u64 = 300;
 
 fn default_swarm_timeout_secs() -> u64 {
     DEFAULT_SWARM_TIMEOUT_SECS
+}
+
+// ── Pool ───────────────────────────────────────────────────────
+
+/// Agent pool configuration. When enabled, delegated sub-agents persist
+/// as pool members with stable identities, accumulated context, and
+/// lifecycle management (resident/dormant).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "pool"]
+pub struct PoolConfig {
+    /// Enable persistent agent pool. When false, sub-agents are ephemeral (destroyed after task).
+    pub enabled: bool,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
 }
 
 /// Valid temperature range for all paths (config, CLI, env override).
@@ -9453,6 +9479,7 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
+            pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -12081,6 +12108,7 @@ auto_save = true
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
+            pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -12648,6 +12676,7 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
+            pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
