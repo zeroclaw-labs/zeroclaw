@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession } from '@/lib/api';
+import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
@@ -609,9 +609,60 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   }, []);
 
   const clearAllMessages = useCallback(() => {
+    // Optimistically wipe the rendered transcript and any in-flight streaming
+    // state. Bumping the mutation version fences off a racing hydration fetch
+    // so it can't repopulate the just-cleared view.
     localMessageMutationVersionRef.current += 1;
     setMessages([]);
-  }, []);
+    pendingContentRef.current = '';
+    pendingThinkingRef.current = '';
+    capturedThinkingRef.current = '';
+    setStreamingContent('');
+    setStreamingThinking('');
+    setTyping(false);
+    setPendingApproval(null);
+
+    const sid = sessionIdRef.current;
+
+    // The live WebSocket Agent holds the full conversation in memory for the
+    // life of the connection, and the gateway persists each turn to the
+    // session backend. Clearing only React state leaves both intact, so the
+    // next turn still carries prior context and a reload/reconnect repopulates
+    // the old transcript (issue #7126). To genuinely reset context we must:
+    //   1. delete the persisted backend session history, and
+    //   2. tear down + reconnect the socket so the gateway builds a fresh
+    //      Agent that seeds from the now-empty backend.
+    void (async () => {
+      try {
+        // Reuses the existing DELETE /api/sessions/{id} primitive
+        // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
+        // session persistence is disabled, or any transport failure, must not
+        // block the local clear or the reconnect below.
+        await deleteSession(sid);
+      } catch {
+        // Persistence disabled or request failed — proceed with the reconnect
+        // so the live in-memory context is reset regardless.
+      }
+
+      // Rebuild the socket so the backend constructs a new Agent with no seeded
+      // history. Detach the old socket's callbacks first so its onClose does
+      // not write stale connection state. If there is no socket (disconnected),
+      // the alias-bound effect will reconnect on its own — nothing to do here.
+      const oldWs = wsRef.current;
+      if (oldWs) {
+        oldWs.onOpen = null;
+        oldWs.onClose = null;
+        oldWs.onError = null;
+        oldWs.onMessage = null;
+        oldWs.disconnect();
+
+        const ws = new WebSocketClient({ agentAlias });
+        attachSocketCallbacks(ws);
+        ws.connect();
+        wsRef.current = ws;
+      }
+    })();
+  }, [agentAlias, attachSocketCallbacks]);
 
   const respondToApproval = useCallback((decision: ApprovalDecision) => {
     setPendingApproval((current) => {
