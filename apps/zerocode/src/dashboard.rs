@@ -1692,6 +1692,8 @@ impl<'a> Dashboard<'a> {
                     self.detail_scroll = 0;
                     self.session_messages.clear();
                     self.session_messages_id = None;
+                    self.session_messages_total = 0;
+                    self.session_messages_start = 0;
                     self.last_poll = None;
                 }
             }
@@ -2038,7 +2040,7 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
             ];
             if self.tab == Tab::Sessions {
-                entries.push(E::key("X", "kill session"));
+                entries.push(E::key("X", crate::i18n::t("zc-dashboard-help-kill-session")));
             }
             return HelpNode::entries(entries);
         }

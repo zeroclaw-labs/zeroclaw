@@ -215,10 +215,10 @@ keyactions! {
         DetailWidenDown  [Chord::shift(KeyCode::Down)] => "widen detail down",
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
+        KillSession      [Chord::char('X')] => "kill session",
         Refresh          [Chord::char('r')] => "refresh",
         JumpStart        [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd          [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
-        KillSession      [Chord::char('X')] => "kill session",
     }
 }
 

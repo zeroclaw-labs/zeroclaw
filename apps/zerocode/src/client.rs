@@ -1082,7 +1082,7 @@ impl RpcClient {
         .await
     }
 
-    pub async fn session_kill(&self, session_id: &str) -> anyhow::Result<()> {
+    pub async fn session_kill(&self, session_id: &str) -> Result<()> {
         let _: serde_json::Value = self
             .call(
                 method::SESSION_KILL,
