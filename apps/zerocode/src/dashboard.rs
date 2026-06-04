@@ -2141,3 +2141,55 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes}B")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // Regression: byte-index slicing panicked when the byte length exceeded
+        // `max` but `max` landed inside a multi-byte char. This 35-char CJK
+        // string is 105 bytes, so `&s[..40]` used to panic mid-character even
+        // though the string is well under the 40-*character* budget.
+        let s = "用户询问桌面文件列表，助手列出了桌面上的文件夹和文件，包括名称和大小。";
+        assert_eq!(s.chars().count(), 35);
+        assert!(s.len() > 40);
+        // Under the character budget -> returned unchanged, no panic.
+        assert_eq!(truncate(s, 40), s);
+    }
+
+    #[test]
+    fn truncate_multibyte_at_char_boundary() {
+        // Over the character budget: truncates on a char boundary and appends
+        // the ellipsis without panicking.
+        let s = "一二三四五六七八九十甲乙丙丁";
+        let result = truncate(s, 10);
+        assert_eq!(result, "一二三四五六七八九十...");
+        assert_eq!(result.chars().count(), 13);
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // 10 CJK chars (30 bytes) must not be truncated at a max of 20 chars.
+        let s = "一二三四五六七八九十";
+        assert_eq!(truncate(s, 20), s);
+    }
+
+    #[test]
+    fn truncate_short_ascii_unchanged() {
+        assert_eq!(truncate("hello", 40), "hello");
+    }
+
+    #[test]
+    fn truncate_long_ascii() {
+        let s = "a".repeat(50);
+        let result = truncate(&s, 40);
+        assert_eq!(result, format!("{}...", "a".repeat(40)));
+    }
+
+    #[test]
+    fn truncate_uses_first_line_only() {
+        assert_eq!(truncate("first\nsecond", 40), "first");
+    }
+}
