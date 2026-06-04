@@ -803,6 +803,14 @@ impl WhatsAppWebChannel {
         }
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn jid_matches_bot(jid: &str, bot_phone: &str, bot_lid: Option<&str>) -> bool {
+        let digits = Self::jid_digits(jid);
+        !digits.is_empty()
+            && ((!bot_phone.is_empty() && digits == bot_phone)
+                || bot_lid.is_some_and(|lid| !lid.is_empty() && digits == lid))
+    }
+
     /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
     ///
     /// Uses `get_base_message()` to see through ephemeral/view-once/edited/document wrappers,
@@ -836,11 +844,7 @@ impl WhatsAppWebChannel {
     ) -> bool {
         // 1. Structured: check if any mentioned_jid's digits match the bot's phone or LID digits
         for jid in mentioned_jids {
-            let digits = Self::jid_digits(jid);
-            if !digits.is_empty()
-                && ((!bot_phone.is_empty() && digits == bot_phone)
-                    || bot_lid.is_some_and(|lid| !lid.is_empty() && digits == lid))
-            {
+            if Self::jid_matches_bot(jid, bot_phone, bot_lid) {
                 return true;
             }
         }
@@ -875,6 +879,40 @@ impl WhatsAppWebChannel {
         }
 
         has_text_mention(text, bot_phone) || bot_lid.is_some_and(|lid| has_text_mention(text, lid))
+    }
+
+    /// Extract the author JID of the message quoted by an extended-text reply.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_reply_participant(msg: &waproto::whatsapp::Message) -> Option<&str> {
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        base.extended_text_message
+            .as_ref()
+            .and_then(|ext| ext.context_info.as_ref())
+            .and_then(|ctx| ctx.participant.as_deref())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_reply_to_bot(
+        msg: &waproto::whatsapp::Message,
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        Self::extract_reply_participant(msg)
+            .is_some_and(|participant| Self::jid_matches_bot(participant, bot_phone, bot_lid))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_message_addressed_to_bot(
+        msg: &waproto::whatsapp::Message,
+        text: &str,
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        let mentioned_jids = Self::extract_mentioned_jids(msg);
+        Self::contains_bot_mention(text, &mentioned_jids, bot_phone, bot_lid)
+            || Self::is_reply_to_bot(msg, bot_phone, bot_lid)
     }
 }
 
@@ -1444,17 +1482,10 @@ impl Channel for WhatsAppWebChannel {
                                     let bot_phone = bot_phone_inner.lock();
                                     let bot_lid = bot_lid_inner.lock();
                                     if bot_phone.is_some() || bot_lid.is_some() {
-                                        let mentioned_jids =
-                                            Self::extract_mentioned_jids(msg);
                                         let bp = bot_phone.as_deref().unwrap_or("");
                                         let bl = bot_lid.as_deref();
-                                        if !Self::contains_bot_mention(
-                                            &content,
-                                            &mentioned_jids,
-                                            bp,
-                                            bl,
-                                        ) {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message without bot mention");
+                                        if !Self::is_message_addressed_to_bot(msg, &content, bp, bl) {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
                                             return;
                                         }
                                     } else {
@@ -2408,6 +2439,30 @@ mod tests {
 
     // ── Mention detection tests ──
 
+    #[cfg(feature = "whatsapp-web")]
+    fn extended_text_reply(
+        participant: &str,
+        mentioned_jids: &[&str],
+    ) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                waproto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("expand the previous response".to_string()),
+                    context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                        participant: Some(participant.to_string()),
+                        mentioned_jid: mentioned_jids
+                            .iter()
+                            .map(|jid| (*jid).to_string())
+                            .collect(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn jid_digits_extracts_phone_from_jid() {
@@ -2552,6 +2607,54 @@ mod tests {
             &[],
             "",
             None
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_reply_to_phone_jid() {
+        let msg = extended_text_reply("100@s.whatsapp.net", &[]);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            None,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_reply_to_lid_jid() {
+        let msg = extended_text_reply("200@lid", &[]);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_rejects_reply_to_other_participant() {
+        let msg = extended_text_reply("300@s.whatsapp.net", &[]);
+        assert!(!WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_explicit_mention_in_other_reply() {
+        let msg = extended_text_reply("300@s.whatsapp.net", &["100@s.whatsapp.net"]);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            Some("200"),
         ));
     }
 
