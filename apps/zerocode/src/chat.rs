@@ -433,8 +433,7 @@ impl Chat {
             if up || down {
                 match &mut state.model_picker {
                     ModelPickerOverlay::Model(p)
-                    | ModelPickerOverlay::ProviderStage(p)
-                    | ModelPickerOverlay::ProviderModelStage { picker: p, .. } => {
+                    | ModelPickerOverlay::ConfiguredProviderStage(p) => {
                         if up {
                             p.move_up();
                         } else {
@@ -475,35 +474,22 @@ impl Chat {
                             }
                             return false;
                         }
-                        ModelPickerOverlay::ProviderStage(p) => {
+                        ModelPickerOverlay::ConfiguredProviderStage(p) => {
                             let choice = p.selected().map(str::to_string);
+                            state.model_picker = ModelPickerOverlay::None;
                             if let Some(model_provider) = choice {
-                                // Advance to stage 2 (fetch that family's models).
-                                Self::advance_provider_picker(&rpc, state, model_provider).await;
+                                Self::apply_session_override(
+                                    &rpc,
+                                    state,
+                                    crate::client::SessionOverrides {
+                                        model_provider: Some(model_provider),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
                             } else {
-                                state.model_picker = ModelPickerOverlay::None;
                                 state.mark_dirty_full();
                             }
-                            return false;
-                        }
-                        ModelPickerOverlay::ProviderModelStage {
-                            model_provider,
-                            picker,
-                        } => {
-                            let model_provider = model_provider.clone();
-                            let model = picker.selected().map(str::to_string);
-                            state.model_picker = ModelPickerOverlay::None;
-                            // Switch model_provider and model together.
-                            Self::apply_session_override(
-                                &rpc,
-                                state,
-                                crate::client::SessionOverrides {
-                                    model_provider: Some(model_provider),
-                                    model,
-                                    ..Default::default()
-                                },
-                            )
-                            .await;
                             return false;
                         }
                         ModelPickerOverlay::None => {}
@@ -1085,11 +1071,7 @@ impl Chat {
     async fn open_provider_picker(rpc: &RpcClient, state: &mut ChatState) {
         match rpc.quickstart_state().await {
             Ok(snap) => {
-                let providers: Vec<String> = snap
-                    .model_provider_types
-                    .into_iter()
-                    .map(|t| t.kind)
-                    .collect();
+                let providers = snap.model_providers;
                 if providers.is_empty() {
                     state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
                         "zc-model-catalog-no-provider",
@@ -1097,12 +1079,9 @@ impl Chat {
                     state.mark_dirty_full();
                     return;
                 }
+                let current = Self::resolve_model_provider_ref(rpc, &state.agent_alias).await;
                 state.input_bar.set_provider_catalog(providers.clone());
-                // Pre-select the agent's current model_provider family if known.
-                let current = Self::resolve_model_provider_ref(rpc, &state.agent_alias)
-                    .await
-                    .and_then(|r| r.split('.').next().map(str::to_string));
-                state.model_picker = ModelPickerOverlay::ProviderStage(
+                state.model_picker = ModelPickerOverlay::ConfiguredProviderStage(
                     crate::widgets::PickerState::new(providers, current.as_deref()),
                 );
                 state.mark_dirty_full();
@@ -1115,39 +1094,6 @@ impl Chat {
                 state.mark_dirty_full();
             }
         }
-    }
-
-    /// Advance the model_provider picker from stage 1 (family chosen) to stage 2
-    /// (model list for that family), pre-selecting that family's configured
-    /// model. Falls back to an info-bar error if the catalog is empty.
-    async fn advance_provider_picker(
-        rpc: &RpcClient,
-        state: &mut ChatState,
-        model_provider: String,
-    ) {
-        state.info_message = Some(crate::widgets::InfoMessage::info(crate::i18n::t(
-            "zc-model-switch-applying",
-        )));
-        state.mark_dirty_full();
-
-        let models = Self::fetch_models(rpc, &model_provider).await;
-        if models.is_empty() {
-            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
-                "zc-model-catalog-empty",
-            )));
-            state.model_picker = ModelPickerOverlay::None;
-            state.mark_dirty_full();
-            return;
-        }
-        // Pre-select that family's default-aliased configured model if present.
-        let default_ref = format!("{model_provider}.default");
-        let current = Self::configured_model(rpc, &default_ref).await;
-        state.model_picker = ModelPickerOverlay::ProviderModelStage {
-            model_provider,
-            picker: crate::widgets::PickerState::new(models, current.as_deref()),
-        };
-        state.info_message = None;
-        state.mark_dirty_full();
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
@@ -1625,17 +1571,9 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             )
             .render(f, area);
         }
-        ModelPickerOverlay::ProviderStage(picker) => {
+        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
             crate::widgets::PickerModal::new(
                 &crate::i18n::t("zc-model-provider-picker-title"),
-                &picker.items,
-                picker.cursor,
-            )
-            .render(f, area);
-        }
-        ModelPickerOverlay::ProviderModelStage { picker, .. } => {
-            crate::widgets::PickerModal::new(
-                &crate::i18n::t("zc-model-picker-title"),
                 &picker.items,
                 picker.cursor,
             )
@@ -2621,15 +2559,7 @@ enum ModelPickerOverlay {
     None,
     /// Single-stage model picker over the active model_provider's catalog.
     Model(crate::widgets::PickerState),
-    /// Stage 1 of the model_provider flow: choosing a model_provider family.
-    ProviderStage(crate::widgets::PickerState),
-    /// Stage 2 of the model_provider flow: choosing a model from the chosen
-    /// model_provider's freshly fetched catalog. Carries the chosen
-    /// model_provider so the eventual switch sets both.
-    ProviderModelStage {
-        model_provider: String,
-        picker: crate::widgets::PickerState,
-    },
+    ConfiguredProviderStage(crate::widgets::PickerState),
 }
 
 impl ModelPickerOverlay {
@@ -3415,16 +3345,11 @@ mod tests {
         let model =
             ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
         assert!(model.is_open());
-        let stage1 = ModelPickerOverlay::ProviderStage(crate::widgets::PickerState::new(
-            vec!["anthropic".into()],
+        let stage1 = ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
+            vec!["anthropic.personal_code".into()],
             None,
         ));
         assert!(stage1.is_open());
-        let stage2 = ModelPickerOverlay::ProviderModelStage {
-            model_provider: "anthropic".into(),
-            picker: crate::widgets::PickerState::new(vec!["m".into()], None),
-        };
-        assert!(stage2.is_open());
     }
 
     #[tokio::test]
