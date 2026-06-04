@@ -617,16 +617,16 @@ impl Chat {
                     state.toggle_queue_sidebar();
                     return false;
                 }
-                Some(QAction::ResumeQueue) if state.queue_paused() => {
-                    state.resume_queue();
-                    self.pump_queue();
-                    if let ChatPhase::Active(ref mut state) = self.phase {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-resumed",
-                            ))));
-                        state.mark_dirty_append();
+                Some(QAction::PauseResumeQueue) => {
+                    let paused = state.toggle_queue_pause();
+                    let notice = if paused {
+                        crate::i18n::t("zc-queue-paused-notice")
+                    } else {
+                        crate::i18n::t("zc-queue-resumed")
+                    };
+                    state.set_info_notice(notice);
+                    if !paused {
+                        self.pump_queue();
                     }
                     return false;
                 }
@@ -1155,6 +1155,7 @@ impl Chat {
 
 impl crate::widgets::HelpContext for Chat {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ChatTabAction;
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
@@ -1237,8 +1238,22 @@ impl crate::widgets::HelpContext for Chat {
                     E::key("Ctrl+S", crate::i18n::t("zc-chat-help-session-list")),
                     E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
                     E::spacer(),
-                    E::key("Alt+Q", crate::i18n::t("zc-queue-help-toggle")),
-                    E::key("Alt+P", crate::i18n::t("zc-queue-help-resume")),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::ToggleQueue.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-queue-help-toggle"),
+                    ),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::PauseResumeQueue.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-queue-help-resume"),
+                    ),
                     E::key("Alt+↑/↓", crate::i18n::t("zc-queue-help-nav")),
                     E::key("Alt+X", crate::i18n::t("zc-queue-help-delete")),
                     E::key("Alt+E", crate::i18n::t("zc-queue-help-edit")),
@@ -1476,7 +1491,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &ChatState, area: Rect) {
 
     let mut rows: Vec<Line<'static>> = Vec::new();
     if state.queue_paused() {
-        let key = crate::keymap::ChatTabAction::ResumeQueue
+        let key = crate::keymap::ChatTabAction::PauseResumeQueue
             .default_chords()
             .first()
             .map(|c| c.display())
@@ -3252,8 +3267,11 @@ impl ChatState {
         Some(msg)
     }
 
-    pub fn resume_queue(&mut self) {
-        self.queue_paused = false;
+    /// Flip the queue pause state. Returns the new paused value so the caller
+    /// can pump on resume and surface the right notice.
+    pub fn toggle_queue_pause(&mut self) -> bool {
+        self.queue_paused = !self.queue_paused;
+        self.queue_paused
     }
 
     pub fn queue_paused(&self) -> bool {
@@ -4076,7 +4094,10 @@ mod tests {
             "override",
             "injected item dispatches through a pause"
         );
-        s.resume_queue();
+        assert!(
+            !s.toggle_queue_pause(),
+            "toggling a paused queue resumes it"
+        );
         assert_eq!(s.take_next_dispatchable().unwrap().text, "queued");
     }
 
@@ -4156,6 +4177,16 @@ mod tests {
         s.queue_paused = true;
         s.reset_for_session("sess-2".to_string(), None);
         assert_eq!(s.queue_len(), 0);
+        assert!(!s.queue_paused());
+    }
+
+    #[test]
+    fn toggle_queue_pause_flips_state() {
+        let mut s = state();
+        assert!(!s.queue_paused());
+        assert!(s.toggle_queue_pause());
+        assert!(s.queue_paused());
+        assert!(!s.toggle_queue_pause());
         assert!(!s.queue_paused());
     }
 

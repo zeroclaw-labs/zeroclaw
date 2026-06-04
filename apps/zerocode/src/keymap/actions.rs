@@ -165,7 +165,7 @@ keyactions! {
         ApprovalApproveEdit     [Chord::char('e')] => "approve + edit",
         DismissModal            [] => "dismiss",
         ToggleQueue             [Chord::with(KeyCode::Char('q'), KeyModifiers::ALT)] => "toggle queue",
-        ResumeQueue             [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "resume queue",
+        PauseResumeQueue        [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "pause/resume queue",
         QueueNavUp              [Chord::with(KeyCode::Up, KeyModifiers::ALT)] => "queue prev",
         QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
         QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
