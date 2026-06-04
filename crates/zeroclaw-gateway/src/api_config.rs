@@ -2285,6 +2285,44 @@ mod tests {
         );
     }
 
+    /// Guardrail against the original #7156 bug class: a new `#[secret]` field
+    /// added under `[gateway]` that the gateway also mints/rotates itself will
+    /// reproduce the permanent-banner symptom unless it is explicitly listed
+    /// in `is_gateway_managed_field` (or whitelisted below as operator-edited).
+    /// This test fails when such a field lands without a corresponding matcher
+    /// entry, forcing the author to make a deliberate decision instead of
+    /// silently re-introducing the bug.
+    #[test]
+    fn every_gateway_secret_is_classified() {
+        // Secrets under `[gateway]` that are OPERATOR-EDITED (not gateway-
+        // managed). Add the field's prop-field name here only if the gateway
+        // does NOT mint/rotate/persist it itself, so legitimate drift between
+        // disk and memory IS surfaceable. Empty for now — `paired_tokens` is
+        // the only `[gateway]` secret and it's gateway-managed.
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+
+        let cfg = zeroclaw_config::schema::Config::default();
+        let unclassified: Vec<String> = cfg
+            .prop_fields()
+            .iter()
+            .filter(|p| p.is_secret && p.name.starts_with("gateway."))
+            .map(|p| p.name.clone())
+            .filter(|name| {
+                !is_gateway_managed_field(name)
+                    && !OPERATOR_EDITED_GATEWAY_SECRETS.contains(&name.as_str())
+            })
+            .collect();
+
+        assert!(
+            unclassified.is_empty(),
+            "new [gateway] secret field(s) {unclassified:?} are not classified.\n\
+             If the gateway mints/rotates/persists this field itself, add it to \
+             `is_gateway_managed_field`.\n\
+             If operators edit it directly in config.toml, add it to the \
+             OPERATOR_EDITED_GATEWAY_SECRETS list in this test."
+        );
+    }
+
     #[test]
     fn drift_entry_for_secret_omits_both_values() {
         let entry = DriftEntry {

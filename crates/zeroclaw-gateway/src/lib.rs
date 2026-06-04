@@ -2010,7 +2010,12 @@ async fn persist_pairing_tokens(config: Arc<RwLock<Config>>, pairing: &PairingGu
     // this should be removed once async mutexes are used everywhere
     let mut updated_cfg = { config.read().clone() };
     updated_cfg.gateway.paired_tokens = paired_tokens;
-    updated_cfg.mark_dirty("gateway.paired-tokens");
+    // Snake-case to match the prop-field name emitted by the `Configurable`
+    // derive. Until #7156 the string used here was `gateway.paired-tokens`
+    // (kebab); it kept working only thanks to the `-`→`_` fallback in
+    // `resolve_dirty_segments`. Aligning all references to the snake form
+    // removes that fallback dependency and keeps the codebase consistent.
+    updated_cfg.mark_dirty("gateway.paired_tokens");
     updated_cfg
         .save_dirty()
         .await
