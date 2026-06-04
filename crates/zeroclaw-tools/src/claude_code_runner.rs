@@ -225,7 +225,11 @@ impl Tool for ClaudeCodeRunnerTool {
         let create_result = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session_name])
             .arg("-c")
-            .arg(work_dir.to_str().unwrap_or("."))
+            .arg(
+                crate::util_helpers::clean_verbatim_path(&work_dir)
+                    .to_str()
+                    .unwrap_or("."),
+            )
             .output()
             .await;
 

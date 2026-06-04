@@ -10,7 +10,20 @@ use zeroclaw_config::schema::ClaudeCodeConfig;
 
 /// Environment variables safe to pass through to the `claude` subprocess.
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    // Windows system-level variables required for subprocess execution
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SystemRoot",
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
 ];
 
 /// Delegates coding tasks to the Claude Code CLI (`claude -p`).
@@ -176,11 +189,13 @@ impl Tool for ClaudeCodeTool {
         };
 
         // Build CLI command
-        let claude_bin = if cfg!(target_os = "windows") {
-            "claude.cmd"
-        } else {
-            "claude"
-        };
+        let claude_bin = which::which("claude").unwrap_or_else(|_| {
+            if cfg!(target_os = "windows") {
+                "claude.cmd".into()
+            } else {
+                "claude".into()
+            }
+        });
         let mut cmd = Command::new(claude_bin);
         cmd.arg("-p").arg(prompt);
         cmd.arg("--output-format").arg("json");
@@ -221,7 +236,7 @@ impl Tool for ClaudeCodeTool {
             }
         }
 
-        cmd.current_dir(&work_dir);
+        cmd.current_dir(crate::util_helpers::clean_verbatim_path(&work_dir));
         // Execute with timeout — use kill_on_drop(true) so the child process
         // is automatically killed when the future is dropped on timeout,
         // preventing zombie processes.
