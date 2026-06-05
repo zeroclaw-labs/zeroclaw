@@ -127,6 +127,7 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         description,
         integration,
         resource_key,
+        credential_class,
         tab
     )
 )]
@@ -235,6 +236,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let credential_class_expr = match extract_credential_class(&field.attrs) {
+            Ok(expr) => expr,
+            Err(err) => return err.to_compile_error().into(),
+        };
         let tab_token = match extract_tab_variant(&field.attrs) {
             Some(variant) => quote! { crate::config::ConfigTab::#variant },
             None => quote! { crate::config::ConfigTab::None },
@@ -1696,6 +1701,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         enum_variants: #enum_variants_expr,
                         description: #description_lit,
                         derived_from_secret: #derived_from_secret,
+                        credential_class: #credential_class_expr,
                         tab: #tab_token,
                     }
                 }
@@ -1713,6 +1719,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #enum_variants_expr,
                     #description_lit,
                     #derived_from_secret,
+                    #credential_class_expr,
                     #tab_token,
                 )
             });
@@ -2052,6 +2059,35 @@ fn extract_string_attr(attrs: &[syn::Attribute], name: &str) -> Option<String> {
         return Some(lit_str.value());
     }
     None
+}
+
+fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(class) = extract_string_attr(attrs, "credential_class") else {
+        return Ok(quote! { None });
+    };
+
+    let variant = match class.as_str() {
+        "encrypted_secret" => quote! { EncryptedSecret },
+        "path_only_reference" => quote! { PathOnlyReference },
+        "public_value" => quote! { PublicValue },
+        "external_auth_store" => quote! { ExternalAuthStore },
+        "legacy_env_path" => quote! { LegacyEnvPath },
+        "requires_follow_up" => quote! { RequiresFollowUp },
+        _ => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "unknown credential_class `{class}`; expected encrypted_secret, \
+                     path_only_reference, public_value, external_auth_store, \
+                     legacy_env_path, or requires_follow_up"
+                ),
+            ));
+        }
+    };
+
+    Ok(quote! {
+        Some(crate::config::CredentialSurfaceClass::#variant)
+    })
 }
 
 /// Build the `pub fn integration_descriptor(&self) -> IntegrationDescriptor`
