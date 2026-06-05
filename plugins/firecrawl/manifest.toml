@@ -1,0 +1,7 @@
+name = "firecrawl"
+version = "0.1.0"
+description = "Scrape any URL to clean markdown using the Firecrawl API"
+author = "ZeroClaw Labs"
+wasm_path = "firecrawl.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
