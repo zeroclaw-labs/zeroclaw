@@ -68,10 +68,17 @@ fn detect_from_env(
         return ColorDepth::Ansi16;
     }
 
-    // These detection inputs no longer gate the result; truecolor is the
-    // universal default below. Kept in the signature for the tests and for a
-    // future capability probe.
-    let _ = (colorterm, term_program, in_tmux);
+    // macOS Terminal.app genuinely lacks 24-bit colour — it caps at xterm-256.
+    // Emitting truecolor there produces wrong colours, so cap it at 256. It
+    // identifies itself unambiguously via TERM_PROGRAM=Apple_Terminal (iTerm,
+    // WezTerm, kitty, Ghostty, etc. all do truecolor and fall through).
+    if matches!(term_program, Some(p) if p.eq_ignore_ascii_case("Apple_Terminal")) {
+        return ColorDepth::Ansi256;
+    }
+
+    // Remaining detection inputs do not gate the result; truecolor is the
+    // universal default below.
+    let _ = (colorterm, in_tmux);
 
     // Default to truecolor. crossterm emits colours verbatim — a 24-bit
     // `\e[38;2;R;G;Bm` SGR — and that sequence passes through terminal
@@ -247,6 +254,31 @@ mod tests {
                 "TERM={term} in_tmux={in_tmux} should default to truecolor"
             );
         }
+    }
+
+    #[test]
+    fn apple_terminal_caps_at_256() {
+        // macOS Terminal.app lacks 24-bit colour; cap it at 256 so truecolor
+        // themes don't render wrong there.
+        assert_eq!(
+            detect_from_env(
+                None,
+                None,
+                Some("xterm-256color"),
+                Some("Apple_Terminal"),
+                false
+            ),
+            ColorDepth::Ansi256
+        );
+        // Other macOS terminals identify differently and keep truecolor.
+        assert_eq!(
+            detect_from_env(None, None, Some("xterm-256color"), Some("iTerm.app"), false),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(
+            detect_from_env(None, None, Some("xterm-kitty"), Some("WezTerm"), false),
+            ColorDepth::TrueColor
+        );
     }
 
     #[test]

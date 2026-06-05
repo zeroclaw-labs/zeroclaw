@@ -96,6 +96,9 @@ once, on first paint:
 - **Truecolor (24-bit)** is the default for virtually every terminal. zerocode
   emits 24-bit colour, which modern terminals — and terminal multiplexers
   configured for it — render directly.
+- **xterm-256** is used for macOS Terminal.app, which lacks 24-bit colour
+  (detected via `TERM_PROGRAM=Apple_Terminal`). iTerm2, kitty, WezTerm, Ghostty,
+  and other truecolor terminals are unaffected.
 - **ANSI-16** is used only for a genuinely low-colour terminal: `TERM` unset, or
   `dumb`, `ansi`, or any `*-16color` value. Themed colours are down-converted to
   the nearest of the 16 ANSI colours.
