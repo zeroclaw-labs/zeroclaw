@@ -1,28 +1,24 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_config::schema::Config;
 
 /// Compact-mode helper for loading a skill's source file on demand.
+/// Supports workspace skills, open-skills, agent-bound skill bundles, and plugin skills.
 pub struct ReadSkillTool {
+    config: Arc<Config>,
     workspace_dir: PathBuf,
-    open_skills_enabled: bool,
-    open_skills_dir: Option<String>,
-    allow_scripts: bool,
+    agent_alias: String,
 }
 
 impl ReadSkillTool {
-    pub fn new(
-        workspace_dir: PathBuf,
-        open_skills_enabled: bool,
-        open_skills_dir: Option<String>,
-        allow_scripts: bool,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, workspace_dir: PathBuf, agent_alias: String) -> Self {
         Self {
+            config,
             workspace_dir,
-            open_skills_enabled,
-            open_skills_dir,
-            allow_scripts,
+            agent_alias,
         }
     }
 }
@@ -68,11 +64,11 @@ impl Tool for ReadSkillTool {
                 anyhow::Error::msg("Missing 'name' parameter")
             })?;
 
-        let skills = crate::skills::load_skills_with_open_skills_settings(
+        // Load all skills for this agent (workspace + open-skills + bundles + plugins)
+        let skills = crate::skills::load_skills_for_agent(
             &self.workspace_dir,
-            self.open_skills_enabled,
-            self.open_skills_dir.as_deref(),
-            self.allow_scripts,
+            &self.config,
+            &self.agent_alias,
         );
 
         let Some(skill) = skills
@@ -129,10 +125,19 @@ impl Tool for ReadSkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use zeroclaw_config::schema::Config;
 
     fn make_tool(tmp: &TempDir) -> ReadSkillTool {
-        ReadSkillTool::new(tmp.path().join("workspace"), false, None, false)
+        let mut config = Config::default();
+        config.skills.open_skills_enabled = false;
+        config.skills.allow_scripts = false;
+        ReadSkillTool::new(
+            Arc::new(config),
+            tmp.path().join("workspace"),
+            "default".to_string(),
+        )
     }
 
     #[tokio::test]
@@ -219,7 +224,13 @@ description = "Ship safely"
 
         // Construct with allow_scripts=true. Pre-fix this resolved to false
         // inside the loader and the skill was skipped.
-        let tool = ReadSkillTool::new(tmp.path().join("workspace"), false, None, true);
+        let mut config = Config::default();
+        config.skills.allow_scripts = true;
+        let tool = ReadSkillTool::new(
+            Arc::new(config),
+            tmp.path().join("workspace"),
+            "default".to_string(),
+        );
         let result = tool.execute(json!({ "name": "setup" })).await.unwrap();
 
         assert!(
@@ -228,5 +239,114 @@ description = "Ship safely"
             result.error
         );
         assert!(result.output.contains("# Setup"));
+    }
+
+    #[tokio::test]
+    async fn reads_skill_from_agent_bundle() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{AliasedAgentConfig, SkillBundleConfig};
+
+        let tmp = TempDir::new().unwrap();
+
+        // Setup config with skill bundle and agent
+        let mut config = Config::default();
+        config.skill_bundles.insert(
+            "default".to_string(),
+            SkillBundleConfig {
+                directory: Some(tmp.path().join("bundles/default").display().to_string()),
+                ..Default::default()
+            },
+        );
+        // Ensure the "default" agent exists
+        config
+            .agents
+            .entry("default".to_string())
+            .or_insert_with(|| AliasedAgentConfig {
+                skill_bundles: vec!["default".to_string()],
+                ..Default::default()
+            });
+
+        // Create bundle skill
+        let bundle_dir = tmp.path().join("bundles/default/my-bundle-skill");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("SKILL.md"),
+            "# Bundle Skill\n\nThis skill comes from a bundle.\n",
+        )
+        .unwrap();
+
+        let tool = ReadSkillTool::new(
+            Arc::new(config),
+            tmp.path().join("workspace"),
+            "default".to_string(),
+        );
+
+        let result = tool
+            .execute(json!({ "name": "my-bundle-skill" }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "bundle skill should be found. error={:?}",
+            result.error
+        );
+        assert!(result.output.contains("# Bundle Skill"));
+    }
+
+    #[tokio::test]
+    async fn workspace_skill_overrides_bundle_skill() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{AliasedAgentConfig, SkillBundleConfig};
+
+        let tmp = TempDir::new().unwrap();
+
+        // Setup config with skill bundle and agent
+        let mut config = Config::default();
+        config.skill_bundles.insert(
+            "default".to_string(),
+            SkillBundleConfig {
+                directory: Some(tmp.path().join("bundles/default").display().to_string()),
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .entry("default".to_string())
+            .or_insert_with(|| AliasedAgentConfig {
+                skill_bundles: vec!["default".to_string()],
+                ..Default::default()
+            });
+
+        // Create workspace skill
+        let workspace_skill_dir = tmp.path().join("workspace/skills/weather");
+        std::fs::create_dir_all(&workspace_skill_dir).unwrap();
+        std::fs::write(
+            workspace_skill_dir.join("SKILL.md"),
+            "# Weather\n\nWorkspace version.\n",
+        )
+        .unwrap();
+
+        // Create bundle skill with same name
+        let bundle_dir = tmp.path().join("bundles/default/weather");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("SKILL.md"),
+            "# Weather\n\nBundle version.\n",
+        )
+        .unwrap();
+
+        let tool = ReadSkillTool::new(
+            Arc::new(config),
+            tmp.path().join("workspace"),
+            "default".to_string(),
+        );
+
+        let result = tool.execute(json!({ "name": "weather" })).await.unwrap();
+
+        assert!(result.success);
+        // Workspace skill takes precedence
+        assert!(result.output.contains("Workspace version"));
+        assert!(!result.output.contains("Bundle version"));
     }
 }
