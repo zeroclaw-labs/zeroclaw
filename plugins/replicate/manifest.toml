@@ -1,0 +1,7 @@
+name = "replicate"
+version = "0.1.0"
+description = "Run AI models (image, video, audio, text) via the Replicate API"
+author = "ZeroClaw Labs"
+wasm_path = "replicate.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
