@@ -15,6 +15,14 @@ MCP servers are configured under `[mcp]` and `[[mcp.servers]]` in `config.toml`.
 
 Keep `deferred_loading = true` (the default) to load tool schemas on demand — this minimizes initial token overhead.
 
+### Editing servers
+
+Three surfaces edit the same `[[mcp.servers]]` table:
+
+- **`config.toml`** — hand-edit the keys documented below. The full table is round-tripped on save.
+- **zerocode TUI** (`/config` → `mcp.servers`) — first-class per-field editor. The section shows one row per server (the row label is the server's `name`); enter a row to edit `transport`, `command` / `url`, `headers`, `env`, and `tool_timeout_secs` as individual fields. `+ Add` creates a new entry seeded with the name you supply; deleting from the alias list removes the entry. The `name` field is not edited inline (renaming the natural key mid-edit would invalidate every in-flight reference); use the dashboard or hand-edit `config.toml` to rename for now.
+- **Web dashboard** — currently renders `mcp.servers` through a JSON-array editor (the `ObjectArrayEditor` bridge). A migration to the same per-field surface the TUI uses is planned; until then the dashboard remains a usable but coarser editor.
+
 ### `[mcp]` keys
 
 | Key | Type | Default | Notes |
