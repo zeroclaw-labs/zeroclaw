@@ -68,39 +68,56 @@ subreddit = "rust"                        # optional: filter to a single subredd
 
 ## Mastodon
 
+The Mastodon channel speaks the standard Mastodon REST + Streaming APIs and works against any Mastodon-compatible instance (mastodon.social, fosstodon.org, hachyderm.io, Pleroma, GoToSocial). The agent reads inbound mentions and direct messages, then posts replies back as statuses. It is a polling channel — no inbound webhook or public route is required.
+
+**Getting credentials.** Mint a personal access token on your instance under **Settings → Development → New Application**. Grant the scopes `read`, `write:statuses`, and `read:notifications` (the last is required for inbound listening). The OAuth code-grant flow is not implemented; the manual token mint is the supported path for a single bot account.
+
 ```toml
 [channels.mastodon.default]
-enabled = true
-instance_url = "https://mastodon.social"
-access_token = "..."                       # Settings → Development → New Application (read, write:statuses, read:notifications)
-allowed_users = ["alice@mastodon.social"]  # user@instance; empty = deny all, "*" = allow all
-mention_only = true                        # only respond to statuses that @-mention the bot (DMs always count)
-visibility = "direct"                      # direct | private | unlisted | public — outbound reply visibility
-poll_interval_secs = 60                    # notification poll cadence
+enabled = true                             # must be explicitly enabled (default false)
+instance_url = "https://mastodon.social"   # instance base URL; trailing slash optional (stripped at load)
+access_token = "..."                        # PAT from Settings → Development → New Application (read, write:statuses, read:notifications)
+allowed_users = ["alice@mastodon.social"]  # user@instance form; empty = deny all, "*" = allow all (local accounts may omit @instance)
+mention_only = true                        # default true: only respond to statuses that @-mention the bot (DMs always count)
+visibility = "direct"                      # direct | private | unlisted | public — default direct (outbound reply visibility)
+poll_interval_secs = 60                    # default 60: polling fallback cadence when streaming is unavailable
+excluded_tools = []                        # tools withheld from the model on this channel
 ```
 
-- **Auth:** a personal access token from the instance's Development settings. Needs `read`, `write:statuses`, and `read:notifications` scopes.
-- **Inbound:** ActivityPub notifications — mentions and direct messages polled every `poll_interval_secs`.
-- **Outbound:** status replies posted at the configured `visibility` (defaults to `direct` so replies are not broadcast to public timelines).
+**How it works.** On `listen()` the channel first resolves its own account via `GET /api/v1/accounts/verify_credentials`, then subscribes to the user-stream WebSocket at `wss://{instance}/api/v1/streaming?stream=user&access_token=…` and routes `notification` events of type `mention` into prompts. Disconnects retry with exponential backoff (1s → 60s). After three consecutive connect failures the channel falls back to **polling** `GET /api/v1/notifications?types[]=mention` every `poll_interval_secs` (default 60, floored at 5s), deduping by `since_id`. Outbound replies are sent via `POST /api/v1/statuses` (bearer-auth) with `status`, `visibility`, and an optional `in_reply_to_id`; bodies over 500 characters are split into threaded chunks, each re-prefixed with the recipient `@mention` and an `(i/N)` marker.
+
+**Allowlist & filtering.** `allowed_users` lists accounts in `user@instance` form; an empty list **denies everyone**, `"*"` allows everyone, and matching is case-insensitive. Local-instance accounts may be listed bare (without `@instance`). When `mention_only` is true (the default) the bot ignores statuses that do not @-mention it, except `direct`-visibility statuses, which always count as mentions. The bot never reacts to its own statuses, and notification types other than `mention` (favourite, reblog, follow, poll) are ignored. Outbound replies use the configured `visibility`, which defaults to `direct` so replies are not broadcast to public timelines unless an operator explicitly opts in.
+
 - **Slot:** alias-keyed `[channels.mastodon.<alias>]` (any ActivityPub-compatible instance).
+- **Polling channel:** no inbound webhook or public route is needed. The `access_token` is a `#[secret]` config field — set it in config, not via environment variables.
 
 ## Lemmy
 
+The Lemmy channel works against any Lemmy-compatible instance (lemmy.world, beehaw.org, self-hosted). v1 focuses on **private messages only** — the simplest and most useful surface for a personal agent; comment/post listening is deferred. It is a polling channel — no inbound webhook or public route is required.
+
+**Getting credentials.** Two paths, with the pre-minted JWT checked first:
+
+1. **Username + password** — set `username` and `password` for the bot account; the channel calls `POST /api/v3/user/login` once at startup to mint a JWT and caches it in memory. v1 does not support 2FA via this path.
+2. **Pre-minted JWT** — copy a long-lived token from the Lemmy web UI (browser cookie / admin tools) into `jwt`. When non-empty it takes precedence over username/password and the login call is skipped. **Recommended for production and required for accounts with 2FA.**
+
 ```toml
 [channels.lemmy.default]
-enabled = true
-instance_url = "https://lemmy.world"
-username = "your-bot"                       # required when `jwt` is empty
-password = "..."                            # required when `jwt` is empty (prefer jwt in production)
-jwt = ""                                    # pre-minted JWT; takes precedence over username/password, required for 2FA accounts
-allowed_users = ["alice", "bob@lemmy.world"]  # bare or instance-qualified; empty = deny all, "*" = allow all
-poll_interval_secs = 30                     # private-message poll cadence (min 5)
+enabled = true                                # must be explicitly enabled (default false)
+instance_url = "https://lemmy.world"          # instance base URL; trailing slash optional (stripped at load)
+username = "your-bot"                          # bot account username; required when `jwt` is empty
+password = "..."                               # bot account password; required when `jwt` is empty (prefer jwt in production)
+jwt = ""                                       # pre-minted JWT; takes precedence over username/password, required for 2FA accounts
+allowed_users = ["alice", "bob@lemmy.world"]  # bare or instance-qualified; empty = deny all, "*" = allow all (case-insensitive)
+poll_interval_secs = 30                        # default 30: private-message poll cadence (floored at 5s)
+excluded_tools = []                            # tools withheld from the model on this channel
 ```
 
-- **Auth:** username + password auto-login at startup, or a pre-minted `jwt` (recommended for production, required for 2FA-enabled accounts).
-- **Inbound:** private messages via `GET /api/v3/private_message/list`, polled every `poll_interval_secs`.
-- **Outbound:** private-message replies.
+**How it works.** After acquiring a JWT (seed JWT or login), the channel resolves its own user id via `GET /api/v3/site` for self-suppression. Every `poll_interval_secs` (default 30, floored at 5s) it polls `GET /api/v3/private_message/list?unread_only=true&page=1&limit=20`. For each delivered message it builds a `ChannelMessage` with `reply_target = "pm:{creator_id}"`, then issues `POST /api/v3/private_message/mark_as_read` (best-effort) so the next poll does not re-deliver it; dropped messages are also marked read so they stop reappearing in the unread list. A 401 clears the cached auth and forces a re-login. Outbound replies are sent via `POST /api/v3/private_message` with `{recipient_id, content}` (bearer-auth); bodies over 10000 characters are split with `(i/N)` continuation markers.
+
+**Allowlist & filtering.** `allowed_users` may be **bare** (`"alice"`) or **instance-qualified** (`"alice@lemmy.world"`). An empty list **denies everyone**, `"*"` allows everyone, and matching is case-insensitive. A bare allowlist entry matches both bare and instance-qualified senders; a qualified entry requires an exact match on the full string. The bot never reacts to its own messages, and read or deleted messages are skipped.
+
 - **Slot:** alias-keyed `[channels.lemmy.<alias>]`.
+- **Polling channel:** no inbound webhook or public route is needed. The `password` and `jwt` fields are `#[secret]` config fields — set them in config, not via environment variables.
 
 ---
 

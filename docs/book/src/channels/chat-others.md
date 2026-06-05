@@ -188,34 +188,54 @@ Treats a Notion database as a message surface. Useful for asynchronous workflows
 
 ## Rocket.Chat
 
+The Rocket.Chat channel is a REST-polling integration against any Rocket.Chat-compatible server (rocket.chat cloud or self-hosted). It polls each configured room for new messages and replies via `chat.postMessage`. It is a polling channel — no inbound webhook or public route is required.
+
+**Getting credentials.** In the Rocket.Chat web UI, mint a Personal Access Token under **My Account → Personal Access Tokens → Add**. The PAT model requires two values, both shown in the creation dialog: the **token** itself (sent as the `X-Auth-Token` header) and the bot account's **`_id`** (sent as the `X-User-Id` header). Copy them into `auth_token` and `user_id` respectively.
+
 ```toml
 [channels.rocketchat.default]
-enabled = true
-server_url = "https://chat.example.com"
-auth_token = "..."                 # Personal Access Token (My Account → Personal Access Tokens), sent as X-Auth-Token
-user_id = "..."                    # bot account's _id, sent as X-User-Id (shown next to the token)
-allowed_users = ["alice"]          # usernames without leading @; empty = deny all, "*" = allow all
-room_ids = ["GENERAL"]             # DM / channel / private-group IDs to poll
-poll_interval_secs = 10            # REST poll cadence
+enabled = true                          # must be explicitly enabled (default false)
+server_url = "https://chat.example.com" # server base URL; trailing slash optional (stripped at load)
+auth_token = "..."                      # Personal Access Token (My Account → Personal Access Tokens), sent as X-Auth-Token
+user_id = "..."                         # bot account's _id, sent as X-User-Id (shown next to the token)
+allowed_users = ["alice"]               # usernames without leading @; empty = deny all, "*" = allow all
+room_ids = ["GENERAL"]                  # DM / channel / private-group IDs to poll
+poll_interval_secs = 10                 # default 10: REST poll cadence (floored at 2s)
+excluded_tools = []                     # tools withheld from the model on this channel
 ```
 
-REST-polling channel. Mint a Personal Access Token in Rocket.Chat and copy both the token and the bot's `_id` into `auth_token` and `user_id`. The agent polls each listed `room_ids` for new messages every `poll_interval_secs`. Slot: alias-keyed `[channels.rocketchat.<alias>]`.
+**How it works.** Every `poll_interval_secs` (default 10, floored at 2s) the channel iterates over each id in `room_ids` and calls `GET /api/v1/chat.syncMessages?roomId={id}&lastUpdate={iso8601}`, advancing a per-room cursor by the most recent `_updatedAt` it has seen (the first poll looks back 60 seconds). A `chat.postMessage` accepts a room id uniformly for DMs, channels, and private groups, so the reply target is simply the room id. Find a `room_id` via the admin REST API or by opening the channel in admin mode. When `room_ids` is empty the listener has nothing to poll and simply idles. Outbound replies are sent via `POST /api/v1/chat.postMessage` with `{roomId, text}` (both auth headers applied); Rocket.Chat enforces no hard per-message limit, but bodies over 4000 characters are split with `(i/N)` continuation markers so they render cleanly.
+
+**Allowlist & filtering.** `allowed_users` lists Rocket.Chat usernames **without** a leading `@`. An empty list **denies everyone**, `"*"` allows everyone, and matching is case-insensitive (a leading `@` on an entry is tolerated). The bot skips its own posts, system/bot-flagged messages, edited messages (ingestion is append-only), and empty bodies.
+
+- **Slot:** alias-keyed `[channels.rocketchat.<alias>]`.
+- **Polling channel:** no inbound webhook or public route is needed. The `auth_token` is a `#[secret]` config field — set it in config, not via environment variables.
 
 ## Zulip
 
+The Zulip channel works against any Zulip-compatible server (zulipchat.com or self-hosted), using the long-poll Events API for inbound and `messages.send` for outbound. It is a polling channel — no inbound webhook or public route is required.
+
+**Getting credentials.** Create a bot in the Zulip web UI under **Personal settings → Bots → Add a new bot**, then copy the bot's **email** and **API key** into `bot_email` and `api_key`. Both are sent as HTTP Basic auth (email as username, API key as password) on every request. The operator must also **subscribe the bot to each stream** listed in `streams` from the Zulip UI — v1 does not auto-subscribe.
+
 ```toml
 [channels.zulip.default]
-enabled = true
-server_url = "https://yourorg.zulipchat.com"
-bot_email = "agent-bot@yourorg.zulipchat.com"   # HTTP Basic auth username
+enabled = true                                   # must be explicitly enabled (default false)
+server_url = "https://yourorg.zulipchat.com"     # server base URL; trailing slash optional (stripped at load)
+bot_email = "agent-bot@yourorg.zulipchat.com"   # HTTP Basic auth username; also used to suppress self-messages
 api_key = "..."                                  # HTTP Basic auth password (Personal settings → Bots → Add a new bot)
-allowed_users = ["alice@yourorg.zulipchat.com"]  # empty = deny all, "*" = allow all (case-insensitive)
+allowed_users = ["alice@yourorg.zulipchat.com"]  # sender emails; empty = deny all, "*" = allow all (case-insensitive)
 streams = ["general"]                            # bot must be subscribed in the Zulip UI; empty = private messages only
-default_topic = "agent"                          # topic used when sending to a stream without an explicit topic
-event_timeout_secs = 60                          # long-poll timeout for GET /api/v1/events
+default_topic = "agent"                          # default "agent": topic used when sending to a stream without an explicit topic
+event_timeout_secs = 60                          # default 60: long-poll timeout for GET /api/v1/events
+excluded_tools = []                              # tools withheld from the model on this channel
 ```
 
-Long-poll channel against the Zulip Events API. Create a bot under **Personal settings → Bots → Add a new bot** and copy the bot email + API key. Subscribe the bot to each stream in `streams` from the Zulip UI (v1 does not auto-subscribe). Inbound mentions/messages arrive via long-polled `GET /api/v1/events`. Slot: alias-keyed `[channels.zulip.<alias>]`.
+**How it works.** On `listen()` the channel registers a long-poll event queue via `POST /api/v1/register` (`event_types=["message"]`, narrowed to the configured `streams`), then loops on `GET /api/v1/events?queue_id=…&last_event_id=…`. Each call blocks until a message arrives or `event_timeout_secs` (default 60) elapses, after which it reissues. The cursor advances on every successful poll. If Zulip expires the queue (`BAD_EVENT_QUEUE_ID`) the channel re-registers and resumes; other transient errors back off and retry. Outbound replies are sent via `POST /api/v1/messages` (form-urlencoded, Basic auth); bodies over 8000 characters are split with `(i/N)` continuation markers.
+
+**Allowlist, streams & topics.** `allowed_users` lists sender **emails**; an empty list **denies everyone**, `"*"` allows everyone, and matching is case-insensitive. `streams` are the streams to listen on (the bot must be subscribed to each); an **empty `streams` narrows to private-message events only**. When replying to a stream without an explicit topic, the channel uses `default_topic` (default `"agent"`). Recipient encoding for outbound sends: `stream:Stream Name`, `stream:Stream Name/Topic`, `private:user@example.com,user2@example.com` (multi-party DM), or a bare email (DM shorthand). The bot suppresses its own messages (`sender_email == bot_email`, case-insensitive) and skips edited messages.
+
+- **Slot:** alias-keyed `[channels.zulip.<alias>]`.
+- **Polling channel:** no inbound webhook or public route is needed. The `api_key` is a `#[secret]` config field — set it in config, not via environment variables.
 
 ---
 
