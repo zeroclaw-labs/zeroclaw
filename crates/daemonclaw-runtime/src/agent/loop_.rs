@@ -2610,9 +2610,9 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
-    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
-    let fallback_provider_loop = oni_fallback_provider();
-    let embedding_routes_loop = oni_embedding_routes();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+    let fallback_provider_loop = get_fallback_provider();
+    let embedding_routes_loop = get_embedding_routes();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
@@ -2765,8 +2765,8 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
-    let fallback_name_loop = oni_fallback_name();
-    let model_routes_loop = oni_model_routes();
+    let fallback_name_loop = get_fallback_name();
+    let model_routes_loop = get_model_routes();
     let mut provider_name = provider_override
         .as_deref()
         .or(fallback_name_loop.as_deref())
@@ -3270,7 +3270,7 @@ pub async fn run(
                             fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
                             fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
-                            &oni_model_routes(),
+                            &get_model_routes(),
                             &new_model,
                             &provider_runtime_options,
                         )?;
@@ -3587,7 +3587,7 @@ pub async fn run(
                                 fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
                                 fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
-                                &oni_model_routes(),
+                                &get_model_routes(),
                                 &new_model,
                                 &provider_runtime_options,
                             )?;
@@ -3741,9 +3741,9 @@ pub async fn process_message(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
-    let fallback_provider_pm = oni_fallback_provider();
-    let embedding_routes_pm = oni_embedding_routes();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+    let fallback_provider_pm = get_fallback_provider();
+    let embedding_routes_pm = get_embedding_routes();
     let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
@@ -3859,7 +3859,7 @@ pub async fn process_message(
         }
     }
 
-    let fallback_name_pm = oni_fallback_name();
+    let fallback_name_pm = get_fallback_name();
     let provider_name = fallback_name_pm.as_deref().unwrap_or("openrouter");
     let model_name = fallback_provider_pm
         .as_ref()
@@ -3872,7 +3872,7 @@ pub async fn process_message(
         fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
         fallback_provider_pm.as_ref().and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &oni_model_routes(),
+        &get_model_routes(),
         &model_name,
         &provider_runtime_options,
     )?;
@@ -4017,7 +4017,7 @@ pub async fn process_message(
     );
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
-        oni_fallback_provider()
+        get_fallback_provider()
             .as_ref()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)

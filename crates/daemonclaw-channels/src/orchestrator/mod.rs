@@ -808,18 +808,18 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
 }
 
 fn resolved_default_provider(_config: &Config) -> String {
-    daemonclaw_config::provider_store::oni_fallback_name()
+    daemonclaw_config::provider_store::get_fallback_name()
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
 fn resolved_default_model(_config: &Config) -> String {
-    daemonclaw_config::provider_store::oni_fallback_provider()
+    daemonclaw_config::provider_store::get_fallback_provider()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
-    let fp = daemonclaw_config::provider_store::oni_fallback_provider();
+    let fp = daemonclaw_config::provider_store::get_fallback_provider();
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
@@ -5042,7 +5042,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         daemonclaw_providers::provider_runtime_options_from_config(&config);
-    let fp_start = oni_fallback_provider();
+    let fp_start = get_fallback_provider();
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
@@ -5082,9 +5082,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
-    let fallback_provider_orch = oni_fallback_provider();
-    let embedding_routes_orch = oni_embedding_routes();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+    let fallback_provider_orch = get_fallback_provider();
+    let embedding_routes_orch = get_embedding_routes();
     let model = resolved_default_model(&config);
     let temperature = fallback_provider_orch
         .as_ref()
@@ -5528,8 +5528,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         autonomy_level: config.autonomy.level,
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
-        model_routes: Arc::new(oni_model_routes()),
-        query_classification: daemonclaw_config::provider_store::oni_classification_config(),
+        model_routes: Arc::new(get_model_routes()),
+        query_classification: daemonclaw_config::provider_store::get_classification_config(),
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {

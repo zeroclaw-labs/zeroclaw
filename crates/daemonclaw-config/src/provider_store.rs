@@ -137,27 +137,59 @@ impl ProviderStore {
         Ok(conn)
     }
 
+    fn migrate_table_names(&self) -> Result<()> {
+        let conn = self.connect()?;
+        let existing: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'oni_%'"
+            )?;
+            stmt.query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        if existing.is_empty() {
+            return Ok(());
+        }
+        let renames = [
+            ("oni_providers", "providers"),
+            ("oni_default_provider", "default_provider"),
+            ("oni_model_routes", "model_routes"),
+            ("oni_embedding_routes", "embedding_routes"),
+            ("oni_proxy", "proxy_settings"),
+            ("oni_classification_rules", "classification_rules"),
+            ("oni_classification_enabled", "classification_enabled"),
+        ];
+        for (old, new) in &renames {
+            if existing.iter().any(|t| t == *old) {
+                conn.execute(&format!("ALTER TABLE \"{old}\" RENAME TO \"{new}\""), [])?;
+            }
+        }
+        tracing::info!("Renamed {} legacy oni_* tables to generic names", existing.len());
+        Ok(())
+    }
+
     fn ensure_tables(&self) -> Result<()> {
+        self.migrate_table_names()?;
         let conn = self.connect()?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS oni_providers (
+            "CREATE TABLE IF NOT EXISTS providers (
                  name        TEXT PRIMARY KEY,
                  config_json TEXT NOT NULL
              );
 
-             CREATE TABLE IF NOT EXISTS oni_default_provider (
+             CREATE TABLE IF NOT EXISTS default_provider (
                  id   INTEGER PRIMARY KEY CHECK (id = 1),
                  name TEXT NOT NULL
              );
 
-             CREATE TABLE IF NOT EXISTS oni_model_routes (
+             CREATE TABLE IF NOT EXISTS model_routes (
                  hint     TEXT PRIMARY KEY,
                  provider TEXT NOT NULL,
                  model    TEXT NOT NULL,
                  api_key  TEXT
              );
 
-             CREATE TABLE IF NOT EXISTS oni_embedding_routes (
+             CREATE TABLE IF NOT EXISTS embedding_routes (
                  hint       TEXT PRIMARY KEY,
                  provider   TEXT NOT NULL,
                  model      TEXT NOT NULL,
@@ -165,12 +197,12 @@ impl ProviderStore {
                  api_key    TEXT
              );
 
-             CREATE TABLE IF NOT EXISTS oni_proxy (
+             CREATE TABLE IF NOT EXISTS proxy_settings (
                  id          INTEGER PRIMARY KEY CHECK (id = 1),
                  config_json TEXT NOT NULL
              );
 
-             CREATE TABLE IF NOT EXISTS oni_classification_rules (
+             CREATE TABLE IF NOT EXISTS classification_rules (
                  hint       TEXT PRIMARY KEY,
                  keywords   TEXT NOT NULL DEFAULT '[]',
                  patterns   TEXT NOT NULL DEFAULT '[]',
@@ -179,7 +211,7 @@ impl ProviderStore {
                  priority   INTEGER NOT NULL DEFAULT 0
              );
 
-             CREATE TABLE IF NOT EXISTS oni_classification_enabled (
+             CREATE TABLE IF NOT EXISTS classification_enabled (
                  id      INTEGER PRIMARY KEY CHECK (id = 1),
                  enabled INTEGER NOT NULL DEFAULT 0
              );",
@@ -198,12 +230,12 @@ impl ProviderStore {
     ) -> Result<bool> {
         let conn = self.connect()?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM oni_providers",
+            "SELECT COUNT(*) FROM providers",
             [],
             |r| r.get(0),
         )?;
         let has_default: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM oni_default_provider",
+            "SELECT COUNT(*) > 0 FROM default_provider",
             [],
             |r| r.get(0),
         )?;
@@ -216,28 +248,28 @@ impl ProviderStore {
             let json = serde_json::to_string(config)
                 .with_context(|| format!("Failed to serialize provider '{name}'"))?;
             conn.execute(
-                "INSERT OR IGNORE INTO oni_providers (name, config_json) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO providers (name, config_json) VALUES (?1, ?2)",
                 params![name, json],
             )?;
         }
 
         if let Some(ref fallback) = providers.fallback {
             conn.execute(
-                "INSERT OR REPLACE INTO oni_default_provider (id, name) VALUES (1, ?1)",
+                "INSERT OR REPLACE INTO default_provider (id, name) VALUES (1, ?1)",
                 params![fallback],
             )?;
         }
 
         for route in &providers.model_routes {
             conn.execute(
-                "INSERT OR IGNORE INTO oni_model_routes (hint, provider, model, api_key) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO model_routes (hint, provider, model, api_key) VALUES (?1, ?2, ?3, ?4)",
                 params![route.hint, route.provider, route.model, route.api_key],
             )?;
         }
 
         for route in &providers.embedding_routes {
             conn.execute(
-                "INSERT OR IGNORE INTO oni_embedding_routes (hint, provider, model, dimensions, api_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO embedding_routes (hint, provider, model, dimensions, api_key) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![route.hint, route.provider, route.model, route.dimensions.map(|d| d as i64), route.api_key],
             )?;
         }
@@ -245,7 +277,7 @@ impl ProviderStore {
         let proxy_json = serde_json::to_string(proxy)
             .context("Failed to serialize proxy config")?;
         conn.execute(
-            "INSERT OR REPLACE INTO oni_proxy (id, config_json) VALUES (1, ?1)",
+            "INSERT OR REPLACE INTO proxy_settings (id, config_json) VALUES (1, ?1)",
             params![proxy_json],
         )?;
 
@@ -253,12 +285,12 @@ impl ProviderStore {
             let keywords_json = serde_json::to_string(&rule.keywords)?;
             let patterns_json = serde_json::to_string(&rule.patterns)?;
             conn.execute(
-                "INSERT OR IGNORE INTO oni_classification_rules (hint, keywords, patterns, min_length, max_length, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO classification_rules (hint, keywords, patterns, min_length, max_length, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![rule.hint, keywords_json, patterns_json, rule.min_length.map(|v| v as i64), rule.max_length.map(|v| v as i64), rule.priority],
             )?;
         }
         conn.execute(
-            "INSERT OR REPLACE INTO oni_classification_enabled (id, enabled) VALUES (1, ?1)",
+            "INSERT OR REPLACE INTO classification_enabled (id, enabled) VALUES (1, ?1)",
             params![classification.enabled as i32],
         )?;
 
@@ -280,7 +312,7 @@ impl ProviderStore {
         }
         let conn = self.connect().ok()?;
         conn.query_row(
-            "SELECT name FROM oni_default_provider WHERE id = 1",
+            "SELECT name FROM default_provider WHERE id = 1",
             [],
             |r| r.get(0),
         )
@@ -298,7 +330,7 @@ impl ProviderStore {
         let conn = self.connect().ok()?;
         let json: String = conn
             .query_row(
-                "SELECT config_json FROM oni_providers WHERE name = ?1",
+                "SELECT config_json FROM providers WHERE name = ?1",
                 params![name],
                 |r| r.get(0),
             )
@@ -316,7 +348,7 @@ impl ProviderStore {
         let conn = self.connect().ok()?;
         let json: String = conn
             .query_row(
-                "SELECT config_json FROM oni_providers WHERE name = ?1",
+                "SELECT config_json FROM providers WHERE name = ?1",
                 params![name],
                 |r| r.get(0),
             )
@@ -329,7 +361,7 @@ impl ProviderStore {
             Ok(c) => c,
             Err(_) => return HashMap::new(),
         };
-        let mut stmt = match conn.prepare("SELECT name, config_json FROM oni_providers") {
+        let mut stmt = match conn.prepare("SELECT name, config_json FROM providers") {
             Ok(s) => s,
             Err(_) => return HashMap::new(),
         };
@@ -360,7 +392,7 @@ impl ProviderStore {
             Err(_) => return Vec::new(),
         };
         let mut stmt = match conn
-            .prepare("SELECT hint, provider, model, api_key FROM oni_model_routes ORDER BY hint")
+            .prepare("SELECT hint, provider, model, api_key FROM model_routes ORDER BY hint")
         {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -384,7 +416,7 @@ impl ProviderStore {
             Err(_) => return Vec::new(),
         };
         let mut stmt = match conn.prepare(
-            "SELECT hint, provider, model, dimensions, api_key FROM oni_embedding_routes ORDER BY hint",
+            "SELECT hint, provider, model, dimensions, api_key FROM embedding_routes ORDER BY hint",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -410,7 +442,7 @@ impl ProviderStore {
         };
         let json: Option<String> = conn
             .query_row(
-                "SELECT config_json FROM oni_proxy WHERE id = 1",
+                "SELECT config_json FROM proxy_settings WHERE id = 1",
                 [],
                 |r| r.get(0),
             )
@@ -457,7 +489,7 @@ impl ProviderStore {
     fn fallback_name_from_db(&self) -> Option<String> {
         let conn = self.connect().ok()?;
         conn.query_row(
-            "SELECT name FROM oni_default_provider WHERE id = 1",
+            "SELECT name FROM default_provider WHERE id = 1",
             [],
             |r| r.get(0),
         )
@@ -469,7 +501,7 @@ impl ProviderStore {
     pub fn set_fallback_name(&self, name: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
-            "INSERT OR REPLACE INTO oni_default_provider (id, name) VALUES (1, ?1)",
+            "INSERT OR REPLACE INTO default_provider (id, name) VALUES (1, ?1)",
             params![name],
         )?;
         Ok(())
@@ -486,7 +518,7 @@ impl ProviderStore {
             .with_context(|| format!("Failed to serialize provider '{name}'"))?;
         let conn = self.connect()?;
         conn.execute(
-            "INSERT OR REPLACE INTO oni_providers (name, config_json) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO providers (name, config_json) VALUES (?1, ?2)",
             params![name, json],
         )?;
         Ok(())
@@ -494,10 +526,10 @@ impl ProviderStore {
 
     pub fn set_model_routes(&self, routes: &[ModelRouteConfig]) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM oni_model_routes", [])?;
+        conn.execute("DELETE FROM model_routes", [])?;
         for route in routes {
             conn.execute(
-                "INSERT INTO oni_model_routes (hint, provider, model, api_key) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO model_routes (hint, provider, model, api_key) VALUES (?1, ?2, ?3, ?4)",
                 params![route.hint, route.provider, route.model, route.api_key],
             )?;
         }
@@ -507,7 +539,7 @@ impl ProviderStore {
     pub fn remove_model_route(&self, hint: &str) -> Result<usize> {
         let conn = self.connect()?;
         let removed = conn.execute(
-            "DELETE FROM oni_model_routes WHERE hint = ?1",
+            "DELETE FROM model_routes WHERE hint = ?1",
             params![hint],
         )?;
         Ok(removed)
@@ -515,10 +547,10 @@ impl ProviderStore {
 
     pub fn set_embedding_routes(&self, routes: &[EmbeddingRouteConfig]) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM oni_embedding_routes", [])?;
+        conn.execute("DELETE FROM embedding_routes", [])?;
         for route in routes {
             conn.execute(
-                "INSERT INTO oni_embedding_routes (hint, provider, model, dimensions, api_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO embedding_routes (hint, provider, model, dimensions, api_key) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![route.hint, route.provider, route.model, route.dimensions.map(|d| d as i64), route.api_key],
             )?;
         }
@@ -529,7 +561,7 @@ impl ProviderStore {
         let json = serde_json::to_string(proxy).context("Failed to serialize proxy config")?;
         let conn = self.connect()?;
         conn.execute(
-            "INSERT OR REPLACE INTO oni_proxy (id, config_json) VALUES (1, ?1)",
+            "INSERT OR REPLACE INTO proxy_settings (id, config_json) VALUES (1, ?1)",
             params![json],
         )?;
         Ok(())
@@ -543,14 +575,14 @@ impl ProviderStore {
 
         let enabled: bool = conn
             .query_row(
-                "SELECT enabled != 0 FROM oni_classification_enabled WHERE id = 1",
+                "SELECT enabled != 0 FROM classification_enabled WHERE id = 1",
                 [],
                 |r| r.get(0),
             )
             .unwrap_or(false);
 
         let mut stmt = match conn.prepare(
-            "SELECT hint, keywords, patterns, min_length, max_length, priority FROM oni_classification_rules ORDER BY priority DESC, hint",
+            "SELECT hint, keywords, patterns, min_length, max_length, priority FROM classification_rules ORDER BY priority DESC, hint",
         ) {
             Ok(s) => s,
             Err(_) => return QueryClassificationConfig { enabled, rules: Vec::new() },
@@ -582,17 +614,17 @@ impl ProviderStore {
 
     pub fn set_classification_config(&self, config: &QueryClassificationConfig) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM oni_classification_rules", [])?;
+        conn.execute("DELETE FROM classification_rules", [])?;
         for rule in &config.rules {
             let keywords_json = serde_json::to_string(&rule.keywords)?;
             let patterns_json = serde_json::to_string(&rule.patterns)?;
             conn.execute(
-                "INSERT INTO oni_classification_rules (hint, keywords, patterns, min_length, max_length, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO classification_rules (hint, keywords, patterns, min_length, max_length, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![rule.hint, keywords_json, patterns_json, rule.min_length.map(|v| v as i64), rule.max_length.map(|v| v as i64), rule.priority],
             )?;
         }
         conn.execute(
-            "INSERT OR REPLACE INTO oni_classification_enabled (id, enabled) VALUES (1, ?1)",
+            "INSERT OR REPLACE INTO classification_enabled (id, enabled) VALUES (1, ?1)",
             params![config.enabled as i32],
         )?;
         Ok(())
@@ -668,40 +700,40 @@ pub fn test_store_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn oni_fallback_name() -> Option<String> {
+pub fn get_fallback_name() -> Option<String> {
     STORE.get().and_then(|s| s.fallback_name())
 }
 
-pub fn oni_fallback_provider() -> Option<ModelProviderConfig> {
+pub fn get_fallback_provider() -> Option<ModelProviderConfig> {
     STORE.get().and_then(|s| s.fallback_provider())
 }
 
-pub fn oni_providers() -> HashMap<String, ModelProviderConfig> {
+pub fn get_providers() -> HashMap<String, ModelProviderConfig> {
     STORE
         .get()
         .map(|s| s.all_providers())
         .unwrap_or_default()
 }
 
-pub fn oni_model_routes() -> Vec<ModelRouteConfig> {
+pub fn get_model_routes() -> Vec<ModelRouteConfig> {
     STORE
         .get()
         .map(|s| s.model_routes())
         .unwrap_or_default()
 }
 
-pub fn oni_embedding_routes() -> Vec<EmbeddingRouteConfig> {
+pub fn get_embedding_routes() -> Vec<EmbeddingRouteConfig> {
     STORE
         .get()
         .map(|s| s.embedding_routes())
         .unwrap_or_default()
 }
 
-pub fn oni_proxy() -> ProxyConfig {
+pub fn get_proxy() -> ProxyConfig {
     STORE.get().map(|s| s.proxy()).unwrap_or_default()
 }
 
-pub fn oni_classification_config() -> QueryClassificationConfig {
+pub fn get_classification_config() -> QueryClassificationConfig {
     STORE
         .get()
         .map(|s| s.classification_config())
@@ -734,7 +766,7 @@ mod tests {
         let tables: Vec<String> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'oni_%' ORDER BY name",
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('providers','default_provider','model_routes','embedding_routes','proxy_settings','classification_rules','classification_enabled') ORDER BY name",
                 )
                 .unwrap();
             stmt.query_map([], |r| r.get(0))
@@ -742,11 +774,13 @@ mod tests {
                 .filter_map(|r| r.ok())
                 .collect()
         };
-        assert!(tables.contains(&"oni_providers".to_string()));
-        assert!(tables.contains(&"oni_default_provider".to_string()));
-        assert!(tables.contains(&"oni_model_routes".to_string()));
-        assert!(tables.contains(&"oni_embedding_routes".to_string()));
-        assert!(tables.contains(&"oni_proxy".to_string()));
+        assert!(tables.contains(&"providers".to_string()));
+        assert!(tables.contains(&"default_provider".to_string()));
+        assert!(tables.contains(&"model_routes".to_string()));
+        assert!(tables.contains(&"embedding_routes".to_string()));
+        assert!(tables.contains(&"proxy_settings".to_string()));
+        assert!(tables.contains(&"classification_rules".to_string()));
+        assert!(tables.contains(&"classification_enabled".to_string()));
     }
 
     #[test]

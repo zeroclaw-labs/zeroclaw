@@ -165,8 +165,8 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "200+ models, 1 API key",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("openrouter")
-                    && daemonclaw_config::provider_store::oni_fallback_provider()
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("openrouter")
+                    && daemonclaw_config::provider_store::get_fallback_provider()
                         .as_ref()
                         .and_then(|e| e.api_key.as_ref())
                         .is_some()
@@ -182,7 +182,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Claude 3.5/4 Sonnet & Opus",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("anthropic") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("anthropic") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -194,7 +194,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "GPT-4o, GPT-5, o1",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("openai") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("openai") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -206,7 +206,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Gemini 2.5 Pro/Flash",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_provider()
+                if daemonclaw_config::provider_store::get_fallback_provider()
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("google/"))
@@ -222,7 +222,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "DeepSeek V3 & R1",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_provider()
+                if daemonclaw_config::provider_store::get_fallback_provider()
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("deepseek/"))
@@ -238,7 +238,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Grok 3 & 4",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_provider()
+                if daemonclaw_config::provider_store::get_fallback_provider()
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("x-ai/"))
@@ -254,7 +254,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Mistral Large & Codestral",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_provider()
+                if daemonclaw_config::provider_store::get_fallback_provider()
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("mistral"))
@@ -270,7 +270,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Local models (Llama, etc.)",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("ollama") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("ollama") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -282,7 +282,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Search-augmented AI",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("perplexity") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("perplexity") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -294,7 +294,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Open-source models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(daemonclaw_config::provider_store::oni_fallback_name().as_deref(), Some("huggingface" | "hf")) {
+                if matches!(daemonclaw_config::provider_store::get_fallback_name().as_deref(), Some("huggingface" | "hf")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -307,7 +307,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if matches!(
-                    daemonclaw_config::provider_store::oni_fallback_name().as_deref(),
+                    daemonclaw_config::provider_store::get_fallback_name().as_deref(),
                     Some("lmstudio" | "lm-studio")
                 ) {
                     IntegrationStatus::Active
@@ -321,7 +321,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Privacy-first inference (Llama, Opus)",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("venice") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("venice") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -333,7 +333,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Vercel AI Gateway",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("vercel") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("vercel") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -345,7 +345,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Cloudflare AI Gateway",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("cloudflare") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("cloudflare") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -357,7 +357,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Kimi & Kimi Coding",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name()
+                if daemonclaw_config::provider_store::get_fallback_name()
                     .as_deref()
                     .is_some_and(is_moonshot_alias)
                 {
@@ -372,7 +372,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Synthetic AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("synthetic") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("synthetic") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -384,7 +384,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Code-focused AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("opencode") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("opencode") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -396,7 +396,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Subsidized Code-focused AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("opencode-go") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("opencode-go") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -408,7 +408,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref().is_some_and(is_zai_alias) {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref().is_some_and(is_zai_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -420,7 +420,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "ChatGLM / Zhipu models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref().is_some_and(is_glm_alias) {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref().is_some_and(is_glm_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -432,7 +432,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "MiniMax AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name()
+                if daemonclaw_config::provider_store::get_fallback_name()
                     .as_deref()
                     .is_some_and(is_minimax_alias)
                 {
@@ -447,7 +447,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Alibaba DashScope Qwen models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref().is_some_and(is_qwen_alias) {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref().is_some_and(is_qwen_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -459,7 +459,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "AWS managed model access",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("bedrock") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("bedrock") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -471,7 +471,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Baidu AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name()
+                if daemonclaw_config::provider_store::get_fallback_name()
                     .as_deref()
                     .is_some_and(is_qianfan_alias)
                 {
@@ -486,7 +486,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Ultra-fast LPU inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("groq") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("groq") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -498,7 +498,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Open-source model hosting",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("together") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("together") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -510,7 +510,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Fast open-source inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("fireworks") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("fireworks") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -522,7 +522,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Affordable open-source inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("novita") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("novita") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -534,7 +534,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Command R+ & embeddings",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if daemonclaw_config::provider_store::oni_fallback_name().as_deref() == Some("cohere") {
+                if daemonclaw_config::provider_store::get_fallback_name().as_deref() == Some("cohere") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available

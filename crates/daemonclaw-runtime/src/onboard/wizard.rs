@@ -481,7 +481,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     let has_channels = has_launchable_channels(&config.channels);
 
     if has_channels
-        && daemonclaw_config::provider_store::oni_fallback_provider()
+        && daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .is_some()
@@ -539,7 +539,7 @@ pub async fn run_channels_repair_wizard(callbacks: WizardCallbacks) -> Result<Co
     let has_channels = has_launchable_channels(&config.channels);
 
     if has_channels
-        && daemonclaw_config::provider_store::oni_fallback_provider()
+        && daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .is_some()
@@ -608,7 +608,7 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
 
     let has_channels = has_launchable_channels(&config.channels);
     if has_channels
-        && daemonclaw_config::provider_store::oni_fallback_provider()
+        && daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .is_some()
@@ -2262,7 +2262,7 @@ pub async fn run_models_refresh(
     provider_override: Option<&str>,
     force: bool,
 ) -> Result<()> {
-    let fallback_name_mr = daemonclaw_config::provider_store::oni_fallback_name();
+    let fallback_name_mr = daemonclaw_config::provider_store::get_fallback_name();
     let provider_name = provider_override
         .or(fallback_name_mr.as_deref())
         .unwrap_or("openrouter")
@@ -2299,7 +2299,7 @@ pub async fn run_models_refresh(
         return Ok(());
     }
 
-    let fp_refresh = daemonclaw_config::provider_store::oni_fallback_provider();
+    let fp_refresh = daemonclaw_config::provider_store::get_fallback_provider();
     let api_key = fp_refresh
         .as_ref()
         .and_then(|e| e.api_key.clone())
@@ -2358,7 +2358,7 @@ pub async fn run_models_refresh(
 }
 
 pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
-    let fallback_name_ml = daemonclaw_config::provider_store::oni_fallback_name();
+    let fallback_name_ml = daemonclaw_config::provider_store::get_fallback_name();
     let provider_name = provider_override
         .or(fallback_name_ml.as_deref())
         .unwrap_or("openrouter");
@@ -2383,7 +2383,7 @@ pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -
     );
     println!();
     for model in &cached.models {
-        let marker = if daemonclaw_config::provider_store::oni_fallback_provider()
+        let marker = if daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.model.as_deref())
             == Some(model.as_str())
@@ -2404,8 +2404,8 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
         anyhow::bail!("Model name cannot be empty");
     }
 
-    use daemonclaw_config::provider_store::{provider_store, oni_fallback_name};
-    let name = oni_fallback_name().unwrap_or_else(|| "default".into());
+    use daemonclaw_config::provider_store::{provider_store, get_fallback_name};
+    let name = get_fallback_name().unwrap_or_else(|| "default".into());
     let mut entry = provider_store().get_provider(&name).unwrap_or_default();
     entry.model = Some(model.to_string());
     provider_store().upsert_provider(&name, &entry)?;
@@ -2419,9 +2419,9 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
 }
 
 pub async fn run_models_status(config: &Config) -> Result<()> {
-    use daemonclaw_config::provider_store::{oni_fallback_name, oni_fallback_provider};
-    let fb_name_status = oni_fallback_name();
-    let fb_provider_status = oni_fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_name, get_fallback_provider};
+    let fb_name_status = get_fallback_name();
+    let fb_provider_status = get_fallback_provider();
     let provider = fb_name_status.as_deref().unwrap_or("openrouter");
     let model = fb_provider_status
         .as_ref()
@@ -6219,14 +6219,14 @@ fn print_summary(config: &Config) {
         "    {} Provider:      {}",
         style("🤖").cyan(),
         {
-            let n = daemonclaw_config::provider_store::oni_fallback_name();
+            let n = daemonclaw_config::provider_store::get_fallback_name();
             n.as_deref().unwrap_or("openrouter").to_string()
         }
     );
     println!(
         "    {} Model:         {}",
         style("🧠").cyan(),
-        daemonclaw_config::provider_store::oni_fallback_provider()
+        daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.model.as_deref())
             .unwrap_or("(default)")
@@ -6259,7 +6259,7 @@ fn print_summary(config: &Config) {
     println!(
         "    {} API Key:       {}",
         style("🔑").cyan(),
-        if daemonclaw_config::provider_store::oni_fallback_provider()
+        if daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .is_some()
@@ -6346,9 +6346,9 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let fb_name_ns = daemonclaw_config::provider_store::oni_fallback_name();
+    let fb_name_ns = daemonclaw_config::provider_store::get_fallback_name();
     let provider = fb_name_ns.as_deref().unwrap_or("openrouter");
-    if daemonclaw_config::provider_store::oni_fallback_provider()
+    if daemonclaw_config::provider_store::get_fallback_provider()
         .as_ref()
         .and_then(|e| e.api_key.as_deref())
         .is_none()

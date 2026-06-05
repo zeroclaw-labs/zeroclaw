@@ -10728,8 +10728,8 @@ impl Config {
         // Proxy env overrides and runtime cache are now handled via ProviderStore.
         // Apply proxy from the store into the runtime cache.
         {
-            use crate::provider_store::oni_proxy;
-            let mut proxy = oni_proxy();
+            use crate::provider_store::get_proxy;
+            let mut proxy = get_proxy();
 
             // Apply env overrides on top of the DB-stored proxy config.
             let explicit_proxy_enabled = std::env::var("DAEMONCLAW_PROXY_ENABLED")

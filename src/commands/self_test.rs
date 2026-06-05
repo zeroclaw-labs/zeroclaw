@@ -228,7 +228,7 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
     let mem = match crate::memory::create_memory(
         &config.memory,
         &config.workspace_dir,
-        daemonclaw_config::provider_store::oni_fallback_provider()
+        daemonclaw_config::provider_store::get_fallback_provider()
             .as_ref()
             .and_then(|e| e.api_key.as_deref()),
     ) {

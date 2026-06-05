@@ -433,10 +433,10 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes};
-    let fallback = oni_fallback_provider();
-    let fallback_name_gw = oni_fallback_name();
-    let embedding_routes_gw = oni_embedding_routes();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes};
+    let fallback = get_fallback_provider();
+    let fallback_name_gw = get_fallback_name();
+    let embedding_routes_gw = get_embedding_routes();
     let provider: Arc<dyn Provider> =
         Arc::from(daemonclaw_providers::create_resilient_provider_with_options(
             fallback_name_gw.as_deref().unwrap_or("openrouter"),
@@ -1560,7 +1560,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = daemonclaw_config::provider_store::oni_fallback_name()
+    let provider_label = daemonclaw_config::provider_store::get_fallback_name()
         .unwrap_or_else(|| "unknown".to_string());
     let model_label = state.model.clone();
     let started_at = Instant::now();

@@ -1211,29 +1211,29 @@ async fn main() -> Result<()> {
                 temperature,
                 ..
             } => {
-                use daemonclaw::config::provider_store::{provider_store, oni_fallback_provider, oni_fallback_name};
+                use daemonclaw::config::provider_store::{provider_store, get_fallback_provider, get_fallback_name};
                 let store = provider_store();
-                let fallback = oni_fallback_provider();
+                let fallback = get_fallback_provider();
                 let final_temperature = temperature
                     .unwrap_or_else(|| fallback.as_ref().and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &provider {
                     let _ = store.set_fallback_name(p);
                 }
                 if let Some(m) = &model {
-                    let fb_name = oni_fallback_name().unwrap_or_else(|| "openai".to_string());
+                    let fb_name = get_fallback_name().unwrap_or_else(|| "openai".to_string());
                     let mut entry = store.get_provider(&fb_name).unwrap_or_default();
                     entry.model = Some(m.clone());
                     let _ = store.upsert_provider(&fb_name, &entry);
                 }
                 {
-                    let fb_name = oni_fallback_name().unwrap_or_else(|| "openai".to_string());
+                    let fb_name = get_fallback_name().unwrap_or_else(|| "openai".to_string());
                     let mut entry = store.get_provider(&fb_name).unwrap_or_default();
                     entry.temperature = Some(final_temperature);
                     let _ = store.upsert_provider(&fb_name, &entry);
                 }
 
-                let fb = oni_fallback_provider();
-                let provider_name_owned = oni_fallback_name().unwrap_or_else(|| "openai".to_string());
+                let fb = get_fallback_provider();
+                let provider_name_owned = get_fallback_name().unwrap_or_else(|| "openai".to_string());
                 let provider = daemonclaw::providers::create_provider(
                     &provider_name_owned,
                     fb.as_ref().and_then(|e| e.api_key.as_deref()),
@@ -1290,7 +1290,7 @@ async fn main() -> Result<()> {
             peripheral,
         } => {
             let final_temperature = temperature.unwrap_or_else(|| {
-                daemonclaw_config::provider_store::oni_fallback_provider()
+                daemonclaw_config::provider_store::get_fallback_provider()
                     .as_ref()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7)
@@ -1543,11 +1543,11 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                daemonclaw_config::provider_store::oni_fallback_name().as_deref().unwrap_or("openrouter")
+                daemonclaw_config::provider_store::get_fallback_name().as_deref().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
-                daemonclaw_config::provider_store::oni_fallback_provider()
+                daemonclaw_config::provider_store::get_fallback_provider()
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(default)")
@@ -1699,7 +1699,7 @@ async fn main() -> Result<()> {
 
         Commands::Providers => {
             let providers = providers::list_providers();
-            let current = daemonclaw_config::provider_store::oni_fallback_name()
+            let current = daemonclaw_config::provider_store::get_fallback_name()
                 .as_deref()
                 .unwrap_or("openrouter")
                 .trim()

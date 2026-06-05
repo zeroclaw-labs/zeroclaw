@@ -434,10 +434,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Provider validity
-    use daemonclaw_config::provider_store::{oni_fallback_name, oni_fallback_provider, oni_model_routes, oni_embedding_routes};
-    let fallback_name_doc = oni_fallback_name();
+    use daemonclaw_config::provider_store::{get_fallback_name, get_fallback_provider, get_model_routes, get_embedding_routes};
+    let fallback_name_doc = get_fallback_name();
     let fallback_provider = fallback_name_doc.as_deref();
-    let fallback_provider_doc = oni_fallback_provider();
+    let fallback_provider_doc = get_fallback_provider();
     if let Some(provider) = fallback_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
@@ -523,7 +523,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model routes validation
-    let model_routes_doc = oni_model_routes();
+    let model_routes_doc = get_model_routes();
     for route in &model_routes_doc {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
@@ -546,7 +546,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Embedding routes validation
-    let embedding_routes_doc = oni_embedding_routes();
+    let embedding_routes_doc = get_embedding_routes();
     for route in &embedding_routes_doc {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));

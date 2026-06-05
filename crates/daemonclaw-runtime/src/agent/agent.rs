@@ -391,9 +391,9 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        use daemonclaw_config::provider_store::{oni_fallback_provider, oni_fallback_name, oni_embedding_routes, oni_model_routes};
-        let fallback_provider_ag = oni_fallback_provider();
-        let embedding_routes_ag = oni_embedding_routes();
+        use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+        let fallback_provider_ag = get_fallback_provider();
+        let embedding_routes_ag = get_embedding_routes();
         let memory: Arc<dyn Memory> =
             Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
@@ -508,7 +508,7 @@ impl Agent {
             }
         }
 
-        let fallback_name_ag = oni_fallback_name();
+        let fallback_name_ag = get_fallback_name();
         let provider_name = fallback_name_ag.as_deref().unwrap_or("openrouter");
 
         let model_name = fallback_provider_ag
@@ -520,7 +520,7 @@ impl Agent {
         let provider_runtime_options =
             daemonclaw_providers::provider_runtime_options_from_config(config);
 
-        let model_routes_ag = oni_model_routes();
+        let model_routes_ag = get_model_routes();
         let provider: Box<dyn Provider> = daemonclaw_providers::create_routed_provider_with_options(
             provider_name,
             fallback_provider_ag.as_ref().and_then(|e| e.api_key.as_deref()),
@@ -595,7 +595,7 @@ impl Agent {
                     .unwrap_or(0.7),
             )
             .workspace_dir(config.workspace_dir.clone())
-            .classification_config(daemonclaw_config::provider_store::oni_classification_config())
+            .classification_config(daemonclaw_config::provider_store::get_classification_config())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
@@ -1477,7 +1477,7 @@ pub async fn run(
 ) -> Result<()> {
     let start = Instant::now();
 
-    use daemonclaw_config::provider_store::{provider_store, oni_fallback_name as efn, oni_fallback_provider as efp};
+    use daemonclaw_config::provider_store::{provider_store, get_fallback_name as efn, get_fallback_provider as efp};
     let effective_config = config;
     if let Some(p) = provider_override {
         let _ = provider_store().set_fallback_name(&p);

@@ -118,7 +118,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(daemonclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
-        "provider": daemonclaw_config::provider_store::oni_fallback_name(),
+        "provider": daemonclaw_config::provider_store::get_fallback_name(),
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,

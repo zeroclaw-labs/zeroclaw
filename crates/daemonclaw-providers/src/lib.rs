@@ -742,8 +742,8 @@ impl Default for ProviderRuntimeOptions {
 pub fn provider_runtime_options_from_config(
     config: &daemonclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
-    use daemonclaw_config::provider_store::{oni_fallback_provider, oni_providers};
-    let fallback = oni_fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_providers};
+    let fallback = get_fallback_provider();
     // Resolve merge_system_into_user from the active model provider profile by
     // matching api_url — providers are now in the DB-backed store.
     let merge_system_into_user = fallback
@@ -752,7 +752,7 @@ pub fn provider_runtime_options_from_config(
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .and_then(|active_url| {
-            let providers = oni_providers();
+            let providers = get_providers();
             providers.into_values().find(|p| {
                 p.base_url
                     .as_deref()
