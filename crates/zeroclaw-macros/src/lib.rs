@@ -128,6 +128,7 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         integration,
         resource_key,
         credential_class,
+        natural_key,
         tab
     )
 )]
@@ -236,6 +237,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
             Err(err) => return err.to_compile_error().into(),
@@ -1178,24 +1180,30 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
             } else if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
                 // ── Nested Vec<T> ──
-                // Vec doesn't implement Configurable, so we cannot delegate
-                // get_prop / set_prop / prop_fields / init_defaults to the
-                // field directly — those address an element by name and a
-                // Vec carries no name index. The list-section emission below
-                // handles `+ Add` and per-entry creation; per-prop access to
-                // elements happens through the schema's natural-key routing
-                // once entries are inserted.
+                // Vec doesn't implement Configurable, so we cannot blindly
+                // delegate get_prop / set_prop / prop_fields / init_defaults
+                // to the field directly — those address an element by name
+                // and a Vec carries no name index of its own. The list-section
+                // emission below handles `+ Add` and per-entry creation.
                 //
                 // Bulk-walk operations (encrypt / decrypt / mask / restore /
-                // secret_fields / set_secret), however, only need to iterate
-                // the Vec and dispatch on each element's own `T` method —
-                // they don't address by name. So those DO push here, mirroring
-                // the single-level `HashMap<String, T>` traversal above.
+                // secret_fields / set_secret) only need to iterate the Vec
+                // and dispatch on each element's own `T` method — they don't
+                // address by name. Those always push here, mirroring the
+                // single-level `HashMap<String, T>` traversal above.
                 //
-                // Intentionally NO push to nested_prop_fields / nested_get_prop /
-                // nested_set_prop / nested_prop_is_secret / init_defaults_ops /
-                // map_key_recurse / create_map_key_recurse for Vec<T> + #[nested]
-                // — all those call methods Vec doesn't have.
+                // Per-element property routing (prop_fields, get_prop,
+                // set_prop, prop_is_secret) is gated on an explicit
+                // `#[natural_key = "<field>"]` attribute on the Vec field
+                // (see schema.rs `mcp.servers` for the canonical use). When
+                // the attribute is present the derive also emits
+                // get_map_keys / delete_map_key / rename_map_key arms so
+                // the section behaves like a `HashMap<String, T>` from the
+                // dashboard / TUI's point of view. Without it, the Vec stays
+                // in the legacy `ObjectArray` whole-array round-trip mode —
+                // unchanged from prior behaviour, so unrelated schema
+                // sections (peripheral.boards, classification rules, …)
+                // are not affected by this commit.
                 nested_collect.push(quote! {
                     for inner in self.#field_ident.iter() {
                         fields.extend(inner.secret_fields());
@@ -1283,6 +1291,342 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
+
+                // ── Per-element routing for `#[natural_key = "..."]` Vecs ──
+                // Gated on the explicit field attribute: Vec sections without
+                // a declared natural-key field keep the legacy behaviour
+                // (whole-array round-trip through `ObjectArray` `set_prop`),
+                // so unrelated schema sections (peripheral.boards,
+                // classification rules, …) don't change shape under this commit.
+                //
+                // The single source of truth for "what is this Vec's natural
+                // key field" lives at the field site in `schema.rs`, e.g.
+                //   #[natural_key = "name"]
+                //   pub servers: Vec<McpServerConfig>,
+                // The derive forwards property paths of the form
+                // `<my_prefix>.<field>.<natural_key>.<inner_suffix>` to the
+                // matched element's own `get_prop` / `set_prop`, using the
+                // `route_vec_path` helper for the parsing + ambiguity check.
+                //
+                // The `name` (or whichever natural-key) field is treated
+                // as read-only via per-element routing: callers that need
+                // to rename use `config_map_key_rename`, which mutates the
+                // natural key through `rename_map_key` arms (see below).
+                // This keeps the natural key stable from the routing
+                // function's point of view during in-flight edits.
+                if let Some(nk_field) = &natural_key_field {
+                    let nk_field_lit = nk_field.clone();
+                    // get_map_keys: enumerate live natural keys. Order
+                    // matches Vec insertion order so the TUI alias list
+                    // is stable across reloads.
+                    get_map_keys_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #vec_field_name_lit)
+                            };
+                            if section_path == expected {
+                                let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                                let nk_path = if inner_prefix.is_empty() {
+                                    #nk_field_lit.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{}", #nk_field_lit)
+                                };
+                                return Some(
+                                    self.#field_ident
+                                        .iter()
+                                        .map(|e| e.get_prop(&nk_path).unwrap_or_default())
+                                        .collect(),
+                                );
+                            }
+                        }
+                    });
+
+                    // delete_map_key: remove the first element whose
+                    // natural key matches. Duplicate-key configs are
+                    // already a validator-rejected state; the routing
+                    // surface refuses to silently pick one duplicate
+                    // (see VecRoute::Ambiguous), so here we delete the
+                    // first match and let the operator re-invoke for
+                    // the rest. Returns Ok(false) when no element matches.
+                    delete_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #vec_field_name_lit)
+                            };
+                            if section_path == expected {
+                                let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                                let nk_path = if inner_prefix.is_empty() {
+                                    #nk_field_lit.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{}", #nk_field_lit)
+                                };
+                                let pos = self.#field_ident.iter().position(|e| {
+                                    e.get_prop(&nk_path).as_deref() == Ok(map_key)
+                                });
+                                if let Some(idx) = pos {
+                                    self.#field_ident.remove(idx);
+                                    return Ok(true);
+                                }
+                                return Ok(false);
+                            }
+                        }
+                    });
+
+                    // rename_map_key: validate new key, ensure it isn't
+                    // already taken, then mutate the matched element's
+                    // natural-key field via its own set_prop. Refuses
+                    // when the source key is ambiguous (two elements
+                    // share it) — operator must repair first.
+                    rename_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #vec_field_name_lit)
+                            };
+                            if section_path == expected {
+                                let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                                let nk_path = if inner_prefix.is_empty() {
+                                    #nk_field_lit.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{}", #nk_field_lit)
+                                };
+                                let mut hits: Vec<usize> = self.#field_ident
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, e)| {
+                                        if e.get_prop(&nk_path).as_deref() == Ok(map_key) {
+                                            Some(i)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if hits.is_empty() {
+                                    return Ok(false);
+                                }
+                                if hits.len() > 1 {
+                                    return Err(format!(
+                                        "natural key `{map_key}` is ambiguous in `{expected}`: \
+                                         {} entries share it; fix duplicates before renaming",
+                                        hits.len()
+                                    ));
+                                }
+                                let already_taken = self.#field_ident.iter().any(|e| {
+                                    e.get_prop(&nk_path).as_deref() == Ok(new_key)
+                                });
+                                if already_taken {
+                                    return Err(format!(
+                                        "natural key `{new_key}` already exists in `{expected}`",
+                                    ));
+                                }
+                                let idx = hits.remove(0);
+                                self.#field_ident[idx]
+                                    .set_prop(&nk_path, new_key)
+                                    .map_err(|e| format!(
+                                        "set `{nk_path}` on `{expected}[{idx}]` failed: {e}",
+                                    ))?;
+                                return Ok(true);
+                            }
+                        }
+                    });
+
+                    // prop_fields: enumerate each element's own
+                    // prop_fields, prefix child paths as
+                    // `<outer>.<natural_key>.<leaf>`. Elements whose
+                    // natural key is empty (half-created entries) are
+                    // emitted with an `<unnamed-N>` placeholder so the
+                    // TUI still shows them — otherwise an empty-name
+                    // entry would silently vanish from the alias list.
+                    //
+                    // The natural-key field itself is filtered out of
+                    // the per-element prop list: it is not editable
+                    // through `set_prop` (use rename_map_key), so the
+                    // TUI must not surface it as an editable row.
+                    nested_prop_fields.push(quote! {
+                        {
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let outer_prefix = if Self::configurable_prefix().is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #vec_field_name_lit)
+                            };
+                            let nk_path = if inner_prefix.is_empty() {
+                                #nk_field_lit.to_string()
+                            } else {
+                                format!("{inner_prefix}.{}", #nk_field_lit)
+                            };
+                            for (idx, inner) in self.#field_ident.iter().enumerate() {
+                                let nk = inner.get_prop(&nk_path).unwrap_or_default();
+                                let key = if nk.is_empty() {
+                                    format!("<unnamed-{idx}>")
+                                } else {
+                                    nk
+                                };
+                                let base = format!("{outer_prefix}.{key}");
+                                for mut field in inner.prop_fields() {
+                                    if field.name == nk_path {
+                                        // Hide the natural-key field from
+                                        // the per-element editor; rename
+                                        // goes through rename_map_key.
+                                        continue;
+                                    }
+                                    let leaf = field
+                                        .name
+                                        .strip_prefix(inner_prefix)
+                                        .and_then(|s| s.strip_prefix('.'))
+                                        .unwrap_or(field.name.as_str())
+                                        .to_string();
+                                    field.name = if leaf.is_empty() {
+                                        base.clone()
+                                    } else {
+                                        format!("{base}.{leaf}")
+                                    };
+                                    fields.push(field);
+                                }
+                            }
+                        }
+                    });
+
+                    // get_prop: dispatch via `route_vec_path`, surface
+                    // ambiguity as an Err so the caller sees the broken
+                    // state rather than reading whichever duplicate
+                    // happened to come first.
+                    nested_get_prop.push(quote! {
+                        {
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let nk_path = if inner_prefix.is_empty() {
+                                #nk_field_lit.to_string()
+                            } else {
+                                format!("{inner_prefix}.{}", #nk_field_lit)
+                            };
+                            let nk_values: Vec<String> = self.#field_ident
+                                .iter()
+                                .map(|e| e.get_prop(&nk_path).unwrap_or_default())
+                                .collect();
+                            match crate::config::route_vec_path(
+                                name,
+                                Self::configurable_prefix(),
+                                #vec_field_name_lit,
+                                <#vec_inner_ty>::configurable_prefix(),
+                                nk_values.iter().enumerate().map(|(i, s)| (i, s.as_str())),
+                            ) {
+                                crate::config::VecRoute::Hit { index, inner_name } => {
+                                    if let Some(inner) = self.#field_ident.get(index)
+                                        && let Ok(val) = inner.get_prop(&inner_name)
+                                    {
+                                        return Ok(val);
+                                    }
+                                }
+                                crate::config::VecRoute::Ambiguous { key, count } => {
+                                    return Err(format!(
+                                        "natural key `{key}` is ambiguous in `{}.{}`: \
+                                         {count} entries share it; fix duplicates first",
+                                        Self::configurable_prefix(),
+                                        #vec_field_name_lit,
+                                    ));
+                                }
+                                crate::config::VecRoute::Miss => {}
+                            }
+                        }
+                    });
+
+                    // set_prop: same routing as get_prop. The natural-key
+                    // field itself is read-only here — use rename_map_key
+                    // to change it.
+                    nested_set_prop.push(quote! {
+                        {
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let nk_path = if inner_prefix.is_empty() {
+                                #nk_field_lit.to_string()
+                            } else {
+                                format!("{inner_prefix}.{}", #nk_field_lit)
+                            };
+                            let nk_values: Vec<String> = self.#field_ident
+                                .iter()
+                                .map(|e| e.get_prop(&nk_path).unwrap_or_default())
+                                .collect();
+                            match crate::config::route_vec_path(
+                                name,
+                                Self::configurable_prefix(),
+                                #vec_field_name_lit,
+                                <#vec_inner_ty>::configurable_prefix(),
+                                nk_values.iter().enumerate().map(|(i, s)| (i, s.as_str())),
+                            ) {
+                                crate::config::VecRoute::Hit { index, inner_name } => {
+                                    if inner_name == nk_path {
+                                        return Err(format!(
+                                            "`{nk_path}` is the natural key for `{}.{}` \
+                                             entries and is read-only; use \
+                                             config_map_key_rename to change it",
+                                            Self::configurable_prefix(),
+                                            #vec_field_name_lit,
+                                        ));
+                                    }
+                                    if let Some(inner) = self.#field_ident.get_mut(index)
+                                        && inner.set_prop(&inner_name, value_str).is_ok()
+                                    {
+                                        return Ok(());
+                                    }
+                                }
+                                crate::config::VecRoute::Ambiguous { key, count } => {
+                                    return Err(format!(
+                                        "natural key `{key}` is ambiguous in `{}.{}`: \
+                                         {count} entries share it; fix duplicates first",
+                                        Self::configurable_prefix(),
+                                        #vec_field_name_lit,
+                                    ));
+                                }
+                                crate::config::VecRoute::Miss => {}
+                            }
+                        }
+                    });
+
+                    // prop_is_secret: static dispatch (no &self), so we
+                    // can't consult live natural keys. Iterate every
+                    // dot-split of `rest` and ask the inner type — same
+                    // shape as the HashMap arm. False negatives here
+                    // mean a secret leak through encryption-skip, so
+                    // bias toward over-marking.
+                    nested_prop_is_secret.push(quote! {
+                        {
+                            let key_prefix = if Self::configurable_prefix().is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #vec_field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&key_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                                let mut splits: Vec<usize> = rest
+                                    .match_indices('.')
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                splits.reverse();
+                                for split_at in splits {
+                                    let inner_suffix = &rest[split_at + 1..];
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if <#vec_inner_ty>::prop_is_secret(&inner_name) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             } else {
                 let plain_field_name_lit = snake_to_kebab(&field_ident.to_string());
                 let plain_field_doc = extract_doc(&field.attrs);
