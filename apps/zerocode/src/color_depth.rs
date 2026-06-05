@@ -26,10 +26,11 @@ pub(crate) enum ColorDepth {
 static DEPTH: OnceLock<ColorDepth> = OnceLock::new();
 
 /// The terminal's colour depth, detected once from the environment on first
-/// use and memoised. Detection reads `ZEROCODE_COLOR`, `COLORTERM`, `TERM`,
-/// `TERM_PROGRAM`, and tmux presence. Lazy initialisation means callers
-/// never need an explicit startup hook — the first themed colour to render
-/// triggers it.
+/// use and memoised. Detection honours the `ZEROCODE_COLOR` override, then
+/// falls back to truecolor for every terminal except a `dumb`/`ansi`/`-16color`
+/// / empty `TERM`, which gets ANSI-16. Lazy initialisation means callers never
+/// need an explicit startup hook — the first themed colour to render triggers
+/// it.
 pub(crate) fn active() -> ColorDepth {
     *DEPTH.get_or_init(|| {
         detect_from_env(

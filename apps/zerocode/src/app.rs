@@ -118,15 +118,12 @@ pub async fn run(
     config_dir: &std::path::Path,
 ) -> Result<bool> {
     let mut mode = Mode::Dashboard;
-    // Per-agent theme overrides resolved from `[theme.agent_override.<alias>]`.
-    // When the Code or Chat pane is focused on a listed agent, its theme
-    // replaces the base theme for that frame. Resolved once per `run` (i.e. per
-    // reconnect cycle); a bad override name is reported and skipped rather than
-    // aborting the whole TUI.
     // Per-agent theme overrides live in a process-global registry (theme.rs),
     // mirroring how the global theme works: the Config pane writes there on
-    // assign/clear so changes apply live, and we read it each frame to tint the
-    // Code/Chat pane for the focused agent. Seed it once from config here.
+    // assign/clear so changes apply live, and the draw loop reads it each frame
+    // to tint the Code/Chat pane for the focused agent. Seed it once from config
+    // here; an unknown override name resolves to the terminal theme rather than
+    // aborting.
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut show_help = false;
     let mut reload_confirm = false;
