@@ -53,6 +53,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+# Form-urlencoded parsing for SMS channel webhooks (Twilio/Plivo/Vonage).
+serde_urlencoded = "0.7"
 
 # Error handling
 anyhow = "1.0"
@@ -92,6 +94,11 @@ channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
+channel-twilio = ["zeroclaw-channels/channel-twilio"]
+channel-plivo = ["zeroclaw-channels/channel-plivo"]
+channel-telnyx = ["zeroclaw-channels/channel-telnyx"]
+channel-sinch = ["zeroclaw-channels/channel-sinch"]
+channel-vonage = ["zeroclaw-channels/channel-vonage"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated

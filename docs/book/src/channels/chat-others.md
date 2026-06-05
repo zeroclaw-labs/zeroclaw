@@ -186,6 +186,67 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## SMS Providers (webhook-based)
+
+All five SMS channels are alias-keyed (`[channels.<name>.<alias>]`), feature-gated
+(`channel-<name>`), and webhook-driven: the gateway hosts a fixed inbound route and
+verifies the provider's signature before dispatching to the agent. `allowed_numbers`
+gates inbound senders — empty denies everyone, `"*"` allows all, otherwise an exact
+E.164 match. Outbound long messages are chunked automatically.
+
+| Provider | Webhook path | Signature scheme |
+| --- | --- | --- |
+| Twilio | `/twilio/sms` | HMAC-SHA1 over URL + sorted form params (`X-Twilio-Signature`) |
+| Plivo  | `/plivo/sms`  | HMAC-SHA256 V3 over URL + nonce + body (`X-Plivo-Signature-V3`) |
+| Telnyx | `/telnyx/sms` | Ed25519 over `timestamp\|body` (`telnyx-signature-ed25519`) |
+| Sinch  | `/sinch/sms`  | HMAC-SHA256 over nonce + body (`x-sinch-webhook-signature`) |
+| Vonage | `/vonage/sms` | HMAC-SHA256 over sorted form params (`sig` param) |
+
+```toml
+[channels.twilio.default]
+enabled = true
+account_sid = "AC..."
+auth_token = "..."                 # also the inbound webhook HMAC key
+from_number = "+15555550100"
+allowed_numbers = ["+15555550199"]
+
+[channels.plivo.default]
+enabled = true
+account_id = "..."
+auth_token = "..."
+from_number = "+15555550100"
+allowed_numbers = ["*"]
+
+[channels.telnyx.default]
+enabled = true
+api_key = "..."
+from_number = "+15555550100"
+messaging_profile_id = "..."       # optional
+public_key = "..."                 # base64 Ed25519 key from the Telnyx portal
+allowed_numbers = ["+15555550199"]
+
+[channels.sinch.default]
+enabled = true
+service_plan_id = "..."
+api_token = "..."
+region = "us"                      # or "eu"
+from_number = "+15555550100"
+callback_secret = "..."            # distinct from api_token
+allowed_numbers = ["+15555550199"]
+
+[channels.vonage.default]
+enabled = true
+api_key = "..."
+api_secret = "..."
+from_number_or_sender_id = "+15555550100"
+signature_secret = "..."           # distinct from api_secret
+allowed_numbers = ["+15555550199"]
+```
+
+Point each provider's inbound-message webhook at `https://<gateway>/<path>` (add your
+gateway path prefix if configured). Twilio and Plivo sign the destination URL, so set
+`X-Forwarded-Proto`/`X-Forwarded-Host` correctly when behind a reverse proxy or tunnel.
+
 ---
 
 ## When to prefer a dedicated guide

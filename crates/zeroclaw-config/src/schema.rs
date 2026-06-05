@@ -10381,6 +10381,26 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub wati: HashMap<String, WatiConfig>,
+    /// Twilio SMS channel instances (`[channels.twilio.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub twilio: HashMap<String, TwilioConfig>,
+    /// Plivo SMS channel instances (`[channels.plivo.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub plivo: HashMap<String, PlivoConfig>,
+    /// Telnyx SMS channel instances (`[channels.telnyx.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub telnyx: HashMap<String, TelnyxConfig>,
+    /// Sinch SMS channel instances (`[channels.sinch.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub sinch: HashMap<String, SinchConfig>,
+    /// Vonage SMS channel instances (`[channels.vonage.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub vonage: HashMap<String, VonageConfig>,
     /// Nextcloud Talk bot channel instances (`[channels.nextcloud_talk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10576,6 +10596,36 @@ impl ChannelsConfig {
                 configured: !self.wati.is_empty(),
             },
             ChannelInfo {
+                kind: "twilio",
+                name: "Twilio",
+                desc: "SMS via Twilio Programmable Messaging",
+                configured: !self.twilio.is_empty(),
+            },
+            ChannelInfo {
+                kind: "plivo",
+                name: "Plivo",
+                desc: "SMS via Plivo Messaging",
+                configured: !self.plivo.is_empty(),
+            },
+            ChannelInfo {
+                kind: "telnyx",
+                name: "Telnyx",
+                desc: "SMS via Telnyx Messaging",
+                configured: !self.telnyx.is_empty(),
+            },
+            ChannelInfo {
+                kind: "sinch",
+                name: "Sinch",
+                desc: "SMS via Sinch Batches API",
+                configured: !self.sinch.is_empty(),
+            },
+            ChannelInfo {
+                kind: "vonage",
+                name: "Vonage",
+                desc: "SMS via Vonage Messaging",
+                configured: !self.vonage.is_empty(),
+            },
+            ChannelInfo {
                 kind: "nextcloud",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
@@ -10721,6 +10771,11 @@ impl ChannelsConfig {
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
             || self.wati.values().any(|c| c.enabled)
+            || self.twilio.values().any(|c| c.enabled)
+            || self.plivo.values().any(|c| c.enabled)
+            || self.telnyx.values().any(|c| c.enabled)
+            || self.sinch.values().any(|c| c.enabled)
+            || self.vonage.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
@@ -10768,6 +10823,11 @@ impl Default for ChannelsConfig {
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             wati: HashMap::new(),
+            twilio: HashMap::new(),
+            plivo: HashMap::new(),
+            telnyx: HashMap::new(),
+            sinch: HashMap::new(),
+            vonage: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -11723,6 +11783,238 @@ impl ChannelConfig for WatiConfig {
     }
     fn desc() -> &'static str {
         "WhatsApp via WATI Business API"
+    }
+}
+
+/// Twilio SMS channel configuration (Programmable Messaging + webhook receive).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.twilio"]
+pub struct TwilioConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.twilio.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Twilio Account SID (`ACxxxxxxxx…`) — public identifier, used as the
+    /// HTTP Basic auth username and the path component of the Messages API.
+    #[tab(Connection)]
+    pub account_sid: String,
+    /// Twilio Auth Token. Used as both the HTTP Basic auth password for
+    /// outbound calls and the HMAC-SHA1 key for inbound webhook signature
+    /// verification.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub auth_token: String,
+    /// Phone number to send from, in E.164 format (e.g. `"+15555550100"`).
+    /// Must be a number you have provisioned in the Twilio console.
+    #[tab(Advanced)]
+    pub from_number: String,
+    /// Allowed sender numbers in E.164 format (e.g. `"+15555550199"`). Empty
+    /// list = deny all. `"*"` allows everyone (use with care; this is a
+    /// public PSTN endpoint).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+}
+
+impl ChannelConfig for TwilioConfig {
+    fn name() -> &'static str {
+        "Twilio"
+    }
+    fn desc() -> &'static str {
+        "SMS via Twilio Programmable Messaging"
+    }
+}
+
+/// Plivo SMS channel configuration (REST Message API + webhook receive).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.plivo"]
+pub struct PlivoConfig {
+    /// Whether this channel is active. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Plivo Auth ID (the public account identifier; not secret).
+    #[tab(Connection)]
+    pub account_id: String,
+    /// Plivo Auth Token. Used as the HTTP Basic password for outbound calls
+    /// and as the HMAC key for inbound webhook signature verification.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub auth_token: String,
+    /// Phone number to send from (E.164 format, e.g. `+15555550100`).
+    #[tab(Advanced)]
+    pub from_number: String,
+    /// Allowed inbound sender numbers (E.164 format) or `"*"` for all.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+}
+
+impl ChannelConfig for PlivoConfig {
+    fn name() -> &'static str {
+        "Plivo"
+    }
+    fn desc() -> &'static str {
+        "SMS via Plivo Messaging"
+    }
+}
+
+/// Telnyx SMS channel configuration (V2 Messaging API + Ed25519 webhook verify).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.telnyx"]
+pub struct TelnyxConfig {
+    /// Whether this channel is active. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Telnyx V2 API key. Sent as the HTTP `Authorization: Bearer ...`
+    /// credential on every outbound REST call.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: String,
+    /// Phone number to send from, in E.164 format (e.g. `"+15555550100"`).
+    /// Must be a number provisioned in your Telnyx account.
+    #[tab(Advanced)]
+    pub from_number: String,
+    /// Optional Telnyx Messaging Profile ID. When set, outbound messages
+    /// are sent through the named profile instead of the bare `from_number`.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub messaging_profile_id: Option<String>,
+    /// Allowed sender numbers in E.164 format. Empty list = deny all.
+    /// `"*"` allows everyone (use with care; this is a public PSTN endpoint).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+    /// Base64-encoded Ed25519 public key used to verify inbound webhook
+    /// signatures. Distinct from `api_key` — copied from a different page
+    /// in the Telnyx portal. Update this whenever Telnyx rotates the
+    /// signing key, otherwise inbound webhooks will fail verification.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub public_key: String,
+}
+
+impl ChannelConfig for TelnyxConfig {
+    fn name() -> &'static str {
+        "Telnyx"
+    }
+    fn desc() -> &'static str {
+        "SMS via Telnyx Messaging"
+    }
+}
+
+/// Sinch SMS channel configuration (Batches API + HMAC webhook verify).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.sinch"]
+pub struct SinchConfig {
+    /// Whether this channel is active. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sinch service plan ID (project identifier, public). Used as a path
+    /// component on the Batches API endpoint.
+    #[tab(Connection)]
+    pub service_plan_id: String,
+    /// Sinch API token used as the HTTP `Bearer` credential for outbound
+    /// `POST /xms/v1/{service_plan_id}/batches` requests. Distinct from
+    /// `callback_secret`.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_token: String,
+    /// Sinch SMS region. `"us"` (default) targets `us.sms.api.sinch.com`,
+    /// `"eu"` targets `eu.sms.api.sinch.com`.
+    #[tab(Advanced)]
+    #[serde(default = "default_sinch_region")]
+    pub region: String,
+    /// Phone number to send from, in E.164 format (e.g. `"+15555550100"`).
+    /// Must be a number provisioned for your Sinch service plan.
+    #[tab(Advanced)]
+    pub from_number: String,
+    /// Allowed sender numbers in E.164 format. Empty list = deny all.
+    /// `"*"` allows everyone (use with care; this is a public PSTN endpoint).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+    /// HMAC-SHA256 secret used to verify the `x-sinch-webhook-signature`
+    /// header (`v1,nonce,base64(sig)` over `nonce_bytes || raw_body`).
+    /// Distinct from `api_token`.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub callback_secret: String,
+}
+
+fn default_sinch_region() -> String {
+    "us".to_string()
+}
+
+impl ChannelConfig for SinchConfig {
+    fn name() -> &'static str {
+        "Sinch"
+    }
+    fn desc() -> &'static str {
+        "SMS via Sinch Batches API"
+    }
+}
+
+/// Vonage SMS channel configuration (legacy SMS API + HMAC webhook verify).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.vonage"]
+pub struct VonageConfig {
+    /// Whether this channel is active. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Vonage API key — public identifier shown in the dashboard.
+    #[tab(Connection)]
+    pub api_key: String,
+    /// Vonage API secret. Sent in the outbound SMS POST body alongside
+    /// `api_key` (Vonage's legacy SMS API takes credentials in the form
+    /// body, not headers).
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_secret: String,
+    /// Sender — E.164 phone number (e.g. `"+15555550100"`), short code,
+    /// or alphanumeric sender ID (where allowed by destination country).
+    #[tab(Advanced)]
+    pub from_number_or_sender_id: String,
+    /// Allowed sender numbers in E.164 format. Empty list = deny all.
+    /// `"*"` allows everyone (use with care; this is a public PSTN endpoint).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+    /// Inbound webhook signature secret. Distinct from `api_secret` — set
+    /// separately in the Vonage dashboard's API settings as the "Signature
+    /// secret" with algorithm "HMAC SHA-256". The gateway recomputes the
+    /// `sig` parameter on every inbound webhook and rejects mismatches.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub signature_secret: String,
+}
+
+impl ChannelConfig for VonageConfig {
+    fn name() -> &'static str {
+        "Vonage"
+    }
+    fn desc() -> &'static str {
+        "SMS via Vonage Messaging"
     }
 }
 
@@ -17170,6 +17462,11 @@ auto_save = true
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
                 wati: HashMap::new(),
+                twilio: HashMap::new(),
+                plivo: HashMap::new(),
+                telnyx: HashMap::new(),
+                sinch: HashMap::new(),
+                vonage: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
@@ -18607,6 +18904,11 @@ allowed_users = ["@u:matrix.org"]
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             wati: HashMap::new(),
+            twilio: HashMap::new(),
+            plivo: HashMap::new(),
+            telnyx: HashMap::new(),
+            sinch: HashMap::new(),
+            vonage: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -19029,6 +19331,11 @@ allowed_numbers = ["+1", "+2"]
             )]),
             linq: HashMap::new(),
             wati: HashMap::new(),
+            twilio: HashMap::new(),
+            plivo: HashMap::new(),
+            telnyx: HashMap::new(),
+            sinch: HashMap::new(),
+            vonage: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),

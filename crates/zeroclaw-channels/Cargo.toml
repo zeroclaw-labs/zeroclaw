@@ -153,6 +153,11 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
+# SMS channels (optional). Twilio webhook signatures are HMAC-SHA1; Telnyx
+# webhook signatures are Ed25519. Gated to their channel features.
+sha1 = { version = "0.10", optional = true }
+ed25519-dalek = { version = "2", default-features = false, optional = true }
+
 [features]
 default = [
   "default-channels",
@@ -223,6 +228,11 @@ channel-notion = []
 channel-mqtt = ["dep:rumqttc"]
 channel-linq = []
 channel-wati = []
+channel-twilio = ["dep:sha1"]
+channel-plivo = []
+channel-telnyx = ["dep:ed25519-dalek"]
+channel-sinch = []
+channel-vonage = []
 channel-nextcloud = []
 channel-mochat = []
 channel-wechat = [

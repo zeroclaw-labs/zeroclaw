@@ -56,22 +56,32 @@ pub use crate::nextcloud_talk::NextcloudTalkChannel;
 pub use crate::nostr::NostrChannel;
 #[cfg(feature = "channel-notion")]
 pub use crate::notion::NotionChannel;
+#[cfg(feature = "channel-plivo")]
+pub use crate::plivo::PlivoChannel;
 #[cfg(feature = "channel-qq")]
 pub use crate::qq::QQChannel;
 #[cfg(feature = "channel-reddit")]
 pub use crate::reddit::RedditChannel;
 #[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
+#[cfg(feature = "channel-sinch")]
+pub use crate::sinch::SinchChannel;
 #[cfg(feature = "channel-slack")]
 pub use crate::slack::SlackChannel;
+#[cfg(feature = "channel-telnyx")]
+pub use crate::telnyx::TelnyxChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+#[cfg(feature = "channel-twilio")]
+pub use crate::twilio::TwilioChannel;
 #[cfg(feature = "channel-twitter")]
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
+#[cfg(feature = "channel-vonage")]
+pub use crate::vonage::VonageChannel;
 #[cfg(feature = "channel-wati")]
 pub use crate::wati::WatiChannel;
 #[cfg(feature = "channel-webhook")]
@@ -5656,6 +5666,100 @@ fn build_channel_by_id(
         "linq" => {
             anyhow::bail!("Linq channel requires the `channel-linq` feature");
         }
+        #[cfg(feature = "channel-twilio")]
+        "twilio" => {
+            let tw = config
+                .channels
+                .twilio
+                .get("default")
+                .context("Twilio channel is not configured")?;
+            Ok(Arc::new(TwilioChannel::new(
+                tw.account_sid.clone(),
+                tw.auth_token.clone(),
+                tw.from_number.clone(),
+                tw.allowed_numbers.clone(),
+            )))
+        }
+        #[cfg(not(feature = "channel-twilio"))]
+        "twilio" => {
+            anyhow::bail!("Twilio channel requires the `channel-twilio` feature");
+        }
+        #[cfg(feature = "channel-plivo")]
+        "plivo" => {
+            let pl = config
+                .channels
+                .plivo
+                .get("default")
+                .context("Plivo channel is not configured")?;
+            Ok(Arc::new(PlivoChannel::new(
+                pl.account_id.clone(),
+                pl.auth_token.clone(),
+                pl.from_number.clone(),
+                pl.allowed_numbers.clone(),
+            )))
+        }
+        #[cfg(not(feature = "channel-plivo"))]
+        "plivo" => {
+            anyhow::bail!("Plivo channel requires the `channel-plivo` feature");
+        }
+        #[cfg(feature = "channel-telnyx")]
+        "telnyx" => {
+            let tx = config
+                .channels
+                .telnyx
+                .get("default")
+                .context("Telnyx channel is not configured")?;
+            Ok(Arc::new(TelnyxChannel::new(
+                tx.api_key.clone(),
+                tx.from_number.clone(),
+                tx.messaging_profile_id.clone(),
+                tx.allowed_numbers.clone(),
+                &tx.public_key,
+            )?))
+        }
+        #[cfg(not(feature = "channel-telnyx"))]
+        "telnyx" => {
+            anyhow::bail!("Telnyx channel requires the `channel-telnyx` feature");
+        }
+        #[cfg(feature = "channel-sinch")]
+        "sinch" => {
+            let sc = config
+                .channels
+                .sinch
+                .get("default")
+                .context("Sinch channel is not configured")?;
+            Ok(Arc::new(SinchChannel::new(
+                sc.service_plan_id.clone(),
+                sc.api_token.clone(),
+                sc.region.clone(),
+                sc.from_number.clone(),
+                sc.allowed_numbers.clone(),
+                sc.callback_secret.clone(),
+            )))
+        }
+        #[cfg(not(feature = "channel-sinch"))]
+        "sinch" => {
+            anyhow::bail!("Sinch channel requires the `channel-sinch` feature");
+        }
+        #[cfg(feature = "channel-vonage")]
+        "vonage" => {
+            let vo = config
+                .channels
+                .vonage
+                .get("default")
+                .context("Vonage channel is not configured")?;
+            Ok(Arc::new(VonageChannel::new(
+                vo.api_key.clone(),
+                vo.api_secret.clone(),
+                vo.from_number_or_sender_id.clone(),
+                vo.allowed_numbers.clone(),
+                vo.signature_secret.clone(),
+            )))
+        }
+        #[cfg(not(feature = "channel-vonage"))]
+        "vonage" => {
+            anyhow::bail!("Vonage channel requires the `channel-vonage` feature");
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -5842,6 +5946,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
+            twilio, plivo, telnyx, sinch, vonage, \
             email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
@@ -6567,6 +6672,178 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "WATI channel is configured but this build was compiled without \
              `channel-wati`; skipping WATI."
+        );
+    }
+
+    #[cfg(feature = "channel-twilio")]
+    for (alias, tw) in &config.channels.twilio {
+        if !active_channel_aliases.contains(&format!("twilio.{alias}")) {
+            continue;
+        }
+        if !tw.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Twilio",
+            alias: Some(alias.clone()),
+            channel: Arc::new(TwilioChannel::new(
+                tw.account_sid.clone(),
+                tw.auth_token.clone(),
+                tw.from_number.clone(),
+                tw.allowed_numbers.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-twilio"))]
+    if !config.channels.twilio.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Twilio channel is configured but this build was compiled without \
+             `channel-twilio`; skipping Twilio."
+        );
+    }
+
+    #[cfg(feature = "channel-plivo")]
+    for (alias, pl) in &config.channels.plivo {
+        if !active_channel_aliases.contains(&format!("plivo.{alias}")) {
+            continue;
+        }
+        if !pl.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Plivo",
+            alias: Some(alias.clone()),
+            channel: Arc::new(PlivoChannel::new(
+                pl.account_id.clone(),
+                pl.auth_token.clone(),
+                pl.from_number.clone(),
+                pl.allowed_numbers.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-plivo"))]
+    if !config.channels.plivo.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Plivo channel is configured but this build was compiled without \
+             `channel-plivo`; skipping Plivo."
+        );
+    }
+
+    #[cfg(feature = "channel-telnyx")]
+    for (alias, tx) in &config.channels.telnyx {
+        if !active_channel_aliases.contains(&format!("telnyx.{alias}")) {
+            continue;
+        }
+        if !tx.enabled {
+            continue;
+        }
+        match TelnyxChannel::new(
+            tx.api_key.clone(),
+            tx.from_number.clone(),
+            tx.messaging_profile_id.clone(),
+            tx.allowed_numbers.clone(),
+            &tx.public_key,
+        ) {
+            Ok(telnyx_channel) => {
+                channels.push(ConfiguredChannel {
+                    display_name: "Telnyx",
+                    alias: Some(alias.clone()),
+                    channel: Arc::new(telnyx_channel),
+                });
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"alias": alias, "error": format!("{e}")})),
+                    "Telnyx channel config invalid; skipping this instance"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-telnyx"))]
+    if !config.channels.telnyx.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Telnyx channel is configured but this build was compiled without \
+             `channel-telnyx`; skipping Telnyx."
+        );
+    }
+
+    #[cfg(feature = "channel-sinch")]
+    for (alias, sc) in &config.channels.sinch {
+        if !active_channel_aliases.contains(&format!("sinch.{alias}")) {
+            continue;
+        }
+        if !sc.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Sinch",
+            alias: Some(alias.clone()),
+            channel: Arc::new(SinchChannel::new(
+                sc.service_plan_id.clone(),
+                sc.api_token.clone(),
+                sc.region.clone(),
+                sc.from_number.clone(),
+                sc.allowed_numbers.clone(),
+                sc.callback_secret.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-sinch"))]
+    if !config.channels.sinch.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Sinch channel is configured but this build was compiled without \
+             `channel-sinch`; skipping Sinch."
+        );
+    }
+
+    #[cfg(feature = "channel-vonage")]
+    for (alias, vo) in &config.channels.vonage {
+        if !active_channel_aliases.contains(&format!("vonage.{alias}")) {
+            continue;
+        }
+        if !vo.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Vonage",
+            alias: Some(alias.clone()),
+            channel: Arc::new(VonageChannel::new(
+                vo.api_key.clone(),
+                vo.api_secret.clone(),
+                vo.from_number_or_sender_id.clone(),
+                vo.allowed_numbers.clone(),
+                vo.signature_secret.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-vonage"))]
+    if !config.channels.vonage.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Vonage channel is configured but this build was compiled without \
+             `channel-vonage`; skipping Vonage."
         );
     }
 

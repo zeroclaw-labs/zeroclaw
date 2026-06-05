@@ -79,6 +79,31 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-wati"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Twilio"),
+        type_keys: &["twilio"],
+        compiled: cfg!(feature = "channel-twilio"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Plivo"),
+        type_keys: &["plivo"],
+        compiled: cfg!(feature = "channel-plivo"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Telnyx"),
+        type_keys: &["telnyx"],
+        compiled: cfg!(feature = "channel-telnyx"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Sinch"),
+        type_keys: &["sinch"],
+        compiled: cfg!(feature = "channel-sinch"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Vonage"),
+        type_keys: &["vonage"],
+        compiled: cfg!(feature = "channel-vonage"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("NextCloud Talk"),
         type_keys: &["nextcloud-talk", "nextcloud_talk"],
         compiled: cfg!(feature = "channel-nextcloud"),

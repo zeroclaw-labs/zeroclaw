@@ -47,6 +47,11 @@ use anyhow::{Context, Result};
     feature = "channel-linq",
     feature = "channel-nextcloud",
     feature = "channel-wati",
+    feature = "channel-twilio",
+    feature = "channel-plivo",
+    feature = "channel-telnyx",
+    feature = "channel-sinch",
+    feature = "channel-vonage",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::body::Bytes;
@@ -71,6 +76,11 @@ use uuid::Uuid;
     feature = "channel-linq",
     feature = "channel-nextcloud",
     feature = "channel-wati",
+    feature = "channel-twilio",
+    feature = "channel-plivo",
+    feature = "channel-telnyx",
+    feature = "channel-sinch",
+    feature = "channel-vonage",
     feature = "channel-whatsapp-cloud"
 ))]
 use zeroclaw_api::channel::{Channel, SendMessage};
@@ -81,6 +91,16 @@ use zeroclaw_channels::gmail_push::GmailPushChannel;
 use zeroclaw_channels::linq::LinqChannel;
 #[cfg(feature = "channel-nextcloud")]
 use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
+#[cfg(feature = "channel-plivo")]
+use zeroclaw_channels::plivo::PlivoChannel;
+#[cfg(feature = "channel-sinch")]
+use zeroclaw_channels::sinch::SinchChannel;
+#[cfg(feature = "channel-telnyx")]
+use zeroclaw_channels::telnyx::TelnyxChannel;
+#[cfg(feature = "channel-twilio")]
+use zeroclaw_channels::twilio::TwilioChannel;
+#[cfg(feature = "channel-vonage")]
+use zeroclaw_channels::vonage::VonageChannel;
 #[cfg(feature = "channel-wati")]
 use zeroclaw_channels::wati::WatiChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
@@ -156,10 +176,88 @@ fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Str
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-twilio")]
+fn twilio_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("twilio_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(feature = "channel-plivo")]
+fn plivo_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("plivo_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(feature = "channel-telnyx")]
+fn telnyx_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("telnyx_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(feature = "channel-sinch")]
+fn sinch_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("sinch_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(feature = "channel-vonage")]
+fn vonage_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("vonage_{}_{}", msg.sender, msg.id)
+}
+
+/// Reconstruct the public URL a webhook hit, for signature schemes (Twilio,
+/// Plivo) that sign the destination URL. Trusts `X-Forwarded-Proto` /
+/// `X-Forwarded-Host` (set by tunnels and reverse proxies) and falls back to
+/// the `Host` header, assuming HTTPS since production webhooks always arrive
+/// over TLS. `route_path` is the channel's fixed webhook path
+/// (e.g. `/twilio/sms`); `path_prefix` is the gateway-wide prefix.
+///
+/// Returns `None` when no host can be determined (the signature cannot be
+/// verified without it).
+#[cfg(any(feature = "channel-twilio", feature = "channel-plivo"))]
+fn reconstruct_webhook_url(
+    headers: &HeaderMap,
+    path_prefix: &str,
+    route_path: &str,
+) -> Option<String> {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let prefix = if path_prefix.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", path_prefix.trim_matches('/'))
+    };
+    Some(format!("{scheme}://{host}{prefix}{route_path}"))
+}
+
+/// Parse an `application/x-www-form-urlencoded` body into a sorted `BTreeMap`.
+/// `BTreeMap` ordering matches the "sort by key" requirement of the Twilio
+/// and Vonage signature algorithms. Returns `None` on a malformed body.
+#[cfg(any(
+    feature = "channel-twilio",
+    feature = "channel-plivo",
+    feature = "channel-vonage"
+))]
+fn parse_form_urlencoded(body: &[u8]) -> Option<std::collections::BTreeMap<String, String>> {
+    let parsed: Vec<(String, String)> = serde_urlencoded::from_bytes(body).ok()?;
+    Some(parsed.into_iter().collect())
+}
+
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
     feature = "channel-wati",
+    feature = "channel-twilio",
+    feature = "channel-plivo",
+    feature = "channel-telnyx",
+    feature = "channel-sinch",
+    feature = "channel-vonage",
     feature = "channel-whatsapp-cloud"
 ))]
 fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -426,6 +524,21 @@ pub struct AppState {
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     #[cfg(feature = "channel-wati")]
     pub wati: Option<Arc<WatiChannel>>,
+    /// Twilio SMS channel (webhook signature key is embedded in the channel)
+    #[cfg(feature = "channel-twilio")]
+    pub twilio: Option<Arc<TwilioChannel>>,
+    /// Plivo SMS channel (V3 webhook signature key is embedded in the channel)
+    #[cfg(feature = "channel-plivo")]
+    pub plivo: Option<Arc<PlivoChannel>>,
+    /// Telnyx SMS channel (Ed25519 webhook key is embedded in the channel)
+    #[cfg(feature = "channel-telnyx")]
+    pub telnyx: Option<Arc<TelnyxChannel>>,
+    /// Sinch SMS channel (HMAC callback secret is embedded in the channel)
+    #[cfg(feature = "channel-sinch")]
+    pub sinch: Option<Arc<SinchChannel>>,
+    /// Vonage SMS channel (HMAC signature secret is embedded in the channel)
+    #[cfg(feature = "channel-vonage")]
+    pub vonage: Option<Arc<VonageChannel>>,
     /// Gmail Pub/Sub push notification channel
     #[cfg(feature = "channel-email")]
     pub gmail_push: Option<Arc<GmailPushChannel>>,
@@ -1011,6 +1124,83 @@ pub async fn run_gateway(
             )
         });
 
+    // Twilio SMS channel (if configured)
+    #[cfg(feature = "channel-twilio")]
+    let twilio_channel: Option<Arc<TwilioChannel>> =
+        config.channels.twilio.values().next().map(|tw| {
+            Arc::new(TwilioChannel::new(
+                tw.account_sid.clone(),
+                tw.auth_token.clone(),
+                tw.from_number.clone(),
+                tw.allowed_numbers.clone(),
+            ))
+        });
+
+    // Plivo SMS channel (if configured)
+    #[cfg(feature = "channel-plivo")]
+    let plivo_channel: Option<Arc<PlivoChannel>> =
+        config.channels.plivo.values().next().map(|pl| {
+            Arc::new(PlivoChannel::new(
+                pl.account_id.clone(),
+                pl.auth_token.clone(),
+                pl.from_number.clone(),
+                pl.allowed_numbers.clone(),
+            ))
+        });
+
+    // Telnyx SMS channel (if configured). A config typo in `public_key`
+    // surfaces here as `Err`; log and skip rather than panic.
+    #[cfg(feature = "channel-telnyx")]
+    let telnyx_channel: Option<Arc<TelnyxChannel>> =
+        config.channels.telnyx.values().next().and_then(|tx| {
+            match TelnyxChannel::new(
+                tx.api_key.clone(),
+                tx.from_number.clone(),
+                tx.messaging_profile_id.clone(),
+                tx.allowed_numbers.clone(),
+                &tx.public_key,
+            ) {
+                Ok(ch) => Some(Arc::new(ch)),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "Telnyx channel config invalid; webhook route disabled"
+                    );
+                    None
+                }
+            }
+        });
+
+    // Sinch SMS channel (if configured)
+    #[cfg(feature = "channel-sinch")]
+    let sinch_channel: Option<Arc<SinchChannel>> =
+        config.channels.sinch.values().next().map(|sc| {
+            Arc::new(SinchChannel::new(
+                sc.service_plan_id.clone(),
+                sc.api_token.clone(),
+                sc.region.clone(),
+                sc.from_number.clone(),
+                sc.allowed_numbers.clone(),
+                sc.callback_secret.clone(),
+            ))
+        });
+
+    // Vonage SMS channel (if configured)
+    #[cfg(feature = "channel-vonage")]
+    let vonage_channel: Option<Arc<VonageChannel>> =
+        config.channels.vonage.values().next().map(|vo| {
+            Arc::new(VonageChannel::new(
+                vo.api_key.clone(),
+                vo.api_secret.clone(),
+                vo.from_number_or_sender_id.clone(),
+                vo.allowed_numbers.clone(),
+                vo.signature_secret.clone(),
+            ))
+        });
+
     // Nextcloud Talk channel (if configured)
     #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
@@ -1394,6 +1584,16 @@ pub async fn run_gateway(
         nextcloud_talk_webhook_secret,
         #[cfg(feature = "channel-wati")]
         wati: wati_channel,
+        #[cfg(feature = "channel-twilio")]
+        twilio: twilio_channel,
+        #[cfg(feature = "channel-plivo")]
+        plivo: plivo_channel,
+        #[cfg(feature = "channel-telnyx")]
+        telnyx: telnyx_channel,
+        #[cfg(feature = "channel-sinch")]
+        sinch: sinch_channel,
+        #[cfg(feature = "channel-vonage")]
+        vonage: vonage_channel,
         #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
         observer: state_observer,
@@ -2233,6 +2433,31 @@ fn optional_channel_routes() -> Router<AppState> {
     let router = router
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook));
+    #[cfg(feature = "channel-twilio")]
+    let router = router.route(
+        zeroclaw_channels::twilio::TWILIO_WEBHOOK_PATH,
+        post(handle_twilio_webhook),
+    );
+    #[cfg(feature = "channel-plivo")]
+    let router = router.route(
+        zeroclaw_channels::plivo::PLIVO_WEBHOOK_PATH,
+        post(handle_plivo_webhook),
+    );
+    #[cfg(feature = "channel-telnyx")]
+    let router = router.route(
+        zeroclaw_channels::telnyx::TELNYX_WEBHOOK_PATH,
+        post(handle_telnyx_webhook),
+    );
+    #[cfg(feature = "channel-sinch")]
+    let router = router.route(
+        zeroclaw_channels::sinch::SINCH_WEBHOOK_PATH,
+        post(handle_sinch_webhook),
+    );
+    #[cfg(feature = "channel-vonage")]
+    let router = router.route(
+        zeroclaw_channels::vonage::VONAGE_WEBHOOK_PATH,
+        post(handle_vonage_webhook),
+    );
     #[cfg(feature = "channel-nextcloud")]
     let router = router.route("/nextcloud-talk", post(handle_nextcloud_talk_webhook));
     #[cfg(feature = "channel-email")]
@@ -3016,6 +3241,321 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /twilio/sms — inbound Twilio SMS webhook (HMAC-SHA1 signature).
+#[cfg(feature = "channel-twilio")]
+async fn handle_twilio_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let xml = |status: StatusCode, payload: &str| {
+        (
+            status,
+            [(header::CONTENT_TYPE, "application/xml")],
+            payload.to_string(),
+        )
+    };
+
+    let Some(ref twilio) = state.twilio else {
+        return xml(StatusCode::NOT_FOUND, "<Response/>");
+    };
+
+    let Some(full_url) = reconstruct_webhook_url(
+        &headers,
+        &state.path_prefix,
+        zeroclaw_channels::twilio::TWILIO_WEBHOOK_PATH,
+    ) else {
+        return xml(StatusCode::BAD_REQUEST, "<Response/>");
+    };
+
+    // Parse + verify before any further processing. Parse failures and
+    // signature failures both return the same response to avoid leaking
+    // payload-validity info to unauthenticated callers.
+    let Some(form_params) = parse_form_urlencoded(&body) else {
+        return xml(StatusCode::UNAUTHORIZED, "<Response/>");
+    };
+    let signature = headers
+        .get("x-twilio-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !twilio.verify_signature(&full_url, &form_params, signature) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "twilio"})),
+            "Twilio webhook signature verification failed"
+        );
+        return xml(StatusCode::UNAUTHORIZED, "<Response/>");
+    }
+
+    let Some(msg) = twilio.parse_webhook_payload(&form_params) else {
+        return xml(StatusCode::OK, "<Response/>");
+    };
+
+    process_sms_inbound(&state, twilio.as_ref(), &msg, "twilio", twilio_memory_key).await;
+    xml(StatusCode::OK, "<Response/>")
+}
+
+/// POST /plivo/sms — inbound Plivo SMS webhook (V3 HMAC-SHA256 signature).
+#[cfg(feature = "channel-plivo")]
+async fn handle_plivo_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let json_err =
+        |status: StatusCode, err: &str| (status, Json(serde_json::json!({ "error": err })));
+
+    let Some(ref plivo) = state.plivo else {
+        return json_err(StatusCode::NOT_FOUND, "Plivo not configured");
+    };
+
+    let Some(full_url) = reconstruct_webhook_url(
+        &headers,
+        &state.path_prefix,
+        zeroclaw_channels::plivo::PLIVO_WEBHOOK_PATH,
+    ) else {
+        return json_err(StatusCode::BAD_REQUEST, "Missing Host header");
+    };
+    let nonce = headers
+        .get("x-plivo-signature-v3-nonce")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let signature = headers
+        .get("x-plivo-signature-v3")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !plivo.verify_signature(&full_url, nonce, &body, signature) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "plivo"})),
+            "Plivo webhook signature verification failed"
+        );
+        return json_err(StatusCode::UNAUTHORIZED, "Invalid signature");
+    }
+
+    let Some(form_params) = parse_form_urlencoded(&body) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid form body");
+    };
+    let Some(msg) = plivo.parse_webhook_payload(&form_params) else {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    };
+
+    process_sms_inbound(&state, plivo.as_ref(), &msg, "plivo", plivo_memory_key).await;
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /telnyx/sms — inbound Telnyx SMS webhook (Ed25519 signature).
+#[cfg(feature = "channel-telnyx")]
+async fn handle_telnyx_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let json_err =
+        |status: StatusCode, err: &str| (status, Json(serde_json::json!({ "error": err })));
+
+    let Some(ref telnyx) = state.telnyx else {
+        return json_err(StatusCode::NOT_FOUND, "Telnyx not configured");
+    };
+
+    let timestamp = headers
+        .get("telnyx-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let signature = headers
+        .get("telnyx-signature-ed25519")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !telnyx.verify_signature(timestamp, &body, signature, chrono::Utc::now().timestamp()) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "telnyx"})),
+            "Telnyx webhook signature verification failed"
+        );
+        return json_err(StatusCode::UNAUTHORIZED, "Invalid signature");
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid JSON payload");
+    };
+    let Some(msg) = telnyx.parse_webhook_payload(&payload) else {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    };
+
+    process_sms_inbound(&state, telnyx.as_ref(), &msg, "telnyx", telnyx_memory_key).await;
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /sinch/sms — inbound Sinch SMS webhook (HMAC-SHA256 signature).
+#[cfg(feature = "channel-sinch")]
+async fn handle_sinch_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let json_err =
+        |status: StatusCode, err: &str| (status, Json(serde_json::json!({ "error": err })));
+
+    let Some(ref sinch) = state.sinch else {
+        return json_err(StatusCode::NOT_FOUND, "Sinch not configured");
+    };
+
+    let signature = headers
+        .get("x-sinch-webhook-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !sinch.verify_signature(&body, signature) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "sinch"})),
+            "Sinch webhook signature verification failed"
+        );
+        return json_err(StatusCode::UNAUTHORIZED, "Invalid signature");
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid JSON payload");
+    };
+    let Some(msg) = sinch.parse_webhook_payload(&payload) else {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    };
+
+    process_sms_inbound(&state, sinch.as_ref(), &msg, "sinch", sinch_memory_key).await;
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /vonage/sms — inbound Vonage SMS webhook (HMAC-SHA256 signature over
+/// alphabetically-sorted form params).
+#[cfg(feature = "channel-vonage")]
+async fn handle_vonage_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+    let json_err =
+        |status: StatusCode, err: &str| (status, Json(serde_json::json!({ "error": err })));
+
+    let Some(ref vonage) = state.vonage else {
+        return json_err(StatusCode::NOT_FOUND, "Vonage not configured");
+    };
+
+    let Some(form_params) = parse_form_urlencoded(&body) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid form body");
+    };
+    if !vonage.verify_signature(&form_params) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "vonage"})),
+            "Vonage webhook signature verification failed"
+        );
+        return json_err(StatusCode::UNAUTHORIZED, "Invalid signature");
+    }
+
+    let Some(msg) = vonage.parse_webhook_payload(&form_params) else {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    };
+
+    process_sms_inbound(&state, vonage.as_ref(), &msg, "vonage", vonage_memory_key).await;
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Shared inbound-SMS flow: auto-save, run the agent loop, and send the reply
+/// back over the same channel. Used by the Twilio/Plivo/Telnyx/Sinch/Vonage
+/// webhook handlers, which differ only in payload parsing and signature
+/// verification.
+#[cfg(any(
+    feature = "channel-twilio",
+    feature = "channel-plivo",
+    feature = "channel-telnyx",
+    feature = "channel-sinch",
+    feature = "channel-vonage"
+))]
+async fn process_sms_inbound<C: Channel + ?Sized>(
+    state: &AppState,
+    channel: &C,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_name: &str,
+    memory_key: fn(&zeroclaw_api::channel::ChannelMessage) -> String,
+) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({"channel": channel_name, "sender": msg.sender, "content": msg.content})
+        ),
+        "inbound webhook message"
+    );
+    let session_id = sender_session_id(channel_name, msg);
+
+    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+        let key = memory_key(msg);
+        let _ = state
+            .mem
+            .store(
+                &key,
+                &msg.content,
+                MemoryCategory::Conversation,
+                Some(&session_id),
+            )
+            .await;
+    }
+
+    match Box::pin(run_gateway_chat_with_tools(
+        state,
+        &msg.content,
+        Some(&session_id),
+    ))
+    .await
+    {
+        Ok(GatewayChatOutcome { response, .. }) => {
+            if let Err(e) = channel
+                .send(&SendMessage::new(response, &msg.reply_target))
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"channel": channel_name, "error": format!("{e}")})
+                        ),
+                    "Failed to send SMS reply"
+                );
+            }
+        }
+        Err(e) => {
+            let reply = if is_needs_quickstart_err(&e) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "SMS chat refused: gateway has no model configured; visit /quickstart"
+                );
+                needs_quickstart_channel_reply()
+            } else {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"channel": channel_name, "error": format!("{e}")})
+                        ),
+                    "LLM error"
+                );
+                "Sorry, I couldn't process your message right now.".to_string()
+            };
+            let _ = channel
+                .send(&SendMessage::new(reply, &msg.reply_target))
+                .await;
+        }
+    }
+}
+
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
 #[cfg(feature = "channel-nextcloud")]
 async fn handle_nextcloud_talk_webhook(
@@ -3747,6 +4287,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -3826,6 +4376,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
@@ -4388,6 +4948,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4480,6 +5050,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4584,6 +5164,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4660,6 +5250,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4741,6 +5341,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4829,6 +5439,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4914,6 +5534,16 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -5051,6 +5681,16 @@ mod tests {
             tui_registry: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),

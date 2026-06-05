@@ -2041,6 +2041,16 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             #[cfg(feature = "channel-wati")]
             wati: None,
+            #[cfg(feature = "channel-twilio")]
+            twilio: None,
+            #[cfg(feature = "channel-plivo")]
+            plivo: None,
+            #[cfg(feature = "channel-telnyx")]
+            telnyx: None,
+            #[cfg(feature = "channel-sinch")]
+            sinch: None,
+            #[cfg(feature = "channel-vonage")]
+            vonage: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
