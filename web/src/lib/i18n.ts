@@ -415,6 +415,14 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
     'nav.quickstart': 'Quickstart',
+    'nav.skills': 'Skills',
+    // Skills
+    'skills.title': 'Skills',
+    'skills.load_error': 'Failed to load skills',
+    'skills.search': 'Search skills...',
+    'skills.reload': 'Reload',
+    'skills.empty': 'No skills found',
+    'skills.skill_md': 'SKILL.md',
 
     // Dashboard
     'dashboard.title': 'Dashboard',

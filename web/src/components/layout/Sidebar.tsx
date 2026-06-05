@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
+  BookOpen,
   Clock,
   LayoutDashboard,
   MessageSquare,
@@ -26,6 +27,7 @@ const navItems: NavItem[] = [
   { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
+  { to: '/skills', icon: BookOpen, labelKey: 'nav.skills' },
   { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
