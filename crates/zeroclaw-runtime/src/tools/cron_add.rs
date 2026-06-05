@@ -1010,6 +1010,34 @@ mod tests {
         assert!(jobs[0].delivery.best_effort);
     }
 
+    #[tokio::test]
+    async fn past_at_schedule_error_includes_clock_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": "2020-01-01T00:00:00Z" },
+                "job_type": "shell",
+                "command": "echo at"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("'at' must be in the future"));
+        assert!(error.contains("now_utc="), "{error}");
+        assert!(error.contains("now_local="), "{error}");
+        assert!(
+            error.contains("at_utc=2020-01-01T00:00:00+00:00"),
+            "{error}"
+        );
+        assert!(error.contains("at_local="), "{error}");
+        assert!(error.contains("delta_seconds="), "{error}");
+    }
+
     #[test]
     fn schedule_schema_is_oneof_with_cron_at_every_variants() {
         let tmp = tempfile::TempDir::new().unwrap();
