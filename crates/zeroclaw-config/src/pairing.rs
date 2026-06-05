@@ -246,6 +246,20 @@ impl PairingGuard {
             None
         }
     }
+
+    /// Revoke a single token by its hash. Returns true if the token was removed.
+    pub fn revoke_token(&self, token_hash: &str) -> bool {
+        let mut tokens = self.paired_tokens.lock();
+        tokens.remove(token_hash)
+    }
+
+    /// Revoke all paired tokens. Returns the number of tokens removed.
+    pub fn revoke_all_tokens(&self) -> usize {
+        let mut tokens = self.paired_tokens.lock();
+        let count = tokens.len();
+        tokens.clear();
+        count
+    }
 }
 
 /// Normalize a client identifier: trim whitespace, map empty to `"unknown"`.
@@ -749,5 +763,60 @@ mod tests {
             result.is_ok(),
             "Legitimate client should not be locked out by attacker"
         );
+    }
+
+    // ── Token revocation ───────────────────────────────────────
+
+    #[test]
+    async fn revoke_token_removes_single_token() {
+        let guard = PairingGuard::new(true, &["zc_token1".into(), "zc_token2".into()]);
+        let hash1 = hash_token("zc_token1");
+
+        assert!(guard.revoke_token(&hash1));
+        assert!(!guard.is_authenticated("zc_token1"));
+        assert!(guard.is_authenticated("zc_token2"));
+
+        let remaining = guard.tokens();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains(&hash_token("zc_token2")));
+    }
+
+    #[test]
+    async fn revoke_token_returns_false_for_nonexistent_token() {
+        let guard = PairingGuard::new(true, &["zc_token1".into()]);
+        let fake_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(!guard.revoke_token(fake_hash));
+        assert!(guard.is_authenticated("zc_token1"));
+    }
+
+    #[test]
+    async fn revoke_all_tokens_clears_all() {
+        let guard = PairingGuard::new(
+            true,
+            &["zc_token1".into(), "zc_token2".into(), "zc_token3".into()],
+        );
+
+        let count = guard.revoke_all_tokens();
+        assert_eq!(count, 3);
+        assert!(!guard.is_paired());
+        assert!(guard.tokens().is_empty());
+
+        // Even if pairing is required, no token is authenticated
+        assert!(!guard.is_authenticated("zc_token1"));
+        assert!(!guard.is_authenticated("zc_token2"));
+        assert!(!guard.is_authenticated("zc_token3"));
+    }
+
+    #[test]
+    async fn revoked_token_cannot_be_used_for_auth() {
+        let guard = PairingGuard::new(true, &["zc_secret".into()]);
+        let token = "zc_secret";
+
+        assert!(guard.is_authenticated(token));
+
+        let hash = hash_token(token);
+        guard.revoke_token(&hash);
+
+        assert!(!guard.is_authenticated(token));
     }
 }

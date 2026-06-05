@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::persist_pairing_tokens;
+
 /// Metadata about a paired device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -190,6 +192,22 @@ impl DeviceRegistry {
         } else {
             false
         }
+    }
+
+    /// Find device ID by token hash, if it exists.
+    pub fn find_device_by_token_hash(&self, token_hash: &str) -> Option<String> {
+        let cache = self.cache.lock();
+        cache.get(token_hash).map(|info| info.id.clone())
+    }
+
+    /// Get token hash for a device by ID (reverse lookup).
+    /// Returns the token hash if the device exists.
+    pub fn get_token_hash_by_device_id(&self, device_id: &str) -> Option<String> {
+        let cache = self.cache.lock();
+        cache
+            .iter()
+            .find(|(_, v)| v.id == device_id)
+            .map(|(k, _)| k.clone())
     }
 
     pub fn update_last_seen(&self, token_hash: &str) {
@@ -380,21 +398,63 @@ pub async fn revoke_device(
         return e.into_response();
     }
 
+    // Find the device's token hash before revoking from registry
+    let token_hash_opt = state
+        .device_registry
+        .as_ref()
+        .and_then(|registry| registry.get_token_hash_by_device_id(&device_id));
+
+    // Remove from device registry
     let revoked = state
         .device_registry
         .as_ref()
         .map(|r| r.revoke(&device_id))
         .unwrap_or(false);
 
-    if revoked {
-        Json(serde_json::json!({
-            "message": "Device revoked",
-            "device_id": device_id
-        }))
-        .into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Device not found").into_response()
+    if !revoked {
+        return (StatusCode::NOT_FOUND, "Device not found").into_response();
     }
+
+    // Also revoke token from pairing state to fully invalidate access
+    if let Some(token_hash) = token_hash_opt {
+        let pairing_revoked = state.pairing.revoke_token(&token_hash);
+        if !pairing_revoked {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"device_id": device_id, "token_hash": token_hash})
+                    ),
+                "revoke_device: token hash was not in paired_tokens"
+            );
+        }
+    }
+
+    // Persist the updated paired_tokens to config
+    if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        // Device removal succeeded but persistence failed — still return success but log error
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"device_id": device_id, "error": format!("{e}")})),
+            "Failed to persist device revocation"
+        );
+        return Json(serde_json::json!({
+            "message": "Device removed, but failed to persist token revocation. Restart required for durability.",
+            "device_id": device_id,
+            "persisted": false
+        }))
+        .into_response();
+    }
+
+    Json(serde_json::json!({
+        "message": "Device and token revoked",
+        "device_id": device_id,
+        "persisted": true
+    }))
+    .into_response()
 }
 
 /// POST /api/devices/me/capabilities — the calling device replaces its capability list.
@@ -462,17 +522,96 @@ pub async fn rotate_token(
         return e.into_response();
     }
 
-    // Generate a new pairing code for re-pairing
+    // Find the device's token hash
+    let token_hash_opt = state
+        .device_registry
+        .as_ref()
+        .and_then(|registry| registry.get_token_hash_by_device_id(&device_id));
+
+    let token_hash = match token_hash_opt {
+        Some(hash) => hash,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Device not found",
+                    "device_id": device_id
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Revoke the token from pairing state
+    let revoked = state.pairing.revoke_token(&token_hash);
+    if !revoked {
+        // Token was not in paired_tokens, but continue anyway
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"device_id": device_id, "token_hash": token_hash})
+                ),
+            "rotate_token: token hash was not in paired_tokens"
+        );
+    }
+
+    // Remove device from registry
+    let registry_removed = state
+        .device_registry
+        .as_ref()
+        .map(|r| r.revoke(&device_id))
+        .unwrap_or(false);
+
+    if !registry_removed {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"device_id": device_id})),
+            "rotate_token: device was not found in registry during revoke"
+        );
+    }
+
+    // Generate new pairing code for re-pairing
     match state.pairing.generate_new_pairing_code() {
-        Some(code) => Json(serde_json::json!({
-            "device_id": device_id,
-            "pairing_code": code,
-            "message": "Use this code to re-pair the device"
-        }))
-        .into_response(),
+        Some(code) => {
+            // Persist the updated paired_tokens to config
+            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+                // Rotation succeeded but persistence failed — still return success but log error
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"device_id": device_id, "error": format!("{e}")})
+                        ),
+                    "Failed to persist token rotation"
+                );
+                return Json(serde_json::json!({
+                    "device_id": device_id,
+                    "pairing_code": code,
+                    "message": "Token revoked in memory, but failed to persist. Please restart the gateway to make the revocation durable.",
+                    "persisted": false
+                }))
+                .into_response();
+            }
+
+            Json(serde_json::json!({
+                "device_id": device_id,
+                "pairing_code": code,
+                "message": "Old token revoked and device removed; use this code to re-pair",
+                "persisted": true
+            }))
+            .into_response()
+        }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Cannot generate new pairing code",
+            Json(serde_json::json!({
+                "error": "Cannot generate new pairing code",
+                "device_id": device_id
+            })),
         )
             .into_response(),
     }
