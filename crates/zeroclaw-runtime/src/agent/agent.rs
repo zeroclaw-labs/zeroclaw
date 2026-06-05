@@ -3438,7 +3438,6 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use zeroclaw_api::observability_traits::ObserverMetric;
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,

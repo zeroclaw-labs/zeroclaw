@@ -199,15 +199,14 @@ impl OtelObserver {
     /// carrying that span as the remote parent. Otherwise returns the ambient
     /// context (no explicit parent → isolated span).
     fn parent_cx_for(&self, turn_id: Option<&str>) -> Context {
-        if let Some(tid) = turn_id {
-            if let Some((_, cx)) = self
+        if let Some(tid) = turn_id
+            && let Some((_, cx)) = self
                 .active_agent_spans
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(tid)
-            {
-                return cx.clone();
-            }
+        {
+            return cx.clone();
         }
         Context::current()
     }
@@ -637,6 +636,7 @@ impl Observer for OtelObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::traits::TurnTokenUsage;
     use std::time::Duration;
 
     // Note: OtelObserver::new() requires an OTLP endpoint.

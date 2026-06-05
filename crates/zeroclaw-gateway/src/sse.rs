@@ -242,7 +242,6 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_api::observability_traits::TurnTokenUsage;
     use zeroclaw_runtime::observability::{Observer, ObserverEvent};
 
     fn make_broadcast() -> (
