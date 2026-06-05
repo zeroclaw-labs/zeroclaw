@@ -29,8 +29,8 @@ The script:
 2. Builds (or downloads) the binary
 3. Installs to `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`
 4. Prints mode-specific next steps:
-   - `--prebuilt`, `--standard`, `--full`: run `zeroclaw onboard`
-   - `--minimal`: onboarding is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`)
+   - `--prebuilt`, `--standard`, `--full`: run `zeroclaw quickstart`
+   - `--minimal`: quickstart is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`)
 
 For source builds, `setup.bat` now prints the exact `cargo build ...` command it executes and reports the installed `zeroclaw.exe` size so command shape and artifact expectations stay visible.
 
@@ -38,7 +38,7 @@ For source builds, `setup.bat` now prints the exact `cargo build ...` command it
 
 ```cmd
 scoop install zeroclaw
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 ### Option 3 — From source
@@ -49,7 +49,7 @@ Requires Rust (`rustup`) and Visual Studio Build Tools:
 git clone https://github.com/zeroclaw-labs/zeroclaw
 cd zeroclaw
 cargo install --locked --path .
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 ## System dependencies
