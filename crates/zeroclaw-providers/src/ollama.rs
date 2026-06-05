@@ -1,6 +1,7 @@
 use crate::multimodal;
 use crate::traits::{
     ChatMessage, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
+    ToolsPayload,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -138,7 +139,8 @@ struct OutgoingFunction {
 
 #[derive(Debug, Serialize)]
 struct Options {
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_ctx: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,7 +416,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         tools: Option<&[serde_json::Value]>,
     ) -> ChatRequest {
         self.build_chat_request_with_think(
@@ -431,7 +433,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         tools: Option<&[serde_json::Value]>,
         think: Option<bool>,
     ) -> ChatRequest {
@@ -440,7 +442,7 @@ impl OllamaModelProvider {
             messages,
             stream: false,
             options: Options {
-                temperature: self.tuning.temperature_override.unwrap_or(temperature),
+                temperature: self.tuning.temperature_override.or(temperature),
                 num_ctx: Some(self.tuning.num_ctx),
                 num_predict: Some(self.tuning.num_predict),
             },
@@ -570,12 +572,95 @@ impl OllamaModelProvider {
             .collect()
     }
 
+    fn with_prompt_guided_tool_instructions(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        let Some(tools) = tools.filter(|items| !items.is_empty()) else {
+            return Ok(messages.to_vec());
+        };
+
+        let ToolsPayload::PromptGuided { instructions } = self.convert_tools(tools) else {
+            anyhow::bail!(
+                "Ollama returned non-prompt-guided tools payload while native tools are disabled"
+            );
+        };
+        let mut modified_messages = messages.to_vec();
+
+        if let Some(system_message) = modified_messages.iter_mut().find(|m| m.role == "system") {
+            if !system_message.content.is_empty() {
+                system_message.content.push_str("\n\n");
+            }
+            system_message.content.push_str(&instructions);
+        } else {
+            modified_messages.insert(0, ChatMessage::system(instructions));
+        }
+
+        Ok(modified_messages)
+    }
+
+    fn response_to_chat_response(&self, response: ApiChatResponse, model: &str) -> ChatResponse {
+        let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
+            Some(TokenUsage {
+                input_tokens: response.prompt_eval_count,
+                output_tokens: response.eval_count,
+                cached_input_tokens: None,
+            })
+        } else {
+            None
+        };
+
+        if !response.message.tool_calls.is_empty() {
+            let tool_calls: Vec<ToolCall> = response
+                .message
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let (name, args) = self.extract_tool_name_and_args(tc);
+                    ToolCall {
+                        id: tc
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        name,
+                        arguments: serde_json::to_string(&args)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                        extra_content: None,
+                    }
+                })
+                .collect();
+            let text = Self::normalize_response_text(response.message.content);
+            return ChatResponse {
+                text,
+                tool_calls,
+                usage,
+                reasoning_content: None,
+            };
+        }
+
+        let text = Self::effective_content(
+            &response.message.content,
+            response.message.thinking.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            Self::fallback_text_for_empty_content(model, response.message.thinking.as_deref())
+        });
+
+        ChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+            usage,
+            reasoning_content: None,
+        }
+    }
+
     /// Send a single HTTP request to Ollama and parse the response.
     async fn send_request_inner(
         &self,
         messages: &[Message],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
         think: Option<bool>,
@@ -589,7 +674,7 @@ impl OllamaModelProvider {
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={}",
+                "Ollama request: url={} model={} message_count={} temperature={:?} think={:?} tool_count={}",
                 url,
                 model,
                 request.messages.len(),
@@ -671,7 +756,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> anyhow::Result<ApiChatResponse> {
@@ -816,7 +901,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let mut messages = Vec::new();
@@ -877,7 +961,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -926,7 +1009,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -945,67 +1027,7 @@ impl ModelProvider for OllamaModelProvider {
             )
             .await?;
 
-        let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
-            Some(TokenUsage {
-                input_tokens: response.prompt_eval_count,
-                output_tokens: response.eval_count,
-                cached_input_tokens: None,
-            })
-        } else {
-            None
-        };
-
-        // Native tool calls returned by the model.
-        if !response.message.tool_calls.is_empty() {
-            let tool_calls: Vec<ToolCall> = response
-                .message
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let (name, args) = self.extract_tool_name_and_args(tc);
-                    ToolCall {
-                        id: tc
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        name,
-                        arguments: serde_json::to_string(&args)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                        extra_content: None,
-                    }
-                })
-                .collect();
-            let text = Self::normalize_response_text(response.message.content);
-            return Ok(ChatResponse {
-                text,
-                tool_calls,
-                usage,
-                reasoning_content: None,
-            });
-        }
-
-        // No native tool calls — use the effective content (content with
-        // `<think>` tags stripped, falling back to thinking field).
-        // The loop_.rs `parse_tool_calls` will extract any XML-style tool
-        // calls from the text, so preserve `<tool_call>` tags here.
-        let effective = Self::effective_content(
-            &response.message.content,
-            response.message.thinking.as_deref(),
-        );
-        let text = if let Some(content) = effective {
-            content
-        } else {
-            Self::fallback_text_for_empty_content(
-                &normalized_model,
-                response.message.thinking.as_deref(),
-            )
-        };
-        Ok(ChatResponse {
-            text: Some(text),
-            tool_calls: vec![],
-            usage,
-            reasoning_content: None,
-        })
+        Ok(self.response_to_chat_response(response, &normalized_model))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1024,40 +1046,21 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        // Convert ToolSpec to OpenAI-compatible JSON and delegate to chat_with_tools.
-        if let Some(specs) = request.tools
-            && !specs.is_empty()
-        {
-            let tools: Vec<serde_json::Value> = specs
-                .iter()
-                .map(|s| {
-                    let params =
-                        zeroclaw_api::schema::SchemaCleanr::clean_for_openai(s.parameters.clone());
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": s.name,
-                            "description": s.description,
-                            "parameters": params
-                        }
-                    })
-                })
-                .collect();
-            return self
-                .chat_with_tools(request.messages, &tools, model, temperature)
-                .await;
-        }
-
-        // No tools — fall back to plain text chat.
-        let text = self
-            .chat_with_history(request.messages, model, temperature)
+        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
+        let messages =
+            self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
+        let api_messages = self.convert_messages(&messages);
+        let response = self
+            .send_request(
+                api_messages,
+                &normalized_model,
+                temperature,
+                should_auth,
+                None,
+            )
             .await?;
-        Ok(ChatResponse {
-            text: Some(text),
-            tool_calls: vec![],
-            usage: None,
-            reasoning_content: None,
-        })
+
+        Ok(self.response_to_chat_response(response, &normalized_model))
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -1104,6 +1107,7 @@ impl ::zeroclaw_api::attribution::Attributable for OllamaModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn default_url() {
@@ -1231,6 +1235,117 @@ mod tests {
         assert!(!should_auth);
     }
 
+    #[tokio::test]
+    async fn chat_with_tool_specs_omits_native_tools_payload() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_api::model_provider::ChatRequest;
+        use zeroclaw_api::tool::ToolSpec;
+
+        type CapturedBody = Arc<Mutex<Option<serde_json::Value>>>;
+
+        async fn capture_request(
+            State(captured): State<CapturedBody>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *captured.lock().expect("capture mutex poisoned") = Some(body);
+            Json(serde_json::json!({
+                "message": {
+                    "role": "assistant",
+                    "content": "done"
+                },
+                "prompt_eval_count": 10,
+                "eval_count": 3
+            }))
+        }
+
+        let captured: CapturedBody = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/api/chat", post(capture_request))
+            .with_state(captured.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let provider = OllamaModelProvider::new("test", Some(&format!("http://{addr}")), None);
+        let messages = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("read a file"),
+        ];
+        let tools = vec![ToolSpec {
+            name: "file_read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        }];
+
+        let response = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "llama3",
+                Some(0.2),
+            )
+            .await
+            .expect("ollama chat request should succeed");
+
+        server.abort();
+
+        assert_eq!(response.text.as_deref(), Some("done"));
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(10)
+        );
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(3)
+        );
+        let body = captured
+            .lock()
+            .expect("capture mutex poisoned")
+            .take()
+            .expect("request body should be captured");
+        assert!(
+            body.get("tools").is_none(),
+            "Ollama chat() must not serialize native tools while supports_native_tools() is false: {body}"
+        );
+        let request_messages = body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("request messages should be serialized");
+        assert!(
+            request_messages.iter().any(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content| {
+                            content.contains("## Tool Use Protocol")
+                                && content.contains("file_read")
+                                && content.contains("\"path\"")
+                        })
+            }),
+            "prompt-guided tool instructions should be generated from ToolSpec: {body}"
+        );
+    }
+
     #[test]
     fn request_omits_think_when_reasoning_not_configured() {
         let model_provider = OllamaModelProvider::new("test", None, None);
@@ -1243,7 +1358,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.7,
+            Some(0.7),
             None,
         );
 
@@ -1267,7 +1382,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.7,
+            Some(0.7),
             None,
         );
 
@@ -1290,7 +1405,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.2,
+            Some(0.2),
             None,
         );
 
@@ -1303,11 +1418,10 @@ mod tests {
 
     #[test]
     fn build_chat_request_with_think_emits_explicit_options() {
-        // Wire-shape snapshot: the JSON body of every Ollama /api/chat
-        // request MUST carry an `options` object with all three keys
-        // (`temperature`, `num_ctx`, `num_predict`) populated. Older
-        // tests cover individual fields piecemeal; this one locks the
-        // full shape so a future refactor can't silently drop a field.
+        // Wire-shape snapshot: when temperature is Some, the JSON body of
+        // every Ollama /api/chat request must carry an `options` object
+        // with `num_ctx` and `num_predict`, and a `temperature` matching
+        // the value passed. None must omit the temperature key entirely.
         let provider = OllamaModelProvider::new("test", None, None);
         let request = provider.build_chat_request_with_think(
             vec![Message {
@@ -1318,7 +1432,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.3,
+            Some(0.3),
             None,
             Some(true),
         );
@@ -1328,9 +1442,10 @@ mod tests {
             .get("options")
             .expect("options object missing from request body");
 
-        assert!(
-            options.get("temperature").is_some(),
-            "options.temperature must be present on every wire request"
+        assert_eq!(
+            options.get("temperature"),
+            Some(&serde_json::json!(0.3)),
+            "options.temperature must match the value passed in"
         );
         assert!(
             options.get("num_ctx").is_some(),
@@ -1362,7 +1477,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.5,
+            Some(0.5),
             None,
         );
 
@@ -1388,7 +1503,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.9,
+            Some(0.9),
             None,
         );
 
@@ -1409,7 +1524,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.42,
+            Some(0.42),
             None,
         );
 
@@ -1441,11 +1556,12 @@ mod tests {
         let first = provider.build_chat_request_with_think(
             messages.clone(),
             "llama3",
-            0.4,
+            Some(0.4),
             None,
             Some(true),
         );
-        let retry = provider.build_chat_request_with_think(messages, "llama3", 0.4, None, None);
+        let retry =
+            provider.build_chat_request_with_think(messages, "llama3", Some(0.4), None, None);
 
         let first_json = serde_json::to_value(first).unwrap();
         let retry_json = serde_json::to_value(retry).unwrap();

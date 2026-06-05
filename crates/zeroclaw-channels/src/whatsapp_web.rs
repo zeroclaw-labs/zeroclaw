@@ -222,7 +222,13 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            match super::tts::TtsManager::from_config(config) {
+            // Bind the TTS manager to the agent that owns THIS channel so the
+            // voice reply uses that agent's `tts_provider`. Without this the
+            // shared manager resolves the lexicographically-smallest enabled
+            // agent, which silently breaks TTS when that agent has no
+            // `tts_provider` set (e.g. a background/delegate agent).
+            let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
+            match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -385,6 +391,77 @@ impl WhatsAppWebChannel {
         } else {
             chat_jid.to_string()
         }
+    }
+
+    /// True when the address is a WhatsApp LID JID (not deliverable for outbound).
+    #[cfg(feature = "whatsapp-web")]
+    fn is_lid_jid_string(jid: &str) -> bool {
+        jid.trim()
+            .rsplit_once('@')
+            .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case("lid"))
+    }
+
+    /// Map an undeliverable LID chat JID to `digits@s.whatsapp.net` when phone
+    /// candidates are known. Returns `(target, converted)`.
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_deliverable_reply_target(chat: &str, phone_candidates: &[String]) -> (String, bool) {
+        if !Self::is_lid_jid_string(chat) {
+            return (chat.to_string(), false);
+        }
+        for candidate in phone_candidates {
+            let digits: String = candidate.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return (format!("{digits}@s.whatsapp.net"), true);
+            }
+        }
+        (chat.to_string(), false)
+    }
+
+    /// Best-effort LID→phone lookup via whatsapp-rust 0.6 `get_lid_pn_entry`.
+    #[cfg(feature = "whatsapp-web")]
+    async fn lookup_phone_from_lid_jid(
+        client: &whatsapp_rust::Client,
+        lid_jid: &str,
+    ) -> Option<String> {
+        let lid_user = lid_jid.split('@').next().filter(|u| !u.is_empty())?;
+        let jid = wacore_binary::jid::Jid::lid(lid_user);
+        match client.get_lid_pn_entry(&jid).await {
+            Ok(Some(entry)) => Some(entry.phone_number),
+            _ => None,
+        }
+    }
+
+    /// Resolve an outbound recipient, converting LID JIDs via the live client cache.
+    #[cfg(feature = "whatsapp-web")]
+    async fn resolve_outbound_recipient(
+        client: &whatsapp_rust::Client,
+        recipient: &str,
+    ) -> Result<String> {
+        let trimmed = recipient.trim();
+        if !Self::is_lid_jid_string(trimmed) {
+            return Ok(trimmed.to_string());
+        }
+        if let Some(phone) = Self::lookup_phone_from_lid_jid(client, trimmed).await
+            && let Some(token) = Self::normalize_phone_token(&phone)
+        {
+            let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                let resolved = format!("{digits}@s.whatsapp.net");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "from": trimmed,
+                            "to": resolved,
+                        })),
+                    "outbound LID→phone recipient"
+                );
+                return Ok(resolved);
+            }
+        }
+        anyhow::bail!(
+            "Cannot deliver to LID JID `{trimmed}`: phone resolution failed (LID JIDs cannot receive messages)"
+        )
     }
 
     /// Normalize phone number to E.164 format
@@ -614,7 +691,7 @@ impl WhatsAppWebChannel {
         text: &str,
         tts_manager: &super::tts::TtsManager,
     ) -> Result<()> {
-        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
         ::zeroclaw_log::record!(
             INFO,
@@ -652,7 +729,7 @@ impl WhatsAppWebChannel {
             )
         );
 
-        // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
+        // Estimate duration from file size: Opus at ~32 kbps → bytes / 4000 ≈ seconds
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
@@ -871,7 +948,9 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(&message.recipient)?;
+        let deliverable_recipient =
+            Self::resolve_outbound_recipient(&client, &message.recipient).await?;
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -910,7 +989,7 @@ impl Channel for WhatsAppWebChannel {
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
                 let tts_manager = self.tts_manager.clone().unwrap();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -1174,7 +1253,7 @@ impl Channel for WhatsAppWebChannel {
                                     .cloned();
 
                                 let is_group = info.source.is_group;
-                                let reply_target = Self::compute_reply_target(
+                                let mut reply_target = Self::compute_reply_target(
                                     &chat,
                                     info.source.chat.is_lid(),
                                     is_group,
@@ -1266,6 +1345,51 @@ impl Channel for WhatsAppWebChannel {
 
                                 let normalized = normalized.unwrap_or_else(|| sender.clone());
 
+                                // LID chat JIDs cannot receive outbound messages (typing may
+                                // still work). Resolve to phone JID for all non-group DMs.
+                                if !is_group && Self::is_lid_jid_string(&reply_target) {
+                                    let mut lid_candidates = sender_candidates.clone();
+                                    if let Some(phone) =
+                                        Self::lookup_phone_from_lid_jid(&client, &reply_target).await
+                                        && let Some(token) = Self::normalize_phone_token(&phone)
+                                        && !lid_candidates.iter().any(|c| c == &token)
+                                    {
+                                        lid_candidates.push(token);
+                                    }
+                                    let (resolved, converted) =
+                                        Self::resolve_deliverable_reply_target(
+                                            &reply_target,
+                                            &lid_candidates,
+                                        );
+                                    if converted {
+                                        reply_target = resolved;
+                                        ::zeroclaw_log::record!(
+                                            INFO,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_attrs(::serde_json::json!({
+                                                "reply_target": reply_target,
+                                            })),
+                                            "DM LID→phone reply target"
+                                        );
+                                    } else {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                            .with_attrs(::serde_json::json!({
+                                                "reply_target": reply_target,
+                                            })),
+                                            "undeliverable LID reply_target; outbound may fail"
+                                        );
+                                    }
+                                }
+
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note).
                                 // When `transcribe_non_ptt_audio` is enabled in the transcription
                                 // config, also transcribe forwarded / regular audio messages.
@@ -1292,15 +1416,16 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
-                                // We store the chat JID (reply_target) since that's what send() receives.
+                                // Key by final reply_target (post-LID resolution): send() checks
+                                // message.recipient, which is the resolved phone JID for LID DMs.
                                 let content = if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.insert(chat.clone());
+                                        vs.insert(reply_target.clone());
                                     }
                                     format!("[Voice] {vt}")
                                 } else {
                                     if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&chat);
+                                        vs.remove(&reply_target);
                                     }
                                     let text = msg.text_content().unwrap_or("");
                                     text.trim().to_string()
@@ -1365,8 +1490,8 @@ impl Channel for WhatsAppWebChannel {
                                         channel_alias: Some((*alias).clone()),
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
-                                        // For self-chat with LID JIDs, this is the
-                                        // resolved phone JID (see above).
+                                        // For DMs with LID JIDs, this is the resolved
+                                        // phone JID (see LID→phone resolution above).
                                         reply_target,
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1591,7 +1716,8 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(recipient)?;
+        let deliverable_recipient = Self::resolve_outbound_recipient(&client, recipient).await?;
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
         client.chatstate().send_composing(&to).await.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1630,7 +1756,8 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(recipient)?;
+        let deliverable_recipient = Self::resolve_outbound_recipient(&client, recipient).await?;
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
         client.chatstate().send_paused(&to).await.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1939,6 +2066,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn is_lid_jid_string_detects_lid_domain() {
+        assert!(WhatsAppWebChannel::is_lid_jid_string("76188559093817@lid"));
+        assert!(!WhatsAppWebChannel::is_lid_jid_string(
+            "15551234567@s.whatsapp.net"
+        ));
+        assert!(!WhatsAppWebChannel::is_lid_jid_string("+15551234567"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn compute_reply_target_lid_dm_without_phone_fallback() {
         // Non-group LID DM without mapped_phone → falls back to chat JID
         let chat_jid = "76188559093817@lid";
@@ -1949,6 +2086,17 @@ mod tests {
             result, chat_jid,
             "LID DM without mapped_phone must fall back to original chat JID"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_deliverable_reply_target_converts_lid_with_phone_candidate() {
+        let (target, converted) = WhatsAppWebChannel::resolve_deliverable_reply_target(
+            "76188559093817@lid",
+            &["+15551234567".to_string()],
+        );
+        assert!(converted);
+        assert_eq!(target, "15551234567@s.whatsapp.net");
     }
 
     #[test]
@@ -1972,6 +2120,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn resolve_deliverable_reply_target_leaves_phone_jid_unchanged() {
+        let chat = "15551234567@s.whatsapp.net";
+        let (target, converted) =
+            WhatsAppWebChannel::resolve_deliverable_reply_target(chat, &["+15551234567".into()]);
+        assert!(!converted);
+        assert_eq!(target, chat);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn compute_reply_target_group_unchanged() {
         // Group chat → original chat JID (groups don't need conversion)
         let chat_jid = "120363012345678901@g.us";
@@ -1986,6 +2144,42 @@ mod tests {
         assert_eq!(
             result, chat_jid,
             "Group chat must preserve original chat JID"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_deliverable_reply_target_warns_via_unchanged_lid_when_no_candidates() {
+        let chat = "76188559093817@lid";
+        let (target, converted) = WhatsAppWebChannel::resolve_deliverable_reply_target(chat, &[]);
+        assert!(!converted);
+        assert_eq!(target, chat);
+    }
+
+    /// Regression: inbound voice tracking must use the resolved `reply_target`
+    /// (phone JID), not the original LID `chat`, because `send()` looks up
+    /// `voice_chats` with `message.recipient` (= `reply_target`).
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_dm_voice_tracking_key_matches_send_recipient() {
+        let chat_lid = "76188559093817@lid";
+        let (reply_target, converted) = WhatsAppWebChannel::resolve_deliverable_reply_target(
+            chat_lid,
+            &["+15551234567".to_string()],
+        );
+        assert!(converted);
+        assert_ne!(chat_lid, reply_target);
+
+        let mut voice_chats = std::collections::HashSet::new();
+        voice_chats.insert(reply_target.clone());
+        let message_recipient = reply_target.clone();
+        assert!(
+            voice_chats.contains(&message_recipient),
+            "voice_chats must be keyed by resolved reply_target for send() lookup"
+        );
+        assert!(
+            !voice_chats.contains(chat_lid),
+            "original LID chat JID must not be the voice_chats key after LID→phone resolution"
         );
     }
 

@@ -30,6 +30,11 @@ pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
     /// Synthesize `text` using the given `voice`, returning raw audio bytes.
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
 
+    /// The audio container/codec of the bytes returned by `synthesize`
+    /// (e.g. `"opus"`, `"wav"`, `"mp3"`). Used by `TtsManager::synthesize_opus`
+    /// to decide whether transcoding is necessary — only `"opus"` skips it.
+    fn output_format(&self) -> &str;
+
     /// Voices supported by this model_provider.
     fn supported_voices(&self) -> Vec<String>;
 
@@ -103,6 +108,10 @@ impl OpenAiTtsProvider {
 impl TtsProvider for OpenAiTtsProvider {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn output_format(&self) -> &str {
+        &self.response_format
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
@@ -205,6 +214,9 @@ impl ElevenLabsTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for ElevenLabsTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
     fn name(&self) -> &str {
         "elevenlabs"
     }
@@ -312,6 +324,10 @@ impl GoogleTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for GoogleTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
+
     fn name(&self) -> &str {
         "google"
     }
@@ -426,6 +442,10 @@ impl EdgeTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for EdgeTtsProvider {
+    fn output_format(&self) -> &str {
+        "mp3"
+    }
+
     fn name(&self) -> &str {
         "edge"
     }
@@ -518,6 +538,10 @@ impl PiperTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for PiperTtsProvider {
+    fn output_format(&self) -> &str {
+        "wav"
+    }
+
     fn name(&self) -> &str {
         "piper"
     }
@@ -571,6 +595,69 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
+/// Transcode raw audio bytes to OGG/Opus via an `ffmpeg` subprocess.
+///
+/// Pipes `audio` into ffmpeg's stdin and reads OGG/Opus from stdout.
+/// stdin and stdout are driven concurrently to avoid buffer-deadlocks on
+/// large inputs. Requires `ffmpeg` with `libopus` support installed.
+async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "ogg",
+            "-acodec",
+            "libopus",
+            "-b:a",
+            "32k",
+            "-vbr",
+            "on",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context(
+            "failed to spawn ffmpeg — ensure ffmpeg with libopus support is installed \
+             (e.g. `sudo dnf install ffmpeg` / `sudo apt install ffmpeg`)",
+        )?;
+
+    let mut stdin = child.stdin.take().expect("stdin configured above");
+
+    // Drive stdin and wait concurrently: if ffmpeg fills its stdout pipe
+    // before we finish writing stdin, sequential operation would deadlock.
+    let (write_result, output) = tokio::join!(
+        async move {
+            stdin.write_all(&audio).await?;
+            stdin.shutdown().await
+        },
+        child.wait_with_output()
+    );
+
+    write_result.context("failed to write audio to ffmpeg stdin")?;
+    let output = output.context("ffmpeg process error")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ffmpeg transcode to opus failed: {stderr}");
+    }
+
+    anyhow::ensure!(
+        !output.stdout.is_empty(),
+        "ffmpeg produced empty output — check that libopus is available"
+    );
+
+    Ok(output.stdout)
+}
+
 /// Central manager for per-agent TTS synthesis.
 ///
 /// `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
@@ -600,6 +687,19 @@ impl TtsManager {
     /// so when no agent-bound resolution is available the manager refuses
     /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_for_agent(config, None)
+    }
+
+    /// Build a `TtsManager` bound to a specific agent's `tts_provider`.
+    ///
+    /// `agent_alias` is the channel-owning agent (resolve via
+    /// [`Config::agent_for_channel`]). When `None`, falls back to the
+    /// runtime-active agent ([`Config::resolved_runtime_agent_alias`]) for
+    /// callers that cannot determine the owning agent. Binding to the
+    /// owning agent is what lets a channel owned by e.g. `primary` use
+    /// `primary`'s `tts_provider` instead of whichever enabled agent
+    /// happens to sort first.
+    pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
@@ -650,12 +750,12 @@ impl TtsManager {
             config.tts.max_text_length
         };
 
-        // Per-agent join: the runtime-active agent's `tts_provider` is the
-        // resolved alias for this manager instance. Empty (or no resolved
+        // Per-agent join: bind to the channel-owning agent's `tts_provider`
+        // when known, else the runtime-active agent. Empty (or no resolved
         // agent) = no TTS; `synthesize` fails loud rather than silently
         // pick a provider.
-        let agent_tts_provider = config
-            .resolved_runtime_agent_alias()
+        let agent_tts_provider = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
             .and_then(|alias| config.agents.get(alias))
             .map(|a| a.tts_provider.as_str().to_string())
             .unwrap_or_default();
@@ -667,6 +767,25 @@ impl TtsManager {
             default_voice: config.tts.default_voice.clone(),
             max_text_length,
         })
+    }
+
+    /// Synthesize `text` and return OGG/Opus audio suitable for Telegram
+    /// `sendVoice` and WhatsApp PTT voice notes. If the active provider
+    /// already outputs Opus (e.g. OpenAI with `response_format = "opus"`),
+    /// the bytes pass through unchanged; otherwise they are transcoded via an
+    /// `ffmpeg` subprocess. Requires `ffmpeg` with `libopus` support installed.
+    pub async fn synthesize_opus(&self, text: &str) -> Result<Vec<u8>> {
+        let audio = self.synthesize(text).await?;
+        let provider_alias = self.agent_tts_provider.as_str();
+        let format = self
+            .tts_providers
+            .get(provider_alias)
+            .map(|p| p.output_format())
+            .unwrap_or("unknown");
+        if format == "opus" {
+            return Ok(audio);
+        }
+        transcode_to_opus(audio).await
     }
 
     /// Synthesize text using the runtime-active agent's resolved
@@ -859,6 +978,47 @@ mod tests {
         let cfg = config_with_edge_alias();
         let manager = TtsManager::from_config(&cfg).unwrap();
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
+    }
+
+    /// Regression for #7001: a channel-owning agent's `tts_provider` must win
+    /// over a lexicographically-earlier enabled agent that has none. Binding
+    /// the manager to the owner (`from_config_for_agent(cfg, Some("primary"))`)
+    /// resolves `primary`'s provider, not the first-sorting agent's empty one.
+    #[test]
+    fn tts_manager_binds_owning_agent_provider() {
+        // Reuse the edge.default provider registration, but install two agents:
+        // `primary` (the channel owner, has the provider) and a
+        // lexicographically-earlier `background` agent with no `tts_provider`.
+        let mut cfg = config_with_edge_alias();
+        cfg.agents.clear();
+        cfg.agents.insert(
+            "primary".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                tts_provider: "edge.default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "background".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                ..Default::default()
+            },
+        );
+
+        // Owner-bound resolution picks primary's provider...
+        let owner_bound = TtsManager::from_config_for_agent(&cfg, Some("primary")).unwrap();
+        assert_eq!(
+            owner_bound.agent_tts_provider, "edge.default",
+            "owner-bound manager must resolve the channel owner's tts_provider"
+        );
+
+        // ...while binding to the provider-less first-sorting agent stays empty,
+        // proving the binding is per-agent and not a global/first-sorting pick.
+        let background_bound = TtsManager::from_config_for_agent(&cfg, Some("background")).unwrap();
+        assert!(
+            background_bound.agent_tts_provider.is_empty(),
+            "an agent with no tts_provider must not inherit another agent's provider"
+        );
     }
 
     #[tokio::test]

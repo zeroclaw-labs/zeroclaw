@@ -552,7 +552,7 @@ impl WeComWsChannel {
 
         let retention = Duration::from_secs(u64::from(self.cfg.file_retention_days) * 86_400);
         let root = self.cfg.workspace_dir.join("wecom_ws_files");
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             cleanup_inbox_files(root, retention).await;
         });
     }
@@ -571,7 +571,7 @@ impl WeComWsChannel {
             "aibot_msg_callback" => {
                 let channel = self.clone();
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     channel.handle_msg_callback(frame, &tx).await;
                 });
                 false
@@ -767,7 +767,7 @@ impl WeComWsChannel {
 
         let channel_self = self.clone();
         let tx = tx.clone();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut inbound = parsed;
             channel_self
                 .materialize_quote_attachments(&mut inbound)
@@ -3119,7 +3119,7 @@ mod tests {
         *channel.ws_tx.lock().await = Some(ws_tx);
 
         let responder_channel = channel.clone();
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
                 panic!("expected respond_msg frame");
             };
@@ -3181,7 +3181,7 @@ mod tests {
         *channel.ws_tx.lock().await = Some(ws_tx);
 
         let responder_channel = channel.clone();
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
                 panic!("expected send_msg frame");
             };
@@ -3408,7 +3408,7 @@ mod tests {
         *channel.ws_tx.lock().await = Some(ws_tx);
 
         let responder_channel = channel.clone();
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
                 panic!("expected access-denied response frame");
             };
@@ -3541,7 +3541,7 @@ mod tests {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let responder_channel = channel.clone();
         let responder_attempts = Arc::clone(&attempts);
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             while let Some(WsOutbound::Frame(frame)) = rx.recv().await {
                 let attempt = responder_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let req_id = frame
@@ -3589,14 +3589,14 @@ mod tests {
         *channel.ws_tx.lock().await = Some(tx);
 
         let first_channel = channel.clone();
-        let first = tokio::spawn(async move {
+        let first = zeroclaw_spawn::spawn!(async move {
             first_channel
                 .ws_send_respond_msg("req-serial", "stream-1", "first", false)
                 .await
         });
 
         let second_channel = channel.clone();
-        let second = tokio::spawn(async move {
+        let second = zeroclaw_spawn::spawn!(async move {
             second_channel
                 .ws_send_respond_msg("req-serial", "stream-1", "second", false)
                 .await

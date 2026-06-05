@@ -1,4 +1,5 @@
 use super::ModelProvider;
+use super::stream_guard::AbortOnDrop;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -1127,7 +1128,7 @@ impl ModelProvider for ReliableModelProvider {
             let stream = model_provider.stream_chat(req, &current_model, temperature, options);
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-            tokio::spawn(async move {
+            let handle = ::zeroclaw_spawn::spawn!(async move {
                 let mut stream = stream;
                 while let Some(event) = stream.next().await {
                     if let Err(ref e) = event {
@@ -1139,8 +1140,9 @@ impl ModelProvider for ReliableModelProvider {
                 }
             });
 
-            return stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|event| (event, rx))
+            let guard = AbortOnDrop::new(handle.abort_handle());
+            return stream::unfold((rx, guard), |(mut rx, guard)| async move {
+                rx.recv().await.map(|event| (event, (rx, guard)))
             })
             .boxed();
         }
@@ -1190,7 +1192,7 @@ impl ModelProvider for ReliableModelProvider {
             // Use a channel to bridge the stream with logging
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-            tokio::spawn(async move {
+            let handle = ::zeroclaw_spawn::spawn!(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
@@ -1203,8 +1205,9 @@ impl ModelProvider for ReliableModelProvider {
             });
 
             // Convert channel receiver to stream
-            return stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|chunk| (chunk, rx))
+            let guard = AbortOnDrop::new(handle.abort_handle());
+            return stream::unfold((rx, guard), |(mut rx, guard)| async move {
+                rx.recv().await.map(|chunk| (chunk, (rx, guard)))
             })
             .boxed();
         }
@@ -1249,7 +1252,7 @@ impl ModelProvider for ReliableModelProvider {
 
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-            tokio::spawn(async move {
+            let handle = ::zeroclaw_spawn::spawn!(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
@@ -1261,8 +1264,9 @@ impl ModelProvider for ReliableModelProvider {
                 }
             });
 
-            return stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|chunk| (chunk, rx))
+            let guard = AbortOnDrop::new(handle.abort_handle());
+            return stream::unfold((rx, guard), |(mut rx, guard)| async move {
+                rx.recv().await.map(|chunk| (chunk, (rx, guard)))
             })
             .boxed();
         }

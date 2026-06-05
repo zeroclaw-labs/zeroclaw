@@ -16,7 +16,16 @@ pub struct CostTracker {
     config: CostConfig,
     storage: Arc<Mutex<CostStorage>>,
     session_id: String,
-    session_costs: Arc<Mutex<Vec<CostRecord>>>,
+    /// Per-daemon-lifetime aggregates keyed by `Option<agent_alias>`,
+    /// replacing the unbounded per-turn `Vec<CostRecord>`.
+    session_totals: Arc<Mutex<HashMap<Option<String>, AgentTotals>>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct AgentTotals {
+    cost_usd: f64,
+    total_tokens: u64,
+    request_count: u64,
 }
 
 impl CostTracker {
@@ -35,7 +44,7 @@ impl CostTracker {
             config,
             storage: Arc::new(Mutex::new(storage)),
             session_id: uuid::Uuid::new_v4().to_string(),
-            session_costs: Arc::new(Mutex::new(Vec::new())),
+            session_totals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -48,8 +57,8 @@ impl CostTracker {
         self.storage.lock()
     }
 
-    fn lock_session_costs(&self) -> MutexGuard<'_, Vec<CostRecord>> {
-        self.session_costs.lock()
+    fn lock_session_totals(&self) -> MutexGuard<'_, HashMap<Option<String>, AgentTotals>> {
+        self.session_totals.lock()
     }
 
     /// Check if a request is within budget.
@@ -149,17 +158,22 @@ impl CostTracker {
         } else {
             None
         };
-        let record = CostRecord::with_agent(&self.session_id, effective_alias, usage);
+        let cost_usd = usage.cost_usd;
+        let total_tokens = usage.total_tokens;
+        let record = CostRecord::with_agent(&self.session_id, effective_alias.clone(), usage);
 
-        // Persist first for durability guarantees.
         {
             let mut storage = self.lock_storage();
-            storage.add_record(record.clone())?;
+            storage.add_record(record)?;
         }
 
-        // Then update in-memory session snapshot.
-        let mut session_costs = self.lock_session_costs();
-        session_costs.push(record);
+        {
+            let mut totals = self.lock_session_totals();
+            let entry = totals.entry(effective_alias).or_default();
+            entry.cost_usd += cost_usd;
+            entry.total_tokens += total_tokens;
+            entry.request_count += 1;
+        }
 
         Ok(())
     }
@@ -227,19 +241,27 @@ impl CostTracker {
             (d, m, storage.daily_records()?)
         };
 
-        let session_costs = self.lock_session_costs();
+        let (session_cost, total_tokens, request_count) = {
+            let totals = self.lock_session_totals();
+            totals
+                .iter()
+                .filter(|(alias, _)| match agent_filter {
+                    Some(want) => alias.as_deref() == Some(want),
+                    None => true,
+                })
+                .fold((0.0_f64, 0_u64, 0_usize), |(c, t, r), (_, v)| {
+                    (
+                        c + v.cost_usd,
+                        t + v.total_tokens,
+                        r + v.request_count as usize,
+                    )
+                })
+        };
+
         let matches_agent = |record: &CostRecord| match agent_filter {
             Some(alias) => record.agent_alias.as_deref() == Some(alias),
             None => true,
         };
-
-        // Session view is kept on `CostSummary` for backward-compat with
-        // callers that still want it (CLI `cost` command, etc.), but the
-        // dashboard reads the daily-scoped rollups below.
-        let scoped: Vec<&CostRecord> = session_costs.iter().filter(|r| matches_agent(r)).collect();
-        let session_cost: f64 = scoped.iter().map(|record| record.usage.cost_usd).sum();
-        let total_tokens: u64 = scoped.iter().map(|record| record.usage.total_tokens).sum();
-        let request_count = scoped.len();
 
         // Daily-scoped per-model rollup. Filter by agent when scoped.
         let model_records: Vec<&CostRecord> =

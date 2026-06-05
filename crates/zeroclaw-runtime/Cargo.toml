@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-log.workspace = true
@@ -36,6 +37,7 @@ hostname = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 indicatif = "0.18"
 lru = "0.16"
+mime_guess = "2"
 nanohtml2text = "0.2"
 parking_lot = "0.12"
 portable-atomic = "1"

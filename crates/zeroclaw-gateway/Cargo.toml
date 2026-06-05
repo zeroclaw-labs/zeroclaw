@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true

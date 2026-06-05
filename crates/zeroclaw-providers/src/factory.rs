@@ -708,15 +708,24 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Codex variant routing: the `requires_openai_auth` flag on the
-        // shared base flips OpenAI to its Codex-protocol cousin. Lives on
-        // the typed alias — operators set it via the schema-mirror grammar
-        // alongside any other OpenAI alias field.
+        // Codex variant routing: OAuth subscription auth → Codex responses protocol.
         if self.base.requires_openai_auth {
             return Ok(Box::new(
                 crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?,
             ));
         }
+        // Responses wire protocol with standard API key — full streaming tool calls.
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, api_url, key);
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
+        // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
@@ -1086,6 +1095,20 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("llama.cpp");
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p = crate::openai::OpenAiResponsesModelProvider::new(
+                alias,
+                Some(base_url),
+                Some(llama_cpp_key),
+            );
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
             "llama.cpp",
@@ -1281,7 +1304,7 @@ mod tests {
                 post(capture_chat_request),
             )
             .with_state(capture.clone());
-        let server = tokio::spawn(async move {
+        let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.expect("serve test server");
         });
 
@@ -1378,5 +1401,40 @@ mod tests {
         );
 
         assert_eq!(provider.credential.as_deref(), Some("ollama-key"));
+    }
+
+    #[test]
+    fn llamacpp_factory_routes_to_responses_provider_when_wire_api_responses() {
+        use zeroclaw_config::schema::{LlamacppModelProviderConfig, ModelProviderConfig, WireApi};
+        let cfg = LlamacppModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                Some("http://localhost:8080/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn llamacpp_factory_defaults_to_chat_completions_without_wire_api() {
+        use zeroclaw_config::schema::LlamacppModelProviderConfig;
+        let cfg = LlamacppModelProviderConfig::default();
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                Some("http://localhost:8080/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
     }
 }

@@ -1,38 +1,18 @@
 use crate::util::*;
 use std::path::{Path, PathBuf};
+use zeroclaw_api::model_provider::ModelProvider;
 
 const DEFAULT_BATCH_SIZE: usize = 50;
-
-struct Backend {
-    base_url: String,
-    model: String,
-    api_key: Option<String>,
-}
-
-fn resolve_backend(model_provider: &str) -> anyhow::Result<Backend> {
-    let cfg = read_model_provider_config(model_provider)?;
-    let model = cfg.model
-        .ok_or_else(|| anyhow::Error::msg("No model set for model_provider '{model_provider}' — add `model = \"...\"` to [providers.models.{model_provider}] in config.toml"))?;
-    Ok(Backend {
-        base_url: cfg.base_url,
-        model,
-        api_key: cfg.api_key,
-    })
-}
 
 pub fn run(
     locale: Option<&str>,
     force: bool,
     model_provider: Option<&str>,
+    config_dir: Option<&str>,
+    catalog: Option<&str>,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = repo_root();
-    let locales_dir = fluent_locales_dir(&root);
-    let en_dir = locales_dir.join("en");
-
-    if !en_dir.exists() {
-        anyhow::bail!("English locale dir not found: {}", en_dir.display());
-    }
 
     let targets: Vec<String> = match locale {
         Some(l) => vec![l.to_string()],
@@ -41,29 +21,45 @@ pub fn run(
 
     let provider_name = model_provider.ok_or_else(|| {
         anyhow::Error::msg(
-            "--model-provider <name> is required (configured in [providers.models.<name>] in config.toml)",
+            "--model-provider <alias> is required (configured under [providers.models.<kind>.<alias>] in config.toml)",
         )
     })?;
-    let backend = resolve_backend(provider_name)?;
+    // The runtime provider stack resolves endpoint, auth, and wire protocol
+    // per family and decrypts secrets — nothing is hand-rolled here.
+    let (provider, model) = build_model_provider(provider_name, config_dir)?;
     let batch_size = batch.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
 
-    for target_locale in &targets {
-        let target_dir = locales_dir.join(target_locale);
-        std::fs::create_dir_all(&target_dir)?;
-
-        for ftl_path in ftl_files_in(&en_dir)? {
-            let filename = ftl_path.file_name().unwrap();
-            let target_ftl = target_dir.join(filename);
-
-            fill_ftl_file(
-                &ftl_path,
-                &target_ftl,
-                target_locale,
-                force,
-                &backend,
-                batch_size,
-            )?;
+    let mut filled_any = false;
+    for locales_dir in fluent_catalog_roots_for(&root, catalog)? {
+        let en_dir = locales_dir.join("en");
+        if !en_dir.exists() {
+            continue;
         }
+        filled_any = true;
+
+        for target_locale in &targets {
+            let target_dir = locales_dir.join(target_locale);
+            std::fs::create_dir_all(&target_dir)?;
+
+            for ftl_path in ftl_files_in(&en_dir)? {
+                let filename = ftl_path.file_name().unwrap();
+                let target_ftl = target_dir.join(filename);
+
+                fill_ftl_file(
+                    &ftl_path,
+                    &target_ftl,
+                    target_locale,
+                    force,
+                    provider.as_ref(),
+                    &model,
+                    batch_size,
+                )?;
+            }
+        }
+    }
+
+    if !filled_any {
+        anyhow::bail!("no fluent catalogue roots with an en/ dir found");
     }
 
     Ok(())
@@ -74,7 +70,8 @@ fn fill_ftl_file(
     target_path: &PathBuf,
     locale: &str,
     force: bool,
-    backend: &Backend,
+    provider: &dyn ModelProvider,
+    model: &str,
     batch_size: usize,
 ) -> anyhow::Result<()> {
     let en_entries = parse_ftl(&std::fs::read_to_string(en_path)?);
@@ -110,7 +107,7 @@ fn fill_ftl_file(
     let locale_name = locale_display_name(locale);
 
     for chunk in to_translate.chunks(batch_size) {
-        let translated = call_api(backend, locale_name, chunk)?;
+        let translated = call_api(provider, model, locale_name, chunk)?;
 
         // Merge: update existing or append new
         for (key, value) in translated {
@@ -130,7 +127,8 @@ fn fill_ftl_file(
 }
 
 fn call_api(
-    backend: &Backend,
+    provider: &dyn ModelProvider,
+    model: &str,
     locale_name: &str,
     entries: &[(String, String)],
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -148,46 +146,16 @@ fn call_api(
          - Preserve exactly: Fluent placeholders ({{ variable }}), special syntax, and escape sequences.\n\
          - Do NOT wrap output in markdown code fences."
     );
+    let user_content = serde_json::to_string(&input_obj)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-
-    let (status, text) = rt.block_on(async {
-        let client = reqwest::Client::new();
-        let user_content = serde_json::to_string(&input_obj)?;
-
-        let body = serde_json::json!({
-            "model": backend.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content}
-            ],
-            "reasoning_effort": "none"
-        });
-        let mut req = client
-            .post(format!("{}/v1/chat/completions", backend.base_url))
-            .json(&body);
-        if let Some(key) = &backend.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-        let response = req.send().await?;
-
-        let status = response.status();
-        let text = response.text().await?;
-        Ok::<_, anyhow::Error>((status, text))
+    let content = rt.block_on(async {
+        provider
+            .chat_with_system(Some(&system), &user_content, model, None)
+            .await
     })?;
-
-    if !status.is_success() {
-        anyhow::bail!("API error {status}: {text}");
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::Error::msg(format!("Failed to parse API response: {e}\n{text}")))?;
-
-    let content = parsed["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow::Error::msg("No content in response: {text}"))?;
 
     // Strip markdown code fences and stray inline backticks. Models sometimes
     // wrap a single-line JSON response in `` `…` `` instead of a fenced block,

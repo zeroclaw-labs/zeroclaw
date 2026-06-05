@@ -166,6 +166,7 @@ pub const ATTRIBUTION_FIELDS: &[&str] = &[
     "sop_name",
     "model",
     "embedding_provider",
+    "owner_tui_id",
 ];
 
 /// Composite alias-bound prefixes. Each prefix gets three on-disk keys:
