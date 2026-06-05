@@ -163,6 +163,13 @@ pub(crate) fn default_theme() -> Theme {
     DEFAULT_THEME
 }
 
+/// The graceful-fallback palette for an unknown theme name: the inherit-shell
+/// `terminal` theme. Always present in the registry, so resolution never fails
+/// just because a config names a theme this build doesn't have.
+pub(crate) fn fallback_theme() -> Theme {
+    TERMINAL
+}
+
 pub(crate) fn fg_primary() -> Color {
     active().body
 }

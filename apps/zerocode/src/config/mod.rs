@@ -149,22 +149,22 @@ fn default_theme() -> String {
 
 impl ZerocodeConfig {
     pub fn resolve_theme(&self) -> Result<Theme> {
-        let name = &self.theme.name;
-        if name.trim().is_empty() {
+        let name = self.theme.name.trim();
+        if name.is_empty() {
             return theme::theme_by_name(theme::DEFAULT_THEME_NAME)
                 .context("default theme missing from registry");
         }
-        theme::theme_by_name(name).with_context(|| {
-            let known = theme::theme_names().collect::<Vec<_>>().join(", ");
-            format!("unknown theme '{name}' in {FILE_NAME}; known themes: {known}")
-        })
+        // Unknown theme name (e.g. a config written by a newer build, or a
+        // typo) falls back to the inherit-shell `terminal` theme rather than
+        // aborting the TUI. The fallback is always present in the registry.
+        Ok(theme::theme_by_name(name).unwrap_or_else(theme::fallback_theme))
     }
 
     /// Resolve the per-agent theme override for `alias`, if one is configured.
     /// Returns `Ok(None)` when the agent has no override (the pane uses the base
-    /// theme). An override naming an unknown theme is a hard error, matching the
-    /// base theme's strictness, so a typo fails loud rather than silently
-    /// ignoring the override.
+    /// theme). An override naming an unknown theme falls back to the
+    /// inherit-shell `terminal` theme rather than failing — same graceful
+    /// posture as the global theme.
     pub fn resolve_agent_theme(&self, alias: &str) -> Result<Option<Theme>> {
         let Some(over) = self.theme.agent_override.get(alias) else {
             return Ok(None);
@@ -173,13 +173,9 @@ impl ZerocodeConfig {
         if name.is_empty() {
             return Ok(None);
         }
-        theme::theme_by_name(name).map(Some).with_context(|| {
-            let known = theme::theme_names().collect::<Vec<_>>().join(", ");
-            format!(
-                "unknown theme '{name}' in [theme.agent_override.{alias}] of {FILE_NAME}; \
-                     known themes: {known}"
-            )
-        })
+        Ok(Some(
+            theme::theme_by_name(name).unwrap_or_else(theme::fallback_theme),
+        ))
     }
 
     /// Resolve the stored keybindings into a validated override table.
@@ -575,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_unknown_theme_errors() {
+    fn resolve_unknown_theme_falls_back_to_terminal() {
         let c = ZerocodeConfig {
             theme: ThemeSection {
                 name: "bogus".to_string(),
@@ -583,8 +579,11 @@ mod tests {
             },
             ..Default::default()
         };
-        let err = c.resolve_theme().unwrap_err();
-        assert!(err.to_string().contains("unknown theme 'bogus'"));
+        let resolved = c
+            .resolve_theme()
+            .expect("unknown theme falls back, never errors");
+        assert_eq!(resolved.title, theme::fallback_theme().title);
+        assert_eq!(resolved.background, theme::fallback_theme().background);
     }
 
     #[test]
@@ -606,12 +605,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_override_unknown_theme_errors() {
+    fn agent_override_unknown_theme_falls_back_to_terminal() {
         let body = "[theme.agent_override.coder]\nname = \"no_such_theme\"\n";
         let c: ZerocodeConfig = toml::from_str(body).unwrap();
-        let err = c.resolve_agent_theme("coder").unwrap_err();
-        assert!(err.to_string().contains("unknown theme 'no_such_theme'"));
-        assert!(err.to_string().contains("[theme.agent_override.coder]"));
+        let t = c
+            .resolve_agent_theme("coder")
+            .expect("unknown override falls back, never errors")
+            .expect("override present");
+        assert_eq!(t.title, theme::fallback_theme().title);
+        assert_eq!(t.background, theme::fallback_theme().background);
     }
 
     #[test]
