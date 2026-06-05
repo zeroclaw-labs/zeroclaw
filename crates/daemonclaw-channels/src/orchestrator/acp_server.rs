@@ -224,10 +224,7 @@ impl AcpServer {
     // ── Method handlers ──────────────────────────────────────────
 
     fn handle_initialize(&self, _params: &Value) -> RpcResult {
-        let default_model = self
-            .config
-            .providers
-            .fallback_provider()
+        let default_model = daemonclaw_config::provider_store::get_fallback_provider()
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
 

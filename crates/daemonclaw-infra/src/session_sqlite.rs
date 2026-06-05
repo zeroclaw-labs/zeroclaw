@@ -102,6 +102,22 @@ impl SqliteSessionBackend {
             );
         }
 
+        // Migration: add actor attribution columns for pool
+        let has_actor_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sessions') WHERE name = 'actor_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_actor_id {
+            let _ = conn.execute("ALTER TABLE sessions ADD COLUMN actor_id TEXT", []);
+            let _ = conn.execute("ALTER TABLE sessions ADD COLUMN actor_type TEXT", []);
+            let _ = conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_actor ON sessions(actor_id);",
+            );
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
             db_path,
@@ -186,13 +202,23 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        self.append_with_actor(session_key, message, None, None)
+    }
+
+    fn append_with_actor(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        actor_id: Option<&str>,
+        actor_type: Option<&str>,
+    ) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
+            "INSERT INTO sessions (session_key, role, content, created_at, actor_id, actor_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session_key, message.role, message.content, now, actor_id, actor_type],
         )
         .map_err(std::io::Error::other)?;
 

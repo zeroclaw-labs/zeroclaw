@@ -4,14 +4,16 @@
 //! and gateway/security/agent config boundary conditions.
 
 use daemonclaw::config::migration::{self, V1Compat};
+use daemonclaw::config::providers::ProvidersConfig;
 use daemonclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig};
 
-fn migrate(toml_str: &str) -> Config {
+fn migrate(toml_str: &str) -> (Config, ProvidersConfig) {
     let mut table: toml::Table = toml::from_str(toml_str).expect("failed to parse table");
     migration::prepare_table(&mut table);
     let prepared = toml::to_string(&table).expect("failed to re-serialize");
     let compat: V1Compat = toml::from_str(&prepared).expect("failed to deserialize");
-    compat.into_config()
+    let (config, providers, _proxy, _classification) = compat.into_config_with_providers();
+    (config, providers)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +36,7 @@ fn config_valid_keys_not_flagged_as_unknown() {
 
 #[test]
 fn config_unknown_keys_parse_without_error() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 default_temperature = 0.7
 default_provider = "test"
@@ -43,8 +45,7 @@ another_fake = 42
 "#,
     );
     assert!(
-        (config
-            .providers
+        (providers
             .fallback_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
@@ -79,13 +80,14 @@ default_temperature = "hot"
 #[test]
 fn config_out_of_range_temperature_fails() {
     // Temperature validation now happens at the provider level.
+    // Providers are no longer in Config — parse via V1Compat to reach them.
     let toml_str = r#"
 [providers.models.test]
 temperature = 99.0
 "#;
-    let config: Config = toml::from_str(toml_str).expect("parses");
+    let compat: V1Compat = toml::from_str(toml_str).expect("parses");
     // Out-of-range temperature is stored but caught by validate().
-    assert!(config.providers.models["test"].temperature == Some(99.0));
+    assert!(compat.providers.models["test"].temperature == Some(99.0));
 }
 
 #[test]
@@ -94,8 +96,8 @@ fn config_negative_temperature_fails() {
 [providers.models.test]
 temperature = -0.5
 "#;
-    let config: Config = toml::from_str(toml_str).expect("parses");
-    assert!(config.providers.models["test"].temperature == Some(-0.5));
+    let compat: V1Compat = toml::from_str(toml_str).expect("parses");
+    assert!(compat.providers.models["test"].temperature == Some(-0.5));
 }
 
 #[test]
@@ -370,10 +372,9 @@ fn autonomy_config_toml_roundtrip() {
 
 #[test]
 fn config_empty_toml_uses_default_temperature() {
-    let config = migrate("");
+    let (_config, providers) = migrate("");
     assert!(
-        (config
-            .providers
+        (providers
             .fallback_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
@@ -385,16 +386,15 @@ fn config_empty_toml_uses_default_temperature() {
 
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
-    let config = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
+    let (config, _providers) = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
     assert_eq!(config.gateway.port, 42617);
 }
 
 #[test]
 fn config_only_temperature_parses() {
-    let config = migrate("default_temperature = 1.2\ndefault_provider = \"test\"\n");
+    let (_config, providers) = migrate("default_temperature = 1.2\ndefault_provider = \"test\"\n");
     assert!(
-        (config
-            .providers
+        (providers
             .fallback_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
@@ -406,7 +406,7 @@ fn config_only_temperature_parses() {
 
 #[test]
 fn config_extra_unknown_keys_ignored() {
-    let config = migrate(
+    let (_config, providers) = migrate(
         r#"
 default_temperature = 0.5
 default_provider = "test"
@@ -416,8 +416,7 @@ value = 123
 "#,
     );
     assert!(
-        (config
-            .providers
+        (providers
             .fallback_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
@@ -570,12 +569,11 @@ allowed_numbers = ["*"]
 
 #[test]
 fn config_empty_parses_with_all_defaults() {
-    let config = migrate("");
+    let (config, providers) = migrate("");
     assert!(config.channels.cli);
     assert!(config.channels.whatsapp.is_none());
     assert!(
-        (config
-            .providers
+        (providers
             .fallback_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)

@@ -47,6 +47,14 @@ pub struct V1Compat {
     #[serde(flatten)]
     pub config: super::schema::Config,
 
+    // ── Provider/proxy/classification TOML sections (now DB-backed, but still parsed for migration) ──
+    #[serde(default)]
+    pub providers: crate::providers::ProvidersConfig,
+    #[serde(default)]
+    pub proxy: super::schema::ProxyConfig,
+    #[serde(default)]
+    pub query_classification: super::schema::QueryClassificationConfig,
+
     // ── Old top-level provider fields (removed in V2) ──
     #[serde(default)]
     api_key: Option<String>,
@@ -76,12 +84,28 @@ pub struct V1Compat {
 
 impl V1Compat {
     /// Consume self, migrating old fields into the current Config layout.
-    pub fn into_config(mut self) -> super::schema::Config {
+    /// Returns only the Config; providers/proxy/classification data is discarded.
+    /// Use `into_config_with_providers` when you need the provider data for store migration.
+    pub fn into_config(self) -> super::schema::Config {
+        let (config, _providers, _proxy, _classification) = self.into_config_with_providers();
+        config
+    }
+
+    /// Consume self, migrating old fields, and return Config plus the
+    /// providers/proxy/classification data parsed from TOML (for migration into provider_store).
+    pub fn into_config_with_providers(
+        mut self,
+    ) -> (
+        super::schema::Config,
+        crate::providers::ProvidersConfig,
+        super::schema::ProxyConfig,
+        super::schema::QueryClassificationConfig,
+    ) {
         let from = self.config.schema_version;
         let needs_migration = from < CURRENT_SCHEMA_VERSION || self.has_legacy_fields();
 
         if !needs_migration {
-            return self.config;
+            return (self.config, self.providers, self.proxy, self.query_classification);
         }
 
         self.migrate_providers();
@@ -94,7 +118,7 @@ impl V1Compat {
              Run `daemonclaw config migrate` to update the file on disk.",
         );
 
-        self.config
+        (self.config, self.providers, self.proxy, self.query_classification)
     }
 
     fn has_legacy_fields(&self) -> bool {
@@ -121,12 +145,11 @@ impl V1Compat {
         // First, move old model_providers entries into providers.models.
         // These take precedence over top-level fields (more specific).
         for (key, profile) in std::mem::take(&mut self.model_providers) {
-            self.config.providers.models.entry(key).or_insert(profile);
+            self.providers.models.entry(key).or_insert(profile);
         }
 
         // Then fill gaps in the fallback entry from top-level fields.
         let entry = self
-            .config
             .providers
             .models
             .entry(fallback.clone())
@@ -159,16 +182,16 @@ impl V1Compat {
             entry.extra_headers = headers;
         }
 
-        if self.config.providers.fallback.is_none() {
-            self.config.providers.fallback = Some(fallback);
+        if self.providers.fallback.is_none() {
+            self.providers.fallback = Some(fallback);
         }
 
         // Move routing rules into providers.
-        if self.config.providers.model_routes.is_empty() && !self.model_routes.is_empty() {
-            self.config.providers.model_routes = std::mem::take(&mut self.model_routes);
+        if self.providers.model_routes.is_empty() && !self.model_routes.is_empty() {
+            self.providers.model_routes = std::mem::take(&mut self.model_routes);
         }
-        if self.config.providers.embedding_routes.is_empty() && !self.embedding_routes.is_empty() {
-            self.config.providers.embedding_routes = std::mem::take(&mut self.embedding_routes);
+        if self.providers.embedding_routes.is_empty() && !self.embedding_routes.is_empty() {
+            self.providers.embedding_routes = std::mem::take(&mut self.embedding_routes);
         }
     }
 }
@@ -243,11 +266,27 @@ pub fn migrate_file(raw: &str) -> Result<Option<String>> {
     if compat.config.schema_version >= CURRENT_SCHEMA_VERSION && !compat.has_legacy_fields() {
         return Ok(None);
     }
-    let config = compat.into_config();
+    let (config, providers, proxy, _classification) = compat.into_config_with_providers();
 
     // Serialize the migrated config to get the target table structure.
-    let target: toml::Table = toml::from_str(&toml::to_string(&config)?)
+    // Re-merge providers and proxy so migrate_file preserves them in the TOML
+    // (they will be migrated to the DB separately at runtime).
+    let mut target: toml::Table = toml::from_str(&toml::to_string(&config)?)
         .context("Failed to round-trip migrated config")?;
+    if let Ok(prov_val) = toml::to_string(&providers) {
+        if let Ok(prov_table) = prov_val.parse::<toml::Table>() {
+            if !prov_table.is_empty() {
+                target.insert("providers".to_string(), toml::Value::Table(prov_table));
+            }
+        }
+    }
+    if let Ok(proxy_val) = toml::to_string(&proxy) {
+        if let Ok(proxy_table) = proxy_val.parse::<toml::Table>() {
+            if !proxy_table.is_empty() {
+                target.insert("proxy".to_string(), toml::Value::Table(proxy_table));
+            }
+        }
+    }
 
     // Sync the original document (with comments) to match the target.
     let mut doc: DocumentMut = raw.parse().context("Failed to parse config.toml")?;

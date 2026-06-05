@@ -33,20 +33,13 @@ pub struct DeviceRegistry {
 
 impl DeviceRegistry {
     pub fn new(workspace_dir: &Path) -> Self {
-        let db_path = workspace_dir.join("devices.db");
-        let conn = Connection::open(&db_path).expect("Failed to open device registry database");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS devices (
-                token_hash TEXT PRIMARY KEY,
-                id TEXT NOT NULL,
-                name TEXT,
-                device_type TEXT,
-                paired_at TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                ip_address TEXT
-            )",
-        )
-        .expect("Failed to create devices table");
+        let state_db = daemonclaw_config::state_db::StateDb::open(workspace_dir)
+            .expect("Failed to open state.db for device registry");
+        state_db
+            .ensure_devices_table()
+            .expect("Failed to ensure devices table in state.db");
+        let db_path = state_db.path().to_path_buf();
+        let conn = Connection::open(&db_path).expect("Failed to open state.db for device registry");
 
         // Warm the in-memory cache from DB
         let mut cache = HashMap::new();
@@ -183,6 +176,14 @@ impl DeviceRegistry {
 
     pub fn device_count(&self) -> usize {
         self.cache.lock().len()
+    }
+
+    pub fn has_token_hash(&self, hash: &str) -> bool {
+        self.cache.lock().contains_key(hash)
+    }
+
+    pub fn token_hashes(&self) -> Vec<String> {
+        self.cache.lock().keys().cloned().collect()
     }
 }
 
@@ -380,5 +381,85 @@ pub async fn rotate_token(
             "Cannot generate new pairing code",
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_registry_has_token_hash_and_token_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::new(temp.path());
+
+        assert!(!registry.has_token_hash("nonexistent"));
+        assert!(registry.token_hashes().is_empty());
+
+        let now = Utc::now();
+        registry.register(
+            "hash_aaa".to_string(),
+            DeviceInfo {
+                id: "d1".to_string(),
+                name: None,
+                device_type: None,
+                paired_at: now,
+                last_seen: now,
+                ip_address: None,
+            },
+        );
+
+        assert!(registry.has_token_hash("hash_aaa"));
+        assert!(!registry.has_token_hash("hash_bbb"));
+        assert_eq!(registry.token_hashes().len(), 1);
+        assert!(registry.token_hashes().contains(&"hash_aaa".to_string()));
+    }
+
+    #[test]
+    fn device_registry_survives_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+
+        {
+            let registry = DeviceRegistry::new(temp.path());
+            registry.register(
+                "hash_persist".to_string(),
+                DeviceInfo {
+                    id: "d1".to_string(),
+                    name: Some("Test".to_string()),
+                    device_type: None,
+                    paired_at: now,
+                    last_seen: now,
+                    ip_address: None,
+                },
+            );
+        }
+
+        let registry2 = DeviceRegistry::new(temp.path());
+        assert!(registry2.has_token_hash("hash_persist"));
+        assert_eq!(registry2.device_count(), 1);
+    }
+
+    #[test]
+    fn revoke_removes_token_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let registry = DeviceRegistry::new(temp.path());
+
+        registry.register(
+            "hash_revoke".to_string(),
+            DeviceInfo {
+                id: "device-to-revoke".to_string(),
+                name: None,
+                device_type: None,
+                paired_at: now,
+                last_seen: now,
+                ip_address: None,
+            },
+        );
+
+        assert!(registry.has_token_hash("hash_revoke"));
+        assert!(registry.revoke("device-to-revoke"));
+        assert!(!registry.has_token_hash("hash_revoke"));
     }
 }

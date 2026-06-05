@@ -709,14 +709,14 @@ async fn save_tui_config(app: &App) -> Result<()> {
 /// the filesystem or network.
 fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
     // ── Provider ────────────────────────────────────────────────────
-    let provider_id = app.selected_provider_id();
-    config.providers.fallback = Some(provider_id.to_string());
+    use daemonclaw_config::provider_store::{provider_store, try_provider_store};
 
-    let entry = config
-        .providers
-        .models
-        .entry(provider_id.to_string())
-        .or_default();
+    let provider_id = app.selected_provider_id();
+
+    // Build or update the provider entry in the store.
+    let mut entry = try_provider_store()
+        .and_then(|s| s.get_provider(provider_id))
+        .unwrap_or_default();
 
     // Clear stale custom provider URL if switching away from custom
     if !provider_id.starts_with("custom") {
@@ -736,7 +736,11 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         entry.model = Some(model.to_string());
     }
 
-    // Provider fields are now resolved directly from providers — no cache needed.
+    // Write provider entry and set fallback in the store.
+    if let Some(store) = try_provider_store() {
+        let _ = store.upsert_provider(provider_id, &entry);
+        let _ = store.set_fallback_name(provider_id);
+    }
 
     // ── Channel ─────────────────────────────────────────────────────
     // Create a stub config for the selected channel with placeholder

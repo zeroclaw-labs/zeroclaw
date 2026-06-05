@@ -6,7 +6,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use daemonclaw_config::schema::Config;
 
-const STATUS_FLUSH_SECONDS: u64 = 5;
+const STATUS_FLUSH_SECONDS: u64 = 60;
+const MAX_HEALTH_ROWS: u64 = 10_000;
 
 /// Wait for shutdown signal (SIGINT or SIGTERM).
 /// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
@@ -226,15 +227,8 @@ pub async fn run(
     // TimeoutStopSec=30s in the service unit gives us a hard deadline.
     let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
 
-    // 1. Final health snapshot
-    let mut json = crate::health::snapshot_json();
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
-        obj.insert("shutdown".into(), serde_json::json!("clean"));
-    }
-    let state_path = state_file_path(&config);
-    let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-    let _ = tokio::fs::write(&state_path, data).await;
+    // 1. Final health snapshot to state.db
+    write_health_snapshot_to_db(&config, Some("clean"));
 
     // 2. Touch liveness so the watchdog timer doesn't restart us during the stop window
     crate::health::touch_liveness(&config.workspace_dir);
@@ -262,25 +256,41 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
+fn write_health_snapshot_to_db(config: &Config, shutdown: Option<&str>) {
+    let json = crate::health::snapshot_json();
+    let written_at = Utc::now().to_rfc3339();
+    let pid = json.get("pid").and_then(|v| v.as_i64());
+    let uptime = json.get("uptime_seconds").and_then(|v| v.as_i64());
+    let components = json
+        .get("components")
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+
+    let Ok(state_db) = daemonclaw_config::state_db::StateDb::open(&config.workspace_dir) else {
+        return;
+    };
+    let _ = state_db.ensure_daemon_health_table();
+    let Ok(conn) = state_db.connect() else { return };
+    let _ = conn.execute(
+        "INSERT INTO daemon_health (written_at, pid, uptime_secs, shutdown, components) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![written_at, pid, uptime, shutdown, components],
+    );
+    let _ = conn.execute(
+        "DELETE FROM daemon_health WHERE id NOT IN (SELECT id FROM daemon_health ORDER BY id DESC LIMIT ?1)",
+        rusqlite::params![MAX_HEALTH_ROWS],
+    );
+}
+
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let path = state_file_path(&config);
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
             interval.tick().await;
-            let mut json = crate::health::snapshot_json();
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "written_at".into(),
-                    serde_json::json!(Utc::now().to_rfc3339()),
-                );
-            }
-            let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-            let _ = tokio::fs::write(&path, data).await;
+            let cfg = config.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                write_health_snapshot_to_db(&cfg, None);
+            })
+            .await;
         }
     })
 }
@@ -505,9 +515,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             daemonclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,
-                config
-                    .providers
-                    .fallback_provider()
+                daemonclaw_config::provider_store::get_fallback_provider()
+                    .as_ref()
                     .and_then(|e| e.api_key.as_deref()),
             )
             .ok();
@@ -552,9 +561,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
                 (None, None) => task_prompt,
             };
-            let temp = config
-                .providers
-                .fallback_provider()
+            let temp = daemonclaw_config::provider_store::get_fallback_provider()
+                .as_ref()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7);
             let phase2_fut = Box::pin(crate::agent::run(

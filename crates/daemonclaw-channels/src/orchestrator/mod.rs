@@ -357,7 +357,7 @@ struct ChannelRuntimeContext {
     query_classification: daemonclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
-    session_store: Option<Arc<daemonclaw_infra::session_store::SessionStore>>,
+    session_store: Option<Arc<dyn SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -370,6 +370,7 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<daemonclaw_infra::debounce::MessageDebouncer>,
+    audit_logger: Option<Arc<daemonclaw_runtime::security::audit::AuditLogger>>,
 }
 
 #[derive(Clone)]
@@ -611,6 +612,7 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     sender: &str,
+    session_key: &str,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -644,9 +646,11 @@ fn build_channel_system_prompt(
     if !reply_target.is_empty() {
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}, sender={sender}. \
+             reply_target={reply_target}, sender={sender}, session_id={session_key}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
+             The session_id is the durable identifier for this conversation — use it \
+             for self-reference, resume, checkpointing, and cross-session continuity. \
              When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
              \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
@@ -803,38 +807,28 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
     None
 }
 
-fn resolved_default_provider(config: &Config) -> String {
-    config
-        .providers
-        .fallback
-        .clone()
+fn resolved_default_provider(_config: &Config) -> String {
+    daemonclaw_config::provider_store::get_fallback_name()
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
-fn resolved_default_model(config: &Config) -> String {
-    config
-        .providers
-        .fallback_provider()
+fn resolved_default_model(_config: &Config) -> String {
+    daemonclaw_config::provider_store::get_fallback_provider()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
+    let fp = daemonclaw_config::provider_store::get_fallback_provider();
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
-        temperature: config
-            .providers
-            .fallback_provider()
+        temperature: fp.as_ref()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7),
-        api_key: config
-            .providers
-            .fallback_provider()
+        api_key: fp.as_ref()
             .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .fallback_provider()
+        api_url: fp.as_ref()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
     }
@@ -904,13 +898,7 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(daemonclaw_dir) = path.parent() {
         let store =
             daemonclaw_runtime::security::SecretStore::new(daemonclaw_dir, parsed.secrets.encrypt);
-        if let Some(fallback_entry) = parsed.providers.fallback_provider_mut() {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut fallback_entry.api_key,
-                "config.providers.fallback.api_key",
-            )?;
-        }
+        // Provider API keys are now decrypted by the provider_store directly.
         // Decrypt TTS provider API keys for runtime reload
         if let Some(ref mut openai) = parsed.tts.openai {
             decrypt_optional_secret_for_runtime_reload(
@@ -2771,6 +2759,7 @@ async fn process_channel_message(
         &msg.channel,
         &msg.reply_target,
         &msg.sender,
+        &history_key,
     );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
@@ -3075,6 +3064,7 @@ async fn process_channel_message(
                         target_channel.as_deref(),
                         None, // receipt_generator
                         None, // collected_receipts
+                        ctx.audit_logger.as_deref(),
                     ),
                     ),
                     ),
@@ -5052,17 +5042,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         daemonclaw_providers::provider_runtime_options_from_config(&config);
+    let fp_start = get_fallback_provider();
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.clone()),
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.clone()),
+            fp_start.as_ref().and_then(|e| e.api_key.clone()),
+            fp_start.as_ref().and_then(|e| e.base_url.clone()),
             config.reliability.clone(),
             provider_runtime_options.clone(),
         )
@@ -5097,21 +5082,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+    let fallback_provider_orch = get_fallback_provider();
+    let embedding_routes_orch = get_embedding_routes();
     let model = resolved_default_model(&config);
-    let temperature = config
-        .providers
-        .fallback_provider()
+    let temperature = fallback_provider_orch
+        .as_ref()
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_orch,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        fallback_provider_orch.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -5141,11 +5125,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.http_request,
         &config.web_fetch,
         &workspace,
-        &config.agents,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        &std::collections::HashMap::new(),
+        fallback_provider_orch.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
         None,
@@ -5298,10 +5279,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
-    if !config.agents.is_empty() {
+    if config.pool.enabled {
         tool_descs.push((
             "delegate",
-            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
+            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). Use action='list_members' to see pool members.",
         ));
     }
 
@@ -5510,14 +5491,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
-        api_key: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.base_url.clone()),
+        api_key: fallback_provider_orch.as_ref().and_then(|e| e.api_key.clone()),
+        api_url: fallback_provider_orch.as_ref().and_then(|e| e.base_url.clone()),
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
@@ -5553,21 +5528,54 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         autonomy_level: config.autonomy.level,
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
-        model_routes: Arc::new(config.providers.model_routes.clone()),
-        query_classification: config.query_classification.clone(),
+        model_routes: Arc::new(get_model_routes()),
+        query_classification: daemonclaw_config::provider_store::get_classification_config(),
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {
-            match daemonclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
-                Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
+            let backend_name = config.channels.session_backend.as_str();
+            let store: Option<Arc<dyn SessionBackend>> = match backend_name {
+                "sqlite" => {
+                    match SqliteSessionBackend::new(&config.workspace_dir) {
+                        Ok(backend) => {
+                            match backend.migrate_from_jsonl(&config.workspace_dir) {
+                                Ok(0) => {}
+                                Ok(n) => tracing::info!("📂 Migrated {n} JSONL session(s) to SQLite"),
+                                Err(e) => tracing::warn!("JSONL→SQLite migration failed: {e}"),
+                            }
+                            if config.channels.session_ttl_hours > 0 {
+                                if let Ok(cleaned) = backend.cleanup_stale(config.channels.session_ttl_hours) {
+                                    if cleaned > 0 {
+                                        tracing::info!("📂 Cleaned up {cleaned} stale session(s)");
+                                    }
+                                }
+                            }
+                            tracing::info!("📂 Session persistence enabled (sqlite)");
+                            Some(Arc::new(backend))
+                        }
+                        Err(e) => {
+                            tracing::warn!("SQLite session backend failed, falling back to JSONL: {e}");
+                            match daemonclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
+                                Ok(store) => Some(Arc::new(store)),
+                                Err(e2) => { tracing::warn!("Session persistence disabled: {e2}"); None }
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Session persistence disabled: {e}");
-                    None
+                _ => {
+                    match daemonclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
+                        Ok(store) => {
+                            tracing::info!("📂 Session persistence enabled (jsonl)");
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Session persistence disabled: {e}");
+                            None
+                        }
+                    }
                 }
-            }
+            };
+            store
         } else {
             None
         },
@@ -5587,32 +5595,42 @@ pub async fn start_channels(config: Config) -> Result<()> {
         debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
+        audit_logger: if config.security.audit.enabled {
+            match daemonclaw_runtime::security::audit::AuditLogger::new(
+                config.security.audit.clone(),
+                config.workspace_dir.clone(),
+            ) {
+                Ok(logger) => {
+                    tracing::info!("🔒 Audit logger enabled (audit.db)");
+                    Some(Arc::new(logger))
+                }
+                Err(e) => {
+                    tracing::warn!("Audit logger failed to initialize: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        },
     });
 
-    // Hydrate in-memory conversation histories from persisted JSONL session files.
-    // Cap to MAX_CONVERSATION_SENDERS sessions (sorted by file mtime, most recent first)
+    // Hydrate in-memory conversation histories from persisted sessions.
+    // Cap to MAX_CONVERSATION_SENDERS sessions (sorted by last activity, most recent first)
     // and trim each to MAX_CHANNEL_HISTORY turns to bound startup memory.
     // If the last persisted turn is a user message (orphan from a crash mid-query),
     // close it with a marker so the LLM doesn't try to continue the old request.
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
-        let session_keys = store.list_sessions();
 
-        // Sort by file mtime (most recently modified first) for predictable hydration.
-        // Collect mtimes up front to avoid repeated FS reads inside the comparator.
-        let mut keyed: Vec<_> = session_keys
+        // list_sessions_with_metadata returns sorted by last_activity DESC for SQLite,
+        // and by list order for JSONL. Cap to MAX_CONVERSATION_SENDERS.
+        let metadata = store.list_sessions_with_metadata();
+        let session_keys: Vec<String> = metadata
             .into_iter()
-            .map(|k| {
-                let mt = store
-                    .session_mtime(&k)
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                (k, mt)
-            })
+            .take(MAX_CONVERSATION_SENDERS)
+            .map(|m| m.key)
             .collect();
-        keyed.sort_by(|a, b| b.1.cmp(&a.1));
-        keyed.truncate(MAX_CONVERSATION_SENDERS);
-        let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
 
         let mut histories = runtime_ctx
             .conversation_histories
@@ -6123,6 +6141,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6249,6 +6268,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6332,6 +6352,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6351,7 +6372,7 @@ mod tests {
     #[test]
     fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(daemonclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let store: Arc<dyn SessionBackend> = Arc::new(daemonclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
 
         let sender = "telegram_u4".to_string();
 
@@ -6432,6 +6453,7 @@ mod tests {
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -7033,6 +7055,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7125,6 +7148,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7231,6 +7255,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7322,6 +7347,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7423,6 +7449,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7545,6 +7572,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7648,6 +7676,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7766,6 +7795,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -7988,6 +8018,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(4);
@@ -8102,6 +8133,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -8235,6 +8267,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -8365,6 +8398,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -8473,6 +8507,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -8562,6 +8597,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -8651,6 +8687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9446,6 +9483,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9592,6 +9630,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9779,6 +9818,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -9897,6 +9937,7 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -10521,6 +10562,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -10619,6 +10661,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -10751,6 +10794,7 @@ This is an example JSON object for profile settings."#;
             )),
             media_pipeline: daemonclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: daemonclaw_config::schema::TranscriptionConfig::default(),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -10927,6 +10971,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11049,6 +11094,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11163,6 +11209,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11297,6 +11344,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -11613,6 +11661,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<daemonclaw_api::channel::ChannelMessage>(8);
@@ -11812,23 +11861,25 @@ This is an example JSON object for profile settings."#;
             "mattermost",
             "channel123:root456",
             "user_abc123",
+            "mattermost_channel123_user_abc123",
         );
         assert!(prompt.contains("sender=user_abc123"));
         assert!(prompt.contains("channel=mattermost"));
         assert!(prompt.contains("reply_target=channel123:root456"));
+        assert!(prompt.contains("session_id=mattermost_channel123_user_abc123"));
     }
 
     #[test]
     fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
-        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123");
+        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123", "key");
         assert!(!prompt.contains("sender="));
         assert!(!prompt.contains("Channel context:"));
     }
 
     #[test]
     fn build_channel_system_prompt_sender_distinguishes_users() {
-        let prompt_a = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa");
-        let prompt_b = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb");
+        let prompt_a = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa", "key_a");
+        let prompt_b = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb", "key_b");
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);

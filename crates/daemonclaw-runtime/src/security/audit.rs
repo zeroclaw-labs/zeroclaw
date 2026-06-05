@@ -2,20 +2,23 @@
 //!
 //! Each audit entry is chained via a Merkle hash: `entry_hash = SHA-256(prev_hash || canonical_json)`.
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
+//!
+//! Storage: SQLite database at `workspace/audit/audit.db`.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use daemonclaw_config::schema::AuditConfig;
 
 /// Well-known seed for the genesis entry's `prev_hash`.
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+const MAX_AUDIT_EVENTS: i64 = 500_000;
+const RETENTION_CHECK_INTERVAL: u64 = 1000;
 
 /// Audit event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +31,8 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    ChainTruncation,
+    ChainBoundary,
 }
 
 /// Actor information (who performed the action)
@@ -192,20 +197,22 @@ fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Internal chain state tracked across writes.
+/// Chain tip state recovered from the database.
 struct ChainState {
     prev_hash: String,
     sequence: u64,
 }
 
-/// Audit logger
+/// Audit logger backed by SQLite (`workspace/audit/audit.db`).
+///
+/// Chain integrity is guaranteed at the database level: each `log()` call
+/// reads the current chain tip and appends atomically within a single
+/// `BEGIN IMMEDIATE` transaction. This serializes concurrent writers
+/// (both intra-process threads and inter-process instances) via SQLite's
+/// WAL write lock, preventing chain forks.
 pub struct AuditLogger {
-    log_path: PathBuf,
+    db_path: PathBuf,
     config: AuditConfig,
-    #[allow(dead_code)] // WIP: buffered writes for batch flushing
-    buffer: Mutex<Vec<AuditEvent>>,
-    chain: Mutex<ChainState>,
-    /// Signing key (loaded once at construction time if sign_events enabled)
     signing_key: Option<Vec<u8>>,
 }
 
@@ -222,15 +229,14 @@ pub struct CommandExecutionLog<'a> {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger.
+    /// Create a new audit logger backed by SQLite.
     ///
-    /// If the log file already exists, the chain state is recovered from the last
-    /// entry so that new writes continue the existing hash chain.
+    /// Opens (or creates) `workspace_dir/audit/audit.db`, sets WAL mode,
+    /// and recovers chain state from the last entry.
     ///
     /// If `config.sign_events` is true, requires `DAEMONCLAW_AUDIT_SIGNING_KEY` env var
     /// to be set with a hex-encoded 32-byte key. Fails if key is missing or invalid.
-    pub fn new(config: AuditConfig, daemonclaw_dir: PathBuf) -> Result<Self> {
-        // Load and validate signing key if sign_events enabled
+    pub fn new(config: AuditConfig, workspace_dir: PathBuf) -> Result<Self> {
         let signing_key = if config.sign_events {
             let key_hex = std::env::var("DAEMONCLAW_AUDIT_SIGNING_KEY").map_err(|_| {
                 anyhow::anyhow!("sign_events enabled but DAEMONCLAW_AUDIT_SIGNING_KEY not set")
@@ -251,15 +257,71 @@ impl AuditLogger {
             None
         };
 
-        let log_path = daemonclaw_dir.join(&config.log_path);
-        let chain_state = recover_chain_state(&log_path);
+        let audit_dir = workspace_dir.join("audit");
+        std::fs::create_dir_all(&audit_dir)
+            .with_context(|| format!("Failed to create audit directory: {}", audit_dir.display()))?;
+        let db_path = audit_dir.join("audit.db");
+
+        let conn = Self::open_conn(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_events (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_json  TEXT NOT NULL,
+                 event_type  TEXT NOT NULL,
+                 timestamp   TEXT NOT NULL,
+                 sequence    INTEGER NOT NULL,
+                 entry_hash  TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events(timestamp);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_sequence_unique ON audit_events(sequence);
+             CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_events(event_type);",
+        )
+        .context("Failed to create audit_events table")?;
+
+        Self::install_append_only_triggers(&conn)?;
+
         Ok(Self {
-            log_path,
+            db_path,
             config,
-            buffer: Mutex::new(Vec::new()),
-            chain: Mutex::new(chain_state),
             signing_key,
         })
+    }
+
+    fn open_conn(db_path: &Path) -> Result<Connection> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open audit.db: {}", db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(conn)
+    }
+
+    fn connect(&self) -> Result<Connection> {
+        Self::open_conn(&self.db_path)
+    }
+
+    fn install_append_only_triggers(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS audit_no_update
+                 BEFORE UPDATE ON audit_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'audit_events is append-only: UPDATE prohibited');
+                 END;
+             CREATE TRIGGER IF NOT EXISTS audit_no_delete
+                 BEFORE DELETE ON audit_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'audit_events is append-only: DELETE prohibited — use retention API');
+                 END;",
+        )
+        .context("Failed to install append-only triggers")
+    }
+
+    /// Path to the underlying database file.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Compute HMAC-SHA256 signature over entry_hash when sign_events enabled.
@@ -278,41 +340,63 @@ impl AuditLogger {
         }
     }
 
-    /// Log an event
+    /// Log an event (INSERT into audit.db with Merkle chain).
+    ///
+    /// The chain tip is read and the new entry inserted within a single
+    /// `BEGIN IMMEDIATE` transaction, so concurrent writers (threads or
+    /// separate processes) serialize via SQLite's write lock. This prevents
+    /// chain forks where two writers read the same tip and produce
+    /// duplicate sequence numbers.
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
 
-        // Check log size and rotate if needed
-        self.rotate_if_needed()?;
+        let conn = self.connect()?;
 
-        // Populate chain fields under the lock
-        let mut chained = event.clone();
-        {
-            let mut state = self.chain.lock();
-            chained.sequence = state.sequence;
-            chained.prev_hash = state.prev_hash.clone();
-            chained.entry_hash = compute_entry_hash(&state.prev_hash, &chained);
+        // BEGIN IMMEDIATE acquires the write lock before any reads, ensuring
+        // no other writer can read the same chain tip concurrently.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
 
-            // Compute signature if sign_events enabled
-            chained.signature = self.compute_signature(&chained.entry_hash)?;
+        let result = (|| -> Result<u64> {
+            let state = recover_chain_state(&conn);
 
-            state.prev_hash = chained.entry_hash.clone();
-            state.sequence += 1;
+            let mut ev = event.clone();
+            ev.sequence = state.sequence;
+            ev.prev_hash = state.prev_hash.clone();
+            ev.entry_hash = compute_entry_hash(&state.prev_hash, &ev);
+            ev.signature = self.compute_signature(&ev.entry_hash)?;
+
+            let json = serde_json::to_string(&ev)?;
+            let event_type_val = serde_json::to_value(&ev.event_type)?;
+            conn.execute(
+                "INSERT INTO audit_events (event_json, event_type, timestamp, sequence, entry_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    json,
+                    event_type_val.as_str().unwrap_or("unknown"),
+                    ev.timestamp.to_rfc3339(),
+                    ev.sequence as i64,
+                    ev.entry_hash,
+                ],
+            )?;
+
+            Ok(ev.sequence + 1)
+        })();
+
+        match result {
+            Ok(next_seq) => {
+                conn.execute_batch("COMMIT")?;
+                if next_seq % RETENTION_CHECK_INTERVAL == 0 {
+                    let _ = self.run_retention();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-
-        // Serialize and write
-        let line = serde_json::to_string(&chained)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
-
-        writeln!(file, "{}", line)?;
-        file.sync_all()?;
-
-        Ok(())
     }
 
     /// Log a command execution event.
@@ -353,68 +437,122 @@ impl AuditLogger {
         })
     }
 
-    /// Rotate log if it exceeds max size
-    fn rotate_if_needed(&self) -> Result<()> {
-        if let Ok(metadata) = std::fs::metadata(&self.log_path) {
-            let current_size_mb = metadata.len() / (1024 * 1024);
-            if current_size_mb >= u64::from(self.config.max_size_mb) {
-                self.rotate()?;
+    /// Perform retention pruning as a recorded operation.
+    ///
+    /// Appends a `chain_truncation` event documenting the removed sequence
+    /// range, then temporarily drops the append-only trigger to execute the
+    /// DELETE, and reinstalls it. The chain always documents its own
+    /// truncation — a clean `verify_chain` cannot result from silent removal.
+    fn run_retention(&self) -> Result<()> {
+        let conn = self.connect()?;
+
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events",
+            [],
+            |r| r.get(0),
+        )?;
+        if total <= MAX_AUDIT_EVENTS {
+            return Ok(());
+        }
+
+        let to_remove = total - MAX_AUDIT_EVENTS;
+        let (min_seq, max_seq): (i64, i64) = conn.query_row(
+            "SELECT MIN(sequence), MAX(sequence) FROM audit_events
+             WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
+            params![MAX_AUDIT_EVENTS],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        let truncation_event = AuditEvent::new(AuditEventType::ChainTruncation)
+            .with_actor("system".to_string(), None, None)
+            .with_action(
+                format!("retention_prune: removed {to_remove} events, sequences {min_seq}..{max_seq}"),
+                "system".to_string(),
+                true,
+                true,
+            );
+        self.log(&truncation_event)?;
+
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let delete_result = (|| -> Result<()> {
+            conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_delete")?;
+            conn.execute(
+                "DELETE FROM audit_events WHERE id NOT IN
+                 (SELECT id FROM audit_events ORDER BY id DESC LIMIT ?1)",
+                params![MAX_AUDIT_EVENTS + 1], // +1 for the truncation event we just added
+            )?;
+            Self::install_append_only_triggers(&conn)?;
+            Ok(())
+        })();
+
+        match delete_result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                tracing::info!(
+                    removed = to_remove,
+                    seq_range = format!("{min_seq}..{max_seq}").as_str(),
+                    "Audit retention: pruned old events (recorded in chain)"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                let _ = Self::install_append_only_triggers(&conn);
+                Err(e)
             }
         }
-        Ok(())
     }
 
-    /// Rotate the log file
-    fn rotate(&self) -> Result<()> {
-        for i in (1..10).rev() {
-            let old_name = format!("{}.{}.log", self.log_path.display(), i);
-            let new_name = format!("{}.{}.log", self.log_path.display(), i + 1);
-            let _ = std::fs::rename(&old_name, &new_name);
-        }
-
-        let rotated = format!("{}.1.log", self.log_path.display());
-        std::fs::rename(&self.log_path, &rotated)?;
-        Ok(())
+    /// Record a chain boundary — a permanent note that specific sequences
+    /// were removed from the chain at a known point. Used to make past
+    /// deletions (like fork cleanup) honest rather than invisible.
+    pub fn record_chain_boundary(&self, description: &str) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::ChainBoundary)
+            .with_actor("system".to_string(), None, None)
+            .with_action(
+                description.to_string(),
+                "administrative".to_string(),
+                true,
+                true,
+            );
+        self.log(&event)
     }
 }
 
-/// Recover chain state from an existing log file.
+/// Recover chain state from the last entry in the database.
 ///
-/// Returns the genesis state if the file does not exist or is empty.
-fn recover_chain_state(log_path: &Path) -> ChainState {
-    let file = match std::fs::File::open(log_path) {
-        Ok(f) => f,
-        Err(_) => {
-            return ChainState {
-                prev_hash: GENESIS_PREV_HASH.to_string(),
-                sequence: 0,
-            };
-        }
-    };
+/// Returns the genesis state if the table is empty.
+fn recover_chain_state(conn: &Connection) -> ChainState {
+    let result: std::result::Result<String, _> = conn.query_row(
+        "SELECT event_json FROM audit_events ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    );
 
-    let reader = BufReader::new(file);
-    let mut last_entry: Option<AuditEvent> = None;
-    for l in reader.lines().map_while(Result::ok) {
-        if let Ok(entry) = serde_json::from_str::<AuditEvent>(&l) {
-            last_entry = Some(entry);
+    match result {
+        Ok(json) => {
+            if let Ok(entry) = serde_json::from_str::<AuditEvent>(&json) {
+                ChainState {
+                    prev_hash: entry.entry_hash,
+                    sequence: entry.sequence + 1,
+                }
+            } else {
+                ChainState {
+                    prev_hash: GENESIS_PREV_HASH.to_string(),
+                    sequence: 0,
+                }
+            }
         }
-    }
-
-    match last_entry {
-        Some(entry) => ChainState {
-            prev_hash: entry.entry_hash,
-            sequence: entry.sequence + 1,
-        },
-        None => ChainState {
+        Err(_) => ChainState {
             prev_hash: GENESIS_PREV_HASH.to_string(),
             sequence: 0,
         },
     }
 }
 
-/// Verify the integrity of an audit log's Merkle hash chain.
+/// Verify the integrity of an audit database's Merkle hash chain.
 ///
-/// Reads every entry from the log file and checks:
+/// Reads every entry from audit.db and checks:
 /// - Each `entry_hash` matches the recomputed `SHA-256(prev_hash || content)`.
 /// - `prev_hash` links to the preceding entry (or the genesis seed for the first).
 /// - Sequence numbers are contiguous starting from 0.
@@ -422,60 +560,56 @@ fn recover_chain_state(log_path: &Path) -> ChainState {
 ///   verifies the HMAC-SHA256 signature over `entry_hash`.
 ///
 /// Returns `Ok(entry_count)` on success, or an error describing the first violation.
-pub fn verify_chain(log_path: &Path) -> Result<u64> {
-    let file = std::fs::File::open(log_path)?;
-    let reader = BufReader::new(file);
+pub fn verify_chain(db_path: &Path) -> Result<u64> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT event_json FROM audit_events ORDER BY id ASC",
+    )?;
 
     let mut expected_prev_hash = GENESIS_PREV_HASH.to_string();
     let mut expected_sequence: u64 = 0;
 
-    // Attempt to load signing key from environment (optional)
     let signing_key = std::env::var("DAEMONCLAW_AUDIT_SIGNING_KEY")
         .ok()
         .and_then(|key_hex| hex::decode(&key_hex).ok())
         .filter(|key_bytes| key_bytes.len() == 32);
 
-    for (line_idx, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: AuditEvent = serde_json::from_str(&line)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
-        // Check sequence continuity
+    for (row_idx, row_result) in rows.enumerate() {
+        let json = row_result?;
+        let entry: AuditEvent = serde_json::from_str(&json)?;
+
         if entry.sequence != expected_sequence {
             bail!(
-                "sequence gap at line {}: expected {}, got {}",
-                line_idx + 1,
+                "sequence gap at row {}: expected {}, got {}",
+                row_idx + 1,
                 expected_sequence,
                 entry.sequence
             );
         }
 
-        // Check prev_hash linkage
         if entry.prev_hash != expected_prev_hash {
             bail!(
-                "prev_hash mismatch at line {} (sequence {}): expected {}, got {}",
-                line_idx + 1,
+                "prev_hash mismatch at row {} (sequence {}): expected {}, got {}",
+                row_idx + 1,
                 entry.sequence,
                 expected_prev_hash,
                 entry.prev_hash
             );
         }
 
-        // Recompute and verify entry_hash
         let recomputed = compute_entry_hash(&entry.prev_hash, &entry);
         if entry.entry_hash != recomputed {
             bail!(
-                "entry_hash mismatch at line {} (sequence {}): expected {}, got {}",
-                line_idx + 1,
+                "entry_hash mismatch at row {} (sequence {}): expected {}, got {}",
+                row_idx + 1,
                 entry.sequence,
                 recomputed,
                 entry.entry_hash
             );
         }
 
-        // Verify signature if present and key is available
         if let Some(ref signature) = entry.signature
             && let Some(ref key_bytes) = signing_key
         {
@@ -489,13 +623,12 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
 
             if signature != &expected_sig {
                 bail!(
-                    "signature verification failed at line {} (sequence {}): signature mismatch",
-                    line_idx + 1,
+                    "signature verification failed at row {} (sequence {}): signature mismatch",
+                    row_idx + 1,
                     entry.sequence
                 );
             }
         }
-        // If signature present but key not available, skip verification (backward compat)
 
         expected_prev_hash = entry.entry_hash.clone();
         expected_sequence += 1;
@@ -508,7 +641,7 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
 mod tests {
     use super::*;
     use scopeguard::defer;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     /// Mutex to serialize tests that read/write DAEMONCLAW_AUDIT_SIGNING_KEY env var.
@@ -568,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_logger_disabled_does_not_create_file() -> Result<()> {
+    fn audit_logger_disabled_does_not_insert_events() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
             enabled: false,
@@ -579,12 +712,13 @@ mod tests {
 
         logger.log(&event)?;
 
-        // File should not exist since logging is disabled
-        assert!(!tmp.path().join("audit.log").exists());
+        let conn = Connection::open(logger.db_path())?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))?;
+        assert_eq!(count, 0);
         Ok(())
     }
 
-    // ── §8.1 Log rotation tests ─────────────────────────────
+    // ── §8.1 SQLite storage tests ───────────────────────────────
 
     #[tokio::test]
     async fn audit_logger_writes_event_when_enabled() -> Result<()> {
@@ -601,13 +735,16 @@ mod tests {
 
         logger.log(&event)?;
 
-        let log_path = tmp.path().join("audit.log");
-        assert!(log_path.exists(), "audit log file must be created");
+        let conn = Connection::open(logger.db_path())?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))?;
+        assert_eq!(count, 1);
 
-        let content = tokio::fs::read_to_string(&log_path).await?;
-        assert!(!content.is_empty(), "audit log must not be empty");
-
-        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let parsed: AuditEvent = serde_json::from_str(&json)?;
         assert!(parsed.action.is_some());
         Ok(())
     }
@@ -632,9 +769,13 @@ mod tests {
             duration_ms: 42,
         })?;
 
-        let log_path = tmp.path().join("audit.log");
-        let content = tokio::fs::read_to_string(&log_path).await?;
-        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let conn = Connection::open(logger.db_path())?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let parsed: AuditEvent = serde_json::from_str(&json)?;
 
         let action = parsed.action.unwrap();
         assert_eq!(action.command, Some("echo test".to_string()));
@@ -648,31 +789,23 @@ mod tests {
     }
 
     #[test]
-    fn audit_rotation_creates_numbered_backup() -> Result<()> {
+    fn audit_db_created_in_audit_subdirectory() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
             enabled: true,
-            max_size_mb: 0, // Force rotation on first write
             ..Default::default()
         };
         let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
 
-        // Write initial content that triggers rotation
-        let log_path = tmp.path().join("audit.log");
-        std::fs::write(&log_path, "initial content\n")?;
-
-        let event = AuditEvent::new(AuditEventType::CommandExecution);
-        logger.log(&event)?;
-
-        let rotated = format!("{}.1.log", log_path.display());
-        assert!(
-            std::path::Path::new(&rotated).exists(),
-            "rotation must create .1.log backup"
+        assert!(logger.db_path().exists());
+        assert_eq!(
+            logger.db_path(),
+            tmp.path().join("audit").join("audit.db")
         );
         Ok(())
     }
 
-    // ── Merkle hash-chain tests ─────────────────────────────
+    // ── Merkle hash-chain tests ─────────────────────────────────
 
     #[test]
     fn merkle_chain_genesis_uses_well_known_seed() -> Result<()> {
@@ -687,9 +820,13 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::SecurityEvent);
         logger.log(&event)?;
 
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let conn = Connection::open(logger.db_path())?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let parsed: AuditEvent = serde_json::from_str(&json)?;
 
         assert_eq!(parsed.sequence, 0);
         assert_eq!(parsed.prev_hash, GENESIS_PREV_HASH);
@@ -707,7 +844,6 @@ mod tests {
         };
         let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
 
-        // Write several events
         for i in 0..5 {
             let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
                 format!("cmd-{}", i),
@@ -718,8 +854,7 @@ mod tests {
             logger.log(&event)?;
         }
 
-        let log_path = tmp.path().join("audit.log");
-        let count = verify_chain(&log_path)?;
+        let count = verify_chain(logger.db_path())?;
         assert_eq!(count, 5);
         Ok(())
     }
@@ -744,21 +879,23 @@ mod tests {
             logger.log(&event)?;
         }
 
-        // Tamper with the second entry (change the command text)
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 3);
-
-        let mut entry: serde_json::Value = serde_json::from_str(lines[1])?;
+        // Simulate external tampering (bypass triggers to set up tampered state)
+        let conn = Connection::open(logger.db_path())?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_update")?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events WHERE sequence = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut entry: serde_json::Value = serde_json::from_str(&json)?;
         entry["action"]["command"] = serde_json::Value::String("TAMPERED".to_string());
-        let tampered_line = serde_json::to_string(&entry)?;
+        let tampered_json = serde_json::to_string(&entry)?;
+        conn.execute(
+            "UPDATE audit_events SET event_json = ?1 WHERE sequence = 1",
+            params![tampered_json],
+        )?;
 
-        let tampered_content = format!("{}\n{}\n{}\n", lines[0], tampered_line, lines[2]);
-        std::fs::write(&log_path, tampered_content)?;
-
-        // Verification must fail
-        let result = verify_chain(&log_path);
+        let result = verify_chain(logger.db_path());
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -789,14 +926,12 @@ mod tests {
             logger.log(&event)?;
         }
 
-        // Remove the second entry to create a sequence gap
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        let gapped_content = format!("{}\n{}\n", lines[0], lines[2]);
-        std::fs::write(&log_path, gapped_content)?;
+        // Simulate external tampering (bypass triggers to create a gap)
+        let conn = Connection::open(logger.db_path())?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_delete")?;
+        conn.execute("DELETE FROM audit_events WHERE sequence = 1", [])?;
 
-        let result = verify_chain(&log_path);
+        let result = verify_chain(logger.db_path());
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -810,7 +945,6 @@ mod tests {
     #[test]
     fn merkle_chain_recovery_continues_after_restart() -> Result<()> {
         let tmp = TempDir::new()?;
-        let log_path = tmp.path().join("audit.log");
 
         // First logger writes 2 entries
         {
@@ -851,12 +985,13 @@ mod tests {
         }
 
         // Full chain should verify (4 entries, sequences 0..3)
-        let count = verify_chain(&log_path)?;
+        let db_path = tmp.path().join("audit").join("audit.db");
+        let count = verify_chain(&db_path)?;
         assert_eq!(count, 4);
         Ok(())
     }
 
-    // ── HMAC signing tests ──────────────────────────────────
+    // ── HMAC signing tests ──────────────────────────────────────
 
     #[test]
     fn signature_present_when_sign_events_enabled() -> Result<()> {
@@ -887,9 +1022,13 @@ mod tests {
 
         logger.log(&event)?;
 
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let conn = Connection::open(logger.db_path())?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let parsed: AuditEvent = serde_json::from_str(&json)?;
 
         assert!(
             parsed.signature.is_some(),
@@ -915,9 +1054,13 @@ mod tests {
 
         logger.log(&event)?;
 
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let conn = Connection::open(logger.db_path())?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let parsed: AuditEvent = serde_json::from_str(&json)?;
 
         assert!(
             parsed.signature.is_none(),
@@ -955,9 +1098,13 @@ mod tests {
 
         logger.log(&event)?;
 
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let conn = Connection::open(logger.db_path())?;
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let parsed: AuditEvent = serde_json::from_str(&json)?;
 
         // Manually recompute HMAC to verify correctness
         use hmac::{Hmac, Mac};
@@ -1169,11 +1316,13 @@ mod tests {
             logger.log(&event)?;
         }
 
-        let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        let event1: AuditEvent = serde_json::from_str(lines[0])?;
-        let event2: AuditEvent = serde_json::from_str(lines[1])?;
+        let conn = Connection::open(logger.db_path())?;
+        let mut stmt = conn.prepare("SELECT event_json FROM audit_events ORDER BY id ASC")?;
+        let jsons: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let event1: AuditEvent = serde_json::from_str(&jsons[0])?;
+        let event2: AuditEvent = serde_json::from_str(&jsons[1])?;
 
         // Different entry_hashes due to chaining, so signatures should differ
         assert_ne!(event1.entry_hash, event2.entry_hash);
@@ -1206,7 +1355,6 @@ mod tests {
         }
 
         let tmp = TempDir::new()?;
-        let log_path = tmp.path().join("audit.log");
         let test_key = "a1".repeat(32); // 64 hex chars = 32 bytes
 
         // First logger with sign_events=false (unsigned records)
@@ -1255,24 +1403,278 @@ mod tests {
         // Set the key in env so verify_chain can check signatures
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("DAEMONCLAW_AUDIT_SIGNING_KEY", &test_key) };
-        let count = verify_chain(&log_path)?;
+        let db_path = tmp.path().join("audit").join("audit.db");
+        let count = verify_chain(&db_path)?;
         assert_eq!(count, 4, "should verify all 4 records");
 
         // Verify that first 2 records have no signature, last 2 have signatures
-        let content = std::fs::read_to_string(&log_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 4);
+        let conn = Connection::open(&db_path)?;
+        let mut stmt = conn.prepare("SELECT event_json FROM audit_events ORDER BY id ASC")?;
+        let jsons: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(jsons.len(), 4);
 
-        let rec0: AuditEvent = serde_json::from_str(lines[0])?;
-        let rec1: AuditEvent = serde_json::from_str(lines[1])?;
-        let rec2: AuditEvent = serde_json::from_str(lines[2])?;
-        let rec3: AuditEvent = serde_json::from_str(lines[3])?;
+        let rec0: AuditEvent = serde_json::from_str(&jsons[0])?;
+        let rec1: AuditEvent = serde_json::from_str(&jsons[1])?;
+        let rec2: AuditEvent = serde_json::from_str(&jsons[2])?;
+        let rec3: AuditEvent = serde_json::from_str(&jsons[3])?;
 
         assert!(rec0.signature.is_none(), "first unsigned record");
         assert!(rec1.signature.is_none(), "second unsigned record");
         assert!(rec2.signature.is_some(), "first signed record");
         assert!(rec3.signature.is_some(), "second signed record");
 
+        Ok(())
+    }
+
+    // ── Concurrency tests ──────────────────────────────────────
+
+    #[test]
+    fn concurrent_writers_produce_single_valid_chain() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let db_path = tmp.path().to_path_buf();
+
+        // Two independent AuditLogger instances (simulates two processes
+        // or two independently-constructed loggers sharing one audit.db).
+        let logger_a = Arc::new(AuditLogger::new(config.clone(), db_path.clone())?);
+        let logger_b = Arc::new(AuditLogger::new(config, db_path.clone())?);
+
+        let events_per_writer = 50;
+        let la = Arc::clone(&logger_a);
+        let lb = Arc::clone(&logger_b);
+
+        let handle_a = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("writer-a".into(), None, None)
+                    .with_action(format!("a-cmd-{i}"), "low".into(), false, true);
+                la.log(&event)?;
+            }
+            Ok(())
+        });
+
+        let handle_b = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("writer-b".into(), None, None)
+                    .with_action(format!("b-cmd-{i}"), "low".into(), false, true);
+                lb.log(&event)?;
+            }
+            Ok(())
+        });
+
+        handle_a.join().unwrap()?;
+        handle_b.join().unwrap()?;
+
+        let audit_db = tmp.path().join("audit").join("audit.db");
+
+        // verify_chain walks the entire chain and checks:
+        // - contiguous sequences (0..N)
+        // - each prev_hash links to the preceding entry_hash
+        // - each entry_hash is correctly computed
+        // This FAILS if any fork occurred (duplicate sequence or mislinked prev_hash).
+        let count = verify_chain(&audit_db)?;
+        assert_eq!(count, events_per_writer * 2);
+
+        // Double-check: all sequence numbers are unique
+        let conn = Connection::open(&audit_db)?;
+        let unique_seqs: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT sequence) FROM audit_events",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(unique_seqs, (events_per_writer * 2) as i64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_interleave_from_both_sources() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let db_path = tmp.path().to_path_buf();
+
+        let logger_a = Arc::new(AuditLogger::new(config.clone(), db_path.clone())?);
+        let logger_b = Arc::new(AuditLogger::new(config, db_path)?);
+
+        let la = Arc::clone(&logger_a);
+        let lb = Arc::clone(&logger_b);
+        let events_per_writer = 20;
+
+        let handle_a = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("daemon".into(), None, None)
+                    .with_action(format!("shell-{i}"), "standard".into(), true, true);
+                la.log(&event)?;
+            }
+            Ok(())
+        });
+
+        let handle_b = std::thread::spawn(move || -> Result<()> {
+            for i in 0..events_per_writer {
+                let event = AuditEvent::new(AuditEventType::CommandExecution)
+                    .with_actor("cli".into(), None, None)
+                    .with_action(format!("echo-{i}"), "standard".into(), true, true);
+                lb.log(&event)?;
+            }
+            Ok(())
+        });
+
+        handle_a.join().unwrap()?;
+        handle_b.join().unwrap()?;
+
+        let audit_db = tmp.path().join("audit").join("audit.db");
+        let count = verify_chain(&audit_db)?;
+        assert_eq!(count, events_per_writer * 2);
+
+        // Verify both writers contributed (events are interleaved, not batched)
+        let conn = Connection::open(&audit_db)?;
+        let daemon_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_json LIKE '%writer-a%' OR event_json LIKE '%daemon%'",
+            [],
+            |r| r.get(0),
+        )?;
+        let cli_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_json LIKE '%writer-b%' OR event_json LIKE '%cli%'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(daemon_count, events_per_writer as i64);
+        assert_eq!(cli_count, events_per_writer as i64);
+
+        Ok(())
+    }
+
+    // ── Append-only enforcement tests ──────────────────────────
+
+    #[test]
+    fn direct_delete_is_rejected_by_trigger() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("shell".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        let conn = Connection::open(logger.db_path())?;
+        let result = conn.execute("DELETE FROM audit_events WHERE sequence = 0", []);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("append-only") && err.contains("DELETE prohibited"),
+            "expected append-only DELETE error, got: {err}"
+        );
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events", [], |r| r.get(0),
+        )?;
+        assert_eq!(count, 1, "row must survive the rejected DELETE");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_update_is_rejected_by_trigger() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("shell".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        let conn = Connection::open(logger.db_path())?;
+        let result = conn.execute(
+            "UPDATE audit_events SET event_json = 'TAMPERED' WHERE sequence = 0",
+            [],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("append-only") && err.contains("UPDATE prohibited"),
+            "expected append-only UPDATE error, got: {err}"
+        );
+
+        let json: String = conn.query_row(
+            "SELECT event_json FROM audit_events WHERE sequence = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            !json.contains("TAMPERED"),
+            "row content must be unchanged after rejected UPDATE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn log_still_works_with_triggers_installed() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..10 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution)
+                .with_action(format!("cmd-{i}"), "low".into(), false, true);
+            logger.log(&event)?;
+        }
+
+        let count = verify_chain(logger.db_path())?;
+        assert_eq!(count, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn record_chain_boundary_appends_event() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("shell".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        logger.record_chain_boundary(
+            "fork cleanup: seqs 34-37, 79-80, 116 removed — 6 daemon + 1 CLI proof event"
+        )?;
+
+        let count = verify_chain(logger.db_path())?;
+        assert_eq!(count, 2);
+
+        let conn = Connection::open(logger.db_path())?;
+        let event_type: String = conn.query_row(
+            "SELECT event_type FROM audit_events WHERE sequence = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(event_type, "chain_boundary");
         Ok(())
     }
 }

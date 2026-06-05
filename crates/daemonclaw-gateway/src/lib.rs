@@ -24,7 +24,7 @@ pub mod static_files;
 pub mod tls;
 pub mod ws;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
     Router,
     body::Bytes,
@@ -433,25 +433,29 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes};
+    let fallback = get_fallback_provider();
+    let fallback_name_gw = get_fallback_name();
+    let embedding_routes_gw = get_embedding_routes();
     let provider: Arc<dyn Provider> =
         Arc::from(daemonclaw_providers::create_resilient_provider_with_options(
-            config.providers.fallback.as_deref().unwrap_or("openrouter"),
-            fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.base_url.as_deref()),
+            fallback_name_gw.as_deref().unwrap_or("openrouter"),
+            fallback.as_ref().and_then(|e| e.api_key.as_deref()),
+            fallback.as_ref().and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &daemonclaw_providers::provider_runtime_options_from_config(&config),
         )?);
     let model = fallback
+        .as_ref()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
-    let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
+    let temperature = fallback.as_ref().and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_gw,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback.and_then(|e| e.api_key.as_deref()),
+        fallback.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
@@ -489,11 +493,8 @@ pub async fn run_gateway(
         &config.http_request,
         &config.web_fetch,
         &config.workspace_dir,
-        &config.agents,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        &std::collections::HashMap::new(),
+        fallback.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
         None,
@@ -716,10 +717,75 @@ pub async fn run_gateway(
         None
     };
 
-    // ── Pairing guard ──────────────────────────────────────
+    // ── Migrate standalone devices.db → state.db (Track 4) ──
+    if let Ok(state_db) = daemonclaw_config::state_db::StateDb::open(&config.workspace_dir) {
+        match state_db.migrate_devices_from_standalone(&config.workspace_dir) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("📦 Migrated {n} device(s) from standalone devices.db to state.db"),
+            Err(e) => tracing::warn!("Device migration from standalone devices.db failed: {e}"),
+        }
+    }
+
+    // ── Device registry (must be created before PairingGuard so we can load tokens) ──
+    let device_registry: Option<Arc<api_pairing::DeviceRegistry>> =
+        if config.gateway.require_pairing {
+            Some(Arc::new(api_pairing::DeviceRegistry::new(
+                &config.workspace_dir,
+            )))
+        } else {
+            None
+        };
+
+    // ── One-time migration: config paired_tokens → devices.db ──
+    if !config.gateway.paired_tokens.is_empty() {
+        if let Some(ref registry) = device_registry {
+            let now = chrono::Utc::now();
+            for raw_token in &config.gateway.paired_tokens {
+                let token_hash = if raw_token.len() == 64
+                    && raw_token.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    raw_token.clone()
+                } else {
+                    PairingGuard::token_hash(raw_token)
+                };
+                if !registry.has_token_hash(&token_hash) {
+                    registry.register(
+                        token_hash,
+                        api_pairing::DeviceInfo {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: Some("Migrated from config".to_string()),
+                            device_type: Some("migrated".to_string()),
+                            paired_at: now,
+                            last_seen: now,
+                            ip_address: None,
+                        },
+                    );
+                }
+            }
+            tracing::info!(
+                "🔐 Migrated {} pairing token(s) from config.toml to devices.db",
+                config.gateway.paired_tokens.len()
+            );
+
+            // Strip paired_tokens from config.toml (last config write for pairing)
+            let mut stripped_cfg = config.clone();
+            stripped_cfg.gateway.paired_tokens.clear();
+            if let Err(e) = stripped_cfg.save().await {
+                tracing::warn!("Failed to strip paired_tokens from config.toml: {e}");
+            } else {
+                tracing::info!("🔐 Removed paired_tokens from config.toml");
+            }
+        }
+    }
+
+    // ── Pairing guard (loads token hashes from devices.db) ──
+    let device_hashes = device_registry
+        .as_ref()
+        .map(|r| r.token_hashes())
+        .unwrap_or_default();
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
+        &device_hashes,
     ));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -868,14 +934,7 @@ pub async fn run_gateway(
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
 
-    // Device registry and pairing store (only when pairing is required)
-    let device_registry = if config.gateway.require_pairing {
-        Some(Arc::new(api_pairing::DeviceRegistry::new(
-            &config.workspace_dir,
-        )))
-    } else {
-        None
-    };
+    // Pairing store (only when pairing is required; device_registry created earlier)
     let pending_pairings = if config.gateway.require_pairing {
         Some(Arc::new(api_pairing::PairingStore::new(
             config.gateway.pairing_dashboard.max_pending_codes,
@@ -1286,22 +1345,27 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) =
-                Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
-            {
-                tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
-                let body = serde_json::json!({
-                    "paired": true,
-                    "persisted": false,
-                    "token": token,
-                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
-                });
-                return (StatusCode::OK, Json(body));
-            }
+            let token_hash = PairingGuard::token_hash(&token);
+            let persisted = if let Some(ref registry) = state.device_registry {
+                registry.register(
+                    token_hash,
+                    api_pairing::DeviceInfo {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: None,
+                        device_type: Some("legacy-pair".to_string()),
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: Some(rate_key.clone()),
+                    },
+                );
+                true
+            } else {
+                false
+            };
 
             let body = serde_json::json!({
                 "paired": true,
-                "persisted": true,
+                "persisted": persisted,
                 "token": token,
                 "message": "Save this token — use it as Authorization: Bearer <token>"
             });
@@ -1324,22 +1388,6 @@ async fn handle_pair(
             (StatusCode::TOO_MANY_REQUESTS, Json(err))
         }
     }
-}
-
-async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
-    let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.lock().clone() };
-    updated_cfg.gateway.paired_tokens = paired_tokens;
-    updated_cfg
-        .save()
-        .await
-        .context("Failed to persist paired tokens to config.toml")?;
-
-    // Keep shared runtime config in sync with persisted tokens.
-    *config.lock() = updated_cfg;
-    Ok(())
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
@@ -1512,12 +1560,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .lock()
-        .providers
-        .fallback
-        .clone()
+    let provider_label = daemonclaw_config::provider_store::get_fallback_name()
         .unwrap_or_else(|| "unknown".to_string());
     let model_label = state.model.clone();
     let started_at = Instant::now();
@@ -2657,46 +2700,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_pairing_tokens_writes_config_tokens() {
+    async fn pairing_writes_to_device_registry_not_config() {
         let temp = tempfile::tempdir().unwrap();
-        let config_path = temp.path().join("config.toml");
         let workspace_path = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
 
-        let config = Config {
-            config_path: config_path.clone(),
-            workspace_dir: workspace_path,
-            ..Default::default()
-        };
-        config.save().await.unwrap();
+        let registry = Arc::new(api_pairing::DeviceRegistry::new(&workspace_path));
+        assert_eq!(registry.device_count(), 0);
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(Mutex::new(config));
-        Box::pin(persist_pairing_tokens(shared_config.clone(), &guard))
-            .await
-            .unwrap();
-
-        // In-memory tokens should remain as plaintext 64-char hex hashes.
-        let plaintext = {
-            let in_memory = shared_config.lock();
-            assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
-            in_memory.gateway.paired_tokens[0].clone()
-        };
-        assert_eq!(plaintext.len(), 64);
-        assert!(plaintext.chars().all(|c: char| c.is_ascii_hexdigit()));
-
-        // On disk, the token should be encrypted (secrets.encrypt defaults to true).
-        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
-        let raw_parsed: Config = toml::from_str(&saved).unwrap();
-        assert_eq!(raw_parsed.gateway.paired_tokens.len(), 1);
-        let on_disk = &raw_parsed.gateway.paired_tokens[0];
-        assert!(
-            daemonclaw_runtime::security::SecretStore::is_encrypted(on_disk),
-            "paired_token should be encrypted on disk"
+        let token_hash = PairingGuard::token_hash(&token);
+        registry.register(
+            token_hash.clone(),
+            api_pairing::DeviceInfo {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: None,
+                device_type: Some("legacy-pair".to_string()),
+                paired_at: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+                ip_address: Some("test_client".to_string()),
+            },
         );
+
+        assert_eq!(registry.device_count(), 1);
+        assert!(registry.has_token_hash(&token_hash));
+    }
+
+    #[tokio::test]
+    async fn migration_moves_config_tokens_to_device_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let workspace_path = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        // Write a config with a plaintext paired_token
+        let token = "zc_migration_test_token_abcdef1234567890";
+        let mut config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: workspace_path.clone(),
+            ..Default::default()
+        };
+        config.gateway.paired_tokens = vec![token.to_string()];
+        config.save().await.unwrap();
+
+        // Simulate the migration: hash the token and register in device DB
+        let registry = api_pairing::DeviceRegistry::new(&workspace_path);
+        let token_hash = PairingGuard::token_hash(token);
+        registry.register(
+            token_hash.clone(),
+            api_pairing::DeviceInfo {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: Some("Migrated from config".to_string()),
+                device_type: Some("migrated".to_string()),
+                paired_at: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+                ip_address: None,
+            },
+        );
+
+        assert!(registry.has_token_hash(&token_hash));
+
+        // Strip paired_tokens from config (as the migration does)
+        config.gateway.paired_tokens.clear();
+        config.save().await.unwrap();
+
+        // Verify config no longer has the token
+        let saved = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !saved.contains("zc_migration_test_token"),
+            "Plaintext token must not remain in config.toml"
+        );
+        let raw_parsed: Config = toml::from_str(&saved).unwrap();
+        assert!(
+            raw_parsed.gateway.paired_tokens.is_empty(),
+            "paired_tokens must be empty in config after migration"
+        );
+
+        // PairingGuard loaded with the hash from DB should authenticate
+        let guard = PairingGuard::new(true, &[token_hash]);
+        assert!(guard.is_authenticated(token));
+    }
+
+    #[tokio::test]
+    async fn startup_loads_device_registry_tokens_into_pairing_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_path = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let registry = api_pairing::DeviceRegistry::new(&workspace_path);
+        let token = "zc_preexisting_device_token";
+        let token_hash = PairingGuard::token_hash(token);
+        registry.register(
+            token_hash.clone(),
+            api_pairing::DeviceInfo {
+                id: "device-1".to_string(),
+                name: Some("Test device".to_string()),
+                device_type: None,
+                paired_at: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+                ip_address: None,
+            },
+        );
+
+        let device_hashes = registry.token_hashes();
+        let guard = PairingGuard::new(true, &device_hashes);
+
+        assert!(guard.is_authenticated(token));
+        assert!(guard.pairing_code().is_none());
     }
 
     #[test]

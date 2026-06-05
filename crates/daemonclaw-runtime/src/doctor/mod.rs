@@ -434,8 +434,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Provider validity
-    let fallback_provider = config.providers.fallback.as_deref();
-    let fallback_provider_doc = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_name, get_fallback_provider, get_model_routes, get_embedding_routes};
+    let fallback_name_doc = get_fallback_name();
+    let fallback_provider = fallback_name_doc.as_deref();
+    let fallback_provider_doc = get_fallback_provider();
     if let Some(provider) = fallback_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
@@ -455,6 +457,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     // API key presence
     if fallback_provider != Some("ollama") {
         if fallback_provider_doc
+            .as_ref()
             .and_then(|e| e.api_key.as_deref())
             .is_some()
         {
@@ -468,7 +471,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model configured
-    let default_model = fallback_provider_doc.and_then(|e| e.model.as_deref());
+    let default_model = fallback_provider_doc.as_ref().and_then(|e| e.model.as_deref());
     if default_model.is_some() {
         items.push(DiagItem::ok(
             cat,
@@ -480,6 +483,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Temperature range
     let default_temperature = fallback_provider_doc
+        .as_ref()
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     if (0.0..=2.0).contains(&default_temperature) {
@@ -519,7 +523,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model routes validation
-    for route in &config.providers.model_routes {
+    let model_routes_doc = get_model_routes();
+    for route in &model_routes_doc {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
@@ -541,7 +546,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Embedding routes validation
-    for route in &config.providers.embedding_routes {
+    let embedding_routes_doc = get_embedding_routes();
+    for route in &embedding_routes_doc {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));
         }
@@ -577,9 +583,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         .strip_prefix("hint:")
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && !config
-            .providers
-            .embedding_routes
+        && !embedding_routes_doc
             .iter()
             .any(|route| route.hint.trim() == hint)
     {
@@ -604,21 +608,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Delegate agents: provider validity
-    let mut agent_names: Vec<_> = config.agents.keys().collect();
-    agent_names.sort();
-    for name in agent_names {
-        let agent = config.agents.get(name).unwrap();
-        if let Some(reason) = provider_validation_error(&agent.provider) {
-            items.push(DiagItem::warn(
-                cat,
-                format!(
-                    "agent \"{name}\" uses invalid provider \"{}\": {}",
-                    agent.provider, reason
-                ),
-            ));
-        }
-    }
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
@@ -776,40 +765,43 @@ fn workspace_probe_path(workspace_dir: &Path) -> std::path::PathBuf {
 
 fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "daemon";
-    let state_file = crate::daemon::state_file_path(config);
 
-    if !state_file.exists() {
-        items.push(DiagItem::error(
-            cat,
-            format!(
-                "state file not found: {} — is the daemon running?",
-                state_file.display()
-            ),
-        ));
+    let state_db = match daemonclaw_config::state_db::StateDb::open(&config.workspace_dir) {
+        Ok(db) => db,
+        Err(_) => {
+            // Fall back to legacy JSON file
+            return check_daemon_state_legacy(config, items);
+        }
+    };
+    let _ = state_db.ensure_daemon_health_table();
+    let conn = match state_db.connect() {
+        Ok(c) => c,
+        Err(_) => return check_daemon_state_legacy(config, items),
+    };
+
+    let row: Option<(String, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT written_at, uptime_secs, components FROM daemon_health ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+
+    let Some((written_at, _uptime, components_str)) = row else {
+        items.push(DiagItem::error(cat, "no health snapshots in state.db — is the daemon running?"));
         return;
-    }
-
-    let raw = match std::fs::read_to_string(&state_file) {
-        Ok(r) => r,
-        Err(e) => {
-            items.push(DiagItem::error(cat, format!("cannot read state file: {e}")));
-            return;
-        }
     };
 
-    let snapshot: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            items.push(DiagItem::error(cat, format!("invalid state JSON: {e}")));
-            return;
-        }
-    };
+    let components_json: serde_json::Value = components_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!({}));
+    let snapshot = serde_json::json!({
+        "updated_at": &written_at,
+        "components": components_json,
+    });
 
-    // Daemon heartbeat freshness
-    let updated_at = snapshot
-        .get("updated_at")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let updated_at = written_at.as_str();
 
     if let Ok(ts) = DateTime::parse_from_rfc3339(updated_at) {
         let age = Utc::now()
@@ -902,6 +894,41 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 cat,
                 format!("{channel_count} channels, {stale} stale"),
             ));
+        }
+    }
+}
+
+fn check_daemon_state_legacy(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "daemon";
+    let state_file = crate::daemon::state_file_path(config);
+    if !state_file.exists() {
+        items.push(DiagItem::error(
+            cat,
+            format!("state file not found: {} — is the daemon running?", state_file.display()),
+        ));
+        return;
+    }
+    let raw = match std::fs::read_to_string(&state_file) {
+        Ok(r) => r,
+        Err(e) => {
+            items.push(DiagItem::error(cat, format!("cannot read state file: {e}")));
+            return;
+        }
+    };
+    let snapshot: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            items.push(DiagItem::error(cat, format!("invalid state JSON: {e}")));
+            return;
+        }
+    };
+    let updated_at = snapshot.get("updated_at").and_then(serde_json::Value::as_str).unwrap_or("");
+    if let Ok(ts) = DateTime::parse_from_rfc3339(updated_at) {
+        let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc)).num_seconds();
+        if age <= DAEMON_STALE_SECONDS {
+            items.push(DiagItem::ok(cat, format!("heartbeat fresh ({age}s ago) [legacy JSON]")));
+        } else {
+            items.push(DiagItem::error(cat, format!("heartbeat stale ({age}s ago) [legacy JSON]")));
         }
     }
 }
@@ -1067,14 +1094,16 @@ mod tests {
 
     #[test]
     fn config_validation_catches_bad_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
-        config
-            .providers
-            .models
-            .entry("default".into())
-            .or_default()
-            .temperature = Some(5.0);
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let mut entry = daemonclaw_config::schema::ModelProviderConfig::default();
+            entry.temperature = Some(5.0);
+            let _ = store.upsert_provider("default", &entry);
+            let _ = store.set_fallback_name("default");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1084,14 +1113,16 @@ mod tests {
 
     #[test]
     fn config_validation_accepts_valid_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
-        config
-            .providers
-            .models
-            .entry("default".into())
-            .or_default()
-            .temperature = Some(0.7);
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let mut entry = daemonclaw_config::schema::ModelProviderConfig::default();
+            entry.temperature = Some(0.7);
+            let _ = store.upsert_provider("default", &entry);
+            let _ = store.set_fallback_name("default");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1111,8 +1142,13 @@ mod tests {
 
     #[test]
     fn config_validation_catches_unknown_provider() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("totally-fake".into());
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_fallback_name("totally-fake");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items
@@ -1124,8 +1160,13 @@ mod tests {
 
     #[test]
     fn config_validation_catches_malformed_custom_provider() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:".into());
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_fallback_name("custom:");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
@@ -1139,8 +1180,13 @@ mod tests {
 
     #[test]
     fn config_validation_accepts_custom_provider() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://my-api.com".into());
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_fallback_name("custom:https://my-api.com");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));
@@ -1178,13 +1224,18 @@ mod tests {
 
     #[test]
     fn config_validation_warns_empty_model_route() {
-        let mut config = Config::default();
-        config.providers.model_routes = vec![daemonclaw_config::schema::ModelRouteConfig {
-            hint: "fast".into(),
-            provider: "groq".into(),
-            model: String::new(),
-            api_key: None,
-        }];
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_model_routes(&[daemonclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                provider: "groq".into(),
+                model: String::new(),
+                api_key: None,
+            }]);
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let route_item = items.iter().find(|i| i.message.contains("empty model"));
@@ -1194,14 +1245,19 @@ mod tests {
 
     #[test]
     fn config_validation_warns_empty_embedding_route_model() {
-        let mut config = Config::default();
-        config.providers.embedding_routes = vec![daemonclaw_config::schema::EmbeddingRouteConfig {
-            hint: "semantic".into(),
-            provider: "openai".into(),
-            model: String::new(),
-            dimensions: Some(1536),
-            api_key: None,
-        }];
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_embedding_routes(&[daemonclaw_config::schema::EmbeddingRouteConfig {
+                hint: "semantic".into(),
+                provider: "openai".into(),
+                model: String::new(),
+                dimensions: Some(1536),
+                api_key: None,
+            }]);
+        }
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1215,14 +1271,19 @@ mod tests {
 
     #[test]
     fn config_validation_warns_invalid_embedding_route_provider() {
-        let mut config = Config::default();
-        config.providers.embedding_routes = vec![daemonclaw_config::schema::EmbeddingRouteConfig {
-            hint: "semantic".into(),
-            provider: "groq".into(),
-            model: "text-embedding-3-small".into(),
-            dimensions: None,
-            api_key: None,
-        }];
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_embedding_routes(&[daemonclaw_config::schema::EmbeddingRouteConfig {
+                hint: "semantic".into(),
+                provider: "groq".into(),
+                model: "text-embedding-3-small".into(),
+                dimensions: None,
+                api_key: None,
+            }]);
+        }
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1286,57 +1347,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn config_validation_reports_delegate_agents_in_sorted_order() {
-        let mut config = Config::default();
-        config.agents.insert(
-            "zeta".into(),
-            daemonclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-z".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-        config.agents.insert(
-            "alpha".into(),
-            daemonclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-a".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            },
-        );
-
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-
-        let agent_messages: Vec<_> = items
-            .iter()
-            .filter(|item| item.message.starts_with("agent \""))
-            .map(|item| item.message.as_str())
-            .collect();
-
-        assert_eq!(agent_messages.len(), 2);
-        assert!(agent_messages[0].contains("agent \"alpha\""));
-        assert!(agent_messages[1].contains("agent \"zeta\""));
-    }
 }

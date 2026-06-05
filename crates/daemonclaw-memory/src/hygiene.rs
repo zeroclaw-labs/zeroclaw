@@ -90,35 +90,75 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
 }
 
 fn should_run_now(workspace_dir: &Path) -> Result<bool> {
-    let path = state_path(workspace_dir);
+    if let Ok(state_db) = daemonclaw_config::state_db::StateDb::open(workspace_dir) {
+        let _ = state_db.ensure_hygiene_state_table();
+        if let Ok(conn) = state_db.connect() {
+            let last_run: Option<String> = conn
+                .query_row(
+                    "SELECT last_run_at FROM hygiene_state WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(ref ts_str) = last_run {
+                if let Ok(ts) = DateTime::parse_from_rfc3339(ts_str) {
+                    return Ok(Utc::now().signed_duration_since(ts.with_timezone(&Utc))
+                        >= Duration::hours(HYGIENE_INTERVAL_HOURS));
+                }
+            }
+            return Ok(true);
+        }
+    }
+
+    // Fallback to legacy JSON file
+    let path = workspace_dir.join("state").join(STATE_FILE);
     if !path.exists() {
         return Ok(true);
     }
-
     let raw = fs::read_to_string(&path)?;
     let state: HygieneState = match serde_json::from_str(&raw) {
         Ok(s) => s,
         Err(_) => return Ok(true),
     };
-
     let Some(last_run_at) = state.last_run_at else {
         return Ok(true);
     };
-
     let last = match DateTime::parse_from_rfc3339(&last_run_at) {
         Ok(ts) => ts.with_timezone(&Utc),
         Err(_) => return Ok(true),
     };
-
     Ok(Utc::now().signed_duration_since(last) >= Duration::hours(HYGIENE_INTERVAL_HOURS))
 }
 
 fn write_state(workspace_dir: &Path, report: &HygieneReport) -> Result<()> {
-    let path = state_path(workspace_dir);
+    if let Ok(state_db) = daemonclaw_config::state_db::StateDb::open(workspace_dir) {
+        let _ = state_db.ensure_hygiene_state_table();
+        if let Ok(conn) = state_db.connect() {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT OR REPLACE INTO hygiene_state (id, last_run_at, archived_memory, archived_session, purged_memory, purged_session, pruned_convo)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    now,
+                    report.archived_memory_files,
+                    report.archived_session_files,
+                    report.purged_memory_archives,
+                    report.purged_session_archives,
+                    report.pruned_conversation_rows,
+                ],
+            )?;
+            // Remove legacy JSON file if it exists
+            let legacy = workspace_dir.join("state").join(STATE_FILE);
+            let _ = fs::remove_file(legacy);
+            return Ok(());
+        }
+    }
+
+    // Fallback to legacy JSON
+    let path = workspace_dir.join("state").join(STATE_FILE);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-
     let state = HygieneState {
         last_run_at: Some(Utc::now().to_rfc3339()),
         last_report: report.clone(),
@@ -126,10 +166,6 @@ fn write_state(workspace_dir: &Path, report: &HygieneReport) -> Result<()> {
     let json = serde_json::to_vec_pretty(&state)?;
     fs::write(path, json)?;
     Ok(())
-}
-
-fn state_path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("state").join(STATE_FILE)
 }
 
 fn archive_daily_memory_files(workspace_dir: &Path, archive_after_days: u32) -> Result<u64> {

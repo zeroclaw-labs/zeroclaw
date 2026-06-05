@@ -690,6 +690,7 @@ pub async fn agent_turn(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     channel: Option<&dyn Channel>,
+    audit_logger: Option<&crate::security::audit::AuditLogger>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -719,6 +720,7 @@ pub async fn agent_turn(
         channel,
         None, // receipt_generator
         None, // collected_receipts
+        audit_logger,
     )
     .await
 }
@@ -886,6 +888,7 @@ pub async fn run_tool_call_loop(
     channel: Option<&dyn Channel>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    audit_logger: Option<&crate::security::audit::AuditLogger>,
 ) -> Result<String> {
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -1887,6 +1890,19 @@ pub async fn run_tool_call_loop(
                     call.name, result_output
                 );
                 detection_relevant_output.push_str(&outcome.output);
+                if let Some(logger) = audit_logger {
+                    if let Err(e) = logger.log_command_event(crate::security::audit::CommandExecutionLog {
+                        channel: channel_name,
+                        command: &call.name,
+                        risk_level: "standard",
+                        approved: true,
+                        allowed: true,
+                        success: outcome.success,
+                        duration_ms: outcome.duration.as_millis() as u64,
+                    }) {
+                        tracing::warn!(tool = %call.name, error = %e, "audit log failed");
+                    }
+                }
                 turn_tool_records.push(daemonclaw_api::agent::ToolCallRecord {
                     name: call.name.clone(),
                     arguments: serde_json::from_str(&call.arguments)
@@ -2199,6 +2215,21 @@ pub async fn run_tool_call_loop(
                     "output": scrub_credentials(&outcome.output),
                 }),
             );
+
+            // ── Audit: log tool execution ─────────────────────
+            if let Some(logger) = audit_logger {
+                if let Err(e) = logger.log_command_event(crate::security::audit::CommandExecutionLog {
+                    channel: channel_name,
+                    command: &call.name,
+                    risk_level: "standard",
+                    approved: true,
+                    allowed: true,
+                    success: outcome.success,
+                    duration_ms: outcome.duration.as_millis() as u64,
+                }) {
+                    tracing::warn!(tool = %call.name, error = %e, "audit log failed");
+                }
+            }
 
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
@@ -2579,15 +2610,17 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
-    let fallback_provider_loop = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+    let fallback_provider_loop = get_fallback_provider();
+    let embedding_routes_loop = get_embedding_routes();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_loop,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2626,8 +2659,8 @@ pub async fn run(
         &config.http_request,
         &config.web_fetch,
         &config.workspace_dir,
-        &config.agents,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        &std::collections::HashMap::new(),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
         None,
@@ -2732,15 +2765,17 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
+    let fallback_name_loop = get_fallback_name();
+    let model_routes_loop = get_model_routes();
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.providers.fallback.as_deref())
+        .or(fallback_name_loop.as_deref())
         .unwrap_or("openrouter")
         .to_string();
 
     let mut model_name = model_override
         .as_deref()
-        .or(fallback_provider_loop.and_then(|e| e.model.as_deref()))
+        .or(fallback_provider_loop.as_ref().and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
@@ -2749,10 +2784,10 @@ pub async fn run(
 
     let mut provider: Box<dyn Provider> = daemonclaw_providers::create_routed_provider_with_options(
         &provider_name,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &config.providers.model_routes,
+        &model_routes_loop,
         &model_name,
         &provider_runtime_options,
     )?;
@@ -2763,6 +2798,25 @@ pub async fn run(
         provider: provider_name.to_string(),
         model: model_name.to_string(),
     });
+
+    // ── Audit logger (shared with channel orchestrator path) ─────
+    let audit_logger = if config.security.audit.enabled {
+        match crate::security::audit::AuditLogger::new(
+            config.security.audit.clone(),
+            config.workspace_dir.clone(),
+        ) {
+            Ok(logger) => {
+                tracing::info!("🔒 Audit logger enabled (audit.db)");
+                Some(logger)
+            }
+            Err(e) => {
+                tracing::warn!("Audit logger init failed, continuing without: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -2882,10 +2936,10 @@ pub async fn run(
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
-    if !config.agents.is_empty() {
+    if config.pool.enabled {
         tool_descs.push((
             "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
+            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work. Use action='list_members' to see available pool members.",
         ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
@@ -2996,6 +3050,7 @@ pub async fn run(
             let bg_llm_config = crate::hooks::builtin::BackgroundLlmConfig {
                 provider_name: provider_name.clone(),
                 api_key: fallback_provider_loop
+                    .as_ref()
                     .and_then(|e| e.api_key.as_deref())
                     .map(String::from),
                 model: model_name.clone(),
@@ -3191,6 +3246,7 @@ pub async fn run(
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
                         None, // collected_receipts
+                        audit_logger.as_ref(),
                     ),
                 )
                 .await
@@ -3211,10 +3267,10 @@ pub async fn run(
 
                         provider = daemonclaw_providers::create_routed_provider_with_options(
                             &new_provider,
-                            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                            fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+                            fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
-                            &config.providers.model_routes,
+                            &get_model_routes(),
                             &new_model,
                             &provider_runtime_options,
                         )?;
@@ -3506,6 +3562,7 @@ pub async fn run(
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
                             None, // collected_receipts
+                            audit_logger.as_ref(),
                         ),
                     )
                     .await
@@ -3527,10 +3584,10 @@ pub async fn run(
 
                             provider = daemonclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
-                                fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                                fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                                fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+                                fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
-                                &config.providers.model_routes,
+                                &get_model_routes(),
                                 &new_model,
                                 &provider_runtime_options,
                             )?;
@@ -3684,14 +3741,16 @@ pub async fn process_message(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let fallback_provider_pm = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+    let fallback_provider_pm = get_fallback_provider();
+    let embedding_routes_pm = get_embedding_routes();
     let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.providers.embedding_routes,
+        &embedding_routes_pm,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3720,8 +3779,8 @@ pub async fn process_message(
         &config.http_request,
         &config.web_fetch,
         &config.workspace_dir,
-        &config.agents,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        &std::collections::HashMap::new(),
+        fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
         None,
@@ -3800,18 +3859,20 @@ pub async fn process_message(
         }
     }
 
-    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    let fallback_name_pm = get_fallback_name();
+    let provider_name = fallback_name_pm.as_deref().unwrap_or("openrouter");
     let model_name = fallback_provider_pm
+        .as_ref()
         .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let provider_runtime_options =
         daemonclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = daemonclaw_providers::create_routed_provider_with_options(
         provider_name,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_pm.and_then(|e| e.base_url.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.api_key.as_deref()),
+        fallback_provider_pm.as_ref().and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &config.providers.model_routes,
+        &get_model_routes(),
         &model_name,
         &provider_runtime_options,
     )?;
@@ -3956,9 +4017,8 @@ pub async fn process_message(
     );
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
-        config
-            .providers
-            .fallback_provider()
+        get_fallback_provider()
+            .as_ref()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             + thinking_params.temperature_adjustment,
@@ -4007,6 +4067,16 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
+    let audit_logger = if config.security.audit.enabled {
+        crate::security::audit::AuditLogger::new(
+            config.security.audit.clone(),
+            config.workspace_dir.clone(),
+        )
+        .ok()
+    } else {
+        None
+    };
+
     agent_turn(
         provider.as_ref(),
         &mut history,
@@ -4026,6 +4096,7 @@ pub async fn process_message(
         activated_handle_pm.as_ref(),
         None,
         None, // channel: process_message path has no channel ref
+        audit_logger.as_ref(),
     )
     .await
 }
@@ -5179,6 +5250,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5237,6 +5309,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5289,6 +5362,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5340,6 +5414,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -5398,6 +5473,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -5456,6 +5532,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -5515,6 +5592,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -5572,6 +5650,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -5629,6 +5708,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -5769,6 +5849,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("parallel execution should complete");
@@ -5849,6 +5930,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5921,6 +6003,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5988,6 +6071,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6068,6 +6152,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6138,6 +6223,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6228,6 +6314,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("loop should complete");
@@ -6292,6 +6379,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6383,6 +6471,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -6451,6 +6540,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("streaming provider should complete");
@@ -6522,6 +6612,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -6600,6 +6691,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -6687,6 +6779,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("routed streaming provider should complete");
@@ -6771,6 +6864,7 @@ mod tests {
                 Some(&activated),
                 None,
                 None, // channel
+                None, // audit_logger
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -7957,6 +8051,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("tool loop should complete");
@@ -8120,6 +8215,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // audit_logger
                 ),
             )
             .await
@@ -8209,6 +8305,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // audit_logger
                 ),
             )
             .await
@@ -8271,6 +8368,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // audit_logger
         )
         .await
         .expect("should succeed without cost scope");

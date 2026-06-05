@@ -118,7 +118,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(daemonclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
-        "provider": config.providers.fallback,
+        "provider": daemonclaw_config::provider_store::get_fallback_name(),
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
@@ -992,20 +992,7 @@ fn mask_sensitive_fields(
         mask_required_secret(&mut ngrok.auth_token);
     }
 
-    for agent in masked.agents.values_mut() {
-        mask_optional_secret(&mut agent.api_key);
-    }
-
-    // Mask providers
-    for model in masked.providers.models.values_mut() {
-        mask_optional_secret(&mut model.api_key);
-    }
-    for route in &mut masked.providers.model_routes {
-        mask_optional_secret(&mut route.api_key);
-    }
-    for route in &mut masked.providers.embedding_routes {
-        mask_optional_secret(&mut route.api_key);
-    }
+    // Provider secrets are masked by the provider_store (DB-backed); no Config fields to mask.
 
     if let Some(telegram) = masked.channels.telegram.as_mut() {
         mask_required_secret(&mut telegram.bot_token);
@@ -1120,19 +1107,7 @@ fn restore_masked_sensitive_fields(
         restore_required_secret(&mut incoming_tunnel.auth_token, &current_tunnel.auth_token);
     }
 
-    for (name, agent) in &mut incoming.agents {
-        if let Some(current_agent) = current.agents.get(name) {
-            restore_optional_secret(&mut agent.api_key, &current_agent.api_key);
-        }
-    }
-    restore_model_route_api_keys(
-        &mut incoming.providers.model_routes,
-        &current.providers.model_routes,
-    );
-    restore_embedding_route_api_keys(
-        &mut incoming.providers.embedding_routes,
-        &current.providers.embedding_routes,
-    );
+    // Provider model/embedding routes are now DB-backed; no Config-level restore needed.
 
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels.telegram.as_mut(),
@@ -1271,12 +1246,7 @@ fn restore_masked_sensitive_fields(
         &current.transcription.api_key,
     );
 
-    // Restore api_keys inside providers.models entries.
-    for (name, incoming_entry) in &mut incoming.providers.models {
-        if let Some(current_entry) = current.providers.models.get(name) {
-            restore_optional_secret(&mut incoming_entry.api_key, &current_entry.api_key);
-        }
-    }
+    // Provider model api_keys are now DB-backed; no Config-level restore needed.
 }
 
 fn hydrate_config_for_save(

@@ -5,6 +5,7 @@ use std::fs;
 use std::sync::Arc;
 use daemonclaw_api::tool::{Tool, ToolResult};
 use daemonclaw_config::policy::SecurityPolicy;
+use daemonclaw_config::provider_store::provider_store;
 use daemonclaw_config::schema::{
     Config, ProxyConfig, ProxyScope, runtime_proxy_config, set_runtime_proxy_config,
 };
@@ -139,7 +140,7 @@ impl ProxyConfigTool {
     }
 
     fn handle_get(&self) -> anyhow::Result<ToolResult> {
-        let file_proxy = self.load_config_without_env()?.proxy;
+        let file_proxy = provider_store().proxy();
         let runtime_proxy = runtime_proxy_config();
         Ok(ToolResult {
             success: true,
@@ -169,9 +170,10 @@ impl ProxyConfigTool {
     }
 
     async fn handle_set(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let mut cfg = self.load_config_without_env()?;
-        let previous_scope = cfg.proxy.scope;
-        let mut proxy = cfg.proxy.clone();
+        let store = provider_store();
+        let previous_proxy = store.proxy();
+        let previous_scope = previous_proxy.scope;
+        let mut proxy = previous_proxy;
         let mut touched_proxy_url = false;
 
         if let Some(enabled) = args.get("enabled") {
@@ -235,8 +237,6 @@ impl ProxyConfigTool {
         }
 
         if args.get("enabled").is_none() && touched_proxy_url {
-            // Keep auto-enable behavior when users provide a proxy URL, but
-            // auto-disable when all proxy URLs are cleared in the same update.
             proxy.enabled = proxy.has_any_proxy_url();
         }
 
@@ -244,8 +244,7 @@ impl ProxyConfigTool {
         proxy.services = proxy.normalized_services();
         proxy.validate()?;
 
-        cfg.proxy = proxy.clone();
-        cfg.save().await?;
+        store.set_proxy(&proxy)?;
         set_runtime_proxy_config(proxy.clone());
 
         if proxy.enabled && proxy.scope == ProxyScope::Environment {
@@ -266,12 +265,13 @@ impl ProxyConfigTool {
     }
 
     async fn handle_disable(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let mut cfg = self.load_config_without_env()?;
-        let clear_env_default = cfg.proxy.scope == ProxyScope::Environment;
-        cfg.proxy.enabled = false;
-        cfg.save().await?;
+        let store = provider_store();
+        let mut proxy = store.proxy();
+        let clear_env_default = proxy.scope == ProxyScope::Environment;
+        proxy.enabled = false;
+        store.set_proxy(&proxy)?;
 
-        set_runtime_proxy_config(cfg.proxy.clone());
+        set_runtime_proxy_config(proxy.clone());
 
         let clear_env = args
             .get("clear_env")
@@ -285,7 +285,7 @@ impl ProxyConfigTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "message": "Proxy disabled",
-                "proxy": Self::proxy_json(&cfg.proxy),
+                "proxy": Self::proxy_json(&proxy),
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
@@ -293,8 +293,7 @@ impl ProxyConfigTool {
     }
 
     fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
-        let cfg = self.load_config_without_env()?;
-        let proxy = cfg.proxy;
+        let proxy = provider_store().proxy();
         proxy.validate()?;
 
         if !proxy.enabled {
@@ -476,6 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_scope_services_requires_services_entries() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -501,6 +502,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -523,6 +526,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 

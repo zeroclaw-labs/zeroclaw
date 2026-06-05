@@ -144,9 +144,10 @@ fn security_full_autonomy_parses() {
 /// Config does not expose raw API keys in Debug output.
 #[test]
 fn security_config_debug_does_not_leak_api_key() {
-    let mut config = Config::default();
-    config.providers.fallback = Some("test".into());
-    config.providers.models.insert(
+    use daemonclaw::config::providers::ProvidersConfig;
+    let mut providers = ProvidersConfig::default();
+    providers.fallback = Some("test".into());
+    providers.models.insert(
         "test".into(),
         daemonclaw::config::ModelProviderConfig {
             api_key: Some("sk-1234567890abcdef".to_string()),
@@ -154,7 +155,7 @@ fn security_config_debug_does_not_leak_api_key() {
         },
     );
 
-    let debug_output = format!("{:?}", config);
+    let debug_output = format!("{:?}", providers);
 
     if debug_output.contains("sk-1234567890abcdef") {
         // Known pattern — nested Debug shows all fields.

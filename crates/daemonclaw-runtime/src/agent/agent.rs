@@ -391,14 +391,16 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let fallback_provider_ag = config.providers.fallback_provider();
+        use daemonclaw_config::provider_store::{get_fallback_provider, get_fallback_name, get_embedding_routes, get_model_routes};
+        let fallback_provider_ag = get_fallback_provider();
+        let embedding_routes_ag = get_embedding_routes();
         let memory: Arc<dyn Memory> =
             Arc::from(daemonclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
-                &config.providers.embedding_routes,
+                &embedding_routes_ag,
                 Some(&config.storage.provider.config),
                 &config.workspace_dir,
-                fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+                fallback_provider_ag.as_ref().and_then(|e| e.api_key.as_deref()),
             )?);
 
         let composio_key = if config.composio.enabled {
@@ -437,8 +439,8 @@ impl Agent {
             &config.http_request,
             &config.web_fetch,
             &config.workspace_dir,
-            &config.agents,
-            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+            &std::collections::HashMap::new(),
+            fallback_provider_ag.as_ref().and_then(|e| e.api_key.as_deref()),
             config,
             None,
             Some(Arc::clone(&agent_skill_store)),
@@ -506,9 +508,11 @@ impl Agent {
             }
         }
 
-        let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+        let fallback_name_ag = get_fallback_name();
+        let provider_name = fallback_name_ag.as_deref().unwrap_or("openrouter");
 
         let model_name = fallback_provider_ag
+            .as_ref()
             .and_then(|e| e.model.as_deref())
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
@@ -516,12 +520,13 @@ impl Agent {
         let provider_runtime_options =
             daemonclaw_providers::provider_runtime_options_from_config(config);
 
+        let model_routes_ag = get_model_routes();
         let provider: Box<dyn Provider> = daemonclaw_providers::create_routed_provider_with_options(
             provider_name,
-            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
-            fallback_provider_ag.and_then(|e| e.base_url.as_deref()),
+            fallback_provider_ag.as_ref().and_then(|e| e.api_key.as_deref()),
+            fallback_provider_ag.as_ref().and_then(|e| e.base_url.as_deref()),
             &config.reliability,
-            &config.providers.model_routes,
+            &model_routes_ag,
             &model_name,
             &provider_runtime_options,
         )?;
@@ -534,9 +539,7 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
-        let route_model_by_hint: HashMap<String, String> = config
-            .providers
-            .model_routes
+        let route_model_by_hint: HashMap<String, String> = model_routes_ag
             .iter()
             .map(|route| (route.hint.clone(), route.model.clone()))
             .collect();
@@ -587,11 +590,12 @@ impl Agent {
             .model_name(model_name)
             .temperature(
                 fallback_provider_ag
+                    .as_ref()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7),
             )
             .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
+            .classification_config(daemonclaw_config::provider_store::get_classification_config())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
@@ -620,6 +624,7 @@ impl Agent {
                     let bg_llm_config = crate::hooks::builtin::BackgroundLlmConfig {
                         provider_name: provider_name.to_string(),
                         api_key: fallback_provider_ag
+                            .as_ref()
                             .and_then(|e| e.api_key.as_deref())
                             .map(String::from),
                         model: model_name_for_hooks.clone(),
@@ -1472,29 +1477,31 @@ pub async fn run(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let mut effective_config = config;
+    use daemonclaw_config::provider_store::{provider_store, get_fallback_name as efn, get_fallback_provider as efp};
+    let effective_config = config;
     if let Some(p) = provider_override {
-        effective_config.providers.fallback = Some(p);
+        let _ = provider_store().set_fallback_name(&p);
     }
     if let Some(m) = model_override {
-        effective_config.ensure_fallback_provider().model = Some(m);
+        let name = efn().unwrap_or_else(|| "default".into());
+        let mut entry = provider_store().get_provider(&name).unwrap_or_default();
+        entry.model = Some(m);
+        let _ = provider_store().upsert_provider(&name, &entry);
     }
-    effective_config.ensure_fallback_provider().temperature = Some(temperature);
+    {
+        let name = efn().unwrap_or_else(|| "default".into());
+        let mut entry = provider_store().get_provider(&name).unwrap_or_default();
+        entry.temperature = Some(temperature);
+        let _ = provider_store().upsert_provider(&name, &entry);
+    }
 
     let mut agent = Agent::from_config(&effective_config).await?;
 
-    let provider_name = effective_config
-        .providers
-        .fallback
-        .as_deref()
-        .unwrap_or("openrouter")
-        .to_string();
-    let model_name = effective_config
-        .providers
-        .fallback_provider()
-        .and_then(|e| e.model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
+    let provider_name = efn()
+        .unwrap_or_else(|| "openrouter".into());
+    let model_name = efp()
+        .and_then(|e| e.model.clone())
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -1770,6 +1777,8 @@ mod tests {
         use axum::{Json, Router, http::HeaderMap, routing::post};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
 
         let captured_headers: Arc<std::sync::Mutex<Option<HashMap<String, String>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -1818,9 +1827,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some(format!("custom:http://{addr}"));
         {
-            let entry = config.ensure_fallback_provider();
+            use daemonclaw_config::provider_store::try_provider_store;
+            let provider_name = format!("custom:http://{addr}");
+            let mut entry = daemonclaw_config::schema::ModelProviderConfig::default();
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());
             entry.extra_headers.insert(
@@ -1830,6 +1840,10 @@ mod tests {
             entry
                 .extra_headers
                 .insert("X-Title".to_string(), "daemonclaw-web".to_string());
+            if let Some(store) = try_provider_store() {
+                let _ = store.upsert_provider(&provider_name, &entry);
+                let _ = store.set_fallback_name(&provider_name);
+            }
         }
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;

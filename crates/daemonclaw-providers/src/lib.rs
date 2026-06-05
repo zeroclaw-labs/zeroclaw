@@ -742,16 +742,18 @@ impl Default for ProviderRuntimeOptions {
 pub fn provider_runtime_options_from_config(
     config: &daemonclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
-    let fallback = config.providers.fallback_provider();
+    use daemonclaw_config::provider_store::{get_fallback_provider, get_providers};
+    let fallback = get_fallback_provider();
     // Resolve merge_system_into_user from the active model provider profile by
-    // matching api_url — apply_named_model_provider_profile() has already run
-    // and rewritten providers.fallback, but providers.models retains all profiles.
+    // matching api_url — providers are now in the DB-backed store.
     let merge_system_into_user = fallback
+        .as_ref()
         .and_then(|e| e.base_url.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .and_then(|active_url| {
-            config.providers.models.values().find(|p| {
+            let providers = get_providers();
+            providers.into_values().find(|p| {
                 p.base_url
                     .as_deref()
                     .map(str::trim)
@@ -765,19 +767,20 @@ pub fn provider_runtime_options_from_config(
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: fallback.and_then(|e| e.base_url.clone()),
+        provider_api_url: fallback.as_ref().and_then(|e| e.base_url.clone()),
         daemonclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(fallback.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        provider_timeout_secs: Some(fallback.as_ref().and_then(|e| e.timeout_secs).unwrap_or(120)),
         extra_headers: fallback
+            .as_ref()
             .map(|e| e.extra_headers.clone())
             .unwrap_or_default(),
-        api_path: fallback.and_then(|e| e.api_path.clone()),
-        provider_max_tokens: fallback.and_then(|e| e.max_tokens),
+        api_path: fallback.as_ref().and_then(|e| e.api_path.clone()),
+        provider_max_tokens: fallback.as_ref().and_then(|e| e.max_tokens),
         merge_system_into_user,
-        provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        provider_extra: fallback.as_ref().and_then(|e| e.provider_extra.clone()),
     }
 }
 

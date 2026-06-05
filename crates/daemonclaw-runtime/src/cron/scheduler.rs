@@ -317,9 +317,8 @@ async fn run_agent_job(
         match daemonclaw_memory::create_memory(
             &config.memory,
             &config.workspace_dir,
-            config
-                .providers
-                .fallback_provider()
+            daemonclaw_config::provider_store::get_fallback_provider()
+                .as_ref()
                 .and_then(|e| e.api_key.as_deref()),
         ) {
             Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
@@ -365,9 +364,8 @@ async fn run_agent_job(
                 Some(prefixed_prompt),
                 None,
                 model_override,
-                config
-                    .providers
-                    .fallback_provider()
+                daemonclaw_config::provider_store::get_fallback_provider()
+                    .as_ref()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7),
                 vec![],
@@ -395,9 +393,8 @@ async fn run_agent_job(
             if let Ok(mem) = daemonclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,
-                config
-                    .providers
-                    .fallback_provider()
+                daemonclaw_config::provider_store::get_fallback_provider()
+                    .as_ref()
                     .and_then(|e| e.api_key.as_deref()),
             ) {
                 let _ = mem.purge_session(&mem_session_key).await;

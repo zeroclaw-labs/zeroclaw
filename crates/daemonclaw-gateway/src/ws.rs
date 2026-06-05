@@ -398,12 +398,7 @@ async fn process_chat_message(
 ) {
     use daemonclaw_runtime::agent::TurnEvent;
 
-    let provider_label = state
-        .config
-        .lock()
-        .providers
-        .fallback
-        .clone()
+    let provider_label = daemonclaw_config::provider_store::get_fallback_name()
         .unwrap_or_else(|| "unknown".to_string());
 
     // Broadcast agent_start event
