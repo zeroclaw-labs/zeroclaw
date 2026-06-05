@@ -11,9 +11,65 @@ MCP servers can be connected via three transport types:
 
 ## Configuration
 
-MCP servers are configured under `[mcp]` and `[[mcp.servers]]` in `config.toml`. The display `name` (used as the tool prefix `name__tool_name`) is required, plus `transport` (`stdio` | `sse` | `http`) and the transport-specific fields. See the [Config reference](../reference/config.md) for the full field index and defaults.
+MCP servers are configured under `[mcp]` and `[[mcp.servers]]` in `config.toml`. The display `name` (used as the tool prefix `name__tool_name`) is required, plus `transport` (`stdio` | `sse` | `http`) and the transport-specific fields. See the [Config reference](../reference/config.md) for the surrounding section index.
 
 Keep `deferred_loading = true` (the default) to load tool schemas on demand — this minimizes initial token overhead.
+
+### `[mcp]` keys
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch for MCP tool loading. |
+| `deferred_loading` | bool | `true` | When `true`, only tool *names* go into the system prompt; full schemas are fetched on demand via `tool_search`. |
+| `servers` | `[[mcp.servers]]` array | `[]` | One entry per server. Also accepts `mcpServers` as an alias. |
+
+### `[[mcp.servers]]` keys
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `name` | string | `""` | Display name; used as the tool prefix `<server>__<tool>`. Auto-filled when added via the dashboard. |
+| `transport` | `"stdio"` \| `"http"` \| `"sse"` | `"stdio"` | Lowercase. |
+| `url` | string | unset | **Required** for `http`/`sse`. Must parse as a URL and use scheme `http` or `https`. |
+| `command` | string | `""` | **Required** (non-empty) for `stdio`; ignored for HTTP/SSE. |
+| `args` | string[] | `[]` | Command arguments for `stdio` transport. |
+| `env` | table&lt;string, string&gt; | `{}` | Environment variables for `stdio` transport. Values are stored as secrets. |
+| `headers` | table&lt;string, string&gt; | `{}` | Request headers for `http`/`sse`. Values are stored as secrets (commonly carry Bearer tokens). |
+| `tool_timeout_secs` | integer | unset | Optional per-call timeout in seconds. Hard-capped at `600`. |
+
+Validation enforces transport-specific requirements: `stdio` rejects an empty `command`; `http` and `sse` reject a missing `url` or a non-`http(s)` scheme; any `tool_timeout_secs` above `600` is rejected at startup.
+
+### HTTP transport example
+
+```toml
+[mcp]
+enabled = true
+deferred_loading = true   # optional; this is the default
+
+[[mcp.servers]]
+name = "github"
+transport = "http"
+url = "https://api.example.com/mcp"
+tool_timeout_secs = 60
+
+[mcp.servers.headers]
+Authorization = "Bearer sk-…"
+X-Custom-Header = "value"
+```
+
+Tools from this server appear to the LLM as `github__<toolname>` — the `name` field is the prefix. Swap `transport = "http"` for `transport = "sse"` to connect to the same URL over Server-Sent Events.
+
+### stdio transport example
+
+```toml
+[[mcp.servers]]
+name = "fs"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]
+
+[mcp.servers.env]
+LOG_LEVEL = "info"
+```
 
 ## Security and Auto-Approval
 
