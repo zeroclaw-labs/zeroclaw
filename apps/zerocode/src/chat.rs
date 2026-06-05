@@ -88,8 +88,22 @@ pub(crate) struct Chat {
     git_branch_rx: mpsc::Receiver<(String, Option<String>)>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
+    /// Background model-catalog fetch result, routed back so the Loading
+    /// picker can swap to the populated list without blocking the draw loop.
+    model_fetch_tx: mpsc::Sender<ModelFetchResult>,
+    model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
     phase: ChatPhase,
     pane_kind: PaneKind,
+}
+
+/// Result of a background model-catalog fetch, routed back so the Loading
+/// picker swaps to the populated list (or surfaces an error) on the draw loop.
+struct ModelFetchResult {
+    session_id: String,
+    family: String,
+    model_provider_ref: String,
+    models: Vec<String>,
+    current: Option<String>,
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -99,6 +113,7 @@ fn should_retry_on_entry(phase: &ChatPhase) -> bool {
 impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
+        let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -106,6 +121,8 @@ impl Chat {
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
+            model_fetch_tx,
+            model_fetch_rx,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -264,6 +281,12 @@ impl Chat {
         }
     }
 
+    fn drain_model_fetch_results(&mut self) {
+        while let Ok(res) = self.model_fetch_rx.try_recv() {
+            self.apply_model_fetch(res);
+        }
+    }
+
     /// Spawn a background `session/git_branch` poll when the cache is stale.
     /// Gated by `git_branch_inflight` so we never have more than one fetch
     /// outstanding per Chat — the daemon walks the filesystem each call and
@@ -303,6 +326,7 @@ impl Chat {
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
         self.drain_git_branch_results();
+        self.drain_model_fetch_results();
         self.maybe_refresh_git_branch();
 
         match &mut self.phase {
@@ -441,7 +465,7 @@ impl Chat {
                             p.move_down();
                         }
                     }
-                    ModelPickerOverlay::None => {}
+                    ModelPickerOverlay::Loading | ModelPickerOverlay::None => {}
                 }
                 state.mark_dirty_full();
                 return false;
@@ -493,7 +517,7 @@ impl Chat {
                             }
                             return false;
                         }
-                        ModelPickerOverlay::None => {}
+                        ModelPickerOverlay::Loading | ModelPickerOverlay::None => {}
                     }
                     return false;
                 }
@@ -698,7 +722,8 @@ impl Chat {
                 }
                 InputBarAction::OpenModelPicker => {
                     let rpc = self.rpc.clone();
-                    Self::open_model_picker(&rpc, state).await;
+                    let tx = self.model_fetch_tx.clone();
+                    Self::open_model_picker(&rpc, &tx, state).await;
                     return false;
                 }
                 InputBarAction::OpenModelProviderPicker => {
@@ -1042,12 +1067,11 @@ impl Chat {
 
     /// Open the single-stage model picker for the active agent's model_provider,
     /// pre-selecting the currently-configured model.
-    async fn open_model_picker(rpc: &RpcClient, state: &mut ChatState) {
-        state.info_message = Some(crate::widgets::InfoMessage::info(crate::i18n::t(
-            "zc-model-switch-applying",
-        )));
-        state.mark_dirty_full();
-
+    async fn open_model_picker(
+        rpc: &Arc<RpcClient>,
+        model_fetch_tx: &mpsc::Sender<ModelFetchResult>,
+        state: &mut ChatState,
+    ) {
         let active_provider = match state.model_provider_ref.clone() {
             Some(r) => Some(r),
             None => Self::resolve_model_provider_ref(rpc, &state.agent_alias).await,
@@ -1064,30 +1088,87 @@ impl Chat {
             .next()
             .unwrap_or(&model_provider_ref)
             .to_string();
-        // Lazy: reuse the cached catalog when it is already warm for this
-        // model_provider family; otherwise fetch.
-        let models = if state.input_bar.model_catalog_provider() == Some(family.as_str())
+
+        // Warm cache: open immediately, no fetch, no loading state.
+        if state.input_bar.model_catalog_provider() == Some(family.as_str())
             && !state.input_bar.model_catalog().is_empty()
         {
-            state.input_bar.model_catalog().to_vec()
-        } else {
-            Self::fetch_models(rpc, &family).await
+            let models = state.input_bar.model_catalog().to_vec();
+            let current = match state.model.clone() {
+                Some(m) => Some(m),
+                None => Self::configured_model(rpc, &model_provider_ref).await,
+            };
+            state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
+                models,
+                current.as_deref(),
+            ));
+            state.info_message = None;
+            state.mark_dirty_full();
+            return;
+        }
+
+        // Cold cache: show the Loading modal now and fetch off the draw loop so
+        // the waiting state actually paints. The result returns over
+        // model_fetch_tx and is drained in refresh_if_inactive.
+        state.model_picker = ModelPickerOverlay::Loading;
+        state.info_message = Some(crate::widgets::InfoMessage::info(crate::i18n::t(
+            "zc-model-catalog-loading",
+        )));
+        state.mark_dirty_full();
+
+        let rpc = rpc.clone();
+        let tx = model_fetch_tx.clone();
+        let session_id = state.session_id.clone();
+        let model_provider_ref_c = model_provider_ref.clone();
+        let session_model = state.model.clone();
+        tokio::spawn(async move {
+            let models = Self::fetch_models(&rpc, &family).await;
+            let current = match session_model {
+                Some(m) => Some(m),
+                None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+            };
+            let _ = tx
+                .send(ModelFetchResult {
+                    session_id,
+                    family,
+                    model_provider_ref: model_provider_ref_c,
+                    models,
+                    current,
+                })
+                .await;
+        });
+    }
+
+    /// Apply a completed background catalog fetch: swap the Loading picker to
+    /// the populated list (or surface an empty-catalog error), and warm the
+    /// autocomplete cache. Ignores results for a session that has since
+    /// changed or a picker the user already dismissed.
+    fn apply_model_fetch(&mut self, res: ModelFetchResult) {
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return;
         };
-        if models.is_empty() {
+        if state.session_id != res.session_id {
+            return;
+        }
+        if !matches!(state.model_picker, ModelPickerOverlay::Loading) {
+            return;
+        }
+        if res.models.is_empty() {
+            state.model_picker = ModelPickerOverlay::None;
             state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
                 "zc-model-catalog-empty",
             )));
             state.mark_dirty_full();
             return;
         }
-        // Keep the input-bar autocomplete cache aligned with what we just fetched.
-        state.input_bar.set_model_catalog(family, models.clone());
-        let current = match state.model.clone() {
-            Some(m) => Some(m),
-            None => Self::configured_model(rpc, &model_provider_ref).await,
-        };
-        state.model_picker =
-            ModelPickerOverlay::Model(crate::widgets::PickerState::new(models, current.as_deref()));
+        state
+            .input_bar
+            .set_model_catalog(res.family, res.models.clone());
+        state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
+            res.models,
+            res.current.as_deref(),
+        ));
+        let _ = res.model_provider_ref;
         state.info_message = None;
         state.mark_dirty_full();
     }
@@ -1591,6 +1672,14 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Model / model_provider picker overlay (drawn on top of content).
     match &state.model_picker {
+        ModelPickerOverlay::Loading => {
+            // The "Loading models…" status shows in the info bar; the overlay
+            // exists only to block input until the catalog arrives. A modal box
+            // with no rows would render nothing, so draw a titled placeholder.
+            let title = crate::i18n::t("zc-model-catalog-loading");
+            let placeholder = [String::new()];
+            crate::widgets::PickerModal::new(&title, &placeholder, usize::MAX).render(f, area);
+        }
         ModelPickerOverlay::Model(picker) => {
             crate::widgets::PickerModal::new(
                 &crate::i18n::t("zc-model-picker-title"),
@@ -2585,6 +2674,9 @@ enum ModelPickerOverlay {
     /// No picker open.
     #[default]
     None,
+    /// Catalog fetch in flight — drawn as a modal so the user sees a
+    /// waiting state instead of a frozen UI while the models load.
+    Loading,
     /// Single-stage model picker over the active model_provider's catalog.
     Model(crate::widgets::PickerState),
     ConfiguredProviderStage(crate::widgets::PickerState),
