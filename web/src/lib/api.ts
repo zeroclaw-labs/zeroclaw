@@ -497,6 +497,46 @@ export async function getPlugins(): Promise<PluginsResponse | null> {
   return (await response.json()) as PluginsResponse;
 }
 
+/** Response shape for the plugin lifecycle endpoints. `stub: true` means the
+ *  gateway accepted the request but has not yet wired it to `PluginHost` — the
+ *  action did not actually take effect, so the UI must surface the message
+ *  rather than claim success. */
+export interface PluginActionResponse {
+  ok?: boolean;
+  stub?: boolean;
+  message: string;
+  name?: string;
+  source?: string;
+  enabled?: boolean;
+}
+
+/** POST /api/plugins/install — install a plugin from a source (path, registry
+ *  name, or git URL). Currently a stub (see `PluginActionResponse.stub`). */
+export function installPlugin(source: string): Promise<PluginActionResponse> {
+  return apiFetch<PluginActionResponse>("/api/plugins/install", {
+    method: "POST",
+    body: JSON.stringify({ source }),
+  });
+}
+
+/** DELETE /api/plugins/{name} — remove an installed plugin. Currently a stub. */
+export function removePlugin(name: string): Promise<PluginActionResponse> {
+  return apiFetch<PluginActionResponse>(
+    `/api/plugins/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** POST /api/plugins/enabled — toggle `[plugins].enabled`. Currently a stub. */
+export function setPluginsEnabled(
+  enabled: boolean,
+): Promise<PluginActionResponse> {
+  return apiFetch<PluginActionResponse>("/api/plugins/enabled", {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export function initSection(
   section?: string,
 ): Promise<{ initialized: string[] }> {
