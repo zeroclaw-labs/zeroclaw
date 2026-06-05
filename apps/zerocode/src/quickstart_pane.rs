@@ -1506,7 +1506,7 @@ impl QuickstartPane {
             } else {
                 None
             };
-        let rows: Vec<FieldFormRow> = fields
+        let mut rows: Vec<FieldFormRow> = fields
             .into_iter()
             .map(|mut d| {
                 if let Some(ref models) = model_catalog
