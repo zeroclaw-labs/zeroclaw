@@ -252,8 +252,23 @@ pub struct McpRegistry {
     servers: Vec<McpServer>,
     /// prefixed_name → (server_index, original_tool_name)
     tool_index: HashMap<String, (usize, String)>,
-    /// Per-server connection outcome, one entry per configured server
-    /// (preserves the order of `mcp.servers`, including failed connections).
+    /// Startup-time snapshot of per-server connection outcomes, one entry per
+    /// configured server in `mcp.servers` order — **including failed
+    /// connections**.
+    ///
+    /// Source of truth: this *is* the canonical record of "what happened when we
+    /// connected at startup". It is NOT duplicate state and NOT a cache of
+    /// `servers`: `servers` holds only the connections that **succeeded** (see
+    /// `connect_all` — failures are recorded here at line ~295 and never pushed
+    /// to `servers`), so the set of failed servers and their error strings
+    /// cannot be reconstructed from `servers` alone. The field is written once
+    /// in `connect_all` and is immutable afterward.
+    ///
+    /// It exists for the dashboard `GET /api/mcp/status` endpoint, which must
+    /// report both successful and failed servers without re-probing. For tool
+    /// counts on *live* servers the canonical source remains `servers[i].tools()`;
+    /// this snapshot only fills the gap for connections that never made it into
+    /// `servers`.
     statuses: Vec<McpServerStatus>,
 }
 
