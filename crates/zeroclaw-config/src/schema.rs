@@ -3822,9 +3822,20 @@ pub struct McpConfig {
     /// dashboard's `+ Add MCP server` affordance and the `POST
     /// /api/config/map-key?path=mcp.servers&key=<name>` endpoint pick it
     /// up automatically (no hand-table on the gateway side).
+    ///
+    /// `#[natural_key = "name"]` opts the Vec into per-element property
+    /// routing (see `route_vec_path` and the `Configurable` derive's
+    /// `#[natural_key]` arm). With it, `set_prop("mcp.servers.<name>.url",
+    /// ...)` and `get_prop("mcp.servers.<name>.transport")` resolve to
+    /// the matching element's own `set_prop` / `get_prop`, and the
+    /// `mcp.servers` section behaves like a `HashMap<String,
+    /// McpServerConfig>` from the dashboard / TUI's point of view.
+    /// `name` itself becomes read-only via `set_prop`; rename goes
+    /// through `rename_map_key` which mutates the `name` field in place.
     #[tab(Servers)]
     #[serde(default, alias = "mcpServers")]
     #[nested]
+    #[natural_key = "name"]
     pub servers: Vec<McpServerConfig>,
 }
 
@@ -22892,12 +22903,176 @@ allowed_users = []
         assert_eq!(config.mcp.servers[0].name, "fs");
 
         // Per-entry fields are mutated via standard set_prop on the inner
-        // path (the same call site the per-prop PUT handler uses); the
-        // McpServerConfig schema's `#[prefix = "mcp.servers"]` makes the
-        // path resolution work without hand-table dispatch.
-        // (Wider per-entry path routing through Vec<T> requires a
-        // future generalization of route_hashmap_path-equivalent for
-        // List sections; tracked as future work.)
+        // path; routing goes through the `#[natural_key = "name"]` arm
+        // on `McpConfig::servers` (see `route_vec_path` and the
+        // `Configurable` derive's natural-key arm for the wiring).
+        config
+            .set_prop("mcp.servers.fs.command", "/usr/bin/mcp-fs")
+            .expect("set_prop on mcp.servers.fs.command should route through natural-key arm");
+        assert_eq!(config.mcp.servers[0].command, "/usr/bin/mcp-fs");
+
+        // Round-trip via get_prop.
+        let got = config.get_prop("mcp.servers.fs.command").expect(
+            "get_prop on mcp.servers.fs.command should resolve through the natural-key arm",
+        );
+        assert_eq!(got, "/usr/bin/mcp-fs");
+
+        // Enum-typed fields (transport) parse from their wire form.
+        config
+            .set_prop("mcp.servers.fs.transport", "http")
+            .expect("transport should accept its enum variants as strings");
+        assert_eq!(
+            config.mcp.servers[0].transport,
+            crate::schema::McpTransport::Http
+        );
+
+        // The natural-key field itself is read-only via set_prop — the
+        // routing arm returns an explicit error pointing at
+        // config_map_key_rename rather than mutating `name` in place
+        // (which would silently re-key the entry and strand any
+        // in-flight references to the old key).
+        let err = config
+            .set_prop("mcp.servers.fs.name", "filesystem")
+            .expect_err("set_prop on the natural-key field must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("natural key")
+                && msg.contains("read-only")
+                && msg.contains("config_map_key_rename"),
+            "unexpected error message for read-only natural-key set: {msg}"
+        );
+
+        // Rename via the dedicated path. The element's `name` field
+        // changes in place; subsequent prop access uses the new key.
+        let renamed = config
+            .rename_map_key("mcp.servers", "fs", "filesystem")
+            .expect("rename should succeed when the new key is free");
+        assert!(renamed, "rename_map_key should report Ok(true) on success");
+        assert_eq!(config.mcp.servers[0].name, "filesystem");
+        assert_eq!(
+            config.get_prop("mcp.servers.filesystem.command").unwrap(),
+            "/usr/bin/mcp-fs"
+        );
+
+        // The old key no longer resolves — confirming the rename was
+        // not just an alias add.
+        assert!(
+            config.get_prop("mcp.servers.fs.command").is_err(),
+            "old natural key should stop resolving after rename"
+        );
+
+        // prop_fields enumerates the per-element fields under the
+        // current natural key, and filters out the natural-key field
+        // itself (no editable `name` row in the TUI).
+        let paths: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|n| n.starts_with("mcp.servers."))
+            .collect();
+        assert!(
+            paths.iter().any(|n| n == "mcp.servers.filesystem.command"),
+            "prop_fields should surface per-element child props; got: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|n| n == "mcp.servers.filesystem.name"),
+            "prop_fields must hide the natural-key field to keep it read-only; got: {paths:?}"
+        );
+
+        // delete_map_key by natural key removes the matching element.
+        let deleted = config
+            .delete_map_key("mcp.servers", "filesystem")
+            .expect("delete by natural key should resolve");
+        assert!(deleted);
+        assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_servers_routing_is_ambiguous_on_duplicate_names() {
+        // `validate_mcp_config` rejects duplicate `name` at save time,
+        // but until the operator repairs the config the in-flight
+        // routing must refuse to silently mutate one of the duplicates.
+        // This is the schema-side anchor for that contract; the helper
+        // function's behaviour is unit-tested directly in
+        // `helpers::tests::route_vec_path_reports_ambiguous_duplicates`.
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerConfig {
+            name: "dupe".into(),
+            transport: McpTransport::Stdio,
+            command: "/a".into(),
+            ..Default::default()
+        });
+        config.mcp.servers.push(McpServerConfig {
+            name: "dupe".into(),
+            transport: McpTransport::Stdio,
+            command: "/b".into(),
+            ..Default::default()
+        });
+
+        let set_err = config
+            .set_prop("mcp.servers.dupe.command", "/c")
+            .expect_err("set_prop on a duplicated natural key must refuse");
+        assert!(
+            set_err.to_string().contains("ambiguous"),
+            "expected ambiguity error, got: {set_err}"
+        );
+
+        let get_err = config
+            .get_prop("mcp.servers.dupe.command")
+            .expect_err("get_prop on a duplicated natural key must refuse");
+        assert!(
+            get_err.to_string().contains("ambiguous"),
+            "expected ambiguity error, got: {get_err}"
+        );
+
+        // Neither side mutated the underlying state.
+        assert_eq!(config.mcp.servers[0].command, "/a");
+        assert_eq!(config.mcp.servers[1].command, "/b");
+
+        // rename_map_key likewise refuses, with an actionable message.
+        let rename_err = config
+            .rename_map_key("mcp.servers", "dupe", "ok")
+            .expect_err("rename of a duplicated natural key must refuse");
+        assert!(
+            rename_err.contains("ambiguous"),
+            "expected ambiguity error from rename, got: {rename_err}"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_rename_refuses_when_new_key_is_taken() {
+        let mut config = Config::default();
+        config.create_map_key("mcp.servers", "fs").unwrap();
+        config.create_map_key("mcp.servers", "github").unwrap();
+
+        let err = config
+            .rename_map_key("mcp.servers", "fs", "github")
+            .expect_err("rename should refuse when the target key already exists");
+        assert!(
+            err.contains("already exists"),
+            "expected target-collision error, got: {err}"
+        );
+
+        // State untouched.
+        assert_eq!(config.mcp.servers.len(), 2);
+        assert_eq!(config.mcp.servers[0].name, "fs");
+        assert_eq!(config.mcp.servers[1].name, "github");
+    }
+
+    #[test]
+    async fn mcp_servers_get_map_keys_lists_natural_keys_in_insertion_order() {
+        let mut config = Config::default();
+        config.create_map_key("mcp.servers", "a").unwrap();
+        config.create_map_key("mcp.servers", "b").unwrap();
+        config.create_map_key("mcp.servers", "c").unwrap();
+
+        let keys = config
+            .get_map_keys("mcp.servers")
+            .expect("mcp.servers must surface its natural keys via get_map_keys");
+        assert_eq!(
+            keys,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
