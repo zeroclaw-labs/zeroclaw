@@ -210,6 +210,13 @@ impl SessionStore {
         }
         if let Some(ref p) = patch.model_provider {
             session.overrides.model_provider = Some(p.clone());
+            // A provider switch without an explicit model must not carry the
+            // previous provider's model forward (e.g. switching to an Ollama
+            // alias while a Claude model override lingers). Clear it so the
+            // dispatcher resolves the new alias's configured model.
+            if patch.model.is_none() {
+                session.overrides.model = None;
+            }
         }
         if let Some(t) = patch.temperature {
             session.overrides.temperature = Some(t);
@@ -767,6 +774,46 @@ mod tests {
             .await
             .expect("session exists");
         assert_eq!(merged.model_provider.as_deref(), Some("anthropic.default"));
+    }
+
+    #[tokio::test]
+    async fn provider_switch_without_model_clears_prior_model() {
+        // Switching provider with no explicit model must drop the prior
+        // model override so the dispatcher resolves the new alias's
+        // configured model (e.g. Ollama alias must not keep a Claude model).
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model: Some("claude-opus-4-5".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        let merged = store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model_provider: Some("ollama.default".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(merged.model_provider.as_deref(), Some("ollama.default"));
+        assert_eq!(
+            merged.model, None,
+            "a provider-only switch must clear the lingering model override"
+        );
     }
 
     #[tokio::test]
