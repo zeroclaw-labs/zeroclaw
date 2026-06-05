@@ -1367,7 +1367,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     format!("{inner_prefix}.{}", #nk_field_lit)
                                 };
                                 let pos = self.#field_ident.iter().position(|e| {
-                                    e.get_prop(&nk_path).as_deref() == Ok(map_key)
+                                    e.get_prop(&nk_path).ok().as_deref() == Some(map_key)
                                 });
                                 if let Some(idx) = pos {
                                     self.#field_ident.remove(idx);
@@ -1402,7 +1402,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     .iter()
                                     .enumerate()
                                     .filter_map(|(i, e)| {
-                                        if e.get_prop(&nk_path).as_deref() == Ok(map_key) {
+                                        if e.get_prop(&nk_path).ok().as_deref() == Some(map_key) {
                                             Some(i)
                                         } else {
                                             None
@@ -1420,7 +1420,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     ));
                                 }
                                 let already_taken = self.#field_ident.iter().any(|e| {
-                                    e.get_prop(&nk_path).as_deref() == Ok(new_key)
+                                    e.get_prop(&nk_path).ok().as_deref() == Some(new_key)
                                 });
                                 if already_taken {
                                     return Err(format!(
@@ -1495,10 +1495,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
-                    // get_prop: dispatch via `route_vec_path`, surface
-                    // ambiguity as an Err so the caller sees the broken
-                    // state rather than reading whichever duplicate
-                    // happened to come first.
+                    // get_prop: dispatch via `route_vec_path`. On a Hit
+                    // the path is unambiguously ours, so we return the
+                    // inner result directly — even on failure — rather
+                    // than falling through to the next nested field,
+                    // which would mask actionable errors (read-only
+                    // natural key, unknown inner property) as
+                    // "Unknown property" at the outer fallback.
                     nested_get_prop.push(quote! {
                         {
                             let inner_prefix = <#vec_inner_ty>::configurable_prefix();
@@ -1519,28 +1522,25 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 nk_values.iter().enumerate().map(|(i, s)| (i, s.as_str())),
                             ) {
                                 crate::config::VecRoute::Hit { index, inner_name } => {
-                                    if let Some(inner) = self.#field_ident.get(index)
-                                        && let Ok(val) = inner.get_prop(&inner_name)
-                                    {
-                                        return Ok(val);
-                                    }
+                                    return self.#field_ident[index].get_prop(&inner_name);
                                 }
                                 crate::config::VecRoute::Ambiguous { key, count } => {
-                                    return Err(format!(
+                                    return Err(anyhow::Error::msg(format!(
                                         "natural key `{key}` is ambiguous in `{}.{}`: \
                                          {count} entries share it; fix duplicates first",
                                         Self::configurable_prefix(),
                                         #vec_field_name_lit,
-                                    ));
+                                    )));
                                 }
                                 crate::config::VecRoute::Miss => {}
                             }
                         }
                     });
 
-                    // set_prop: same routing as get_prop. The natural-key
-                    // field itself is read-only here — use rename_map_key
-                    // to change it.
+                    // set_prop: same routing as get_prop, with the
+                    // natural-key field returned as a read-only error.
+                    // The Hit branch always returns (even on inner
+                    // failure) for the same reason as get_prop above.
                     nested_set_prop.push(quote! {
                         {
                             let inner_prefix = <#vec_inner_ty>::configurable_prefix();
@@ -1562,27 +1562,25 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             ) {
                                 crate::config::VecRoute::Hit { index, inner_name } => {
                                     if inner_name == nk_path {
-                                        return Err(format!(
-                                            "`{nk_path}` is the natural key for `{}.{}` \
+                                        return Err(anyhow::Error::msg(format!(
+                                            "`{}` is the natural key for `{}.{}` \
                                              entries and is read-only; use \
                                              config_map_key_rename to change it",
+                                            nk_path,
                                             Self::configurable_prefix(),
                                             #vec_field_name_lit,
-                                        ));
+                                        )));
                                     }
-                                    if let Some(inner) = self.#field_ident.get_mut(index)
-                                        && inner.set_prop(&inner_name, value_str).is_ok()
-                                    {
-                                        return Ok(());
-                                    }
+                                    return self.#field_ident[index]
+                                        .set_prop(&inner_name, value_str);
                                 }
                                 crate::config::VecRoute::Ambiguous { key, count } => {
-                                    return Err(format!(
+                                    return Err(anyhow::Error::msg(format!(
                                         "natural key `{key}` is ambiguous in `{}.{}`: \
                                          {count} entries share it; fix duplicates first",
                                         Self::configurable_prefix(),
                                         #vec_field_name_lit,
-                                    ));
+                                    )));
                                 }
                                 crate::config::VecRoute::Miss => {}
                             }
@@ -1804,9 +1802,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                if let Ok(val) = self.#field_ident.get_prop(&inner_name) {
-                                    return Ok(val);
-                                }
+                                // When the path prefix matches this
+                                // nested field, the nested type is the
+                                // only authority for the path: every
+                                // top-level field has a distinct prefix
+                                // (confirmed by the prefix-uniqueness
+                                // tests in `nested_section_help`-shaped
+                                // surfaces) so there is no other
+                                // nested field that could also claim
+                                // this path. Falling through on Err
+                                // would mask actionable errors (e.g.
+                                // the natural-key arm's "read-only" /
+                                // "ambiguous" messages, or a deeper
+                                // routing error inside a HashMap entry)
+                                // as the outer Config's generic
+                                // "Unknown property" fallback. Return
+                                // the inner result directly so the
+                                // caller sees what actually happened.
+                                return self.#field_ident.get_prop(&inner_name);
                             }
                         }
                     });
@@ -1827,9 +1840,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                if let Ok(()) = self.#field_ident.set_prop(&inner_name, value_str) {
-                                    return Ok(());
-                                }
+                                // See the matching comment on
+                                // `nested_get_prop` above: return the
+                                // inner result directly rather than
+                                // swallowing Err so actionable
+                                // messages reach the caller.
+                                return self.#field_ident.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -1878,18 +1894,30 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 create_map_key_recurse.push(quote! {
-                    if let Ok(created) = self.#field_ident.create_map_key(section_path, map_key) {
-                        return Ok(created);
+                    // Propagate explicit errors from the inner type
+                    // (validation, duplicates, etc.) so callers see
+                    // actionable messages. Only the inner type's
+                    // "no map-keyed/list section at ..." sentinel
+                    // means "this isn't my path"; treat that as a
+                    // fall-through and try the next nested field.
+                    match self.#field_ident.create_map_key(section_path, map_key) {
+                        Ok(created) => return Ok(created),
+                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                        Err(e) => return Err(e),
                     }
                 });
                 delete_map_key_recurse.push(quote! {
-                    if let Ok(removed) = self.#field_ident.delete_map_key(section_path, map_key) {
-                        return Ok(removed);
+                    match self.#field_ident.delete_map_key(section_path, map_key) {
+                        Ok(removed) => return Ok(removed),
+                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                        Err(e) => return Err(e),
                     }
                 });
                 rename_map_key_recurse.push(quote! {
-                    if let Ok(renamed) = self.#field_ident.rename_map_key(section_path, map_key, new_key) {
-                        return Ok(renamed);
+                    match self.#field_ident.rename_map_key(section_path, map_key, new_key) {
+                        Ok(renamed) => return Ok(renamed),
+                        Err(e) if e.starts_with("no map-keyed/list section at ") => {}
+                        Err(e) => return Err(e),
                     }
                 });
 
