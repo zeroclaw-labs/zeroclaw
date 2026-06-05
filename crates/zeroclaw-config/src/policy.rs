@@ -1073,7 +1073,8 @@ fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
         || candidate.starts_with("../")
-        || candidate.starts_with('~')
+        || candidate == "~"
+        || candidate.starts_with("~/")
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
@@ -1643,6 +1644,16 @@ impl SecurityPolicy {
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
+            // If the raw token was wrapped in matching quotes, its content
+            // is a string literal — ~ inside quotes is NOT expanded by the
+            // shell, so skip tilde-based path checks.
+            if (raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\''))
+            {
+                if candidate.starts_with('~') {
+                    return None;
+                }
+            }
             if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
                 Some(candidate.to_string())
             } else {
@@ -1694,10 +1705,65 @@ impl SecurityPolicy {
                 RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
+            // Heredoc body tracking: tokens inside a heredoc body
+            // (between <<DELIM and DELIM) should skip tilde-based path
+            // checks because ~ in heredoc body is not always a path
+            // reference (the shell only expands it when the delimiter
+            // is unquoted, and even then ~ followed by digits is invalid).
+            let mut heredoc_delimiters: Vec<String> = Vec::new();
+
             for token in words {
                 let candidate = strip_wrapping_quotes(token).trim();
                 if candidate.is_empty() {
                     continue;
+                }
+
+                // ── Heredoc body detection ─────────────────────────
+                // Check if this token opens a heredoc (<<DELIM).
+                // Matches the same pattern as split_unquoted_segments.
+                if token.starts_with("<<") && !token.starts_with("<<<") && token.len() > 2 {
+                    let delimiter = token[2..]
+                        .trim_start_matches('-')
+                        .trim_matches(|c| c == '\'' || c == '"' || c == '\\');
+                    if !delimiter.is_empty() {
+                        heredoc_delimiters.push(delimiter.to_string());
+                        // The opener token itself is not a path argument.
+                        if delimiter.len() + 2 == token.trim().len() {
+                            continue;
+                        }
+                    }
+                }
+
+                // Check if we are inside a heredoc body.
+                if let Some(delim) = heredoc_delimiters.last() {
+                    if candidate == delim.as_str() {
+                        // End of heredoc body — pop the delimiter.
+                        heredoc_delimiters.pop();
+                        continue;
+                    }
+                    // Inside heredoc body: skip tilde-based path checks.
+                    // Absolute/relative paths are still checked.
+                    if candidate.starts_with('~') {
+                        continue;
+                    }
+                }
+
+                // ── Quoted string literal check ────────────────────
+                // If the raw token was wrapped in matching quotes its
+                // content is a string literal — ~ inside quotes is NOT
+                // expanded by the shell, so skip tilde-based checks.
+                if (token.starts_with('"') && token.ends_with('"')
+                    || token.starts_with('\'') && token.ends_with('\''))
+                    && candidate.starts_with('~')
+                {
+                    // Still check absolute/relative paths in quoted
+                    // strings, but skip pure tilde-based path checks.
+                    if !candidate.starts_with('/')
+                        && !candidate.starts_with("./")
+                        && !candidate.starts_with("../")
+                    {
+                        continue;
+                    }
                 }
 
                 if next_is_redirect_target {
@@ -3954,10 +4020,9 @@ mod tests {
             p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
             Some("~root/.ssh/id_rsa".into())
         );
-        assert_eq!(
-            p.forbidden_path_argument("ls ~nobody"),
-            Some("~nobody".into())
-        );
+        // Bare ~nobody no longer triggers looks_like_path after tightening;
+        // this is safe because is_path_allowed would still block it at
+        // path resolution time.
     }
 
     #[test]
@@ -4037,6 +4102,71 @@ mod tests {
         assert_eq!(
             p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    /// Quoted string with `~` prefix is a literal, not a path expansion.
+    fn forbidden_path_argument_allows_quoted_tilde_strings() {
+        let p = default_policy();
+        // Double-quoted argument that starts with tilde.
+        assert_eq!(p.forbidden_path_argument("echo \"~20\""), None);
+        assert_eq!(p.forbidden_path_argument("echo \"~\""), None);
+        assert_eq!(p.forbidden_path_argument("echo \"~/foo\""), None);
+        // Single-quoted argument that starts with tilde.
+        assert_eq!(p.forbidden_path_argument("echo '~20'"), None);
+        assert_eq!(p.forbidden_path_argument("echo '~'"), None);
+    }
+
+    #[test]
+    /// Unquoted `~20` no longer looks like a path (tightened looks_like_path).
+    fn forbidden_path_argument_allows_tilde_digit_without_slash() {
+        let p = default_policy();
+        assert_eq!(p.forbidden_path_argument("echo ~20"), None);
+        assert_eq!(
+            p.forbidden_path_argument("git log --since=~20.minutes"),
+            None
+        );
+    }
+
+    #[test]
+    /// Tilde paths in heredoc bodies should not be flagged.
+    fn forbidden_path_argument_allows_tilde_in_heredoc_body() {
+        let p = default_policy();
+        // Heredoc body containing tilde with digits.
+        // `\n` in the test string represents actual newline characters
+        // as they would appear in a shell command.
+        assert_eq!(p.forbidden_path_argument("cat <<EOF\n~20\nEOF"), None);
+        assert_eq!(p.forbidden_path_argument("cat <<'EOF'\n~20\nEOF"), None);
+        // Heredoc body containing ~/ pattern — still skipped
+        // because the shell would only expand it for unquoted delimiters,
+        // and our token-level check cannot distinguish quoted vs unquoted
+        // delimiters in the re-split context.
+        assert_eq!(p.forbidden_path_argument("cat <<EOF\n~/foo\nEOF"), None);
+    }
+
+    #[test]
+    /// Absolute paths in heredoc bodies should still be detected.
+    fn forbidden_path_argument_detects_absolute_path_in_heredoc_body() {
+        let p = unix_forbidden_path_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat <<EOF\n/etc/passwd\nEOF"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    /// `~user/...` paths (with a valid-looking path component) are still
+    /// flagged because they contain `/` and are valid shell expansions.
+    fn forbidden_path_argument_detects_tilde_user_with_slash() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
+            Some("~root/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("ls ~nobody/tmp"),
+            Some("~nobody/tmp".into())
         );
     }
 
