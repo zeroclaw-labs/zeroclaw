@@ -16484,6 +16484,30 @@ mod tests {
     use tokio::sync::MutexGuard;
     use tokio::test;
 
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array.entries"]
+    struct ObjectArraySecretEntry {
+        pub name: String,
+        #[secret]
+        pub token: Option<String>,
+        #[secret]
+        pub headers: HashMap<String, String>,
+    }
+
+    impl crate::config::HasPropKind for Vec<ObjectArraySecretEntry> {
+        const PROP_KIND: crate::config::PropKind = crate::config::PropKind::ObjectArray;
+
+        fn display_secret_terminals() -> Vec<&'static str> {
+            ObjectArraySecretEntry::secret_field_terminals()
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array"]
+    struct ObjectArraySecretFixture {
+        pub entries: Vec<ObjectArraySecretEntry>,
+    }
+
     // ── Tilde expansion ───────────────────────────────────────
 
     #[test]
@@ -23240,6 +23264,72 @@ allowed_users = []
                 || has_term("password")
                 || has_term("secret")
         })
+    }
+
+    #[test]
+    async fn object_array_prop_display_redacts_nested_secret_fields() {
+        let fixture = ObjectArraySecretFixture {
+            entries: vec![
+                ObjectArraySecretEntry {
+                    name: "primary".to_string(),
+                    token: Some("nested-token-credential".to_string()),
+                    headers: HashMap::from([
+                        (
+                            "Authorization".to_string(),
+                            "Bearer nested-header-credential".to_string(),
+                        ),
+                        ("X-Tenant".to_string(), "tenant-credential".to_string()),
+                    ]),
+                },
+                ObjectArraySecretEntry {
+                    name: "unset-secret".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+            ],
+        };
+
+        let display_value = fixture
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "test.object_array.entries")
+            .expect("object-array field should be surfaced")
+            .display_value;
+        let readback = fixture
+            .get_prop("test.object_array.entries")
+            .expect("object-array field should be readable");
+
+        for rendered in [&display_value, &readback] {
+            assert!(
+                !rendered.contains("nested-token-credential"),
+                "object-array display/readback must redact scalar nested secrets: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Bearer nested-header-credential"),
+                "object-array display/readback must redact nested secret map values: {rendered}"
+            );
+            assert!(
+                !rendered.contains("tenant-credential"),
+                "object-array display/readback must redact every value in nested secret maps: {rendered}"
+            );
+            assert!(
+                rendered.contains("primary"),
+                "non-secret object-array fields should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("unset-secret"),
+                "non-secret fields on entries with unset secrets should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("****"),
+                "redacted object-array output should show masked placeholders: {rendered}"
+            );
+        }
+
+        assert!(
+            display_value.contains(r#""token":null"#),
+            "JSON display should preserve unset optional secrets as null, not a populated mask: {display_value}"
+        );
     }
 
     #[test]
