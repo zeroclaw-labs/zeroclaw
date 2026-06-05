@@ -837,7 +837,8 @@ fn parse_malformed_file_write_json(inner: &str) -> Option<ParsedToolCall> {
 
     let content_marker = "\"content\"";
     let marker_idx = inner.find(content_marker)?;
-    let colon_idx = inner[marker_idx + content_marker.len()..].find(':')? + marker_idx + content_marker.len();
+    let colon_idx =
+        inner[marker_idx + content_marker.len()..].find(':')? + marker_idx + content_marker.len();
     let quote_idx = inner[colon_idx + 1..].find('"')? + colon_idx + 1;
     let start_idx = quote_idx + 1;
 
@@ -914,7 +915,6 @@ fn parse_malformed_file_write_json(inner: &str) -> Option<ParsedToolCall> {
         tool_call_id: None,
     })
 }
-
 
 /// Parse MiniMax-style XML tool calls with attributed invoke/parameter tags.
 fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
