@@ -222,6 +222,16 @@ sections! {
         help:  "Model Context Protocol settings. Toggle `enabled` and pick deferred \
                 or eager loading. Individual MCP servers live under `mcp.servers[]`.",
     },
+    McpServers => {
+        key:   "mcp.servers",
+        shape: OneTierAliasMap,
+        help:  "Individual Model Context Protocol servers. Each entry binds a \
+                transport (stdio, http, sse), the command or URL to reach it, \
+                optional headers, and a `tool_timeout_secs` cap (≤ 600). Each \
+                server's `name` is its addressable key — rename via the section \
+                page rather than editing the field directly. Group servers \
+                into bundles under `mcp_bundles` below.",
+    },
     McpBundles => {
         key:   "mcp_bundles",
         shape: OneTierAliasMap,
@@ -403,6 +413,13 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
                 .is_some_and(|rest| rest.contains('.'))
         }),
         Section::Hardware => cfg.hardware.enabled,
+        // Servers' existence in the Vec is the signal — a fresh install
+        // has an empty `mcp.servers`, so any element at all (even one
+        // with no command set) counts as user intent to use MCP. The
+        // parent `Mcp` section stays marker-only because its top-level
+        // booleans (`enabled`, `deferred_loading`) have meaningful
+        // defaults that are indistinguishable from user choice.
+        Section::McpServers => !cfg.mcp.servers.is_empty(),
         // Memory's default backend is "sqlite" and Tunnel's is "none" —
         // both are valid user choices indistinguishable from untouched
         // defaults. TTS / transcription providers and agents start
