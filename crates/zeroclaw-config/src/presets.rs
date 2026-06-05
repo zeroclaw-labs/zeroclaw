@@ -14,8 +14,8 @@
 //!   [`RuntimeProfileConfig`] field values. The Quickstart writes
 //!   these verbatim into the corresponding config table on apply.
 //!
-//! Adding or removing a preset is one row in the [`risk_presets!`] /
-//! [`runtime_presets!`] table below; every consumer dispatches off
+//! Adding or removing a preset is one row in the `risk_presets!` /
+//! `runtime_presets!` table below; every consumer dispatches off
 //! `&'static [RiskPreset]` / `&'static [RuntimePreset]` so drift is
 //! impossible.
 //!

@@ -120,7 +120,7 @@ pub struct GenerateOptions<'a> {
     /// Encrypt secret-bearing string values in the output. Works at every
     /// schema version via [`encrypt_secret_strings`], which walks the TOML
     /// and ChaCha20-Poly1305-encrypts any leaf whose key name appears in
-    /// [`SECRET_KEY_NAMES`].
+    /// `SECRET_KEY_NAMES`.
     pub encrypt_secrets: bool,
     /// Directory containing (or to receive) the `.secret_key` used for
     /// `enc2:` encryption. Required when `encrypt_secrets` is true. The
@@ -141,7 +141,7 @@ pub struct GenerateOptions<'a> {
 ///
 /// When [`GenerateOptions::encrypt_secrets`] is set, secret-bearing
 /// string values (api_key, bot_token, access_token, etc. — see
-/// [`SECRET_KEY_NAMES`]) are ChaCha20-Poly1305-encrypted with the
+/// `SECRET_KEY_NAMES`) are ChaCha20-Poly1305-encrypted with the
 /// `.secret_key` under `secret_store_dir`. Works at every version.
 pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<String> {
     if target_version == 0 || target_version > CURRENT_SCHEMA_VERSION {
@@ -193,7 +193,7 @@ fn secret_key_names() -> &'static std::collections::HashSet<&'static str> {
 }
 
 /// Walk a TOML tree and encrypt every string leaf whose terminal key
-/// name appears in [`secret_key_names`]. Strings already in `enc2:` /
+/// name appears in `secret_key_names`. Strings already in `enc2:` /
 /// `enc:` form are left alone (idempotent). Arrays of strings under a
 /// matching key (e.g. `paired_tokens`) are encrypted element-wise.
 ///

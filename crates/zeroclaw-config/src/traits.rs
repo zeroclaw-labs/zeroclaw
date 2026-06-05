@@ -757,7 +757,7 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
-/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+/// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     /// Canonical kebab-case identifier used in config TOML

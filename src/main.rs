@@ -433,7 +433,7 @@ enum Commands {
         api_key: Option<String>,
 
         /// ModelProvider name. Used as the type key for the synthesized
-        /// `[model_providers.<type>.default]` entry.
+        /// `[model_providers.`<type>`.default]` entry.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -494,7 +494,7 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to providers.models.<type>.<alias>.temperature)
+        /// Temperature (0.0 - 2.0, defaults to `providers.models.<type>.<alias>.temperature`)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -700,7 +700,7 @@ Examples:
     /// Browse the shared workspace one directory at a time
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-List children of a directory under <install>/shared/. Paths are relative \
+List children of a directory under `<install>`/shared/. Paths are relative \
 to the shared workspace root; `..` traversal that escapes the root is \
 rejected. Used by the dashboard's skill-bundle directory picker and by \
 operators who want to inspect what's installed.
@@ -936,7 +936,7 @@ Examples:
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
-repository and install them under <config-dir>/data/ftl/<locale>/, where the \
+repository and install them under `<config-dir>`/data/ftl/`<locale>`/, where the \
 runtime and zerocode loaders read them.
 
 Pass a single locale. By default every catalogue is fetched; restrict with \
@@ -2173,8 +2173,8 @@ async fn run_quickstart_cli(
 /// Used by both the model-provider field form and the channel field
 /// form so the two sub-flows share a single prompt implementation.
 #[cfg(feature = "agent-runtime")]
-/// Recognize a `providers.models.<type>.<alias>.model` config path and
-/// return `<type>` if the family is in the canonical model-provider
+/// Recognize a `providers.models.`<type>`.`<alias>`.model` config path and
+/// return ``<type>`` if the family is in the canonical model-provider
 /// registry. Used by `config set` to offer a live model picker when
 /// no value is supplied. Returns `None` for any other path shape or
 /// an unknown provider family.
@@ -2755,7 +2755,7 @@ fn validated_locale(locale: &str) -> Result<String> {
 }
 
 /// Fetch translated FTL catalogues for `locale` from upstream and install them
-/// under `<config-dir>/data/ftl/<locale>/`. `catalog` is an optional
+/// under ``<config-dir>`/data/ftl/`<locale>`/`. `catalog` is an optional
 /// comma-separated subset of {cli, tools, zerocode}; `None` fetches all.
 ///
 /// Security: `locale` is validated against the upstream `locales.toml` registry

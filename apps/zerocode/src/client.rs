@@ -475,7 +475,7 @@ impl RpcClient {
 
     /// Connect to the daemon via WebSocket Secure (WSS).
     ///
-    /// Same handshake and reconnect semantics as [`connect`] — pass
+    /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
     /// When `tls_skip_verify` is true, certificate verification is
@@ -1000,7 +1000,7 @@ impl RpcClient {
         self.session_new_with_id(agent_alias, cwd, None).await
     }
 
-    /// Like [`session_new_with_id`] but sets `exclude_memory: true` so the
+    /// Like [`Self::session_new_with_id`] but sets `exclude_memory: true` so the
     /// daemon strips memory tools and uses a NoneMemory backend. Used by the
     /// ACP pane, which should never have access to persistent memory.
     pub async fn session_new_acp(

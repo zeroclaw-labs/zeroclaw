@@ -368,7 +368,7 @@ struct ChannelRuntimeContext {
     agent_alias: Arc<String>,
     /// Resolved aliased-agent config for the agent owning this
     /// runtime context. Per-channel agent dispatch (one agent per
-    /// channel.<type>.<alias>) is a follow-up.
+    /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,

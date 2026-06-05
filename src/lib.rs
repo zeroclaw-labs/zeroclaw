@@ -294,7 +294,7 @@ pub enum SkillCommands {
     /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-Scaffold a new skill under a skill bundle. Writes <bundle.directory>/<name>/SKILL.md \
+Scaffold a new skill under a skill bundle. Writes `<bundle.directory>`/`<name>`/SKILL.md \
 plus the canonical optional subdirs (scripts/, references/, assets/). \
 Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
 
@@ -380,7 +380,7 @@ Examples:
 pub enum SkillBundleCommands {
     /// List configured skill bundles and their resolved directories
     List,
-    /// Add a new skill bundle. Directory defaults to shared/skills/<alias>/.
+    /// Add a new skill bundle. Directory defaults to shared/skills/`<alias>`/.
     Add {
         /// Bundle alias (lowercase + hyphens; same convention as agents/channels)
         alias: String,
