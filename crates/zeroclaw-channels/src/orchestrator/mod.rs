@@ -1447,32 +1447,37 @@ fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_tu
         return;
     };
 
-    // Walk backwards to find the boundary: count user messages to
-    // identify which turns are "recent" (protected from stripping).
+    // Walk backwards to find the oldest user message that still belongs to the
+    // most recent `keep_turns` exchanges. Everything before that boundary is
+    // old enough to strip. If the session has fewer than `keep_turns` user
+    // turns, preserve every message.
     let mut user_count = 0;
-    let mut protect_from = turns.len();
+    let mut strip_before = 0;
     for (i, turn) in turns.iter().enumerate().rev() {
         if turn.role == "user" {
             user_count += 1;
-            if user_count > keep_turns {
-                // Everything before this index is old enough to strip.
-                protect_from = i + 1; // protect from next message onward
+            if user_count == keep_turns {
+                strip_before = i;
                 break;
             }
         }
     }
 
+    if user_count < keep_turns {
+        return;
+    }
+
     // Remove tool and intermediate assistant messages before the boundary.
     // An "intermediate assistant" is one whose content looks like a tool
-    // call (contains `<tool_call>` or starts with `{\"tool_call`).
+    // call, either in legacy XML / JSON forms or in native `tool_calls` JSON.
     let mut i = 0;
-    while i < protect_from && i < turns.len() {
+    while i < strip_before && i < turns.len() {
         let dominated = turns[i].role == "tool"
             || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
         if dominated {
             turns.remove(i);
             // Adjust boundary since we removed an element.
-            protect_from = protect_from.saturating_sub(1);
+            strip_before = strip_before.saturating_sub(1);
         } else {
             i += 1;
         }
@@ -1485,7 +1490,43 @@ fn is_tool_call_content(content: &str) -> bool {
     let trimmed = content.trim();
     trimmed.contains("<tool_call>")
         || trimmed.starts_with("{\"tool_call\"")
-        || trimmed.starts_with("{\"name\"")
+        || is_named_tool_call_json(trimmed)
+        || is_native_tool_call_json(trimmed)
+}
+
+fn is_named_tool_call_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+
+    value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .is_some_and(|name| {
+            !name.is_empty()
+                && (value.get("args").is_some()
+                    || value.get("arguments").is_some()
+                    || value.get("parameters").is_some())
+        })
+}
+
+fn is_native_tool_call_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+
+    let Some(tool_calls) = value.get("tool_calls").and_then(|calls| calls.as_array()) else {
+        return false;
+    };
+
+    !tool_calls.is_empty()
+        && tool_calls.iter().all(|call| {
+            call.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|name| name.as_str())
+                .or_else(|| call.get("name").and_then(|name| name.as_str()))
+                .is_some()
+        })
 }
 
 fn rollback_orphan_user_turn(
@@ -9114,6 +9155,29 @@ mod tests {
             Some(0.0),
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
+    }
+
+    fn seed_sender_history(ctx: &ChannelRuntimeContext, sender: &str, turns: Vec<ChatMessage>) {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.push(sender.to_string(), turns);
+    }
+
+    fn cloned_sender_history(ctx: &ChannelRuntimeContext, sender: &str) -> Vec<ChatMessage> {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.peek(sender).cloned().unwrap_or_default()
+    }
+
+    fn history_signature(turns: &[ChatMessage]) -> Vec<(String, String)> {
+        turns
+            .iter()
+            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .collect()
     }
 
     #[test]
@@ -17905,6 +17969,115 @@ Done."#;
         ));
         assert!(!is_tool_call_content("The iPad has been blocked."));
         assert!(!is_tool_call_content(""));
+    }
+
+    #[test]
+    fn is_tool_call_content_does_not_misclassify_regular_name_json() {
+        assert!(!is_tool_call_content(
+            "{\"name\":\"Alice\",\"role\":\"admin\"}"
+        ));
+    }
+
+    #[test]
+    fn strip_old_tool_context_preserves_recent_tool_context_when_history_within_keep_window() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-short";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("block the iPad"),
+                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::assistant("Done, iPad is blocked."),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 2);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            turns.len(),
+            4,
+            "tool context in protected turns must not be stripped"
+        );
+        assert_eq!(turns[1].role, "assistant");
+        assert!(turns[1].content.contains("tool_call"));
+        assert_eq!(turns[2].role, "tool");
+    }
+
+    #[test]
+    fn strip_old_tool_context_strips_tool_context_before_keep_window_boundary() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-boundary";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("first task"),
+                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+                ChatMessage::tool("ok"),
+                ChatMessage::assistant("first task done"),
+                ChatMessage::user("second task"),
+                ChatMessage::assistant("second task done"),
+                ChatMessage::user("third task"),
+                ChatMessage::assistant("third task done"),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 2);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            history_signature(&turns),
+            vec![
+                ("user".to_string(), "first task".to_string()),
+                ("assistant".to_string(), "first task done".to_string()),
+                ("user".to_string(), "second task".to_string()),
+                ("assistant".to_string(), "second task done".to_string()),
+                ("user".to_string(), "third task".to_string()),
+                ("assistant".to_string(), "third task done".to_string()),
+            ],
+            "tool context older than the protected keep window should be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_old_tool_context_removes_native_tool_call_assistant_messages() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-native";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("first task"),
+                ChatMessage::assistant(
+                    r#"{"content":"Need to call tool","tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+                ),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::assistant("first task done"),
+                ChatMessage::user("second task"),
+                ChatMessage::assistant("second task done"),
+                ChatMessage::user("third task"),
+                ChatMessage::assistant("third task done"),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 1);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            history_signature(&turns),
+            vec![
+                ("user".to_string(), "first task".to_string()),
+                ("assistant".to_string(), "first task done".to_string()),
+                ("user".to_string(), "second task".to_string()),
+                ("assistant".to_string(), "second task done".to_string()),
+                ("user".to_string(), "third task".to_string()),
+                ("assistant".to_string(), "third task done".to_string()),
+            ],
+            "native assistant tool-call JSON should be stripped together with old tool results"
+        );
     }
 
     #[test]
