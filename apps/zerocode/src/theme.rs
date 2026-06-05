@@ -174,7 +174,18 @@ pub(crate) fn set_active(theme: Theme) {
 }
 
 pub(crate) fn active() -> Theme {
-    ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME)
+    let raw = ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME);
+    Theme {
+        title: crate::color_depth::downgrade(raw.title),
+        heading: crate::color_depth::downgrade(raw.heading),
+        body: crate::color_depth::downgrade(raw.body),
+        dim: crate::color_depth::downgrade(raw.dim),
+        accent: crate::color_depth::downgrade(raw.accent),
+        warn: crate::color_depth::downgrade(raw.warn),
+        selection_bg: crate::color_depth::downgrade(raw.selection_bg),
+        tool: crate::color_depth::downgrade(raw.tool),
+        background: crate::color_depth::downgrade(raw.background),
+    }
 }
 
 pub(crate) fn default_theme() -> Theme {
