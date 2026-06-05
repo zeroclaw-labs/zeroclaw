@@ -308,7 +308,6 @@ zc-chat-help-select-agent = Select agent
 zc-chat-help-quit = Quit
 zc-chat-help-switch-session = Switch session
 zc-chat-help-close = Close
-zc-chat-help-submit-name = Submit name
 zc-chat-help-cancel = Cancel
 zc-chat-help-approve = Approve
 zc-chat-help-always-approve = Always approve
@@ -325,7 +324,6 @@ zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-toggle-thinking-cmd = Toggle thinking visibility
 zc-chat-help-new-session = New session
 zc-chat-help-session-list = Session list
-zc-chat-help-rename-session = Rename session
 
 zc-chat-approval-title = Approve tool call: { $tool }  [{ $secs }s]
 zc-chat-approval-action-allow = Allow
@@ -333,9 +331,6 @@ zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
 
-zc-chat-rename-prompt = New name:
-zc-chat-rename-action-submit = submit
-zc-chat-rename-action-cancel = cancel
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }

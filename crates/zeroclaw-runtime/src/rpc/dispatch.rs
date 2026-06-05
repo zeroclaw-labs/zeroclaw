@@ -56,7 +56,6 @@ pub enum Method {
     SessionMessages,
     SessionState,
     SessionDelete,
-    SessionRename,
     SessionApprove,
 
     // Memory
@@ -157,7 +156,6 @@ impl Method {
         (Method::SessionMessages, "session/messages"),
         (Method::SessionState, "session/state"),
         (Method::SessionDelete, "session/delete"),
-        (Method::SessionRename, "session/rename"),
         (Method::SessionApprove, "session/approve"),
         // Memory
         (Method::MemoryList, "memory/list"),
@@ -418,7 +416,6 @@ impl RpcDispatcher {
             Method::SessionMessages => self.handle_session_messages(&req.params).await,
             Method::SessionState => self.handle_session_state(&req.params).await,
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
-            Method::SessionRename => self.handle_session_rename(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params),
 
             // Memory
@@ -1696,29 +1693,6 @@ impl RpcDispatcher {
         to_result(SessionDeleteResult {
             session_id: req.session_id,
             deleted: true,
-        })
-    }
-
-    async fn handle_session_rename(&self, params: &Value) -> RpcResult {
-        let req: SessionRenameParams = parse_params(params)?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        // Try all candidate keys — UPDATE on a missing key is a no-op.
-        for key in &[
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ] {
-            backend
-                .set_session_name(key, &req.name)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Rename failed: {e}")))?;
-        }
-        to_result(SessionRenameResult {
-            session_id: req.session_id,
-            name: req.name,
         })
     }
 
