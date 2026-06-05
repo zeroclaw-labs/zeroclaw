@@ -76,6 +76,7 @@ zc-zerocode-agent-theme-no-agents = No agents configured
 zc-zerocode-agent-theme-none = No override on this agent
 zc-zerocode-agent-theme-set = Override set: { $agent } → { $theme }
 zc-zerocode-agent-theme-cleared = Override cleared for { $agent }
+zc-zerocode-agent-theme-hint = { $assign } assign theme   ·   { $clear } clear override
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.

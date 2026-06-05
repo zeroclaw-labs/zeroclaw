@@ -227,6 +227,16 @@ pub(crate) fn selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Selection highlight without a foreground override: only the selection
+/// background and bold. Use where row spans carry their own meaningful colours
+/// (e.g. the theme list's palette swatches) that a full `selected_style` would
+/// otherwise patch away.
+pub(crate) fn selected_bg_style() -> Style {
+    Style::default()
+        .bg(active().selection_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
 pub(crate) fn input_style() -> Style {
     Style::default().fg(active().body)
 }

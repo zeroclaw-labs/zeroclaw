@@ -279,14 +279,26 @@ impl ZerocodePane {
     }
 
     fn draw_theme(&self, frame: &mut Frame, area: Rect) {
+        let selected = self.theme_cursor.min(self.themes.len().saturating_sub(1));
         let items: Vec<ListItem> = self
             .themes
             .iter()
-            .map(|n| ListItem::new(Line::from(Span::styled(n.clone(), theme::body_style()))))
+            .enumerate()
+            .map(|(i, n)| {
+                // Swatches only on the highlighted row; other rows reserve the
+                // same width in blanks so the name indent never shifts.
+                let mut spans = if i == selected {
+                    theme_swatch_spans(n)
+                } else {
+                    theme_swatch_blank()
+                };
+                spans.push(Span::styled(n.clone(), theme::body_style()));
+                ListItem::new(Line::from(spans))
+            })
             .collect();
         let mut state = ListState::default();
         if !items.is_empty() {
-            state.select(Some(self.theme_cursor.min(items.len() - 1)));
+            state.select(Some(selected));
         }
         // In assign-to-agent mode the same list writes the agent's override; the
         // title makes the target unmistakable.
@@ -297,7 +309,10 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&title))
-                .highlight_style(theme::selected_style())
+                // A fg-less highlight (bg + bold only) so the per-swatch colours
+                // on the highlighted row survive — a full `selected_style` would
+                // patch every span's fg and flatten the palette preview.
+                .highlight_style(theme::selected_bg_style())
                 .highlight_symbol("› "),
             area,
             &mut state,
@@ -344,14 +359,51 @@ impl ZerocodePane {
             .collect();
         let mut state = ListState::default();
         state.select(Some(self.agent_cursor.min(items.len() - 1)));
+
+        // Reserve a one-line hint footer inside the panel so the key actions
+        // are visible without opening the help modal.
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let block = theme::panel_block(" Agent Themes ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
         frame.render_stateful_widget(
             List::new(items)
-                .block(theme::panel_block(" Agent Themes "))
                 .highlight_style(theme::selected_style())
                 .highlight_symbol("› "),
-            area,
+            rows[0],
             &mut state,
         );
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                self.agent_theme_hint(),
+                theme::dim_style(),
+            ))),
+            rows[1],
+        );
+    }
+
+    /// One-line key hint for the Agent Themes section, with key labels derived
+    /// from the keymap (assign / clear) rather than hardcoded.
+    fn agent_theme_hint(&self) -> String {
+        use crate::keymap::{ConfigTabAction as A, RebindableActions};
+        let label = |a: A| -> String {
+            a.resolved()
+                .iter()
+                .map(Chord::display)
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        crate::i18n::t_args(
+            "zc-zerocode-agent-theme-hint",
+            &[
+                ("assign", &label(A::Enter)),
+                ("clear", &label(A::DeleteRow)),
+            ],
+        )
     }
 
     fn draw_presets(&self, frame: &mut Frame, area: Rect) {
@@ -1247,6 +1299,54 @@ impl ZerocodePane {
             Focus::Locale => self.locale_cursor = idx,
             Focus::Connection => self.conn_cursor = idx,
         }
+    }
+}
+
+/// Number of representative roles previewed per theme (canvas, title, heading,
+/// body, warn, tool). The swatch strip is this many blocks plus a trailing
+/// space; every row reserves that width so names stay aligned.
+const SWATCH_ROLE_COUNT: usize = 6;
+const SWATCH_STRIP_WIDTH: usize = SWATCH_ROLE_COUNT + 1;
+
+/// Inline palette swatches for a theme row: one block per representative role,
+/// in the theme's own colours, followed by a trailing space before the name.
+/// The `terminal` (inherit) theme has every role as `Color::Reset`, so it gets
+/// blank swatches — there is no fixed palette to preview, but the width is kept
+/// so its name aligns with the others.
+fn theme_swatch_spans(name: &str) -> Vec<Span<'static>> {
+    let Some(roles) = theme_swatch_roles(name) else {
+        return vec![Span::raw(" ".repeat(SWATCH_STRIP_WIDTH))];
+    };
+    let mut spans: Vec<Span<'static>> = roles
+        .iter()
+        .map(|c| {
+            // Route through the colour-depth downgrade so swatches stay faithful
+            // on 256/16-colour terminals instead of emitting raw truecolor.
+            let c = crate::color_depth::downgrade(*c);
+            Span::styled("█", ratatui::style::Style::default().fg(c))
+        })
+        .collect();
+    spans.push(Span::raw(" "));
+    spans
+}
+
+/// A blank placeholder the same width as the swatch strip, so an unhighlighted
+/// row keeps the name at the same indent as the highlighted one.
+fn theme_swatch_blank() -> Vec<Span<'static>> {
+    vec![Span::raw(" ".repeat(SWATCH_STRIP_WIDTH))]
+}
+
+/// The representative role colours previewed for a theme, or `None` when the
+/// theme has no fixed palette (the `terminal` inherit theme).
+fn theme_swatch_roles(name: &str) -> Option<[ratatui::style::Color; SWATCH_ROLE_COUNT]> {
+    use ratatui::style::Color;
+    let t = theme::theme_by_name(name)?;
+    // Representative spread: canvas, title/accent, heading, body, warn, tool.
+    let roles = [t.background, t.title, t.heading, t.body, t.warn, t.tool];
+    if roles.iter().all(|c| *c == Color::Reset) {
+        None
+    } else {
+        Some(roles)
     }
 }
 
