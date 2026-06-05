@@ -106,32 +106,34 @@ The existing workflows do pin actions to full commit SHAs, which is correct secu
 
 The two parallel workflows should be consolidated into a single, well-structured pipeline. The distinction between "Quality Gate" and "CI" is not meaningful to contributors — both are checks a PR must pass. The consolidation creates one place to find check results, one place to update when behaviour changes, and one place to document what each check is doing and why.
 
-The consolidated pipeline follows a staged structure where fast, cheap checks run first and gate slower, more expensive ones:
+The consolidated pipeline follows a staged structure where a very cheap formatting check runs first, then Rust-heavy jobs fan out in parallel. Lint remains required, but it should not unnecessarily hold the build and test cache warm-up hostage when the goal is to shorten the green critical path:
 
 ```
-Stage 1: Format + Lint (2–5 min)
+Stage 1: Format (cheap serial gate)
   └── cargo fmt --check
+
+Post-format quality gate (parallel, required)
   └── cargo clippy --workspace --all-targets -- -D warnings
   └── Docs quality gate
 
-Stage 2: Build + Check (parallel, 5–15 min)
+Post-format Build + Check (parallel, 5–15 min)
   └── Build matrix (Linux x86_64, macOS ARM, Windows)
   └── cargo check --features ci-all
   └── cargo check --no-default-features (kernel profile)
   └── cargo check --target i686 (32-bit)
 
-Stage 3: Test (10–30 min, gated on Stage 1)
+Post-format Test (parallel, 10–30 min)
   └── cargo nextest run --workspace
 
-Stage 4: Security (parallel with Stage 3)
+Post-format Security (parallel)
   └── cargo deny check (licenses, sources, advisories)
   └── Advisory triage gate (see §4)
 
-Stage 5: Required Gate
+Required Gate
   └── Composite status — branch protection requires only this job
 ```
 
-Stages 2, 3, and 4 run in parallel after Stage 1 passes. This means a formatting error fails fast without burning compute on a build that will be thrown away. The Required Gate job aggregates all results so branch protection needs to track only one job name — a pattern already present in both current workflows.
+The post-format jobs run in parallel after formatting passes. This means a formatting error fails fast without burning compute on a build that will be thrown away, while clippy, build, test, and security can make progress together on cleanly formatted PRs. The Required Gate job aggregates all results so branch protection needs to track only one job name — a pattern already present in both current workflows.
 
 ### 3.2 Workspace-Aware Clippy
 
