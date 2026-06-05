@@ -3308,10 +3308,24 @@ impl Agent {
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
+        use ::zeroclaw_log::Instrument as _;
+
+        let (alias, provider, model) = self.attribution_fields();
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            agent_alias = %alias,
+            model_provider = %provider,
+            model = %model,
+            channel = "cli",
+        );
+
+        self.turn(message).instrument(span).await
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
+        use ::zeroclaw_log::Instrument as _;
+
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /quit to exit.\n");
 
@@ -3326,7 +3340,17 @@ impl Agent {
         });
 
         while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
+            let (alias, provider, model) = self.attribution_fields();
+            let span = ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                agent_alias = %alias,
+                model_provider = %provider,
+                model = %model,
+                channel = "cli",
+            );
+
+            let response = match self.turn(&msg.content).instrument(span).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
@@ -3349,8 +3373,6 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
-    let start = Instant::now();
-
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -3377,56 +3399,12 @@ pub async fn run(
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
-    let (provider_name, model_name) =
-        match effective_config.resolved_model_provider_for_agent(agent_alias) {
-            Some((ty, _alias, entry)) => {
-                let model = entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| effective_config.resolve_default_model())
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                (ty.to_string(), model)
-            }
-            None => (
-                provider_override.unwrap_or_else(|| "unknown".to_string()),
-                effective_config
-                    .resolve_default_model()
-                    .unwrap_or_else(|| "<unresolved>".to_string()),
-            ),
-        };
-
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentStart)
-            .with_category(::zeroclaw_log::EventCategory::Agent)
-            .with_attrs(::serde_json::json!({
-                "model_provider": provider_name,
-                "model": model_name,
-            })),
-        "agent_start"
-    );
-
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
         println!("{response}");
     } else {
         agent.run_interactive().await?;
     }
-
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
-            .with_category(::zeroclaw_log::EventCategory::Agent)
-            .with_duration(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .with_attrs(::serde_json::json!({
-                "model_provider": provider_name,
-                "model": model_name,
-            })),
-        "agent_end"
-    );
 
     Ok(())
 }

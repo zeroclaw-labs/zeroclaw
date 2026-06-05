@@ -15,6 +15,9 @@ pub struct ContentProcessor {
 
 impl ContentProcessor {
     pub fn from_observability(config: &ObservabilityConfig) -> Self {
+        warn_unknown_llm_policy(&config.log_llm_io);
+        warn_unknown_tool_policy(&config.log_tool_io);
+
         Self {
             llm_policy: LlmIoPolicy::from_raw(&config.log_llm_io),
             llm_max_chars: config.log_llm_io_max_chars.max(1),
@@ -76,6 +79,36 @@ impl ContentProcessor {
             LlmIoPolicy::Redacted => Some(truncate_content(&redacted, self.llm_max_chars)),
             LlmIoPolicy::Full => Some(redacted),
         }
+    }
+}
+
+fn warn_unknown_llm_policy(raw: &str) {
+    if !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "off" | "redacted" | "full" | ""
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"value": raw, "config_key": "log_llm_io", "default": "off"})),
+            "unknown log_llm_io value, defaulting to off"
+        );
+    }
+}
+
+fn warn_unknown_tool_policy(raw: &str) {
+    if !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "off" | "redacted" | "full" | ""
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"value": raw, "config_key": "log_tool_io", "default": "redacted"})),
+            "unknown log_tool_io value, defaulting to redacted"
+        );
     }
 }
 
