@@ -2570,13 +2570,36 @@ impl RpcDispatcher {
             roots.insert(s.as_str().to_string());
         }
 
-        // Drop bare parents when a dotted child exists
-        // (`providers` vanishes once `providers.models` is present).
+        // Drop bare parents when a dotted child exists AND the parent
+        // carries no direct scalar fields of its own. `providers`
+        // vanishes once `providers.models` is present because
+        // `ProvidersConfig` is a pure wrapper — every scalar lives
+        // under a sub-section. But `mcp` keeps `enabled` and
+        // `deferred_loading` directly, so the parent stays visible
+        // alongside `mcp.servers` and `mcp.bundles`.
+        let direct_scalar_parents: std::collections::HashSet<String> = config
+            .prop_fields()
+            .iter()
+            .filter_map(|f| {
+                let mut segs = f.name.split('.');
+                let root = segs.next()?;
+                // exactly one more segment past root = direct child scalar
+                segs.next()?;
+                if segs.next().is_some() {
+                    return None;
+                }
+                Some(root.to_string())
+            })
+            .collect();
         let parents_with_children: std::collections::HashSet<String> = roots
             .iter()
             .filter_map(|k| k.split_once('.').map(|(p, _)| p.to_string()))
             .collect();
-        roots.retain(|k| k.contains('.') || !parents_with_children.contains(k));
+        roots.retain(|k| {
+            k.contains('.')
+                || !parents_with_children.contains(k)
+                || direct_scalar_parents.contains(k)
+        });
 
         // Hide cost.rates subtree.
         roots.retain(|k| !k.starts_with("cost.rates"));
