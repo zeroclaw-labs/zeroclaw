@@ -992,6 +992,17 @@ impl Chat {
         }
     }
 
+    /// The agent alias this pane is currently focused on, if any. Used to
+    /// resolve a per-agent theme override while this pane is active. Returns
+    /// `None` in the agent-picker phase, where no agent is yet chosen.
+    pub(crate) fn selected_agent(&self) -> Option<&str> {
+        match &self.phase {
+            ChatPhase::Active(s) => Some(s.agent_alias.as_str()),
+            ChatPhase::PickCwd { agent_alias, .. } => Some(agent_alias.as_str()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.

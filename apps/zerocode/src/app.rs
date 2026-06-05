@@ -14,6 +14,7 @@ use ratatui::{
 use crate::acp;
 use crate::chat;
 use crate::client::{ConnectionState, RpcClient};
+use crate::config;
 use crate::config_manager;
 use crate::dashboard;
 use crate::keymap::{GlobalAction, ModalAction};
@@ -50,7 +51,7 @@ const MODES: [Mode; 6] = [
 
 // ── Mode enum ────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Dashboard,
     Config,
@@ -117,6 +118,16 @@ pub async fn run(
     config_dir: &std::path::Path,
 ) -> Result<bool> {
     let mut mode = Mode::Dashboard;
+    // Per-agent theme overrides resolved from `[theme.agent_override.<alias>]`.
+    // When the Code or Chat pane is focused on a listed agent, its theme
+    // replaces the base theme for that frame. Resolved once per `run` (i.e. per
+    // reconnect cycle); a bad override name is reported and skipped rather than
+    // aborting the whole TUI.
+    // Per-agent theme overrides live in a process-global registry (theme.rs),
+    // mirroring how the global theme works: the Config pane writes there on
+    // assign/clear so changes apply live, and we read it each frame to tint the
+    // Code/Chat pane for the focused agent. Seed it once from config here.
+    theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut show_help = false;
     let mut reload_confirm = false;
     let mut quit_confirm = false;
@@ -156,6 +167,23 @@ pub async fn run(
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+
+        // Per-agent theme override: while the Code or Chat pane is focused on
+        // an agent with a configured override, swap that palette in for the
+        // whole frame (backdrop, pane, bars) so the pane reads cohesively, then
+        // restore the base theme after drawing. The base theme is whatever the
+        // global currently holds, so live theme changes from the Config pane
+        // still take effect for non-overridden panes.
+        let base_theme = theme::active_raw();
+        let frame_theme = match mode {
+            Mode::Acp => acp_pane.selected_agent().and_then(theme::agent_override),
+            Mode::Chat => chat_pane.selected_agent().and_then(theme::agent_override),
+            _ => None,
+        };
+        if let Some(t) = frame_theme {
+            theme::set_active(t);
+        }
+
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
@@ -204,24 +232,27 @@ pub async fn run(
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
+                use crate::keymap::RebindableActions;
+                let chord_keys = |chords: Vec<crate::keymap::Chord>| -> Vec<String> {
+                    chords.iter().map(crate::keymap::Chord::display).collect()
+                };
                 let mut node = HelpNode::entries(vec![
                     HelpEntry::new(
-                        vec![
-                            Box::leak(
-                                crate::keymap::GlobalAction::PaneNavLeft.default_chords()[0]
-                                    .display()
-                                    .into_boxed_str(),
-                            ),
-                            Box::leak(
-                                crate::keymap::GlobalAction::PaneNavRight.default_chords()[0]
-                                    .display()
-                                    .into_boxed_str(),
-                            ),
-                        ],
+                        [
+                            chord_keys(crate::keymap::GlobalAction::PaneNavLeft.resolved()),
+                            chord_keys(crate::keymap::GlobalAction::PaneNavRight.resolved()),
+                        ]
+                        .concat(),
                         crate::i18n::t("zc-app-help-cycle-mode"),
                     ),
-                    HelpEntry::key("Ctrl+R", crate::i18n::t("zc-app-help-reload")),
-                    HelpEntry::key("Ctrl+C", crate::i18n::t("zc-app-help-quit")),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::ReloadDaemon.resolved()),
+                        crate::i18n::t("zc-app-help-reload"),
+                    ),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
+                        crate::i18n::t("zc-app-help-quit"),
+                    ),
                     HelpEntry::spacer(),
                 ]);
                 let pane_node = match mode {
@@ -246,6 +277,12 @@ pub async fn run(
                 draw_reload_status_toast(frame, frame.area(), msg);
             }
         })?;
+
+        // Restore the base palette so the override never leaks into the next
+        // frame, a different pane, or live theme changes from the Config pane.
+        if frame_theme.is_some() {
+            theme::set_active(base_theme);
+        }
 
         // Disconnect handoff runs every iteration, not just when the input
         // poll times out. A steady stream of events (mouse scroll, resize,
@@ -466,6 +503,27 @@ pub async fn run(
     }
 
     Ok(false)
+}
+
+/// Resolve every `[theme.agent_override.<alias>]` entry into a ready palette,
+/// keyed by agent alias. Loads the local zerocode config; an unreadable config
+/// or an override naming an unknown theme is skipped silently (never written to
+/// stderr — that would corrupt the alternate-screen TUI). The base theme
+/// remains in effect for any agent not present in the returned map; a bad
+/// override surfaces in the Config pane's own validation, not here.
+fn resolve_agent_overrides(
+    config_dir: &std::path::Path,
+) -> std::collections::HashMap<String, theme::Theme> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(cfg) = config::ensure_and_load(config_dir) else {
+        return out;
+    };
+    for alias in cfg.agent_override_aliases() {
+        if let Ok(Some(t)) = cfg.resolve_agent_theme(alias) {
+            out.insert(alias.to_string(), t);
+        }
+    }
+    out
 }
 
 // ── Mode bar ─────────────────────────────────────────────────────

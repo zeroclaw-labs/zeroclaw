@@ -24,6 +24,7 @@ zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 
 zc-zerocode-tab-theme = Theme
+zc-zerocode-tab-agent-theme = Agent Themes
 zc-zerocode-tab-presets = Presets
 zc-zerocode-tab-bindings = Keybindings
 zc-zerocode-tab-locale = Locale
@@ -59,11 +60,22 @@ zc-zerocode-capture-cancel = Cancel capture
 zc-zerocode-help-switch-pane = Switch pane (Theme/Presets/Keybindings)
 zc-zerocode-help-navigate = Navigate
 zc-zerocode-help-apply-theme = Apply theme (live + saved)
+zc-zerocode-help-assign-agent-theme = Assign theme to the selected agent
+zc-zerocode-help-pick-agent = Choose theme for this agent
+zc-zerocode-help-clear-agent-theme = Clear the agent's override
 zc-zerocode-help-apply-preset = Apply preset (overwrites keybindings)
 zc-zerocode-help-rebind = Rebind selected action
 zc-zerocode-help-reset-default = Reset action to default
 zc-zerocode-help-mouse-label = Mouse
 zc-zerocode-help-mouse-desc = Click pane / row, scroll, click section tab
+
+zc-zerocode-agent-modal-title = Select Agent
+zc-zerocode-agent-modal-pick = Pick agent, then choose a theme
+zc-zerocode-agent-theme-loading = Loading agents…
+zc-zerocode-agent-theme-no-agents = No agents configured
+zc-zerocode-agent-theme-none = No override on this agent
+zc-zerocode-agent-theme-set = Override set: { $agent } → { $theme }
+zc-zerocode-agent-theme-cleared = Override cleared for { $agent }
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.

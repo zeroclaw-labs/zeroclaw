@@ -90,6 +90,46 @@ pub(crate) fn theme_names() -> impl Iterator<Item = &'static str> {
 
 static ACTIVE: RwLock<Theme> = RwLock::new(DEFAULT_THEME);
 
+/// Per-agent theme overrides, keyed by agent alias. A process-global registry
+/// mirroring `ACTIVE`: the Config pane writes here on assign/clear (live, no
+/// restart), and the app loop reads it each frame to tint the Code/Chat pane
+/// for the focused agent. Lazily created so the static stays const-initialised.
+static AGENT_OVERRIDES: RwLock<Option<std::collections::HashMap<String, Theme>>> =
+    RwLock::new(None);
+
+/// Replace the whole agent-override registry (loaded once at startup).
+pub(crate) fn set_agent_overrides(map: std::collections::HashMap<String, Theme>) {
+    if let Ok(mut guard) = AGENT_OVERRIDES.write() {
+        *guard = Some(map);
+    }
+}
+
+/// Insert or replace one agent's override (live assign from the Config pane).
+pub(crate) fn set_agent_override(alias: &str, theme: Theme) {
+    if let Ok(mut guard) = AGENT_OVERRIDES.write() {
+        guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(alias.to_string(), theme);
+    }
+}
+
+/// Remove one agent's override (live clear from the Config pane).
+pub(crate) fn clear_agent_override(alias: &str) {
+    if let Ok(mut guard) = AGENT_OVERRIDES.write()
+        && let Some(map) = guard.as_mut()
+    {
+        map.remove(alias);
+    }
+}
+
+/// The override palette for `alias`, if any. Read each frame by the app loop.
+pub(crate) fn agent_override(alias: &str) -> Option<Theme> {
+    AGENT_OVERRIDES
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(alias).copied()))
+}
+
 pub(crate) fn set_active(theme: Theme) {
     if let Ok(mut guard) = ACTIVE.write() {
         *guard = theme;
@@ -97,7 +137,7 @@ pub(crate) fn set_active(theme: Theme) {
 }
 
 pub(crate) fn active() -> Theme {
-    let raw = ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME);
+    let raw = active_raw();
     Theme {
         title: crate::color_depth::downgrade(raw.title),
         heading: crate::color_depth::downgrade(raw.heading),
@@ -109,6 +149,14 @@ pub(crate) fn active() -> Theme {
         tool: crate::color_depth::downgrade(raw.tool),
         background: crate::color_depth::downgrade(raw.background),
     }
+}
+
+/// The stored palette without colour-depth downgrade. Used to snapshot and
+/// restore the base theme around a per-frame override swap: `set_active` stores
+/// raw RGB, so save/restore must round-trip the raw value, not the downgraded
+/// one `active()` returns.
+pub(crate) fn active_raw() -> Theme {
+    ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME)
 }
 
 pub(crate) fn default_theme() -> Theme {

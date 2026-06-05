@@ -834,6 +834,22 @@ impl<'a> App<'a> {
                 Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
             }
         }
+        // Agent theme overrides: feed the same enabled-agent list the Code/Chat
+        // pickers walk, fetched lazily when the AgentTheme tab is first focused.
+        if self.zerocode.agents_needs_list() {
+            match self.rpc.agents_status().await {
+                Ok(res) => {
+                    let aliases = res
+                        .agents
+                        .into_iter()
+                        .filter(|a| a.enabled)
+                        .map(|a| a.alias)
+                        .collect();
+                    self.zerocode.set_agents(aliases);
+                }
+                Err(e) => self.zerocode.report_agents_error(&e.to_string()),
+            }
+        }
     }
 
     async fn load_aliases(&mut self, map_path: &str) -> Result<()> {

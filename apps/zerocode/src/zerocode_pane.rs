@@ -4,6 +4,7 @@
 //! `KEY_PRESETS`, each action enum's `variants()`) — nothing is
 //! hardcoded here.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -24,14 +25,16 @@ use crate::theme;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Theme,
+    AgentTheme,
     Presets,
     Bindings,
     Locale,
     Connection,
 }
 
-const FOCI: [Focus; 5] = [
+const FOCI: [Focus; 6] = [
     Focus::Theme,
+    Focus::AgentTheme,
     Focus::Presets,
     Focus::Bindings,
     Focus::Locale,
@@ -42,6 +45,7 @@ impl Focus {
     fn fluent_key(self) -> &'static str {
         match self {
             Self::Theme => "zc-zerocode-tab-theme",
+            Self::AgentTheme => "zc-zerocode-tab-agent-theme",
             Self::Presets => "zc-zerocode-tab-presets",
             Self::Bindings => "zc-zerocode-tab-bindings",
             Self::Locale => "zc-zerocode-tab-locale",
@@ -103,6 +107,19 @@ pub(crate) struct ZerocodePane {
     // Theme
     themes: Vec<String>,
     theme_cursor: usize,
+    /// When `Some(alias)`, the theme list assigns to that agent's override
+    /// rather than the global theme. Cleared after the assignment or on cancel.
+    theme_target_agent: Option<String>,
+    // Agent theme overrides
+    /// Configured agent aliases from the daemon (agents/status), fed by
+    /// config_manager — the same registry the Code/Chat agent pickers walk.
+    agents: Vec<String>,
+    agent_cursor: usize,
+    /// alias -> override theme name, loaded from the local config.
+    agent_overrides: HashMap<String, String>,
+    /// Last `agents/status` error, distinguishing a genuine failure from the
+    /// transient "loading…" state.
+    agents_error: Option<String>,
     // Presets
     presets: Vec<String>,
     preset_cursor: usize,
@@ -148,11 +165,27 @@ impl ZerocodePane {
             .iter()
             .position(|n| theme::theme_by_name(n).map(|t| t.title) == Some(active.title))
             .unwrap_or(0);
+        let agent_overrides: HashMap<String, String> = config::ensure_and_load(config_dir)
+            .ok()
+            .map(|c| {
+                c.agent_override_aliases()
+                    .filter_map(|a| {
+                        c.agent_override_name(a)
+                            .map(|n| (a.to_string(), n.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut pane = Self {
             config_dir: config_dir.to_path_buf(),
             focus: Focus::Theme,
             themes,
             theme_cursor,
+            theme_target_agent: None,
+            agents: Vec::new(),
+            agent_cursor: 0,
+            agent_overrides,
+            agents_error: None,
             presets,
             preset_cursor: 0,
             rows: Vec::new(),
@@ -211,6 +244,7 @@ impl ZerocodePane {
 
         match self.focus {
             Focus::Theme => self.draw_theme(frame, cols[1]),
+            Focus::AgentTheme => self.draw_agent_theme(frame, cols[1]),
             Focus::Presets => self.draw_presets(frame, cols[1]),
             Focus::Bindings => self.draw_bindings(frame, cols[1]),
             Focus::Locale => self.draw_locale(frame, cols[1]),
@@ -254,9 +288,65 @@ impl ZerocodePane {
         if !items.is_empty() {
             state.select(Some(self.theme_cursor.min(items.len() - 1)));
         }
+        // In assign-to-agent mode the same list writes the agent's override; the
+        // title makes the target unmistakable.
+        let title = match &self.theme_target_agent {
+            Some(alias) => format!(" Theme → {alias} "),
+            None => " Theme ".to_string(),
+        };
         frame.render_stateful_widget(
             List::new(items)
-                .block(theme::panel_block(" Theme "))
+                .block(theme::panel_block(&title))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            area,
+            &mut state,
+        );
+    }
+
+    fn draw_agent_theme(&self, frame: &mut Frame, area: Rect) {
+        if let Some(err) = &self.agents_error {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    err.clone(),
+                    theme::warn_style(),
+                )))
+                .block(theme::panel_block(" Agent Themes ")),
+                area,
+            );
+            return;
+        }
+        if self.agents.is_empty() {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    crate::i18n::t("zc-zerocode-agent-theme-loading"),
+                    theme::dim_style(),
+                )))
+                .block(theme::panel_block(" Agent Themes ")),
+                area,
+            );
+            return;
+        }
+        let items: Vec<ListItem> = self
+            .agents
+            .iter()
+            .map(|alias| {
+                let over = self
+                    .agent_overrides
+                    .get(alias)
+                    .map(String::as_str)
+                    .unwrap_or("—");
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{alias:<24}"), theme::body_style()),
+                    Span::styled(over.to_string(), theme::accent_style()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.agent_cursor.min(items.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(" Agent Themes "))
                 .highlight_style(theme::selected_style())
                 .highlight_symbol("› "),
             area,
@@ -487,6 +577,29 @@ impl ZerocodePane {
         }
     }
 
+    /// Feed the configured agent aliases (daemon `agents/status`), supplied by
+    /// config_manager which holds the RpcClient. Mirrors `set_locales`.
+    pub(crate) fn set_agents(&mut self, agents: Vec<String>) {
+        self.agents = agents;
+        self.agents_error = None;
+        if !self.agents.is_empty() && self.agent_cursor >= self.agents.len() {
+            self.agent_cursor = self.agents.len() - 1;
+        }
+    }
+
+    /// True if the AgentTheme tab is focused and the agent list hasn't loaded —
+    /// config_manager uses this to know when to call `agents/status`. Stops
+    /// re-requesting once an attempt has failed.
+    pub(crate) fn agents_needs_list(&self) -> bool {
+        self.focus == Focus::AgentTheme && self.agents.is_empty() && self.agents_error.is_none()
+    }
+
+    /// Record an `agents/status` failure so the tab shows the error instead of
+    /// spinning on "loading…" forever.
+    pub(crate) fn report_agents_error(&mut self, msg: &str) {
+        self.agents_error = Some(format!("agents unavailable: {msg}"));
+    }
+
     /// True if the Locale tab is focused and the registry hasn't loaded yet —
     /// config_manager uses this to know when to call `locales/list`. Once a
     /// list attempt has failed, stop re-requesting on every keypress; the user
@@ -664,11 +777,59 @@ impl ZerocodePane {
             Some(ConfigTabAction::DeleteRow) if self.focus == Focus::Bindings => {
                 self.reset_row();
             }
+            Some(ConfigTabAction::DeleteRow) if self.focus == Focus::AgentTheme => {
+                self.clear_agent_override();
+            }
             _ => {}
         }
     }
 
+    /// Begin assigning a theme to the highlighted agent: point the reusable
+    /// theme list at that agent's override and move focus there. Preselect the
+    /// list cursor on the agent's current override if it has one.
+    fn begin_agent_assign(&mut self) {
+        let Some(alias) = self.agents.get(self.agent_cursor).cloned() else {
+            self.status = Some(crate::i18n::t("zc-zerocode-agent-theme-no-agents"));
+            return;
+        };
+        if let Some(name) = self.agent_overrides.get(&alias)
+            && let Some(pos) = self.themes.iter().position(|t| t == name)
+        {
+            self.theme_cursor = pos;
+        }
+        self.theme_target_agent = Some(alias);
+        self.focus = Focus::Theme;
+    }
+
+    /// Remove the highlighted agent's override (DeleteRow in the AgentTheme
+    /// section).
+    fn clear_agent_override(&mut self) {
+        let Some(alias) = self.agents.get(self.agent_cursor).cloned() else {
+            return;
+        };
+        if !self.agent_overrides.contains_key(&alias) {
+            self.status = Some(crate::i18n::t("zc-zerocode-agent-theme-none"));
+            return;
+        }
+        match config::persist_agent_theme_clear(&self.config_dir, &alias) {
+            Ok(()) => {
+                self.agent_overrides.remove(&alias);
+                theme::clear_agent_override(&alias);
+                self.status = Some(crate::i18n::t_args(
+                    "zc-zerocode-agent-theme-cleared",
+                    &[("agent", &alias)],
+                ));
+            }
+            Err(e) => self.status = Some(format!("Clear failed: {e}")),
+        }
+    }
+
     fn cycle_focus(&mut self, delta: isize) {
+        // Leaving the Theme section abandons any pending agent assignment so the
+        // list reverts to global-theme mode.
+        if self.focus == Focus::Theme {
+            self.theme_target_agent = None;
+        }
         let i = FOCI.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
         let n = FOCI.len() as isize;
         self.focus = FOCI[(((i + delta) % n + n) % n) as usize];
@@ -677,6 +838,7 @@ impl ZerocodePane {
     fn move_cursor(&mut self, delta: isize) {
         let (cursor, len) = match self.focus {
             Focus::Theme => (&mut self.theme_cursor, self.themes.len()),
+            Focus::AgentTheme => (&mut self.agent_cursor, self.agents.len()),
             Focus::Presets => (&mut self.preset_cursor, self.presets.len()),
             Focus::Bindings => (&mut self.binding_cursor, self.rows.len()),
             Focus::Locale => (&mut self.locale_cursor, self.locales.len() + 1),
@@ -692,6 +854,7 @@ impl ZerocodePane {
     fn activate(&mut self) {
         match self.focus {
             Focus::Theme => self.apply_theme(),
+            Focus::AgentTheme => self.begin_agent_assign(),
             Focus::Presets => self.apply_preset(),
             Focus::Bindings => {
                 if !self.rows.is_empty() {
@@ -809,14 +972,39 @@ impl ZerocodePane {
     }
 
     fn apply_theme(&mut self) {
-        let Some(name) = self.themes.get(self.theme_cursor) else {
+        let Some(name) = self.themes.get(self.theme_cursor).cloned() else {
             return;
         };
-        let Some(t) = theme::theme_by_name(name) else {
+        // Assign-to-agent mode: write the override and return focus to the
+        // AgentTheme section instead of touching the global theme.
+        if let Some(alias) = self.theme_target_agent.take() {
+            if theme::theme_by_name(&name).is_none() {
+                return;
+            }
+            match config::persist_agent_theme(&self.config_dir, &alias, &name) {
+                Ok(()) => {
+                    self.agent_overrides.insert(alias.clone(), name.clone());
+                    // Live-apply, exactly like the global theme: update the
+                    // process-global override registry so the Code/Chat pane
+                    // picks it up on the next frame without an app restart.
+                    if let Some(t) = theme::theme_by_name(&name) {
+                        theme::set_agent_override(&alias, t);
+                    }
+                    self.status = Some(crate::i18n::t_args(
+                        "zc-zerocode-agent-theme-set",
+                        &[("agent", &alias), ("theme", &name)],
+                    ));
+                }
+                Err(e) => self.status = Some(format!("Override save failed: {e}")),
+            }
+            self.focus = Focus::AgentTheme;
+            return;
+        }
+        let Some(t) = theme::theme_by_name(&name) else {
             return;
         };
         theme::set_active(t);
-        match config::persist_theme(&self.config_dir, name) {
+        match config::persist_theme(&self.config_dir, &name) {
             Ok(()) => self.status = Some(format!("Theme set to {name}")),
             Err(e) => self.status = Some(format!("Theme set (save failed: {e})")),
         }
@@ -902,59 +1090,86 @@ impl ZerocodePane {
     // ── Contextual help ──────────────────────────────────────────
 
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::{HelpEntry as E, HelpNode};
+
+        // Render the live chords bound to an action, never a hardcoded literal,
+        // so the help reflects the actual (possibly overridden) keymap.
+        let keys = |a: A| -> Vec<String> {
+            use crate::keymap::RebindableActions;
+            a.resolved().iter().map(Chord::display).collect()
+        };
+
         if self.capture.is_some() {
             return HelpNode::entries(vec![
                 E::key("any key", crate::i18n::t("zc-zerocode-capture-assign")),
-                E::key("Esc", crate::i18n::t("zc-zerocode-capture-cancel")),
+                E::new(keys(A::Back), crate::i18n::t("zc-zerocode-capture-cancel")),
             ]);
         }
         let mut entries = vec![
             E::new(
-                vec!["←", "→", "h", "l"],
+                [keys(A::TabLeft), keys(A::TabRight)].concat(),
                 crate::i18n::t("zc-zerocode-help-switch-pane"),
             ),
             E::new(
-                vec!["↑", "↓", "j", "k"],
+                [keys(A::Up), keys(A::Down)].concat(),
                 crate::i18n::t("zc-zerocode-help-navigate"),
             ),
         ];
         match self.focus {
             Focus::Theme => {
-                entries.push(E::key(
-                    "Enter",
-                    crate::i18n::t("zc-zerocode-help-apply-theme"),
+                let label = if self.theme_target_agent.is_some() {
+                    "zc-zerocode-help-assign-agent-theme"
+                } else {
+                    "zc-zerocode-help-apply-theme"
+                };
+                entries.push(E::new(keys(A::Enter), crate::i18n::t(label)));
+            }
+            Focus::AgentTheme => {
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-pick-agent"),
+                ));
+                entries.push(E::new(
+                    keys(A::DeleteRow),
+                    crate::i18n::t("zc-zerocode-help-clear-agent-theme"),
                 ));
             }
             Focus::Presets => {
-                entries.push(E::key(
-                    "Enter",
+                entries.push(E::new(
+                    keys(A::Enter),
                     crate::i18n::t("zc-zerocode-help-apply-preset"),
                 ));
             }
             Focus::Bindings => {
-                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-rebind")));
-                entries.push(E::key(
-                    "d",
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-rebind"),
+                ));
+                entries.push(E::new(
+                    keys(A::DeleteRow),
                     crate::i18n::t("zc-zerocode-help-reset-default"),
                 ));
             }
             Focus::Locale => {
-                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-locale")));
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-locale"),
+                ));
             }
             Focus::Connection => {
-                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-conn")));
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-conn"),
+                ));
             }
         }
         entries.push(E::spacer());
-        entries.push(E::new(
-            vec![],
-            format!(
-                "{}: {}",
-                crate::i18n::t("zc-zerocode-help-mouse-label"),
-                crate::i18n::t("zc-zerocode-help-mouse-desc"),
-            ),
-        ));
+        entries.push(E::desc(format!(
+            "{}: {}",
+            crate::i18n::t("zc-zerocode-help-mouse-label"),
+            crate::i18n::t("zc-zerocode-help-mouse-desc"),
+        )));
         HelpNode::entries(entries)
     }
 
@@ -1010,6 +1225,7 @@ impl ZerocodePane {
     fn current_len(&self) -> usize {
         match self.focus {
             Focus::Theme => self.themes.len(),
+            Focus::AgentTheme => self.agents.len(),
             Focus::Presets => self.presets.len(),
             Focus::Bindings => self.rows.len(),
             Focus::Locale => self.locales.len() + 1,
@@ -1025,6 +1241,7 @@ impl ZerocodePane {
         let idx = idx.min(len - 1);
         match self.focus {
             Focus::Theme => self.theme_cursor = idx,
+            Focus::AgentTheme => self.agent_cursor = idx,
             Focus::Presets => self.preset_cursor = idx,
             Focus::Bindings => self.binding_cursor = idx,
             Focus::Locale => self.locale_cursor = idx,
