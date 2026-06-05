@@ -73,6 +73,8 @@ pub struct DiscordChannel {
     /// Value is `Some(parent_id)` when the channel is a thread, `None`
     /// when it is a regular (non-thread) channel.
     thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    /// Cached bot roles in each guild: `guild_id -> role_ids`.
+    bot_guild_roles: Arc<AsyncMutex<HashMap<String, Vec<String>>>>,
     /// Ephemeral Discord gateway session state for Resume across reconnects.
     gateway_session: Mutex<DiscordGatewaySession>,
 }
@@ -138,6 +140,7 @@ impl DiscordChannel {
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            bot_guild_roles: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
         }
     }
@@ -333,6 +336,95 @@ impl DiscordChannel {
             .lock()
             .await
             .insert(channel_id.to_string(), result.clone());
+        result
+    }
+
+    /// Fetch the roles the bot has in `guild_id`. Cached for the lifetime of
+    /// the channel instance to avoid redundant API queries.
+    async fn get_bot_roles(
+        &self,
+        client: &reqwest::Client,
+        guild_id: &str,
+        bot_user_id: &str,
+    ) -> Vec<String> {
+        {
+            let cache = self.bot_guild_roles.lock().await;
+            if let Some(roles) = cache.get(guild_id) {
+                return roles.clone();
+            }
+        }
+
+        let url = format!("https://discord.com/api/v10/guilds/{guild_id}/members/{bot_user_id}");
+        let lookup = async {
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .send()
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "request failed"
+                    );
+                    anyhow::Error::msg(format!("request failed: {e}"))
+                })?;
+            if !resp.status().is_success() {
+                anyhow::bail!("non-success status {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "body parse failed"
+                );
+                anyhow::Error::msg(format!("body parse failed: {e}"))
+            })?;
+            let roles = body
+                .get("roles")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(String::from)
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            Ok::<Vec<String>, anyhow::Error>(roles)
+        };
+
+        let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(roles)) => roles,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(
+                            ::serde_json::json!({"guild_id": guild_id, "bot_user_id": bot_user_id, "error": format!("{}", e)})
+                        ),
+                    "guild member lookup failed"
+                );
+                return Vec::new();
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"guild_id": guild_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})),
+                    "guild member lookup timed out"
+                );
+                return Vec::new();
+            }
+        };
+
+        self.bot_guild_roles
+            .lock()
+            .await
+            .insert(guild_id.to_string(), result.clone());
         result
     }
 
@@ -2001,16 +2093,34 @@ impl Channel for DiscordChannel {
                         .cloned()
                         .unwrap_or_default();
                     let has_attachments = !atts.is_empty();
+                    let client = self.http_client();
+                    let mut is_mentioned = contains_bot_mention(content, &bot_user_id);
+                    if !is_mentioned && effective_mention_only {
+                        if let Some(guild_id) = d.get("guild_id").and_then(|g| g.as_str()) {
+                            if let Some(mention_roles) = d.get("mention_roles").and_then(|r| r.as_array()) {
+                                if !mention_roles.is_empty() {
+                                    let bot_roles = self.get_bot_roles(&client, guild_id, &bot_user_id).await;
+                                    for role_val in mention_roles {
+                                        if let Some(role_id) = role_val.as_str() {
+                                            if bot_roles.contains(&role_id.to_string()) {
+                                                is_mentioned = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let Some(clean_content) = admit_discord_message(
                         content,
                         has_attachments,
-                        effective_mention_only,
+                        effective_mention_only && !is_mentioned,
                         &bot_user_id,
                     ) else {
                         continue;
                     };
-
-                    let client = self.http_client();
                     let (attachment_text, media_attachments) = process_attachments(
                         &atts,
                         &client,

@@ -826,6 +826,96 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
     if calls.is_empty() { None } else { Some(calls) }
 }
 
+fn parse_malformed_file_write_json(inner: &str) -> Option<ParsedToolCall> {
+    if !inner.contains("file_write") {
+        return None;
+    }
+
+    let path_re = regex::Regex::new(r#""path"\s*:\s*"([^"]+)""#).ok()?;
+    let path_caps = path_re.captures(inner)?;
+    let path = path_caps.get(1)?.as_str().to_string();
+
+    let content_marker = "\"content\"";
+    let marker_idx = inner.find(content_marker)?;
+    let colon_idx = inner[marker_idx + content_marker.len()..].find(':')? + marker_idx + content_marker.len();
+    let quote_idx = inner[colon_idx + 1..].find('"')? + colon_idx + 1;
+    let start_idx = quote_idx + 1;
+
+    let mut end_idx = inner.len();
+    let mut found = false;
+    while end_idx > start_idx {
+        end_idx -= 1;
+        if &inner[end_idx..end_idx + 1] == "\"" {
+            let rem = inner[end_idx + 1..].trim();
+            if rem == "}"
+                || rem == "}}"
+                || rem == "}\n}"
+                || rem == "}\r\n}"
+                || rem == "}\n}\n"
+                || rem.is_empty()
+            {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    let raw_content = &inner[start_idx..end_idx];
+
+    let mut unescaped = String::with_capacity(raw_content.len());
+    let mut chars = raw_content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next_c) = chars.peek() {
+                match next_c {
+                    'n' => {
+                        unescaped.push('\n');
+                        chars.next();
+                    }
+                    'r' => {
+                        unescaped.push('\r');
+                        chars.next();
+                    }
+                    't' => {
+                        unescaped.push('\t');
+                        chars.next();
+                    }
+                    '"' => {
+                        unescaped.push('"');
+                        chars.next();
+                    }
+                    '\\' => {
+                        unescaped.push('\\');
+                        chars.next();
+                    }
+                    _ => {
+                        unescaped.push(c);
+                    }
+                }
+            } else {
+                unescaped.push(c);
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("path".to_string(), serde_json::Value::String(path));
+    arguments.insert("content".to_string(), serde_json::Value::String(unescaped));
+
+    Some(ParsedToolCall {
+        name: "file_write".to_string(),
+        arguments: serde_json::Value::Object(arguments),
+        tool_call_id: None,
+    })
+}
+
+
 /// Parse MiniMax-style XML tool calls with attributed invoke/parameter tags.
 fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
     let mut calls = Vec::new();
@@ -1643,6 +1733,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 parsed_any = true;
             }
 
+            // Fallback for malformed JSON file_write tool calls with unescaped HTML content
+            if !parsed_any && let Some(fallback_call) = parse_malformed_file_write_json(inner) {
+                calls.push(fallback_call);
+                parsed_any = true;
+            }
+
             if !parsed_any {
                 // GLM-style shortened body: `shell>uname -a` or `shell\ncommand: date`
                 if let Some(glm_call) = parse_glm_shortened_body(inner) {
@@ -1683,6 +1779,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 // Try XML
                 if !parsed_any && let Some(xml_calls) = parse_xml_tool_calls(inner) {
                     calls.extend(xml_calls);
+                    parsed_any = true;
+                }
+
+                // Fallback for malformed JSON file_write tool calls with unescaped HTML content
+                if !parsed_any && let Some(fallback_call) = parse_malformed_file_write_json(inner) {
+                    calls.push(fallback_call);
                     parsed_any = true;
                 }
 
@@ -3830,5 +3932,26 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
+    }
+
+    #[test]
+    fn test_parse_malformed_file_write_json_with_unescaped_quotes() {
+        let input = r#"<tool_call>
+{
+  "name": "file_write",
+  "arguments": {
+    "path": "neon_striker.html",
+    "content": "<!DOCTYPE html>\n<html>\n<p style="margin-top: 15px; color: #ff007f;">Hello World</p>\n</html>"
+  }
+}
+</tool_call>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.name, "file_write");
+        let path = call.arguments.get("path").unwrap().as_str().unwrap();
+        let content = call.arguments.get("content").unwrap().as_str().unwrap();
+        assert_eq!(path, "neon_striker.html");
+        assert!(content.contains("<p style=\"margin-top: 15px; color: #ff007f;\">Hello World</p>"));
     }
 }

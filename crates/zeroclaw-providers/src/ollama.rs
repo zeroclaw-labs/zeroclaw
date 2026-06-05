@@ -1055,7 +1055,7 @@ impl ModelProvider for OllamaModelProvider {
             .send_request(
                 api_messages,
                 &normalized_model,
-                temperature,
+                Some(temperature),
                 should_auth,
                 None,
             )

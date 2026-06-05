@@ -807,7 +807,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             )
         });
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        Ok(Box::new(crate::gemini::GeminiModelProvider::new_with_auth(
+        let mut p = crate::gemini::GeminiModelProvider::new_with_auth(
             alias,
             key,
             auth_service,
@@ -815,7 +815,11 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             self.oauth_project.clone(),
             self.oauth_client_id.clone(),
             self.oauth_client_secret.clone(),
-        )))
+        );
+        if let Some(mt) = opts.provider_max_tokens {
+            p = p.with_max_tokens(Some(mt));
+        }
+        Ok(Box::new(p))
     }
 }
 
