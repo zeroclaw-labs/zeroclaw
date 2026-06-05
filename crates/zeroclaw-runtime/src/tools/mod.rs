@@ -578,7 +578,11 @@ pub fn all_tools_with_runtime(
             agent_alias,
         )),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+        Arc::new(CronRemoveTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronUpdateTool::new(
             config.clone(),
             security.clone(),
