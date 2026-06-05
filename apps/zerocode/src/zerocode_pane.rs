@@ -1,6 +1,6 @@
 //! The local `zerocode` config pane: theme selector, keybinding list,
 //! and preset picker, plus the chord-capture modal for per-action
-//! rebinding. All surfaces walk the canonical registries (`THEMES`,
+//! rebinding. All surfaces walk the canonical registries (`theme_names`,
 //! `KEY_PRESETS`, each action enum's `variants()`) — nothing is
 //! hardcoded here.
 
