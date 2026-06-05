@@ -323,6 +323,11 @@ async fn run_http_server(state: AppState, bind_addr: String) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/state", get(get_state))
+        // Demo-only manual control surface for the browser visualizer's buttons.
+        // Accepts unauthenticated POST /manual JSON {pin, value} and only mutates
+        // the in-memory simulated GPIO state (never the pty/firmware command stream
+        // and never real hardware). See the Security & Privacy Impact section of the
+        // PR body for the full network surface description.
         .route("/manual", post(manual_flip))
         .route("/ws", get(ws_handler))
         .with_state(state);
@@ -356,6 +361,8 @@ async fn manual_flip(
         )
             .into_response();
     }
+    // Demo-only: this mutates only the simulator's in-memory pin state for the
+    // visualizer/manual demo page. It is not forwarded to the pty side.
     state
         .write_pin(req.pin, if req.value == 0 { 0 } else { 1 }, "manual")
         .await;
