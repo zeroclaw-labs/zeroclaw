@@ -87,7 +87,7 @@ Chord glyphs like `Ctrl+C`, `Esc`, `Shift+Up` are protocol, not language. The `H
 
 ### Locale resolution
 
-Locale comes from a top-level `locale` field in `zerocode-config.toml`. When unset, `i18n::detect_locale()` walks (in order) `<config-dir>/zerocode/zerocode-config.toml`, `~/.zeroclaw/zerocode-config.toml`, `~/.zeroclaw/config.toml`, then `<config-dir>/zeroclaw/config.toml`, finally falling back to `en`. The same lookup matches how the daemon resolves its own locale.
+Locale comes from a top-level `locale` field in `zerocode-config.toml`. When unset, `i18n::detect_locale()` reads a single file — `<config-dir>/zerocode-config.toml`, where the config dir is resolved as `--config-dir`, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw` — and otherwise falls back to `en`. zerocode resolves its locale independently from its own `zerocode-config.toml`; it does not share the daemon's lookup.
 
 ### Adding strings
 
