@@ -383,4 +383,107 @@ mod tests {
             );
         }
     }
+
+    /// Integration tests for the Shazam WASM plugin. Build first:
+    ///   cd plugins/shazam && cargo build --target wasm32-wasip1 --release
+    ///   cp target/wasm32-wasip1/release/shazam.wasm shazam.wasm
+    mod shazam_integration {
+        use super::*;
+
+        fn wasm_path() -> Option<std::path::PathBuf> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugins/shazam/shazam.wasm");
+            if path.exists() { Some(path) } else { None }
+        }
+
+        #[test]
+        fn load_and_read_metadata() {
+            let Some(path) = wasm_path() else {
+                eprintln!("SKIP: shazam.wasm not found (build the plugin first)");
+                return;
+            };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let meta = call_tool_metadata(&mut plugin).unwrap();
+            assert_eq!(meta.name, "shazam");
+            assert!(
+                meta.parameters_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == "action")
+            );
+            let actions = meta.parameters_schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap();
+            assert!(actions.iter().any(|v| v == "search_track"));
+            assert!(actions.iter().any(|v| v == "get_track_details"));
+        }
+
+        #[test]
+        fn execute_missing_action() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({})).unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("action"));
+        }
+
+        #[test]
+        fn execute_unknown_action() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({"action": "nope"})).unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("Unknown action"));
+        }
+
+        #[test]
+        fn execute_search_missing_query() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({"action": "search_track"})).unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("query"));
+        }
+
+        #[test]
+        fn execute_get_track_details_missing_key() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args =
+                serde_json::to_vec(&serde_json::json!({"action": "get_track_details"})).unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("track_key"));
+        }
+
+        /// End-to-end: a valid action with no `SHAZAM_RAPIDAPI_KEY` set exercises
+        /// the `zc_env_read` host fn, which traps when the var is unset — proving
+        /// the env_read path is wired (validation passes, then the key read fires).
+        #[test]
+        fn execute_missing_api_key_exercises_env_read_host_fn() {
+            let Some(path) = wasm_path() else { return };
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("SHAZAM_RAPIDAPI_KEY") };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args =
+                serde_json::to_vec(&serde_json::json!({"action": "search_track", "query": "test"}))
+                    .unwrap();
+            let err = call_execute(&mut plugin, &args).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("SHAZAM_RAPIDAPI_KEY") || msg.contains("not set"),
+                "expected env-var error, got: {msg}"
+            );
+        }
+    }
 }
