@@ -48,6 +48,7 @@
   - [Signal](./channels/signal.md)
   - [WhatsApp](./channels/whatsapp.md)
   - [Other chat platforms](./channels/chat-others.md)
+  - [SMS (Twilio, Plivo, Telnyx, Sinch, Vonage)](./channels/sms.md)
   - [Social (Bluesky, Nostr, Twitter, Reddit)](./channels/social.md)
   - [Email](./channels/email.md)
   - [Voice & telephony](./channels/voice.md)
