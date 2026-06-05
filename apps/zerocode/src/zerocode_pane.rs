@@ -107,6 +107,9 @@ pub(crate) struct ZerocodePane {
     // Theme
     themes: Vec<String>,
     theme_cursor: usize,
+    /// Separate cursor for the assign-to-agent flow so picking a theme for an
+    /// agent never moves the global Theme tab's selection.
+    assign_cursor: usize,
     /// When `Some(alias)`, the theme list assigns to that agent's override
     /// rather than the global theme. Cleared after the assignment or on cancel.
     theme_target_agent: Option<String>,
@@ -181,6 +184,7 @@ impl ZerocodePane {
             focus: Focus::Theme,
             themes,
             theme_cursor,
+            assign_cursor: 0,
             theme_target_agent: None,
             agents: Vec::new(),
             agent_cursor: 0,
@@ -278,8 +282,29 @@ impl ZerocodePane {
         );
     }
 
+    /// The cursor the theme list is currently driving: the agent-assign cursor
+    /// while assigning to an agent, the global-theme cursor otherwise. Keeping
+    /// them distinct stops an agent pick from moving the global Theme selection.
+    fn theme_list_cursor(&self) -> usize {
+        if self.theme_target_agent.is_some() {
+            self.assign_cursor
+        } else {
+            self.theme_cursor
+        }
+    }
+
+    fn theme_list_cursor_mut(&mut self) -> &mut usize {
+        if self.theme_target_agent.is_some() {
+            &mut self.assign_cursor
+        } else {
+            &mut self.theme_cursor
+        }
+    }
+
     fn draw_theme(&self, frame: &mut Frame, area: Rect) {
-        let selected = self.theme_cursor.min(self.themes.len().saturating_sub(1));
+        let selected = self
+            .theme_list_cursor()
+            .min(self.themes.len().saturating_sub(1));
         let items: Vec<ListItem> = self
             .themes
             .iter()
@@ -847,7 +872,9 @@ impl ZerocodePane {
         if let Some(name) = self.agent_overrides.get(&alias)
             && let Some(pos) = self.themes.iter().position(|t| t == name)
         {
-            self.theme_cursor = pos;
+            self.assign_cursor = pos;
+        } else {
+            self.assign_cursor = 0;
         }
         self.theme_target_agent = Some(alias);
         self.focus = Focus::Theme;
@@ -888,17 +915,25 @@ impl ZerocodePane {
     }
 
     fn move_cursor(&mut self, delta: isize) {
-        let (cursor, len) = match self.focus {
-            Focus::Theme => (&mut self.theme_cursor, self.themes.len()),
-            Focus::AgentTheme => (&mut self.agent_cursor, self.agents.len()),
-            Focus::Presets => (&mut self.preset_cursor, self.presets.len()),
-            Focus::Bindings => (&mut self.binding_cursor, self.rows.len()),
-            Focus::Locale => (&mut self.locale_cursor, self.locales.len() + 1),
-            Focus::Connection => (&mut self.conn_cursor, CONN_FIELDS.len()),
+        let len = match self.focus {
+            Focus::Theme => self.themes.len(),
+            Focus::AgentTheme => self.agents.len(),
+            Focus::Presets => self.presets.len(),
+            Focus::Bindings => self.rows.len(),
+            Focus::Locale => self.locales.len() + 1,
+            Focus::Connection => CONN_FIELDS.len(),
         };
         if len == 0 {
             return;
         }
+        let cursor = match self.focus {
+            Focus::Theme => self.theme_list_cursor_mut(),
+            Focus::AgentTheme => &mut self.agent_cursor,
+            Focus::Presets => &mut self.preset_cursor,
+            Focus::Bindings => &mut self.binding_cursor,
+            Focus::Locale => &mut self.locale_cursor,
+            Focus::Connection => &mut self.conn_cursor,
+        };
         let next = (*cursor as isize + delta).clamp(0, len as isize - 1);
         *cursor = next as usize;
     }
@@ -1024,7 +1059,7 @@ impl ZerocodePane {
     }
 
     fn apply_theme(&mut self) {
-        let Some(name) = self.themes.get(self.theme_cursor).cloned() else {
+        let Some(name) = self.themes.get(self.theme_list_cursor()).cloned() else {
             return;
         };
         // Assign-to-agent mode: write the override and return focus to the
@@ -1292,7 +1327,7 @@ impl ZerocodePane {
         }
         let idx = idx.min(len - 1);
         match self.focus {
-            Focus::Theme => self.theme_cursor = idx,
+            Focus::Theme => *self.theme_list_cursor_mut() = idx,
             Focus::AgentTheme => self.agent_cursor = idx,
             Focus::Presets => self.preset_cursor = idx,
             Focus::Bindings => self.binding_cursor = idx,
@@ -1468,5 +1503,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pane = ZerocodePane::new(dir.path());
         assert!(!pane.wants_text_input());
+    }
+
+    // Regression: assigning a theme to an agent must not move the global Theme
+    // tab's selection. The assign flow uses a separate cursor, so returning to
+    // the Theme tab shows the saved global theme, not the agent's pick.
+    #[test]
+    fn agent_assign_preserves_global_theme_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.set_agents(vec!["coder".to_string()]);
+
+        // Park the global theme selection on a known, non-zero row.
+        while pane.focus != Focus::Theme {
+            pane.handle_key(key(KeyCode::Right));
+        }
+        pane.handle_key(key(KeyCode::Down));
+        pane.handle_key(key(KeyCode::Down));
+        pane.handle_key(key(KeyCode::Down));
+        let global = pane.theme_cursor;
+        assert!(global > 0, "global cursor should have moved off row 0");
+
+        // Enter assign mode for the agent and pick a different row.
+        while pane.focus != Focus::AgentTheme {
+            pane.handle_key(key(KeyCode::Right));
+        }
+        pane.handle_key(key(KeyCode::Enter));
+        assert!(pane.focus == Focus::Theme);
+        assert!(pane.theme_target_agent.is_some());
+        // Move the assign cursor; the global cursor must not follow.
+        pane.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            pane.theme_cursor, global,
+            "assign navigation moved the global cursor"
+        );
+        pane.handle_key(key(KeyCode::Enter));
+
+        // Back on the Theme tab, the global selection is intact.
+        assert!(pane.focus == Focus::AgentTheme);
+        assert!(pane.theme_target_agent.is_none());
+        assert_eq!(
+            pane.theme_cursor, global,
+            "applying an agent override changed the global cursor"
+        );
+        assert!(
+            pane.agent_overrides.contains_key("coder"),
+            "agent override was not recorded"
+        );
     }
 }
