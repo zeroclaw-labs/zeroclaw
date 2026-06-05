@@ -3403,6 +3403,14 @@ impl ChatState {
                 status: QueueItemStatus::Injected,
             },
         );
+        // Ctrl+Enter is an explicit "send now" — the strongest deliberate
+        // intent the input box offers. Resume the whole queue so pending
+        // items flow behind the inject and the paused ghost-text clears,
+        // matching the same rationale resume_queue() documents for Enter.
+        self.queue_paused = false;
+        if self.turn_in_flight {
+            self.resume_override = true;
+        }
         Ok(())
     }
 
@@ -4376,7 +4384,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_pauses_pending_but_injection_overrides() {
+    fn cancel_pauses_pending_but_injection_resumes() {
         let mut s = state();
         s.turn_in_flight = true;
         s.enqueue_message("queued".to_string(), Vec::new()).unwrap();
@@ -4388,16 +4396,20 @@ mod tests {
         );
         s.inject_message("override".to_string(), Vec::new())
             .unwrap();
+        assert!(
+            !s.queue_paused(),
+            "an explicit inject (Ctrl+Enter) resumes the whole queue"
+        );
         assert_eq!(
             s.take_next_dispatchable().unwrap().text,
             "override",
-            "injected item dispatches through a pause"
+            "injected item dispatches first"
         );
-        assert!(
-            !s.toggle_queue_pause(),
-            "toggling a paused queue resumes it"
+        assert_eq!(
+            s.take_next_dispatchable().unwrap().text,
+            "queued",
+            "pending then flows because the inject unpaused the queue"
         );
-        assert_eq!(s.take_next_dispatchable().unwrap().text, "queued");
     }
 
     #[test]
