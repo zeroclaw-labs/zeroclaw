@@ -7690,8 +7690,11 @@ pub async fn start_channels(
         let workspace = config.agent_workspace_dir(agent_alias);
         // Per-agent skills: install-wide workspace + open_skills set,
         // unioned with this agent's declared `skill_bundles`.
-        let skills =
-            zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
+        let skills = zeroclaw_runtime::skills::load_skills_for_agent(
+            &&config.data_dir,
+            &config,
+            agent_alias,
+        );
 
         let all_tools_result_ch = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
