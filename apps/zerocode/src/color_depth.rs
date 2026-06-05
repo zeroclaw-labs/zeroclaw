@@ -98,6 +98,13 @@ fn detect_from_env(
         return ColorDepth::Ansi16;
     }
 
+    // A multiplexer TERM without a `256` suffix (bare `screen`, `tmux`,
+    // `screen.xterm`, etc.) advertises an 8/16-colour terminfo — emitting
+    // xterm-256 indices into it garbles the display. Treat it as ANSI-16.
+    if multiplexed {
+        return ColorDepth::Ansi16;
+    }
+
     // Conservative default: most modern xterm-family TERMs support 256.
     ColorDepth::Ansi256
 }
@@ -278,6 +285,26 @@ mod tests {
                 None,
                 false
             ),
+            ColorDepth::Ansi256
+        );
+    }
+
+    #[test]
+    fn bare_screen_tmux_term_is_ansi16() {
+        // The real-world breakage: SSH + tmux exporting bare `TERM=screen`
+        // (no `-256color`), no COLORTERM. Its terminfo is 8/16-colour, so
+        // emitting xterm-256 indices garbles the display — must be Ansi16.
+        assert_eq!(
+            detect_from_env(None, None, Some("screen"), Some("tmux"), true),
+            ColorDepth::Ansi16
+        );
+        assert_eq!(
+            detect_from_env(None, None, Some("tmux"), None, true),
+            ColorDepth::Ansi16
+        );
+        // …but the 256-variant still resolves to 256.
+        assert_eq!(
+            detect_from_env(None, None, Some("screen-256color"), None, true),
             ColorDepth::Ansi256
         );
     }
