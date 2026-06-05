@@ -1311,6 +1311,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
+                daemonclaw_api::agent::TurnSource::Cli,
             ))
             .await
             .map(|_| ())

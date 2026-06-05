@@ -3065,6 +3065,7 @@ async fn process_channel_message(
                         None, // receipt_generator
                         None, // collected_receipts
                         ctx.audit_logger.as_deref(),
+                        daemonclaw_api::agent::TurnSource::Channel,
                     ),
                     ),
                     ),

@@ -251,6 +251,7 @@ mod tests {
             tool_calls,
             tool_call_count: 2,
             active_skill,
+            turn_source: daemonclaw_api::agent::TurnSource::Channel,
             outcome: TurnOutcome::Success,
             final_response: "Nginx reloaded successfully.".into(),
             turn_number: 3,

@@ -151,6 +151,10 @@ impl HookHandler for DialecticHook {
     }
 
     async fn on_turn_complete(&self, result: &TurnResult) -> crate::hooks::traits::TurnCompleteAction {
+        if result.turn_source.is_automated() {
+            return crate::hooks::traits::TurnCompleteAction::Continue;
+        }
+
         let turn_num = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         let snippet = if result.final_response.len() > 200 {
@@ -341,5 +345,72 @@ mod tests {
     fn parse_json_invalid() {
         assert!(DialecticHook::parse_json_from_response("no json here").is_none());
         assert!(DialecticHook::parse_json_from_response("{broken").is_none());
+    }
+
+    #[tokio::test]
+    async fn automated_turn_skipped_no_counter_increment() {
+        use async_trait::async_trait;
+        use daemonclaw_api::agent::{TurnOutcome, TurnSource};
+        use daemonclaw_api::memory_traits::StructuredMemory;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct MockMemory {
+            data: Mutex<HashMap<String, serde_json::Value>>,
+        }
+        impl MockMemory {
+            fn new() -> Self {
+                Self { data: Mutex::new(HashMap::new()) }
+            }
+        }
+        #[async_trait]
+        impl StructuredMemory for MockMemory {
+            async fn store_json(&self, key: &str, value: &serde_json::Value, _cat: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().insert(key.to_string(), value.clone());
+                Ok(())
+            }
+            async fn get_json(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+            async fn patch_json(&self, key: &str, patch: &serde_json::Value, _cat: &str) -> anyhow::Result<serde_json::Value> {
+                let mut data = self.data.lock().unwrap();
+                data.insert(key.to_string(), patch.clone());
+                Ok(patch.clone())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn StructuredMemory> = Arc::new(MockMemory::new());
+        let store = Arc::new(crate::user_model::UserModelStore::new(memory));
+        let observer: Arc<dyn crate::observability::Observer> =
+            Arc::new(crate::observability::noop::NoopObserver);
+        let llm_config = super::super::background_llm::BackgroundLlmConfig {
+            provider_name: "test".into(),
+            api_key: None,
+            model: "test".into(),
+            temperature: 0.0,
+            runtime_options: Default::default(),
+        };
+        let hook = DialecticHook::with_cadence(
+            store, observer, llm_config, tmp.path().to_path_buf(), 3, 10,
+        );
+
+        let cron_result = TurnResult {
+            user_message: "cron heartbeat".into(),
+            tool_calls: vec![],
+            tool_call_count: 0,
+            active_skill: None,
+            turn_source: TurnSource::Cron,
+            outcome: TurnOutcome::Success,
+            final_response: "ok".into(),
+            turn_number: 1,
+        };
+
+        hook.on_turn_complete(&cron_result).await;
+        hook.on_turn_complete(&cron_result).await;
+        hook.on_turn_complete(&cron_result).await;
+
+        assert_eq!(hook.turn_counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(hook.turns_buffer.lock().unwrap().is_empty());
     }
 }

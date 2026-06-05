@@ -26,6 +26,24 @@ pub enum TurnOutcome {
     Interrupted,
 }
 
+/// Where a turn originated — used by hooks to distinguish operator
+/// interaction from automated/scheduled execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnSource {
+    /// Interactive CLI session.
+    Cli,
+    /// Channel message (Telegram, Slack, etc.) from an operator.
+    Channel,
+    /// Cron scheduler or daemon heartbeat — no human in the loop.
+    Cron,
+}
+
+impl TurnSource {
+    pub fn is_automated(self) -> bool {
+        matches!(self, Self::Cron)
+    }
+}
+
 /// Record of a single tool call within a turn.
 #[derive(Debug, Clone)]
 pub struct ToolCallRecord {
@@ -47,6 +65,7 @@ pub struct TurnResult {
     pub tool_calls: Vec<ToolCallRecord>,
     pub tool_call_count: usize,
     pub active_skill: Option<String>,
+    pub turn_source: TurnSource,
     pub outcome: TurnOutcome,
     pub final_response: String,
     pub turn_number: u64,

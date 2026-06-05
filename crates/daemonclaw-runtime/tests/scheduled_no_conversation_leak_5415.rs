@@ -145,6 +145,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
         false,
         None,
         None,
+        daemonclaw_api::agent::TurnSource::Cron,
     )
     .await;
     let (success, output) = match run_result {

@@ -372,6 +372,7 @@ async fn run_agent_job(
                 false,
                 Some(session_path.clone()),
                 job.allowed_tools.clone(),
+                daemonclaw_api::agent::TurnSource::Cron,
             ))
             .await
         }

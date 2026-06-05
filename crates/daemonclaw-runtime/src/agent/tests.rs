@@ -1394,6 +1394,7 @@ mod spine_contract {
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
             0, 0, None, None, None, None, None,
+            daemonclaw_api::agent::TurnSource::Channel,
         ).await.unwrap();
 
         assert!(
@@ -1431,6 +1432,7 @@ mod spine_contract {
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
             0, 0, None, None, None, None, None,
+            daemonclaw_api::agent::TurnSource::Channel,
         ).await.unwrap();
 
         // PreventStop should have forced more than 1 call before the
@@ -1484,6 +1486,7 @@ mod spine_contract {
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
             0, 0, None, None, None, None, None,
+            daemonclaw_api::agent::TurnSource::Channel,
         ).await.unwrap();
 
         // The hook fires on every final response and injects an error,
@@ -1989,6 +1992,7 @@ mod spine_contract {
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
             0, 0, None, None, None, None, None,
+            daemonclaw_api::agent::TurnSource::Channel,
         ).await.unwrap();
 
         // The response text should appear exactly once, not doubled.
@@ -2098,6 +2102,7 @@ mod spine_contract {
             &[], &[], None, None,
             &daemonclaw_config::schema::PacingConfig::default(),
             0, 0, None, None, None, None, None,
+            daemonclaw_api::agent::TurnSource::Channel,
         ).await.unwrap();
 
         // The novel content must survive to delivery.

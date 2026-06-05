@@ -1610,6 +1610,7 @@ impl DelegateTool {
                 None, // receipt_generator
                 None, // collected_receipts
                 self.audit_logger.as_deref(),
+                daemonclaw_api::agent::TurnSource::Channel,
             ),
         )
         .await;

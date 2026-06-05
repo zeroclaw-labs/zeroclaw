@@ -721,6 +721,7 @@ pub async fn agent_turn(
         None, // receipt_generator
         None, // collected_receipts
         audit_logger,
+        daemonclaw_api::agent::TurnSource::Channel, // legacy callers are channel-like
     )
     .await
 }
@@ -889,6 +890,7 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
     audit_logger: Option<&crate::security::audit::AuditLogger>,
+    turn_source: daemonclaw_api::agent::TurnSource,
 ) -> Result<String> {
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -1763,6 +1765,7 @@ pub async fn run_tool_call_loop(
                     tool_call_count: turn_tool_records.len(),
                     tool_calls: std::mem::take(&mut turn_tool_records),
                     active_skill: turn_active_skill.take(),
+                    turn_source,
                     outcome: daemonclaw_api::agent::TurnOutcome::Success,
                     final_response: display_text.clone(),
                     turn_number,
@@ -2507,6 +2510,7 @@ pub async fn run_tool_call_loop(
             tool_call_count: turn_tool_records.len(),
             tool_calls: std::mem::take(&mut turn_tool_records),
             active_skill: turn_active_skill.take(),
+            turn_source,
             outcome: daemonclaw_api::agent::TurnOutcome::Interrupted,
             final_response: accumulated_display_text.clone(),
             turn_number,
@@ -2599,6 +2603,7 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    turn_source: daemonclaw_api::agent::TurnSource,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer_with_workspace(&config.observability, &config.workspace_dir);
@@ -3247,6 +3252,7 @@ pub async fn run(
                         None, // receipt_generator
                         None, // collected_receipts
                         audit_logger.as_ref(),
+                        turn_source,
                     ),
                 )
                 .await
@@ -3580,6 +3586,7 @@ pub async fn run(
                             None, // receipt_generator
                             None, // collected_receipts
                             audit_logger.as_ref(),
+                            turn_source,
                         ),
                     )
                     .await
@@ -5285,6 +5292,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5344,6 +5352,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5397,6 +5406,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5449,6 +5459,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -5508,6 +5519,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -5567,6 +5579,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -5627,6 +5640,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -5685,6 +5699,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -5743,6 +5758,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -5884,6 +5900,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("parallel execution should complete");
@@ -5965,6 +5982,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6038,6 +6056,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6106,6 +6125,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6187,6 +6207,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6258,6 +6279,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6349,6 +6371,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("loop should complete");
@@ -6414,6 +6437,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6506,6 +6530,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -6575,6 +6600,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("streaming provider should complete");
@@ -6647,6 +6673,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -6726,6 +6753,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -6814,6 +6842,7 @@ mod tests {
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -8086,6 +8115,7 @@ Let me check the result."#;
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("tool loop should complete");
@@ -8250,6 +8280,7 @@ Let me check the result."#;
                     None, // receipt_generator
                     None, // collected_receipts
                     None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
                 ),
             )
             .await
@@ -8340,6 +8371,7 @@ Let me check the result."#;
                     None, // receipt_generator
                     None, // collected_receipts
                     None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
                 ),
             )
             .await
@@ -8403,6 +8435,7 @@ Let me check the result."#;
             None, // receipt_generator
             None, // collected_receipts
             None, // audit_logger
+            daemonclaw_api::agent::TurnSource::Channel,
         )
         .await
         .expect("should succeed without cost scope");

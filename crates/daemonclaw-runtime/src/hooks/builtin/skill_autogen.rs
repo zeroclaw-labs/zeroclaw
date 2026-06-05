@@ -147,6 +147,10 @@ impl HookHandler for SkillAutogenHook {
     }
 
     async fn on_turn_complete(&self, result: &TurnResult) -> crate::hooks::traits::TurnCompleteAction {
+        if result.turn_source.is_automated() {
+            return crate::hooks::traits::TurnCompleteAction::Continue;
+        }
+
         if result.tool_call_count < self.min_tool_calls {
             return crate::hooks::traits::TurnCompleteAction::Continue;
         }
@@ -231,6 +235,7 @@ mod tests {
             tool_calls,
             tool_call_count: tool_count,
             active_skill,
+            turn_source: daemonclaw_api::agent::TurnSource::Channel,
             outcome: TurnOutcome::Success,
             final_response: "Done! Nginx config deployed and reloaded.".into(),
             turn_number: 1,
@@ -279,5 +284,38 @@ mod tests {
     fn parse_response_missing_fields() {
         let json = r#"{"name": "test"}"#;
         assert!(SkillAutogenHook::parse_response(json).is_none());
+    }
+
+    fn make_cron_turn_result(tool_count: usize) -> TurnResult {
+        let mut result = make_turn_result(tool_count, None);
+        result.turn_source = daemonclaw_api::agent::TurnSource::Cron;
+        result
+    }
+
+    #[tokio::test]
+    async fn automated_turn_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SkillStore::new(tmp.path()));
+        let observer: Arc<dyn crate::observability::Observer> =
+            Arc::new(crate::observability::noop::NoopObserver);
+        let llm_config = BackgroundLlmConfig {
+            provider_name: "test".into(),
+            api_key: None,
+            model: "test".into(),
+            temperature: 0.0,
+            runtime_options: Default::default(),
+        };
+        let hook = SkillAutogenHook::with_threshold(store, observer, llm_config, 1);
+        let result = make_cron_turn_result(10);
+        let action = hook.on_turn_complete(&result).await;
+        assert_eq!(action, crate::hooks::traits::TurnCompleteAction::Continue);
+    }
+
+    #[test]
+    fn turn_source_automated_flag() {
+        use daemonclaw_api::agent::TurnSource;
+        assert!(TurnSource::Cron.is_automated());
+        assert!(!TurnSource::Cli.is_automated());
+        assert!(!TurnSource::Channel.is_automated());
     }
 }

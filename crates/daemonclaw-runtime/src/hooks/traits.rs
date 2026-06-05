@@ -21,7 +21,7 @@ impl<T> HookResult<T> {
 }
 
 /// Control signal returned by `on_turn_complete` hooks.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TurnCompleteAction {
     /// No opinion — let the loop proceed normally.
     #[default]
