@@ -1421,7 +1421,7 @@ impl LarkChannel {
                     });
 
                     let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
+                        id: lark_msg.message_id.clone(),
                         sender: self
                             .resolve_sender(&lark_msg.chat_id, Some(sender_open_id))
                             .to_string(),
@@ -2105,7 +2105,7 @@ impl LarkChannel {
             });
 
         vec![ChannelMessage {
-            id: Uuid::new_v4().to_string(),
+            id: message_id.to_string(),
             sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -2371,7 +2371,7 @@ impl LarkChannel {
             .unwrap_or(open_id);
 
         messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
+            id: evt_message_id.to_string(),
             sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -5916,6 +5916,76 @@ mod tests {
         assert_eq!(
             INBOUND_ACK_EMOJI_TYPE, "GLANCE",
             "inbound ack policy: a single GLANCE 👀 reaction, no random pool",
+        );
+    }
+
+    /// Regression guard: ChannelMessage.id MUST equal the Feishu om_xxx
+    /// message_id so that the orchestrator's add_reaction calls (which
+    /// pass msg.id straight to `/im/v1/messages/{message_id}/reactions`)
+    /// succeed instead of returning HTTP 400 / code 99992354
+    /// "Invalid ids: [<uuid>]". Replacing the inbound id with
+    /// `Uuid::new_v4()` silently breaks the 👀/✅ ack/done reaction flow.
+    #[tokio::test]
+    async fn lark_inbound_channel_message_id_is_om_xxx_not_uuid() {
+        let ch = make_channel();
+        let om_id = "om_ack_reaction_compat_xyz";
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_testuser123"
+                    }
+                },
+                "message": {
+                    "message_id": om_id,
+                    "message_type": "text",
+                    "content": "{\"text\":\"ack test\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "p2p",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].id, om_id,
+            "ChannelMessage.id must equal the Feishu om_xxx message_id; \
+             otherwise add_reaction returns 99992354 (id not exist). \
+             Got: {:?}",
+            msgs[0].id
+        );
+
+        // Belt-and-suspenders: explicitly assert msg.id is NOT a
+        // UUID-v4 shape (8-4-4-4-12 hex with hyphens). Future "let's
+        // just use UUID" PRs will fail this and prompt a re-read.
+        fn looks_like_uuid_v4(s: &str) -> bool {
+            let bytes = s.as_bytes();
+            if bytes.len() != 36 {
+                return false;
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                let is_hyphen_pos = i == 8 || i == 13 || i == 18 || i == 23;
+                if is_hyphen_pos {
+                    if b != b'-' {
+                        return false;
+                    }
+                } else if !b.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+            true
+        }
+        assert!(
+            !looks_like_uuid_v4(&msgs[0].id),
+            "ChannelMessage.id must NOT be a UUID-v4 shape — Feishu \
+             add_reaction requires the native om_xxx open_message_id. \
+             Got: {:?}",
+            msgs[0].id
         );
     }
 
