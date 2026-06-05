@@ -203,14 +203,12 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
-             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
-             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
+             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\n",
         );
     } else {
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
              Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
         );
     }

@@ -2981,7 +2981,28 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
     instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
     instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
+        "CRITICAL FORMAT RULES:\n\
+         1. The JSON object inside the <tool_call> tags MUST contain exactly two top-level keys: \"name\" (string, matching the tool name) and \"arguments\" (nested JSON object, containing the parameters).\n\
+         2. NEVER write the tool parameters directly at the root of the JSON object. For example, <tool_call>{\"path\": \"file.html\", \"content\": \"...\"}</tool_call> is WRONG and will fail to parse.\n\
+         3. ALWAYS wrap the parameters under the \"arguments\" key and specify \"name\".\n\n\
+         INCORRECT (STRICTLY FORBIDDEN):\n\
+         <tool_call>\n\
+         {\n\
+           \"path\": \"game.html\",\n\
+           \"content\": \"<!DOCTYPE html>...\"\n\
+         }\n\
+         </tool_call>\n\n\
+         CORRECT (REQUIRED):\n\
+         <tool_call>\n\
+         {\n\
+           \"name\": \"file_write\",\n\
+           \"arguments\": {\n\
+             \"path\": \"game.html\",\n\
+             \"content\": \"<!DOCTYPE html>...\"\n\
+           }\n\
+         }\n\
+         </tool_call>\n\n\
+         CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
     );
     instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");

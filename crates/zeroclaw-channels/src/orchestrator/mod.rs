@@ -659,7 +659,8 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
-    match channel_name {
+    let base_name = channel_name.split('.').next().unwrap_or(channel_name);
+    match base_name {
         "matrix" => Some(
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
@@ -668,7 +669,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Paths inside markers MUST be absolute (starting with /). Never use relative paths.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
-             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n\
+             - CRITICAL: If you are providing, sharing, or generating files/code with large contents (e.g. HTML pages, games, scripts, spreadsheets, or long data exports), do NOT paste the code/content in the message directly. Instead, save or locate the file inside the workspace directory, and deliver it as a file attachment using `[DOCUMENT:<absolute-path>]`.\n",
         ),
         "discord" => Some(
             "When responding on Discord:\n\
@@ -677,7 +679,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
              - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - CRITICAL: If you are providing, sharing, or generating files/code with large contents (e.g. HTML pages, games, scripts, spreadsheets, or long data exports), do NOT paste the code/content in the message directly. Discord limits message sizes and will truncate long messages, corrupting files/code blocks. Instead, save or locate the file inside the workspace directory, and deliver it as a file attachment using `[DOCUMENT:<absolute-path>]`.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
@@ -691,7 +694,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.\n\
+             - CRITICAL: If you are providing, sharing, or generating files/code with large contents (e.g. HTML pages, games, scripts, spreadsheets, or long data exports), do NOT paste the code/content in the message directly. Instead, save or locate the file inside the workspace directory, and deliver it as a file attachment using `[DOCUMENT:<path-or-url>]`.\n",
         ),
         "qq" => Some(
             "When responding on QQ:\n\
@@ -700,7 +704,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
                [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - CRITICAL: If you are providing, sharing, or generating files/code with large contents (e.g. HTML pages, games, scripts, spreadsheets, or long data exports), do NOT paste the code/content in the message directly. Instead, save or locate the file inside the workspace directory, and deliver it as a file attachment using `[DOCUMENT:<path-or-url>]`.\n",
         ),
         "wechat" => Some(
             "When responding on WeChat:\n\
@@ -708,7 +713,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
                [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use absolute local paths when sending generated files whenever possible.\n",
+             - Use absolute local paths when sending generated files whenever possible.\n\
+             - CRITICAL: If you are providing, sharing, or generating files/code with large contents (e.g. HTML pages, games, scripts, spreadsheets, or long data exports), do NOT paste the code/content in the message directly. Instead, save or locate the file inside the workspace directory, and deliver it as a file attachment using `[DOCUMENT:<path-or-url>]`.\n",
         ),
         "wecom_ws" => Some(
             "When responding on WeCom AI Bot WebSocket:\n\
@@ -15288,6 +15294,21 @@ BTC is currently around $65,000 based on latest tool output."#
             block.contains("[IMAGE:<absolute-path>]"),
             "discord block must show the absolute-path marker form"
         );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_supports_aliases() {
+        let block_default =
+            channel_delivery_instructions("discord.default").expect("should resolve default alias");
+        assert!(block_default.contains("When responding on Discord:"));
+
+        let block_second =
+            channel_delivery_instructions("discord.second").expect("should resolve second alias");
+        assert!(block_second.contains("When responding on Discord:"));
+
+        let block_telegram = channel_delivery_instructions("telegram.custom")
+            .expect("should resolve telegram alias");
+        assert!(block_telegram.contains("When responding on Telegram:"));
     }
 
     #[test]

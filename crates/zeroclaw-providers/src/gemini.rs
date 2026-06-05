@@ -42,6 +42,7 @@ pub struct GeminiModelProvider {
     /// from `GeminiModelProviderConfig.oauth_client_id` / `oauth_client_secret`.
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -551,6 +552,7 @@ impl GeminiModelProvider {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            max_tokens: None,
         }
     }
     /// Create a new Gemini model_provider with managed OAuth from auth-profiles.json.
@@ -627,7 +629,13 @@ impl GeminiModelProvider {
             auth_profile_override: profile_override,
             oauth_client_id,
             oauth_client_secret,
+            max_tokens: None,
         }
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     fn normalize_non_empty(value: &str) -> Option<String> {
@@ -1180,7 +1188,7 @@ impl GeminiModelProvider {
             system_instruction,
             generation_config: GenerationConfig {
                 temperature,
-                max_output_tokens: 8192,
+                max_output_tokens: self.max_tokens.unwrap_or(8192),
             },
         };
 
@@ -1568,6 +1576,7 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            max_tokens: None,
         }
     }
 
@@ -2353,6 +2362,7 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            max_tokens: None,
         };
 
         let result = model_provider.warmup().await;
