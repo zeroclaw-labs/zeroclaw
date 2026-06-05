@@ -98,14 +98,12 @@ fn detect_from_env(
         return ColorDepth::Ansi16;
     }
 
-    // A multiplexer TERM without a `256` suffix (bare `screen`, `tmux`,
-    // `screen.xterm`, etc.) advertises an 8/16-colour terminfo — emitting
-    // xterm-256 indices into it garbles the display. Treat it as ANSI-16.
-    if multiplexed {
-        return ColorDepth::Ansi16;
-    }
-
-    // Conservative default: most modern xterm-family TERMs support 256.
+    // Everything else — including a multiplexer exporting a bare `screen` /
+    // `tmux` TERM with no colour signal (the common unconfigured SSH+tmux
+    // case) — gets 256. xterm-256 indexed escapes render correctly on
+    // effectively every terminal in use today; the 8-colour-only terminal is
+    // extinct in practice. Truecolor is the only depth that actually breaks
+    // through a multiplexer, and that path is handled above.
     ColorDepth::Ansi256
 }
 
@@ -290,19 +288,23 @@ mod tests {
     }
 
     #[test]
-    fn bare_screen_tmux_term_is_ansi16() {
-        // The real-world breakage: SSH + tmux exporting bare `TERM=screen`
-        // (no `-256color`), no COLORTERM. Its terminfo is 8/16-colour, so
-        // emitting xterm-256 indices garbles the display — must be Ansi16.
+    fn bare_screen_tmux_term_is_256() {
+        // Unconfigured SSH + tmux exports a bare `TERM=screen` with no
+        // COLORTERM. xterm-256 indexed escapes render fine there, so default to
+        // 256 (not 16) — only truecolor is actually clamped by the multiplexer.
         assert_eq!(
             detect_from_env(None, None, Some("screen"), Some("tmux"), true),
-            ColorDepth::Ansi16
+            ColorDepth::Ansi256
         );
         assert_eq!(
             detect_from_env(None, None, Some("tmux"), None, true),
-            ColorDepth::Ansi16
+            ColorDepth::Ansi256
         );
-        // …but the 256-variant still resolves to 256.
+        // Truecolor IS clamped through the multiplexer, down to 256.
+        assert_eq!(
+            detect_from_env(None, Some("truecolor"), Some("screen"), Some("tmux"), true),
+            ColorDepth::Ansi256
+        );
         assert_eq!(
             detect_from_env(None, None, Some("screen-256color"), None, true),
             ColorDepth::Ansi256
