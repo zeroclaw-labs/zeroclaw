@@ -179,6 +179,19 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct SessionKillParams {
+        pub session_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionKillResult {
+        pub session_id: String,
+        pub killed: bool,
+    }
+}
+
+rpc_type! {
     pub struct SessionPromptParams {
         pub session_id: String,
         pub prompt: String,
