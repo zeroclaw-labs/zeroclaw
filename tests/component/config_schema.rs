@@ -12,7 +12,7 @@ fn migrate(toml_str: &str) -> (Config, ProvidersConfig) {
     migration::prepare_table(&mut table);
     let prepared = toml::to_string(&table).expect("failed to re-serialize");
     let compat: V1Compat = toml::from_str(&prepared).expect("failed to deserialize");
-    let (config, providers, _proxy) = compat.into_config_with_providers();
+    let (config, providers, _proxy, _classification) = compat.into_config_with_providers();
     (config, providers)
 }
 

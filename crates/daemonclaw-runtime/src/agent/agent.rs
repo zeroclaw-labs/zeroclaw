@@ -595,7 +595,7 @@ impl Agent {
                     .unwrap_or(0.7),
             )
             .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
+            .classification_config(daemonclaw_config::provider_store::oni_classification_config())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
@@ -1777,6 +1777,8 @@ mod tests {
         use axum::{Json, Router, http::HeaderMap, routing::post};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
 
         let captured_headers: Arc<std::sync::Mutex<Option<HashMap<String, String>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -1825,9 +1827,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some(format!("custom:http://{addr}"));
         {
-            let entry = config.ensure_fallback_provider();
+            use daemonclaw_config::provider_store::try_provider_store;
+            let provider_name = format!("custom:http://{addr}");
+            let mut entry = daemonclaw_config::schema::ModelProviderConfig::default();
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());
             entry.extra_headers.insert(
@@ -1837,6 +1840,10 @@ mod tests {
             entry
                 .extra_headers
                 .insert("X-Title".to_string(), "daemonclaw-web".to_string());
+            if let Some(store) = try_provider_store() {
+                let _ = store.upsert_provider(&provider_name, &entry);
+                let _ = store.set_fallback_name(&provider_name);
+            }
         }
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;

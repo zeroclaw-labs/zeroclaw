@@ -1,15 +1,12 @@
 use crate::util_helpers::MaybeSet;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 use daemonclaw_api::tool::{Tool, ToolResult};
 use daemonclaw_config::policy::SecurityPolicy;
 use daemonclaw_config::provider_store::provider_store;
-use daemonclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
-
-const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
+use daemonclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
 
 pub struct ModelRoutingConfigTool {
     config: Arc<Config>,
@@ -226,12 +223,13 @@ impl ModelRoutingConfigTool {
         })
     }
 
-    fn snapshot(cfg: &Config) -> Value {
+    fn snapshot(_cfg: &Config) -> Value {
         let store = provider_store();
         let mut routes = store.model_routes();
         routes.sort_by(|a, b| a.hint.cmp(&b.hint));
 
-        let mut rules = cfg.query_classification.rules.clone();
+        let classification = store.classification_config();
+        let mut rules = classification.rules;
         rules.sort_by(|a, b| {
             b.priority
                 .cmp(&a.priority)
@@ -269,8 +267,8 @@ impl ModelRoutingConfigTool {
                 "temperature": fallback_provider.as_ref().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
-                "enabled": cfg.query_classification.enabled,
-                "rules_count": cfg.query_classification.rules.len(),
+                "enabled": classification.enabled,
+                "rules_count": rules.len(),
             },
             "scenarios": scenarios,
             "classification_only_rules": classification_only_rules,
@@ -314,8 +312,8 @@ impl ModelRoutingConfigTool {
     }
 
     fn handle_list_hints(&self) -> anyhow::Result<ToolResult> {
-        let cfg = self.load_config_without_env()?;
-        let mut route_hints: Vec<String> = provider_store()
+        let store = provider_store();
+        let mut route_hints: Vec<String> = store
             .model_routes()
             .iter()
             .map(|r| r.hint.clone())
@@ -323,8 +321,8 @@ impl ModelRoutingConfigTool {
         route_hints.sort();
         route_hints.dedup();
 
-        let mut classification_hints: Vec<String> = cfg
-            .query_classification
+        let mut classification_hints: Vec<String> = store
+            .classification_config()
             .rules
             .iter()
             .map(|r| r.hint.clone())
@@ -551,16 +549,13 @@ impl ModelRoutingConfigTool {
         Self::normalize_and_sort_routes(&mut new_routes);
         store.set_model_routes(&new_routes)?;
 
-        let mut cfg = self.load_config_without_env()?;
+        let mut classification = store.classification_config();
 
         if should_touch_rule {
             if matches!(classification_enabled, Some(false)) {
-                cfg.query_classification
-                    .rules
-                    .retain(|rule| rule.hint != hint);
+                classification.rules.retain(|rule| rule.hint != hint);
             } else {
-                let existing_rule = cfg
-                    .query_classification
+                let existing_rule = classification
                     .rules
                     .iter()
                     .find(|rule| rule.hint == hint)
@@ -606,18 +601,17 @@ impl ModelRoutingConfigTool {
                     );
                 }
 
-                cfg.query_classification
-                    .rules
-                    .retain(|rule| rule.hint != hint);
-                cfg.query_classification.rules.push(next_rule);
+                classification.rules.retain(|rule| rule.hint != hint);
+                classification.rules.push(next_rule);
             }
         }
 
-        Self::normalize_and_sort_rules(&mut cfg.query_classification.rules);
-        cfg.query_classification.enabled = !cfg.query_classification.rules.is_empty();
+        Self::normalize_and_sort_rules(&mut classification.rules);
+        classification.enabled = !classification.rules.is_empty();
 
-        cfg.save().await?;
+        store.set_classification_config(&classification)?;
 
+        let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
@@ -639,26 +633,23 @@ impl ModelRoutingConfigTool {
         let store = provider_store();
         let routes_removed = store.remove_model_route(&hint)?;
 
-        let mut cfg = self.load_config_without_env()?;
-
+        let mut classification = store.classification_config();
         let mut rules_removed = 0usize;
         if remove_classification {
-            let before_rules = cfg.query_classification.rules.len();
-            cfg.query_classification
-                .rules
-                .retain(|rule| rule.hint != hint);
-            rules_removed = before_rules.saturating_sub(cfg.query_classification.rules.len());
+            let before_rules = classification.rules.len();
+            classification.rules.retain(|rule| rule.hint != hint);
+            rules_removed = before_rules.saturating_sub(classification.rules.len());
         }
 
         if routes_removed == 0 && rules_removed == 0 {
             anyhow::bail!("No scenario found for hint '{hint}'");
         }
 
-        Self::normalize_and_sort_rules(&mut cfg.query_classification.rules);
-        cfg.query_classification.enabled = !cfg.query_classification.rules.is_empty();
+        Self::normalize_and_sort_rules(&mut classification.rules);
+        classification.enabled = !classification.rules.is_empty();
+        store.set_classification_config(&classification)?;
 
-        cfg.save().await?;
-
+        let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
@@ -848,6 +839,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -879,6 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_scenario_creates_route_and_rule() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -914,6 +909,8 @@ mod tests {
 
     #[tokio::test]
     async fn remove_scenario_also_removes_rule() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -1003,6 +1000,8 @@ mod tests {
         // When no API key is configured (test_config has none), the probe is
         // skipped and any model string is accepted. This verifies the probe-
         // skip path doesn't accidentally reject valid config changes.
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -1027,6 +1026,8 @@ mod tests {
     async fn set_default_temperature_only_skips_probe() {
         // Temperature-only changes don't set a new model, so the probe should
         // not fire at all (no provider/model to probe).
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 

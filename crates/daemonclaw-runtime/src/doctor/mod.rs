@@ -1094,14 +1094,16 @@ mod tests {
 
     #[test]
     fn config_validation_catches_bad_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
-        config
-            .providers
-            .models
-            .entry("default".into())
-            .or_default()
-            .temperature = Some(5.0);
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let mut entry = daemonclaw_config::schema::ModelProviderConfig::default();
+            entry.temperature = Some(5.0);
+            let _ = store.upsert_provider("default", &entry);
+            let _ = store.set_fallback_name("default");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1111,14 +1113,16 @@ mod tests {
 
     #[test]
     fn config_validation_accepts_valid_temperature() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
-        config
-            .providers
-            .models
-            .entry("default".into())
-            .or_default()
-            .temperature = Some(0.7);
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let mut entry = daemonclaw_config::schema::ModelProviderConfig::default();
+            entry.temperature = Some(0.7);
+            let _ = store.upsert_provider("default", &entry);
+            let _ = store.set_fallback_name("default");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1138,8 +1142,13 @@ mod tests {
 
     #[test]
     fn config_validation_catches_unknown_provider() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("totally-fake".into());
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_fallback_name("totally-fake");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items
@@ -1151,8 +1160,13 @@ mod tests {
 
     #[test]
     fn config_validation_catches_malformed_custom_provider() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:".into());
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_fallback_name("custom:");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
@@ -1166,8 +1180,13 @@ mod tests {
 
     #[test]
     fn config_validation_accepts_custom_provider() {
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://my-api.com".into());
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_fallback_name("custom:https://my-api.com");
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));
@@ -1205,13 +1224,18 @@ mod tests {
 
     #[test]
     fn config_validation_warns_empty_model_route() {
-        let mut config = Config::default();
-        config.providers.model_routes = vec![daemonclaw_config::schema::ModelRouteConfig {
-            hint: "fast".into(),
-            provider: "groq".into(),
-            model: String::new(),
-            api_key: None,
-        }];
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_model_routes(&[daemonclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                provider: "groq".into(),
+                model: String::new(),
+                api_key: None,
+            }]);
+        }
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let route_item = items.iter().find(|i| i.message.contains("empty model"));
@@ -1221,14 +1245,19 @@ mod tests {
 
     #[test]
     fn config_validation_warns_empty_embedding_route_model() {
-        let mut config = Config::default();
-        config.providers.embedding_routes = vec![daemonclaw_config::schema::EmbeddingRouteConfig {
-            hint: "semantic".into(),
-            provider: "openai".into(),
-            model: String::new(),
-            dimensions: Some(1536),
-            api_key: None,
-        }];
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_embedding_routes(&[daemonclaw_config::schema::EmbeddingRouteConfig {
+                hint: "semantic".into(),
+                provider: "openai".into(),
+                model: String::new(),
+                dimensions: Some(1536),
+                api_key: None,
+            }]);
+        }
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1242,14 +1271,19 @@ mod tests {
 
     #[test]
     fn config_validation_warns_invalid_embedding_route_provider() {
-        let mut config = Config::default();
-        config.providers.embedding_routes = vec![daemonclaw_config::schema::EmbeddingRouteConfig {
-            hint: "semantic".into(),
-            provider: "groq".into(),
-            model: "text-embedding-3-small".into(),
-            dimensions: None,
-            api_key: None,
-        }];
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _lock = daemonclaw_config::provider_store::test_store_lock();
+        let config = Config::default();
+        if let Some(store) = try_provider_store() {
+            let _ = store.set_embedding_routes(&[daemonclaw_config::schema::EmbeddingRouteConfig {
+                hint: "semantic".into(),
+                provider: "groq".into(),
+                model: "text-embedding-3-small".into(),
+                dimensions: None,
+                api_key: None,
+            }]);
+        }
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);

@@ -47,11 +47,13 @@ pub struct V1Compat {
     #[serde(flatten)]
     pub config: super::schema::Config,
 
-    // ── Provider/proxy TOML sections (now DB-backed, but still parsed for migration) ──
+    // ── Provider/proxy/classification TOML sections (now DB-backed, but still parsed for migration) ──
     #[serde(default)]
     pub providers: crate::providers::ProvidersConfig,
     #[serde(default)]
     pub proxy: super::schema::ProxyConfig,
+    #[serde(default)]
+    pub query_classification: super::schema::QueryClassificationConfig,
 
     // ── Old top-level provider fields (removed in V2) ──
     #[serde(default)]
@@ -82,27 +84,28 @@ pub struct V1Compat {
 
 impl V1Compat {
     /// Consume self, migrating old fields into the current Config layout.
-    /// Returns only the Config; providers/proxy data is discarded.
+    /// Returns only the Config; providers/proxy/classification data is discarded.
     /// Use `into_config_with_providers` when you need the provider data for store migration.
     pub fn into_config(self) -> super::schema::Config {
-        let (config, _providers, _proxy) = self.into_config_with_providers();
+        let (config, _providers, _proxy, _classification) = self.into_config_with_providers();
         config
     }
 
     /// Consume self, migrating old fields, and return Config plus the
-    /// providers/proxy data parsed from TOML (for migration into provider_store).
+    /// providers/proxy/classification data parsed from TOML (for migration into provider_store).
     pub fn into_config_with_providers(
         mut self,
     ) -> (
         super::schema::Config,
         crate::providers::ProvidersConfig,
         super::schema::ProxyConfig,
+        super::schema::QueryClassificationConfig,
     ) {
         let from = self.config.schema_version;
         let needs_migration = from < CURRENT_SCHEMA_VERSION || self.has_legacy_fields();
 
         if !needs_migration {
-            return (self.config, self.providers, self.proxy);
+            return (self.config, self.providers, self.proxy, self.query_classification);
         }
 
         self.migrate_providers();
@@ -115,7 +118,7 @@ impl V1Compat {
              Run `daemonclaw config migrate` to update the file on disk.",
         );
 
-        (self.config, self.providers, self.proxy)
+        (self.config, self.providers, self.proxy, self.query_classification)
     }
 
     fn has_legacy_fields(&self) -> bool {
@@ -263,7 +266,7 @@ pub fn migrate_file(raw: &str) -> Result<Option<String>> {
     if compat.config.schema_version >= CURRENT_SCHEMA_VERSION && !compat.has_legacy_fields() {
         return Ok(None);
     }
-    let (config, providers, proxy) = compat.into_config_with_providers();
+    let (config, providers, proxy, _classification) = compat.into_config_with_providers();
 
     // Serialize the migrated config to get the target table structure.
     // Re-merge providers and proxy so migrate_file preserves them in the TOML

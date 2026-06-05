@@ -6,11 +6,19 @@ use std::sync::OnceLock;
 
 use crate::providers::ProvidersConfig;
 use crate::schema::{
-    EmbeddingRouteConfig, ModelProviderConfig, ModelRouteConfig, ProxyConfig,
+    ClassificationRule, EmbeddingRouteConfig, ModelProviderConfig, ModelRouteConfig,
+    ProxyConfig, QueryClassificationConfig,
 };
 use crate::secrets::SecretStore;
 
 static STORE: OnceLock<ProviderStore> = OnceLock::new();
+
+/// Mutex used to serialise test code that mutates + reads the global
+/// provider store.  Tests that call `set_fallback_name`, `upsert_provider`,
+/// etc. on the shared store should hold this lock for the duration of
+/// their write-then-read sequence to prevent data races with concurrent
+/// tests.
+static TEST_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct ProviderStore {
     db_path: PathBuf,
@@ -160,6 +168,20 @@ impl ProviderStore {
              CREATE TABLE IF NOT EXISTS oni_proxy (
                  id          INTEGER PRIMARY KEY CHECK (id = 1),
                  config_json TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS oni_classification_rules (
+                 hint       TEXT PRIMARY KEY,
+                 keywords   TEXT NOT NULL DEFAULT '[]',
+                 patterns   TEXT NOT NULL DEFAULT '[]',
+                 min_length INTEGER,
+                 max_length INTEGER,
+                 priority   INTEGER NOT NULL DEFAULT 0
+             );
+
+             CREATE TABLE IF NOT EXISTS oni_classification_enabled (
+                 id      INTEGER PRIMARY KEY CHECK (id = 1),
+                 enabled INTEGER NOT NULL DEFAULT 0
              );",
         )
         .context("Failed to create provider store tables")?;
@@ -172,6 +194,7 @@ impl ProviderStore {
         &self,
         providers: &ProvidersConfig,
         proxy: &ProxyConfig,
+        classification: &QueryClassificationConfig,
     ) -> Result<bool> {
         let conn = self.connect()?;
         let count: i64 = conn.query_row(
@@ -224,6 +247,19 @@ impl ProviderStore {
         conn.execute(
             "INSERT OR REPLACE INTO oni_proxy (id, config_json) VALUES (1, ?1)",
             params![proxy_json],
+        )?;
+
+        for rule in &classification.rules {
+            let keywords_json = serde_json::to_string(&rule.keywords)?;
+            let patterns_json = serde_json::to_string(&rule.patterns)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO oni_classification_rules (hint, keywords, patterns, min_length, max_length, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![rule.hint, keywords_json, patterns_json, rule.min_length.map(|v| v as i64), rule.max_length.map(|v| v as i64), rule.priority],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO oni_classification_enabled (id, enabled) VALUES (1, ?1)",
+            params![classification.enabled as i32],
         )?;
 
         let migrated_count = providers.models.len();
@@ -499,6 +535,69 @@ impl ProviderStore {
         Ok(())
     }
 
+    pub fn classification_config(&self) -> QueryClassificationConfig {
+        let conn = match self.connect() {
+            Ok(c) => c,
+            Err(_) => return QueryClassificationConfig::default(),
+        };
+
+        let enabled: bool = conn
+            .query_row(
+                "SELECT enabled != 0 FROM oni_classification_enabled WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+
+        let mut stmt = match conn.prepare(
+            "SELECT hint, keywords, patterns, min_length, max_length, priority FROM oni_classification_rules ORDER BY priority DESC, hint",
+        ) {
+            Ok(s) => s,
+            Err(_) => return QueryClassificationConfig { enabled, rules: Vec::new() },
+        };
+
+        let rules = stmt
+            .query_map([], |r| {
+                let keywords_json: String = r.get(1)?;
+                let patterns_json: String = r.get(2)?;
+                let keywords: Vec<String> =
+                    serde_json::from_str(&keywords_json).unwrap_or_default();
+                let patterns: Vec<String> =
+                    serde_json::from_str(&patterns_json).unwrap_or_default();
+                Ok(ClassificationRule {
+                    hint: r.get(0)?,
+                    keywords,
+                    patterns,
+                    min_length: r.get::<_, Option<i64>>(3)?.map(|v| v as usize),
+                    max_length: r.get::<_, Option<i64>>(4)?.map(|v| v as usize),
+                    priority: r.get(5)?,
+                })
+            })
+            .ok()
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+
+        QueryClassificationConfig { enabled, rules }
+    }
+
+    pub fn set_classification_config(&self, config: &QueryClassificationConfig) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM oni_classification_rules", [])?;
+        for rule in &config.rules {
+            let keywords_json = serde_json::to_string(&rule.keywords)?;
+            let patterns_json = serde_json::to_string(&rule.patterns)?;
+            conn.execute(
+                "INSERT INTO oni_classification_rules (hint, keywords, patterns, min_length, max_length, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![rule.hint, keywords_json, patterns_json, rule.min_length.map(|v| v as i64), rule.max_length.map(|v| v as i64), rule.priority],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO oni_classification_enabled (id, enabled) VALUES (1, ?1)",
+            params![config.enabled as i32],
+        )?;
+        Ok(())
+    }
+
     pub fn secret_store(&self) -> &SecretStore {
         &self.secret_store
     }
@@ -523,9 +622,9 @@ pub fn init_provider_store(
     encrypt_enabled: bool,
 ) -> Result<()> {
     let store = ProviderStore::new(workspace_dir, daemonclaw_dir, encrypt_enabled)?;
-    STORE
-        .set(store)
-        .map_err(|_| anyhow::anyhow!("Provider store already initialized"))?;
+    // OnceLock::set returns Err if already initialized — that's fine,
+    // the first writer wins.  Silently ignore the duplicate.
+    let _ = STORE.set(store);
     Ok(())
 }
 
@@ -537,6 +636,36 @@ pub fn provider_store() -> &'static ProviderStore {
 
 pub fn try_provider_store() -> Option<&'static ProviderStore> {
     STORE.get()
+}
+
+/// Ensure the global provider store is initialized.
+///
+/// If the store has not been initialised yet, creates one backed by a
+/// temporary directory (kept alive for the process lifetime).
+/// If the store is already initialised, this is a no-op.
+///
+/// This is meant for test code in downstream crates that needs the store
+/// present before exercising tool / doctor / wizard helpers.
+pub fn ensure_provider_store_for_tests() {
+    if STORE.get().is_some() {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "daemonclaw-test-store-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&path).expect("create test provider store dir");
+    init_provider_store(&path, &path, false)
+        .expect("test provider store init");
+}
+
+/// Acquire a lock that serialises test access to the shared provider store.
+///
+/// Tests that mutate the global store (set_fallback_name, upsert_provider,
+/// set_model_routes, etc.) and then assert on the result should hold this
+/// guard for the entire write-then-read span.
+pub fn test_store_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn oni_fallback_name() -> Option<String> {
@@ -572,6 +701,13 @@ pub fn oni_proxy() -> ProxyConfig {
     STORE.get().map(|s| s.proxy()).unwrap_or_default()
 }
 
+pub fn oni_classification_config() -> QueryClassificationConfig {
+    STORE
+        .get()
+        .map(|s| s.classification_config())
+        .unwrap_or_default()
+}
+
 // ── Test helper ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -581,7 +717,7 @@ pub fn init_provider_store_for_test(
     proxy: &ProxyConfig,
 ) -> Result<()> {
     let store = ProviderStore::new(workspace_dir, workspace_dir, false)?;
-    store.migrate_from_config(providers, proxy)?;
+    store.migrate_from_config(providers, proxy, &QueryClassificationConfig::default())?;
     let _ = STORE.set(store);
     Ok(())
 }
@@ -637,7 +773,7 @@ mod tests {
         });
 
         let proxy = ProxyConfig::default();
-        let migrated = store.migrate_from_config(&providers, &proxy).unwrap();
+        let migrated = store.migrate_from_config(&providers, &proxy, &QueryClassificationConfig::default()).unwrap();
         assert!(migrated);
 
         assert_eq!(store.fallback_name(), Some("zai".to_string()));
@@ -665,10 +801,10 @@ mod tests {
             },
         );
 
-        assert!(store.migrate_from_config(&providers, &ProxyConfig::default()).unwrap());
+        assert!(store.migrate_from_config(&providers, &ProxyConfig::default(), &QueryClassificationConfig::default()).unwrap());
 
         providers.models.get_mut("zai").unwrap().model = Some("v2".to_string());
-        assert!(!store.migrate_from_config(&providers, &ProxyConfig::default()).unwrap());
+        assert!(!store.migrate_from_config(&providers, &ProxyConfig::default(), &QueryClassificationConfig::default()).unwrap());
 
         let fb = store.fallback_provider().unwrap();
         assert_eq!(fb.model.as_deref(), Some("v1"), "Second migration must not overwrite");

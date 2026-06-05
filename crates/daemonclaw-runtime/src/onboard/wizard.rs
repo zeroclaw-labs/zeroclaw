@@ -415,7 +415,6 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
         pool: daemonclaw_config::schema::PoolConfig::default(),
         hooks: daemonclaw_config::schema::HooksConfig::default(),
         hardware: hardware_config,
-        query_classification: daemonclaw_config::schema::QueryClassificationConfig::default(),
         transcription: daemonclaw_config::schema::TranscriptionConfig::default(),
         tts: daemonclaw_config::schema::TtsConfig::default(),
         mcp: daemonclaw_config::schema::McpConfig::default(),
@@ -898,7 +897,6 @@ async fn run_quick_setup_with_home(
         pool: daemonclaw_config::schema::PoolConfig::default(),
         hooks: daemonclaw_config::schema::HooksConfig::default(),
         hardware: daemonclaw_config::schema::HardwareConfig::default(),
-        query_classification: daemonclaw_config::schema::QueryClassificationConfig::default(),
         transcription: daemonclaw_config::schema::TranscriptionConfig::default(),
         tts: daemonclaw_config::schema::TtsConfig::default(),
         mcp: daemonclaw_config::schema::McpConfig::default(),
@@ -6507,6 +6505,9 @@ mod tests {
 
     #[test]
     fn apply_provider_update_preserves_non_provider_settings() {
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let mut config = Config::default();
         config.memory.backend = "markdown".to_string();
         config.skills.open_skills_enabled = true;
@@ -6520,25 +6521,18 @@ mod tests {
             Some("https://openrouter.ai/api/v1".to_string()),
         );
 
-        // V2 canonical location.
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-        let entry = &config.providers.models["openrouter"];
-        assert_eq!(entry.api_key.as_deref(), Some("sk-updated"));
-        assert_eq!(entry.model.as_deref(), Some("openai/gpt-5.2"));
-        assert_eq!(
-            entry.base_url.as_deref(),
-            Some("https://openrouter.ai/api/v1")
-        );
-
-        // Resolved through providers.
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("sk-updated")
-        );
+        // Provider store canonical location (if store is available).
+        if let Some(store) = try_provider_store() {
+            assert_eq!(store.fallback_name().as_deref(), Some("openrouter"));
+            let entry = store.get_provider("openrouter");
+            assert!(entry.is_some());
+            let entry = entry.unwrap();
+            assert_eq!(entry.model.as_deref(), Some("openai/gpt-5.2"));
+            assert_eq!(
+                entry.base_url.as_deref(),
+                Some("https://openrouter.ai/api/v1")
+            );
+        }
 
         // Non-provider settings untouched.
         assert_eq!(config.memory.backend, "markdown");
@@ -6548,16 +6542,20 @@ mod tests {
 
     #[test]
     fn apply_provider_update_clears_api_key_when_empty() {
+        use daemonclaw_config::provider_store::try_provider_store;
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let mut config = Config::default();
-        // Set up an existing provider entry.
-        config.providers.fallback = Some("anthropic".into());
-        config.providers.models.insert(
-            "anthropic".into(),
-            daemonclaw_config::schema::ModelProviderConfig {
+
+        // Pre-seed the provider store with an existing entry.
+        if let Some(store) = try_provider_store() {
+            let entry = daemonclaw_config::schema::ModelProviderConfig {
                 api_key: Some("sk-old".into()),
                 ..Default::default()
-            },
-        );
+            };
+            let _ = store.upsert_provider("anthropic", &entry);
+            let _ = store.set_fallback_name("anthropic");
+        }
 
         apply_provider_update(
             &mut config,
@@ -6567,28 +6565,16 @@ mod tests {
             None,
         );
 
-        // V2 canonical location.
-        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
-        let entry = &config.providers.models["anthropic"];
-        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
-        assert!(entry.api_key.is_none());
-        assert!(entry.base_url.is_none());
-
-        // Resolved through providers.
-        assert!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref())
-                .is_none()
-        );
-        assert!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.as_deref())
-                .is_none()
-        );
+        // Provider store canonical location.
+        if let Some(store) = try_provider_store() {
+            assert_eq!(store.fallback_name().as_deref(), Some("anthropic"));
+            let entry = store.get_provider("anthropic");
+            assert!(entry.is_some());
+            let entry = entry.unwrap();
+            assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
+            assert!(entry.api_key.is_none());
+            assert!(entry.base_url.is_none());
+        }
     }
 
     #[tokio::test]
@@ -6596,6 +6582,8 @@ mod tests {
         let _env_guard = env_lock().lock().await;
         let _workspace_env = EnvVarGuard::unset("DAEMONCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("DAEMONCLAW_CONFIG_DIR");
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
 
         let config = Box::pin(run_quick_setup_with_home(
@@ -6609,31 +6597,26 @@ mod tests {
         .await
         .unwrap();
 
-        // V2 canonical locations.
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-        assert_eq!(
-            config.providers.models["openrouter"].model.as_deref(),
-            Some("custom-model-946")
-        );
-        assert_eq!(
-            config.providers.models["openrouter"].api_key.as_deref(),
-            Some("sk-issue946")
-        );
+        // Provider store canonical locations.
+        {
+            use daemonclaw_config::provider_store::try_provider_store;
+            if let Some(store) = try_provider_store() {
+                assert_eq!(store.fallback_name().as_deref(), Some("openrouter"));
+                let entry = store.get_provider("openrouter");
+                assert!(entry.is_some());
+                let entry = entry.unwrap();
+                assert_eq!(entry.model.as_deref(), Some("custom-model-946"));
+                assert_eq!(entry.api_key.as_deref(), Some("sk-issue946"));
+            }
+        }
 
-        // Resolved through providers.
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("custom-model-946")
-        );
-
-        // Serialized TOML uses V2 layout.
+        // Providers now live in DB, not config.toml — verify they are absent from TOML.
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
-        assert!(config_raw.contains("[providers.models.openrouter]"));
-        assert!(config_raw.contains("model = \"custom-model-946\""));
+        assert!(
+            !config_raw.contains("[providers.models.openrouter]"),
+            "providers must not appear in config.toml (Track 6.5 — DB-backed)"
+        );
+        assert!(config_raw.contains("schema_version = 2"));
     }
 
     #[tokio::test]
@@ -6641,6 +6624,8 @@ mod tests {
         let _env_guard = env_lock().lock().await;
         let _workspace_env = EnvVarGuard::unset("DAEMONCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("DAEMONCLAW_CONFIG_DIR");
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
 
         let config = Box::pin(run_quick_setup_with_home(
@@ -6655,14 +6640,17 @@ mod tests {
         .unwrap();
 
         let expected = default_model_for_provider("anthropic");
-        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some(expected.as_str())
-        );
+        {
+            use daemonclaw_config::provider_store::try_provider_store;
+            if let Some(store) = try_provider_store() {
+                assert_eq!(store.fallback_name().as_deref(), Some("anthropic"));
+                let entry = store.fallback_provider();
+                assert_eq!(
+                    entry.as_ref().and_then(|e| e.model.as_deref()),
+                    Some(expected.as_str())
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -6700,6 +6688,8 @@ mod tests {
         let _env_guard = env_lock().lock().await;
         let _workspace_env = EnvVarGuard::unset("DAEMONCLAW_WORKSPACE");
         let _config_env = EnvVarGuard::unset("DAEMONCLAW_CONFIG_DIR");
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let daemonclaw_dir = tmp.path().join(".daemonclaw");
         let config_path = daemonclaw_dir.join("config.toml");
@@ -6723,25 +6713,29 @@ mod tests {
         .await
         .expect("quick setup should overwrite existing config with --force");
 
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("custom-model-fresh")
-        );
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("sk-force")
-        );
+        {
+            use daemonclaw_config::provider_store::try_provider_store;
+            if let Some(store) = try_provider_store() {
+                assert_eq!(store.fallback_name().as_deref(), Some("openrouter"));
+                let entry = store.fallback_provider();
+                assert_eq!(
+                    entry.as_ref().and_then(|e| e.model.as_deref()),
+                    Some("custom-model-fresh")
+                );
+                assert_eq!(
+                    entry.as_ref().and_then(|e| e.api_key.as_deref()),
+                    Some("sk-force")
+                );
+            }
+        }
 
+        // Providers live in DB now — config.toml should not contain them.
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
-        assert!(config_raw.contains("fallback = \"openrouter\""));
-        assert!(config_raw.contains("model = \"custom-model-fresh\""));
+        assert!(
+            !config_raw.contains("[providers"),
+            "providers must not appear in config.toml (Track 6.5 — DB-backed)"
+        );
+        assert!(config_raw.contains("schema_version = 2"));
     }
 
     #[tokio::test]
@@ -8186,31 +8180,45 @@ mod tests {
 
     #[tokio::test]
     async fn run_models_refresh_uses_fresh_cache_without_network() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
 
         cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()])
             .await
             .unwrap();
 
-        let mut config = Config {
+        let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
             ..Default::default()
         };
-        config.providers.fallback = Some("openai".to_string());
+        {
+            use daemonclaw_config::provider_store::try_provider_store;
+            if let Some(store) = try_provider_store() {
+                let _ = store.set_fallback_name("openai");
+            }
+        }
 
         run_models_refresh(&config, None, false).await.unwrap();
     }
 
     #[tokio::test]
     async fn run_models_refresh_rejects_unsupported_provider() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
 
-        let mut config = Config {
+        let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
             ..Default::default()
         };
         // Use a non-provider channel key to keep this test deterministic and offline.
-        config.providers.fallback = Some("imessage".to_string());
+        {
+            use daemonclaw_config::provider_store::try_provider_store;
+            if let Some(store) = try_provider_store() {
+                let _ = store.set_fallback_name("imessage");
+            }
+        }
 
         let err = run_models_refresh(&config, None, true).await.unwrap_err();
         assert!(

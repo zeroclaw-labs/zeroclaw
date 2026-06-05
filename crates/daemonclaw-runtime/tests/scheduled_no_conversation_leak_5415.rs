@@ -23,14 +23,12 @@
 //!    `session_state_file=None`).
 //! 5. Assert no captured request body contains the planted unique sentinel.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
-use daemonclaw_config::providers::ProvidersConfig;
 use daemonclaw_config::schema::{Config, ModelProviderConfig};
 use daemonclaw_memory::{Memory, MemoryCategory, SqliteMemory};
 
@@ -100,25 +98,25 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     }
 
     // ── Config pointing the agent at the mock provider ─────────────
-    let mut models = HashMap::new();
-    models.insert(
-        provider_name.clone(),
-        ModelProviderConfig {
-            api_key: Some("test-key".to_string()),
-            model: Some("test-model".to_string()),
-            ..Default::default()
-        },
-    );
     let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: tmp.path().join("config.toml"),
-        providers: ProvidersConfig {
-            fallback: Some(provider_name.clone()),
-            models,
-            ..Default::default()
-        },
         ..Config::default()
     };
+
+    // Set up the provider store with the mock provider.
+    {
+        use daemonclaw_config::provider_store::try_provider_store;
+        if let Some(store) = try_provider_store() {
+            let entry = ModelProviderConfig {
+                api_key: Some("test-key".to_string()),
+                model: Some("test-model".to_string()),
+                ..Default::default()
+            };
+            let _ = store.upsert_provider(&provider_name, &entry);
+            let _ = store.set_fallback_name(&provider_name);
+        }
+    }
     // No retries / no waits — fail fast if the mock has issues, and don't
     // multiply the captured bodies during this test.
     config.reliability.scheduler_retries = 0;

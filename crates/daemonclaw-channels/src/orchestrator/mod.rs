@@ -5529,7 +5529,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         autonomy_level: config.autonomy.level,
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
         model_routes: Arc::new(oni_model_routes()),
-        query_classification: config.query_classification.clone(),
+        query_classification: daemonclaw_config::provider_store::oni_classification_config(),
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {

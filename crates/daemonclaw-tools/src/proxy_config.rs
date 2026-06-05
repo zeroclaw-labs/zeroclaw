@@ -475,6 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_scope_services_requires_services_entries() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -500,6 +502,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -522,6 +526,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
+        daemonclaw_config::provider_store::ensure_provider_store_for_tests();
+        let _store_lock = daemonclaw_config::provider_store::test_store_lock();
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 

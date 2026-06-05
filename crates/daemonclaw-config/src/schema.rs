@@ -162,11 +162,6 @@ pub struct Config {
     #[nested]
     pub pipeline: PipelineConfig,
 
-    /// Automatic query classification — maps user messages to model hints.
-    #[serde(default)]
-    #[nested]
-    pub query_classification: QueryClassificationConfig,
-
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     #[nested]
@@ -9461,7 +9456,6 @@ impl Default for Config {
             pool: PoolConfig::default(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
-            query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
@@ -9825,14 +9819,14 @@ async fn strip_providers_proxy_from_toml(config_path: &Path) -> Result<()> {
     let raw = fs::read_to_string(config_path).await?;
     let mut doc: toml_edit::DocumentMut = raw.parse().context("Failed to parse config.toml")?;
     let mut changed = false;
-    for key in &["providers", "proxy"] {
+    for key in &["providers", "proxy", "query_classification"] {
         if doc.remove(key).is_some() {
             changed = true;
         }
     }
     if changed {
         fs::write(config_path, doc.to_string()).await?;
-        tracing::info!("Stripped [providers] and [proxy] sections from config.toml (migrated to state.db)");
+        tracing::info!("Stripped [providers], [proxy], and [query_classification] sections from config.toml (migrated to state.db)");
     }
     Ok(())
 }
@@ -9977,7 +9971,7 @@ impl Config {
                 toml::to_string(&table).context("Failed to re-serialize prepared table")?;
             let compat: crate::migration::V1Compat =
                 toml::from_str(&table_str).context("Failed to deserialize config file")?;
-            let (mut config, toml_providers, toml_proxy) = compat.into_config_with_providers();
+            let (mut config, toml_providers, toml_proxy, toml_classification) = compat.into_config_with_providers();
 
             // Ensure the built-in default auto_approve entries are always
             // present.  When a user specifies `auto_approve` in their TOML
@@ -10021,7 +10015,7 @@ impl Config {
                 config.secrets.encrypt,
             )?;
             match crate::provider_store::provider_store()
-                .migrate_from_config(&toml_providers, &toml_proxy)
+                .migrate_from_config(&toml_providers, &toml_proxy, &toml_classification)
             {
                 Ok(true) => {
                     if let Err(e) = strip_providers_proxy_from_toml(&config_path).await {
@@ -11557,7 +11551,6 @@ auto_save = true
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
-            query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
