@@ -621,8 +621,12 @@ pub struct LarkChannel {
     /// Populated by `request_approval`, drained by `handle_card_action_event`.
     pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// Seconds to wait for the user's button click before auto-denying.
-    /// Currently hard-coded to 120; lift to `LarkConfig` when a use case
-    /// for per-channel overrides arises.
+    /// Set by the orchestrator from
+    /// `[channels.lark.<alias>].approval_timeout_secs` via
+    /// [`Self::with_approval_timeout_secs`]. Schema default is 300s
+    /// (matches the channel-wide standard used by Telegram, Discord, etc.);
+    /// `LarkChannel::new()` seeds 120 as a conservative fallback for the
+    /// rare construction path that bypasses the builder.
     approval_timeout_secs: u64,
     /// When `true`, [`Self::resolve_sender`] keys group-chat sessions on the
     /// sending user's `open_id` instead of the group's `chat_id`. Default
@@ -656,7 +660,8 @@ pub struct LarkChannel {
     /// writes are guarded by an async mutex so concurrent token streams
     /// cooperate on the same draft without racing the rate-limit window.
     /// Runtime state (not a config duplicate per SSOT) — bounded by the
-    /// number of in-flight drafts; entries are removed by `finalize_draft`.
+    /// number of in-flight drafts; entries are removed by `finalize_draft`
+    /// and `cancel_draft`.
     last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     #[cfg(test)]
     api_base_override: Option<String>,
@@ -783,7 +788,18 @@ impl LarkChannel {
         stream_mode: StreamMode,
         draft_update_interval_ms: u64,
     ) -> Self {
-        self.stream_mode = stream_mode;
+        let effective_stream_mode = match stream_mode {
+            StreamMode::MultiMessage => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,),
+                    "lark: stream_mode=multi_message is not supported by Feishu's editable-card surface; falling back to off (no draft streaming). Use stream_mode=partial for incremental card edits."
+                );
+                StreamMode::Off
+            }
+            other => other,
+        };
+        self.stream_mode = effective_stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
         self
     }
@@ -2828,10 +2844,18 @@ impl Channel for LarkChannel {
 
     /// Replace the draft body with a "cancelled" marker. Feishu does not
     /// expose an official "delete-draft" endpoint, so the closest faithful
-    /// signal is a one-line PATCH that overwrites the card content.
+    /// signal is a one-line PATCH that overwrites the card content. We
+    /// best-effort emit the marker, then unconditionally evict the
+    /// `last_draft_edit` rate-limit entry so the per-message_id slot is
+    /// reclaimed even when the PATCH itself fails (matching the
+    /// `finalize_draft` cleanup contract — see the field doc on
+    /// `last_draft_edit`).
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
-        self.update_draft(recipient, message_id, "_(cancelled)_")
-            .await
+        let result = self
+            .update_draft(recipient, message_id, "_(cancelled)_")
+            .await;
+        self.last_draft_edit.lock().await.remove(message_id);
+        result
     }
 }
 
