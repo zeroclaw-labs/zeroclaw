@@ -58,53 +58,31 @@ fn detect_from_env(
 
     let term = term.unwrap_or("");
 
-    if term.is_empty() || term == "dumb" {
+    // Genuinely capability-free terminals: no TERM, or an explicit dumb/8-16
+    // colour terminfo. Only these get the lossy ANSI-16 path.
+    if term.is_empty() || term == "dumb" || term == "ansi" {
         return ColorDepth::Ansi16;
     }
-
-    // tmux/screen multiplex truecolor only when explicitly configured; their
-    // default `*-256color` TERM clamps 24-bit SGR. Treat them as 256 unless
-    // COLORTERM is propagated through, which only happens with passthrough on.
-    let multiplexed = in_tmux || term.starts_with("screen") || term.starts_with("tmux");
-
-    let colorterm_truecolor = matches!(colorterm, Some(c) if c.eq_ignore_ascii_case("truecolor") || c.eq_ignore_ascii_case("24bit"));
-
-    if colorterm_truecolor && !multiplexed {
-        return ColorDepth::TrueColor;
-    }
-
-    // Terminals known to do truecolor even without COLORTERM, when not behind
-    // a multiplexer that would clamp it.
-    let term_program_truecolor = matches!(
-        term_program,
-        Some(p) if p.eq_ignore_ascii_case("iTerm.app")
-            || p.eq_ignore_ascii_case("WezTerm")
-            || p.eq_ignore_ascii_case("vscode")
-            || p.eq_ignore_ascii_case("ghostty")
-    );
-    if term_program_truecolor && !multiplexed {
-        return ColorDepth::TrueColor;
-    }
-
-    if term.contains("truecolor") || term.contains("direct") {
-        return ColorDepth::TrueColor;
-    }
-
-    if term.contains("256") {
-        return ColorDepth::Ansi256;
-    }
-
     if term.ends_with("-16color") {
         return ColorDepth::Ansi16;
     }
 
-    // Everything else — including a multiplexer exporting a bare `screen` /
-    // `tmux` TERM with no colour signal (the common unconfigured SSH+tmux
-    // case) — gets 256. xterm-256 indexed escapes render correctly on
-    // effectively every terminal in use today; the 8-colour-only terminal is
-    // extinct in practice. Truecolor is the only depth that actually breaks
-    // through a multiplexer, and that path is handled above.
-    ColorDepth::Ansi256
+    // These detection inputs no longer gate the result; truecolor is the
+    // universal default below. Kept in the signature for the tests and for a
+    // future capability probe.
+    let _ = (colorterm, term_program, in_tmux);
+
+    // Default to truecolor. crossterm emits colours verbatim — a 24-bit
+    // `\e[38;2;R;G;Bm` SGR — and that sequence passes through terminal
+    // multiplexers (tmux/screen) uncorrupted even when their TERM advertises a
+    // low-colour terminfo. 256-indexed escapes do NOT: a `screen`/`tmux`
+    // terminfo down-translates `\e[38;5;Nm` to the nearest of the host's 16
+    // ANSI palette slots, collapsing every theme colour onto whatever those
+    // slots happen to be (often near-monochrome). Truecolor sidesteps that
+    // translation, so it is the most faithful universal output for every modern
+    // terminal. The `ZEROCODE_COLOR` override (handled above) forces 256/16 for
+    // the rare terminal that genuinely mishandles 24-bit SGR.
+    ColorDepth::TrueColor
 }
 
 fn parse_override(v: &str) -> Option<ColorDepth> {
@@ -249,93 +227,36 @@ mod tests {
     }
 
     #[test]
-    fn colorterm_truecolor_outside_tmux() {
-        assert_eq!(
-            detect_from_env(None, Some("truecolor"), Some("xterm-256color"), None, false),
-            ColorDepth::TrueColor
-        );
-        assert_eq!(
-            detect_from_env(None, Some("24bit"), Some("xterm-256color"), None, false),
-            ColorDepth::TrueColor
-        );
+    fn defaults_to_truecolor() {
+        // Truecolor is the universal default: it passes through multiplexers
+        // verbatim, whereas 256-indexed escapes get squashed to the host's 16
+        // ANSI slots by a screen/tmux terminfo. So every capable TERM — plain
+        // xterm, 256color, and a bare multiplexer TERM — emits truecolor.
+        for (term, in_tmux) in [
+            ("xterm", false),
+            ("xterm-256color", false),
+            ("screen", true),
+            ("tmux", true),
+            ("screen-256color", true),
+            ("xterm-kitty", false),
+        ] {
+            assert_eq!(
+                detect_from_env(None, None, Some(term), None, in_tmux),
+                ColorDepth::TrueColor,
+                "TERM={term} in_tmux={in_tmux} should default to truecolor"
+            );
+        }
     }
 
     #[test]
-    fn tmux_clamps_truecolor_to_256() {
-        // COLORTERM=truecolor but inside tmux: the multiplexer clamps, so 256.
-        assert_eq!(
-            detect_from_env(None, Some("truecolor"), Some("screen-256color"), None, true),
-            ColorDepth::Ansi256
-        );
-        assert_eq!(
-            detect_from_env(None, Some("truecolor"), Some("tmux-256color"), None, true),
-            ColorDepth::Ansi256
-        );
-    }
-
-    #[test]
-    fn screen_term_is_256_even_without_tmux_envvar() {
-        assert_eq!(
-            detect_from_env(
-                None,
-                Some("truecolor"),
-                Some("screen-256color"),
-                None,
-                false
-            ),
-            ColorDepth::Ansi256
-        );
-    }
-
-    #[test]
-    fn bare_screen_tmux_term_is_256() {
-        // Unconfigured SSH + tmux exports a bare `TERM=screen` with no
-        // COLORTERM. xterm-256 indexed escapes render fine there, so default to
-        // 256 (not 16) — only truecolor is actually clamped by the multiplexer.
+    fn unconfigured_ssh_tmux_emits_truecolor() {
+        // The real-world case: SSH + tmux exports a bare `TERM=screen`, no
+        // COLORTERM. Truecolor passes through uncorrupted, so emit it rather
+        // than 256 (which the screen terminfo would collapse onto the host's
+        // 16 grayscale-able slots).
         assert_eq!(
             detect_from_env(None, None, Some("screen"), Some("tmux"), true),
-            ColorDepth::Ansi256
-        );
-        assert_eq!(
-            detect_from_env(None, None, Some("tmux"), None, true),
-            ColorDepth::Ansi256
-        );
-        // Truecolor IS clamped through the multiplexer, down to 256.
-        assert_eq!(
-            detect_from_env(None, Some("truecolor"), Some("screen"), Some("tmux"), true),
-            ColorDepth::Ansi256
-        );
-        assert_eq!(
-            detect_from_env(None, None, Some("screen-256color"), None, true),
-            ColorDepth::Ansi256
-        );
-    }
-
-    #[test]
-    fn legacy_macos_terminal_app_is_256() {
-        // Terminal.app: TERM_PROGRAM=Apple_Terminal, no COLORTERM, 256color.
-        assert_eq!(
-            detect_from_env(
-                None,
-                None,
-                Some("xterm-256color"),
-                Some("Apple_Terminal"),
-                false
-            ),
-            ColorDepth::Ansi256
-        );
-    }
-
-    #[test]
-    fn iterm_truecolor_when_not_multiplexed() {
-        assert_eq!(
-            detect_from_env(None, None, Some("xterm-256color"), Some("iTerm.app"), false),
             ColorDepth::TrueColor
-        );
-        // …but clamped under tmux.
-        assert_eq!(
-            detect_from_env(None, None, Some("screen-256color"), Some("iTerm.app"), true),
-            ColorDepth::Ansi256
         );
     }
 
@@ -353,6 +274,10 @@ mod tests {
             detect_from_env(None, None, None, None, false),
             ColorDepth::Ansi16
         );
+        assert_eq!(
+            detect_from_env(None, None, Some("ansi"), None, false),
+            ColorDepth::Ansi16
+        );
     }
 
     #[test]
@@ -360,14 +285,6 @@ mod tests {
         assert_eq!(
             detect_from_env(None, None, Some("xterm-16color"), None, false),
             ColorDepth::Ansi16
-        );
-    }
-
-    #[test]
-    fn direct_term_is_truecolor() {
-        assert_eq!(
-            detect_from_env(None, None, Some("xterm-direct"), None, false),
-            ColorDepth::TrueColor
         );
     }
 
