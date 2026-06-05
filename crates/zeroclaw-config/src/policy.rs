@@ -1647,12 +1647,11 @@ impl SecurityPolicy {
             // If the raw token was wrapped in matching quotes, its content
             // is a string literal — ~ inside quotes is NOT expanded by the
             // shell, so skip tilde-based path checks.
-            if (raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\''))
+            if ((raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\'')))
+                && candidate.starts_with('~')
             {
-                if candidate.starts_with('~') {
-                    return None;
-                }
+                return None;
             }
             if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
                 Some(candidate.to_string())
