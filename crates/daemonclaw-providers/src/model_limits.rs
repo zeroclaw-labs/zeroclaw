@@ -125,6 +125,7 @@ static MODEL_TABLE: &[ModelEntry] = &[
     ModelEntry { prefix: "moonshot-v1-8k",               context_window: 8_000 },
     ModelEntry { prefix: "moonshot",                     context_window: 128_000 },
     // ── MiniMax ─────────────────────────────────────────────────────
+    ModelEntry { prefix: "MiniMax-M3",                   context_window: 1_000_000 },
     ModelEntry { prefix: "MiniMax-Text-01",              context_window: 1_000_000 },
     ModelEntry { prefix: "abab7",                        context_window: 245_760 },
     ModelEntry { prefix: "abab6.5",                      context_window: 245_760 },

@@ -3083,10 +3083,41 @@ async fn process_channel_message(
                     new_model
                 );
 
+                // Look up the target provider in the store, falling back to
+                // credential siblings.  When a sibling supplies the credential
+                // we ALSO switch the provider name so the factory picks the
+                // sibling's endpoint (e.g. ZAI subscription covers the ZAI URL,
+                // not the GLM URL, even though the models are the same).
+                let mut effective_provider = new_provider.clone();
+                let switch_entry = daemonclaw_config::provider_store::try_provider_store()
+                    .and_then(|store| {
+                        store.get_provider(&new_provider).or_else(|| {
+                            let siblings = daemonclaw_providers::credential_siblings(&new_provider);
+                            siblings.iter().find_map(|name| {
+                                store.get_provider(name).map(|entry| {
+                                    effective_provider = name.to_string();
+                                    entry
+                                })
+                            })
+                        })
+                    });
+                let switch_key = switch_entry.as_ref()
+                    .and_then(|e| e.api_key.clone());
+                let switch_url = switch_entry.as_ref()
+                    .and_then(|e| e.base_url.clone());
+
+                if effective_provider != new_provider {
+                    tracing::info!(
+                        "Using sibling provider '{}' endpoint for '{}'",
+                        effective_provider,
+                        new_provider
+                    );
+                }
+
                 match create_resilient_provider_nonblocking(
-                    &new_provider,
-                    ctx.api_key.clone(),
-                    ctx.api_url.clone(),
+                    &effective_provider,
+                    switch_key,
+                    switch_url,
                     ctx.reliability.as_ref().clone(),
                     ctx.provider_runtime_options.clone(),
                 )
@@ -3094,7 +3125,7 @@ async fn process_channel_message(
                 {
                     Ok(new_prov) => {
                         active_provider = Arc::from(new_prov);
-                        route.provider = new_provider;
+                        route.provider = effective_provider;
                         route.model = new_model;
                         clear_model_switch_request();
 

@@ -3257,25 +3257,42 @@ pub async fn run(
                 }
                 Err(e) => {
                     if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                        let mut effective_provider = new_provider.clone();
+                        let switch_entry = daemonclaw_config::provider_store::try_provider_store()
+                            .and_then(|store| {
+                                store.get_provider(&new_provider).or_else(|| {
+                                    let siblings = daemonclaw_providers::credential_siblings(&new_provider);
+                                    siblings.iter().find_map(|name| {
+                                        store.get_provider(name).map(|entry| {
+                                            effective_provider = name.to_string();
+                                            entry
+                                        })
+                                    })
+                                })
+                            });
+                        let switch_key = switch_entry.as_ref().and_then(|e| e.api_key.clone());
+                        let switch_url = switch_entry.as_ref().and_then(|e| e.base_url.clone());
+
                         tracing::info!(
-                            "Model switch requested, switching from {} {} to {} {}",
+                            "Model switch requested, switching from {} {} to {} {} (effective provider: {})",
                             provider_name,
                             model_name,
                             new_provider,
-                            new_model
+                            new_model,
+                            effective_provider
                         );
 
                         provider = daemonclaw_providers::create_routed_provider_with_options(
-                            &new_provider,
-                            fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
-                            fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
+                            &effective_provider,
+                            switch_key.as_deref(),
+                            switch_url.as_deref(),
                             &config.reliability,
                             &get_model_routes(),
                             &new_model,
                             &provider_runtime_options,
                         )?;
 
-                        provider_name = new_provider;
+                        provider_name = effective_provider;
                         model_name = new_model;
 
                         clear_model_switch_request();
@@ -3574,25 +3591,42 @@ pub async fn run(
                             break String::new();
                         }
                         if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                            let mut effective_provider = new_provider.clone();
+                            let switch_entry = daemonclaw_config::provider_store::try_provider_store()
+                                .and_then(|store| {
+                                    store.get_provider(&new_provider).or_else(|| {
+                                        let siblings = daemonclaw_providers::credential_siblings(&new_provider);
+                                        siblings.iter().find_map(|name| {
+                                            store.get_provider(name).map(|entry| {
+                                                effective_provider = name.to_string();
+                                                entry
+                                            })
+                                        })
+                                    })
+                                });
+                            let switch_key = switch_entry.as_ref().and_then(|e| e.api_key.clone());
+                            let switch_url = switch_entry.as_ref().and_then(|e| e.base_url.clone());
+
                             tracing::info!(
-                                "Model switch requested, switching from {} {} to {} {}",
+                                "Model switch requested, switching from {} {} to {} {} (effective provider: {})",
                                 provider_name,
                                 model_name,
                                 new_provider,
-                                new_model
+                                new_model,
+                                effective_provider
                             );
 
                             provider = daemonclaw_providers::create_routed_provider_with_options(
-                                &new_provider,
-                                fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
-                                fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
+                                &effective_provider,
+                                switch_key.as_deref(),
+                                switch_url.as_deref(),
                                 &config.reliability,
                                 &get_model_routes(),
                                 &new_model,
                                 &provider_runtime_options,
                             )?;
 
-                            provider_name = new_provider;
+                            provider_name = effective_provider;
                             model_name = new_model;
 
                             clear_model_switch_request();

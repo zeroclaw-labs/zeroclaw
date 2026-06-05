@@ -37,11 +37,11 @@ impl Tool for ModelSwitchTool {
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Provider name (e.g., 'openai', 'anthropic', 'groq', 'ollama'). Required for 'set' and 'list_models' actions."
+                    "description": "Provider name (e.g., 'openai', 'glm', 'minimax'). For 'set': optional if model is given (auto-resolved from model name). For 'list_models': required."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model ID (e.g., 'gpt-4o', 'claude-sonnet-4-6'). Required for 'set' action."
+                    "description": "Model ID (e.g., 'gpt-4o', 'glm-5.1', 'MiniMax-M3'). For 'set': optional if provider is given (uses provider's default model). At least one of provider or model is required for 'set'."
                 }
             },
             "required": ["action"]
@@ -95,44 +95,86 @@ impl ModelSwitchTool {
     }
 
     fn handle_set(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let provider = args.get("provider").and_then(|v| v.as_str());
+        let raw_provider = args.get("provider").and_then(|v| v.as_str());
+        let raw_model = args.get("model").and_then(|v| v.as_str());
 
-        let provider = match provider {
-            Some(p) => p,
-            None => {
+        if raw_provider.is_none() && raw_model.is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "At least one of 'provider' or 'model' is required for 'set' action. \
+                     You can specify just a model (e.g. 'glm-5.1') and the provider will \
+                     be auto-resolved, or just a provider to use its default model."
+                        .to_string(),
+                ),
+            });
+        }
+
+        // --- Resolve provider from model when not explicitly given ---
+        let resolved_provider: String = if let Some(p) = raw_provider {
+            p.to_string()
+        } else {
+            let model = raw_model.unwrap(); // safe: at least one is Some
+            match daemonclaw_providers::resolve_provider_for_model(model) {
+                Some(p) => p.to_string(),
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: serde_json::to_string_pretty(&json!({
+                            "model": model,
+                            "hint": "Could not auto-detect the provider for this model. \
+                                     Please specify the 'provider' parameter explicitly."
+                        }))?,
+                        error: Some(format!(
+                            "Cannot resolve provider for model '{}'. Specify 'provider' explicitly.",
+                            model
+                        )),
+                    });
+                }
+            }
+        };
+
+        // --- Resolve model from provider when not explicitly given ---
+        let resolved_model: String = if let Some(m) = raw_model {
+            m.to_string()
+        } else {
+            // Check the provider store for a configured default model first.
+            let store_model = daemonclaw_config::provider_store::try_provider_store()
+                .and_then(|store| store.get_provider(&resolved_provider))
+                .and_then(|entry| entry.model);
+
+            if let Some(m) = store_model {
+                m
+            } else if let Some(m) = daemonclaw_providers::default_model_for_provider(&resolved_provider) {
+                m.to_string()
+            } else {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
-                    error: Some("Missing 'provider' parameter for 'set' action".to_string()),
+                    output: serde_json::to_string_pretty(&json!({
+                        "provider": resolved_provider,
+                        "hint": "No default model known for this provider. \
+                                 Please specify the 'model' parameter explicitly."
+                    }))?,
+                    error: Some(format!(
+                        "No default model for provider '{}'. Specify 'model' explicitly.",
+                        resolved_provider
+                    )),
                 });
             }
         };
 
-        let model = args.get("model").and_then(|v| v.as_str());
-
-        let model = match model {
-            Some(m) => m,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Missing 'model' parameter for 'set' action".to_string()),
-                });
-            }
-        };
-
-        // Validate the provider exists.
-        // Custom URL-based providers (e.g. "custom:https://api.nvidia.com/v1")
-        // and Anthropic-compatible custom endpoints bypass the known-provider
-        // check because they are not in the static provider list.
-        let is_custom_provider =
-            provider.starts_with("custom:") || provider.starts_with("anthropic-custom:");
+        // Validate the provider exists (skip for custom URL-based providers).
+        let is_custom_provider = resolved_provider.starts_with("custom:")
+            || resolved_provider.starts_with("anthropic-custom:");
 
         if !is_custom_provider {
             let known_providers = daemonclaw_providers::list_providers();
             let provider_valid = known_providers.iter().any(|p| {
-                p.name.eq_ignore_ascii_case(provider)
-                    || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(provider))
+                p.name.eq_ignore_ascii_case(&resolved_provider)
+                    || p.aliases
+                        .iter()
+                        .any(|a| a.eq_ignore_ascii_case(&resolved_provider))
             });
 
             if !provider_valid {
@@ -142,24 +184,41 @@ impl ModelSwitchTool {
                         "available_providers": known_providers.iter().map(|p| p.name).collect::<Vec<_>>()
                     }))?,
                     error: Some(format!(
-                        "Unknown provider: {}. Use 'list_providers' to see available options, or use 'custom:<url>' for custom endpoints.",
-                        provider
+                        "Unknown provider: {}. Use 'list_providers' to see available options, \
+                         or use 'custom:<url>' for custom endpoints.",
+                        resolved_provider
                     )),
                 });
             }
         }
 
+        let mut notes = Vec::new();
+        if raw_provider.is_none() {
+            notes.push(format!(
+                "Provider auto-resolved from model name: '{}'",
+                resolved_provider
+            ));
+        }
+        if raw_model.is_none() {
+            notes.push(format!(
+                "Model auto-resolved from provider default: '{}'",
+                resolved_model
+            ));
+        }
+
         // Set the global model switch request
         let switch_state = get_model_switch_state();
-        *switch_state.lock().unwrap() = Some((provider.to_string(), model.to_string()));
+        *switch_state.lock().unwrap() =
+            Some((resolved_provider.clone(), resolved_model.clone()));
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "message": "Model switch requested",
-                "provider": provider,
-                "model": model,
-                "note": "The agent will switch to this model on the next turn. Use 'get' to check pending switch."
+                "provider": resolved_provider,
+                "model": resolved_model,
+                "auto_resolved": notes,
+                "note": "The agent will switch to this model on the next turn."
             }))?,
             error: None,
         })
@@ -212,14 +271,14 @@ impl ModelSwitchTool {
             "openai" => vec![
                 "gpt-4o",
                 "gpt-4o-mini",
+                "gpt-4.1",
                 "gpt-4-turbo",
-                "gpt-4",
                 "gpt-3.5-turbo",
             ],
             "anthropic" => vec![
                 "claude-sonnet-4-6",
-                "claude-sonnet-4-5",
-                "claude-3-5-sonnet",
+                "claude-opus-4",
+                "claude-3.5-sonnet",
                 "claude-3-opus",
                 "claude-3-haiku",
             ],
@@ -235,14 +294,47 @@ impl ModelSwitchTool {
                 "llama-3.1-70b-speculative",
             ],
             "ollama" => vec!["llama3", "llama3.1", "mistral", "codellama", "phi3"],
-            "deepseek" => vec!["deepseek-chat", "deepseek-coder"],
+            "deepseek" => vec!["deepseek-chat", "deepseek-coder", "deepseek-r1"],
             "mistral" => vec![
                 "mistral-large-latest",
                 "mistral-small-latest",
                 "mistral-nemo",
+                "codestral",
             ],
-            "google" | "gemini" => vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
-            "xai" | "grok" => vec!["grok-2", "grok-2-vision", "grok-beta"],
+            "google" | "gemini" => vec![
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-2.0-flash",
+                "gemini-1.5-pro",
+            ],
+            "xai" | "grok" => vec!["grok-3", "grok-2", "grok-2-vision"],
+            "glm" | "zhipu" | "zai" | "z.ai" => vec![
+                "glm-5",
+                "glm-5-plus",
+                "glm-5-turbo",
+                "glm-5-air",
+                "glm-4-long",
+                "glm-4-plus",
+            ],
+            "minimax" | "minimax-intl" | "minimaxi" => vec![
+                "MiniMax-M3",
+                "MiniMax-Text-01",
+                "abab7",
+                "abab6.5",
+            ],
+            "qwen" | "dashscope" => vec![
+                "qwen3-235b",
+                "qwen3-32b",
+                "qwen-turbo",
+                "qwen-plus",
+                "qwen-max",
+            ],
+            "moonshot" | "kimi" => vec![
+                "moonshot-v1-128k",
+                "moonshot-v1-32k",
+                "moonshot-v1-8k",
+            ],
+            "cohere" => vec!["command-a", "command-r-plus", "command-r"],
             _ => vec![],
         };
 

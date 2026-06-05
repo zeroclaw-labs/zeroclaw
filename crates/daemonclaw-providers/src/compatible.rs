@@ -508,7 +508,9 @@ impl OpenAiCompatibleProvider {
             .next()
             .unwrap_or(model)
             .to_ascii_lowercase();
-        id.contains("deepseek-v3") || id.contains("deepseek_v3")
+        id.contains("deepseek-v3")
+            || id.contains("deepseek_v3")
+            || id.contains("minimax-text-01")
     }
 
     /// Whether system messages should be flattened into the first user message,

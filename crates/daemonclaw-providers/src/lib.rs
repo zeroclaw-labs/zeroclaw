@@ -618,6 +618,26 @@ fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> {
     }
 }
 
+/// Providers that share the same authentication credentials.
+///
+/// Used during model-switch credential lookup: if the target provider has no
+/// key in the store, we check siblings that use the same auth system.
+pub fn credential_siblings(name: &str) -> &'static [&'static str] {
+    // GLM and ZAI are both Zhipu platform products sharing the same JWT key.
+    if is_glm_alias(name) {
+        &["zai"]
+    } else if is_zai_alias(name) {
+        &["glm"]
+    // Qwen and Bailian both use DashScope API keys.
+    } else if is_qwen_alias(name) {
+        &["bailian"]
+    } else if is_bailian_alias(name) {
+        &["qwen"]
+    } else {
+        &[]
+    }
+}
+
 pub fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
     if is_qwen_alias(name) {
         Some("qwen")
@@ -638,6 +658,97 @@ pub fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Resolve a model name to its canonical provider key.
+///
+/// Returns `None` for model families that are hosted by multiple providers
+/// (e.g. llama, phi) — those require an explicit provider.
+pub fn resolve_provider_for_model(model: &str) -> Option<&'static str> {
+    let lower = model.to_lowercase();
+    let normalized = lower.rsplit_once('/').map_or(lower.as_str(), |(_, m)| m);
+
+    // Longest-prefix-first within each family so "gpt-4o-mini" doesn't
+    // accidentally match a shorter prefix from another family.
+    static MODEL_TO_PROVIDER: &[(&str, &str)] = &[
+        // OpenAI
+        ("gpt-", "openai"),
+        ("o1-", "openai"),
+        ("o3-", "openai"),
+        ("o4-", "openai"),
+        // Anthropic
+        ("claude-", "anthropic"),
+        ("claude", "anthropic"),
+        // Google
+        ("gemini-", "gemini"),
+        ("gemini", "gemini"),
+        // GLM / Zhipu
+        ("glm-", "glm"),
+        ("glm", "glm"),
+        // DeepSeek
+        ("deepseek-", "deepseek"),
+        ("deepseek", "deepseek"),
+        // Qwen
+        ("qwen", "qwen"),
+        // Mistral family
+        ("mistral-", "mistral"),
+        ("mistral", "mistral"),
+        ("codestral", "mistral"),
+        ("pixtral", "mistral"),
+        ("ministral", "mistral"),
+        // MiniMax
+        ("minimax-", "minimax"),
+        ("minimax", "minimax"),
+        ("abab", "minimax"),
+        // xAI
+        ("grok-", "xai"),
+        ("grok", "xai"),
+        // Moonshot / Kimi
+        ("moonshot-", "moonshot"),
+        ("moonshot", "moonshot"),
+        // Cohere
+        ("command-", "cohere"),
+        ("command", "cohere"),
+    ];
+
+    for &(prefix, provider) in MODEL_TO_PROVIDER {
+        if normalized.starts_with(prefix) {
+            return Some(provider);
+        }
+    }
+    None
+}
+
+/// Return a reasonable default model for a provider.
+///
+/// The caller should prefer the model stored in [`ProviderStore`] over this
+/// fallback — this is only used when the store has no model configured.
+pub fn default_model_for_provider(provider: &str) -> Option<&'static str> {
+    let lower = provider.to_lowercase();
+    match lower.as_str() {
+        _ if is_minimax_alias(&lower) => Some("MiniMax-M3"),
+        _ if is_glm_alias(&lower) => Some("glm-5"),
+        _ if is_zai_alias(&lower) => Some("glm-5"),
+        _ if is_qwen_alias(&lower) => Some("qwen3-235b"),
+        _ if is_bailian_alias(&lower) => Some("qwen3-235b"),
+        _ if is_moonshot_alias(&lower) => Some("moonshot-v1-128k"),
+        _ if is_deepseek_alias(&lower) => Some("deepseek-chat"),
+        "openai" => Some("gpt-4o"),
+        "anthropic" => Some("claude-sonnet-4-6"),
+        "gemini" | "google" | "google-gemini" => Some("gemini-2.5-flash"),
+        "xai" | "grok" => Some("grok-2"),
+        "mistral" => Some("mistral-large-latest"),
+        "groq" => Some("llama-3.3-70b-versatile"),
+        "cohere" => Some("command-a"),
+        "ollama" => Some("llama3"),
+        "openrouter" => Some("anthropic/claude-sonnet-4-6"),
+        "deepseek" => Some("deepseek-chat"),
+        _ => None,
+    }
+}
+
+fn is_deepseek_alias(name: &str) -> bool {
+    name == "deepseek"
 }
 
 fn minimax_base_url(name: &str) -> Option<&'static str> {
@@ -1331,11 +1442,12 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
-            OpenAiCompatibleProvider::new_merge_system_into_user(
+            OpenAiCompatibleProvider::new_with_vision(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
+                true,
             ),
         )),
         "azure_openai" | "azure-openai" | "azure" => {
@@ -2875,13 +2987,15 @@ mod tests {
     }
 
     #[test]
-    fn factory_minimax_disables_native_tool_calling() {
+    fn factory_minimax_supports_native_tools_and_vision() {
         let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
-        assert!(!minimax.supports_native_tools());
+        assert!(minimax.supports_native_tools());
+        assert!(minimax.supports_vision());
 
         let minimax_cn =
             create_provider("minimax-cn", Some("key")).expect("provider should resolve");
-        assert!(!minimax_cn.supports_native_tools());
+        assert!(minimax_cn.supports_native_tools());
+        assert!(minimax_cn.supports_vision());
     }
 
     #[test]
