@@ -1537,6 +1537,27 @@ impl QuickstartPane {
                 FieldFormRow { descriptor: d, buf }
             })
             .collect();
+        // Prepend an editable alias row for ModelProvider so users can
+        // choose a custom alias instead of the hardcoded "default".
+        if matches!(section, QuickstartFieldSection::ModelProvider) {
+            let default_alias = "default".to_string();
+            rows.insert(
+                0,
+                FieldFormRow {
+                    descriptor: QuickstartFieldDescriptor {
+                        key: "alias".to_string(),
+                        label: crate::i18n::t("zc-quickstart-field-label-alias"),
+                        help: crate::i18n::t("zc-quickstart-field-help-alias"),
+                        kind: crate::client::QuickstartFieldKind::String,
+                        is_secret: false,
+                        enum_variants: None,
+                        required: true,
+                        default: Some(default_alias.clone()),
+                    },
+                    buf: default_alias,
+                },
+            );
+        }
         let alias = match section {
             QuickstartFieldSection::ModelProvider => "default".to_string(),
             _ => type_key.clone(),
@@ -1586,11 +1607,11 @@ impl QuickstartPane {
                 let mut provider_fields: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 for row in &f.fields {
-                    // `model` is hoisted to `FormState::model` for the
-                    // summary line; every other descriptor flows
-                    // through `provider_fields` keyed by its schema
-                    // identifier (kebab-case).
-                    if row.descriptor.key == "model" {
+                    // `model` and `alias` are hoisted to FormState
+                    // fields; every other descriptor flows through
+                    // `provider_fields` keyed by its schema identifier
+                    // (kebab-case).
+                    if row.descriptor.key == "model" || row.descriptor.key == "alias" {
                         continue;
                     }
                     let value = row.buf.trim();
@@ -1599,7 +1620,15 @@ impl QuickstartPane {
                     }
                 }
                 self.form.provider_type = f.type_key.clone();
-                self.form.provider_alias = f.alias.clone();
+                // Read alias from the editable field row; fall back to
+                // `f.alias` for backward compatibility (non-ModelProvider
+                // sections keep the auto-generated alias path).
+                let alias_value = pick("alias");
+                self.form.provider_alias = if alias_value.is_empty() {
+                    f.alias.clone()
+                } else {
+                    alias_value
+                };
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
@@ -1896,8 +1925,6 @@ fn draw_modal(
                     theme::dim_style(),
                 ),
                 Span::styled(f.type_key.as_str(), theme::accent_style()),
-                Span::styled("    Alias: ", theme::dim_style()),
-                Span::styled(f.alias.as_str(), theme::body_style()),
             ]));
             lines.push(Line::from(""));
             for (i, row) in f.fields.iter().enumerate() {
