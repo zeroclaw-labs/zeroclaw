@@ -5024,21 +5024,39 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_bytes_empty_file() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({ "ok": false, "description": "empty document rejected" }),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let mention_only = false;
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
             mention_only,
-        );
+        )
+        .with_api_base(mock_server.uri());
         let file_bytes: Vec<u8> = vec![];
 
         let result = ch
             .send_document_bytes("123456", None, file_bytes, "empty.txt", None)
             .await;
 
-        // Should not panic, will fail at API level
-        assert!(result.is_err());
+        let err = result.expect_err("empty document send should fail");
+        assert!(
+            err.to_string().contains("empty document rejected"),
+            "expected mocked Telegram error, got: {err}"
+        );
     }
 
     #[tokio::test]
