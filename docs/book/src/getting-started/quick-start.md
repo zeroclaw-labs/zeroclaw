@@ -58,6 +58,20 @@ zeroclaw service start
 
 Then use a chat platform channel to reach the agent from Discord, Telegram, or wherever you configured.
 
+## Configure
+
+`zeroclaw onboard` covers first run. To change settings afterward, open
+zerocode and use its **Config** pane rather than editing the config file by
+hand:
+
+```bash
+zerocode
+```
+
+Every setting has a typed control and an inline explanation, and most apply
+live. The docs quote the TOML each control writes so you can see the persisted
+result. See [zerocode](./zerocode/index.md) for details.
+
 ## If onboarding's questions annoy you
 
 Run non-interactively with `--quick`:

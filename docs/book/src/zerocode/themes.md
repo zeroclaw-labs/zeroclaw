@@ -1,12 +1,11 @@
 # Themes & terminal colours
 
-zerocode ships a set of named colour themes shared with the ZeroClaw web
-dashboard and these docs, lets each agent carry its own theme in the Code and
-Chat panes, and adapts its colour output to what the terminal can render.
+zerocode ships a set of named colour themes, lets each agent carry its own theme
+in the Code and Chat panes, and adapts its colour output to what the terminal
+can render.
 
-All theme settings live in the local `zerocode-config.toml` (in the same
-directory as the rest of your ZeroClaw config), independent of which daemon
-zerocode connects to.
+All theme settings live in zerocode's own `zerocode-config.toml`, independent of
+which daemon zerocode connects to.
 
 ## Choosing a theme
 
@@ -25,26 +24,20 @@ see the colours before applying.
 
 ### Available themes
 
-zerocode has 37 themes: two authored locally plus 35 generated from the shared
-theme registry.
-
-The two authored themes:
+Two themes are authored directly in zerocode because they have no registry
+entry:
 
 - **`terminal`** — inherits your terminal's own colours. Every role is left to
   the terminal default and the app skips painting a background, so a tuned shell
   palette shows through untouched.
 - **`icy_blue`** — the default on non-macOS platforms.
 
-The 35 registry themes (snake_case, dark group then light group):
+The remaining themes are generated at build time from the dashboard theme
+registry (`web/src/contexts/themes.json`), the single source of truth zerocode,
+the React dashboard, and these docs all read. The list below is produced by
+`cargo xtask mdbook themes` and included at build time. It is never committed:
 
-`ayu_dark`, `catppuccin_mocha`, `cobalt2`, `default_dark`, `dracula`,
-`everforest_dark`, `flexoki_dark`, `gruvbox_dark`, `hacker_green`,
-`high_contrast_dark`, `kanagawa_dragon`, `kanagawa_wave`, `material_dark`,
-`monokai`, `night_owl`, `nord_dark`, `oled_black`, `one_dark`, `rose_pine`,
-`rose_pine_moon`, `solarized_dark`, `tokyo_night`, `catppuccin_latte`,
-`default_light`, `everforest_light`, `flexoki_light`, `gruvbox_light`,
-`high_contrast_white`, `kanagawa_lotus`, `material_light`, `nord_light`,
-`one_light`, `rose_pine_dawn`, `solarized_light`, `tokyo_night_day`.
+{{#include zerocode-theme-list.md}}
 
 The default theme is `terminal` on macOS and `icy_blue` on every other
 platform.
