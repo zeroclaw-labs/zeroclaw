@@ -1,0 +1,7 @@
+name = "ollama-embed"
+version = "0.1.0"
+description = "Generate text embeddings locally via your own Ollama instance (private RAG)"
+author = "ZeroClaw Labs"
+wasm_path = "ollama_embed.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
