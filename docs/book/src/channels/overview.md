@@ -102,7 +102,7 @@ The `channels` entry binds the channel alias to the agent that should answer it.
 
 ## Pairing
 
-Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. `zeroclaw onboard channels` walks you through pairing each channel you configure; use `zeroclaw channel bind-telegram` for Telegram-specific identities and the channel-specific guide for channels such as WhatsApp or Signal. Without pairing, the channel rejects everything.
+Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. Each channel's setup guide (linked from the matrix above) walks through that channel's pairing flow; `zeroclaw channel bind-telegram` handles Telegram-specific identities. Without pairing, the channel rejects everything.
 
 The rationale: an agent with a public Telegram bot token and no pairing is a publicly-accessible shell. Pairing is the gate.
 
