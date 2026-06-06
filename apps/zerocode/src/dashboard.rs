@@ -1684,6 +1684,19 @@ impl<'a> Dashboard<'a> {
                 self.search_buf.clear();
                 self.last_poll = None; // re-poll for server-side search
             }
+            Some(DashboardTabAction::KillSession) if self.tab == Tab::Sessions => {
+                if let Some(idx) = self.selected_session_index() {
+                    let sid = self.sessions[idx].session_id.clone();
+                    let _ = self.rpc.session_kill(&sid).await;
+                    self.detail_open = false;
+                    self.detail_scroll = 0;
+                    self.session_messages.clear();
+                    self.session_messages_id = None;
+                    self.session_messages_total = 0;
+                    self.session_messages_start = 0;
+                    self.last_poll = None;
+                }
+            }
             _ => {}
         }
         false
@@ -1999,7 +2012,7 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
         }
 
         if self.detail_open {
-            return HelpNode::entries(vec![
+            let mut entries = vec![
                 E::new(
                     vec!["Esc", "Enter"],
                     crate::i18n::t("zc-dashboard-help-close-detail"),
@@ -2025,7 +2038,14 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
                 E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
-            ]);
+            ];
+            if self.tab == Tab::Sessions {
+                entries.push(E::key(
+                    "X",
+                    crate::i18n::t("zc-dashboard-help-kill-session"),
+                ));
+            }
+            return HelpNode::entries(entries);
         }
 
         // Per-tab bindings — only show what actually works on this tab.

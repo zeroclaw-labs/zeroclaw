@@ -46,7 +46,7 @@ mv zeroclaw $PREFIX/bin/
 zeroclaw --version
 
 # Run setup
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 ## Direct Installation via ADB

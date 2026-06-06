@@ -153,11 +153,15 @@ Nearly all of the above landed after beta-1. The items that are specifically new
 - **`zeroclaw-tui` renamed to `zerocode`** across the workspace; the TUI is installed as a standalone app (`cargo install --path apps/zerocode`) rather than a feature of the main binary. The `tui-onboarding` feature is removed.
 - **RPC pairing-token auth removed.** Local IPC is gated by filesystem permissions on the socket; remote access uses WSS (#6837).
 - **`delegation_policy` is now `{ mode = "allow" | "forbidden" }`** — the previous per-agent allow-list is gone; reachable delegates are determined by shared risk profile.
+- **Agent builder API:** `AgentBuilder::memory_loader(Box<dyn MemoryLoader>)` is removed and replaced by `AgentBuilder::memory_strategy(Arc<dyn MemoryStrategy>)`. Callers that previously supplied a custom loader must now wrap it in a `DefaultMemoryStrategy` (or their own `MemoryStrategy` implementation) and pass it via `.memory_strategy(...)`. The builder's default fallback automatically creates a `DefaultMemoryStrategy` when no explicit strategy is provided, so most test and ad-hoc callers are unaffected. (#6850)
 
 ## Known Limitations
 
 This is a beta. The following are known and will be addressed before the full v0.8.0 release:
 
+- **Channel tool-approval timeouts default to 0s.** In practice the per-channel `approval_timeout_secs` resolves to `0` rather than the documented 300s (120s for Telegram), so an `always_ask` tool prompt can auto-deny immediately instead of waiting for an operator. Set `approval_timeout_secs` explicitly on each channel as a workaround.
+- **Onboarding and agent-assignment UX is not final.** Expect rough edges in the onboarding flow and in how agents are assigned during setup.
+- **Web gateway UI is not finalized.** The dashboard is functional but still changing; layout, controls, and routes may shift before stable.
 - **Daemon resident memory does not fully return to baseline** (#6826). Each open zerocode Code (ACP) or Chat session holds its agent and conversation history in RAM; concurrently held sessions are additive, in practice topping out around ~200 MB. glibc arena fragmentation means resident memory does not fully return to the pre-session baseline even after sessions close. Restarting the daemon reclaims it fully.
 - **Daemon restart / reconnect hangs** (#7043). Disconnecting the daemon and reconnecting TUIs across a daemon restart can leave a TUI hung. If this happens, quit and relaunch zerocode.
 - **`onboard` is deprecated.** The legacy onboarding command no longer configures anything — invoking it prints a notice pointing at `zeroclaw quickstart`, and any legacy flags error. Use `zeroclaw quickstart` for setup.

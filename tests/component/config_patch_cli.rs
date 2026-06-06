@@ -3,6 +3,7 @@
 use axum::{Router, routing::patch};
 use parking_lot::Mutex;
 use std::process::{Command, Stdio};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -46,8 +47,8 @@ fn test_state(config: Config) -> AppState {
         )),
         whatsapp: None,
         whatsapp_app_secret: None,
-        linq: None,
-        linq_signing_secret: None,
+        linq: HashMap::new(),
+        linq_signing_secrets: HashMap::new(),
         nextcloud_talk: None,
         nextcloud_talk_webhook_secret: None,
         wati: None,
