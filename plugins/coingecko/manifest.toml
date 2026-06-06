@@ -1,0 +1,7 @@
+name = "coingecko"
+version = "0.1.0"
+description = "Look up live cryptocurrency prices using the CoinGecko API (keyless)"
+author = "ZeroClaw Labs"
+wasm_path = "coingecko.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
