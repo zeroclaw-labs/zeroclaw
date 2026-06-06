@@ -1,0 +1,7 @@
+name = "huggingface"
+version = "0.1.0"
+description = "Run text/JSON models via the Hugging Face Inference API"
+author = "ZeroClaw Labs"
+wasm_path = "huggingface.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
