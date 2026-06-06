@@ -51,11 +51,12 @@ The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen — substit
 
 ## Bootstrap (uppercase tail)
 
-Two env vars decide *where* the config file lives, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface:
+These env vars decide *where* the config file and instance data live, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface. They resolve in the order `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE` (deprecated):
 
 ```sh
-ZEROCLAW_WORKSPACE=/srv/zeroclaw          # workspace root
-ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location
+ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location (takes precedence)
+ZEROCLAW_DATA_DIR=/srv/zeroclaw           # instance data directory (canonical)
+ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DATA_DIR
 ```
 
 The gateway's web-dashboard location is configured via the standard
