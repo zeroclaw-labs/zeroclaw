@@ -97,6 +97,21 @@ fn env_read(var_name: &str) -> Result<String, Error> {
     unsafe { zc_env_read(var_name.to_string()) }
 }
 
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+/// Slicing on a raw byte index (e.g. an error body or a long workflow response)
+/// can land inside a multi-byte character and panic; this walks back to the
+/// nearest char boundary at or before `max`.
+fn truncate_chars(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // ── Output formatting ─────────────────────────────────────────────
 
 /// Build the model-facing output and the mandatory fidelity footer (last,
@@ -204,13 +219,13 @@ pub fn execute(input: String) -> FnResult<String> {
         return fail(format!(
             "n8n webhook error ({}): {}",
             resp.status,
-            &resp.body[..resp.body.len().min(500)]
+            truncate_chars(&resp.body, 500)
         ));
     }
 
     let response_raw = resp.body.trim();
     let truncated = response_raw.len() > MAX_RESPONSE_CHARS;
-    let response = &response_raw[..response_raw.len().min(MAX_RESPONSE_CHARS)];
+    let response = truncate_chars(response_raw, MAX_RESPONSE_CHARS);
 
     Ok(serde_json::to_string(&ToolResult::success(
         format_summary(
@@ -248,5 +263,30 @@ mod tests {
     fn truncation_disclosed() {
         let out = format_summary("f", "x", true);
         assert!(out.contains("truncated to"));
+    }
+
+    #[test]
+    fn truncate_chars_never_splits_multibyte_error_and_response() {
+        // Both the error preview (cap 500) and the success response (cap
+        // MAX_RESPONSE_CHARS) slice the body by index; a cutoff landing inside a
+        // multi-byte character must not panic and must stay on a char boundary.
+        let err_body = "é".repeat(400); // 800 bytes; 500 cutoff is mid-char
+        let cut = truncate_chars(&err_body, 500);
+        assert!(cut.len() <= 500);
+        assert!(err_body.is_char_boundary(cut.len()));
+
+        // Long non-ASCII successful workflow response.
+        let resp_body = "ü".repeat(MAX_RESPONSE_CHARS); // 2 bytes each
+        let resp_cut = truncate_chars(&resp_body, MAX_RESPONSE_CHARS);
+        assert!(resp_cut.len() <= MAX_RESPONSE_CHARS);
+        assert!(resp_body.is_char_boundary(resp_cut.len()));
+        // Formats without panicking.
+        let _ = format_summary("f", resp_cut, true);
+    }
+
+    #[test]
+    fn truncate_chars_short_input_unchanged() {
+        assert_eq!(truncate_chars("hello", 500), "hello");
+        assert_eq!(truncate_chars("", 500), "");
     }
 }
