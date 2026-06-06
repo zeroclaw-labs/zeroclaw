@@ -1046,6 +1046,7 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
         let messages =
             self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
@@ -1054,7 +1055,7 @@ impl ModelProvider for OllamaModelProvider {
             .send_request(
                 api_messages,
                 &normalized_model,
-                temperature,
+                Some(temperature),
                 should_auth,
                 None,
             )
