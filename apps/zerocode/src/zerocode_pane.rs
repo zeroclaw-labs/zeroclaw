@@ -271,7 +271,11 @@ impl ZerocodePane {
             })
             .collect();
         let mut state = ListState::default();
-        state.select(FOCI.iter().position(|f| *f == self.focus));
+        // While assigning a theme to an agent the detail focus is borrowed by
+        // the reusable Theme list, but the section the user is acting on is
+        // Agent Themes — highlight that so the left rail does not claim the
+        // global Theme section is selected.
+        state.select(FOCI.iter().position(|f| *f == self.displayed_focus()));
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" zerocode "))
@@ -280,6 +284,17 @@ impl ZerocodePane {
             area,
             &mut state,
         );
+    }
+
+    /// The section the left rail should highlight. During an agent assignment
+    /// the detail focus is borrowed by the reusable Theme list, but the section
+    /// being acted on is Agent Themes; surface that rather than Theme.
+    fn displayed_focus(&self) -> Focus {
+        if self.theme_target_agent.is_some() {
+            Focus::AgentTheme
+        } else {
+            self.focus
+        }
     }
 
     /// The cursor the theme list is currently driving: the agent-assign cursor
@@ -1550,5 +1565,24 @@ mod tests {
             pane.agent_overrides.contains_key("coder"),
             "agent override was not recorded"
         );
+    }
+
+    // Regression: while assigning a theme to an agent the left rail must
+    // highlight Agent Themes, not Theme — the detail focus is borrowed by the
+    // reusable theme list but the user is acting on the agent section.
+    #[test]
+    fn assign_mode_left_rail_shows_agent_themes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.set_agents(vec!["coder".to_string()]);
+        while pane.focus != Focus::AgentTheme {
+            pane.handle_key(key(KeyCode::Right));
+        }
+        pane.handle_key(key(KeyCode::Enter));
+        // Detail focus is borrowed by the Theme list...
+        assert_eq!(pane.focus, Focus::Theme);
+        assert!(pane.theme_target_agent.is_some());
+        // ...but the left rail still names the section being acted on.
+        assert_eq!(pane.displayed_focus(), Focus::AgentTheme);
     }
 }
