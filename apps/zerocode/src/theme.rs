@@ -245,6 +245,14 @@ pub(crate) fn selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Retained ("you are here") selection for a pane that does NOT currently hold
+/// the cursor. Distinct from `selected_style` (the active cursor): no bold and a
+/// dim foreground so the row reads as a remembered position, not the live focus.
+pub(crate) fn selected_inactive_style() -> Style {
+    let t = active();
+    Style::default().fg(t.dim).bg(t.selection_bg)
+}
+
 pub(crate) fn input_style() -> Style {
     Style::default().fg(active().body)
 }
