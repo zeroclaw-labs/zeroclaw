@@ -1,0 +1,7 @@
+name = "ace-step"
+version = "0.1.0"
+description = "Generate music from text prompts using a self-hosted ACE-Step open-weights model (no vendor API)"
+author = "ZeroClaw Labs"
+wasm_path = "ace_step.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
