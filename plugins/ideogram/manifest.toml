@@ -1,0 +1,7 @@
+name = "ideogram"
+version = "0.1.0"
+description = "Generate images with accurate in-image text using the Ideogram API"
+author = "ZeroClaw Labs"
+wasm_path = "ideogram.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
