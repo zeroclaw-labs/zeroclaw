@@ -474,10 +474,10 @@ pub async fn run(
                             logs_pane.handle_mouse(mouse, content_area);
                         }
                         Mode::Acp => {
-                            acp_pane.handle_mouse(mouse, content_area);
+                            acp_pane.handle_mouse(mouse, content_area).await;
                         }
                         Mode::Chat => {
-                            chat_pane.handle_mouse(mouse, content_area);
+                            chat_pane.handle_mouse(mouse, content_area).await;
                         }
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;

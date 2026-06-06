@@ -133,6 +133,69 @@ impl ConfigSection {
     }
 }
 
+// ── Keymap-derived chord glyphs (footers + help) ─────────────────
+//
+// Footer hints and the help overlay must show the live, possibly-overridden
+// chord for each action — never a hardcoded glyph.
+
+/// First display chord for a `ConfigTabAction`, or its fallback label.
+fn tab_key(action: crate::keymap::ConfigTabAction) -> String {
+    use crate::keymap::RebindableActions;
+    action
+        .resolved()
+        .first()
+        .map(crate::keymap::Chord::display)
+        .unwrap_or_default()
+}
+
+/// All display chords for a `ConfigTabAction`, joined for help rows.
+fn tab_keys(action: crate::keymap::ConfigTabAction) -> Vec<String> {
+    use crate::keymap::RebindableActions;
+    action
+        .resolved()
+        .iter()
+        .map(crate::keymap::Chord::display)
+        .collect()
+}
+
+/// First display chord for a `ConfigEditorAction` (Enter/Esc/Ctrl+S in edits).
+fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
+    use crate::keymap::RebindableActions;
+    action
+        .resolved()
+        .first()
+        .map(crate::keymap::Chord::display)
+        .unwrap_or_default()
+}
+
+/// Joined up/down display chords for list navigation footers.
+fn nav_keys() -> String {
+    use crate::keymap::ConfigTabAction as A;
+    tab_keys(A::Up)
+        .into_iter()
+        .chain(tab_keys(A::Down))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Up+down display chords as a vec, for help rows that render each chord.
+fn nav_keys_split() -> Vec<String> {
+    use crate::keymap::ConfigTabAction as A;
+    tab_keys(A::Up)
+        .into_iter()
+        .chain(tab_keys(A::Down))
+        .collect()
+}
+
+/// Left+right display chords, used by composite-tab switch help rows.
+fn switch_tabs_keys() -> Vec<String> {
+    use crate::keymap::ConfigTabAction as A;
+    tab_keys(A::TabLeft)
+        .into_iter()
+        .chain(tab_keys(A::TabRight))
+        .collect()
+}
+
 // ── App state ────────────────────────────────────────────────────
 
 pub(crate) struct App<'a> {
@@ -1074,6 +1137,11 @@ impl<'a> App<'a> {
                 self.section_cursor += 1;
             }
             Some(ConfigTabAction::Enter) => {
+                return self.enter_section(self.section_cursor).await;
+            }
+            // Right drills into the highlighted section, mirroring the zerocode
+            // tab's cursor model (Enter and Right both step inward).
+            Some(ConfigTabAction::TabRight) => {
                 return self.enter_section(self.section_cursor).await;
             }
             _ => {}
@@ -2427,11 +2495,16 @@ impl<'a> App<'a> {
         self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
-            "↑↓  Enter=open  Esc=clear filter"
+            format!(
+                "{}  {}=open  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
         } else {
-            "?=help"
+            "?=help".to_string()
         };
-        self.draw_footer(frame, r, hints);
+        self.draw_footer(frame, r, &hints);
     }
 
     fn draw_type_list(&mut self, frame: &mut Frame, area: Rect, section_idx: usize) {
@@ -2504,11 +2577,16 @@ impl<'a> App<'a> {
         self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
-            "↑↓  Enter=open  Esc=clear filter"
+            format!(
+                "{}  {}=open  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
         } else {
-            "?=help"
+            "?=help".to_string()
         };
-        self.draw_footer(frame, r, hints);
+        self.draw_footer(frame, r, &hints);
     }
 
     fn draw_alias_list(
@@ -2583,11 +2661,16 @@ impl<'a> App<'a> {
         self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
-            "↑↓  Enter=open  Esc=clear filter"
+            format!(
+                "{}  {}=open  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
         } else {
-            "?=help"
+            "?=help".to_string()
         };
-        self.draw_footer(frame, r, hints);
+        self.draw_footer(frame, r, &hints);
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
@@ -2615,8 +2698,10 @@ impl<'a> App<'a> {
         frame.render_widget(input, r.main);
 
         let footer = format!(
-            "Enter={}  Esc={}",
+            "{}={}  {}={}",
+            editor_key(crate::keymap::ConfigEditorAction::Confirm),
             crate::i18n::t("zc-config-footer-action-create"),
+            editor_key(crate::keymap::ConfigEditorAction::Cancel),
             crate::i18n::t("zc-config-footer-action-cancel"),
         );
         self.draw_footer(frame, r, &footer);
@@ -2760,11 +2845,16 @@ impl<'a> App<'a> {
         self.last_tab_area = tab_area;
 
         let hints = if self.filter.is_some() {
-            "↑↓  Enter=edit  Esc=clear filter"
+            format!(
+                "{}  {}=edit  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
         } else {
-            "?=help"
+            "?=help".to_string()
         };
-        self.draw_footer(frame, r, hints);
+        self.draw_footer(frame, r, &hints);
     }
 
     // ── Composite tab draw methods ──────────────────────────────
@@ -2805,8 +2895,10 @@ impl<'a> App<'a> {
             );
 
             let footer = format!(
-                "Ctrl+S={}  Esc={}",
+                "{}={}  {}={}",
+                editor_key(crate::keymap::ConfigEditorAction::Save),
                 crate::i18n::t("zc-config-footer-action-save"),
+                editor_key(crate::keymap::ConfigEditorAction::Cancel),
                 crate::i18n::t("zc-config-footer-action-back-to-files"),
             );
             self.draw_footer(frame, r, &footer);
@@ -2904,8 +2996,10 @@ impl<'a> App<'a> {
             );
 
             let footer = format!(
-                "Ctrl+S={}  Esc={}",
+                "{}={}  {}={}",
+                editor_key(crate::keymap::ConfigEditorAction::Save),
                 crate::i18n::t("zc-config-footer-action-save"),
+                editor_key(crate::keymap::ConfigEditorAction::Cancel),
                 crate::i18n::t("zc-config-footer-action-back-to-skills"),
             );
             self.draw_footer(frame, r, &footer);
@@ -2915,7 +3009,16 @@ impl<'a> App<'a> {
                 Paragraph::new(Span::styled(
                     crate::i18n::t_args(
                         "zc-config-skills-help-blurb",
-                        &[("enter_chord", "Enter"), ("archive_chord", "x")],
+                        &[
+                            (
+                                "enter_chord",
+                                &tab_key(crate::keymap::ConfigTabAction::Enter),
+                            ),
+                            (
+                                "archive_chord",
+                                &tab_key(crate::keymap::ConfigTabAction::ToggleSecret),
+                            ),
+                        ],
                     ),
                     theme::dim_style(),
                 ))
@@ -3024,11 +3127,16 @@ impl<'a> App<'a> {
             self.last_tab_area = None;
 
             let hints = if self.filter.is_some() {
-                "↑↓  Enter=save  Esc=clear filter"
+                format!(
+                    "{}  {}=save  {}=clear filter",
+                    nav_keys(),
+                    tab_key(crate::keymap::ConfigTabAction::Enter),
+                    tab_key(crate::keymap::ConfigTabAction::Back),
+                )
             } else {
-                "?=help"
+                "?=help".to_string()
             };
-            self.draw_footer(frame, r, hints);
+            self.draw_footer(frame, r, &hints);
         } else {
             // Text input (masked for secrets) — help text always visible.
             frame.render_widget(
@@ -3073,9 +3181,12 @@ impl<'a> App<'a> {
                     r.main,
                 );
                 let footer = format!(
-                    "Enter={}  Ctrl+S={}  Esc={}",
+                    "{}={}  {}={}  {}={}",
+                    editor_key(crate::keymap::ConfigEditorAction::Confirm),
                     crate::i18n::t("zc-config-footer-action-new-line"),
+                    editor_key(crate::keymap::ConfigEditorAction::Save),
                     crate::i18n::t("zc-config-footer-action-save"),
+                    editor_key(crate::keymap::ConfigEditorAction::Cancel),
                     crate::i18n::t("zc-config-footer-action-cancel"),
                 );
                 self.draw_footer(frame, r, &footer);
@@ -3097,8 +3208,10 @@ impl<'a> App<'a> {
             frame.render_widget(input, r.main);
 
             let footer = format!(
-                "Enter={}  Esc={}",
+                "{}={}  {}={}",
+                editor_key(crate::keymap::ConfigEditorAction::Confirm),
                 crate::i18n::t("zc-config-footer-action-save"),
+                editor_key(crate::keymap::ConfigEditorAction::Cancel),
                 crate::i18n::t("zc-config-footer-action-cancel"),
             );
             self.draw_footer(frame, r, &footer);
@@ -3221,117 +3334,128 @@ impl crate::widgets::HelpContext for App<'_> {
 
 impl App<'_> {
     fn zeroclaw_help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::{HelpEntry as E, HelpNode};
+
+        // All chords resolve from the live keymap so overrides/vim/emacs show.
+        let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
+        let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
+        let help = || E::key("?", crate::i18n::t("zc-config-help-this-help"));
+        let filter = || E::key("/", crate::i18n::t("zc-config-help-filter"));
+        let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
+        let back = || k(A::Back, "zc-config-help-back");
+        let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
+
         match &self.screen {
             Screen::SectionList => {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
-                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-config-help-navigate")),
-                        E::key("Enter", crate::i18n::t("zc-config-help-open-section")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-clear-filter")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        k(A::Enter, "zc-config-help-open-section"),
+                        clear_filter(),
+                        help(),
                     ])
                 } else {
+                    let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
-                        E::new(
-                            vec!["↑↓", "j", "k"],
-                            crate::i18n::t("zc-config-help-navigate"),
-                        ),
-                        E::key("Enter", crate::i18n::t("zc-config-help-open-section")),
-                        E::key("/", crate::i18n::t("zc-config-help-filter")),
-                        E::key("q", crate::i18n::t("zc-config-help-quit")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        E::new(open, crate::i18n::t("zc-config-help-open-section")),
+                        filter(),
+                        k(A::Back, "zc-config-help-quit"),
+                        help(),
                         E::spacer(),
-                        E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open")),
+                        mouse_open(),
                     ])
                 }
             }
             Screen::TypeList { .. } => {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
-                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-config-help-navigate")),
-                        E::key("Enter", crate::i18n::t("zc-config-help-open-type")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-clear-filter")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        k(A::Enter, "zc-config-help-open-type"),
+                        clear_filter(),
+                        help(),
                     ])
                 } else {
+                    let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
-                        E::new(
-                            vec!["↑↓", "j", "k"],
-                            crate::i18n::t("zc-config-help-navigate"),
-                        ),
-                        E::key("Enter", crate::i18n::t("zc-config-help-open-type")),
-                        E::key("/", crate::i18n::t("zc-config-help-filter")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-back")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        E::new(open, crate::i18n::t("zc-config-help-open-type")),
+                        filter(),
+                        back(),
+                        help(),
                         E::spacer(),
-                        E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open")),
+                        mouse_open(),
                     ])
                 }
             }
             Screen::AliasList { .. } => {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
-                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-config-help-navigate")),
-                        E::key("Enter", crate::i18n::t("zc-config-help-open-alias")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-clear-filter")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        k(A::Enter, "zc-config-help-open-alias"),
+                        clear_filter(),
+                        help(),
                     ])
                 } else {
+                    let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
-                        E::new(
-                            vec!["↑↓", "j", "k"],
-                            crate::i18n::t("zc-config-help-navigate"),
-                        ),
-                        E::key("Enter", crate::i18n::t("zc-config-help-open-alias")),
-                        E::key("x", crate::i18n::t("zc-config-help-delete-alias")),
-                        E::key("/", crate::i18n::t("zc-config-help-filter")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-back")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        E::new(open, crate::i18n::t("zc-config-help-open-alias")),
+                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        filter(),
+                        back(),
+                        help(),
                         E::spacer(),
-                        E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open")),
+                        mouse_open(),
                     ])
                 }
             }
             Screen::AliasCreate { .. } => HelpNode::entries(vec![
-                E::key("Enter", crate::i18n::t("zc-config-help-create-alias")),
-                E::key("Esc", crate::i18n::t("zc-config-help-cancel")),
-                E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                    crate::i18n::t("zc-config-help-create-alias"),
+                ),
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                    crate::i18n::t("zc-config-help-cancel"),
+                ),
+                help(),
             ]),
             Screen::FieldList { .. } => {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
-                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-config-help-navigate")),
-                        E::key("Enter", crate::i18n::t("zc-config-help-edit-field")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-clear-filter")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        nav(),
+                        k(A::Enter, "zc-config-help-edit-field"),
+                        clear_filter(),
+                        help(),
                     ])
                 } else if self.is_composite_tab() {
                     match self.tab_names.get(self.active_tab) {
                         Some(ConfigTab::Personality) => {
                             if self.personality_active_file.is_some() {
                                 HelpNode::entries(vec![
-                                    E::key("Ctrl+S", crate::i18n::t("zc-config-help-save")),
-                                    E::key("Esc", crate::i18n::t("zc-config-help-back-to-files")),
-                                    E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                                        crate::i18n::t("zc-config-help-save"),
+                                    ),
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                                        crate::i18n::t("zc-config-help-back-to-files"),
+                                    ),
+                                    help(),
                                 ])
                             } else {
                                 HelpNode::entries(vec![
                                     E::new(
-                                        vec!["←→", "h", "l"],
+                                        switch_tabs_keys(),
                                         crate::i18n::t("zc-config-help-switch-tabs"),
                                     ),
-                                    E::new(
-                                        vec!["↑↓", "j", "k"],
-                                        crate::i18n::t("zc-config-help-navigate"),
-                                    ),
-                                    E::key("Enter", crate::i18n::t("zc-config-help-edit-file")),
-                                    E::key(
-                                        "t",
-                                        crate::i18n::t("zc-config-help-fill-from-template"),
-                                    ),
-                                    E::key("Esc", crate::i18n::t("zc-config-help-back")),
-                                    E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                                    nav(),
+                                    k(A::Enter, "zc-config-help-edit-file"),
+                                    k(A::ApplyTemplate, "zc-config-help-fill-from-template"),
+                                    back(),
+                                    help(),
                                     E::spacer(),
                                     E::key("Mouse", crate::i18n::t("zc-config-help-mouse-tabs")),
                                 ])
@@ -3340,24 +3464,27 @@ impl App<'_> {
                         Some(ConfigTab::Skills) => {
                             if self.skills_active.is_some() {
                                 HelpNode::entries(vec![
-                                    E::key("Ctrl+S", crate::i18n::t("zc-config-help-save")),
-                                    E::key("Esc", crate::i18n::t("zc-config-help-back-to-skills")),
-                                    E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                                        crate::i18n::t("zc-config-help-save"),
+                                    ),
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                                        crate::i18n::t("zc-config-help-back-to-skills"),
+                                    ),
+                                    help(),
                                 ])
                             } else {
                                 HelpNode::entries(vec![
                                     E::new(
-                                        vec!["←→", "h", "l"],
+                                        switch_tabs_keys(),
                                         crate::i18n::t("zc-config-help-switch-tabs"),
                                     ),
-                                    E::new(
-                                        vec!["↑↓", "j", "k"],
-                                        crate::i18n::t("zc-config-help-navigate"),
-                                    ),
-                                    E::key("Enter", crate::i18n::t("zc-config-help-edit-skill")),
-                                    E::key("x", crate::i18n::t("zc-config-help-archive-skill")),
-                                    E::key("Esc", crate::i18n::t("zc-config-help-back")),
-                                    E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                                    nav(),
+                                    k(A::Enter, "zc-config-help-edit-skill"),
+                                    k(A::ToggleSecret, "zc-config-help-archive-skill"),
+                                    back(),
+                                    help(),
                                     E::spacer(),
                                     E::key("Mouse", crate::i18n::t("zc-config-help-mouse-tabs")),
                                 ])
@@ -3378,37 +3505,49 @@ impl App<'_> {
                 if self.is_select_edit() {
                     if self.filter.is_some() {
                         HelpNode::entries(vec![
-                            E::new(vec!["↑", "↓"], crate::i18n::t("zc-config-help-navigate")),
-                            E::key("Enter", crate::i18n::t("zc-config-help-save-selection")),
-                            E::key("Esc", crate::i18n::t("zc-config-help-clear-filter")),
-                            E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                            nav(),
+                            k(A::Enter, "zc-config-help-save-selection"),
+                            clear_filter(),
+                            help(),
                         ])
                     } else {
                         HelpNode::entries(vec![
-                            E::new(
-                                vec!["↑↓", "j", "k"],
-                                crate::i18n::t("zc-config-help-navigate"),
-                            ),
-                            E::key("Enter", crate::i18n::t("zc-config-help-save-selection")),
-                            E::key("/", crate::i18n::t("zc-config-help-filter")),
-                            E::key("Esc", crate::i18n::t("zc-config-help-cancel")),
-                            E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                            nav(),
+                            k(A::Enter, "zc-config-help-save-selection"),
+                            filter(),
+                            k(A::Back, "zc-config-help-cancel"),
+                            help(),
                             E::spacer(),
                             E::key("Mouse", crate::i18n::t("zc-config-help-mouse-save")),
                         ])
                     }
                 } else if is_string_array {
                     HelpNode::entries(vec![
-                        E::key("Enter", crate::i18n::t("zc-config-help-new-line-entry")),
-                        E::key("Ctrl+S", crate::i18n::t("zc-config-help-save-array")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-cancel")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                            crate::i18n::t("zc-config-help-new-line-entry"),
+                        ),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                            crate::i18n::t("zc-config-help-save-array"),
+                        ),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                            crate::i18n::t("zc-config-help-cancel"),
+                        ),
+                        help(),
                     ])
                 } else {
                     HelpNode::entries(vec![
-                        E::key("Enter", crate::i18n::t("zc-config-help-save-value")),
-                        E::key("Esc", crate::i18n::t("zc-config-help-cancel")),
-                        E::key("?", crate::i18n::t("zc-config-help-this-help")),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                            crate::i18n::t("zc-config-help-save-value"),
+                        ),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                            crate::i18n::t("zc-config-help-cancel"),
+                        ),
+                        help(),
                     ])
                 }
             }
@@ -3418,23 +3557,33 @@ impl App<'_> {
 
 impl App<'_> {
     fn field_list_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::{HelpEntry as E, HelpNode};
         let has_tabs = !self.tab_names.is_empty();
         let mut entries = Vec::new();
         if has_tabs {
             entries.push(E::new(
-                vec!["←→", "h", "l"],
+                switch_tabs_keys(),
                 crate::i18n::t("zc-config-help-switch-tabs"),
             ));
         }
         entries.push(E::new(
-            vec!["↑↓", "j", "k"],
+            nav_keys_split(),
             crate::i18n::t("zc-config-help-navigate"),
         ));
-        entries.push(E::key("Enter", crate::i18n::t("zc-config-help-edit-field")));
-        entries.push(E::key("d", crate::i18n::t("zc-config-help-reset-default")));
+        entries.push(E::new(
+            tab_keys(A::Enter),
+            crate::i18n::t("zc-config-help-edit-field"),
+        ));
+        entries.push(E::new(
+            tab_keys(A::DeleteRow),
+            crate::i18n::t("zc-config-help-reset-default"),
+        ));
         entries.push(E::key("/", crate::i18n::t("zc-config-help-filter")));
-        entries.push(E::key("Esc", crate::i18n::t("zc-config-help-back")));
+        entries.push(E::new(
+            tab_keys(A::Back),
+            crate::i18n::t("zc-config-help-back"),
+        ));
         entries.push(E::key("?", crate::i18n::t("zc-config-help-this-help")));
         entries.push(E::spacer());
         let mouse = if has_tabs {

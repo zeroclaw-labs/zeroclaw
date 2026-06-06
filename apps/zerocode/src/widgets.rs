@@ -44,7 +44,7 @@ impl HelpEntry {
         }
     }
 
-    /// A keyless description row (no key column, just text).
+    /// Keyless description row (no key column, just text).
     pub fn desc(action: impl Into<String>) -> Self {
         Self {
             keys: vec![],

@@ -68,6 +68,10 @@ zc-zerocode-help-rebind = Rebind selected action
 zc-zerocode-help-reset-default = Reset action to default
 zc-zerocode-help-mouse-label = Mouse
 zc-zerocode-help-mouse-desc = Click pane / row, scroll, click section tab
+zc-zerocode-help-choose-section = Choose section
+zc-zerocode-help-open-section = Open section
+zc-zerocode-help-navigate-rows = Navigate rows
+zc-zerocode-help-back-to-sections = Back to sections
 
 zc-zerocode-agent-modal-title = Select Agent
 zc-zerocode-agent-modal-pick = Pick agent, then choose a theme
@@ -279,6 +283,8 @@ zc-quickstart-modal-action-edit-name = type to edit name
 zc-quickstart-modal-action-on-file-rows = on file rows
 zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
+zc-quickstart-field-label-alias = Alias
+zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
 zc-quickstart-action-done = Done
 zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents can still send messages to channels.
 
