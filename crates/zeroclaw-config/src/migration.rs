@@ -291,6 +291,14 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
 
+/// Sentinel `dropped_security` entry used when the *whole* config is replaced
+/// by `Config::default()` (unparseable TOML, unsupported future schema, broken
+/// migration chain, or a root that cannot be salvaged section-by-section). In
+/// that case every security-critical section is lost at once, so the posture is
+/// degraded and the serving gate must refuse to start without an explicit
+/// operator override — exactly as it does for a single dropped section.
+pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
+
 /// Result of a resilient (never-failing) config load.
 #[derive(Debug, Clone, Default)]
 pub struct ResilientLoad {
@@ -323,7 +331,10 @@ pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
             return ResilientLoad {
                 config: Config::default(),
                 dropped: Vec::new(),
-                dropped_security: Vec::new(),
+                // Whole-config loss degrades the security posture: every
+                // security-critical section is gone, so mark it so the serving
+                // gate refuses to start without an explicit override.
+                dropped_security: vec![WHOLE_CONFIG_SENTINEL.to_string()],
             };
         }
     };
@@ -374,9 +385,11 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     prune_bad_channel_types(&mut salvaged, &mut dropped);
     prune_bad_top_level_sections(&mut salvaged, &mut dropped);
 
+    let mut whole_config_lost = false;
     let config = salvaged.try_into::<Config>().unwrap_or_else(|err| {
         // Nothing in the root table is individually salvageable (e.g. a
         // non-table root). Boot on defaults so repair surfaces are reachable.
+        whole_config_lost = true;
         ::zeroclaw_log::record!(
             ERROR,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -390,6 +403,11 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
 
     let mut dropped_security: Vec<String> = Vec::new();
     let mut dropped_plain: Vec<String> = Vec::new();
+    // A whole-config default loses every security-critical section at once, so
+    // mark it degraded even though no individual section was named in `dropped`.
+    if whole_config_lost {
+        dropped_security.push(WHOLE_CONFIG_SENTINEL.to_string());
+    }
     for path in dropped {
         if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) {
             dropped_security.push(path);
@@ -1057,6 +1075,47 @@ enabled = "not-a-bool"
         let raw = format!("schema_version = {}\n", CURRENT_SCHEMA_VERSION + 100);
         let cfg = migrate_to_current_resilient(&raw);
         assert_eq!(cfg.schema_version, Config::default().schema_version);
+    }
+
+    #[test]
+    fn unparseable_config_marks_whole_config_degraded() {
+        // Whole-config loss loses every security-critical section at once, so it
+        // must mark the posture degraded — otherwise the serving gate has no
+        // signal and boots a defaulted security posture silently.
+        let load = migrate_to_current_salvaged("this is not valid TOML {{{");
+        assert!(
+            load.dropped_security
+                .iter()
+                .any(|p| p == WHOLE_CONFIG_SENTINEL),
+            "unparseable config must degrade security posture, got {:?}",
+            load.dropped_security
+        );
+    }
+
+    #[test]
+    fn future_schema_version_marks_whole_config_degraded() {
+        let raw = format!("schema_version = {}\n", CURRENT_SCHEMA_VERSION + 100);
+        let load = migrate_to_current_salvaged(&raw);
+        assert!(
+            load.dropped_security
+                .iter()
+                .any(|p| p == WHOLE_CONFIG_SENTINEL),
+            "unsupported future schema must degrade security posture, got {:?}",
+            load.dropped_security
+        );
+    }
+
+    #[test]
+    fn unsalvageable_root_marks_whole_config_degraded() {
+        // A root that is not a table cannot be salvaged section-by-section; the
+        // final deserialize fallback defaults the whole config and must mark it.
+        let raw = "schema_version = 3\nthis_is_a_bare_top_level = \"value\"\n[\n";
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            !load.dropped_security.is_empty(),
+            "an unsalvageable root must degrade security posture, got {:?}",
+            load.dropped_security
+        );
     }
 
     #[test]

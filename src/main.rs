@@ -6837,5 +6837,14 @@ mod tests {
             .expect("degraded posture must boot when allowed")
             .expect("allowed degraded posture must spawn a nag task");
         nag.abort();
+
+        // Whole-config loss (sentinel marker) is degraded too: same fail-closed
+        // behavior so a defaulted security posture cannot serve silently.
+        let mut whole = Config::default();
+        whole.degraded_security = vec![crate::config::migration::WHOLE_CONFIG_SENTINEL.to_string()];
+        assert!(
+            gate_security_posture(&whole, false).is_err(),
+            "whole-config loss must fail closed when not explicitly allowed"
+        );
     }
 }
