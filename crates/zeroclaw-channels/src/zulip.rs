@@ -43,6 +43,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -54,7 +55,10 @@ pub struct ZulipChannel {
     server_url: String,
     bot_email: String,
     api_key: String,
-    allowed_users: Vec<String>,
+    /// Resolves the live peer-authorization allowlist from Config on demand.
+    /// Channel handles must NOT cache peer-authorization state — see AGENTS.md
+    /// "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH".
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     streams: Vec<String>,
     default_topic: String,
     event_timeout: Duration,
@@ -155,7 +159,7 @@ impl ZulipChannel {
         server_url: String,
         bot_email: String,
         api_key: String,
-        allowed_users: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         streams: Vec<String>,
         default_topic: String,
         event_timeout_secs: u64,
@@ -165,7 +169,7 @@ impl ZulipChannel {
             server_url: normalize_server_url(&server_url),
             bot_email,
             api_key,
-            allowed_users,
+            peer_resolver,
             streams,
             default_topic: if default_topic.trim().is_empty() {
                 "agent".to_string()
@@ -308,7 +312,8 @@ impl ZulipChannel {
             // `message` array on some Zulip versions. Treat them as no-ops.
             return None;
         }
-        if !is_user_allowed(&msg.sender_email, &self.allowed_users) {
+        let allowed = (self.peer_resolver)();
+        if !is_user_allowed(&msg.sender_email, &allowed) {
             return None;
         }
         let body = msg.content.trim();
@@ -682,7 +687,7 @@ mod tests {
             "https://zulip.example".into(),
             "agent-bot@example".into(),
             "test-key".into(),
-            allowlist,
+            Arc::new(move || allowlist.clone()),
             streams,
             "agent".into(),
             60,
@@ -919,7 +924,7 @@ mod tests {
                 server_uri.to_string(),
                 "agent-bot@example".into(),
                 "test-key".into(),
-                vec!["*".into()],
+                Arc::new(|| vec!["*".into()]),
                 vec!["Engineering".into()],
                 "agent".into(),
                 60,

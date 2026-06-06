@@ -5323,10 +5323,29 @@ fn build_channel_by_id(
                 .mastodon
                 .get("default")
                 .context("Mastodon channel is not configured")?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = "default".to_string();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .mastodon
+                        .get(&alias)
+                        .map(|c| c.allowed_users.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("mastodon", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(MastodonChannel::new(
                 m.instance_url.clone(),
                 m.access_token.clone(),
-                m.allowed_users.clone(),
+                peer_resolver,
                 m.mention_only,
                 m.visibility,
                 m.poll_interval_secs,
@@ -5344,11 +5363,30 @@ fn build_channel_by_id(
                 .rocketchat
                 .get("default")
                 .context("Rocket.Chat channel is not configured")?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = "default".to_string();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .rocketchat
+                        .get(&alias)
+                        .map(|c| c.allowed_users.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("rocketchat", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(RocketChatChannel::new(
                 rc.server_url.clone(),
                 rc.auth_token.clone(),
                 rc.user_id.clone(),
-                rc.allowed_users.clone(),
+                peer_resolver,
                 rc.room_ids.clone(),
                 rc.poll_interval_secs,
                 "default",
@@ -5365,11 +5403,30 @@ fn build_channel_by_id(
                 .zulip
                 .get("default")
                 .context("Zulip channel is not configured")?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = "default".to_string();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .zulip
+                        .get(&alias)
+                        .map(|c| c.allowed_users.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("zulip", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(ZulipChannel::new(
                 zu.server_url.clone(),
                 zu.bot_email.clone(),
                 zu.api_key.clone(),
-                zu.allowed_users.clone(),
+                peer_resolver,
                 zu.streams.clone(),
                 zu.default_topic.clone(),
                 zu.event_timeout_secs,
@@ -5387,12 +5444,31 @@ fn build_channel_by_id(
                 .lemmy
                 .get("default")
                 .context("Lemmy channel is not configured")?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = "default".to_string();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .lemmy
+                        .get(&alias)
+                        .map(|c| c.allowed_users.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("lemmy", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(LemmyChannel::new(
                 lm.instance_url.clone(),
                 lm.username.clone(),
                 lm.password.clone(),
                 lm.jwt.clone(),
-                lm.allowed_users.clone(),
+                peer_resolver,
                 lm.poll_interval_secs,
                 "default",
             )))
@@ -6339,13 +6415,32 @@ fn collect_configured_channels(
         if !m.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .mastodon
+                    .get(&alias)
+                    .map(|c| c.allowed_users.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("mastodon", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Mastodon",
             alias: Some(alias.clone()),
             channel: Arc::new(MastodonChannel::new(
                 m.instance_url.clone(),
                 m.access_token.clone(),
-                m.allowed_users.clone(),
+                peer_resolver,
                 m.mention_only,
                 m.visibility,
                 m.poll_interval_secs,
@@ -6373,6 +6468,25 @@ fn collect_configured_channels(
         if !rc.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .rocketchat
+                    .get(&alias)
+                    .map(|c| c.allowed_users.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("rocketchat", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "RocketChat",
             alias: Some(alias.clone()),
@@ -6380,7 +6494,7 @@ fn collect_configured_channels(
                 rc.server_url.clone(),
                 rc.auth_token.clone(),
                 rc.user_id.clone(),
-                rc.allowed_users.clone(),
+                peer_resolver,
                 rc.room_ids.clone(),
                 rc.poll_interval_secs,
                 alias.clone(),
@@ -6407,6 +6521,25 @@ fn collect_configured_channels(
         if !zu.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .zulip
+                    .get(&alias)
+                    .map(|c| c.allowed_users.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("zulip", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Zulip",
             alias: Some(alias.clone()),
@@ -6414,7 +6547,7 @@ fn collect_configured_channels(
                 zu.server_url.clone(),
                 zu.bot_email.clone(),
                 zu.api_key.clone(),
-                zu.allowed_users.clone(),
+                peer_resolver,
                 zu.streams.clone(),
                 zu.default_topic.clone(),
                 zu.event_timeout_secs,
@@ -6442,6 +6575,25 @@ fn collect_configured_channels(
         if !lm.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .lemmy
+                    .get(&alias)
+                    .map(|c| c.allowed_users.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("lemmy", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Lemmy",
             alias: Some(alias.clone()),
@@ -6450,7 +6602,7 @@ fn collect_configured_channels(
                 lm.username.clone(),
                 lm.password.clone(),
                 lm.jwt.clone(),
-                lm.allowed_users.clone(),
+                peer_resolver,
                 lm.poll_interval_secs,
                 alias.clone(),
             )),

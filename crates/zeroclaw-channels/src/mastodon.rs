@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -44,7 +45,10 @@ const POLL_NOTIFICATION_LIMIT: u32 = 40;
 pub struct MastodonChannel {
     instance_url: String,
     access_token: String,
-    allowed_users: Vec<String>,
+    /// Resolves the live peer-authorization allowlist from Config on demand.
+    /// Channel handles must NOT cache peer-authorization state — see AGENTS.md
+    /// "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH".
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     mention_only: bool,
     visibility: MastodonVisibility,
     poll_interval: Duration,
@@ -135,7 +139,7 @@ impl MastodonChannel {
     pub fn new(
         instance_url: String,
         access_token: String,
-        allowed_users: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         mention_only: bool,
         visibility: MastodonVisibility,
         poll_interval_secs: u64,
@@ -144,7 +148,7 @@ impl MastodonChannel {
         Self {
             instance_url: normalize_instance_url(&instance_url),
             access_token,
-            allowed_users,
+            peer_resolver,
             mention_only,
             visibility,
             poll_interval: Duration::from_secs(poll_interval_secs.max(5)),
@@ -230,8 +234,10 @@ impl MastodonChannel {
             return None;
         }
 
-        // Drop mentions from accounts not in allowed_users.
-        if !is_account_allowed(&notif.account.acct, &self.allowed_users) {
+        // Drop mentions from accounts not in allowed_users. Resolve the
+        // allowlist live from Config (single source of truth).
+        let allowed = (self.peer_resolver)();
+        if !is_account_allowed(&notif.account.acct, &allowed) {
             return None;
         }
 
@@ -626,7 +632,7 @@ mod tests {
         let ch = MastodonChannel::new(
             "https://mastodon.social".into(),
             "test-token".into(),
-            allowlist,
+            Arc::new(move || allowlist.clone()),
             mention_only,
             MastodonVisibility::Direct,
             60,
@@ -949,7 +955,7 @@ mod tests {
             MastodonChannel::new(
                 server_uri.to_string(),
                 "test-token".into(),
-                vec!["*".into()],
+                Arc::new(|| vec!["*".into()]),
                 false,
                 MastodonVisibility::Direct,
                 60,
@@ -1027,7 +1033,7 @@ mod tests {
             let ch = MastodonChannel::new(
                 server.uri(),
                 "test-token".into(),
-                vec!["*".into()],
+                Arc::new(|| vec!["*".into()]),
                 false,
                 MastodonVisibility::Direct,
                 60,

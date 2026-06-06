@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -42,7 +43,10 @@ pub struct RocketChatChannel {
     server_url: String,
     auth_token: String,
     user_id: String,
-    allowed_users: Vec<String>,
+    /// Resolves the live peer-authorization allowlist from Config on demand.
+    /// Channel handles must NOT cache peer-authorization state — see AGENTS.md
+    /// "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH".
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     room_ids: Vec<String>,
     poll_interval: Duration,
     /// The alias key under `[channels.rocketchat.<alias>]` this handle is bound to.
@@ -130,7 +134,7 @@ impl RocketChatChannel {
         server_url: String,
         auth_token: String,
         user_id: String,
-        allowed_users: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         room_ids: Vec<String>,
         poll_interval_secs: u64,
         alias: impl Into<String>,
@@ -139,7 +143,7 @@ impl RocketChatChannel {
             server_url: normalize_server_url(&server_url),
             auth_token,
             user_id,
-            allowed_users,
+            peer_resolver,
             room_ids,
             poll_interval: Duration::from_secs(poll_interval_secs.max(POLL_MIN_SECS)),
             alias: alias.into(),
@@ -182,7 +186,8 @@ impl RocketChatChannel {
             return None;
         }
 
-        if !is_user_allowed(&user.username, &self.allowed_users) {
+        let allowed = (self.peer_resolver)();
+        if !is_user_allowed(&user.username, &allowed) {
             return None;
         }
 
@@ -483,7 +488,7 @@ mod tests {
             "https://chat.example".into(),
             "test-token".into(),
             "BOTUID".into(),
-            allowlist,
+            Arc::new(move || allowlist.clone()),
             rooms,
             10,
             "default",
@@ -688,7 +693,7 @@ mod tests {
                 server_uri.to_string(),
                 "test-token".into(),
                 "BOTUID".into(),
-                vec!["*".into()],
+                Arc::new(|| vec!["*".into()]),
                 vec!["RID1".into()],
                 10,
                 "default",

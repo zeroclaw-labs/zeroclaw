@@ -37,6 +37,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -51,7 +52,10 @@ pub struct LemmyChannel {
     /// Pre-minted JWT supplied by the operator (takes precedence over
     /// username/password login).
     seed_jwt: String,
-    allowed_users: Vec<String>,
+    /// Resolves the live peer-authorization allowlist from Config on demand.
+    /// Channel handles must NOT cache peer-authorization state — see AGENTS.md
+    /// "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH".
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     poll_interval: Duration,
     /// The alias key under `[channels.lemmy.<alias>]` this handle is bound to.
     alias: String,
@@ -176,7 +180,7 @@ impl LemmyChannel {
         username: String,
         password: String,
         jwt: String,
-        allowed_users: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         poll_interval_secs: u64,
         alias: impl Into<String>,
     ) -> Self {
@@ -185,7 +189,7 @@ impl LemmyChannel {
             username,
             password,
             seed_jwt: jwt,
-            allowed_users,
+            peer_resolver,
             poll_interval: Duration::from_secs(poll_interval_secs.max(POLL_MIN_SECS)),
             alias: alias.into(),
             auth: Mutex::new(None),
@@ -302,7 +306,8 @@ impl LemmyChannel {
         if Some(creator.id) == bot_user_id {
             return None;
         }
-        if !is_user_allowed(&creator.acct_form(), &self.allowed_users) {
+        let allowed = (self.peer_resolver)();
+        if !is_user_allowed(&creator.acct_form(), &allowed) {
             return None;
         }
         let body = pm.content.trim();
@@ -623,7 +628,7 @@ mod tests {
             "agent-bot".into(),
             "test-pass".into(),
             "".into(),
-            allowlist,
+            Arc::new(move || allowlist.clone()),
             30,
             "default",
         )
@@ -860,7 +865,7 @@ mod tests {
                 "agent-bot".into(),
                 "test-pass".into(),
                 jwt.unwrap_or("").into(),
-                vec!["*".into()],
+                Arc::new(|| vec!["*".into()]),
                 30,
                 "default",
             )
