@@ -1,0 +1,7 @@
+name = "wolfram"
+version = "0.1.0"
+description = "Answer computational and factual questions via the Wolfram|Alpha LLM API"
+author = "ZeroClaw Labs"
+wasm_path = "wolfram.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
