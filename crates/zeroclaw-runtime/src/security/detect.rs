@@ -2,8 +2,173 @@
 
 use crate::security::traits::Sandbox;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
+
+const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
+const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
+const FIREJAIL_DESCRIPTION: &str = "Linux user-space sandbox (requires firejail to be installed)";
+const BUBBLEWRAP_DESCRIPTION: &str = "User namespace sandbox (requires bwrap)";
+const DOCKER_DESCRIPTION: &str = "Docker container isolation (requires docker)";
+const SEATBELT_DESCRIPTION: &str = "macOS Seatbelt sandbox (built-in sandbox-exec)";
+
+/// Side-effect-light description of the sandbox backend the runtime would use.
+///
+/// Unlike [`create_sandbox`], this does not instantiate backend wrappers, so a
+/// status/doctor command can report sandbox posture without creating temporary
+/// Seatbelt policy files or emitting fallback logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPosture {
+    pub requested_backend: &'static str,
+    pub active_backend: &'static str,
+    pub active_description: &'static str,
+    pub fallback: bool,
+}
+
+/// Inspect sandbox backend selection without constructing a sandbox instance.
+#[must_use]
+pub fn sandbox_posture(sandbox: &SandboxConfig, runtime_kind: &str) -> SandboxPosture {
+    let requested_backend = sandbox_backend_name(&sandbox.backend);
+    if matches!(sandbox.backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
+        return sandbox_posture_result(requested_backend, "none", NOOP_DESCRIPTION);
+    }
+
+    let (active_backend, active_description) = match sandbox.backend {
+        SandboxBackend::Landlock => {
+            if landlock_available() {
+                ("landlock", LANDLOCK_DESCRIPTION)
+            } else {
+                ("none", NOOP_DESCRIPTION)
+            }
+        }
+        SandboxBackend::Firejail => {
+            if command_succeeds("firejail", &["--version"]) {
+                ("firejail", FIREJAIL_DESCRIPTION)
+            } else {
+                ("none", NOOP_DESCRIPTION)
+            }
+        }
+        SandboxBackend::Bubblewrap => {
+            if command_succeeds("bwrap", &["--version"]) {
+                ("bubblewrap", BUBBLEWRAP_DESCRIPTION)
+            } else {
+                ("none", NOOP_DESCRIPTION)
+            }
+        }
+        SandboxBackend::Docker => {
+            if command_succeeds("docker", &["--version"]) {
+                ("docker", DOCKER_DESCRIPTION)
+            } else {
+                ("none", NOOP_DESCRIPTION)
+            }
+        }
+        SandboxBackend::SandboxExec => {
+            if seatbelt_available() {
+                ("sandbox-exec", SEATBELT_DESCRIPTION)
+            } else {
+                ("none", NOOP_DESCRIPTION)
+            }
+        }
+        SandboxBackend::Auto => detect_best_sandbox_posture(runtime_kind),
+        SandboxBackend::None => ("none", NOOP_DESCRIPTION),
+    };
+
+    sandbox_posture_result(requested_backend, active_backend, active_description)
+}
+
+fn sandbox_posture_result(
+    requested_backend: &'static str,
+    active_backend: &'static str,
+    active_description: &'static str,
+) -> SandboxPosture {
+    SandboxPosture {
+        requested_backend,
+        active_backend,
+        active_description,
+        fallback: !matches!(requested_backend, "auto" | "none")
+            && active_backend != requested_backend,
+    }
+}
+
+fn detect_best_sandbox_posture(runtime_kind: &str) -> (&'static str, &'static str) {
+    let skip_docker = runtime_kind == "native";
+
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(feature = "sandbox-landlock")]
+        {
+            if landlock_available() {
+                return ("landlock", LANDLOCK_DESCRIPTION);
+            }
+        }
+
+        if command_succeeds("firejail", &["--version"]) {
+            return ("firejail", FIREJAIL_DESCRIPTION);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(feature = "sandbox-bubblewrap")]
+        {
+            if command_succeeds("bwrap", &["--version"]) {
+                return ("bubblewrap", BUBBLEWRAP_DESCRIPTION);
+            }
+        }
+
+        if seatbelt_available() {
+            return ("sandbox-exec", SEATBELT_DESCRIPTION);
+        }
+    }
+
+    if !skip_docker && command_succeeds("docker", &["--version"]) {
+        return ("docker", DOCKER_DESCRIPTION);
+    }
+
+    ("none", NOOP_DESCRIPTION)
+}
+
+fn command_succeeds(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_available() -> bool {
+    Path::new("/usr/bin/sandbox-exec").exists()
+        || command_succeeds("sandbox-exec", &["-n", "no-network", "true"])
+}
+
+#[cfg(not(target_os = "macos"))]
+fn seatbelt_available() -> bool {
+    false
+}
+
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn landlock_available() -> bool {
+    super::landlock::LandlockSandbox::probe().is_ok()
+}
+
+#[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+fn landlock_available() -> bool {
+    false
+}
+
+fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
+    match backend {
+        SandboxBackend::Auto => "auto",
+        SandboxBackend::Landlock => "landlock",
+        SandboxBackend::Firejail => "firejail",
+        SandboxBackend::Bubblewrap => "bubblewrap",
+        SandboxBackend::Docker => "docker",
+        SandboxBackend::SandboxExec => "sandbox-exec",
+        SandboxBackend::None => "none",
+    }
+}
 
 /// Create a sandbox based on auto-detection or explicit config.
 ///
@@ -286,6 +451,19 @@ mod tests {
     }
 
     #[test]
+    fn explicit_none_posture_returns_noop_without_fallback() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::None,
+            firejail_args: Vec::new(),
+        };
+        let posture = sandbox_posture(&sandbox_cfg, "");
+        assert_eq!(posture.requested_backend, "none");
+        assert_eq!(posture.active_backend, "none");
+        assert!(!posture.fallback);
+    }
+
+    #[test]
     fn auto_mode_detects_something() {
         let sandbox_cfg = SandboxConfig {
             enabled: None, // Auto-detect
@@ -304,6 +482,17 @@ mod tests {
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
         let sandbox = detect_best_sandbox("native", None);
         assert_ne!(sandbox.name(), "docker");
+    }
+
+    #[test]
+    fn native_runtime_auto_posture_never_selects_docker() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+        };
+        let posture = sandbox_posture(&sandbox_cfg, "native");
+        assert_ne!(posture.active_backend, "docker");
     }
 
     #[test]

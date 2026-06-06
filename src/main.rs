@@ -273,6 +273,8 @@ mod schema_markdown;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
+mod security_status;
+#[cfg(feature = "agent-runtime")]
 mod service;
 #[cfg(feature = "agent-runtime")]
 mod skillforge;
@@ -596,6 +598,13 @@ Examples:
         /// Output format: "exit-code" exits 0 if healthy, 1 otherwise (for Docker HEALTHCHECK)
         #[arg(long)]
         format: Option<String>,
+    },
+
+    /// Inspect the active security posture derived from local config and host detection
+    #[cfg(feature = "agent-runtime")]
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
     },
 
     /// Engage, inspect, and resume emergency-stop states.
@@ -2488,6 +2497,21 @@ enum ConfigCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Show security posture for the default or selected agent risk profile
+    Status {
+        /// Agent alias whose effective runtime security posture should be inspected.
+        #[arg(long)]
+        agent: String,
+
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
     /// Print current estop status.
@@ -4061,6 +4085,19 @@ async fn main() -> Result<()> {
                 )
             );
 
+            Ok(())
+        }
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Security {
+            security_command: SecurityCommands::Status { agent, json },
+        } => {
+            let report = security_status::build_report(&config, &agent)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                security_status::print_report(&report);
+            }
             Ok(())
         }
 
@@ -6256,6 +6293,27 @@ mod tests {
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn security_status_cli_requires_agent_and_parses_json_form() {
+        let err = Cli::try_parse_from(["zeroclaw", "security", "status"])
+            .expect_err("security status requires --agent");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "security", "status", "--agent", "ops", "--json"])
+                .expect("security status --agent --json should parse");
+        match cli.command {
+            Commands::Security {
+                security_command: SecurityCommands::Status { agent, json },
+            } => {
+                assert_eq!(agent, "ops");
+                assert!(json);
+            }
+            other => panic!("expected security status command, got {other:?}"),
         }
     }
 
