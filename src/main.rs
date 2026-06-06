@@ -2813,6 +2813,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Authenticate an email channel via OAuth2 device-code flow
+    EmailLogin {
+        /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
+        #[arg(long)]
+        channel: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -6760,6 +6769,51 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 println!("  {model_provider}: {profile_id}");
             }
 
+            Ok(())
+        }
+
+        AuthCommands::EmailLogin { channel, profile } => {
+            let email_cfg = config.channels.email.get(&channel).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No [channels.email.{channel}] block found in config. \
+                     Add the block with an [channels.email.{channel}.oauth2] section first."
+                ))
+            })?;
+
+            let oauth2 = email_cfg.oauth2.as_ref().ok_or_else(|| anyhow::Error::msg(format!(
+                "[channels.email.{channel}] exists but has no [channels.email.{channel}.oauth2] block."
+            )))?;
+
+            let client = reqwest::Client::new();
+            let device = auth::email_oauth2::start_device_code_flow(
+                &client,
+                &oauth2.device_code_url,
+                &oauth2.client_id,
+                &oauth2.scopes,
+            )
+            .await?;
+
+            println!("Email OAuth2 device-code login started.");
+            println!("Visit:  {}", device.verification_uri);
+            println!("Code:   {}", device.user_code);
+            if let Some(ref uri) = device.verification_uri_complete {
+                println!("Or open directly: {uri}");
+            }
+            println!("Waiting for authorization…");
+
+            let token_set = auth::email_oauth2::poll_device_code_tokens(
+                &client,
+                &oauth2.token_url,
+                &oauth2.client_id,
+                &device,
+            )
+            .await?;
+
+            let channel_alias = format!("email.{channel}");
+            auth_service
+                .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
+                .await?;
+            println!("Saved profile {profile} for {channel_alias}");
             Ok(())
         }
     }
