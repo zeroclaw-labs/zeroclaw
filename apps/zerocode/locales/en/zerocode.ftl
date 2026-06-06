@@ -64,6 +64,10 @@ zc-zerocode-help-rebind = Rebind selected action
 zc-zerocode-help-reset-default = Reset action to default
 zc-zerocode-help-mouse-label = Mouse
 zc-zerocode-help-mouse-desc = Click pane / row, scroll, click section tab
+zc-zerocode-help-choose-section = Choose section
+zc-zerocode-help-open-section = Open section
+zc-zerocode-help-navigate-rows = Navigate rows
+zc-zerocode-help-back-to-sections = Back to sections
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.

@@ -48189,3 +48189,147 @@ msgstr "🔵 团队决策"
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "🟡 Conditional"
 msgstr "🟡 条件"
+
+#: src/SUMMARY.md
+msgid "Channels & Integrations"
+msgstr "频道与集成"
+
+#: src/SUMMARY.md src/developing/index.md
+msgid "Extending & Plugins"
+msgstr "扩展与插件"
+
+#: src/SUMMARY.md
+msgid "Foundations (RFCs)"
+msgstr "基础（RFC）"
+
+#: src/SUMMARY.md
+msgid "Hardware & Boards"
+msgstr "硬件与板卡"
+
+#: src/SUMMARY.md src/setup/index.md
+msgid "Installation"
+msgstr "安装"
+
+#: src/SUMMARY.md
+msgid "Operations & Deployment"
+msgstr "运维与部署"
+
+#: src/SUMMARY.md
+msgid "Security & Autonomy"
+msgstr "安全与自主性"
+
+#: src/SUMMARY.md
+msgid "Standard Operating Procedures"
+msgstr "标准操作程序"
+
+#: src/SUMMARY.md
+msgid "Tools & Extensibility"
+msgstr "工具与扩展性"
+
+#: src/getting-started/index.md
+msgid "Start here if you are installing ZeroClaw for the first time or choosing the simplest path to a working agent."
+msgstr "如果你是第一次安装 ZeroClaw，或想选择最简单的路径来启动一个可用的智能体，请从这里开始。"
+
+#: src/getting-started/index.md
+msgid "[Quick start](./quick-start.md) covers installation, onboarding, and the first chat."
+msgstr "[快速入门](./quick-start.md) 涵盖安装、引导和第一次聊天。"
+
+#: src/getting-started/index.md
+msgid "[YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset."
+msgstr "[YOLO 模式](./yolo.md) 记录最快但不安全的本地开发预设。"
+
+#: src/getting-started/index.md
+msgid "[Multi-model setup](./multi-model-setup.md) explains provider and route basics."
+msgstr "[多模型设置](./multi-model-setup.md) 说明提供商和路由基础。"
+
+#: src/getting-started/index.md
+msgid "[zerocode](./tui.md) introduces the terminal UI."
+msgstr "[zerocode](./tui.md) 介绍终端 UI。"
+
+#: src/getting-started/index.md
+msgid "[Language and translations](./language.md) covers locale selection."
+msgstr "[语言和翻译](./language.md) 涵盖语言区域选择。"
+
+#: src/setup/index.md
+msgid "Choose the installation path for your operating system or deployment target."
+msgstr "为你的操作系统或部署目标选择安装路径。"
+
+#: src/setup/index.md
+msgid "[Docker and containers](./container.md)"
+msgstr "[Docker 和容器](./container.md)"
+
+#: src/reference/index.md
+msgid "Reference material for operators and integrators who need exact command, configuration, environment, and API details."
+msgstr "面向需要精确命令、配置、环境和 API 细节的运维人员与集成者的参考资料。"
+
+#: src/reference/index.md
+msgid "[CLI](./cli.md)"
+msgstr "[命令行界面](./cli.md)"
+
+#: src/reference/index.md
+msgid "[Config](./config.md)"
+msgstr "[配置](./config.md)"
+
+#: src/reference/index.md
+msgid "[Environment variables](./env-vars.md)"
+msgstr "[环境变量](./env-vars.md)"
+
+#: src/reference/index.md
+msgid "[API rustdoc](../api.md)"
+msgstr "[API rustdoc](../api.md)"
+
+#: src/reference/index.md
+msgid "[Gateway HTTP API](../gateway/api.md)"
+msgstr "[网关 HTTP API](../gateway/api.md)"
+
+#: src/reference/index.md
+msgid "[Web dashboard](../gateway/web-dashboard.md)"
+msgstr "[Web 仪表盘](../gateway/web-dashboard.md)"
+
+#: src/developing/index.md
+msgid "Use these pages when extending ZeroClaw or working on project tooling."
+msgstr "在扩展 ZeroClaw 或处理项目工具时，请使用这些页面。"
+
+#: src/developing/index.md
+msgid "[Plugin protocol](./plugin-protocol.md)"
+msgstr "[插件协议](./plugin-protocol.md)"
+
+#: src/developing/index.md
+msgid "[Extension examples](./extension-examples.md)"
+msgstr "[扩展示例](./extension-examples.md)"
+
+#: src/developing/index.md
+msgid "[Building the docs locally](./building-docs.md)"
+msgstr "[本地构建文档](./building-docs.md)"
+
+#: src/developing/index.md
+msgid "[Building the web dashboard](./web.md)"
+msgstr "[构建 Web 仪表盘](./web.md)"
+
+#: src/contributing/index.md
+msgid "Start here before opening issues, proposing architecture changes, or submitting pull requests."
+msgstr "在打开 issue、提出架构变更或提交拉取请求之前，请从这里开始。"
+
+#: src/contributing/index.md
+msgid "[Architecture and contribution map](./architecture-map.md)"
+msgstr "[架构与贡献地图](./architecture-map.md)"
+
+#: src/contributing/index.md
+msgid "[Privacy and PII discipline](./privacy.md)"
+msgstr "[隐私与 PII 纪律](./privacy.md)"
+
+#: src/contributing/index.md
+msgid "[Testing](./testing.md)"
+msgstr "[测试](./testing.md)"
+
+#: src/contributing/index.md
+msgid "[PR review protocol](./pr-review-protocol.md)"
+msgstr "[PR 审查协议](./pr-review-protocol.md)"
+
+#: src/contributing/index.md
+msgid "[Multi-agent setup](./multi-agent-setup.md)"
+msgstr "[多智能体设置](./multi-agent-setup.md)"
+
+#: src/contributing/index.md
+msgid "[Contributor License Agreement](./cla.md)"
+msgstr "[贡献者许可协议](./cla.md)"
