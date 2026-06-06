@@ -87,6 +87,32 @@ impl Selector {
     }
 }
 
+/// Drop validation errors for selectors the user hasn't filled yet.
+///
+/// `revalidate` runs after every selector commit, and the runtime
+/// validates the *whole* submission, short-circuiting at the first
+/// failing step. Mid-build that first failure is almost always a
+/// selector the user simply hasn't reached — e.g. the empty risk
+/// profile, surfacing the instant the model provider is committed. Shown
+/// as a red "1 error(s) — fix selectors and resubmit", it reads as if the
+/// step they just finished broke. Keep only errors for selectors the user
+/// has actually filled; unfilled ones are already tracked as `[ ]` in the
+/// checklist, and submit re-validates the full set with nothing empty to
+/// short-circuit on.
+fn retain_filled_selector_errors(
+    form: &FormState,
+    errors: Vec<QuickstartError>,
+) -> Vec<QuickstartError> {
+    errors
+        .into_iter()
+        .filter(|e| {
+            Selector::ALL
+                .iter()
+                .any(|s| form.is_satisfied(*s) && s.step() == e.step)
+        })
+        .collect()
+}
+
 fn opt(value: &str, label: impl Into<String>, help: impl Into<String>) -> PickerOption {
     PickerOption {
         value: value.to_string(),
@@ -1467,7 +1493,7 @@ impl QuickstartPane {
                 self.last_errors.clear();
             }
             Ok(crate::client::QuickstartValidateResult::Errors { errors }) => {
-                self.last_errors = errors;
+                self.last_errors = retain_filled_selector_errors(&self.form, errors);
             }
             Err(_) => {
                 // Validation failures on the wire are non-fatal —
@@ -2344,6 +2370,48 @@ mod tests {
         let mut f = complete_form();
         f.agent_name.clear();
         assert!(!f.all_selectors_satisfied());
+    }
+
+    fn err(step: QuickstartStep) -> QuickstartError {
+        QuickstartError {
+            step,
+            field: String::new(),
+            message: "boom".into(),
+        }
+    }
+
+    #[test]
+    fn revalidate_hides_errors_for_unfilled_selectors() {
+        // Regression: committing the model provider triggered a full
+        // re-validate. The runtime short-circuits at the first failing
+        // step, so the still-empty risk profile came back as a single
+        // error and the status strip flashed "1 error(s) — fix selectors
+        // and resubmit", as if the provider step had failed.
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+        assert!(f.is_satisfied(Selector::ModelProvider));
+        assert!(!f.is_satisfied(Selector::RiskProfile));
+
+        let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::RiskProfile)]);
+        assert!(
+            kept.is_empty(),
+            "an unfilled selector's error must not surface mid-build: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn revalidate_keeps_errors_for_filled_selectors() {
+        // A real problem with a selector the user *has* filled (e.g. an
+        // alias collision on the model provider) must still surface.
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+
+        let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::ModelProvider)]);
+        assert_eq!(kept.len(), 1, "filled-selector errors must be retained");
     }
 
     #[test]
