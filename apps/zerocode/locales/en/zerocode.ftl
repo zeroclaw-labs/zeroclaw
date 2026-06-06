@@ -270,6 +270,8 @@ zc-quickstart-modal-action-edit-name = type to edit name
 zc-quickstart-modal-action-on-file-rows = on file rows
 zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
+zc-quickstart-field-label-alias = Alias
+zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
 zc-quickstart-action-done = Done
 zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents can still send messages to channels.
 
