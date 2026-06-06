@@ -1,0 +1,7 @@
+name = "tavily"
+version = "0.1.0"
+description = "Agent-grade web search via the Tavily API"
+author = "ZeroClaw Labs"
+wasm_path = "tavily.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
