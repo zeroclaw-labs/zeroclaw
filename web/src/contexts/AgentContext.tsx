@@ -243,7 +243,17 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_call': {
-        const toolName = msg.name ?? 'unknown';
+        // Defense in depth (issue #7151): the chat WebSocket shares a broadcast
+        // bus with observability telemetry, whose `tool_call` frames have a
+        // different shape (`tool`/`duration_ms`/`success`) and carry no `name`.
+        // Such a frame would otherwise produce a permanent "unknown" tool card
+        // with a spinner that never resolves (no matching `tool_result`). The
+        // backend already filters these out, but ignore them here too so a
+        // malformed telemetry frame can never render a stuck card.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         const toolArgs = msg.args;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
@@ -273,6 +283,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_result': {
+        // Defense in depth (issue #7151): mirrors the `tool_call` guard
+        // above. Observability `tool_result`-shaped telemetry would otherwise
+        // overwrite the most recent pending tool card with an empty output.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
@@ -291,7 +308,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
+              toolCall: { name: toolName, output: msg.output ?? '' },
               timestamp: new Date(),
             },
           ];
