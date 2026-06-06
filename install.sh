@@ -1037,6 +1037,24 @@ See all available features:
       info "[dry-run] Would build web dashboard"
     else
       build_web_dashboard "$INSTALL_DIR"
+      # Install built dashboard assets to the system data directory so
+      # systemd-launched daemon can find them regardless of CWD.
+      if [ -d "$INSTALL_DIR/web/dist" ] && [ -f "$INSTALL_DIR/web/dist/index.html" ]; then
+        case "$(uname -s)" in
+        Darwin)
+          web_data_dir="${HOME}/Library/Application Support/zeroclaw/web/dist"
+          ;;
+        MINGW* | CYGWIN* | MSYS*)
+          web_data_dir="${LOCALAPPDATA}/zeroclaw/web/dist"
+          ;;
+        *)
+          web_data_dir="${XDG_DATA_HOME:-${PREFIX:-$HOME/.local}/share}/zeroclaw/web/dist"
+          ;;
+        esac
+        mkdir -p "$web_data_dir"
+        cp -r "$INSTALL_DIR/web/dist/." "$web_data_dir/"
+        info "Web dashboard installed to $web_data_dir"
+      fi
     fi
   fi
 

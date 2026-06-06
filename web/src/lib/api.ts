@@ -111,7 +111,17 @@ export async function apiFetch<T = unknown>(
     return undefined as unknown as T;
   }
 
-  return response.json() as Promise<T>;
+  return response.json().catch((err) => {
+    if (err instanceof SyntaxError) {
+      throw new Error(
+        `Gateway returned a non-JSON response (likely HTML). ` +
+          `This usually means the API endpoint was not reached — ` +
+          `check that the daemon is running and the dashboard assets are installed. ` +
+          `Original: ${err.message}`
+      );
+    }
+    throw err;
+  }) as Promise<T>;
 }
 
 function unwrapField<T>(value: T | Record<string, T>, key: string): T {
