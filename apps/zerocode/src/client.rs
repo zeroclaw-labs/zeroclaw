@@ -85,6 +85,7 @@ pub mod method {
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
+    pub const SESSION_KILL: &str = "session/kill";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -1079,6 +1080,16 @@ impl RpcClient {
             serde_json::json!({ "session_id": session_id }),
         )
         .await
+    }
+
+    pub async fn session_kill(&self, session_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .call(
+                method::SESSION_KILL,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn session_rename(
