@@ -1881,6 +1881,8 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::RwLock;
+    #[cfg(feature = "channel-linq")]
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use zeroclaw_infra::session_backend::SessionBackend;
@@ -2052,9 +2054,9 @@ mod tests {
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
             #[cfg(feature = "channel-nextcloud")]
