@@ -545,7 +545,7 @@ cli-channels-cli-always = {"  "}✅ CLI (toujours disponible)
 cli-channels-notion = {"  "}{ $status } Notion
 cli-channels-start-hint = Pour démarrer les canaux : zeroclaw channel start
 cli-channels-doctor-hint = Pour vérifier l'état :    zeroclaw channel doctor
-cli-channels-configure-hint = Pour configurer :      zeroclaw onboard
+cli-channels-configure-hint = Pour configurer :      zeroclaw config set channels.<name>.<field>=<value>
 cli-onboard-about = Initialiser votre espace de travail et votre configuration
 cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
 cli-memory-remove-about = Supprimer une entrée de mémoire par clé
