@@ -542,5 +542,5 @@ cli-channels-cli-always = {"  "}✅ CLI (常に利用可能)
 cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = チャンネルを開始するには: zeroclaw channel start
 cli-channels-doctor-hint = 状態を確認するには:    zeroclaw channel doctor
-cli-channels-configure-hint = 設定するには:      zeroclaw onboard
+cli-channels-configure-hint = 設定するには:      zeroclaw config set channels.<name>.<field>=<value>
 cli-onboard-about = ワークスペースと設定を初期化

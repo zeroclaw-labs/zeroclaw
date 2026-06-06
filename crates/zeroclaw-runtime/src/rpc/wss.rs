@@ -5,7 +5,6 @@
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
-use super::session::SESSION_DISCONNECT_GRACE;
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -247,40 +246,25 @@ pub async fn run_wss_listener(
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
                     dispatcher.run(&mut transport).await;
 
-                    // Cleanup: unregister TUI from registry on disconnect.
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
-                        let orphaned = ctx
-                            .sessions
-                            .mark_orphaned(tui_id, SESSION_DISCONNECT_GRACE)
-                            .await;
-                        for (session_key, agent_alias) in &orphaned {
-                            use ::zeroclaw_log::Instrument as _;
-                            let span = ::zeroclaw_log::info_span!(
-                                target: "zeroclaw_log_internal_scope",
-                                "zeroclaw_scope",
-                                session_key = %session_key,
-                                agent_alias = %agent_alias,
-                                owner_tui_id = %tui_id,
-                                channel = "wss",
+                        use ::zeroclaw_log::Instrument as _;
+                        let span = ::zeroclaw_log::info_span!(
+                            target: "zeroclaw_log_internal_scope",
+                            "zeroclaw_scope",
+                            owner_tui_id = %tui_id,
+                            channel = "wss",
+                        );
+                        async {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent),
+                                "WSS TUI disconnected; sessions retained (persistent)"
                             );
-                            async {
-                                ::zeroclaw_log::record!(
-                                    INFO,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note,
-                                    )
-                                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                                    .with_attrs(::serde_json::json!({
-                                        "grace_secs": SESSION_DISCONNECT_GRACE.as_secs(),
-                                    })),
-                                    "WSS TUI disconnected; session queued for eviction"
-                                );
-                            }
-                            .instrument(span)
-                            .await;
                         }
+                        .instrument(span)
+                        .await;
                     }
 
                     count.fetch_sub(1, Ordering::Relaxed);

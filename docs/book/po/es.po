@@ -48140,3 +48140,147 @@ msgstr "🔵 Decisión del equipo"
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "🟡 Conditional"
 msgstr "🟡 Condicional"
+
+#: src/SUMMARY.md
+msgid "Channels & Integrations"
+msgstr "Canales e integraciones"
+
+#: src/SUMMARY.md src/developing/index.md
+msgid "Extending & Plugins"
+msgstr "Extensiones y plugins"
+
+#: src/SUMMARY.md
+msgid "Foundations (RFCs)"
+msgstr "Fundamentos (RFC)"
+
+#: src/SUMMARY.md
+msgid "Hardware & Boards"
+msgstr "Hardware y placas"
+
+#: src/SUMMARY.md src/setup/index.md
+msgid "Installation"
+msgstr "Instalación"
+
+#: src/SUMMARY.md
+msgid "Operations & Deployment"
+msgstr "Operaciones y despliegue"
+
+#: src/SUMMARY.md
+msgid "Security & Autonomy"
+msgstr "Seguridad y autonomía"
+
+#: src/SUMMARY.md
+msgid "Standard Operating Procedures"
+msgstr "Procedimientos operativos estándar"
+
+#: src/SUMMARY.md
+msgid "Tools & Extensibility"
+msgstr "Herramientas y extensibilidad"
+
+#: src/getting-started/index.md
+msgid "Start here if you are installing ZeroClaw for the first time or choosing the simplest path to a working agent."
+msgstr "Empieza aquí si instalas ZeroClaw por primera vez o eliges la ruta más sencilla hacia un agente funcional."
+
+#: src/getting-started/index.md
+msgid "[Quick start](./quick-start.md) covers installation, onboarding, and the first chat."
+msgstr "[Inicio rápido](./quick-start.md) cubre la instalación, la incorporación y el primer chat."
+
+#: src/getting-started/index.md
+msgid "[YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset."
+msgstr "[Modo YOLO](./yolo.md) documenta el preset de desarrollo local más rápido e inseguro."
+
+#: src/getting-started/index.md
+msgid "[Multi-model setup](./multi-model-setup.md) explains provider and route basics."
+msgstr "[Configuración multimodelo](./multi-model-setup.md) explica los conceptos básicos de proveedores y rutas."
+
+#: src/getting-started/index.md
+msgid "[zerocode](./tui.md) introduces the terminal UI."
+msgstr "[zerocode](./tui.md) presenta la interfaz de terminal."
+
+#: src/getting-started/index.md
+msgid "[Language and translations](./language.md) covers locale selection."
+msgstr "[Idioma y traducciones](./language.md) cubre la selección de configuración regional."
+
+#: src/setup/index.md
+msgid "Choose the installation path for your operating system or deployment target."
+msgstr "Elige la ruta de instalación para tu sistema operativo o destino de despliegue."
+
+#: src/setup/index.md
+msgid "[Docker and containers](./container.md)"
+msgstr "[Docker y contenedores](./container.md)"
+
+#: src/reference/index.md
+msgid "Reference material for operators and integrators who need exact command, configuration, environment, and API details."
+msgstr "Material de referencia para operadores e integradores que necesitan detalles exactos de comandos, configuración, entorno y API."
+
+#: src/reference/index.md
+msgid "[CLI](./cli.md)"
+msgstr "[CLI](./cli.md)"
+
+#: src/reference/index.md
+msgid "[Config](./config.md)"
+msgstr "[Configuración](./config.md)"
+
+#: src/reference/index.md
+msgid "[Environment variables](./env-vars.md)"
+msgstr "[Variables de entorno](./env-vars.md)"
+
+#: src/reference/index.md
+msgid "[API rustdoc](../api.md)"
+msgstr "[API rustdoc](../api.md)"
+
+#: src/reference/index.md
+msgid "[Gateway HTTP API](../gateway/api.md)"
+msgstr "[API HTTP de la gateway](../gateway/api.md)"
+
+#: src/reference/index.md
+msgid "[Web dashboard](../gateway/web-dashboard.md)"
+msgstr "[Panel web](../gateway/web-dashboard.md)"
+
+#: src/developing/index.md
+msgid "Use these pages when extending ZeroClaw or working on project tooling."
+msgstr "Usa estas páginas al extender ZeroClaw o trabajar en las herramientas del proyecto."
+
+#: src/developing/index.md
+msgid "[Plugin protocol](./plugin-protocol.md)"
+msgstr "[Protocolo de plugins](./plugin-protocol.md)"
+
+#: src/developing/index.md
+msgid "[Extension examples](./extension-examples.md)"
+msgstr "[Ejemplos de extensiones](./extension-examples.md)"
+
+#: src/developing/index.md
+msgid "[Building the docs locally](./building-docs.md)"
+msgstr "[Construir la documentación localmente](./building-docs.md)"
+
+#: src/developing/index.md
+msgid "[Building the web dashboard](./web.md)"
+msgstr "[Construir el panel web](./web.md)"
+
+#: src/contributing/index.md
+msgid "Start here before opening issues, proposing architecture changes, or submitting pull requests."
+msgstr "Empieza aquí antes de abrir issues, proponer cambios de arquitectura o enviar pull requests."
+
+#: src/contributing/index.md
+msgid "[Architecture and contribution map](./architecture-map.md)"
+msgstr "[Mapa de arquitectura y contribución](./architecture-map.md)"
+
+#: src/contributing/index.md
+msgid "[Privacy and PII discipline](./privacy.md)"
+msgstr "[Disciplina de privacidad y PII](./privacy.md)"
+
+#: src/contributing/index.md
+msgid "[Testing](./testing.md)"
+msgstr "[Pruebas](./testing.md)"
+
+#: src/contributing/index.md
+msgid "[PR review protocol](./pr-review-protocol.md)"
+msgstr "[Protocolo de revisión de PR](./pr-review-protocol.md)"
+
+#: src/contributing/index.md
+msgid "[Multi-agent setup](./multi-agent-setup.md)"
+msgstr "[Configuración multiagente](./multi-agent-setup.md)"
+
+#: src/contributing/index.md
+msgid "[Contributor License Agreement](./cla.md)"
+msgstr "[Acuerdo de licencia de colaborador](./cla.md)"
