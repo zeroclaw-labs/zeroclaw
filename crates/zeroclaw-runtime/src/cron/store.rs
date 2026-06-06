@@ -304,6 +304,66 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
     Ok(jobs)
 }
 
+/// Discard jobs that became overdue while the daemon was offline without
+/// executing them.
+///
+/// This is used when `[scheduler] catch_up_on_startup = false`: recurring
+/// jobs are advanced to their next future run, while overdue one-shot jobs are
+/// disabled so they do not execute late after startup.
+pub(crate) fn discard_startup_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<usize> {
+    let overdue_jobs: Vec<CronJob> = all_overdue_jobs(config, now)?
+        .into_iter()
+        .filter(|job| job.next_run < now)
+        .collect();
+
+    if overdue_jobs.is_empty() {
+        return Ok(0);
+    }
+
+    with_initialized_connection(config, |conn| {
+        let mut discarded = 0usize;
+        for job in &overdue_jobs {
+            discard_startup_overdue_job(conn, job, now)?;
+            discarded += 1;
+        }
+        Ok(discarded)
+    })
+}
+
+fn discard_startup_overdue_job(conn: &Connection, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
+    match job.schedule {
+        Schedule::At { .. } => {
+            let changed = conn
+                .execute(
+                    "UPDATE cron_jobs
+                     SET enabled = 0
+                     WHERE id = ?1",
+                    params![job.id],
+                )
+                .context("Failed to disable overdue one-shot cron job at startup")?;
+            if changed == 0 {
+                anyhow::bail!("Cron job '{}' not found", job.id);
+            }
+        }
+        _ => {
+            let next_run = next_run_for_schedule(&job.schedule, now)?;
+            let changed = conn
+                .execute(
+                    "UPDATE cron_jobs
+                     SET next_run = ?1
+                     WHERE id = ?2",
+                    params![next_run.to_rfc3339(), job.id],
+                )
+                .context("Failed to advance overdue recurring cron job at startup")?;
+            if changed == 0 {
+                anyhow::bail!("Cron job '{}' not found", job.id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     let mut job = get_job(config, job_id)?;
     let mut schedule_changed = false;
@@ -1667,6 +1727,112 @@ mod tests {
         let far_future = Utc::now() + ChronoDuration::days(365);
         let overdue = all_overdue_jobs(&config, far_future).unwrap();
         assert!(overdue.is_empty());
+    }
+
+    #[test]
+    fn discard_startup_overdue_jobs_advances_recurring_without_marking_a_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            "test-agent",
+            Some("recurring".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "echo recurring",
+            None,
+        )
+        .unwrap();
+        let startup_now = Utc::now();
+        let missed_at = startup_now - ChronoDuration::minutes(5);
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![missed_at.to_rfc3339(), job.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let discarded = discard_startup_overdue_jobs(&config, startup_now).unwrap();
+        assert_eq!(discarded, 1);
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert!(updated.enabled);
+        assert!(updated.next_run > startup_now);
+        assert!(updated.last_run.is_none());
+        assert!(updated.last_status.is_none());
+        assert!(updated.last_output.is_none());
+    }
+
+    #[test]
+    fn discard_startup_overdue_jobs_disables_one_shot_without_marking_a_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let future_at = Utc::now() + ChronoDuration::minutes(10);
+        let job = add_shell_job(
+            &config,
+            "test-agent",
+            Some("one-shot".into()),
+            Schedule::At { at: future_at },
+            "echo one-shot",
+            None,
+        )
+        .unwrap();
+        let startup_now = Utc::now();
+        let missed_at = startup_now - ChronoDuration::minutes(5);
+        let missed_schedule = serde_json::to_string(&Schedule::At { at: missed_at }).unwrap();
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET schedule = ?1, next_run = ?2 WHERE id = ?3",
+                params![missed_schedule, missed_at.to_rfc3339(), job.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let discarded = discard_startup_overdue_jobs(&config, startup_now).unwrap();
+        assert_eq!(discarded, 1);
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.next_run, missed_at);
+        assert!(updated.last_run.is_none());
+        assert!(updated.last_status.is_none());
+        assert!(updated.last_output.is_none());
+    }
+
+    #[test]
+    fn discard_startup_overdue_jobs_keeps_exact_startup_deadline_due() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            "test-agent",
+            Some("boundary".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "echo boundary",
+            None,
+        )
+        .unwrap();
+        let startup_now = Utc::now();
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![startup_now.to_rfc3339(), job.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let discarded = discard_startup_overdue_jobs(&config, startup_now).unwrap();
+        assert_eq!(discarded, 0);
+
+        let due = due_jobs(&config, startup_now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, job.id);
     }
 
     #[test]
