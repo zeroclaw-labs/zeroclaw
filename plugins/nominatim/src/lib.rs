@@ -111,6 +111,20 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+/// Slicing on a raw byte index (e.g. for an error body) can land inside a
+/// multi-byte character and panic; this walks back to the nearest char boundary.
+fn truncate_chars(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// A geocoded place: display name + coordinates.
 struct Place {
     name: String,
@@ -233,7 +247,7 @@ pub fn execute(input: String) -> FnResult<String> {
         return fail(format!(
             "Nominatim error ({}): {}",
             resp.status,
-            &resp.body[..resp.body.len().min(500)]
+            truncate_chars(&resp.body, 500)
         ));
     }
 
@@ -293,5 +307,23 @@ mod tests {
     fn percent_encode_basics() {
         assert_eq!(percent_encode("New York"), "New%20York");
         assert_eq!(percent_encode("Zz09-_.~"), "Zz09-_.~");
+    }
+
+    #[test]
+    fn truncate_chars_never_splits_multibyte() {
+        // A long non-ASCII error body whose 500-byte cutoff falls mid-character
+        // must not panic and must stay on a char boundary.
+        let body = "é".repeat(400); // 800 bytes; boundary at 500 is mid-char
+        let cut = truncate_chars(&body, 500);
+        assert!(cut.len() <= 500);
+        assert!(body.is_char_boundary(cut.len()));
+        let msg = format!("Nominatim error ({}): {}", 500, truncate_chars(&body, 500));
+        assert!(msg.starts_with("Nominatim error (500):"));
+    }
+
+    #[test]
+    fn truncate_chars_short_input_unchanged() {
+        assert_eq!(truncate_chars("hello", 500), "hello");
+        assert_eq!(truncate_chars("", 500), "");
     }
 }
