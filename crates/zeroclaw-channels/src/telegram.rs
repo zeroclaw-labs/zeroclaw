@@ -1289,11 +1289,8 @@ impl TelegramChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        // Telegram `sendVoice` only accepts OGG/Opus; any other format must go
-        // through `sendAudio` with its real MIME type. Mislabeling (e.g. Groq
-        // Orpheus WAV bytes sent as `audio/ogg`) produces an unplayable note.
-        let format = tts_manager.agent_output_format().unwrap_or("opus");
-        let (method, field, filename, mime) = telegram_audio_send_spec(format)?;
+        // synthesize_opus already transcodes to OGG/Opus via ffmpeg internally
+        let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
 
         let url = format!("{api_base}/bot{bot_token}/{method}");
         let client = zeroclaw_config::schema::build_runtime_proxy_client("channel.telegram");
