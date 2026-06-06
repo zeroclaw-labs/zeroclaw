@@ -1,0 +1,7 @@
+name = "n8n"
+version = "0.1.0"
+description = "Trigger workflows on your self-hosted n8n instance (unlocks n8n's integrations)"
+author = "ZeroClaw Labs"
+wasm_path = "n8n.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
