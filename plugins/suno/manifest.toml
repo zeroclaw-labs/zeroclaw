@@ -1,0 +1,7 @@
+name = "suno"
+version = "0.1.0"
+description = "Generate music from a prompt using your self-hosted Suno API (gcui-art/suno-api)"
+author = "ZeroClaw Labs"
+wasm_path = "suno.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
