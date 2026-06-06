@@ -297,10 +297,19 @@ impl Chat {
         };
         match result {
             Ok(session) => {
+                let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
                 let mut state = ChatState::new(session.session_id, agent_alias.to_string());
                 // Only ACP shows the working directory above the input bar.
                 if self.pane_kind == PaneKind::Acp {
                     state.cwd = session.workspace_dir;
+                }
+                // On a resume, replay the daemon-retained transcript so the
+                // reattached pane shows the prior conversation rather than an
+                // empty history. Fresh sessions have nothing to load.
+                if let Some(sid) = resumed_sid
+                    && let Ok(msgs) = self.rpc.session_messages(&sid).await
+                {
+                    state.load_history(msgs.messages);
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -548,27 +557,7 @@ impl Chat {
                             }
                             // Load persisted message history.
                             if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
-                                for m in msgs.messages {
-                                    match m.role() {
-                                        crate::client::MessageRole::User => {
-                                            if state.first_message.is_none() {
-                                                state.first_message = Some(m.content.clone());
-                                            }
-                                            state.entries.push(ChatEntry::UserMessage {
-                                                text: Some(Arc::<str>::from(m.content)),
-                                                attachments: vec![],
-                                            });
-                                        }
-                                        crate::client::MessageRole::Assistant => {
-                                            state.entries.push(ChatEntry::AgentMessage(
-                                                Arc::<str>::from(m.content),
-                                            ));
-                                        }
-                                        crate::client::MessageRole::System
-                                        | crate::client::MessageRole::Other => {}
-                                    }
-                                }
-                                state.mark_dirty_full(); // bulk session load
+                                state.load_history(msgs.messages);
                             }
                         }
                     }
@@ -2995,6 +2984,32 @@ impl ChatState {
         self.turn_started_at = Instant::now();
     }
 
+    /// Replay persisted message history into the transcript on a session resume.
+    /// Mirrors the daemon-retained store into UI entries and seeds the pinned
+    /// first-message recovery row, so a reconnect/reattach shows the prior
+    /// conversation instead of an empty pane. Idempotent on entries: callers
+    /// invoke it on a freshly reset session state.
+    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+        for m in messages {
+            match m.role() {
+                crate::client::MessageRole::User => {
+                    if self.first_message.is_none() {
+                        self.first_message = Some(m.content.clone());
+                    }
+                    self.entries.push(ChatEntry::UserMessage {
+                        text: Some(Arc::<str>::from(m.content)),
+                        attachments: vec![],
+                    });
+                }
+                crate::client::MessageRole::Assistant => {
+                    self.entries
+                        .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                }
+                crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
+            }
+        }
+        self.mark_dirty_full();
+    }
     /// Reset conversational state for a new or switched session.
     pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
         self.session_id = session_id;
@@ -3775,5 +3790,35 @@ mod tests {
         s.push_user_message(Some("ask".to_string()), Vec::new());
         s.reset_for_session("sess-2".to_string(), None);
         assert!(s.first_message.is_none());
+    }
+
+    #[test]
+    fn load_history_replays_transcript_and_seeds_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session("sess-resume".to_string(), None);
+        let before = s.entries.len();
+        s.load_history(vec![
+            MessageEntry {
+                role: "user".to_string(),
+                content: "first ask".to_string(),
+            },
+            MessageEntry {
+                role: "assistant".to_string(),
+                content: "reply".to_string(),
+            },
+            MessageEntry {
+                role: "system".to_string(),
+                content: "ignored".to_string(),
+            },
+            MessageEntry {
+                role: "user".to_string(),
+                content: "second ask".to_string(),
+            },
+        ]);
+        // User + assistant + user replayed; system dropped.
+        assert_eq!(s.entries.len(), before + 3);
+        // First user message seeds the pinned recovery row.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
     }
 }
