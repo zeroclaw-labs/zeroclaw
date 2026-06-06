@@ -272,7 +272,7 @@ pub async fn run_models(
 
     if targets.is_empty() {
         anyhow::bail!(
-            "No configured model_providers to probe — run `zeroclaw onboard model_providers` first"
+            "No configured model_providers to probe — run `zeroclaw quickstart` to set one up first"
         );
     }
 
@@ -657,7 +657,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(
             cat,
-            "no channels configured — run `zeroclaw onboard` to set one up",
+            "no channels configured — run `zeroclaw quickstart` to set one up",
         ));
     }
 
