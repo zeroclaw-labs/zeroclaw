@@ -1,0 +1,7 @@
+name = "mistral-ocr"
+version = "0.1.0"
+description = "Layout-aware OCR of documents and images (URL to markdown) via the Mistral OCR API"
+author = "ZeroClaw Labs"
+wasm_path = "mistral_ocr.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
