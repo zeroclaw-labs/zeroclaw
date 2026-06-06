@@ -3630,7 +3630,10 @@ impl Channel for TelegramChannel {
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Text in → text out. Voice in → text + voice out.
-        self.try_queue_voice_reply(&message.recipient, &content, false);
+        // Suppressed messages (errors, system notices) are never voiced.
+        if !message.suppress_voice {
+            self.try_queue_voice_reply(&message.recipient, &content, false);
+        }
 
         // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);

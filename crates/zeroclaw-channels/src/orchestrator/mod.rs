@@ -5416,18 +5416,20 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let user_msg = format!("⚠️ Error: {safe_error}");
+                    // Cancel any in-progress draft (don't finalize it with the
+                    // error text, which would trigger TTS on the error message)
+                    // then deliver the error as a plain suppressed send.
                     if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(user_msg, &msg.reply_target)
+                                .suppress_voice()
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                 }
             }
         }
