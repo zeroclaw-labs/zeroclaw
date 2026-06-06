@@ -102,13 +102,13 @@ If cross-compile fails, use Option A and build on the device.
 
 ## Phase 3: Configure ZeroClaw
 
-### 3.1 Run Onboard (or Create Config Manually)
+### 3.1 Run Quickstart (or Create Config Manually)
 
 ```bash
 ssh arduino@<UNO_Q_IP>
 
 # Quick config
-zeroclaw onboard --api-key YOUR_OPENROUTER_KEY --provider openrouter
+zeroclaw quickstart --api-key YOUR_OPENROUTER_KEY --model-provider openrouter
 
 # Or create config manually
 mkdir -p ~/.zeroclaw/workspace
@@ -176,8 +176,8 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
 | 6 | `export CARGO_BUILD_JOBS=1 && cargo build --release --features hardware` |
-| 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
-| 8 | `zeroclaw onboard channels` |
+| 7 | `zeroclaw quickstart --api-key KEY --model-provider openrouter` |
+| 8 | `zeroclaw config set channels.telegram.default.bot-token <token>` |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Message your Telegram bot — it responds |
 | 11 | `zeroclaw peripheral setup-uno-q` (deploys Bridge) |

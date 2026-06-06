@@ -28,15 +28,17 @@ Before testing message flow:
 
 ## 2. Configuration
 
-All config management goes through `zeroclaw config` or `zeroclaw onboard`. Do not hand-edit `~/.zeroclaw/config.toml`.
+All config management goes through `zeroclaw config`. Do not hand-edit `~/.zeroclaw/config.toml`.
 
-Easiest: run the wizard and let it prompt for every Matrix field:
+Easiest: set each Matrix field with `zeroclaw config set` (see below). For the fastest one-shot bring-up, the most ergonomic path is to set the required fields back-to-back:
 
 ```bash
-zeroclaw onboard channels
+zeroclaw config set channels.matrix.homeserver https://matrix.example.com
+zeroclaw config set channels.matrix.access-token   # prompts, input masked
+zeroclaw config set channels.matrix.allowed-users '["*"]'
 ```
 
-Or set individual fields after onboarding:
+Or set individual fields directly:
 
 ```bash
 zeroclaw config set channels.matrix.homeserver https://matrix.example.com
@@ -90,7 +92,7 @@ zeroclaw config set channels.matrix.user-id @bot:example.com
 
 Restart for the new values to take effect: `zeroclaw service restart`.
 
-The wizard (`zeroclaw onboard channels`) prompts for these same fields if you'd rather work through it interactively.
+Each of the three `zeroclaw config set` calls above can be re-run any time to update an individual field.
 
 ### Notes
 
@@ -101,7 +103,7 @@ The wizard (`zeroclaw onboard channels`) prompts for these same fields if you'd 
 
 ## 4. Quick validation
 
-Run `zeroclaw onboard channels` if you haven't yet, then restart with `zeroclaw service restart` (background) or `zeroclaw daemon` (foreground). Send a plain-text message in the configured Matrix room. Confirm:
+Apply the field set in §2 if you haven't yet, then restart with `zeroclaw service restart` (background) or `zeroclaw daemon` (foreground). Send a plain-text message in the configured Matrix room. Confirm:
 
 - ZeroClaw logs show the Matrix listener starting with no repeated sync/auth errors.
 - In an encrypted room, the bot can read and reply to encrypted messages from allowed users.
@@ -126,7 +128,7 @@ Work through in order.
 > **About `$MATRIX_TOKEN` in the snippets below.** Secrets in ZeroClaw are encrypted at rest and intentionally **not** retrievable via `zeroclaw config get` — it prints `[masked]` for any secret field. You have two options:
 >
 > 1. **Get a fresh token** by re-running the password-login curl from §3 Step 1. Export the `access_token` it returns. Good for validation and recovery paths — doesn't affect what's in your config.
-> 2. **Keep a copy** of the token when you first paste it into `zeroclaw onboard` or `zeroclaw config set channels.matrix.access-token`. A one-time side-effect — write it to a scratch note if you want to run these curl checks later.
+> 2. **Keep a copy** of the token when you first paste it into `zeroclaw config set channels.matrix.access-token`. A one-time side-effect — write it to a scratch note if you want to run these curl checks later.
 >
 > The non-secret fields *are* retrievable:
 >
@@ -144,7 +146,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 - Returned `user_id` must match the bot account.
 - If `device_id` is missing from the response, set it manually (see §5H).
-- Rotate the access token without re-running onboard: `zeroclaw config set channels.matrix.access-token` (prompts, masked), then `zeroclaw service restart`.
+- Rotate the access token: `zeroclaw config set channels.matrix.access-token` (prompts, masked), then `zeroclaw service restart`.
 
 ### D. E2EE-specific checks
 
@@ -274,23 +276,7 @@ A recovery key lets ZeroClaw automatically restore room keys and cross-signing s
 
 #### Step 2 — Add the recovery key to ZeroClaw
 
-Either path works. The onboarding wizard is easier for fresh installs; `zeroclaw config set` is preferred for existing installs.
-
-**Option A — during onboarding:**
-
-```bash
-zeroclaw onboard channels
-```
-
-When prompted:
-
-```
-E2EE recovery key (or Enter to skip): EsTj 3yST y93F SLpB jJsz ...
-```
-
-Input is masked. The key is encrypted at rest.
-
-**Option B — existing installs:**
+Apply the recovery key to ZeroClaw:
 
 ```bash
 zeroclaw config set channels.matrix.recovery-key    # input masked

@@ -223,7 +223,7 @@ pub fn dispatch_family_factory(
                     );
                     Err(anyhow::Error::msg(format!(
                         "Unknown model_provider family: {family}. After the V2 to typed-family migration, \
-                         only canonical family names are valid. Run `zeroclaw onboard` to reconfigure, \
+                         only canonical family names are valid. Run `zeroclaw quickstart` to reconfigure, \
                          or set `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` for \
                          OpenAI-compatible custom endpoints."
                     )))
