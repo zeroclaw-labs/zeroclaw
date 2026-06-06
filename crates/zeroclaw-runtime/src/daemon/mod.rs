@@ -619,6 +619,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("state")
         .join("daemon_state.json")
 }
 
@@ -1496,12 +1497,12 @@ mod tests {
     }
 
     #[test]
-    fn state_file_path_uses_config_directory() {
+    fn state_file_path_uses_config_state_directory() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
         let path = state_file_path(&config);
-        assert_eq!(path, tmp.path().join("daemon_state.json"));
+        assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
     }
 
     #[tokio::test]

@@ -1,0 +1,21 @@
+# Sample /etc/jail.conf entry for running ZeroClaw in a thick jail.
+#
+# Append this block to /etc/jail.conf (host side). It shares the host network;
+# to give the jail its own address instead, drop the host-network assumption
+# and add e.g.  ip4.addr = "192.0.2.10";  with an  interface = "...";  line.
+#
+# Adjust `path` to wherever you extracted the base system. See the FreeBSD
+# setup guide (docs/book/src/setup/freebsd.md, "Running in a jail") and
+# dist/freebsd/README.md for the full walkthrough, or run
+# dist/freebsd/zeroclaw-jail-setup.sh to provision the jail end to end.
+
+zeroclaw {
+    host.hostname = "zeroclaw";
+    path = "/jails/zeroclaw";
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop  = "/bin/sh /etc/rc.shutdown";
+    exec.clean;
+    mount.devfs;
+    devfs_ruleset = 4;          # devfsrules_jail: restrict device nodes
+    persist;
+}
