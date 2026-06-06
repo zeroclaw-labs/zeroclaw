@@ -1,0 +1,7 @@
+name = "deepl"
+version = "0.1.0"
+description = "Translate text between languages using the DeepL API"
+author = "ZeroClaw Labs"
+wasm_path = "deepl.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
