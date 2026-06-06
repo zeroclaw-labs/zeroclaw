@@ -10609,7 +10609,7 @@ impl ChannelsConfig {
             },
             ChannelInfo {
                 kind: "telnyx",
-                name: "Telnyx",
+                name: "Telnyx SMS",
                 desc: "SMS via Telnyx Messaging",
                 configured: !self.telnyx.is_empty(),
             },
@@ -11908,7 +11908,7 @@ pub struct TelnyxConfig {
 
 impl ChannelConfig for TelnyxConfig {
     fn name() -> &'static str {
-        "Telnyx"
+        "Telnyx SMS"
     }
     fn desc() -> &'static str {
         "SMS via Telnyx Messaging"

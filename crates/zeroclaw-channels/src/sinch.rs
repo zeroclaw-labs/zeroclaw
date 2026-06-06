@@ -34,6 +34,7 @@
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// Sinch segments outbound messages transparently. Mirroring Twilio's
@@ -50,7 +51,7 @@ pub struct SinchChannel {
     api_token: String,
     region: String,
     from_number: String,
-    allowed_numbers: Vec<String>,
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     callback_secret: String,
 }
 
@@ -60,7 +61,7 @@ impl SinchChannel {
         api_token: String,
         region: String,
         from_number: String,
-        allowed_numbers: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         callback_secret: String,
     ) -> Self {
         Self {
@@ -68,7 +69,7 @@ impl SinchChannel {
             api_token,
             region,
             from_number,
-            allowed_numbers,
+            peer_resolver,
             callback_secret,
         }
     }
@@ -100,7 +101,8 @@ impl SinchChannel {
     /// everyone; `"*"` matches anyone; otherwise an exact case-insensitive
     /// E.164 match is required.
     pub fn is_number_allowed(&self, phone: &str) -> bool {
-        is_number_allowed_for_list(&self.allowed_numbers, phone)
+        let allowed = (self.peer_resolver)();
+        is_number_allowed_for_list(&allowed, phone)
     }
 
     /// Verify a Sinch webhook signature. Sinch's algorithm:
@@ -389,7 +391,7 @@ mod tests {
             "test-api-token".into(),
             "us".into(),
             "+15555550100".into(),
-            vec!["+15555550199".into()],
+            Arc::new(|| vec!["+15555550199".to_string()]),
             "test-callback-secret".into(),
         )
     }

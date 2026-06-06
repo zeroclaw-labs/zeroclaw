@@ -1127,24 +1127,62 @@ pub async fn run_gateway(
     // Twilio SMS channel (if configured)
     #[cfg(feature = "channel-twilio")]
     let twilio_channel: Option<Arc<TwilioChannel>> =
-        config.channels.twilio.values().next().map(|tw| {
+        config.channels.twilio.iter().next().map(|(alias, tw)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let c = cfg_arc.read();
+                    let mut peers = c
+                        .channels
+                        .twilio
+                        .get(&alias)
+                        .map(|x| x.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for p in c.channel_external_peers("twilio", &alias) {
+                        if !peers.contains(&p) {
+                            peers.push(p);
+                        }
+                    }
+                    peers
+                })
+            };
             Arc::new(TwilioChannel::new(
                 tw.account_sid.clone(),
                 tw.auth_token.clone(),
                 tw.from_number.clone(),
-                tw.allowed_numbers.clone(),
+                peer_resolver,
             ))
         });
 
     // Plivo SMS channel (if configured)
     #[cfg(feature = "channel-plivo")]
     let plivo_channel: Option<Arc<PlivoChannel>> =
-        config.channels.plivo.values().next().map(|pl| {
+        config.channels.plivo.iter().next().map(|(alias, pl)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let c = cfg_arc.read();
+                    let mut peers = c
+                        .channels
+                        .plivo
+                        .get(&alias)
+                        .map(|x| x.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for p in c.channel_external_peers("plivo", &alias) {
+                        if !peers.contains(&p) {
+                            peers.push(p);
+                        }
+                    }
+                    peers
+                })
+            };
             Arc::new(PlivoChannel::new(
                 pl.account_id.clone(),
                 pl.auth_token.clone(),
                 pl.from_number.clone(),
-                pl.allowed_numbers.clone(),
+                peer_resolver,
             ))
         });
 
@@ -1152,38 +1190,84 @@ pub async fn run_gateway(
     // surfaces here as `Err`; log and skip rather than panic.
     #[cfg(feature = "channel-telnyx")]
     let telnyx_channel: Option<Arc<TelnyxChannel>> =
-        config.channels.telnyx.values().next().and_then(|tx| {
-            match TelnyxChannel::new(
-                tx.api_key.clone(),
-                tx.from_number.clone(),
-                tx.messaging_profile_id.clone(),
-                tx.allowed_numbers.clone(),
-                &tx.public_key,
-            ) {
-                Ok(ch) => Some(Arc::new(ch)),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+        config
+            .channels
+            .telnyx
+            .iter()
+            .next()
+            .and_then(|(alias, tx)| {
+                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_state.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        let c = cfg_arc.read();
+                        let mut peers = c
+                            .channels
+                            .telnyx
+                            .get(&alias)
+                            .map(|x| x.allowed_numbers.clone())
+                            .unwrap_or_default();
+                        for p in c.channel_external_peers("telnyx", &alias) {
+                            if !peers.contains(&p) {
+                                peers.push(p);
+                            }
+                        }
+                        peers
+                    })
+                };
+                match TelnyxChannel::new(
+                    tx.api_key.clone(),
+                    tx.from_number.clone(),
+                    tx.messaging_profile_id.clone(),
+                    peer_resolver,
+                    &tx.public_key,
+                ) {
+                    Ok(ch) => Some(Arc::new(ch)),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                        "Telnyx channel config invalid; webhook route disabled"
-                    );
-                    None
+                            "Telnyx channel config invalid; webhook route disabled"
+                        );
+                        None
+                    }
                 }
-            }
-        });
+            });
 
     // Sinch SMS channel (if configured)
     #[cfg(feature = "channel-sinch")]
     let sinch_channel: Option<Arc<SinchChannel>> =
-        config.channels.sinch.values().next().map(|sc| {
+        config.channels.sinch.iter().next().map(|(alias, sc)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let c = cfg_arc.read();
+                    let mut peers = c
+                        .channels
+                        .sinch
+                        .get(&alias)
+                        .map(|x| x.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for p in c.channel_external_peers("sinch", &alias) {
+                        if !peers.contains(&p) {
+                            peers.push(p);
+                        }
+                    }
+                    peers
+                })
+            };
             Arc::new(SinchChannel::new(
                 sc.service_plan_id.clone(),
                 sc.api_token.clone(),
                 sc.region.clone(),
                 sc.from_number.clone(),
-                sc.allowed_numbers.clone(),
+                peer_resolver,
                 sc.callback_secret.clone(),
             ))
         });
@@ -1191,12 +1275,31 @@ pub async fn run_gateway(
     // Vonage SMS channel (if configured)
     #[cfg(feature = "channel-vonage")]
     let vonage_channel: Option<Arc<VonageChannel>> =
-        config.channels.vonage.values().next().map(|vo| {
+        config.channels.vonage.iter().next().map(|(alias, vo)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let c = cfg_arc.read();
+                    let mut peers = c
+                        .channels
+                        .vonage
+                        .get(&alias)
+                        .map(|x| x.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for p in c.channel_external_peers("vonage", &alias) {
+                        if !peers.contains(&p) {
+                            peers.push(p);
+                        }
+                    }
+                    peers
+                })
+            };
             Arc::new(VonageChannel::new(
                 vo.api_key.clone(),
                 vo.api_secret.clone(),
                 vo.from_number_or_sender_id.clone(),
-                vo.allowed_numbers.clone(),
+                peer_resolver,
                 vo.signature_secret.clone(),
             ))
         });

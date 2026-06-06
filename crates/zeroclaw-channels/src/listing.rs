@@ -89,7 +89,7 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-plivo"),
     },
     ChannelCompileSpec {
-        schema_name: Some("Telnyx"),
+        schema_name: Some("Telnyx SMS"),
         type_keys: &["telnyx"],
         compiled: cfg!(feature = "channel-telnyx"),
     },

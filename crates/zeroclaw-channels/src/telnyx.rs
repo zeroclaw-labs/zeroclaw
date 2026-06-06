@@ -32,6 +32,7 @@
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const TELNYX_API_BASE: &str = "https://api.telnyx.com";
@@ -50,7 +51,7 @@ pub struct TelnyxChannel {
     api_key: String,
     from_number: String,
     messaging_profile_id: Option<String>,
-    allowed_numbers: Vec<String>,
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     verifying_key: ed25519_dalek::VerifyingKey,
 }
 
@@ -62,7 +63,7 @@ impl TelnyxChannel {
         api_key: String,
         from_number: String,
         messaging_profile_id: Option<String>,
-        allowed_numbers: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         public_key_b64: &str,
     ) -> Result<Self> {
         use base64::Engine;
@@ -90,7 +91,7 @@ impl TelnyxChannel {
             api_key,
             from_number,
             messaging_profile_id,
-            allowed_numbers,
+            peer_resolver,
             verifying_key,
         })
     }
@@ -118,7 +119,8 @@ impl TelnyxChannel {
     /// denies everyone; `"*"` matches anyone; otherwise an exact
     /// case-insensitive E.164 match (with whitespace stripped) is required.
     pub fn is_number_allowed(&self, phone: &str) -> bool {
-        is_number_allowed_for_list(&self.allowed_numbers, phone)
+        let allowed = (self.peer_resolver)();
+        is_number_allowed_for_list(&allowed, phone)
     }
 
     /// Verify a Telnyx webhook signature.
@@ -442,7 +444,7 @@ mod tests {
             "test-api-key".into(),
             "+15555550100".into(),
             None,
-            vec!["+15555550199".into()],
+            Arc::new(|| vec!["+15555550199".to_string()]),
             &test_public_key_b64(),
         )
         .expect("test channel construction succeeds")
@@ -453,7 +455,7 @@ mod tests {
             "test-api-key".into(),
             "+15555550100".into(),
             Some("mp_test_profile".into()),
-            vec!["+15555550199".into()],
+            Arc::new(|| vec!["+15555550199".to_string()]),
             &test_public_key_b64(),
         )
         .expect("test channel with profile construction succeeds")
@@ -486,7 +488,13 @@ mod tests {
 
     #[test]
     fn new_rejects_empty_public_key() {
-        let result = TelnyxChannel::new("k".into(), "+15555550100".into(), None, vec![], "");
+        let result = TelnyxChannel::new(
+            "k".into(),
+            "+15555550100".into(),
+            None,
+            Arc::new(Vec::new),
+            "",
+        );
         let Err(err) = result else {
             panic!("empty public_key should error");
         };
@@ -500,7 +508,7 @@ mod tests {
             "k".into(),
             "+15555550100".into(),
             None,
-            vec![],
+            Arc::new(Vec::new),
             "!!!not-base64!!!",
         );
         let Err(err) = result else {
@@ -514,8 +522,13 @@ mod tests {
     fn new_rejects_wrong_length() {
         use base64::Engine;
         let too_short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
-        let result =
-            TelnyxChannel::new("k".into(), "+15555550100".into(), None, vec![], &too_short);
+        let result = TelnyxChannel::new(
+            "k".into(),
+            "+15555550100".into(),
+            None,
+            Arc::new(Vec::new),
+            &too_short,
+        );
         let Err(err) = result else {
             panic!("16-byte key should error");
         };

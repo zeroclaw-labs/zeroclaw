@@ -39,6 +39,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const VONAGE_API_BASE: &str = "https://rest.nexmo.com";
@@ -55,7 +56,7 @@ pub struct VonageChannel {
     api_key: String,
     api_secret: String,
     from_number_or_sender_id: String,
-    allowed_numbers: Vec<String>,
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     signature_secret: String,
 }
 
@@ -64,14 +65,14 @@ impl VonageChannel {
         api_key: String,
         api_secret: String,
         from_number_or_sender_id: String,
-        allowed_numbers: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         signature_secret: String,
     ) -> Self {
         Self {
             api_key,
             api_secret,
             from_number_or_sender_id,
-            allowed_numbers,
+            peer_resolver,
             signature_secret,
         }
     }
@@ -95,7 +96,8 @@ impl VonageChannel {
     /// everyone; `"*"` matches anyone; otherwise an exact case-insensitive
     /// E.164 match is required.
     pub fn is_number_allowed(&self, phone: &str) -> bool {
-        is_number_allowed_for_list(&self.allowed_numbers, phone)
+        let allowed = (self.peer_resolver)();
+        is_number_allowed_for_list(&allowed, phone)
     }
 
     /// Verify a Vonage inbound-webhook signature. The caller must pass the
@@ -413,7 +415,7 @@ mod tests {
             "TESTKEY".into(),
             "test-secret".into(),
             "+15555550100".into(),
-            vec!["+15555550199".into()],
+            Arc::new(|| vec!["+15555550199".to_string()]),
             "sig-secret".into(),
         )
     }

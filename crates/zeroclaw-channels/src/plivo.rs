@@ -32,6 +32,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const PLIVO_API_BASE: &str = "https://api.plivo.com/v1";
@@ -48,7 +49,7 @@ pub struct PlivoChannel {
     account_id: String,
     auth_token: String,
     from_number: String,
-    allowed_numbers: Vec<String>,
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl PlivoChannel {
@@ -56,13 +57,13 @@ impl PlivoChannel {
         account_id: String,
         auth_token: String,
         from_number: String,
-        allowed_numbers: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         Self {
             account_id,
             auth_token,
             from_number,
-            allowed_numbers,
+            peer_resolver,
         }
     }
 
@@ -87,7 +88,8 @@ impl PlivoChannel {
     /// everyone; `"*"` matches anyone; otherwise an exact case-insensitive
     /// E.164 match is required (whitespace stripped).
     pub fn is_number_allowed(&self, phone: &str) -> bool {
-        is_number_allowed_for_list(&self.allowed_numbers, phone)
+        let allowed = (self.peer_resolver)();
+        is_number_allowed_for_list(&allowed, phone)
     }
 
     /// Verify a Plivo V3 webhook signature against the request URL, nonce,
@@ -377,7 +379,7 @@ mod tests {
             "MAtestauthid".into(),
             "test-auth-token".into(),
             "+15555550100".into(),
-            vec!["+15555550199".into()],
+            Arc::new(|| vec!["+15555550199".to_string()]),
         )
     }
 

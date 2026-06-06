@@ -5673,11 +5673,31 @@ fn build_channel_by_id(
                 .twilio
                 .get("default")
                 .context("Twilio channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .twilio
+                        .get(&alias)
+                        .map(|c| c.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("twilio", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(TwilioChannel::new(
                 tw.account_sid.clone(),
                 tw.auth_token.clone(),
                 tw.from_number.clone(),
-                tw.allowed_numbers.clone(),
+                peer_resolver,
             )))
         }
         #[cfg(not(feature = "channel-twilio"))]
@@ -5691,11 +5711,31 @@ fn build_channel_by_id(
                 .plivo
                 .get("default")
                 .context("Plivo channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .plivo
+                        .get(&alias)
+                        .map(|c| c.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("plivo", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(PlivoChannel::new(
                 pl.account_id.clone(),
                 pl.auth_token.clone(),
                 pl.from_number.clone(),
-                pl.allowed_numbers.clone(),
+                peer_resolver,
             )))
         }
         #[cfg(not(feature = "channel-plivo"))]
@@ -5709,11 +5749,31 @@ fn build_channel_by_id(
                 .telnyx
                 .get("default")
                 .context("Telnyx channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .telnyx
+                        .get(&alias)
+                        .map(|c| c.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("telnyx", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(TelnyxChannel::new(
                 tx.api_key.clone(),
                 tx.from_number.clone(),
                 tx.messaging_profile_id.clone(),
-                tx.allowed_numbers.clone(),
+                peer_resolver,
                 &tx.public_key,
             )?))
         }
@@ -5728,12 +5788,32 @@ fn build_channel_by_id(
                 .sinch
                 .get("default")
                 .context("Sinch channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .sinch
+                        .get(&alias)
+                        .map(|c| c.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("sinch", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(SinchChannel::new(
                 sc.service_plan_id.clone(),
                 sc.api_token.clone(),
                 sc.region.clone(),
                 sc.from_number.clone(),
-                sc.allowed_numbers.clone(),
+                peer_resolver,
                 sc.callback_secret.clone(),
             )))
         }
@@ -5748,11 +5828,31 @@ fn build_channel_by_id(
                 .vonage
                 .get("default")
                 .context("Vonage channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = config
+                        .channels
+                        .vonage
+                        .get(&alias)
+                        .map(|c| c.allowed_numbers.clone())
+                        .unwrap_or_default();
+                    for peer in config.channel_external_peers("vonage", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
             Ok(Arc::new(VonageChannel::new(
                 vo.api_key.clone(),
                 vo.api_secret.clone(),
                 vo.from_number_or_sender_id.clone(),
-                vo.allowed_numbers.clone(),
+                peer_resolver,
                 vo.signature_secret.clone(),
             )))
         }
@@ -6683,6 +6783,25 @@ fn collect_configured_channels(
         if !tw.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .twilio
+                    .get(&alias)
+                    .map(|c| c.allowed_numbers.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("twilio", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Twilio",
             alias: Some(alias.clone()),
@@ -6690,7 +6809,7 @@ fn collect_configured_channels(
                 tw.account_sid.clone(),
                 tw.auth_token.clone(),
                 tw.from_number.clone(),
-                tw.allowed_numbers.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -6714,6 +6833,25 @@ fn collect_configured_channels(
         if !pl.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .plivo
+                    .get(&alias)
+                    .map(|c| c.allowed_numbers.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("plivo", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Plivo",
             alias: Some(alias.clone()),
@@ -6721,7 +6859,7 @@ fn collect_configured_channels(
                 pl.account_id.clone(),
                 pl.auth_token.clone(),
                 pl.from_number.clone(),
-                pl.allowed_numbers.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -6745,16 +6883,35 @@ fn collect_configured_channels(
         if !tx.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .telnyx
+                    .get(&alias)
+                    .map(|c| c.allowed_numbers.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("telnyx", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         match TelnyxChannel::new(
             tx.api_key.clone(),
             tx.from_number.clone(),
             tx.messaging_profile_id.clone(),
-            tx.allowed_numbers.clone(),
+            peer_resolver,
             &tx.public_key,
         ) {
             Ok(telnyx_channel) => {
                 channels.push(ConfiguredChannel {
-                    display_name: "Telnyx",
+                    display_name: "Telnyx SMS",
                     alias: Some(alias.clone()),
                     channel: Arc::new(telnyx_channel),
                 });
@@ -6790,6 +6947,25 @@ fn collect_configured_channels(
         if !sc.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .sinch
+                    .get(&alias)
+                    .map(|c| c.allowed_numbers.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("sinch", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Sinch",
             alias: Some(alias.clone()),
@@ -6798,7 +6974,7 @@ fn collect_configured_channels(
                 sc.api_token.clone(),
                 sc.region.clone(),
                 sc.from_number.clone(),
-                sc.allowed_numbers.clone(),
+                peer_resolver,
                 sc.callback_secret.clone(),
             )),
         });
@@ -6823,6 +6999,25 @@ fn collect_configured_channels(
         if !vo.enabled {
             continue;
         }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = config
+                    .channels
+                    .vonage
+                    .get(&alias)
+                    .map(|c| c.allowed_numbers.clone())
+                    .unwrap_or_default();
+                for peer in config.channel_external_peers("vonage", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Vonage",
             alias: Some(alias.clone()),
@@ -6830,7 +7025,7 @@ fn collect_configured_channels(
                 vo.api_key.clone(),
                 vo.api_secret.clone(),
                 vo.from_number_or_sender_id.clone(),
-                vo.allowed_numbers.clone(),
+                peer_resolver,
                 vo.signature_secret.clone(),
             )),
         });

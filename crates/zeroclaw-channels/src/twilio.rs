@@ -29,6 +29,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const TWILIO_API_BASE: &str = "https://api.twilio.com/2010-04-01";
@@ -44,7 +45,7 @@ pub struct TwilioChannel {
     account_sid: String,
     auth_token: String,
     from_number: String,
-    allowed_numbers: Vec<String>,
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl TwilioChannel {
@@ -52,13 +53,13 @@ impl TwilioChannel {
         account_sid: String,
         auth_token: String,
         from_number: String,
-        allowed_numbers: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         Self {
             account_sid,
             auth_token,
             from_number,
-            allowed_numbers,
+            peer_resolver,
         }
     }
 
@@ -88,7 +89,8 @@ impl TwilioChannel {
     /// everyone; `"*"` matches anyone; otherwise an exact case-insensitive
     /// E.164 match is required.
     pub fn is_number_allowed(&self, phone: &str) -> bool {
-        is_number_allowed_for_list(&self.allowed_numbers, phone)
+        let allowed = (self.peer_resolver)();
+        is_number_allowed_for_list(&allowed, phone)
     }
 
     /// Verify a Twilio webhook signature against the request URL and form
@@ -371,7 +373,7 @@ mod tests {
             "ACtestsid".into(),
             "test-auth-token".into(),
             "+15555550100".into(),
-            vec!["+15555550199".into()],
+            Arc::new(|| vec!["+15555550199".to_string()]),
         )
     }
 
