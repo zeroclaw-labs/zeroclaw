@@ -41,6 +41,18 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
+    /// Optional egress allowlist. When present, the plugin's HTTP requests are
+    /// restricted to these hosts (exact, or a leading-`*.` wildcard such as
+    /// `*.fal.run`). When absent, the always-on SSRF guard still blocks
+    /// loopback/private/cloud-metadata addresses but any public host is
+    /// reachable — backward-compatible with plugins that predate this field.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Optional environment-variable allowlist. When present, `zc_env_read` may
+    /// only read these names. When absent, reads are permitted (with a one-time
+    /// warning) for backward compatibility.
+    #[serde(default)]
+    pub env_allowlist: Option<Vec<String>>,
 }
 
 /// What a plugin can do.

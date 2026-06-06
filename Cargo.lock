@@ -13230,6 +13230,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "url",
  "zeroclaw-api",
  "zeroclaw-log",
 ]

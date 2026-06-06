@@ -66,6 +66,8 @@ capabilities = ["tool"]               # What the plugin provides (required)
 permissions = ["http_client"]          # What the plugin needs (optional)
 signature = "base64url..."            # Ed25519 signature (optional)
 publisher_key = "hex..."              # Publisher public key (optional)
+allowed_hosts = ["*.fal.run"]          # Egress host allowlist (optional, see Sandboxing)
+env_allowlist = ["FAL_API_KEY"]        # Env-var read allowlist (optional, see Sandboxing)
 ```
 
 ### Capabilities
@@ -88,6 +90,24 @@ publisher_key = "hex..."              # Publisher public key (optional)
 | `file_write` | Can write files (not yet implemented) |
 | `memory_read` | Can read agent memory (not yet implemented) |
 | `memory_write` | Can write agent memory (not yet implemented) |
+
+### Sandboxing
+
+Plugins run in a resource- and capability-bounded WASM sandbox:
+
+- **Resource limits (always on):** each plugin instance is capped at 256 MiB of
+  linear memory and a 180 s execution timeout (wasm epoch interruption), so a
+  buggy or malicious plugin can't OOM or wedge the host.
+- **Egress / SSRF guard (always on):** `zc_http_request` blocks non-public
+  destinations — loopback, private ranges, CGNAT, and link-local incl. the cloud
+  metadata address `169.254.169.254` — validated against the *resolved* IPs
+  (not just literals). Only `http`/`https` schemes are allowed.
+- **`allowed_hosts` (opt-in):** restrict egress to specific hosts. Entries are
+  exact, or a leading `*.` wildcard (`*.fal.run` matches `fal.run` and
+  `queue.fal.run`). When omitted, any *public* host is reachable.
+- **`env_allowlist` (opt-in):** restrict `zc_env_read` to named variables. When
+  omitted, reads are permitted (with a one-time warning) for backward
+  compatibility — declare an allowlist to scope a plugin to just the keys it needs.
 
 ## Required WASM exports
 

@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt"] }
 toml = "1.0"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3.26"

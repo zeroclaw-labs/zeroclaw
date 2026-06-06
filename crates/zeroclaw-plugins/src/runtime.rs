@@ -9,15 +9,38 @@ use anyhow::{Context, Result};
 use extism::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 use zeroclaw_api::tool::ToolResult;
 
+/// Maximum linear memory for a plugin instance: 4096 WebAssembly pages ×
+/// 64 KiB = 256 MiB. Generous for the API-wrapper plugins we ship (which
+/// encode one key + a small body and read a JSON response) while bounding a
+/// runaway allocation so a buggy/malicious plugin can't OOM the host.
+const MAX_WASM_PAGES: u32 = 4096;
+
+/// Extism epoch-interruption timeout for a single plugin call, in milliseconds.
+/// Must exceed the 120 s outbound HTTP ceiling in [`handle_http_request`] so a
+/// legitimate slow call (e.g. cold model inference) is not trapped mid-flight.
+/// Epoch interruption only fires at wasm instruction boundaries, so this bounds
+/// runaway *wasm* (tight loops); a stall inside the host's blocking HTTP call is
+/// bounded by the reqwest client timeout instead.
+pub(crate) const EXEC_TIMEOUT_MS: u64 = 180_000;
+
+/// Compile-time invariant: the epoch timeout must outlast the 120 s HTTP ceiling.
+const _: () = assert!(EXEC_TIMEOUT_MS > 120_000);
+
 // ── Host function context ─────────────────────────────────────────
 
-/// Permissions available to a single plugin invocation.
+/// Permissions and scoping available to a single plugin invocation.
 #[derive(Debug, Clone)]
 struct HostContext {
     permissions: HashSet<PluginPermission>,
+    /// Optional per-plugin egress allowlist. `None` = no host restriction
+    /// (the always-on SSRF guard still applies).
+    allowed_hosts: Option<Vec<String>>,
+    /// Optional per-plugin env-var allowlist. `None` = permissive (back-compat).
+    env_allowlist: Option<Vec<String>>,
 }
 
 // ── Data types exchanged with plugins ─────────────────────────────
@@ -81,6 +104,10 @@ fn handle_http_request(
 
     let req: HttpRequest = serde_json::from_str(&request_json)
         .map_err(|e| Error::msg(format!("invalid HTTP request JSON: {e}")))?;
+
+    // SSRF guard: always block non-public destinations; additionally enforce the
+    // per-plugin host allowlist when one is configured.
+    validate_egress(&req.url, ctx.allowed_hosts.as_deref())?;
 
     // 120s ceiling covers legitimate slow cases: large file downloads and slow
     // model-inference endpoints (fal.ai image generation routinely takes 20-60s
@@ -158,6 +185,18 @@ fn handle_env_read(
 
     let var_name: String = plugin.memory_get_val(&inputs[0])?;
 
+    // Per-plugin env scoping. When an allowlist is declared, deny anything
+    // outside it; when absent, permit (back-compat) but warn once per var so
+    // operators can author an allowlist.
+    if !env_var_allowed(ctx.env_allowlist.as_deref(), &var_name) {
+        return Err(Error::msg(format!(
+            "env access denied: '{var_name}' is not in the plugin's env_allowlist"
+        )));
+    }
+    if ctx.env_allowlist.is_none() {
+        warn_unscoped_env_read(&var_name);
+    }
+
     let value = std::env::var(&var_name)
         .map_err(|_| Error::msg(format!("environment variable '{var_name}' not set")))?;
 
@@ -166,13 +205,152 @@ fn handle_env_read(
     Ok(())
 }
 
+// ── Egress (SSRF) guard ───────────────────────────────────────────
+
+/// Validate that a plugin may issue an HTTP request to `url_str`. Always blocks
+/// non-public destinations (SSRF protection); additionally enforces a per-plugin
+/// host allowlist when one is configured.
+fn validate_egress(url_str: &str, allowed_hosts: Option<&[String]>) -> Result<(), Error> {
+    let url = url::Url::parse(url_str)
+        .map_err(|e| Error::msg(format!("invalid URL '{url_str}': {e}")))?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(Error::msg(format!(
+                "URL scheme '{other}' not allowed (http/https only)"
+            )));
+        }
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::msg("URL has no host"))?;
+
+    if let Some(allow) = allowed_hosts
+        && !allow.iter().any(|p| host_matches(p, host))
+    {
+        return Err(Error::msg(format!(
+            "host '{host}' is not in the plugin's allowed_hosts"
+        )));
+    }
+
+    // DNS-rebinding defense: resolve and validate every address (not just IP
+    // literals). Note: reqwest re-resolves on connect, leaving a small TOCTOU
+    // window — full closure requires pinning the validated IP into the
+    // connection (documented follow-up).
+    let port = url.port_or_known_default().unwrap_or(443);
+    let mut resolved_any = false;
+    for sa in (host, port)
+        .to_socket_addrs()
+        .map_err(|e| Error::msg(format!("DNS resolution failed for '{host}': {e}")))?
+    {
+        resolved_any = true;
+        if is_blocked_ip(&sa.ip()) {
+            return Err(Error::msg(format!(
+                "blocked egress to non-public address {} (resolved from '{host}')",
+                sa.ip()
+            )));
+        }
+    }
+    if !resolved_any {
+        return Err(Error::msg(format!("no addresses resolved for '{host}'")));
+    }
+    Ok(())
+}
+
+/// Whether `ip` is a non-public address plugins must not reach.
+fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(mapped) => is_blocked_ipv4(&mapped),
+            None => is_blocked_ipv6(v6),
+        },
+    }
+}
+
+fn is_blocked_ipv4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()            // 127.0.0.0/8
+        || ip.is_private()      // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()   // 169.254.0.0/16 (incl. cloud metadata 169.254.169.254)
+        || ip.is_unspecified()  // 0.0.0.0
+        || ip.is_broadcast()    // 255.255.255.255
+        || ip.is_documentation()
+        || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
+}
+
+fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    ip.is_loopback()                    // ::1
+        || ip.is_unspecified()          // ::
+        || (seg[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
+        || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+}
+
+/// Match a host against an allowlist pattern: exact, or leading `*.` wildcard.
+fn host_matches(pattern: &str, host: &str) -> bool {
+    let p = pattern.trim().to_ascii_lowercase();
+    let h = host.trim().to_ascii_lowercase();
+    match p.strip_prefix("*.") {
+        Some(suffix) => h == suffix || h.ends_with(&format!(".{suffix}")),
+        None => h == p,
+    }
+}
+
+/// Whether `var_name` may be read given an optional allowlist. `None` = permit
+/// (back-compat); `Some` = only names in the list.
+fn env_var_allowed(allowlist: Option<&[String]>, var_name: &str) -> bool {
+    match allowlist {
+        Some(allow) => allow.iter().any(|a| a == var_name),
+        None => true,
+    }
+}
+
+/// Warn once per env-var name when a plugin reads it without an `env_allowlist`.
+fn warn_unscoped_env_read(var_name: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let is_new = warned
+        .lock()
+        .map(|mut s| s.insert(var_name.to_string()))
+        .unwrap_or(false);
+    if is_new {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "plugin read env var '{var_name}' with no env_allowlist declared; \
+                 add `env_allowlist` to the manifest to scope access"
+            )
+        );
+    }
+}
+
 // ── Plugin creation and invocation ────────────────────────────────
 
-/// Create an Extism plugin from a WASM file with the given permissions.
+/// Create an Extism plugin from a WASM file with the given permissions and no
+/// per-plugin egress/env scoping (the always-on SSRF guard still applies).
 pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Result<extism::Plugin> {
+    create_plugin_with(wasm_path, permissions, None, None)
+}
+
+/// Create an Extism plugin with permissions plus optional per-plugin egress and
+/// env allowlists.
+pub fn create_plugin_with(
+    wasm_path: &Path,
+    permissions: &[PluginPermission],
+    allowed_hosts: Option<&[String]>,
+    env_allowlist: Option<&[String]>,
+) -> Result<extism::Plugin> {
     let perm_set: HashSet<PluginPermission> = permissions.iter().cloned().collect();
     let ctx = UserData::new(HostContext {
         permissions: perm_set,
+        allowed_hosts: allowed_hosts.map(|s| s.to_vec()),
+        env_allowlist: env_allowlist.map(|s| s.to_vec()),
     });
 
     let http_fn = Function::new(
@@ -185,7 +363,12 @@ pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Resu
 
     let env_fn = Function::new("zc_env_read", [PTR], [PTR], ctx, handle_env_read);
 
-    let manifest = Manifest::new([Wasm::file(wasm_path)]);
+    // Bound resources so a buggy/malicious plugin can't OOM or wedge the host:
+    // a 256 MiB memory cap and an epoch-interruption timeout. (Extism enables
+    // epoch interruption automatically when a manifest timeout is set.)
+    let manifest = Manifest::new([Wasm::file(wasm_path)])
+        .with_memory_max(MAX_WASM_PAGES)
+        .with_timeout(std::time::Duration::from_millis(EXEC_TIMEOUT_MS));
 
     Plugin::new(manifest, [http_fn, env_fn], true)
         .with_context(|| format!("failed to load WASM plugin from {}", wasm_path.display()))
@@ -223,9 +406,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn egress_blocks_loopback_metadata_and_private() {
+        for url in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://[::1]/",
+        ] {
+            assert!(validate_egress(url, None).is_err(), "should block {url}");
+        }
+    }
+
+    #[test]
+    fn egress_blocks_ipv4_mapped_v6() {
+        // ::ffff:10.0.0.1 maps to the private 10.0.0.1.
+        assert!(validate_egress("http://[::ffff:10.0.0.1]/", None).is_err());
+    }
+
+    #[test]
+    fn egress_allows_public_ip_literal() {
+        // IP literal: resolved locally, no network needed.
+        assert!(validate_egress("https://8.8.8.8/", None).is_ok());
+    }
+
+    #[test]
+    fn egress_rejects_non_http_scheme() {
+        assert!(validate_egress("file:///etc/passwd", None).is_err());
+        assert!(validate_egress("ftp://8.8.8.8/", None).is_err());
+    }
+
+    #[test]
+    fn egress_allowlist_enforced() {
+        // Public IP, but not in the allowlist → blocked before DNS.
+        let allow = vec!["*.fal.run".to_string()];
+        assert!(validate_egress("https://8.8.8.8/", Some(&allow)).is_err());
+    }
+
+    #[test]
+    fn host_matches_exact_and_wildcard() {
+        assert!(host_matches("api.tavily.com", "api.tavily.com"));
+        assert!(!host_matches("api.tavily.com", "evil.com"));
+        assert!(host_matches("*.fal.run", "queue.fal.run"));
+        assert!(host_matches("*.fal.run", "fal.run"));
+        assert!(!host_matches("*.fal.run", "fal.run.evil.com"));
+        assert!(!host_matches("*.fal.run", "notfal.run"));
+    }
+
+    #[test]
+    fn blocked_ip_classification() {
+        use std::net::Ipv4Addr;
+        assert!(is_blocked_ipv4(&Ipv4Addr::new(169, 254, 169, 254)));
+        assert!(is_blocked_ipv4(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_blocked_ipv4(&Ipv4Addr::new(100, 64, 0, 1))); // CGNAT
+        assert!(!is_blocked_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_blocked_ipv4(&Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn env_allowlist_logic() {
+        let allow = vec!["FAL_API_KEY".to_string()];
+        assert!(env_var_allowed(Some(&allow), "FAL_API_KEY"));
+        assert!(!env_var_allowed(Some(&allow), "AWS_SECRET_ACCESS_KEY"));
+        // No allowlist → permissive (back-compat).
+        assert!(env_var_allowed(None, "ANYTHING"));
+    }
+
+    #[test]
     fn host_context_permission_check() {
         let ctx = HostContext {
             permissions: HashSet::from([PluginPermission::HttpClient]),
+            allowed_hosts: None,
+            env_allowlist: None,
         };
         assert!(ctx.permissions.contains(&PluginPermission::HttpClient));
         assert!(!ctx.permissions.contains(&PluginPermission::EnvRead));

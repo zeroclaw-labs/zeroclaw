@@ -1281,6 +1281,8 @@ pub fn all_tools_with_runtime(
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
+                            manifest.allowed_hosts.clone(),
+                            manifest.env_allowlist.clone(),
                         )));
                     }
                     ::zeroclaw_log::record!(
