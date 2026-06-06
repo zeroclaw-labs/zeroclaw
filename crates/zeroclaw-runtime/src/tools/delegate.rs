@@ -498,6 +498,20 @@ impl DelegateTool {
         self.workspace_dir.join("delegate_results")
     }
 
+    /// Persist a background result atomically: write to a sibling temp file then
+    /// rename onto the final path, so a concurrent reader never observes a
+    /// half-written (or zero-length) JSON document.
+    async fn write_result_atomic(
+        result_path: &Path,
+        result: &BackgroundDelegateResult,
+    ) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(result)?;
+        let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        tokio::fs::rename(&tmp_path, result_path).await?;
+        Ok(())
+    }
+
     /// Validate that a user-provided task_id is a valid UUID to prevent
     /// path traversal attacks (e.g. `../../etc/passwd`).
     fn validate_task_id(task_id: &str) -> Result<(), String> {
@@ -952,8 +966,7 @@ impl DelegateTool {
             finished_at: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
-        let json_bytes = serde_json::to_vec_pretty(&initial_result)?;
-        tokio::fs::write(&result_path, &json_bytes).await?;
+        Self::write_result_atomic(&result_path, &initial_result).await?;
 
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
@@ -1057,9 +1070,7 @@ impl DelegateTool {
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                if let Ok(bytes) = serde_json::to_vec_pretty(&final_result) {
-                    let _ = tokio::fs::write(&result_path, &bytes).await;
-                }
+                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1439,8 +1450,7 @@ impl DelegateTool {
         result.status = BackgroundTaskStatus::Cancelled;
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        let bytes = serde_json::to_vec_pretty(&result)?;
-        tokio::fs::write(&result_path, &bytes).await?;
+        Self::write_result_atomic(&result_path, &result).await?;
 
         Ok(ToolResult {
             success: true,
@@ -1836,8 +1846,9 @@ mod tests {
         let mut last_result = None;
 
         loop {
-            if let Ok(content) = std::fs::read_to_string(&result_path) {
-                let result: BackgroundDelegateResult = serde_json::from_str(&content).unwrap();
+            if let Ok(content) = std::fs::read_to_string(&result_path)
+                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
+            {
                 if result.status != BackgroundTaskStatus::Running {
                     return result;
                 }
