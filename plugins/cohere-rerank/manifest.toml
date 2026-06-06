@@ -1,0 +1,7 @@
+name = "cohere-rerank"
+version = "0.1.0"
+description = "Rerank documents by relevance to a query (RAG) using the Cohere Rerank API"
+author = "ZeroClaw Labs"
+wasm_path = "cohere_rerank.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
