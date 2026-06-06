@@ -24,10 +24,10 @@ docker run -d \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
-The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config — you still need to onboard before it's useful:
+The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config — you still need to run quickstart before it's useful:
 
 ```bash
-docker exec -it zeroclaw zeroclaw onboard
+docker exec -it zeroclaw zeroclaw quickstart
 ```
 
 ## Compose
@@ -47,10 +47,10 @@ services:
       ZEROCLAW_ALLOW_PUBLIC_BIND: "1"   # only if the gateway must be reachable on the LAN
 ```
 
-After the container starts, run onboarding:
+After the container starts, run quickstart:
 
 ```bash
-docker compose exec zeroclaw zeroclaw onboard
+docker compose exec zeroclaw zeroclaw quickstart
 ```
 
 Drop `ZEROCLAW_ALLOW_PUBLIC_BIND` if you only need local access.
@@ -159,7 +159,7 @@ Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options
 1. **Expose the gateway** — `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
 2. **Use a tunnel** — ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
 
-`zeroclaw onboard tunnel` configures ngrok or Cloudflare tunnels directly; the resulting public URL is what you point your webhook senders at.
+Configure a tunnel via `zeroclaw config set gateway.tunnel.provider=<ngrok|cloudflare>` and the related `gateway.tunnel.*` fields (see the [Config reference](../reference/config.md)); the resulting public URL is what you point your webhook senders at.
 
 ## Kubernetes
 

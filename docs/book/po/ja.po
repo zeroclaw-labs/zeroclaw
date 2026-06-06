@@ -48254,3 +48254,147 @@ msgstr "🔵 チームの決定"
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "🟡 Conditional"
 msgstr "🟡 条件"
+
+#: src/SUMMARY.md
+msgid "Channels & Integrations"
+msgstr "チャンネルと連携"
+
+#: src/SUMMARY.md src/developing/index.md
+msgid "Extending & Plugins"
+msgstr "拡張とプラグイン"
+
+#: src/SUMMARY.md
+msgid "Foundations (RFCs)"
+msgstr "基盤（RFC）"
+
+#: src/SUMMARY.md
+msgid "Hardware & Boards"
+msgstr "ハードウェアとボード"
+
+#: src/SUMMARY.md src/setup/index.md
+msgid "Installation"
+msgstr "インストール"
+
+#: src/SUMMARY.md
+msgid "Operations & Deployment"
+msgstr "運用とデプロイ"
+
+#: src/SUMMARY.md
+msgid "Security & Autonomy"
+msgstr "セキュリティと自律性"
+
+#: src/SUMMARY.md
+msgid "Standard Operating Procedures"
+msgstr "標準運用手順"
+
+#: src/SUMMARY.md
+msgid "Tools & Extensibility"
+msgstr "ツールと拡張性"
+
+#: src/getting-started/index.md
+msgid "Start here if you are installing ZeroClaw for the first time or choosing the simplest path to a working agent."
+msgstr "ZeroClaw を初めてインストールする場合や、動作するエージェントへの最短ルートを選ぶ場合は、ここから始めてください。"
+
+#: src/getting-started/index.md
+msgid "[Quick start](./quick-start.md) covers installation, onboarding, and the first chat."
+msgstr "[クイックスタート](./quick-start.md) では、インストール、オンボーディング、最初のチャットを扱います。"
+
+#: src/getting-started/index.md
+msgid "[YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset."
+msgstr "[YOLO モード](./yolo.md) では、最速だが安全ではないローカル開発プリセットを説明します。"
+
+#: src/getting-started/index.md
+msgid "[Multi-model setup](./multi-model-setup.md) explains provider and route basics."
+msgstr "[マルチモデル設定](./multi-model-setup.md) では、プロバイダーとルートの基本を説明します。"
+
+#: src/getting-started/index.md
+msgid "[zerocode](./tui.md) introduces the terminal UI."
+msgstr "[zerocode](./tui.md) では、ターミナル UI を紹介します。"
+
+#: src/getting-started/index.md
+msgid "[Language and translations](./language.md) covers locale selection."
+msgstr "[言語と翻訳](./language.md) では、ロケールの選択を扱います。"
+
+#: src/setup/index.md
+msgid "Choose the installation path for your operating system or deployment target."
+msgstr "使用するオペレーティングシステムまたはデプロイ先に合わせて、インストール手順を選んでください。"
+
+#: src/setup/index.md
+msgid "[Docker and containers](./container.md)"
+msgstr "[Docker とコンテナ](./container.md)"
+
+#: src/reference/index.md
+msgid "Reference material for operators and integrators who need exact command, configuration, environment, and API details."
+msgstr "正確なコマンド、設定、環境、API の詳細が必要な運用者とインテグレーター向けのリファレンスです。"
+
+#: src/reference/index.md
+msgid "[CLI](./cli.md)"
+msgstr "[CLI](./cli.md)"
+
+#: src/reference/index.md
+msgid "[Config](./config.md)"
+msgstr "[設定](./config.md)"
+
+#: src/reference/index.md
+msgid "[Environment variables](./env-vars.md)"
+msgstr "[環境変数](./env-vars.md)"
+
+#: src/reference/index.md
+msgid "[API rustdoc](../api.md)"
+msgstr "[API rustdoc](../api.md)"
+
+#: src/reference/index.md
+msgid "[Gateway HTTP API](../gateway/api.md)"
+msgstr "[ゲートウェイ HTTP API](../gateway/api.md)"
+
+#: src/reference/index.md
+msgid "[Web dashboard](../gateway/web-dashboard.md)"
+msgstr "[Web ダッシュボード](../gateway/web-dashboard.md)"
+
+#: src/developing/index.md
+msgid "Use these pages when extending ZeroClaw or working on project tooling."
+msgstr "ZeroClaw を拡張する場合やプロジェクトのツール類に取り組む場合は、これらのページを参照してください。"
+
+#: src/developing/index.md
+msgid "[Plugin protocol](./plugin-protocol.md)"
+msgstr "[プラグインプロトコル](./plugin-protocol.md)"
+
+#: src/developing/index.md
+msgid "[Extension examples](./extension-examples.md)"
+msgstr "[拡張例](./extension-examples.md)"
+
+#: src/developing/index.md
+msgid "[Building the docs locally](./building-docs.md)"
+msgstr "[ドキュメントをローカルでビルドする](./building-docs.md)"
+
+#: src/developing/index.md
+msgid "[Building the web dashboard](./web.md)"
+msgstr "[Web ダッシュボードをビルドする](./web.md)"
+
+#: src/contributing/index.md
+msgid "Start here before opening issues, proposing architecture changes, or submitting pull requests."
+msgstr "Issue を開く、アーキテクチャ変更を提案する、またはプルリクエストを送る前に、ここから始めてください。"
+
+#: src/contributing/index.md
+msgid "[Architecture and contribution map](./architecture-map.md)"
+msgstr "[アーキテクチャとコントリビューションのマップ](./architecture-map.md)"
+
+#: src/contributing/index.md
+msgid "[Privacy and PII discipline](./privacy.md)"
+msgstr "[プライバシーと PII の規律](./privacy.md)"
+
+#: src/contributing/index.md
+msgid "[Testing](./testing.md)"
+msgstr "[テスト](./testing.md)"
+
+#: src/contributing/index.md
+msgid "[PR review protocol](./pr-review-protocol.md)"
+msgstr "[PR レビュープロトコル](./pr-review-protocol.md)"
+
+#: src/contributing/index.md
+msgid "[Multi-agent setup](./multi-agent-setup.md)"
+msgstr "[マルチエージェント設定](./multi-agent-setup.md)"
+
+#: src/contributing/index.md
+msgid "[Contributor License Agreement](./cla.md)"
+msgstr "[コントリビューターライセンス契約](./cla.md)"
