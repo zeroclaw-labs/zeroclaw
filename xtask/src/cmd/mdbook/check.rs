@@ -401,6 +401,8 @@ mod tests {
 
     #[test]
     fn parses_plural_msgstr_variants_for_audit() {
+        // This fixture intentionally contains generated-response contamination so
+        // grep-based follow-up audits do not mistake it for leaked catalog content.
         let raw = r#"#: src/example.md
 msgid "item"
 msgid_plural "items"
