@@ -622,7 +622,7 @@ impl<'a> App<'a> {
                         self.section_cursor = orig;
                     }
                     self.zeroclaw_pane = ZeroclawPane::Sections;
-                    self.load_section_content(self.section_cursor).await?;
+                    self.preview_section(self.section_cursor).await?;
                     self.status_msg = None;
                     return Ok(());
                 }
@@ -1232,6 +1232,14 @@ impl<'a> App<'a> {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => {
+                // The filter edit may have changed the filtered list or moved
+                // `filter_cursor`; resolve the highlighted filtered row back to
+                // its underlying section so the right-pane preview matches what
+                // `draw_sections_pane` highlights and what Enter will open.
+                let visible = self.filtered_indices(&labels);
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.section_cursor = orig;
+                }
                 self.preview_section(self.section_cursor).await?;
                 return Ok(false);
             }
