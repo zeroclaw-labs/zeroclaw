@@ -645,6 +645,23 @@ impl<'a> App<'a> {
                 }
             }
 
+            // Scroll over the pinned section list moves the section highlight and
+            // re-previews — works whether focus is on the sections or the detail.
+            MouseEventKind::ScrollUp
+                if self.section_cursor > 0
+                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+            {
+                self.section_cursor -= 1;
+                self.preview_section(self.section_cursor).await?;
+            }
+            MouseEventKind::ScrollDown
+                if self.section_cursor + 1 < self.sections.len()
+                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+            {
+                self.section_cursor += 1;
+                self.preview_section(self.section_cursor).await?;
+            }
+
             MouseEventKind::ScrollUp
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
             {
