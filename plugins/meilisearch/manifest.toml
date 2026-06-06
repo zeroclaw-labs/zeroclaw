@@ -1,0 +1,7 @@
+name = "meilisearch"
+version = "0.1.0"
+description = "Search your own data via a self-hosted Meilisearch index"
+author = "ZeroClaw Labs"
+wasm_path = "meilisearch.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
