@@ -541,4 +541,4 @@ cli-channels-cli-always = {"  "}✅ CLI（始终可用）
 cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
-cli-channels-configure-hint = 配置方法：      zeroclaw onboard
+cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
