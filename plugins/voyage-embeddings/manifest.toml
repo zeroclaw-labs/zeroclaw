@@ -1,0 +1,7 @@
+name = "voyage-embeddings"
+version = "0.1.0"
+description = "Generate text embedding vectors for retrieval/RAG using the Voyage AI API"
+author = "ZeroClaw Labs"
+wasm_path = "voyage_embeddings.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
