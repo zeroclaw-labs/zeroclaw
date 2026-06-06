@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#
+# commit-msg hook — strip AI-assistant attribution from commit messages.
+#
+# Removes "Co-authored-by: Claude ...", "🤖 Generated with [Claude Code]", and
+# similar AI-attribution footers while preserving real human co-author trailers.
+# This enforces the repo standard documented in CLAUDE.md ("Attribution — no
+# AI/Claude trailers").
+#
+# Install:  git config core.hooksPath .githooks
+# Skip:     git commit --no-verify
+
+set -euo pipefail
+
+msg_file="$1"
+tmp="$(mktemp)"
+
+# Drop AI-attribution lines (case-insensitive). The patterns target Claude /
+# Anthropic-AI attribution and generic "generated/created by AI" footers only —
+# human "Co-authored-by:" trailers (real contributor emails) are left intact.
+grep -viE \
+  '^[[:space:]]*(co-authored-by:[[:space:]]*claude|co-authored-by:.*noreply@anthropic\.com|🤖[[:space:]]*generated with|generated with \[?claude|(created|generated) (with|by) claude( code)?)' \
+  "$msg_file" \
+  | awk '
+      { lines[NR] = $0 }
+      END {
+        last = NR
+        while (last > 0 && lines[last] ~ /^[[:space:]]*$/) last--
+        for (i = 1; i <= last; i++) print lines[i]
+      }' > "$tmp" || true
+
+mv "$tmp" "$msg_file"
