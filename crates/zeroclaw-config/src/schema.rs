@@ -14621,12 +14621,51 @@ impl Config {
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
         for (family, alias, cfg) in self.providers.models.iter_entries() {
+            self.collect_fallback_model_warnings(family, alias, cfg, warnings);
             if cfg.fallback.is_empty() {
                 continue;
             }
             let root = format!("{family}.{alias}");
             let mut visited: Vec<String> = vec![root.clone()];
-            self.walk_fallback(&root, &cfg.fallback, &mut visited, warnings);
+            self.walk_fallback(&root, &cfg.fallback, &mut visited, 1, warnings);
+        }
+    }
+
+    /// Surface `fallback_models` entries the build path silently skips: blank
+    /// entries and entries that duplicate the alias's primary `model`. The skip
+    /// itself is safe, but without a warning an operator never learns that a
+    /// listed fallback model is doing nothing.
+    fn collect_fallback_model_warnings(
+        &self,
+        family: &str,
+        alias: &str,
+        cfg: &ModelProviderConfig,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let Some(primary) = cfg.model.as_deref() else {
+            return;
+        };
+        for (i, model) in cfg.fallback_models.iter().enumerate() {
+            let path = format!("providers.models.{family}.{alias}.fallback_models[{i}]");
+            if model.trim().is_empty() {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "empty_fallback_model",
+                    format!(
+                        "fallback_models entry {i} on {family}.{alias} is empty; \
+                         it is skipped at runtime"
+                    ),
+                    path,
+                ));
+            } else if model == primary {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "fallback_model_duplicates_primary",
+                    format!(
+                        "fallback_models entry {model:?} on {family}.{alias} duplicates the \
+                         primary model; it is skipped at runtime"
+                    ),
+                    path,
+                ));
+            }
         }
     }
 
@@ -14635,8 +14674,21 @@ impl Config {
         from: &str,
         refs: &[crate::providers::ModelProviderRef],
         visited: &mut Vec<String>,
+        depth: usize,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
+        if depth > crate::providers::MAX_FALLBACK_DEPTH {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "max_fallback_depth_exceeded",
+                format!(
+                    "fallback chain from {from} exceeds the maximum depth of {}; \
+                     deeper links are pruned at runtime",
+                    crate::providers::MAX_FALLBACK_DEPTH
+                ),
+                format!("providers.models.{from}.fallback"),
+            ));
+            return;
+        }
         for (i, fallback_ref) in refs.iter().enumerate() {
             let raw = fallback_ref.as_str().trim();
             if raw.is_empty() {
@@ -14668,7 +14720,7 @@ impl Config {
                 continue;
             }
             visited.push(resolved.clone());
-            self.walk_fallback(&resolved, &cfg.fallback, visited, warnings);
+            self.walk_fallback(&resolved, &cfg.fallback, visited, depth + 1, warnings);
             visited.pop();
         }
     }
@@ -23599,6 +23651,81 @@ allowed_users = []
             .models
             .openai
             .insert("primary".to_string(), provider_entry_with_fallback(&[""]));
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn fallback_warns_when_chain_exceeds_max_depth() {
+        let mut config = Config::default();
+        let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
+        for i in 0..n {
+            let next = if i + 1 < n {
+                vec![format!("openai.a{}", i + 1)]
+            } else {
+                vec![]
+            };
+            let refs: Vec<&str> = next.iter().map(String::as_str).collect();
+            config
+                .providers
+                .models
+                .openai
+                .insert(format!("a{i}"), provider_entry_with_fallback(&refs));
+        }
+
+        let depth_warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "max_fallback_depth_exceeded")
+            .collect();
+        assert!(
+            !depth_warnings.is_empty(),
+            "a chain deeper than MAX_FALLBACK_DEPTH must surface a max_fallback_depth_exceeded warning"
+        );
+    }
+
+    #[test]
+    async fn fallback_models_warns_on_empty_entry() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_fallback_model");
+    }
+
+    #[test]
+    async fn fallback_models_warns_on_duplicate_of_primary() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["gpt-4o".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn fallback_models_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
 
         assert!(config.collect_warnings().is_empty());
     }

@@ -197,17 +197,22 @@ anthropic.prod/claude-sonnet-4-5
 ```
 
 Fallback aliases can themselves declare `fallback`, so the chain is as long as
-your config makes it — there is no depth limit. A chain that loops back on itself
-(`a` -> `b` -> `a`) is detected and the cycle edge is pruned; it never loops or
-hangs.
+your config makes it, up to a maximum depth of **3 aliases**. A chain that loops
+back on itself (`a` -> `b` -> `a`) is detected and the cycle edge is pruned, and
+an acyclic chain deeper than the limit has its remaining links pruned; neither
+ever loops, hangs, or overflows the stack.
 
 ### Misconfiguration
 
-A `fallback` entry that names an alias which is not configured, or one that closes
-a cycle, is **non-fatal**: `Config::validate()` still succeeds, the offending edge
-is skipped at runtime, and the issue is surfaced as a validation warning
-(`dangling_fallback_ref` / `fallback_cycle`) on the CLI and in the dashboard. A
-bad fallback link degrades gracefully — it never prevents the agent from running.
+A `fallback` entry that names an alias which is not configured, one that closes a
+cycle, or a chain that exceeds the maximum depth is **non-fatal**:
+`Config::validate()` still succeeds, the offending edge is skipped at runtime, and
+the issue is surfaced as a validation warning (`dangling_fallback_ref` /
+`fallback_cycle` / `max_fallback_depth_exceeded`) on the CLI and in the dashboard.
+A `fallback_models` entry that is blank or duplicates the alias's primary `model`
+is likewise skipped at runtime and surfaced (`empty_fallback_model` /
+`fallback_model_duplicates_primary`). A bad fallback link degrades gracefully — it
+never prevents the agent from running.
 
 ## See also
 

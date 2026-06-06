@@ -1335,7 +1335,13 @@ pub fn create_resilient_model_provider_for_alias(
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
     if let Some(entry) = config.providers.models.find(family, alias) {
-        append_fallback_chain(&mut model_providers, config, &entry.fallback, &mut visited);
+        append_fallback_chain(
+            &mut model_providers,
+            config,
+            &entry.fallback,
+            &mut visited,
+            1,
+        );
     }
 
     let reliable = ReliableModelProvider::new(
@@ -1396,14 +1402,28 @@ fn push_pinned_entries(
 
 /// Depth-first walk of an alias's `fallback` refs. Each resolvable target is
 /// built with its OWN credentials/endpoint/model and appended (model-pinned)
-/// before descending into its own `fallback`. Dangling refs and cycles are
-/// skipped — `Config::collect_warnings` already surfaces them to operators.
+/// before descending into its own `fallback`. Dangling refs, cycles, and chains
+/// deeper than `MAX_FALLBACK_DEPTH` are skipped — `Config::collect_warnings`
+/// already surfaces all three to operators.
 fn append_fallback_chain(
     out: &mut Vec<(String, Box<dyn ModelProvider>)>,
     config: &zeroclaw_config::schema::Config,
     refs: &[zeroclaw_config::providers::ModelProviderRef],
     visited: &mut Vec<String>,
+    depth: usize,
 ) {
+    if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
+                })),
+            "fallback chain exceeds max depth; pruning"
+        );
+        return;
+    }
     for fallback_ref in refs {
         let raw = fallback_ref.as_str().trim();
         if raw.is_empty() {
@@ -1456,7 +1476,7 @@ fn append_fallback_chain(
         }
 
         visited.push(resolved.clone());
-        append_fallback_chain(out, config, &entry.fallback, visited);
+        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1);
         visited.pop();
     }
 }
@@ -3741,6 +3761,48 @@ mod tests {
         assert!(
             result.is_ok(),
             "a fallback cycle must be pruned, never loop or abort the build"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_deep_acyclic_fallback_does_not_overflow() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        let n = zeroclaw_config::providers::MAX_FALLBACK_DEPTH + 50;
+        for i in 0..n {
+            let fallback = if i + 1 < n {
+                vec![zeroclaw_config::providers::ModelProviderRef::new(format!(
+                    "openai.a{}",
+                    i + 1
+                ))]
+            } else {
+                vec![]
+            };
+            config.providers.models.openai.insert(
+                format!("a{i}"),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("gpt-4o".to_string()),
+                        fallback,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "a0",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
 }
