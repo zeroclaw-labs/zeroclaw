@@ -5658,8 +5658,28 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(feature = "channel-linq")]
+        x if x.starts_with("linq.") => {
+            let alias = x.strip_prefix("linq.").context("invalid linq channel id")?;
+            let lq = config
+                .channels
+                .linq
+                .get(alias)
+                .with_context(|| format!("Linq alias '{alias}' not configured"))?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.to_string();
+                Arc::new(move || cfg_arc.read().channel_external_peers("linq", &alias))
+            };
+            Ok(Arc::new(LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                alias.to_string(),
+                peer_resolver,
+            )))
+        }
         #[cfg(not(feature = "channel-linq"))]
-        "linq" => {
+        x if x.starts_with("linq") => {
             anyhow::bail!("Linq channel requires the `channel-linq` feature");
         }
         #[cfg(feature = "channel-email")]

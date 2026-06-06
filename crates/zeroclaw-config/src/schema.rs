@@ -3697,6 +3697,11 @@ pub struct TranscriptionConfig {
     /// Whisper API request.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Optional global audio size upper bound in bytes, enforced before
+    /// dispatching to any transcription provider. Provider-specific caps still
+    /// apply.
+    #[serde(default)]
+    pub max_audio_bytes: Option<usize>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -3735,6 +3740,7 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: default_transcription_max_duration_secs(),
             openai: None,
             deepgram: None,
@@ -10000,7 +10006,8 @@ pub struct CronJobDecl {
     /// Model override for agent jobs.
     #[serde(default)]
     pub model: Option<String>,
-    /// Allowlist of tool names for agent jobs.
+    /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
+    /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.
@@ -11232,6 +11239,7 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// Port to listen on for incoming webhooks.
     #[tab(Advanced)]
+    #[serde(default = "default_webhook_channel_port")]
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
     #[tab(Advanced)]
@@ -11275,6 +11283,10 @@ pub struct WebhookConfig {
     /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_max_delay_ms: Option<u64>,
+}
+
+fn default_webhook_channel_port() -> u16 {
+    8090
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -14748,6 +14760,13 @@ impl Config {
                 RequiredFieldEmpty,
                 "gateway.host",
                 "gateway.host must not be empty"
+            );
+        }
+        if matches!(self.transcription.max_audio_bytes, Some(0)) {
+            validation_bail!(
+                InvalidNumericRange,
+                "transcription.max_audio_bytes",
+                "transcription.max_audio_bytes must be greater than zero"
             );
         }
         // Heartbeat agent: when heartbeat is enabled, the agent field
@@ -18873,6 +18892,12 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn webhook_config_port_defaults_when_omitted() {
+        let p: WebhookConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.port, 8090);
+    }
+
+    #[test]
     async fn webhook_config_retry_fields_default_to_none() {
         let json = r#"{"port":8080}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
@@ -20955,6 +20980,7 @@ group_policy = "disabled"
         assert!(tc.api_url.contains("groq.com"));
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
+        assert!(tc.max_audio_bytes.is_none());
         assert_eq!(tc.max_duration_secs, 120);
         assert!(!tc.transcribe_non_ptt_audio);
     }
@@ -20971,6 +20997,61 @@ group_policy = "disabled"
         assert!(parsed.transcription.enabled);
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+    }
+
+    #[test]
+    async fn config_roundtrip_with_transcription_max_audio_bytes() {
+        let mut config = Config::default();
+        config.transcription.max_audio_bytes = Some(65_536);
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed = parse_test_config(&toml_str);
+
+        assert_eq!(parsed.transcription.max_audio_bytes, Some(65_536));
+    }
+
+    #[test]
+    async fn transcription_max_audio_bytes_round_trips_through_prop_path() {
+        let mut config = Config::default();
+
+        assert_eq!(
+            config
+                .get_prop("transcription.max_audio_bytes")
+                .unwrap()
+                .as_str(),
+            "<unset>"
+        );
+
+        config
+            .set_prop("transcription.max_audio_bytes", "65536")
+            .unwrap();
+        assert_eq!(config.transcription.max_audio_bytes, Some(65_536));
+        assert_eq!(
+            config.get_prop("transcription.max_audio_bytes").unwrap(),
+            "65536"
+        );
+
+        config
+            .set_prop("transcription.max_audio_bytes", "")
+            .unwrap();
+        assert!(config.transcription.max_audio_bytes.is_none());
+        assert_eq!(
+            config.get_prop("transcription.max_audio_bytes").unwrap(),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    async fn config_validate_rejects_zero_transcription_max_audio_bytes() {
+        let mut config = Config::default();
+        config.transcription.max_audio_bytes = Some(0);
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transcription.max_audio_bytes must be greater than zero"),
+            "got: {err}"
+        );
     }
 
     #[test]
