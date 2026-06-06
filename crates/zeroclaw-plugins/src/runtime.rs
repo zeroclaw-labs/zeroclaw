@@ -6,6 +6,8 @@
 
 use crate::PluginPermission;
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use extism::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -29,15 +31,29 @@ struct HttpRequest {
     url: String,
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
+    /// Textual request body (JSON, form, etc.).
     #[serde(default)]
     body: Option<String>,
+    /// Standard-base64-encoded **binary** request body. When present it takes
+    /// precedence over `body` and is decoded to raw bytes before sending — this
+    /// lets a plugin upload binary payloads (e.g. audio for speech-to-text)
+    /// across the text-only host↔guest boundary.
+    #[serde(default)]
+    body_base64: Option<String>,
 }
 
 /// HTTP response returned from host to plugin.
 #[derive(Debug, Serialize, Deserialize)]
 struct HttpResponse {
     status: u16,
+    /// Response body as text, for textual content types (`text/*`, JSON, XML…).
+    /// Empty when the response is binary — see `body_base64`.
     body: String,
+    /// Standard-base64-encoded response body, populated **only** when the
+    /// response is binary (a non-textual content type). Omitted entirely for
+    /// textual responses, so existing text plugins are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_base64: Option<String>,
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
 }
@@ -57,6 +73,62 @@ struct PluginToolResult {
     output: String,
     #[serde(default)]
     error: Option<String>,
+}
+
+// ── HTTP body codec helpers ───────────────────────────────────────
+
+/// Whether a `Content-Type` denotes a textual body that is safe to return as a
+/// UTF-8 string. The parameter set (`charset`, etc.) after `;` is ignored.
+fn is_textual_content_type(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ct.starts_with("text/")
+        || ct == "application/json"
+        || ct == "application/xml"
+        || ct == "application/javascript"
+        || ct == "application/x-www-form-urlencoded"
+        || ct.ends_with("+json")
+        || ct.ends_with("+xml")
+}
+
+/// Split raw response bytes into `(body, body_base64)` based on the content
+/// type. Textual types are returned as a string (the pre-existing behavior);
+/// everything else is base64-encoded so binary survives the text-only
+/// host→guest boundary. An empty/unknown content type that is valid UTF-8 is
+/// treated as text to preserve prior behavior.
+fn encode_response_body(content_type: &str, bytes: &[u8]) -> (String, Option<String>) {
+    let textual = if content_type.trim().is_empty() {
+        std::str::from_utf8(bytes).is_ok()
+    } else {
+        is_textual_content_type(content_type)
+    };
+    if textual {
+        (String::from_utf8_lossy(bytes).into_owned(), None)
+    } else {
+        (String::new(), Some(STANDARD.encode(bytes)))
+    }
+}
+
+/// Resolve the outgoing request body bytes: a `body_base64` (decoded) takes
+/// precedence over the textual `body`. Returns `None` when neither is set.
+fn resolve_request_body(
+    body: &Option<String>,
+    body_base64: &Option<String>,
+) -> Result<Option<Vec<u8>>, Error> {
+    if let Some(b64) = body_base64 {
+        let bytes = STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| Error::msg(format!("invalid body_base64 in request: {e}")))?;
+        Ok(Some(bytes))
+    } else if let Some(text) = body {
+        Ok(Some(text.clone().into_bytes()))
+    } else {
+        Ok(None)
+    }
 }
 
 // ── Host function implementations ─────────────────────────────────
@@ -109,8 +181,8 @@ fn handle_http_request(
         builder = builder.header(k.as_str(), v.as_str());
     }
 
-    if let Some(body) = req.body {
-        builder = builder.body(body);
+    if let Some(bytes) = resolve_request_body(&req.body, &req.body_base64)? {
+        builder = builder.body(bytes);
     }
 
     let resp = builder
@@ -118,18 +190,27 @@ fn handle_http_request(
         .map_err(|e| Error::msg(format!("HTTP request failed: {e}")))?;
 
     let status = resp.status().as_u16();
+    // Capture headers + content type before `bytes()` consumes the response.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let headers: std::collections::HashMap<String, String> = resp
         .headers()
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
-    let body = resp
-        .text()
+    let bytes = resp
+        .bytes()
         .map_err(|e| Error::msg(format!("failed to read response body: {e}")))?;
+    let (body, body_base64) = encode_response_body(&content_type, &bytes);
 
     let response = HttpResponse {
         status,
         body,
+        body_base64,
         headers,
     };
 
@@ -240,12 +321,98 @@ mod tests {
                 .into_iter()
                 .collect(),
             body: Some(r#"{"key":"value"}"#.into()),
+            body_base64: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HttpRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.url, "https://example.com/api");
         assert_eq!(parsed.body.as_deref(), Some(r#"{"key":"value"}"#));
+        assert_eq!(parsed.body_base64, None);
+    }
+
+    #[test]
+    fn http_request_back_compat_without_base64_field() {
+        // A guest built before this change omits `body_base64` entirely.
+        let json = r#"{"method":"GET","url":"https://e.test","body":null}"#;
+        let parsed: HttpRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.body_base64, None);
+        assert!(parsed.headers.is_empty());
+    }
+
+    #[test]
+    fn text_response_omits_base64_field() {
+        // Textual responses must serialize WITHOUT a `body_base64` key so old
+        // plugins see the exact JSON shape they did before.
+        let resp = HttpResponse {
+            status: 200,
+            body: "hello".into(),
+            body_base64: None,
+            headers: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("body_base64"), "got: {json}");
+    }
+
+    #[test]
+    fn resolve_request_body_prefers_base64() {
+        // "hi" == base64 "aGk=".
+        let bytes = resolve_request_body(&Some("text".into()), &Some("aGk=".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"hi");
+    }
+
+    #[test]
+    fn resolve_request_body_text_then_none() {
+        assert_eq!(
+            resolve_request_body(&Some("abc".into()), &None).unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(resolve_request_body(&None, &None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_request_body_rejects_bad_base64() {
+        assert!(resolve_request_body(&None, &Some("not!base64!".into())).is_err());
+    }
+
+    #[test]
+    fn encode_response_text_vs_binary() {
+        // JSON content type → text body, no base64.
+        let (body, b64) = encode_response_body("application/json; charset=utf-8", b"{\"ok\":1}");
+        assert_eq!(body, "{\"ok\":1}");
+        assert!(b64.is_none());
+
+        // Binary content type → empty body, base64 set, round-trips.
+        let raw = [0u8, 159, 146, 150];
+        let (body, b64) = encode_response_body("image/png", &raw);
+        assert!(body.is_empty());
+        let decoded = STANDARD.decode(b64.unwrap()).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_response_empty_content_type_falls_back_to_utf8_check() {
+        // No content type + valid UTF-8 → text.
+        let (body, b64) = encode_response_body("", b"plain");
+        assert_eq!(body, "plain");
+        assert!(b64.is_none());
+        // No content type + invalid UTF-8 → base64.
+        let (body, b64) = encode_response_body("", &[0xff, 0xfe]);
+        assert!(body.is_empty());
+        assert!(b64.is_some());
+    }
+
+    #[test]
+    fn textual_content_type_classification() {
+        assert!(is_textual_content_type("text/html"));
+        assert!(is_textual_content_type("application/json"));
+        assert!(is_textual_content_type("application/ld+json"));
+        assert!(is_textual_content_type("image/svg+xml"));
+        assert!(!is_textual_content_type("image/png"));
+        assert!(!is_textual_content_type("audio/mpeg"));
+        assert!(!is_textual_content_type("application/octet-stream"));
     }
 
     #[test]
