@@ -346,6 +346,7 @@ zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 
 zc-config-breadcrumb-root = Config
+zc-config-section-detail-hint = { $open } or { $into } to open this section
 zc-config-breadcrumb-new = New
 
 zc-config-personality-over-limit = Over { $limit } char limit — cannot save
