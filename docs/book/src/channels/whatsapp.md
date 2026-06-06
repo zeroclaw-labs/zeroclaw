@@ -22,7 +22,7 @@ access_token = "<meta-access-token>"
 # app_secret = "<meta-app-secret>" # recommended for webhook signature verification
 ```
 
-The gateway must be reachable by Meta for inbound webhooks. Use `zeroclaw onboard tunnel` or your own reverse proxy to expose the webhook endpoint when developing locally.
+The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel via `zeroclaw config set gateway.tunnel.provider=<ngrok|cloudflare>` and the related `gateway.tunnel.*` fields (see the [Config reference](../reference/config.md)), or front the gateway with your own reverse proxy when developing locally.
 
 ## Web mode
 
@@ -82,14 +82,13 @@ Use the peer identifier shape that the active backend reports. Cloud API usually
 
 ## Configuring from the CLI
 
-Prefer onboarding or `zeroclaw config set` for WhatsApp:
+Prefer `zeroclaw config set` for WhatsApp fields:
 
 ```bash
-zeroclaw onboard channels
 zeroclaw config set channels.whatsapp.default.session-path ~/.zeroclaw/state/whatsapp-web/session.db
 ```
 
-`zeroclaw channel add <type> <CONFIG>` is not the recommended setup path for WhatsApp. It takes a JSON object at the CLI layer, but current channel setup is routed through onboarding and config editing so secret handling, pairing, and peer authorization stay explicit.
+`zeroclaw channel add <type> <CONFIG>` is not the recommended setup path for WhatsApp. It takes a JSON object at the CLI layer, but current channel setup is routed through `zeroclaw config set` so secret handling, pairing, and peer authorization stay explicit.
 
 ## Start and check
 

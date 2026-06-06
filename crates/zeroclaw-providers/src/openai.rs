@@ -242,6 +242,8 @@ impl OpenAiModelProvider {
                 | "gpt-5.3-chat-latest"
                 | "o1"
                 | "o1-2024-12-17"
+                | "o1-mini"
+                | "o1-mini-2024-09-12"
                 | "o3"
                 | "o3-2025-04-16"
                 | "o3-mini"
@@ -1486,6 +1488,14 @@ mod tests {
         );
         assert_eq!(
             OpenAiModelProvider::adjust_temperature_for_model("o1-2024-12-17", 0.5),
+            1.0
+        );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("o1-mini", 0.5),
+            1.0
+        );
+        assert_eq!(
+            OpenAiModelProvider::adjust_temperature_for_model("o1-mini-2024-09-12", 0.7),
             1.0
         );
     }
