@@ -986,6 +986,64 @@ fn canonical_model_provider_name(name: &str) -> Option<String> {
         .map(|model_provider| model_provider.name.to_string())
 }
 
+/// Outcome of resolving a `/models <arg>` request to a configured,
+/// alias-backed provider ref. The bare family path must never construct a
+/// provider that ignores the configured `[providers.models.<family>.<alias>]`
+/// key/URI — every accepted route resolves to a real alias entry.
+#[cfg_attr(test, derive(Debug))]
+enum ModelsCommandResolution {
+    /// A dotted `<family>.<alias>` ref backed by a configured entry.
+    Resolved(String),
+    /// The family is valid but has more than one configured alias; the user
+    /// must qualify which one. Carries the canonical family and its aliases.
+    Ambiguous {
+        family: String,
+        aliases: Vec<String>,
+    },
+    /// The family is valid but has no configured alias entry, so there is no
+    /// credentialed provider to switch to.
+    NoAlias(String),
+    /// The argument names no known provider family.
+    Unknown,
+}
+
+/// Resolve a `/models <arg>` argument to a configured, alias-backed provider
+/// ref. Accepts either a dotted `<family>.<alias>` that resolves to a real
+/// `[providers.models.<family>.<alias>]` entry, or a bare family name that has
+/// exactly one configured alias. A bare family with several aliases is
+/// ambiguous; one with none has no credentialed provider. This keeps `/models`
+/// inside the v0.8 alias model rather than constructing a bare provider that
+/// silently ignores the configured key/URI.
+fn resolve_models_command(
+    config: &zeroclaw_config::schema::Config,
+    raw: &str,
+) -> ModelsCommandResolution {
+    let candidate = raw.trim();
+    if let Some((family, alias)) = candidate.split_once('.') {
+        return match config.providers.models.find(family, alias) {
+            Some(_) => ModelsCommandResolution::Resolved(format!("{family}.{alias}")),
+            None => ModelsCommandResolution::NoAlias(candidate.to_string()),
+        };
+    }
+
+    let Some(family) = canonical_model_provider_name(candidate) else {
+        return ModelsCommandResolution::Unknown;
+    };
+
+    let mut aliases: Vec<String> = config
+        .providers
+        .models
+        .aliases_of(&family)
+        .map(ToString::to_string)
+        .collect();
+    aliases.sort();
+    match aliases.len() {
+        0 => ModelsCommandResolution::NoAlias(family),
+        1 => ModelsCommandResolution::Resolved(format!("{family}.{}", aliases[0])),
+        _ => ModelsCommandResolution::Ambiguous { family, aliases },
+    }
+}
+
 /// Strictly-resolved model provider for a runtime context, produced only by
 /// resolving an owning agent's mandatory `<type>.<alias>` reference against
 /// its own `[providers.models.<type>.<alias>]` entry. Carries no notion of a
@@ -1958,29 +2016,42 @@ async fn handle_runtime_command_if_needed(
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
-            match canonical_model_provider_name(&raw_model_provider) {
-                Some(provider_name) => {
-                    match get_or_create_provider(ctx, &provider_name, None).await {
+            match resolve_models_command(&ctx.prompt_config, &raw_model_provider) {
+                ModelsCommandResolution::Resolved(provider_ref) => {
+                    match get_or_create_provider(ctx, &provider_ref, None).await {
                         Ok(_) => {
-                            if provider_name != current.model_provider {
-                                current.model_provider = provider_name.clone();
+                            if provider_ref != current.model_provider {
+                                current.model_provider = provider_ref.clone();
                                 set_route_selection(ctx, &sender_key, current.clone());
                             }
 
                             format!(
-                                "ModelProvider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                                "ModelProvider switched to `{provider_ref}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
                                 current.model
                             )
                         }
                         Err(err) => {
                             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
                             format!(
-                                "Failed to initialize model_provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                                "Failed to initialize model_provider `{provider_ref}`. Route unchanged.\nDetails: {safe_err}"
                             )
                         }
                     }
                 }
-                None => format!(
+                ModelsCommandResolution::Ambiguous { family, aliases } => {
+                    let list = aliases
+                        .iter()
+                        .map(|a| format!("`{family}.{a}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "ModelProvider `{family}` has multiple configured aliases. Qualify which one with `/models {family}.<alias>`: {list}"
+                    )
+                }
+                ModelsCommandResolution::NoAlias(ref_or_family) => format!(
+                    "No configured provider entry for `{ref_or_family}`. Add `[providers.models.{ref_or_family}]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones."
+                ),
+                ModelsCommandResolution::Unknown => format!(
                     "Unknown model_provider `{raw_model_provider}`. Use `/models` to list valid model_providers."
                 ),
             }
@@ -14260,6 +14331,103 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    /// `/models <family>` must resolve to a configured alias-backed ref so the
+    /// switched provider uses the alias entry's key/URI — never construct a bare
+    /// family provider that ignores `[providers.models.<family>.<alias>]`.
+    #[test]
+    fn resolve_models_command_resolves_bare_family_to_configured_alias() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        {
+            let base = config
+                .providers
+                .models
+                .ensure("openrouter", "default")
+                .expect("openrouter slot must exist");
+            base.api_key = Some("sk-configured".into());
+            base.uri = Some("https://router.example/v1".into());
+            base.model = Some("some-model".into());
+        }
+
+        match resolve_models_command(&config, "openrouter") {
+            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "openrouter.default"),
+            other => panic!("expected Resolved(openrouter.default), got {other:?}"),
+        }
+
+        // The resolved ref must carry the configured alias credentials.
+        let (key, uri) = provider_credentials_for_ref(&config, "openrouter.default");
+        assert_eq!(key.as_deref(), Some("sk-configured"));
+        assert_eq!(uri.as_deref(), Some("https://router.example/v1"));
+    }
+
+    /// A bare family with no configured alias has no credentialed provider to
+    /// switch to — the command must fail clearly instead of building a bare one.
+    #[test]
+    fn resolve_models_command_rejects_family_without_alias() {
+        let config = zeroclaw_config::schema::Config::default();
+        match resolve_models_command(&config, "openrouter") {
+            ModelsCommandResolution::NoAlias(f) => assert_eq!(f, "openrouter"),
+            other => panic!("expected NoAlias(openrouter), got {other:?}"),
+        }
+    }
+
+    /// A bare family with several configured aliases is ambiguous; the user must
+    /// qualify which one rather than silently picking.
+    #[test]
+    fn resolve_models_command_flags_ambiguous_family() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "secondary")
+            .unwrap();
+
+        match resolve_models_command(&config, "openrouter") {
+            ModelsCommandResolution::Ambiguous { family, aliases } => {
+                assert_eq!(family, "openrouter");
+                assert_eq!(
+                    aliases,
+                    vec!["default".to_string(), "secondary".to_string()]
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// A dotted ref resolves only when the alias entry exists.
+    #[test]
+    fn resolve_models_command_accepts_existing_dotted_ref() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        match resolve_models_command(&config, "openrouter.default") {
+            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "openrouter.default"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        match resolve_models_command(&config, "openrouter.missing") {
+            ModelsCommandResolution::NoAlias(r) => assert_eq!(r, "openrouter.missing"),
+            other => panic!("expected NoAlias, got {other:?}"),
+        }
+    }
+
+    /// An unrecognized family is rejected.
+    #[test]
+    fn resolve_models_command_rejects_unknown_family() {
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(matches!(
+            resolve_models_command(&config, "definitely-not-a-provider"),
+            ModelsCommandResolution::Unknown
+        ));
     }
 
     #[test]
