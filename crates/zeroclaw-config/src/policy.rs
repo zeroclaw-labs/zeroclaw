@@ -669,41 +669,6 @@ enum QuoteState {
 /// Remove heredoc body lines from a single command segment, keeping the
 /// opener line and anything after the terminator. Body content is stdin
 /// data, never an argv path argument, so the path guard must not inspect it.
-fn strip_heredoc_bodies(segment: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    let mut delimiter: Option<String> = None;
-
-    for line in segment.lines() {
-        if let Some(delim) = delimiter.as_deref() {
-            if line.trim() == delim {
-                delimiter = None;
-            }
-            continue;
-        }
-
-        out.push(line);
-
-        if let Some(idx) = line.find("<<") {
-            let after = &line[idx + 2..];
-            // `<<<` is a here-string, not a heredoc body.
-            if after.starts_with('<') {
-                continue;
-            }
-            let raw = after.trim().trim_start_matches('-');
-            let delim = raw
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches(|c| c == '\'' || c == '"' || c == '\\');
-            if !delim.is_empty() {
-                delimiter = Some(delim.to_string());
-            }
-        }
-    }
-
-    out.join("\n")
-}
-
 /// Split a shell command into sub-commands by unquoted separators.
 ///
 /// Separators:
@@ -765,17 +730,19 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
-                    current.push(ch);
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
+                    } else {
+                        current.push(ch);
                     }
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
-                    current.push(ch);
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
+                    } else {
+                        current.push(ch);
                     }
                     continue;
                 }
@@ -802,7 +769,11 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     continue;
                 }
 
-                // Inside a heredoc body: don't split on newlines.
+                // Inside a heredoc body: don't split on newlines, and drop the
+                // body content so the segment carries only the opener line and
+                // the command. This is the single source of heredoc-parsing
+                // truth — it is quote-aware, so quoted `<<WORD` text never opens
+                // a heredoc and cannot hide later real path arguments.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
                     if ch == '\n' {
                         if heredoc_line_buf.trim() == delim {
@@ -812,11 +783,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                             push_segment(&mut segments, &mut current);
                         } else {
                             heredoc_line_buf.clear();
-                            current.push(ch);
                         }
                     } else {
                         heredoc_line_buf.push(ch);
-                        current.push(ch);
                     }
                     continue;
                 }
@@ -1711,7 +1680,6 @@ impl SecurityPolicy {
         };
 
         for segment in split_unquoted_segments(command) {
-            let segment = strip_heredoc_bodies(&segment);
             let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(executable) = words.next() else {
@@ -4041,6 +4009,27 @@ mod tests {
         // must still block, even when a heredoc body follows.
         assert_eq!(
             p.forbidden_path_argument("cat /etc/passwd <<'EOF'\nbody ~20\nEOF"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
+        let p = unix_forbidden_path_policy();
+
+        // `<<EOF` inside a double-quoted string is data, not a heredoc opener.
+        // The closing quote ends the string, and `/etc/shadow` after it is a
+        // real argv path argument that must still block. A non-quote-aware
+        // heredoc stripper would treat the quoted `<<EOF` as a real opener,
+        // swallow the following lines, and hide the forbidden path.
+        assert_eq!(
+            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            Some("/etc/shadow".into())
+        );
+
+        // Single-quoted variant of the same shape.
+        assert_eq!(
+            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
