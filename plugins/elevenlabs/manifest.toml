@@ -1,0 +1,7 @@
+name = "elevenlabs"
+version = "0.1.0"
+description = "Text-to-speech (audio) via the ElevenLabs API"
+author = "ZeroClaw Labs"
+wasm_path = "elevenlabs.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
