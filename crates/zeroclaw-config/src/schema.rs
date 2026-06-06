@@ -6741,7 +6741,9 @@ pub struct PluginsConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.security"]
 pub struct PluginSecurityConfig {
-    /// Signature enforcement mode: "disabled", "permissive", or "strict".
+    /// Signature enforcement mode: "disabled", "permissive" (default), or
+    /// "strict". Permissive loads unsigned/untrusted plugins but logs a warning;
+    /// strict rejects them; disabled performs no checks.
     #[serde(default = "default_signature_mode")]
     pub signature_mode: String,
     /// Hex-encoded Ed25519 public keys of trusted plugin publishers.
@@ -6750,7 +6752,10 @@ pub struct PluginSecurityConfig {
 }
 
 fn default_signature_mode() -> String {
-    "disabled".to_string()
+    // Permissive (warn-but-load) is the default so operators see which plugins
+    // are unverified without breaking existing unsigned local plugins. Set
+    // "strict" to reject unsigned/untrusted plugins.
+    "permissive".to_string()
 }
 
 impl Default for PluginSecurityConfig {
@@ -6759,6 +6764,16 @@ impl Default for PluginSecurityConfig {
             signature_mode: default_signature_mode(),
             trusted_publisher_keys: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod plugin_security_tests {
+    use super::PluginSecurityConfig;
+
+    #[test]
+    fn default_signature_mode_is_permissive() {
+        assert_eq!(PluginSecurityConfig::default().signature_mode, "permissive");
     }
 }
 

@@ -22,7 +22,6 @@ struct LoadedPlugin {
     plugin_dir: PathBuf,
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     wasm_path: Option<PathBuf>,
-    #[allow(dead_code)]
     verification: VerificationResult,
 }
 
@@ -304,6 +303,16 @@ impl PluginHost {
     }
 }
 
+/// Map a verification result to a short status string for display/API.
+fn signature_status_str(v: &VerificationResult) -> &'static str {
+    match v {
+        VerificationResult::Valid { .. } => "valid",
+        VerificationResult::Unsigned => "unsigned",
+        VerificationResult::Untrusted => "untrusted",
+        VerificationResult::Invalid { .. } => "invalid",
+    }
+}
+
 fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
     let loaded = match &p.wasm_path {
         Some(path) => path.exists(),
@@ -318,6 +327,7 @@ fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
         permissions: p.manifest.permissions.clone(),
         wasm_path: p.wasm_path.clone(),
         loaded,
+        signature_status: signature_status_str(&p.verification).to_string(),
     }
 }
 
@@ -468,6 +478,28 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn signature_status_strings() {
+        assert_eq!(
+            signature_status_str(&VerificationResult::Unsigned),
+            "unsigned"
+        );
+        assert_eq!(
+            signature_status_str(&VerificationResult::Untrusted),
+            "untrusted"
+        );
+        assert_eq!(
+            signature_status_str(&VerificationResult::Valid {
+                publisher_key: "k".into()
+            }),
+            "valid"
+        );
+        assert_eq!(
+            signature_status_str(&VerificationResult::Invalid { reason: "r".into() }),
+            "invalid"
+        );
+    }
 
     #[test]
     fn test_empty_plugin_dir() {

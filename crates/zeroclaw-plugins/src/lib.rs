@@ -100,4 +100,7 @@ pub struct PluginInfo {
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,
+    /// Signature verification status: `"valid"`, `"unsigned"`, `"untrusted"`,
+    /// or `"invalid"`. Computed regardless of the enforcement mode.
+    pub signature_status: String,
 }

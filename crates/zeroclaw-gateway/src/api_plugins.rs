@@ -55,6 +55,7 @@ pub mod plugin_routes {
                                 "description": p.description,
                                 "capabilities": p.capabilities,
                                 "loaded": p.loaded,
+                                "signature": p.signature_status,
                             })
                         })
                         .collect(),
