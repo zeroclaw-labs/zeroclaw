@@ -103,8 +103,15 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
-  // Probe whether the gateway exposes /api/plugins (built with `plugins-wasm`).
-  // `getPlugins()` resolves to null on 404 → hide the Plugins nav item.
+  // Feature-detect plugin support and hide the Plugins nav item when absent.
+  //
+  // The `/api/plugins` route only exists when the gateway is built with the
+  // `plugins-wasm` feature. In builds without it the route is simply not
+  // registered, and the SPA catch-all answers unknown `/api/*` paths with
+  // `200 text/html` (not a 404) — so `getPlugins()` detects "unsupported" by a
+  // non-JSON content type and resolves to `null`. We start hidden and only
+  // reveal the tab once the probe confirms real JSON, so a `plugins-wasm`-less
+  // gateway shows no broken/empty Plugins tab. Errors keep it hidden too.
   const [pluginsSupported, setPluginsSupported] = useState(false);
   useEffect(() => {
     let cancelled = false;

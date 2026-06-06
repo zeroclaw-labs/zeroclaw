@@ -313,6 +313,13 @@ fn is_false(b: &bool) -> bool {
 // ── Error helpers ───────────────────────────────────────────────────
 
 /// Convert a `ConfigApiError` into an axum `Response` with the correct status.
+///
+/// `pub(crate)` because this is a shared gateway-API helper: every `/api/*`
+/// surface that speaks `ConfigApiError` (the config endpoints, and now
+/// `api_mcp`) renders errors through this single function so HTTP status
+/// mapping stays consistent. It lives in `api_config` because that's where
+/// `ConfigApiError` is defined; if a third consumer appears, move it (and
+/// `persist_and_swap`) to a shared `api_common` module.
 pub(crate) fn error_response(err: ConfigApiError) -> Response {
     let status =
         StatusCode::from_u16(err.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -403,6 +410,14 @@ fn scoped_validate(
     Ok(Vec::new())
 }
 
+/// Validate, persist to disk, and hot-swap the live config.
+///
+/// `pub(crate)` for the same reason as [`error_response`]: it's a shared
+/// gateway-API helper. Config-mutating endpoints outside `api_config` (the new
+/// `api_mcp` server add/remove handlers) must go through this exact path so
+/// every write gets the same validation, atomic file persistence, and
+/// in-memory swap — rather than each module reimplementing it and risking
+/// drift. Kept in `api_config` alongside the config write internals.
 pub(crate) async fn persist_and_swap(
     state: &AppState,
     mut new_config: zeroclaw_config::schema::Config,
