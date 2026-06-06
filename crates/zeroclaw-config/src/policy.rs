@@ -666,6 +666,44 @@ enum QuoteState {
     Double,
 }
 
+/// Remove heredoc body lines from a single command segment, keeping the
+/// opener line and anything after the terminator. Body content is stdin
+/// data, never an argv path argument, so the path guard must not inspect it.
+fn strip_heredoc_bodies(segment: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut delimiter: Option<String> = None;
+
+    for line in segment.lines() {
+        if let Some(delim) = delimiter.as_deref() {
+            if line.trim() == delim {
+                delimiter = None;
+            }
+            continue;
+        }
+
+        out.push(line);
+
+        if let Some(idx) = line.find("<<") {
+            let after = &line[idx + 2..];
+            // `<<<` is a here-string, not a heredoc body.
+            if after.starts_with('<') {
+                continue;
+            }
+            let raw = after.trim().trim_start_matches('-');
+            let delim = raw
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '\'' || c == '"' || c == '\\');
+            if !delim.is_empty() {
+                delimiter = Some(delim.to_string());
+            }
+        }
+    }
+
+    out.join("\n")
+}
+
 /// Split a shell command into sub-commands by unquoted separators.
 ///
 /// Separators:
@@ -1073,7 +1111,9 @@ fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
         || candidate.starts_with("../")
-        || candidate.starts_with('~')
+        || candidate == "~"
+        || candidate.starts_with("~/")
+        || (candidate.starts_with('~') && candidate.contains('/'))
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
@@ -1671,6 +1711,7 @@ impl SecurityPolicy {
         };
 
         for segment in split_unquoted_segments(command) {
+            let segment = strip_heredoc_bodies(&segment);
             let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(executable) = words.next() else {
@@ -3954,9 +3995,53 @@ mod tests {
             p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
             Some("~root/.ssh/id_rsa".into())
         );
+        // Bare `~user` with no path component is not a forbidden path argument:
+        // narrowed to avoid false-positives on non-path `~`-prefixed tokens
+        // (e.g. `~20`). A `~user/...` form with a slash still blocks (above).
+        assert_eq!(p.forbidden_path_argument("ls ~nobody"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_ignores_tilde_non_path_and_heredoc_body() {
+        let p = unix_forbidden_path_policy();
+
+        // Tilde-then-non-slash tokens are not home paths: `~20`, `~589`, `~foo`.
         assert_eq!(
-            p.forbidden_path_argument("ls ~nobody"),
-            Some("~nobody".into())
+            p.forbidden_path_argument("echo \"about ~20 percent\""),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument("python3 -c \"print('about ~589 lines')\""),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument("printf 'roughly ~foo here\\n'"),
+            None
+        );
+
+        // Heredoc body content is stdin data, never an argv path argument.
+        let heredoc =
+            "cat <<'EOF' > ./out.txt\nthis line has ~20 percent and /etc/passwd mentioned\nEOF";
+        assert_eq!(p.forbidden_path_argument(heredoc), None);
+
+        // Security preserved: real forbidden home/absolute path arguments still block.
+        assert_eq!(
+            p.forbidden_path_argument("cat ~/.ssh/id_rsa"),
+            Some("~/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
+            Some("~root/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/shadow"),
+            Some("/etc/shadow".into())
+        );
+        // A forbidden path used as a real argument on the heredoc opener line
+        // must still block, even when a heredoc body follows.
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd <<'EOF'\nbody ~20\nEOF"),
+            Some("/etc/passwd".into())
         );
     }
 
