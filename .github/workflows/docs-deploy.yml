@@ -173,17 +173,25 @@ jobs:
             popd > /dev/null
           fi
 
-          # Copy built tag docs into gh-pages under '<tag>/'
-          mkdir -p "$CLONE_DIR/$TAG"
-          if [ -d "docs/book/book/$TAG" ]; then
-            rsync -a --delete "docs/book/book/$TAG/" "$CLONE_DIR/$TAG/"
+          # Normalize the build output into a single versioned source dir so the
+          # initial sync and every retry copy from the same place. Old tags that
+          # still build into the pre-versioned layout (`docs/book/book/` with no
+          # `$TAG/` inside) get wrapped into `$TAG/` once, here — the retry path
+          # must not re-derive this, or a concurrent push rejection on an old tag
+          # would leave it with nothing to re-apply.
+          BUILD_ROOT="${GITHUB_WORKSPACE}/docs/book/book"
+          if [ -d "$BUILD_ROOT/$TAG" ]; then
+            TAG_SRC="$BUILD_ROOT/$TAG"
           else
             echo "Old docs layout detected (unversioned). Restructuring to $TAG/..."
-            mkdir -p "docs/book/book_temp/$TAG"
-            rsync -a docs/book/book/ "docs/book/book_temp/$TAG/"
-            rsync -a --delete "docs/book/book_temp/$TAG/" "$CLONE_DIR/$TAG/"
-            rm -rf docs/book/book_temp
+            TAG_SRC="$(mktemp -d)/$TAG"
+            mkdir -p "$TAG_SRC"
+            rsync -a "$BUILD_ROOT/" "$TAG_SRC/"
           fi
+
+          # Copy built tag docs into gh-pages under '<tag>/'
+          mkdir -p "$CLONE_DIR/$TAG"
+          rsync -a --delete "$TAG_SRC/" "$CLONE_DIR/$TAG/"
 
           # If this is a stable release (no pre-release suffix), also copy to /stable/
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -264,9 +272,11 @@ jobs:
             git reset --hard FETCH_HEAD
             git clean -fd
 
-            # Re-apply this run's own version dir from the build output.
+            # Re-apply this run's own version dir from the normalized build
+            # source (TAG_SRC), so old-layout tags re-apply the same wrapped
+            # `$TAG/` tree the initial sync used instead of failing here.
             mkdir -p "$TAG"
-            rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/$TAG/" "$TAG/"
+            rsync -a --delete "$TAG_SRC/" "$TAG/"
             if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               mkdir -p stable
               rsync -a --delete "$TAG/" "stable/"
