@@ -1,0 +1,7 @@
+name = "removebg"
+version = "0.1.0"
+description = "Remove the background from an image using the remove.bg API"
+author = "ZeroClaw Labs"
+wasm_path = "removebg.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
