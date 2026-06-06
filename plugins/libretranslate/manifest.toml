@@ -1,0 +1,7 @@
+name = "libretranslate"
+version = "0.1.0"
+description = "Translate text via your own self-hosted, open-source LibreTranslate instance"
+author = "ZeroClaw Labs"
+wasm_path = "libretranslate.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
