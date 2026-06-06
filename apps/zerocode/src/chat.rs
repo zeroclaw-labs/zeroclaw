@@ -267,25 +267,33 @@ impl Chat {
 
     /// Start the session, optionally with a caller-supplied `cwd`.
     ///
+    /// - Resume (carried session id): never overrides cwd; the daemon keeps the
+    ///   retained session's own working directory.
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Over Unix socket, pass local CWD so the agent works in the
-        // directory the TUI was launched from.  Over WSS the server
-        // uses the agent's workspace dir unless the user supplies one.
-        let cwd_str: Option<String> = if self.rpc.transport() == crate::client::Transport::Local {
+        // Reattach to a carried-over session on reconnect (one-shot); else a
+        // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
+        // the daemon-retained session, its persisted history, and its cwd.
+        let resume = self.resume_session_id.take();
+        // A resume must not re-point the session at the TUI's launch directory:
+        // pass no cwd so the daemon keeps the retained session's own cwd. Only
+        // a fresh session derives a cwd from the transport / caller.
+        let cwd_str: Option<String> = if resume.is_some() {
+            None
+        } else if self.rpc.transport() == crate::client::Transport::Local {
+            // Over Unix socket, pass local CWD so the agent works in the
+            // directory the TUI was launched from.
             std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(str::to_string))
         } else {
+            // Over WSS the server uses the agent's workspace dir unless the
+            // user supplies one.
             cwd_override
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
         };
-        // Reattach to a carried-over session on reconnect (one-shot); else a
-        // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
-        // the daemon-retained session and its persisted history.
-        let resume = self.resume_session_id.take();
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
                 .session_new_acp(agent_alias, cwd_str.as_deref(), resume.as_deref())
