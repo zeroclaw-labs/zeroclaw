@@ -266,6 +266,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_registry;
+#[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
 #[cfg(feature = "schema-export")]
@@ -2375,10 +2377,21 @@ fn which_zerocode_on_path() -> bool {
 enum PluginCommands {
     /// List installed plugins
     List,
-    /// Install a plugin from a directory or URL
+    /// Search the plugin registry
+    Search {
+        /// Substring to match against plugin name or description
+        query: String,
+        /// Registry index URL (overrides $ZEROCLAW_PLUGIN_REGISTRY_URL and the default)
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Install a plugin from a local directory, or by name from the registry
     Install {
-        /// Path to plugin directory or manifest
+        /// Local plugin directory/manifest path, or a registry name (`name` or `name@version`)
         source: String,
+        /// Registry index URL (overrides $ZEROCLAW_PLUGIN_REGISTRY_URL and the default)
+        #[arg(long)]
+        registry: Option<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -5204,18 +5217,37 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
-                host.install(&source)?;
-                println!(
-                    "{}",
-                    ta(
-                        "cli-plugin-installed-from",
-                        &[("source", &source)],
-                        "Plugin installed"
-                    )
+            PluginCommands::Search { query, registry } => {
+                plugin_registry::search_and_print(registry.as_deref(), &query).await
+            }
+            PluginCommands::Install { source, registry } => {
+                // Honor the configured signature policy for installs (not just discovery).
+                let mode = zeroclaw::plugins::host::PluginHost::parse_signature_mode(
+                    &config.plugins.security.signature_mode,
                 );
-                Ok(())
+                let trusted = config.plugins.security.trusted_publisher_keys.clone();
+                let mut host = zeroclaw::plugins::host::PluginHost::with_security(
+                    &config.data_dir,
+                    mode,
+                    trusted,
+                )?;
+                if std::path::Path::new(&source).exists() {
+                    // Existing path → local install.
+                    host.install(&source)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-from",
+                            &[("source", &source)],
+                            "Plugin installed"
+                        )
+                    );
+                    Ok(())
+                } else {
+                    // Otherwise treat it as a registry name (`name` or `name@version`).
+                    plugin_registry::install_from_registry(&source, registry.as_deref(), &mut host)
+                        .await
+                }
             }
             PluginCommands::Remove { name } => {
                 let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;

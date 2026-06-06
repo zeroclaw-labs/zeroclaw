@@ -277,12 +277,58 @@ The output `.wasm` file is at
 ### Installing
 
 ```bash
-# Copy to plugin directory
+# From a local directory
 zeroclaw plugin install /path/to/my-plugin/
+
+# By name from the registry (resolves a download, verifies, and installs)
+zeroclaw plugin install ace-step
+zeroclaw plugin install ace-step@0.1.0      # pin a version
 
 # Or manually
 cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ```
+
+`install` treats the argument as a local path when it exists on disk, and
+otherwise as a registry name. All installs honor the configured
+`signature_mode` (see [Configuration](#configuration)).
+
+### Registry
+
+Browse remotely published plugins:
+
+```bash
+zeroclaw plugin search music
+zeroclaw plugin search music --registry https://my-host/registry.json
+```
+
+The registry is a single JSON index (default: the public
+`zeroclaw-labs/zeroclaw-plugins` index). Override it per-invocation with
+`--registry`, or globally with the `ZEROCLAW_PLUGIN_REGISTRY_URL` environment
+variable — point it at your own host to run a private/self-hosted catalog.
+
+Index format:
+
+```json
+{
+  "plugins": [
+    {
+      "name": "ace-step",
+      "version": "0.1.0",
+      "description": "Self-hosted music generation",
+      "author": "ZeroClaw Labs",
+      "capabilities": ["tool"],
+      "url": "https://.../ace-step-0.1.0.zip",
+      "sha256": "<hex digest of the zip>"
+    }
+  ]
+}
+```
+
+Each `url` points to a zip of the plugin directory (the same layout `install`
+expects: `manifest.toml`, the `.wasm`, and an optional `skills/` subtree). The
+optional `sha256` guards transport integrity; the Ed25519 manifest signature
+(per `signature_mode`) guards authenticity. Archives are capped at 50 MiB and
+extracted with path-traversal protection.
 
 ## Configuration
 
