@@ -631,36 +631,6 @@ impl Chat {
                 }
                 return false;
             }
-            SessionOverlay::Rename { buf } => {
-                use crate::keymap::ConfigEditorAction;
-                match ConfigEditorAction::from_chord(&key) {
-                    Some(ConfigEditorAction::Confirm) => {
-                        let name = std::mem::take(buf);
-                        if !name.is_empty()
-                            && self
-                                .rpc
-                                .session_rename(&state.session_id, &name)
-                                .await
-                                .is_ok()
-                        {
-                            state.session_name = Some(name);
-                        }
-                        state.session_overlay = SessionOverlay::None;
-                    }
-                    Some(ConfigEditorAction::Cancel) => {
-                        state.session_overlay = SessionOverlay::None;
-                    }
-                    Some(ConfigEditorAction::Backspace) => {
-                        buf.pop();
-                    }
-                    _ => {
-                        if let crossterm::event::KeyCode::Char(c) = key.code {
-                            buf.push(c);
-                        }
-                    }
-                }
-                return false;
-            }
             SessionOverlay::None => { /* handled below */ }
         }
 
@@ -958,9 +928,6 @@ impl Chat {
                     sessions: picker_sessions,
                     list_state: ls,
                 };
-            }
-            Some(ChatTabAction::RenameSession) if !state.turn_in_flight => {
-                state.session_overlay = SessionOverlay::Rename { buf: String::new() };
             }
             Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
@@ -1280,10 +1247,6 @@ impl Chat {
             // CWD picker always captures text input.
             ChatPhase::PickCwd { .. } => true,
             ChatPhase::Active(s) => {
-                // Overlay has its own key handling (Rename captures chars).
-                if matches!(s.session_overlay, SessionOverlay::Rename { .. }) {
-                    return true;
-                }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
                     return false;
                 }
@@ -1326,12 +1289,6 @@ impl crate::widgets::HelpContext for Chat {
                             E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
                             E::key("Enter", crate::i18n::t("zc-chat-help-switch-session")),
                             E::key("Esc", crate::i18n::t("zc-chat-help-close")),
-                        ]);
-                    }
-                    SessionOverlay::Rename { .. } => {
-                        return HelpNode::entries(vec![
-                            E::key("Enter", crate::i18n::t("zc-chat-help-submit-name")),
-                            E::key("Esc", crate::i18n::t("zc-chat-help-cancel")),
                         ]);
                     }
                     SessionOverlay::None => {}
@@ -1386,9 +1343,14 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
                     ),
                     E::spacer(),
-                    E::key("Ctrl+N", crate::i18n::t("zc-chat-help-new-session")),
-                    E::key("Ctrl+S", crate::i18n::t("zc-chat-help-session-list")),
-                    E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
+                    E::key(
+                        chord_label(ChatTabAction::NewSession),
+                        crate::i18n::t("zc-chat-help-new-session"),
+                    ),
+                    E::key(
+                        chord_label(ChatTabAction::SwitchSession),
+                        crate::i18n::t("zc-chat-help-session-list"),
+                    ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::PauseResumeQueue),
@@ -1625,9 +1587,6 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             list_state,
         } => {
             render_session_list_overlay(f, area, sessions, list_state);
-        }
-        SessionOverlay::Rename { buf } => {
-            render_rename_overlay(f, area, buf);
         }
         SessionOverlay::None => {}
     }
@@ -2304,44 +2263,6 @@ fn render_session_list_overlay(
     f.render_stateful_widget(list, inner, &mut ls);
 }
 
-fn render_rename_overlay(f: &mut Frame, area: Rect, buf: &str) {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let overlay_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20),
-            Constraint::Min(30),
-            Constraint::Percentage(20),
-        ])
-        .split(vert[1])[1];
-
-    f.render_widget(Clear, overlay_area);
-
-    let prompt = crate::i18n::t("zc-chat-rename-prompt");
-    let submit = crate::i18n::t("zc-chat-rename-action-submit");
-    let cancel = crate::i18n::t("zc-chat-rename-action-cancel");
-    let text = format!("{prompt} {buf}\u{2588}\n\nEnter={submit}  Esc={cancel}");
-    let p = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " Rename Session ",
-                    theme::overlay_border_style(),
-                ))
-                .style(theme::overlay_border_style()),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(p, overlay_area);
-}
-
 /// Render a single-row context usage bar showing token consumption.
 ///
 /// Shows: `ctx: 12,345 / 200,000  [████████░░░░░░░░░░░░]  6%`
@@ -2782,9 +2703,6 @@ enum SessionOverlay {
     List {
         sessions: Vec<SessionEntry>,
         list_state: ListState,
-    },
-    Rename {
-        buf: String,
     },
 }
 
