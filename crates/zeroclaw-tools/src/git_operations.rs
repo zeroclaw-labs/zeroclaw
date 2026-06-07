@@ -209,6 +209,8 @@ impl GitOperationsTool {
         let output = tokio::process::Command::new("git")
             .args(args)
             .current_dir(working_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
             .output()
             .await?;
 
@@ -1255,6 +1257,28 @@ mod tests {
         // Branch listing is read-only; it must not require write access
         assert!(!tool.requires_write_access("branch"));
         assert!(tool.is_read_only("branch"));
+    }
+
+    #[tokio::test]
+    async fn git_credential_op_fails_fast_without_terminal_prompt() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        let tool = test_tool(tmp.path());
+
+        let fetch = tool.run_git_command(
+            &["fetch", "https://127.0.0.1:1/private/repo.git"],
+            tmp.path(),
+        );
+        let res = tokio::time::timeout(std::time::Duration::from_secs(10), fetch).await;
+
+        assert!(
+            res.is_ok(),
+            "git fetch hung — it likely prompted for credentials on the terminal"
+        );
+        assert!(
+            res.unwrap().is_err(),
+            "fetch to an unreachable private remote should fail, not succeed"
+        );
     }
 
     #[tokio::test]

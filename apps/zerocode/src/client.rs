@@ -83,7 +83,6 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
-    pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_KILL: &str = "session/kill";
     // Dashboard
@@ -701,14 +700,6 @@ impl RpcClient {
         self.connection_state.lock().unwrap().clone()
     }
 
-    /// Returns `true` when the daemon connection is known to be dead.
-    pub fn is_disconnected(&self) -> bool {
-        matches!(
-            self.connection_state(),
-            ConnectionState::Disconnected { .. }
-        )
-    }
-
     // ── Notifications ─────────────────────────────────────────────
 
     /// Get a receiver for server-initiated notifications.
@@ -1090,18 +1081,6 @@ impl RpcClient {
             )
             .await?;
         Ok(())
-    }
-
-    pub async fn session_rename(
-        &self,
-        session_id: &str,
-        name: &str,
-    ) -> Result<SessionRenameResult> {
-        self.call(
-            method::SESSION_RENAME,
-            serde_json::json!({ "session_id": session_id, "name": name }),
-        )
-        .await
     }
 
     // ── Dashboard helpers ────────────────────────────────────────
@@ -1658,15 +1637,13 @@ pub struct SessionCancelResult {}
 pub struct SessionGitBranchResult {
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionApproveResult {}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SessionRenameResult {}
 
 #[derive(Debug, Clone)]
 pub enum ApprovalDecision {
@@ -1866,6 +1843,37 @@ pub struct SessionMessagesResult {
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+}
+
+impl MessageEntry {
+    /// Classify the wire `role` string into the closed set the UI renders.
+    /// Unknown roles map to [`MessageRole::Other`] so surfaces can fall back
+    /// without string-matching at the call site.
+    pub fn role(&self) -> MessageRole {
+        MessageRole::from_wire(&self.role)
+    }
+}
+
+/// Closed taxonomy of persisted message roles, as they arrive over the
+/// `session/messages` wire. The daemon emits these as strings; this is the
+/// single place that maps the wire form into a type the UI matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Other,
+}
+
+impl MessageRole {
+    fn from_wire(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "system" => Self::System,
+            _ => Self::Other,
+        }
+    }
 }
 
 // ── TUI identity types ───────────────────────────────────────────

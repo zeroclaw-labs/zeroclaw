@@ -1433,6 +1433,17 @@ impl ZerocodePane {
                     }
                 }
             }
+            // Scroll over the left section list cycles the focused section.
+            MouseEventKind::ScrollDown
+                if mouse::in_rect(mouse.column, mouse.row, self.focus_area) =>
+            {
+                self.cycle_focus(1);
+            }
+            MouseEventKind::ScrollUp
+                if mouse::in_rect(mouse.column, mouse.row, self.focus_area) =>
+            {
+                self.cycle_focus(-1);
+            }
             MouseEventKind::ScrollDown
                 if mouse::in_rect(mouse.column, mouse.row, self.content_area) =>
             {
