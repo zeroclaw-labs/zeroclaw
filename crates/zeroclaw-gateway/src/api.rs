@@ -1118,7 +1118,27 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    let tools = zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[]);
+    // `discover_cli_tools` spawns child processes and blocks; keep it off the
+    // async executor so a slow PATH scan can't stall other gateway requests.
+    let tools = match tokio::task::spawn_blocking(|| {
+        zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[])
+    })
+    .await
+    {
+        Ok(tools) => tools,
+        Err(e) => {
+            // The blocking task panicked; degrade to an empty list rather
+            // than failing the request, but record why it was empty.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "cli-tools discovery task failed; returning empty list"
+            );
+            Vec::new()
+        }
+    };
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
@@ -1861,6 +1881,8 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::RwLock;
+    #[cfg(feature = "channel-linq")]
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use zeroclaw_infra::session_backend::SessionBackend;
@@ -2032,9 +2054,9 @@ mod tests {
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp_app_secret: None,
             #[cfg(feature = "channel-linq")]
-            linq: None,
+            linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
-            linq_signing_secret: None,
+            linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: None,
             #[cfg(feature = "channel-nextcloud")]
