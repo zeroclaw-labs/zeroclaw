@@ -106,8 +106,11 @@ async fn switch_mode(
 
 // ── Top-level entry point ────────────────────────────────────────
 
-/// Run the TUI event loop. Returns `true` if the daemon disconnected
-/// (caller should attempt reconnection), `false` if the user quit normally.
+/// Run the TUI event loop. Owns the full session lifecycle: when the
+/// daemon disconnects it reconnects in-loop (keeping the cached UI alive
+/// and responsive) and rebuilds its panes against the recovered client.
+/// Returns when the user quits.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     rpc: Arc<RpcClient>,
     term: &mut config_manager::Term,
@@ -115,7 +118,9 @@ pub async fn run(
     insecure_tls: bool,
     reconnect_state: SharedReconnectState,
     config_dir: &std::path::Path,
-) -> Result<bool> {
+    target: &crate::ConnectTarget,
+    owns_ephemeral: bool,
+) -> Result<()> {
     let mut mode = Mode::Dashboard;
     let mut show_help = false;
     let mut reload_confirm = false;
@@ -123,35 +128,86 @@ pub async fn run(
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
-    let mut disconnect_since: Option<std::time::Instant> = None;
+    // In-loop reconnection state. `reconnect_last_attempt` throttles
+    // connect tries so the draw/input loop keeps running between them.
+    // `ephemeral_respawn_done` enforces the "owned ephemeral daemon is
+    // respawned at most once" policy; `needs_intervention` latches when
+    // that single respawn fails to come back, stopping auto-respawn while
+    // the UI stays responsive and quittable.
+    let mut reconnect_last_attempt: Option<std::time::Instant> = None;
+    let mut ephemeral_respawn_done = false;
+    let mut needs_intervention = false;
 
-    let mut dashboard_pane = dashboard::Dashboard::new(&rpc, connect_label, insecure_tls);
-    dashboard_pane.init().await?;
-    let mut config_app = config_manager::App::new(&rpc, config_dir);
-    config_app.init().await?;
-    let rpc_arc = rpc.clone();
-    let mut acp_pane = acp::Acp::new(Arc::clone(&rpc_arc));
-    acp_pane.init().await?;
-    let mut chat_pane = chat::Chat::new(Arc::clone(&rpc_arc), chat::PaneKind::Chat);
-    chat_pane.init().await?;
-    // Consume any post-reconnect intent — Quickstart's Stage 2 sets
-    // this before triggering disconnect/reconnect so the next run
-    // lands the user directly in the freshly-created agent's chat.
-    let pending_start_chat = {
-        let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
-        guard.start_chat_with.take()
-    };
-    let mut logs_pane = logs::Logs::new(&rpc);
-    logs_pane.init().await?;
-    let mut quickstart =
-        quickstart_pane::QuickstartPane::new(Arc::clone(&rpc_arc), Arc::clone(&reconnect_state));
-    quickstart.init().await?;
+    // The live client handle. Reassigned in place on a successful
+    // reconnect so every rebuilt pane talks to the recovered daemon.
+    let mut rpc = rpc;
 
-    // Apply any pending Stage-2 intent from the previous run.
-    if let Some(alias) = pending_start_chat {
-        chat_pane.focus_agent(&alias).await;
-        mode = Mode::Chat;
+    // (Re)build the full pane set against the current `rpc`. Used at
+    // startup and again after each reconnect so panes re-subscribe to the
+    // new client's notification channel (a stale `notif_rx` would leave
+    // chat/logs silently deaf). Consumes any pending Quickstart Stage-2
+    // intent so a freshly-created agent lands directly in Chat.
+    //
+    // Evaluates to `anyhow::Result<(panes…)>`: startup unwraps with `?`,
+    // but the recovery path treats a mid-init failure (daemon flapped
+    // again) as a transient disconnect and stays in the loop rather than
+    // tearing down the TUI.
+    macro_rules! build_panes {
+        ($resume_chat:expr, $resume_acp:expr) => {
+            async {
+                let mut dashboard_pane =
+                    dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
+                dashboard_pane.init().await?;
+                let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
+                config_app.init().await?;
+                let mut acp_pane = acp::Acp::new(rpc.clone());
+                // Carry the pre-disconnect session across a reconnect rebuild so
+                // the rebuilt pane resumes the daemon-retained session (#7182)
+                // instead of minting a fresh one. None on first build.
+                acp_pane.set_resume_session_id($resume_acp.0);
+                acp_pane.set_resume_agent_alias($resume_acp.1);
+                acp_pane.init().await?;
+                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                chat_pane.set_resume_session_id($resume_chat.0);
+                chat_pane.set_resume_agent_alias($resume_chat.1);
+                chat_pane.init().await?;
+                let pending_start_chat = {
+                    let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
+                    guard.start_chat_with.take()
+                };
+                let mut logs_pane = logs::Logs::new(rpc.clone());
+                logs_pane.init().await?;
+                let mut quickstart =
+                    quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
+                quickstart.init().await?;
+                if let Some(alias) = pending_start_chat {
+                    chat_pane.focus_agent(&alias).await;
+                    mode = Mode::Chat;
+                }
+                anyhow::Ok((
+                    dashboard_pane,
+                    config_app,
+                    acp_pane,
+                    chat_pane,
+                    logs_pane,
+                    quickstart,
+                ))
+            }
+            .await
+        };
     }
+
+    let (
+        mut dashboard_pane,
+        mut config_app,
+        mut acp_pane,
+        mut chat_pane,
+        mut logs_pane,
+        mut quickstart,
+    ) = build_panes!(
+        (None::<String>, None::<String>),
+        (None::<String>, None::<String>)
+    )?;
 
     loop {
         // Draw
@@ -229,6 +285,7 @@ pub async fn run(
                 &conn_state,
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
+                needs_intervention,
             );
 
             // Help modal overlay (drawn last so it sits on top).
@@ -276,15 +333,92 @@ pub async fn run(
             }
         })?;
 
-        // Disconnect handoff runs every iteration, not just when the input
-        // poll times out. A steady stream of events (mouse scroll, resize,
-        // focus) would otherwise keep `event::poll` returning true and the
-        // grace timer would never start — the UI would sit frozen on the
-        // red "Disconnected" status bar indefinitely.
+        // In-loop recovery. The draw above already rendered the cached
+        // panes and the Disconnected status, and the input poll below keeps
+        // the UI responsive (quit always works), so reconnection happens
+        // here without ever leaving the event loop.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
-            let since = *disconnect_since.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() >= Duration::from_secs(2) {
-                return Ok(true);
+            // Owned ephemeral daemon: respawn exactly once. After that single
+            // respawn we set `needs_intervention` to stop auto-respawning and
+            // surface the state — but we keep polling below, so a manually
+            // restarted daemon still recovers gracefully. Attached daemons
+            // (external socket / WSS) are never spawned: multiple TUIs
+            // respawning would stampede; they only poll for the daemon to
+            // reappear at the expected address.
+            if owns_ephemeral && !ephemeral_respawn_done {
+                ephemeral_respawn_done = true;
+                if let crate::ConnectTarget::LocalSocket(_) = target {
+                    let _ = crate::spawn_ephemeral_daemon(config_dir);
+                }
+            }
+
+            // Always poll (throttled) for the daemon to become reachable —
+            // whether it is our respawned ephemeral one or a daemon the user
+            // brought back up by hand. `needs_intervention` only gates the
+            // auto-respawn above, never the reconnect poll, so recovery is
+            // never a dead end.
+            {
+                let now = std::time::Instant::now();
+                let due = reconnect_last_attempt
+                    .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due {
+                    reconnect_last_attempt = Some(now);
+                    // Reclaim the same TUI identity so the daemon restores
+                    // our UID via HMAC signature verification.
+                    let prev_id = rpc.tui_id().map(String::from);
+                    let prev_sig = rpc.tui_sig().map(String::from);
+                    if let Ok(new_client) = target
+                        .connect(prev_id.as_deref(), prev_sig.as_deref())
+                        .await
+                    {
+                        // Adopt the recovered client and rebuild every pane
+                        // against it (a kept-alive pane would still hold the
+                        // dead client's notification receiver). History is
+                        // not bulk-reloaded — panes refetch lazily and the
+                        // daemon rehydrates the session from its durable row
+                        // on the next prompt.
+                        rpc = Arc::new(new_client);
+                        // Carry the live sessions across the rebuild so the
+                        // recovered panes reattach to the daemon-retained
+                        // sessions instead of starting fresh. The agent alias
+                        // rides along so a multi-agent reconnect reattaches to
+                        // the right agent rather than dropping the session.
+                        let resume_chat = (
+                            chat_pane.current_session_id().map(String::from),
+                            chat_pane.current_agent_alias().map(String::from),
+                        );
+                        let resume_acp = (
+                            acp_pane.current_session_id().map(String::from),
+                            acp_pane.current_agent_alias().map(String::from),
+                        );
+                        match build_panes!(resume_chat, resume_acp) {
+                            Ok(panes) => {
+                                dashboard_pane = panes.0;
+                                config_app = panes.1;
+                                acp_pane = panes.2;
+                                chat_pane = panes.3;
+                                logs_pane = panes.4;
+                                quickstart = panes.5;
+                                reconnect_last_attempt = None;
+                                ephemeral_respawn_done = false;
+                                needs_intervention = false;
+                                continue;
+                            }
+                            Err(_) => {
+                                // Daemon flapped again mid-init. Stay in the
+                                // disconnected loop and retry on the next
+                                // throttle window rather than tearing down.
+                                continue;
+                            }
+                        }
+                    } else if owns_ephemeral && ephemeral_respawn_done {
+                        // The one permitted respawn did not come back — flag
+                        // for the user. We keep polling above, so a manual
+                        // daemon restart still recovers.
+                        needs_intervention = true;
+                    }
+                }
             }
         }
 
@@ -505,7 +639,7 @@ pub async fn run(
         }
     }
 
-    Ok(false)
+    Ok(())
 }
 
 // ── Mode bar ─────────────────────────────────────────────────────
@@ -539,6 +673,7 @@ fn draw_status_bar(
     state: &ConnectionState,
     tui_id: Option<&str>,
     ctx: CtxBar,
+    needs_intervention: bool,
 ) {
     let (dot, label, style) = match state {
         ConnectionState::Connected => (
@@ -546,9 +681,14 @@ fn draw_status_bar(
             " Connected".to_string(),
             Style::default().fg(HEALTHY_GREEN),
         ),
+        ConnectionState::Disconnected { reason } if needs_intervention => (
+            "\u{25cf}",
+            format!(" Daemon unavailable — restart required ({reason})"),
+            Style::default().fg(DEAD_RED),
+        ),
         ConnectionState::Disconnected { reason } => (
             "\u{25cf}",
-            format!(" Disconnected (reason: {reason})"),
+            format!(" Reconnecting… (reason: {reason})"),
             Style::default().fg(DEAD_RED),
         ),
     };

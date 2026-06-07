@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use std::sync::Arc;
+
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
     MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
@@ -63,8 +65,8 @@ impl Tab {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-pub(crate) struct Dashboard<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Dashboard {
+    rpc: Arc<RpcClient>,
     connect_label: String,
     insecure_tls: bool,
     tab: Tab,
@@ -123,8 +125,8 @@ pub(crate) struct Dashboard<'a> {
     double_click: mouse::DoubleClickTracker,
 }
 
-impl<'a> Dashboard<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str, insecure_tls: bool) -> Self {
+impl Dashboard {
+    pub(crate) fn new(rpc: Arc<RpcClient>, connect_label: &str, insecure_tls: bool) -> Self {
         Self {
             rpc,
             connect_label: connect_label.to_string(),
@@ -1988,7 +1990,7 @@ impl<'a> Dashboard<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Dashboard<'_> {
+impl crate::widgets::HelpContext for Dashboard {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
 
