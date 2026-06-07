@@ -57,4 +57,4 @@ If the model freelances or stalls, click the manual flip buttons at the bottom-r
 
 ## What "good" looks like
 
-Pin-flip latency from prompt submission to icon update should be under ~3 seconds with M2.7 on a US connection. Any longer and either the API is slow or the model is reasoning out of band; the manual buttons keep the show moving.
+Pin-flip latency from prompt submission to icon update should be under ~3-5 seconds with a reasonable model on OpenRouter (US connection). Any longer and either the API is slow or the model is reasoning out of band; the manual buttons on the visualizer keep the show moving (they call the same /manual endpoint the agent would).

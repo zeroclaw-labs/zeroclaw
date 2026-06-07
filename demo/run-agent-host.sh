@@ -21,5 +21,10 @@ if [[ -f demo/.env ]]; then
   set +a
 fi
 
-exec cargo run --bin zeroclaw --no-default-features --features "agent-runtime hardware dev-sim" \
+# Substitute Telegram bot token from env into the copied config (for easy test setup).
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  sed -i.bak "s/YOUR_TELEGRAM_BOT_TOKEN/${TELEGRAM_BOT_TOKEN}/g" demo/data/config/config.toml
+fi
+
+exec cargo run --bin zeroclaw --no-default-features --features "agent-runtime hardware dev-sim channel-telegram" \
   -- agent --config-dir demo/data/config --agent demo "$@"

@@ -30,11 +30,12 @@ mkdir -p demo/data/config
 cp -n demo/zeroclaw.toml.example demo/data/config/config.toml 2>/dev/null || true
 
 echo "Starting esp32_sim + visualizer directly on host..."
-echo "  Frontend will be at http://127.0.0.1:8080"
+echo "  Frontend will be at http://127.0.0.1:8080 (localhost for safety in host mode)"
 echo "  In another terminal run the agent with:"
 echo "    ./demo/run-agent-host.sh"
 echo
 echo "Then paste the primer from demo/PROMPTS.md and try natural language."
 echo
 
-exec cargo run -p zeroclaw-hardware --example esp32_sim --features "hardware dev-sim" "$@"
+# Default to localhost bind for host-mode safety (user can override with extra args if wanted).
+exec cargo run -p zeroclaw-hardware --example esp32_sim --features "hardware dev-sim" -- 127.0.0.1:8080 "$@"

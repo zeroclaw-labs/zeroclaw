@@ -12,7 +12,7 @@ Runs entirely inside a Docker container — nothing executes on the host.
    │  Docker container "zeroclaw-demo"            │
    │  ┌───────────────┐    ┌────────────────────┐ │
    │  │ esp32_sim     │    │ zeroclaw (chat)    │ │
-   │  │ • socat       │    │ • MiniMax M2.7     │ │
+   │  │ • socat       │    │ • OpenRouter (your model) │ │
    │  │ • HTTP :8080  │    │ • smartroom tools  │ │
    │  │ • WS /ws      │    │   (set_device etc) │ │
    │  │ • pty master ─┼────┼─► pty slave        │ │
@@ -40,7 +40,8 @@ If you cannot allocate 60-80+ GB to Docker Desktop, test the vignette directly o
 # 1. One-time setup
 cp demo/.env.template demo/.env
 nano demo/.env          # easiest on Mac. Use: code demo/.env  or  vim demo/.env
-                        # At minimum, set:  MINIMAX_API_KEY="your-real-key"
+                        # At minimum, set:  OPENROUTER_API_KEY="your-real-key"
+# For Telegram test comms: TELEGRAM_BOT_TOKEN="your-bot-token" (from @BotFather)
 
 # 2. Install socat if missing (required by the simulator)
 brew install socat
@@ -49,16 +50,20 @@ brew install socat
 mkdir -p demo/data/config
 cp -n demo/zeroclaw.toml.example demo/data/config/config.toml || true
 
-# 4. Terminal 1 – start simulator + visualizer
+# 4. (Optional but for Telegram test) Edit the copied config to set your real bot_token if not using the run script substitution, or set TELEGRAM_BOT_TOKEN in .env (the host script will substitute).
+
+# 5. Terminal 1 – start simulator + visualizer
 ./demo/run-sim-host.sh
 
-# Wait for "frontend ready: http://127.0.0.1:8080", then open the URL.
+# Wait for "frontend ready: http://127.0.0.1:8080", then open the URL. You should see the simulated room (lamps, fan, motion sensor etc.).
 
-# 5. Terminal 2 – start the agent
+# 6. Terminal 2 – start the agent (it will connect to Telegram if token configured)
 ./demo/run-agent-host.sh
 ```
 
-Then paste the system primer from `demo/PROMPTS.md` and use natural language exactly as in the Docker path.
+Then, from your Telegram (chat with the bot you created with the token), paste the system primer from `demo/PROMPTS.md` and use natural language exactly as in the prompts (e.g. "It's getting dark and chilly. I'm settling in to read for an hour.") 
+
+The agent should use the smartroom tools, the commands go over the pty to the sim, and you see the visualizer update live.
 
 This gives you the full functional vignette (smartroom tools → pty → simulator → live SVG) with far less disk pressure.
 
@@ -68,13 +73,13 @@ Use this path when you want the one-command "everything in a container" experien
 
 **Requirements**
 - Docker Desktop with **at least 60-80 GB** allocated to the disk image (see Settings → Resources)
-- A MiniMax or OpenRouter key
+- An OpenRouter key (for the LLM) + optional Telegram bot token for comms test
 
 **One-time setup**
 
 ```bash
 cp demo/.env.template demo/.env
-$EDITOR demo/.env
+$EDITOR demo/.env   # set OPENROUTER_API_KEY (and TELEGRAM_BOT_TOKEN for test)
 ```
 
 **Build (heavy first time)**

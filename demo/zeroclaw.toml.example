@@ -16,21 +16,15 @@
 # You should see the command flow through to the simulator and the visualizer update.
 
 # ─── Providers ─────────────────────────────────────────────────────────────
-# Primary: MiniMax (auth via MINIMAX_API_KEY env var).
-# Fallback: OpenRouter.
+# Use OpenRouter (set OPENROUTER_API_KEY in your .env).
+# The demo is tuned for tool-calling capable models available via OpenRouter.
 
-default_provider = "minimax"
+default_provider = "openrouter"
 
-[provider]
-base_url = "https://api.minimax.io/v1"
-model = "MiniMax-M2.7"
-temperature = 0.3
-max_tokens = 1024
-merge_system_into_user = true
-
-[provider.openrouter]
+[model_providers.openrouter]
+name = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
-model = "minimax/minimax-m2.7"
+# API key is picked up from OPENROUTER_API_KEY environment variable.
 temperature = 0.3
 max_tokens = 1024
 
@@ -78,7 +72,17 @@ auto_approve = [
 
 # ─── Agent (required for current CLI) ──────────────────────────────────────
 [agents.demo]
-model_provider = "minimax"
+provider = "openrouter"
+model = "meta-llama/llama-3.1-8b-instruct"  # Good balance for tool use; swap for a stronger model on OpenRouter as needed (e.g. sonnet, gpt-4o, etc.)
+temperature = 0.3
 
-# Telegram disabled by default (simulator-focused demo).
+# ─── Telegram channel for end-to-end test (message the bot to talk to the agent) ─
+# Set TELEGRAM_BOT_TOKEN in demo/.env (get from @BotFather).
+# After copying config, the run script will substitute if present.
+# For testing, receive all messages from the bot chat (adjust as needed for your setup).
+[channels_config.telegram]
+enabled = true
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+mention_only = false
+stream_mode = "partial"
 
