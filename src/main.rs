@@ -1076,7 +1076,7 @@ async fn run_quickstart_cli(
     use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-        RISK_PRESETS, RUNTIME_PRESETS, SelectorChoice,
+        RISK_PRESETS, SelectorChoice,
     };
     use zeroclaw_runtime::quickstart::{
         FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
@@ -1093,7 +1093,6 @@ async fn run_quickstart_cli(
     struct Form {
         provider: Option<ProviderChoice>,
         risk: Option<PresetChoice>,
-        runtime: Option<PresetChoice>,
         memory: Option<MemoryChoice>,
         channels: Vec<ChannelChoice>,
         // Tracks whether the user explicitly visited Channels and
@@ -1153,9 +1152,6 @@ async fn run_quickstart_cli(
         fn risk_done(&self) -> bool {
             self.risk.is_some()
         }
-        fn runtime_done(&self) -> bool {
-            self.runtime.is_some()
-        }
         fn memory_done(&self) -> bool {
             self.memory.is_some()
         }
@@ -1173,7 +1169,6 @@ async fn run_quickstart_cli(
         fn all_done(&self) -> bool {
             self.provider_done()
                 && self.risk_done()
-                && self.runtime_done()
                 && self.memory_done()
                 && self.channels_done()
                 && self.agent_done()
@@ -1239,7 +1234,6 @@ async fn run_quickstart_cli(
     enum Action {
         Provider,
         Risk,
-        Runtime,
         Memory,
         Channels,
         PeerGroups,
@@ -1331,11 +1325,6 @@ async fn run_quickstart_cli(
                 preset_summary(&form.risk)
             ),
             format!(
-                "{} Runtime profile    — {}",
-                glyph(form.runtime_done()),
-                preset_summary(&form.runtime)
-            ),
-            format!(
                 "{} Memory             — {memory_summary}",
                 glyph(form.memory_done())
             ),
@@ -1362,7 +1351,6 @@ async fn run_quickstart_cli(
         let actions = [
             Action::Provider,
             Action::Risk,
-            Action::Runtime,
             Action::Memory,
             Action::Channels,
             Action::PeerGroups,
@@ -1558,22 +1546,6 @@ async fn run_quickstart_cli(
                 )?;
                 if let Some(c) = chosen {
                     form.risk = Some(match c {
-                        Ok(name) => PresetChoice::Fresh(name),
-                        Err(alias) => PresetChoice::Existing(alias),
-                    });
-                }
-            }
-            Action::Runtime => {
-                let chosen = pick_preset(
-                    "Runtime profile",
-                    RUNTIME_PRESETS
-                        .iter()
-                        .map(|p| (p.preset_name, p.label, p.help))
-                        .collect(),
-                    &state.runtime_profiles,
-                )?;
-                if let Some(c) = chosen {
-                    form.runtime = Some(match c {
                         Ok(name) => PresetChoice::Fresh(name),
                         Err(alias) => PresetChoice::Existing(alias),
                     });
@@ -2082,10 +2054,9 @@ async fn run_quickstart_cli(
         PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
         PresetChoice::Existing(a) => SelectorChoice::Existing(a),
     };
-    let runtime_profile = match form.runtime.expect("runtime satisfied") {
-        PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
-        PresetChoice::Existing(a) => SelectorChoice::Existing(a),
-    };
+    // Runtime profile picker removed from all surfaces; apply silently
+    // forces the `unbounded` preset. Submit it so the field stays well-formed.
+    let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
     let channels = form
         .channels

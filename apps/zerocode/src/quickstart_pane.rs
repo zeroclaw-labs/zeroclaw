@@ -68,10 +68,9 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 8] = [
+    const ALL: [Selector; 7] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
-        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -512,10 +511,9 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        let runtime_profile = match self.runtime_mode {
-            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
-            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
-        };
+        // Runtime profile picker removed from all surfaces; apply silently
+        // forces the `unbounded` preset. Submit it so the field is well-formed.
+        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
