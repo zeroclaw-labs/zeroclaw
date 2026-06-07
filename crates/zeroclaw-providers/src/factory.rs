@@ -1073,7 +1073,11 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
 
 impl CompatFamilySpec for KiloModelProviderConfig {
     const DISPLAY: &'static str = "Kilo";
-    const DEFAULT_URL: &'static str = "https://app.kilo.ai/api/gateway";
+    // Canonical gateway host per https://kilo.ai/docs/gateway (api.kilo.ai;
+    // app.kilo.ai is the web-app sign-in). Must stay in lockstep with
+    // `KiloEndpoint::Gateway` in zeroclaw-config — see the
+    // `kilo_gateway_default_url_matches_schema_endpoint` regression test.
+    const DEFAULT_URL: &'static str = "https://api.kilo.ai/api/gateway";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const PUBLIC_MODEL_LISTING: bool = true;
 }
@@ -1242,6 +1246,24 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::ModelProviderConfig;
+
+    /// Regression for the #7136 review: the Kilo Gateway default exists in two
+    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
+    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
+    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
+    #[test]
+    fn kilo_gateway_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};
+        assert_eq!(
+            <KiloModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            KiloEndpoint::default().uri(),
+            "schema KiloEndpoint and factory DEFAULT_URL disagree on the Kilo Gateway URL"
+        );
+        assert_eq!(
+            KiloEndpoint::default().uri(),
+            "https://api.kilo.ai/api/gateway"
+        );
+    }
 
     #[test]
     fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
