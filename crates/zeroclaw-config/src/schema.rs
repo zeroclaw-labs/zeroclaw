@@ -102,6 +102,12 @@ pub struct Config {
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
     pub dirty_paths: std::collections::HashSet<String>,
+    /// Security-critical sections the resilient loader reset to `Default`
+    /// because the on-disk block was malformed. Non-empty = posture may be
+    /// weaker than intended; exposure gating should refuse to trust the
+    /// instance until repaired. Never serialized — a load-time signal.
+    #[serde(skip)]
+    pub degraded_security: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -13668,6 +13674,7 @@ impl Default for Config {
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -14499,8 +14506,14 @@ impl Config {
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
-            let mut config: Config = crate::migration::migrate_to_current(&contents)
-                .context("Failed to migrate config")?;
+            // Daemon load must never hard-fail on a malformed config — the
+            // operator needs the process up to repair it. The resilient path
+            // degrades (dropping invalid blocks to defaults); security-critical
+            // drops are recorded on `degraded_security` for exposure gating.
+            // Strict validation lives in `zeroclaw config migrate`.
+            let salvage = crate::migration::migrate_to_current_salvaged(&contents);
+            let mut config: Config = salvage.config;
+            config.degraded_security = salvage.dropped_security;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -17112,6 +17125,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -17834,6 +17848,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -20239,6 +20254,99 @@ default_model = "persisted-profile"
         assert!(logs.contains("Config loaded"), "{logs}");
         assert!(logs.contains("\"initialized\":true"), "{logs}");
         assert!(!logs.contains("\"initialized\":false"), "{logs}");
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_assigns_degraded_security_for_malformed_section() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // `[security] audit` must be a table; a scalar forces the security
+        // section to drop to its default on the resilient daemon path.
+        fs::write(
+            &config_path,
+            r#"schema_version = 3
+audit = "should-be-a-table-not-a-string"
+
+[security]
+audit = "should-be-a-table-not-a-string"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            config.degraded_security.iter().any(|s| s == "security"),
+            "load_or_init must surface a dropped [security] section on degraded_security, got {:?}",
+            config.degraded_security
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_marks_whole_config_degraded_for_unparseable_file() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // Not valid TOML at all: the whole config defaults, so every
+        // security-critical section is lost at once. load_or_init must surface
+        // that on degraded_security so the serving gate refuses to start.
+        fs::write(&config_path, "this is not valid TOML {{{")
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            !config.degraded_security.is_empty(),
+            "load_or_init must surface a whole-config loss on degraded_security, got {:?}",
+            config.degraded_security
+        );
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };

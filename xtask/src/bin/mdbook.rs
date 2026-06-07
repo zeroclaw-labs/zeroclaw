@@ -54,6 +54,10 @@ enum Cmd {
     },
     /// Generate versions.json list of deployed documentation versions
     GenVersions,
+    /// Remove orphaned root entries from the gh-pages clone (run in its root)
+    PruneRoot,
+    /// Inject the version-selector script into deployed pages that lack it
+    RetrofitSelector,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
 }
@@ -93,6 +97,8 @@ fn main() -> anyhow::Result<()> {
             std::path::Path::new(&shared_dir),
         ),
         Cmd::GenVersions => cmd::mdbook::versions::run(),
+        Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
+        Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
     }
 }

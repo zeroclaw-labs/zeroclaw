@@ -83,9 +83,9 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
-    /// Background-fetched git branch updates: (session_id, branch).
-    git_branch_tx: mpsc::Sender<(String, Option<String>)>,
-    git_branch_rx: mpsc::Receiver<(String, Option<String>)>,
+    /// Background-fetched git status updates: (session_id, branch, hash).
+    git_branch_tx: mpsc::Sender<GitStatusUpdate>,
+    git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
     phase: ChatPhase,
@@ -96,6 +96,14 @@ pub(crate) struct Chat {
     /// Double-click tracker for the agent picker: a second click on the same row
     /// confirms (enters the session), matching the keyboard Enter.
     pick_agent_double_click: crate::mouse::DoubleClickTracker,
+}
+
+/// Result of one background `session/git_branch` poll, routed back to the UI
+/// thread over `git_branch_tx`.
+struct GitStatusUpdate {
+    session_id: String,
+    branch: Option<String>,
+    hash: Option<String>,
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -260,12 +268,13 @@ impl Chat {
     }
 
     fn drain_git_branch_results(&mut self) {
-        while let Ok((sid, branch)) = self.git_branch_rx.try_recv() {
+        while let Ok(update) = self.git_branch_rx.try_recv() {
             self.git_branch_inflight = false;
             if let ChatPhase::Active(ref mut state) = self.phase
-                && state.session_id == sid
+                && state.session_id == update.session_id
             {
-                state.git_branch = branch;
+                state.git_branch = update.branch;
+                state.git_hash = update.hash;
                 state.git_branch_last_fetch = Some(Instant::now());
             }
         }
@@ -296,12 +305,18 @@ impl Chat {
         let rpc = self.rpc.clone();
         let tx = self.git_branch_tx.clone();
         tokio::spawn(async move {
-            let branch = rpc
-                .session_git_branch(&sid)
-                .await
-                .ok()
-                .and_then(|r| r.branch);
-            let _ = tx.send((sid, branch)).await;
+            let result = rpc.session_git_branch(&sid).await.ok();
+            let (branch, hash) = match result {
+                Some(r) => (r.branch, r.hash),
+                None => (None, None),
+            };
+            let _ = tx
+                .send(GitStatusUpdate {
+                    session_id: sid,
+                    branch,
+                    hash,
+                })
+                .await;
         });
     }
 
@@ -471,19 +486,23 @@ impl Chat {
                             // Load persisted message history.
                             if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
                                 for m in msgs.messages {
-                                    match m.role.as_str() {
-                                        "user" => {
+                                    match m.role() {
+                                        crate::client::MessageRole::User => {
+                                            if state.first_message.is_none() {
+                                                state.first_message = Some(m.content.clone());
+                                            }
                                             state.entries.push(ChatEntry::UserMessage {
                                                 text: Some(Arc::<str>::from(m.content)),
                                                 attachments: vec![],
                                             });
                                         }
-                                        "assistant" => {
+                                        crate::client::MessageRole::Assistant => {
                                             state.entries.push(ChatEntry::AgentMessage(
                                                 Arc::<str>::from(m.content),
                                             ));
                                         }
-                                        _ => {}
+                                        crate::client::MessageRole::System
+                                        | crate::client::MessageRole::Other => {}
                                     }
                                 }
                                 state.mark_dirty_full(); // bulk session load
@@ -1290,7 +1309,8 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
 
     // Optional CWD line just above the input bar (bottom of conv_area).
-    // Cwd left-aligned, optional git branch right-aligned.
+    // Renders `<cwd> - (branch) (hash)`, all left-aligned; the branch and hash
+    // segments are appended only when the daemon's git poll has resolved them.
     let actual_conv = if let Some(ref cwd) = state.cwd {
         if conv_area.height > 1 {
             let cwd_row = Rect::new(
@@ -1299,27 +1319,22 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 conv_area.width,
                 1,
             );
+            let mut line = format!(" {cwd}");
+            if state.git_branch.is_some() || state.git_hash.is_some() {
+                line.push_str(" -");
+                if let Some(ref branch) = state.git_branch {
+                    line.push_str(&format!(" ({branch})"));
+                }
+                if let Some(ref hash) = state.git_hash {
+                    line.push_str(&format!(" ({hash})"));
+                }
+            }
+            line.push(' ');
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {} ", cwd),
-                    theme::dim_style(),
-                )))
-                .alignment(Alignment::Left),
+                Paragraph::new(Line::from(Span::styled(line, theme::dim_style())))
+                    .alignment(Alignment::Left),
                 cwd_row,
             );
-            // Branch is right-aligned over the same row. Paragraph paints over
-            // the trailing cells; left-aligned cwd above paints first so the
-            // two don't fight unless they overlap (cwd narrower than row).
-            if let Some(ref branch) = state.git_branch {
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(" ({branch}) "),
-                        theme::dim_style(),
-                    )))
-                    .alignment(Alignment::Right),
-                    cwd_row,
-                );
-            }
             Rect::new(
                 conv_area.x,
                 conv_area.y,
@@ -1619,13 +1634,36 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         transient = true;
     }
 
-    let inner_height = area.height.saturating_sub(2);
+    // Reserve a pinned top row inside the panel for the session's first user
+    // message — a recovery reminder that stays put across scroll and reload.
+    let show_first = state
+        .first_message
+        .as_deref()
+        .is_some_and(|m| !m.is_empty());
+    let first_row_h: u16 = if show_first && area.height > 2 { 1 } else { 0 };
+
+    let inner_height = area.height.saturating_sub(2).saturating_sub(first_row_h);
 
     let block = theme::panel_block(&format!(" {} ", state.title()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    let p = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    if first_row_h == 1 {
+        let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
+        let msg = state.first_message.as_deref().unwrap_or_default();
+        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
+        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
+    }
+
+    // Conversation paragraph fills the inner area below the pinned row.
+    let body_area = Rect::new(
+        inner.x,
+        inner.y + first_row_h,
+        inner.width,
+        inner.height.saturating_sub(first_row_h),
+    );
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
 
     let total_rows = if transient {
         p.line_count(inner_width) as u16
@@ -1640,7 +1678,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     };
 
     let p = p.scroll((scroll, 0));
-    f.render_widget(p, area);
+    f.render_widget(p, body_area);
 
     state.last_total_rows = total_rows;
     state.last_inner_height = inner_height;
@@ -1648,8 +1686,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Project each entry's line range into screen coords. Off-viewport
     // ranges get no rect.
-    let body_x = area.x + 1;
-    let body_y = area.y + 1;
+    let body_x = body_area.x;
+    let body_y = body_area.y;
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
@@ -2351,6 +2389,13 @@ pub struct ChatState {
     /// interval (`GIT_BRANCH_REFRESH_INTERVAL`). `None` means either "not a
     /// git repo" or "not fetched yet".
     pub git_branch: Option<String>,
+    /// First user message of the session, pulled from the persisted message
+    /// store. Shown as a pinned recovery row at the top of the panel so the
+    /// original ask stays visible across scroll and after a session reload.
+    pub first_message: Option<String>,
+    /// Cached short commit hash for `cwd`, refreshed alongside `git_branch`.
+    /// `None` means "not a git repo", "unborn branch", or "not fetched yet".
+    pub git_hash: Option<String>,
     /// Monotonic timestamp of the last completed `session/git_branch` reply,
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
@@ -2419,6 +2464,8 @@ impl ChatState {
             session_name: None,
             cwd: None,
             git_branch: None,
+            first_message: None,
+            git_hash: None,
             git_branch_last_fetch: None,
             input_bar: InputBarState::new(),
             entries: Vec::new(),
@@ -2693,9 +2740,10 @@ impl ChatState {
 
     /// Display title: session name if set, otherwise agent alias.
     pub fn title(&self) -> String {
+        let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
         match &self.session_name {
-            Some(name) => format!("{} — {}", self.agent_alias, name),
-            None => self.agent_alias.clone(),
+            Some(name) => format!("{} — {}  {}", self.agent_alias, name, short),
+            None => format!("{}  {}", self.agent_alias, short),
         }
     }
 
@@ -2934,6 +2982,12 @@ impl ChatState {
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        if self.first_message.is_none()
+            && let Some(ref t) = text
+            && !t.trim().is_empty()
+        {
+            self.first_message = Some(t.clone());
+        }
         self.entries.push(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
@@ -2967,6 +3021,8 @@ impl ChatState {
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
+        self.first_message = None;
+        self.git_hash = None;
         self.git_branch_last_fetch = None;
         // Context usage is per-session; clear so we don't show stale numbers
         // from the previous session before the first LLM call fires a new
@@ -3618,5 +3674,44 @@ mod tests {
         // padding. The truncation rule collapses every column to `…`.
         let out = markdown_to_lines("| A |\n|---|\n| 1 |\n", 0);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn title_includes_short_session_hash() {
+        let s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        assert_eq!(s.title(), "personal_code  40be773");
+    }
+
+    #[test]
+    fn title_with_session_name_keeps_hash() {
+        let mut s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        s.session_name = Some("my work".to_string());
+        assert_eq!(s.title(), "personal_code — my work  40be773");
+    }
+
+    #[test]
+    fn first_message_captures_first_user_message_only() {
+        let mut s = state();
+        assert!(s.first_message.is_none());
+        s.push_user_message(Some("the original ask".to_string()), Vec::new());
+        s.push_user_message(Some("a follow up".to_string()), Vec::new());
+        assert_eq!(s.first_message.as_deref(), Some("the original ask"));
+    }
+
+    #[test]
+    fn first_message_ignores_empty_text() {
+        let mut s = state();
+        s.push_user_message(Some("   ".to_string()), Vec::new());
+        assert!(s.first_message.is_none());
+        s.push_user_message(Some("real".to_string()), Vec::new());
+        assert_eq!(s.first_message.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn reset_for_session_clears_first_message() {
+        let mut s = state();
+        s.push_user_message(Some("ask".to_string()), Vec::new());
+        s.reset_for_session("sess-2".to_string(), None);
+        assert!(s.first_message.is_none());
     }
 }

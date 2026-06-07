@@ -1631,10 +1631,11 @@ impl RpcDispatcher {
             .get_workspace_dir(&req.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "session not found"))?;
-        let branch = crate::rpc::git::branch_for(std::path::Path::new(&cwd));
+        let info = crate::rpc::git::head_info(std::path::Path::new(&cwd)).unwrap_or_default();
         to_result(SessionGitBranchResult {
             session_id: req.session_id,
-            branch,
+            branch: info.branch,
+            hash: info.hash,
         })
     }
 

@@ -131,6 +131,11 @@ Examples:
         /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
     /// Restart the gateway server
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -152,6 +157,11 @@ Examples:
         /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
     /// Show or generate the pairing code without restarting
     // i18n-exempt: clap derive help — framework requires a compile-time literal

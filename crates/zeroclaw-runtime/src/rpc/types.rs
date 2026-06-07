@@ -237,6 +237,8 @@ rpc_type! {
         pub session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hash: Option<String>,
     }
 }
 
