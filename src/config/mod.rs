@@ -102,6 +102,8 @@ mod tests {
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let discord = DiscordConfig {
@@ -120,6 +122,8 @@ mod tests {
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let lark = LarkConfig {
