@@ -584,12 +584,12 @@ impl FileExplorerState {
             footer_spans.push(Span::styled("\u{2588}", theme::body_style()));
         } else if self.dir_picker {
             footer_spans.push(Span::styled(
-                " c=choose dir  Enter=open  Backspace=up  /=search  .=hidden  Esc=cancel",
+                " j/k=move  l/h=in/out dir  c=choose dir  Enter=open  /=search  .=hidden  Esc=cancel",
                 theme::dim_style(),
             ));
         } else {
             footer_spans.push(Span::styled(
-                " Space=select Enter=confirm Esc=cancel /=search .=hidden",
+                " j/k=move  l/h=in/out dir  Space=select  Enter=confirm  /=search  .=hidden  Esc=cancel",
                 theme::dim_style(),
             ));
         }
