@@ -83,19 +83,36 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
-    /// Background-fetched git branch updates: (session_id, branch).
-    git_branch_tx: mpsc::Sender<(String, Option<String>)>,
-    git_branch_rx: mpsc::Receiver<(String, Option<String>)>,
+    /// Background-fetched git status updates: (session_id, branch, hash).
+    git_branch_tx: mpsc::Sender<GitStatusUpdate>,
+    git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
     phase: ChatPhase,
     pane_kind: PaneKind,
+    /// One-shot session id to reattach to on the next session start, set by
+    /// the app layer across a reconnect so the rebuilt pane resumes the
+    /// pre-disconnect session (the daemon retains it, #7182) instead of
+    /// minting a fresh one. Cleared once consumed by `start_session`.
+    resume_session_id: Option<String>,
+    /// The agent the resumed session belongs to. A multi-agent reconnect must
+    /// reattach to this agent automatically; the resume id is only dropped when
+    /// the user manually picks a different agent.
+    resume_agent_alias: Option<String>,
     /// List rect of the agent picker, recorded each draw so mouse clicks in the
     /// PickAgent phase can map a row to a selection. Default until first draw.
     pick_agent_list_area: Rect,
     /// Double-click tracker for the agent picker: a second click on the same row
     /// confirms (enters the session), matching the keyboard Enter.
     pick_agent_double_click: crate::mouse::DoubleClickTracker,
+}
+
+/// Result of one background `session/git_branch` poll, routed back to the UI
+/// thread over `git_branch_tx`.
+struct GitStatusUpdate {
+    session_id: String,
+    branch: Option<String>,
+    hash: Option<String>,
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -118,8 +135,42 @@ impl Chat {
                 loading: true,
             },
             pane_kind,
+            resume_session_id: None,
+            resume_agent_alias: None,
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
+        }
+    }
+
+    /// Seed a session id to reattach to on the next session start. Used by the
+    /// app layer right before `init()` on a reconnect rebuild so the new pane
+    /// resumes the prior session rather than starting a new one. One-shot:
+    /// consumed by the first `start_session`.
+    pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
+        self.resume_session_id = sid;
+    }
+
+    /// Seed the agent the resumed session belongs to so a multi-agent reconnect
+    /// can reattach automatically instead of dropping the carried session.
+    pub(crate) fn set_resume_agent_alias(&mut self, alias: Option<String>) {
+        self.resume_agent_alias = alias;
+    }
+
+    /// The active session id, if a session is live. Read by the app layer
+    /// before a reconnect rebuild to carry the session across.
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        match &self.phase {
+            ChatPhase::Active(state) => Some(state.session_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The active session's agent alias, if live. Read by the app layer before a
+    /// reconnect rebuild so the resumed session reattaches to its own agent.
+    pub(crate) fn current_agent_alias(&self) -> Option<&str> {
+        match &self.phase {
+            ChatPhase::Active(state) => Some(state.agent_alias.as_str()),
+            _ => None,
         }
     }
 
@@ -152,8 +203,24 @@ impl Chat {
             return Ok(());
         }
 
+        // Multi-agent reconnect: if a resumed session was carried across the
+        // rebuild and its agent is still present, reattach to it automatically
+        // rather than forcing the user back through the picker and minting a
+        // fresh session. The resume id is consumed by `start_session`.
+        if let Some(prior) = self.resume_agent_alias.take()
+            && self.resume_session_id.is_some()
+            && agents.iter().any(|a| a == &prior)
+        {
+            self.pick_or_start_session(&prior).await;
+            return Ok(());
+        }
+
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        // No carried session matched: a manual pick of a different agent must
+        // not bleed a stale resume id into a mismatched agent's session.
+        self.resume_session_id = None;
+        self.resume_agent_alias = None;
         self.phase = ChatPhase::PickAgent {
             agents,
             list_state,
@@ -165,6 +232,13 @@ impl Chat {
     /// Decide whether to show the CWD picker (WSS ACP) or start the session
     /// immediately (Unix, or non-ACP pane).
     async fn pick_or_start_session(&mut self, agent_alias: &str) {
+        // A carried resume id means we are reattaching a daemon-retained session
+        // across a reconnect: it already has a cwd, so skip the picker and
+        // resume directly instead of forcing the user to re-pick a directory.
+        if self.resume_session_id.is_some() {
+            self.start_session(agent_alias, None).await;
+            return;
+        }
         if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
         {
             // Remote ACP: start from the daemon root, not a local path.
@@ -201,34 +275,57 @@ impl Chat {
 
     /// Start the session, optionally with a caller-supplied `cwd`.
     ///
+    /// - Resume (carried session id): never overrides cwd; the daemon keeps the
+    ///   retained session's own working directory.
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Over Unix socket, pass local CWD so the agent works in the
-        // directory the TUI was launched from.  Over WSS the server
-        // uses the agent's workspace dir unless the user supplies one.
-        let cwd_str: Option<String> = if self.rpc.transport() == crate::client::Transport::Local {
+        // Reattach to a carried-over session on reconnect (one-shot); else a
+        // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
+        // the daemon-retained session, its persisted history, and its cwd.
+        let resume = self.resume_session_id.take();
+        // A resume must not re-point the session at the TUI's launch directory:
+        // pass no cwd so the daemon keeps the retained session's own cwd. Only
+        // a fresh session derives a cwd from the transport / caller.
+        let cwd_str: Option<String> = if resume.is_some() {
+            None
+        } else if self.rpc.transport() == crate::client::Transport::Local {
+            // Over Unix socket, pass local CWD so the agent works in the
+            // directory the TUI was launched from.
             std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(str::to_string))
         } else {
+            // Over WSS the server uses the agent's workspace dir unless the
+            // user supplies one.
             cwd_override
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
         };
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
-                .session_new_acp(agent_alias, cwd_str.as_deref(), None)
+                .session_new_acp(agent_alias, cwd_str.as_deref(), resume.as_deref())
                 .await
         } else {
-            self.rpc.session_new(agent_alias, cwd_str.as_deref()).await
+            self.rpc
+                .session_new_with_id(agent_alias, cwd_str.as_deref(), resume.as_deref())
+                .await
         };
         match result {
             Ok(session) => {
+                let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
                 let mut state = ChatState::new(session.session_id, agent_alias.to_string());
                 // Only ACP shows the working directory above the input bar.
                 if self.pane_kind == PaneKind::Acp {
                     state.cwd = session.workspace_dir;
+                }
+                // On a resume, replay the daemon-retained transcript so the
+                // reattached pane shows the prior conversation rather than an
+                // empty history. Fresh sessions have nothing to load.
+                if let Some(sid) = resumed_sid
+                    && let Ok(msgs) = self.rpc.session_messages(&sid).await
+                {
+                    state.load_history(msgs.messages);
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -260,12 +357,13 @@ impl Chat {
     }
 
     fn drain_git_branch_results(&mut self) {
-        while let Ok((sid, branch)) = self.git_branch_rx.try_recv() {
+        while let Ok(update) = self.git_branch_rx.try_recv() {
             self.git_branch_inflight = false;
             if let ChatPhase::Active(ref mut state) = self.phase
-                && state.session_id == sid
+                && state.session_id == update.session_id
             {
-                state.git_branch = branch;
+                state.git_branch = update.branch;
+                state.git_hash = update.hash;
                 state.git_branch_last_fetch = Some(Instant::now());
             }
         }
@@ -296,12 +394,18 @@ impl Chat {
         let rpc = self.rpc.clone();
         let tx = self.git_branch_tx.clone();
         tokio::spawn(async move {
-            let branch = rpc
-                .session_git_branch(&sid)
-                .await
-                .ok()
-                .and_then(|r| r.branch);
-            let _ = tx.send((sid, branch)).await;
+            let result = rpc.session_git_branch(&sid).await.ok();
+            let (branch, hash) = match result {
+                Some(r) => (r.branch, r.hash),
+                None => (None, None),
+            };
+            let _ = tx
+                .send(GitStatusUpdate {
+                    session_id: sid,
+                    branch,
+                    hash,
+                })
+                .await;
         });
     }
 
@@ -470,23 +574,7 @@ impl Chat {
                             }
                             // Load persisted message history.
                             if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
-                                for m in msgs.messages {
-                                    match m.role.as_str() {
-                                        "user" => {
-                                            state.entries.push(ChatEntry::UserMessage {
-                                                text: Some(Arc::<str>::from(m.content)),
-                                                attachments: vec![],
-                                            });
-                                        }
-                                        "assistant" => {
-                                            state.entries.push(ChatEntry::AgentMessage(
-                                                Arc::<str>::from(m.content),
-                                            ));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                state.mark_dirty_full(); // bulk session load
+                                state.load_history(msgs.messages);
                             }
                         }
                     }
@@ -499,36 +587,6 @@ impl Chat {
                             if i + 1 < sessions.len() {
                                 list_state.select(Some(i + 1));
                             }
-                        }
-                    }
-                }
-                return false;
-            }
-            SessionOverlay::Rename { buf } => {
-                use crate::keymap::ConfigEditorAction;
-                match ConfigEditorAction::from_chord(&key) {
-                    Some(ConfigEditorAction::Confirm) => {
-                        let name = std::mem::take(buf);
-                        if !name.is_empty()
-                            && self
-                                .rpc
-                                .session_rename(&state.session_id, &name)
-                                .await
-                                .is_ok()
-                        {
-                            state.session_name = Some(name);
-                        }
-                        state.session_overlay = SessionOverlay::None;
-                    }
-                    Some(ConfigEditorAction::Cancel) => {
-                        state.session_overlay = SessionOverlay::None;
-                    }
-                    Some(ConfigEditorAction::Backspace) => {
-                        buf.pop();
-                    }
-                    _ => {
-                        if let crossterm::event::KeyCode::Char(c) = key.code {
-                            buf.push(c);
                         }
                     }
                 }
@@ -746,9 +804,6 @@ impl Chat {
                     sessions: picker_sessions,
                     list_state: ls,
                 };
-            }
-            Some(ChatTabAction::RenameSession) if !state.turn_in_flight => {
-                state.session_overlay = SessionOverlay::Rename { buf: String::new() };
             }
             Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
@@ -1043,10 +1098,6 @@ impl Chat {
             // CWD picker always captures text input.
             ChatPhase::PickCwd { .. } => true,
             ChatPhase::Active(s) => {
-                // Overlay has its own key handling (Rename captures chars).
-                if matches!(s.session_overlay, SessionOverlay::Rename { .. }) {
-                    return true;
-                }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
                     return false;
                 }
@@ -1064,6 +1115,7 @@ impl Chat {
 
 impl crate::widgets::HelpContext for Chat {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ChatTabAction;
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
@@ -1088,12 +1140,6 @@ impl crate::widgets::HelpContext for Chat {
                             E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
                             E::key("Enter", crate::i18n::t("zc-chat-help-switch-session")),
                             E::key("Esc", crate::i18n::t("zc-chat-help-close")),
-                        ]);
-                    }
-                    SessionOverlay::Rename { .. } => {
-                        return HelpNode::entries(vec![
-                            E::key("Enter", crate::i18n::t("zc-chat-help-submit-name")),
-                            E::key("Esc", crate::i18n::t("zc-chat-help-cancel")),
                         ]);
                     }
                     SessionOverlay::None => {}
@@ -1137,9 +1183,22 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
                     ),
                     E::spacer(),
-                    E::key("Ctrl+N", crate::i18n::t("zc-chat-help-new-session")),
-                    E::key("Ctrl+S", crate::i18n::t("zc-chat-help-session-list")),
-                    E::key("Ctrl+R", crate::i18n::t("zc-chat-help-rename-session")),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::NewSession.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-chat-help-new-session"),
+                    ),
+                    E::key(
+                        Box::leak(
+                            ChatTabAction::SwitchSession.default_chords()[0]
+                                .display()
+                                .into_boxed_str(),
+                        ),
+                        crate::i18n::t("zc-chat-help-session-list"),
+                    ),
                 ]);
                 pane.with_child(state.input_bar.help_context())
             }
@@ -1290,7 +1349,8 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
 
     // Optional CWD line just above the input bar (bottom of conv_area).
-    // Cwd left-aligned, optional git branch right-aligned.
+    // Renders `<cwd> - (branch) (hash)`, all left-aligned; the branch and hash
+    // segments are appended only when the daemon's git poll has resolved them.
     let actual_conv = if let Some(ref cwd) = state.cwd {
         if conv_area.height > 1 {
             let cwd_row = Rect::new(
@@ -1299,27 +1359,22 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 conv_area.width,
                 1,
             );
+            let mut line = format!(" {cwd}");
+            if state.git_branch.is_some() || state.git_hash.is_some() {
+                line.push_str(" -");
+                if let Some(ref branch) = state.git_branch {
+                    line.push_str(&format!(" ({branch})"));
+                }
+                if let Some(ref hash) = state.git_hash {
+                    line.push_str(&format!(" ({hash})"));
+                }
+            }
+            line.push(' ');
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {} ", cwd),
-                    theme::dim_style(),
-                )))
-                .alignment(Alignment::Left),
+                Paragraph::new(Line::from(Span::styled(line, theme::dim_style())))
+                    .alignment(Alignment::Left),
                 cwd_row,
             );
-            // Branch is right-aligned over the same row. Paragraph paints over
-            // the trailing cells; left-aligned cwd above paints first so the
-            // two don't fight unless they overlap (cwd narrower than row).
-            if let Some(ref branch) = state.git_branch {
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(" ({branch}) "),
-                        theme::dim_style(),
-                    )))
-                    .alignment(Alignment::Right),
-                    cwd_row,
-                );
-            }
             Rect::new(
                 conv_area.x,
                 conv_area.y,
@@ -1346,9 +1401,6 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             list_state,
         } => {
             render_session_list_overlay(f, area, sessions, list_state);
-        }
-        SessionOverlay::Rename { buf } => {
-            render_rename_overlay(f, area, buf);
         }
         SessionOverlay::None => {}
     }
@@ -1619,13 +1671,36 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         transient = true;
     }
 
-    let inner_height = area.height.saturating_sub(2);
+    // Reserve a pinned top row inside the panel for the session's first user
+    // message — a recovery reminder that stays put across scroll and reload.
+    let show_first = state
+        .first_message
+        .as_deref()
+        .is_some_and(|m| !m.is_empty());
+    let first_row_h: u16 = if show_first && area.height > 2 { 1 } else { 0 };
+
+    let inner_height = area.height.saturating_sub(2).saturating_sub(first_row_h);
 
     let block = theme::panel_block(&format!(" {} ", state.title()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    let p = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    if first_row_h == 1 {
+        let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
+        let msg = state.first_message.as_deref().unwrap_or_default();
+        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
+        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
+    }
+
+    // Conversation paragraph fills the inner area below the pinned row.
+    let body_area = Rect::new(
+        inner.x,
+        inner.y + first_row_h,
+        inner.width,
+        inner.height.saturating_sub(first_row_h),
+    );
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
 
     let total_rows = if transient {
         p.line_count(inner_width) as u16
@@ -1640,7 +1715,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     };
 
     let p = p.scroll((scroll, 0));
-    f.render_widget(p, area);
+    f.render_widget(p, body_area);
 
     state.last_total_rows = total_rows;
     state.last_inner_height = inner_height;
@@ -1648,8 +1723,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Project each entry's line range into screen coords. Off-viewport
     // ranges get no rect.
-    let body_x = area.x + 1;
-    let body_y = area.y + 1;
+    let body_x = body_area.x;
+    let body_y = body_area.y;
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
@@ -1834,44 +1909,6 @@ fn render_session_list_overlay(
     // Copy state to pass as mutable.
     let mut ls = *list_state;
     f.render_stateful_widget(list, inner, &mut ls);
-}
-
-fn render_rename_overlay(f: &mut Frame, area: Rect, buf: &str) {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let overlay_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20),
-            Constraint::Min(30),
-            Constraint::Percentage(20),
-        ])
-        .split(vert[1])[1];
-
-    f.render_widget(Clear, overlay_area);
-
-    let prompt = crate::i18n::t("zc-chat-rename-prompt");
-    let submit = crate::i18n::t("zc-chat-rename-action-submit");
-    let cancel = crate::i18n::t("zc-chat-rename-action-cancel");
-    let text = format!("{prompt} {buf}\u{2588}\n\nEnter={submit}  Esc={cancel}");
-    let p = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " Rename Session ",
-                    theme::overlay_border_style(),
-                ))
-                .style(theme::overlay_border_style()),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(p, overlay_area);
 }
 
 /// Render a single-row context usage bar showing token consumption.
@@ -2315,9 +2352,6 @@ enum SessionOverlay {
         sessions: Vec<SessionEntry>,
         list_state: ListState,
     },
-    Rename {
-        buf: String,
-    },
 }
 
 /// Tracks what kind of update has invalidated the rendered lines cache.
@@ -2351,6 +2385,13 @@ pub struct ChatState {
     /// interval (`GIT_BRANCH_REFRESH_INTERVAL`). `None` means either "not a
     /// git repo" or "not fetched yet".
     pub git_branch: Option<String>,
+    /// First user message of the session, pulled from the persisted message
+    /// store. Shown as a pinned recovery row at the top of the panel so the
+    /// original ask stays visible across scroll and after a session reload.
+    pub first_message: Option<String>,
+    /// Cached short commit hash for `cwd`, refreshed alongside `git_branch`.
+    /// `None` means "not a git repo", "unborn branch", or "not fetched yet".
+    pub git_hash: Option<String>,
     /// Monotonic timestamp of the last completed `session/git_branch` reply,
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
@@ -2419,6 +2460,8 @@ impl ChatState {
             session_name: None,
             cwd: None,
             git_branch: None,
+            first_message: None,
+            git_hash: None,
             git_branch_last_fetch: None,
             input_bar: InputBarState::new(),
             entries: Vec::new(),
@@ -2693,9 +2736,10 @@ impl ChatState {
 
     /// Display title: session name if set, otherwise agent alias.
     pub fn title(&self) -> String {
+        let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
         match &self.session_name {
-            Some(name) => format!("{} — {}", self.agent_alias, name),
-            None => self.agent_alias.clone(),
+            Some(name) => format!("{} — {}  {}", self.agent_alias, name, short),
+            None => format!("{}  {}", self.agent_alias, short),
         }
     }
 
@@ -2934,6 +2978,12 @@ impl ChatState {
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        if self.first_message.is_none()
+            && let Some(ref t) = text
+            && !t.trim().is_empty()
+        {
+            self.first_message = Some(t.clone());
+        }
         self.entries.push(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
@@ -2946,6 +2996,32 @@ impl ChatState {
         self.turn_started_at = Instant::now();
     }
 
+    /// Replay persisted message history into the transcript on a session resume.
+    /// Mirrors the daemon-retained store into UI entries and seeds the pinned
+    /// first-message recovery row, so a reconnect/reattach shows the prior
+    /// conversation instead of an empty pane. Idempotent on entries: callers
+    /// invoke it on a freshly reset session state.
+    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+        for m in messages {
+            match m.role() {
+                crate::client::MessageRole::User => {
+                    if self.first_message.is_none() {
+                        self.first_message = Some(m.content.clone());
+                    }
+                    self.entries.push(ChatEntry::UserMessage {
+                        text: Some(Arc::<str>::from(m.content)),
+                        attachments: vec![],
+                    });
+                }
+                crate::client::MessageRole::Assistant => {
+                    self.entries
+                        .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                }
+                crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
+            }
+        }
+        self.mark_dirty_full();
+    }
     /// Reset conversational state for a new or switched session.
     pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
         self.session_id = session_id;
@@ -2967,6 +3043,8 @@ impl ChatState {
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
+        self.first_message = None;
+        self.git_hash = None;
         self.git_branch_last_fetch = None;
         // Context usage is per-session; clear so we don't show stale numbers
         // from the previous session before the first LLM call fires a new
@@ -3076,6 +3154,109 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[tokio::test]
+    async fn current_session_id_reports_active_session() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        // No session yet → None.
+        assert_eq!(chat.current_session_id(), None);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        // Active → the live session id (the `state()` helper's id).
+        assert!(chat.current_session_id().is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_session_id_dropped_when_init_lands_in_multi_agent_picker() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.set_resume_session_id(Some("sess-prev".to_string()));
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("init should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = request["id"].as_str().unwrap().to_string();
+        // Two enabled agents → multi-agent picker, no auto-start.
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
+                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                ]
+            })),
+            None,
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        // A carried resume id with no matching agent must not survive into the
+        // picker, or a manual pick of a different agent would reattach a
+        // mismatched session.
+        assert_eq!(chat.resume_session_id, None);
+        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+    }
+
+    #[tokio::test]
+    async fn multi_agent_reconnect_reattaches_prior_agent_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.set_resume_session_id(Some("sess-prev".to_string()));
+        chat.set_resume_agent_alias(Some("beta".to_string()));
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        // First request: the agent list.
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("init should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
+                    {"alias": "beta", "enabled": true, "active_sessions": 1}
+                ]
+            })),
+            None,
+        );
+
+        // Second request must be session_new_with_id carrying the prior id for
+        // the prior agent — NOT a fresh pick / fresh session. This is the whole
+        // fix: a multi-agent reconnect reattaches instead of minting fresh.
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("reconnect should reattach the prior session")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "session/new");
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "beta");
+        assert_eq!(params["session_id"], "sess-prev");
+
+        init.abort();
     }
 
     #[tokio::test]
@@ -3618,5 +3799,74 @@ mod tests {
         // padding. The truncation rule collapses every column to `…`.
         let out = markdown_to_lines("| A |\n|---|\n| 1 |\n", 0);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn title_includes_short_session_hash() {
+        let s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        assert_eq!(s.title(), "personal_code  40be773");
+    }
+
+    #[test]
+    fn title_with_session_name_keeps_hash() {
+        let mut s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        s.session_name = Some("my work".to_string());
+        assert_eq!(s.title(), "personal_code — my work  40be773");
+    }
+
+    #[test]
+    fn first_message_captures_first_user_message_only() {
+        let mut s = state();
+        assert!(s.first_message.is_none());
+        s.push_user_message(Some("the original ask".to_string()), Vec::new());
+        s.push_user_message(Some("a follow up".to_string()), Vec::new());
+        assert_eq!(s.first_message.as_deref(), Some("the original ask"));
+    }
+
+    #[test]
+    fn first_message_ignores_empty_text() {
+        let mut s = state();
+        s.push_user_message(Some("   ".to_string()), Vec::new());
+        assert!(s.first_message.is_none());
+        s.push_user_message(Some("real".to_string()), Vec::new());
+        assert_eq!(s.first_message.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn reset_for_session_clears_first_message() {
+        let mut s = state();
+        s.push_user_message(Some("ask".to_string()), Vec::new());
+        s.reset_for_session("sess-2".to_string(), None);
+        assert!(s.first_message.is_none());
+    }
+
+    #[test]
+    fn load_history_replays_transcript_and_seeds_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session("sess-resume".to_string(), None);
+        let before = s.entries.len();
+        s.load_history(vec![
+            MessageEntry {
+                role: "user".to_string(),
+                content: "first ask".to_string(),
+            },
+            MessageEntry {
+                role: "assistant".to_string(),
+                content: "reply".to_string(),
+            },
+            MessageEntry {
+                role: "system".to_string(),
+                content: "ignored".to_string(),
+            },
+            MessageEntry {
+                role: "user".to_string(),
+                content: "second ask".to_string(),
+            },
+        ]);
+        // User + assistant + user replayed; system dropped.
+        assert_eq!(s.entries.len(), before + 3);
+        // First user message seeds the pinned recovery row.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
     }
 }

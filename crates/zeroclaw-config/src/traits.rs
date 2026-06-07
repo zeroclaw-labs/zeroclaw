@@ -46,6 +46,14 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    /// Terminal field names whose values must be redacted when this type is
+    /// displayed as an object/object-array prop. Most prop kinds have no
+    /// nested secret surface; Configurable object-array element types can
+    /// override this by delegating to their generated `secret_field_terminals`.
+    fn display_secret_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -145,6 +153,10 @@ impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
 }
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;

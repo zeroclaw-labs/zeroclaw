@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use std::sync::Arc;
+
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
     MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
@@ -63,8 +65,8 @@ impl Tab {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-pub(crate) struct Dashboard<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Dashboard {
+    rpc: Arc<RpcClient>,
     connect_label: String,
     insecure_tls: bool,
     tab: Tab,
@@ -123,8 +125,8 @@ pub(crate) struct Dashboard<'a> {
     double_click: mouse::DoubleClickTracker,
 }
 
-impl<'a> Dashboard<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str, insecure_tls: bool) -> Self {
+impl Dashboard {
+    pub(crate) fn new(rpc: Arc<RpcClient>, connect_label: &str, insecure_tls: bool) -> Self {
         Self {
             rpc,
             connect_label: connect_label.to_string(),
@@ -750,11 +752,15 @@ impl<'a> Dashboard<'a> {
             )));
             lines.push(Line::from(""));
             for msg in &self.session_messages {
-                let role_style = match msg.role.as_str() {
-                    "user" => theme::user_label_style(),
-                    "assistant" => theme::agent_label_style(),
-                    "system" => theme::dim_style().add_modifier(Modifier::BOLD),
-                    _ => theme::body_style().add_modifier(Modifier::BOLD),
+                let role_style = match msg.role() {
+                    crate::client::MessageRole::User => theme::user_label_style(),
+                    crate::client::MessageRole::Assistant => theme::agent_label_style(),
+                    crate::client::MessageRole::System => {
+                        theme::dim_style().add_modifier(Modifier::BOLD)
+                    }
+                    crate::client::MessageRole::Other => {
+                        theme::body_style().add_modifier(Modifier::BOLD)
+                    }
                 };
                 lines.push(Line::from(Span::styled(
                     format!("[{}]", msg.role),
@@ -1984,7 +1990,7 @@ impl<'a> Dashboard<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Dashboard<'_> {
+impl crate::widgets::HelpContext for Dashboard {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
 
@@ -2000,7 +2006,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
             ),
             E::key("1–7", crate::i18n::t("zc-dashboard-help-jump-tab")),
             E::key("r", crate::i18n::t("zc-dashboard-help-refresh")),
-            E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
             E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
         ];
 
@@ -2036,7 +2041,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("r", crate::i18n::t("zc-dashboard-help-refresh-short")),
                 E::key("/", crate::i18n::t("zc-dashboard-help-search")),
                 E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
-                E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
             ];
             if self.tab == Tab::Sessions {

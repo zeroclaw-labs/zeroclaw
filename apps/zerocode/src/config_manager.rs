@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
 use anyhow::Result;
@@ -114,6 +115,15 @@ enum FilterEditAction {
 
 // ── Config section sub-tabs ──────────────────────────────────────
 
+/// Which pane of the zeroclaw split holds keyboard focus. The section list
+/// (left) eagerly loads the highlighted section into the right pane for a live
+/// preview; focus moves to the detail (right) on the inward chord.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZeroclawPane {
+    Sections,
+    Detail,
+}
+
 /// Top-level Config sub-tab: the daemon RPC editor (`zeroclaw`) first,
 /// the local client config (`zerocode`) second.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,12 +208,19 @@ fn switch_tabs_keys() -> Vec<String> {
 
 // ── App state ────────────────────────────────────────────────────
 
-pub(crate) struct App<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct App {
+    rpc: Arc<RpcClient>,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
     section_tab_area: Option<Rect>,
     screen: Screen,
+    zeroclaw_pane: ZeroclawPane,
+    /// Section index currently loaded into the right pane, so re-previewing the
+    /// same section preserves its cursor instead of resetting to the top.
+    loaded_section: Option<usize>,
+    /// Per-section top-level cursor, so switching the section-list highlight away
+    /// and back restores each section's own previewed position.
+    section_top_cursor: std::collections::HashMap<usize, usize>,
     sections: Vec<ConfigSectionEntry>,
     templates: Vec<ConfigTemplateEntry>,
     section_cursor: usize,
@@ -249,19 +266,24 @@ pub(crate) struct App<'a> {
     skills_frontmatter_loaded: crate::client::SkillFrontmatter,
     // Mouse support
     last_main_area: Rect,
+    last_section_pane_area: Rect,
+    last_section_list_area: Rect,
     last_list_offset: usize,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
 
-impl<'a> App<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, config_dir: &Path) -> Self {
+impl App {
+    pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
         Self {
             rpc,
             section: ConfigSection::Zeroclaw,
             zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
             section_tab_area: None,
             screen: Screen::SectionList,
+            zeroclaw_pane: ZeroclawPane::Sections,
+            loaded_section: None,
+            section_top_cursor: std::collections::HashMap::new(),
             sections: Vec::new(),
             templates: Vec::new(),
             section_cursor: 0,
@@ -297,6 +319,8 @@ impl<'a> App<'a> {
             skills_frontmatter: Default::default(),
             skills_frontmatter_loaded: Default::default(),
             last_main_area: Rect::default(),
+            last_section_pane_area: Rect::default(),
+            last_section_list_area: Rect::default(),
             last_list_offset: 0,
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
@@ -307,6 +331,11 @@ impl<'a> App<'a> {
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
         self.templates = self.rpc.config_templates().await?;
+        // Eagerly load the first section so the right pane previews content on
+        // first paint, matching the zerocode Config tab.
+        if !self.sections.is_empty() {
+            self.load_section_content(self.section_cursor).await?;
+        }
         Ok(())
     }
 
@@ -316,7 +345,11 @@ impl<'a> App<'a> {
         use ratatui::layout::{Constraint, Direction, Layout};
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
             .split(area);
         self.draw_section_tab_bar(frame, chunks[0]);
         self.section_tab_area = Some(chunks[0]);
@@ -327,12 +360,35 @@ impl<'a> App<'a> {
             return;
         }
 
+        // Unified bottom-left help indicator, matching the Dashboard/Logs panes.
+        frame.render_widget(
+            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            chunks[2],
+        );
+
+        // Split-pane: the section list stays pinned on the left; the highlighted
+        // section's content is eagerly loaded and embedded on the right for a
+        // live preview. Focus is on the left until the inward chord; the right
+        // pane always renders the loaded content.
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(30), Constraint::Min(0)])
+            .split(body);
+        let left = panes[0];
+        let right = panes[1];
+
+        let on_sections = self.zeroclaw_pane == ZeroclawPane::Sections;
+        self.draw_sections_pane(frame, left, on_sections);
+        self.last_section_pane_area = left;
+
         // Clone values out of `screen` so draw methods can take `&mut self`.
+        // The right pane renders the loaded section content whether focus is on
+        // the sections list (preview) or the detail (active).
         match &self.screen {
-            Screen::SectionList => self.draw_section_list(frame, body),
+            Screen::SectionList => self.draw_section_detail_hint(frame, right),
             Screen::TypeList { section_idx } => {
                 let si = *section_idx;
-                self.draw_type_list(frame, body, si);
+                self.draw_type_list(frame, right, si);
             }
             Screen::AliasList {
                 section_idx,
@@ -341,11 +397,11 @@ impl<'a> App<'a> {
             } => {
                 let si = *section_idx;
                 let bc = breadcrumb.clone();
-                self.draw_alias_list(frame, body, si, &bc);
+                self.draw_alias_list(frame, right, si, &bc);
             }
             Screen::AliasCreate { breadcrumb, .. } => {
                 let bc = breadcrumb.clone();
-                self.draw_alias_create(frame, body, &bc);
+                self.draw_alias_create(frame, right, &bc);
             }
             Screen::FieldList {
                 section_idx,
@@ -354,7 +410,7 @@ impl<'a> App<'a> {
             } => {
                 let si = *section_idx;
                 let bc = breadcrumb.clone();
-                self.draw_field_list(frame, body, si, &bc);
+                self.draw_field_list(frame, right, si, &bc);
             }
             Screen::FieldEdit {
                 breadcrumb,
@@ -363,8 +419,19 @@ impl<'a> App<'a> {
             } => {
                 let bc = breadcrumb.clone();
                 let fi = *field_idx;
-                self.draw_field_edit(frame, body, &bc, fi);
+                self.draw_field_edit(frame, right, &bc, fi);
             }
+        }
+    }
+
+    /// Highlight style + symbol for the right (detail) pane lists: active while
+    /// focus is in the detail, dimmed "you are here" while the section list holds
+    /// focus and the detail is just a preview.
+    fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
+        if self.zeroclaw_pane == ZeroclawPane::Detail {
+            (theme::selected_style(), "› ")
+        } else {
+            (theme::selected_inactive_style(), "  ")
         }
     }
 
@@ -416,6 +483,28 @@ impl<'a> App<'a> {
             return Ok(false);
         }
 
+        // Focus on the section list: keys drive the list (which eagerly loads
+        // the highlighted section into the right pane for preview). Focus on the
+        // detail: keys drive whatever drill screen is loaded.
+        if self.zeroclaw_pane == ZeroclawPane::Sections {
+            return self.handle_section_list(key).await;
+        }
+
+        // At a section's top drill level, Left/Back returns focus to the section
+        // list without tearing down the loaded screen, so its cursor is kept.
+        // Deeper levels fall through to the drill handlers' one-level pop.
+        {
+            use crate::keymap::ConfigTabAction;
+            if matches!(
+                ConfigTabAction::from_chord(&key),
+                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+            ) && self.at_section_top_level()
+            {
+                self.zeroclaw_pane = ZeroclawPane::Sections;
+                return Ok(false);
+            }
+        }
+
         match &self.screen {
             Screen::SectionList => {
                 return self.handle_section_list(key).await;
@@ -425,6 +514,13 @@ impl<'a> App<'a> {
             Screen::AliasCreate { .. } => self.handle_alias_create(key).await?,
             Screen::FieldList { .. } => self.handle_field_list(key, term).await?,
             Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
+        }
+        // A drill handler that walked all the way out resets to SectionList;
+        // translate that into "focus returns to the left pane" and reload the
+        // highlighted section so the right pane keeps previewing it.
+        if matches!(self.screen, Screen::SectionList) {
+            self.zeroclaw_pane = ZeroclawPane::Sections;
+            self.load_section_content(self.section_cursor).await?;
         }
         Ok(false)
     }
@@ -511,6 +607,27 @@ impl<'a> App<'a> {
                     return Ok(());
                 }
 
+                // Section pane click: select the clicked section, return focus to
+                // the left pane, and preview that section on the right.
+                if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
+                    let labels: Vec<String> =
+                        self.sections.iter().map(|s| s.label.clone()).collect();
+                    let visible = self.filtered_indices(&labels);
+                    if let Some(pos) = mouse::list_click_index(
+                        mouse.row,
+                        self.last_section_list_area,
+                        0,
+                        visible.len(),
+                    ) && let Some(&orig) = visible.get(pos)
+                    {
+                        self.section_cursor = orig;
+                    }
+                    self.zeroclaw_pane = ZeroclawPane::Sections;
+                    self.preview_section(self.section_cursor).await?;
+                    self.status_msg = None;
+                    return Ok(());
+                }
+
                 // List area click.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
                     let count = self.visible_count();
@@ -527,6 +644,23 @@ impl<'a> App<'a> {
                         }
                     }
                 }
+            }
+
+            // Scroll over the pinned section list moves the section highlight and
+            // re-previews — works whether focus is on the sections or the detail.
+            MouseEventKind::ScrollUp
+                if self.section_cursor > 0
+                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+            {
+                self.section_cursor -= 1;
+                self.preview_section(self.section_cursor).await?;
+            }
+            MouseEventKind::ScrollDown
+                if self.section_cursor + 1 < self.sections.len()
+                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+            {
+                self.section_cursor += 1;
+                self.preview_section(self.section_cursor).await?;
             }
 
             MouseEventKind::ScrollUp
@@ -1098,12 +1232,23 @@ impl<'a> App<'a> {
         let visible = self.filtered_indices(&labels);
 
         match self.handle_filter_key(key, visible.len()) {
-            FilterAction::Consumed => return Ok(false),
+            FilterAction::Consumed => {
+                // The filter edit may have changed the filtered list or moved
+                // `filter_cursor`; resolve the highlighted filtered row back to
+                // its underlying section so the right-pane preview matches what
+                // `draw_sections_pane` highlights and what Enter will open.
+                let visible = self.filtered_indices(&labels);
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.section_cursor = orig;
+                }
+                self.preview_section(self.section_cursor).await?;
+                return Ok(false);
+            }
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.section_cursor = orig;
                     self.deactivate_filter();
-                    return self.enter_section(orig).await;
+                    return self.open_section(orig).await;
                 }
                 return Ok(false);
             }
@@ -1113,27 +1258,103 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::Back) => return Ok(false),
+            // Left at the section list is home — no-op (no tab jump).
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => return Ok(false),
             Some(ConfigTabAction::Up) => {
                 self.section_cursor = self.section_cursor.saturating_sub(1);
+                self.preview_section(self.section_cursor).await?;
             }
             Some(ConfigTabAction::Down) if self.section_cursor + 1 < self.sections.len() => {
                 self.section_cursor += 1;
+                self.preview_section(self.section_cursor).await?;
             }
-            Some(ConfigTabAction::Enter) => {
-                return self.enter_section(self.section_cursor).await;
-            }
-            // Right drills into the highlighted section, mirroring the zerocode
-            // tab's cursor model (Enter and Right both step inward).
-            Some(ConfigTabAction::TabRight) => {
-                return self.enter_section(self.section_cursor).await;
+            // Enter/Right move focus into the detail pane (content already loaded
+            // by the live preview).
+            Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
+                return self.open_section(self.section_cursor).await;
             }
             _ => {}
         }
         Ok(false)
     }
 
-    async fn enter_section(&mut self, idx: usize) -> Result<bool> {
+    /// The right-pane top-level cursor for the currently loaded section, keyed by
+    /// the loaded screen shape.
+    fn current_top_cursor(&self) -> usize {
+        match &self.screen {
+            Screen::TypeList { .. } => self.type_cursor,
+            Screen::AliasList { breadcrumb, .. } if breadcrumb.len() <= 1 => self.alias_cursor,
+            Screen::FieldList { breadcrumb, .. } if breadcrumb.len() <= 1 => self.field_cursor,
+            _ => 0,
+        }
+    }
+
+    /// Restore a remembered top-level cursor onto the freshly loaded section,
+    /// clamped to the loaded list length.
+    fn restore_top_cursor(&mut self, pos: usize) {
+        match &self.screen {
+            Screen::TypeList { .. } => {
+                self.type_cursor = pos.min(self.types.len().saturating_sub(1));
+            }
+            Screen::AliasList { breadcrumb, .. } if breadcrumb.len() <= 1 => {
+                self.alias_cursor = pos.min(self.aliases.len().saturating_sub(1));
+            }
+            Screen::FieldList { breadcrumb, .. } if breadcrumb.len() <= 1 => {
+                self.field_cursor = pos.min(self.fields.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
+    /// Load the highlighted section's content into the right pane for preview,
+    /// without moving keyboard focus off the section list. Re-previewing the
+    /// already-loaded section is a no-op so its cursor is preserved; switching to
+    /// a different section saves the outgoing cursor and restores the incoming
+    /// section's remembered position.
+    async fn preview_section(&mut self, idx: usize) -> Result<()> {
+        if self.loaded_section == Some(idx) {
+            return Ok(());
+        }
+        if let Some(prev) = self.loaded_section {
+            let pos = self.current_top_cursor();
+            self.section_top_cursor.insert(prev, pos);
+        }
+        self.load_section_content(idx).await?;
+        if let Some(&pos) = self.section_top_cursor.get(&idx) {
+            self.restore_top_cursor(pos);
+        }
+        Ok(())
+    }
+
+    /// Move focus into the detail pane for the highlighted section, loading its
+    /// content first if needed.
+    async fn open_section(&mut self, idx: usize) -> Result<bool> {
+        if self.loaded_section != Some(idx) {
+            self.load_section_content(idx).await?;
+        }
+        if !matches!(self.screen, Screen::SectionList) {
+            self.zeroclaw_pane = ZeroclawPane::Detail;
+        }
+        Ok(false)
+    }
+
+    /// True when the detail pane is at the section's top drill level — the first
+    /// breadcrumb level, and on the leftmost field sub-tab if any — so Left/Back
+    /// should return focus to the section list rather than pop a level or switch
+    /// a sub-tab.
+    fn at_section_top_level(&self) -> bool {
+        let depth_one = match &self.screen {
+            Screen::TypeList { .. } => true,
+            Screen::AliasList { breadcrumb, .. } | Screen::FieldList { breadcrumb, .. } => {
+                breadcrumb.len() <= 1
+            }
+            _ => false,
+        };
+        let on_left_subtab = self.tab_names.is_empty() || self.active_tab == 0;
+        depth_one && on_left_subtab
+    }
+
+    async fn load_section_content(&mut self, idx: usize) -> Result<()> {
         if let Some(section) = self.sections.get(idx) {
             let section_key = section.key.clone();
             match section.shape {
@@ -1160,7 +1381,16 @@ impl<'a> App<'a> {
                     };
                 }
             }
+            self.loaded_section = Some(idx);
             self.status_msg = None;
+        }
+        Ok(())
+    }
+
+    async fn enter_section(&mut self, idx: usize) -> Result<bool> {
+        self.load_section_content(idx).await?;
+        if !matches!(self.screen, Screen::SectionList) {
+            self.zeroclaw_pane = ZeroclawPane::Detail;
         }
         Ok(false)
     }
@@ -1190,7 +1420,7 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::Back) => {
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
                 self.screen = Screen::SectionList;
                 self.status_msg = None;
             }
@@ -1200,7 +1430,7 @@ impl<'a> App<'a> {
             Some(ConfigTabAction::Down) if self.type_cursor + 1 < self.types.len() => {
                 self.type_cursor += 1;
             }
-            Some(ConfigTabAction::Enter) => {
+            Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
                 self.enter_type(self.type_cursor).await?;
             }
             _ => {}
@@ -1255,7 +1485,7 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::Back) => {
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::AliasList {
                     section_idx,
@@ -1275,7 +1505,7 @@ impl<'a> App<'a> {
             Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
             }
-            Some(ConfigTabAction::Enter) => {
+            Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
                 if has_add && self.alias_cursor == add_pos {
                     if let Screen::AliasList {
                         section_idx,
@@ -1451,7 +1681,10 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::TabLeft) if !self.tab_names.is_empty() => {
+            // Left switches the field sub-tab leftward; once on the leftmost
+            // sub-tab (or when the section has none) it walks back one breadcrumb
+            // level, so Left is a continuous "out" gesture like the zerocode tab.
+            Some(ConfigTabAction::TabLeft) if !self.tab_names.is_empty() && self.active_tab > 0 => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
                 self.deactivate_filter();
@@ -1467,7 +1700,7 @@ impl<'a> App<'a> {
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            Some(ConfigTabAction::Back) => {
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
                     section_idx,
@@ -1582,7 +1815,7 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::TabLeft) => {
+            Some(ConfigTabAction::TabLeft) if self.active_tab > 0 => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.deactivate_filter();
                 self.on_tab_switched(term).await?;
@@ -1594,7 +1827,7 @@ impl<'a> App<'a> {
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            Some(ConfigTabAction::Back) => {
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
                 // Back to alias list (reuse the normal Esc logic).
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
@@ -1808,7 +2041,7 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::TabLeft) => {
+            Some(ConfigTabAction::TabLeft) if self.active_tab > 0 => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.deactivate_filter();
                 self.on_tab_switched(term).await?;
@@ -1822,7 +2055,7 @@ impl<'a> App<'a> {
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            Some(ConfigTabAction::Back) => {
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
                     section_idx,
@@ -2163,9 +2396,9 @@ impl<'a> App<'a> {
             Some(FilterEditAction::Accept)
         } else if Chord::key(KeyCode::Backspace).matches(&key) {
             Some(FilterEditAction::Backspace)
-        } else if Chord::key(KeyCode::Up).matches(&key) || Chord::char('k').matches(&key) {
+        } else if Chord::key(KeyCode::Up).matches(&key) {
             Some(FilterEditAction::CursorUp)
-        } else if Chord::key(KeyCode::Down).matches(&key) || Chord::char('j').matches(&key) {
+        } else if Chord::key(KeyCode::Down).matches(&key) {
             Some(FilterEditAction::CursorDown)
         } else {
             None
@@ -2325,7 +2558,7 @@ impl<'a> App<'a> {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
-            Some(ConfigTabAction::Back) => {
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
                 self.deactivate_filter();
                 self.pop_to_field_list().await?;
             }
@@ -2415,26 +2648,28 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    fn draw_section_list(&mut self, frame: &mut Frame, area: Rect) {
-        let r = regions(area);
-
-        render_breadcrumb(
-            frame,
-            r.breadcrumb,
-            &[crate::i18n::t("zc-config-breadcrumb-root")],
-        );
-
+    /// Persistent left pane: the section list. `active` is true while the
+    /// SectionList screen holds focus (bright highlight); once a section is
+    /// entered the list dims to a "you are here" marker.
+    fn draw_sections_pane(&mut self, frame: &mut Frame, area: Rect, active: bool) {
+        use ratatui::layout::{Constraint, Direction, Layout};
+        // Reserve one line at the top for the filter bar when filtering.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
         if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+            render_filter_bar(frame, rows[0], buf);
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     format!("ZeroClaw v{}", self.rpc.server_version),
                     theme::dim_style(),
                 )),
-                r.help,
+                rows[0],
             );
         }
+        let list_area = rows[1];
 
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
@@ -2454,7 +2689,6 @@ impl<'a> App<'a> {
         let cursor = if self.filter.is_some() {
             self.filter_cursor
         } else {
-            // Map the real cursor to the visible position
             visible
                 .iter()
                 .position(|&i| i == self.section_cursor)
@@ -2466,43 +2700,66 @@ impl<'a> App<'a> {
             state.select(Some(cursor.min(items.len().saturating_sub(1))));
         }
 
+        let (style, symbol) = if active {
+            (theme::selected_style(), "› ")
+        } else {
+            (theme::selected_inactive_style(), "  ")
+        };
+
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Sections "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
-            r.main,
+                .highlight_style(style)
+                .highlight_symbol(symbol),
+            list_area,
             &mut state,
         );
-        self.last_main_area = r.main;
+        self.last_main_area = list_area;
+        self.last_section_list_area = list_area;
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
+    }
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+    /// Right pane shown while focus is on the section list: the highlighted
+    /// section's description, so the content updates as the cursor moves — and a
+    /// trailing line with the inward chords resolved from the keymap.
+    fn draw_section_detail_hint(&self, frame: &mut Frame, area: Rect) {
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+
+        let help = self
+            .sections
+            .get(self.section_cursor)
+            .map(|s| s.help.clone())
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Span::styled(help, theme::body_style()))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(theme::panel_block(" ")),
+            rows[0],
+        );
+
+        let line = crate::i18n::t_args(
+            "zc-config-section-detail-hint",
+            &[
+                ("open", &tab_key(crate::keymap::ConfigTabAction::Enter)),
+                ("into", &tab_key(crate::keymap::ConfigTabAction::TabRight)),
+            ],
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(line, theme::dim_style())),
+            rows[1],
+        );
     }
 
     fn draw_type_list(&mut self, frame: &mut Frame, area: Rect, section_idx: usize) {
         let r = regions(area);
         let section = &self.sections[section_idx];
 
-        render_breadcrumb(
-            frame,
-            r.breadcrumb,
-            &[
-                crate::i18n::t("zc-config-breadcrumb-root"),
-                section.label.clone(),
-            ],
-        );
+        render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
@@ -2548,11 +2805,12 @@ impl<'a> App<'a> {
             state.select(Some(cursor.min(items.len().saturating_sub(1))));
         }
 
+        let (dstyle, dsym) = self.detail_highlight();
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&format!(" {} ", section.label)))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(dstyle)
+                .highlight_symbol(dsym),
             r.main,
             &mut state,
         );
@@ -2583,7 +2841,7 @@ impl<'a> App<'a> {
         let r = regions(area);
         let section = &self.sections[section_idx];
 
-        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         render_breadcrumb(frame, r.breadcrumb, &bc);
 
@@ -2632,11 +2890,12 @@ impl<'a> App<'a> {
             state.select(Some(cursor.min(items.len().saturating_sub(1))));
         }
 
+        let (dstyle, dsym) = self.detail_highlight();
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Aliases "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(dstyle)
+                .highlight_symbol(dsym),
             r.main,
             &mut state,
         );
@@ -2660,7 +2919,7 @@ impl<'a> App<'a> {
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
         let r = regions(area);
 
-        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         bc.push(crate::i18n::t("zc-config-breadcrumb-new"));
         render_breadcrumb(frame, r.breadcrumb, &bc);
@@ -2703,7 +2962,7 @@ impl<'a> App<'a> {
         // Breadcrumb first, then optional tab bar, then the rest.
         let mut r = regions(area);
 
-        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         render_breadcrumb(frame, r.breadcrumb, &bc);
 
@@ -2816,11 +3075,12 @@ impl<'a> App<'a> {
             state.select(Some(cursor.min(items.len().saturating_sub(1))));
         }
 
+        let (dstyle, dsym) = self.detail_highlight();
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Fields "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(dstyle)
+                .highlight_symbol(dsym),
             r.main,
             &mut state,
         );
@@ -2932,8 +3192,8 @@ impl<'a> App<'a> {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(" Personality Files "))
-                    .highlight_style(theme::selected_style())
-                    .highlight_symbol("› "),
+                    .highlight_style(self.detail_highlight().0)
+                    .highlight_symbol(self.detail_highlight().1),
                 r.main,
                 &mut state,
             );
@@ -3029,8 +3289,8 @@ impl<'a> App<'a> {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(" Skills "))
-                    .highlight_style(theme::selected_style())
-                    .highlight_symbol("› "),
+                    .highlight_style(self.detail_highlight().0)
+                    .highlight_symbol(self.detail_highlight().1),
                 r.main,
                 &mut state,
             );
@@ -3053,7 +3313,7 @@ impl<'a> App<'a> {
         let field = &self.fields[field_idx];
         let short_name = field.path.rsplit('.').next().unwrap_or(&field.path);
 
-        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         bc.push(short_name.to_string());
         render_breadcrumb(frame, r.breadcrumb, &bc);
@@ -3202,17 +3462,16 @@ impl<'a> App<'a> {
         }
     }
 
-    fn draw_footer(&self, frame: &mut Frame, r: Regions, hints: &str) {
+    fn draw_footer(&self, frame: &mut Frame, r: Regions, _hints: &str) {
+        // The help indicator is unified at the pane bottom (draw_into); per-screen
+        // hint strings are no longer rendered here. Only the transient status
+        // message remains inline.
         if let Some(msg) = &self.status_msg {
             frame.render_widget(
                 Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
                 r.status,
             );
         }
-        frame.render_widget(
-            Paragraph::new(Span::styled(hints, theme::dim_style())),
-            r.hints,
-        );
     }
 
     /// Handle a bracketed-paste payload. Routes pasted text into whichever
@@ -3297,7 +3556,7 @@ impl<'a> App<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for App<'_> {
+impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::HelpEntry as E;
         // Section switch is available in either sub-tab.
@@ -3316,7 +3575,7 @@ impl crate::widgets::HelpContext for App<'_> {
     }
 }
 
-impl App<'_> {
+impl App {
     fn zeroclaw_help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::ConfigTabAction as A;
         use crate::widgets::{HelpEntry as E, HelpNode};
@@ -3539,7 +3798,7 @@ impl App<'_> {
     }
 }
 
-impl App<'_> {
+impl App {
     fn field_list_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::ConfigTabAction as A;
         use crate::widgets::{HelpEntry as E, HelpNode};
@@ -3587,7 +3846,6 @@ struct Regions {
     help: Rect,
     main: Rect,
     status: Rect,
-    hints: Rect,
 }
 
 fn regions(area: Rect) -> Regions {
@@ -3598,7 +3856,6 @@ fn regions(area: Rect) -> Regions {
             Constraint::Length(2), // help
             Constraint::Min(4),    // main
             Constraint::Length(1), // status
-            Constraint::Length(1), // hints
         ])
         .split(area);
 
@@ -3607,7 +3864,6 @@ fn regions(area: Rect) -> Regions {
         help: chunks[1],
         main: chunks[2],
         status: chunks[3],
-        hints: chunks[4],
     }
 }
 

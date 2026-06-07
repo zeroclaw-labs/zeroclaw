@@ -22,6 +22,22 @@ impl Acp {
         self.inner.init().await
     }
 
+    pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
+        self.inner.set_resume_session_id(sid);
+    }
+
+    pub(crate) fn set_resume_agent_alias(&mut self, alias: Option<String>) {
+        self.inner.set_resume_agent_alias(alias);
+    }
+
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        self.inner.current_session_id()
+    }
+
+    pub(crate) fn current_agent_alias(&self) -> Option<&str> {
+        self.inner.current_agent_alias()
+    }
+
     pub(crate) async fn refresh_if_inactive(&mut self) {
         self.inner.refresh_if_inactive().await;
     }
