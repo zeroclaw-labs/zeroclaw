@@ -164,11 +164,12 @@ fn load_cli_ftl_sources(locale: &str) -> CliFtlSources {
     }
 }
 
-fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
-    match locale {
-        "zh-CN" => Some(include_str!("../locales/zh-CN/cli.ftl")),
-        _ => None,
-    }
+fn builtin_cli_ftl_source(_locale: &str) -> Option<&'static str> {
+    // Non-English locales have been moved to the `locales/i18n` git submodule.
+    // All locale loading now goes through `load_ftl_from_disk`, which searches
+    // the submodule path first. When the submodule is not checked out, the
+    // runtime gracefully falls back to English.
+    None
 }
 
 fn format_cli_string_with_args(
@@ -257,10 +258,13 @@ fn load_ftl_with_reader(
     filename: &str,
     read: impl Fn(&std::path::Path) -> Option<String>,
 ) -> Option<String> {
-    let path = zeroclaw_config::schema::ftl_locale_dir(locale)
+    let config_path = zeroclaw_config::schema::ftl_locale_dir(locale)
         .ok()
         .map(|d| d.join(filename));
-    let search_paths = [path];
+    let submodule_path = std::path::PathBuf::from(format!(
+        "locales/i18n/ftl/runtime/{locale}/{filename}"
+    ));
+    let search_paths = [config_path, Some(submodule_path)];
     for path in search_paths.into_iter().flatten() {
         if let Some(content) = read(&path) {
             ::zeroclaw_log::record!(
@@ -362,9 +366,11 @@ mod tests {
 
     #[test]
     fn zh_cn_wechat_translations_preserve_machine_facing_tokens() {
-        let zh_cn = include_str!("../locales/zh-CN/cli.ftl");
+        let zh_cn_path = std::path::PathBuf::from("locales/i18n/ftl/runtime/zh-CN/cli.ftl");
+        let zh_cn = std::fs::read_to_string(&zh_cn_path)
+            .expect("zh-CN cli.ftl should be present in submodule (run git submodule update --init)");
         let bind = format_ftl_message(
-            zh_cn,
+            &zh_cn,
             "zh-CN",
             "cli-wechat-send-bind-command",
             &[("command", "/bind")],
@@ -374,7 +380,7 @@ mod tests {
         assert!(bind.contains("/bind"));
         assert!(bind.contains("<code>"));
 
-        let success = format_ftl_message(zh_cn, "zh-CN", "cli-wechat-bound-success", &[])
+        let success = format_ftl_message(&zh_cn, "zh-CN", "cli-wechat-bound-success", &[])
             .expect("zh-CN bind success should format");
         assert!(success.contains("WeChat"));
         assert!(success.contains("ZeroClaw"));
@@ -477,9 +483,12 @@ mod tests {
             ),
             ("cli-wechat-invalid-bind-code", &[][..], [].as_slice()),
         ];
+        let zh_cn_path = std::path::PathBuf::from("locales/i18n/ftl/runtime/zh-CN/cli.ftl");
+        let zh_cn_source = std::fs::read_to_string(&zh_cn_path)
+            .expect("zh-CN cli.ftl should be present in submodule");
         for source in [
             (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            (&zh_cn_source as &str, "zh-CN"),
         ] {
             for (key, args, expected_parts) in keys {
                 let value = format_ftl_message(source.0, source.1, key, args)
@@ -574,10 +583,13 @@ mod tests {
             ),
         ];
 
+        let zh_cn_path = std::path::PathBuf::from("locales/i18n/ftl/runtime/zh-CN/cli.ftl");
+        let zh_cn_source = std::fs::read_to_string(&zh_cn_path)
+            .expect("zh-CN cli.ftl should be present in submodule");
         for (source, locale, cases) in [
             (include_str!("../locales/en/cli.ftl"), "en", en_cases),
             (
-                include_str!("../locales/zh-CN/cli.ftl"),
+                &zh_cn_source as &str,
                 "zh-CN",
                 zh_cn_cases,
             ),

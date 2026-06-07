@@ -13980,17 +13980,17 @@ pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
 pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
     (
         "cli",
-        "crates/zeroclaw-runtime/locales/{locale}/cli.ftl",
+        "locales/i18n/ftl/runtime/{locale}/cli.ftl",
         "cli.ftl",
     ),
     (
         "tools",
-        "crates/zeroclaw-runtime/locales/{locale}/tools.ftl",
+        "locales/i18n/ftl/runtime/{locale}/tools.ftl",
         "tools.ftl",
     ),
     (
         "zerocode",
-        "apps/zerocode/locales/{locale}/zerocode.ftl",
+        "locales/i18n/ftl/zerocode/{locale}/zerocode.ftl",
         "zerocode.ftl",
     ),
 ];

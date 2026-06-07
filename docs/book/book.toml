@@ -31,6 +31,7 @@ level = 0
 
 [preprocessor.gettext]
 after = ["links"]
+po_dir = "locales/i18n/po"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

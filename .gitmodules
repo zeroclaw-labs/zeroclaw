@@ -1,0 +1,4 @@
+[submodule "locales/i18n"]
+	path = locales/i18n
+	url = https://github.com/zeroclaw-labs/zeroclaw-i18n.git
+	branch = main
