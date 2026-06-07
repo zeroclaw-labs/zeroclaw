@@ -4558,6 +4558,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            mcp_registry: None,
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
@@ -4657,6 +4658,7 @@ mod tests {
         );
 
         let state = AppState {
+            mcp_registry: None,
             config: Arc::new(RwLock::new(config)),
             model_provider,
             model: "test-model".into(),
@@ -5980,6 +5982,7 @@ mod tests {
         }
 
         AppState {
+            mcp_registry: None,
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
@@ -6058,6 +6061,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            mcp_registry: None,
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
