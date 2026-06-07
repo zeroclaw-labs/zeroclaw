@@ -5998,6 +5998,12 @@ pub struct HttpRequestConfig {
     /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
+    /// Named authorization secrets for `auth_secret` requests.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub secrets: HashMap<String, String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -6009,6 +6015,7 @@ impl Default for HttpRequestConfig {
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
             allowed_private_hosts: vec![],
+            secrets: HashMap::new(),
         }
     }
 }
@@ -14938,6 +14945,21 @@ impl Config {
             }
         }
 
+        for name in self.http_request.secrets.keys() {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("http_request.secrets.{name}"),
+                    "http_request.secrets key {name:?} must contain 1..=64 ASCII letters, numbers, underscores, or hyphens"
+                );
+            }
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             validation_bail!(
@@ -16850,6 +16872,7 @@ mod tests {
         assert_eq!(cfg.allowed_domains, vec!["*".to_string()]);
         assert!(!cfg.allow_private_hosts);
         assert!(cfg.allowed_private_hosts.is_empty());
+        assert!(cfg.secrets.is_empty());
     }
 
     #[test]
@@ -16865,6 +16888,36 @@ allowed_private_hosts = ["localhost", "10.0.0.1"]
         assert_eq!(
             c.http_request.allowed_private_hosts,
             vec!["localhost".to_string(), "10.0.0.1".to_string()]
+        );
+    }
+
+    #[test]
+    async fn http_request_config_deserializes_auth_secrets() {
+        let c = parse_test_config(
+            r#"
+[http_request.secrets]
+api_token = "Bearer test-token"
+"#,
+        );
+
+        assert_eq!(
+            c.http_request.secrets.get("api_token").map(String::as_str),
+            Some("Bearer test-token")
+        );
+    }
+
+    #[test]
+    async fn http_request_auth_secret_names_are_validated() {
+        let mut config = Config::default();
+        config
+            .http_request
+            .secrets
+            .insert("bad.name".to_string(), "Bearer test-token".to_string());
+
+        let err = config.validate().expect_err("invalid secret name");
+        assert!(
+            err.to_string().contains("http_request.secrets.bad.name"),
+            "validation error must name the bad auth secret path: {err}"
         );
     }
 
@@ -18334,6 +18387,10 @@ default_temperature = 0.7
             "Authorization".to_string(),
             "Bearer upload-credential".to_string(),
         )]);
+        config.http_request.secrets = HashMap::from([(
+            "api_token".to_string(),
+            "Bearer http-request-credential".to_string(),
+        )]);
         config.channels.lark.insert(
             "feishu".to_string(),
             LarkConfig {
@@ -18417,6 +18474,7 @@ default_temperature = 0.7
             "nodes-auth-credential",
             "Bearer otel-credential",
             "Bearer upload-credential",
+            "Bearer http-request-credential",
             "mcp-env-credential",
             "Bearer mcp-cred",
             "tenant-42",
@@ -18550,6 +18608,13 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(upload_auth).unwrap(),
             "Bearer upload-credential"
+        );
+
+        let http_request_auth = stored.http_request.secrets.get("api_token").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(http_request_auth));
+        assert_eq!(
+            store.decrypt(http_request_auth).unwrap(),
+            "Bearer http-request-credential"
         );
 
         let feishu = stored.channels.lark.get("feishu").unwrap();
@@ -22578,6 +22643,10 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         assert!(names.contains(&"channels.matrix.access_token"));
         assert!(names.contains(&"channels.matrix.recovery_key"));
+        assert!(
+            names.contains(&"http_request.secrets"),
+            "http_request.secrets must be classified as a secret map"
+        );
     }
 
     #[test]
@@ -22673,6 +22742,65 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 .set_secret("nonexistent.field", "val".into())
                 .is_err()
         );
+    }
+
+    #[test]
+    async fn config_set_http_request_secret_map_key_is_masked_and_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: dir.path().join("workspace"),
+            secrets: SecretsConfig { encrypt: true },
+            ..Config::default()
+        };
+        let path = "http_request.secrets.api_token";
+
+        assert!(
+            Config::prop_is_secret(path),
+            "dynamic http_request secret map entries must be classified as secret before the key exists"
+        );
+        config
+            .set_prop_persistent(path, "Bearer from-config-set")
+            .unwrap();
+
+        assert_eq!(
+            config
+                .http_request
+                .secrets
+                .get("api_token")
+                .map(String::as_str),
+            Some("Bearer from-config-set")
+        );
+        assert_eq!(config.get_prop(path).unwrap(), "****");
+
+        let field = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("dynamic secret map prop field");
+        assert!(field.is_secret);
+        assert_eq!(field.display_value, "****");
+        assert_eq!(
+            field.credential_class,
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+
+        config.save_dirty().await.unwrap();
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !contents.contains("Bearer from-config-set"),
+            "auth secret must not be written in plaintext: {contents}"
+        );
+
+        let stored = crate::migration::migrate_to_current(&contents).unwrap();
+        let encrypted = stored.http_request.secrets.get("api_token").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(encrypted));
+        let store = crate::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(encrypted).unwrap(), "Bearer from-config-set");
     }
 
     #[test]

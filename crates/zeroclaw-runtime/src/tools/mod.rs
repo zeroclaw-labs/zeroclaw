@@ -683,13 +683,15 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        match HttpRequestTool::new(
+        match HttpRequestTool::new_with_config(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.allow_private_hosts,
             http_config.allowed_private_hosts.clone(),
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
         ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
