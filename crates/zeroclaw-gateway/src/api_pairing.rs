@@ -196,6 +196,17 @@ impl DeviceRegistry {
         Ok(deleted)
     }
 
+    /// Delete every device row and clear the in-memory cache. Returns the
+    /// number of rows removed. Pairs with `PairingGuard::revoke_all_tokens`
+    /// for the "rotate after compromise — nuke everything" path so the device
+    /// registry does not silently coexist with the now-revoked token set.
+    pub fn clear(&self) -> Result<usize, rusqlite::Error> {
+        let conn = self.open_db();
+        let removed = conn.execute("DELETE FROM devices", [])?;
+        self.cache.lock().clear();
+        Ok(removed)
+    }
+
     pub fn update_last_seen(&self, token_hash: &str) {
         let now = Utc::now();
         let conn = self.open_db();

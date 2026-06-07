@@ -3154,37 +3154,161 @@ async fn handle_admin_paircode(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/paircode/new — generate a new pairing code (localhost only)
+/// Query parameters for `POST /admin/paircode/new`.
+///
+/// `rotate` distinguishes the destructive "rotate after compromise" path from
+/// the default "add another client" path (#6984):
+/// - absent / empty → add another client; existing tokens stay valid.
+/// - `rotate=all` → revoke every paired token and clear the device registry,
+///   then issue a fresh code. The only safe action when the operator does not
+///   know which token leaked.
+/// - `rotate=<device_id>` → revoke just that device's token, then issue a code.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct AdminPaircodeQuery {
+    #[serde(default)]
+    pub rotate: Option<String>,
+}
+
+/// POST /admin/paircode/new — generate a new pairing code (localhost only).
+///
+/// With `?rotate=all` or `?rotate=<device_id>` this also revokes existing
+/// bearer tokens before issuing the code, so the CLI/admin surface can
+/// distinguish "add another client" from "rotate after compromise" (#6984).
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<AdminPaircodeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
-    match state.pairing.generate_new_pairing_code() {
-        Some(code) => {
+
+    if !state.pairing.require_pairing() {
+        let body = serde_json::json!({
+            "success": false,
+            "pairing_required": false,
+            "pairing_code": null,
+            "message": "Pairing is disabled for this gateway"
+        });
+        return Ok((StatusCode::BAD_REQUEST, Json(body)));
+    }
+
+    let rotate = params
+        .rotate
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let revocation_message = match rotate {
+        Some("all") => {
+            let revoked = state.pairing.revoke_all_tokens();
+            if let Some(registry) = state.device_registry.as_ref() {
+                if let Err(e) = registry.clear() {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            }
+            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but config persist failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"revoked": revoked})),
+                "all paired tokens revoked via admin endpoint"
+            );
+            Some(format!(
+                "Revoked all {revoked} paired token(s) and cleared the device registry."
+            ))
+        }
+        Some(device_id) => {
+            let Some(registry) = state.device_registry.as_ref() else {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": "Device registry is disabled; cannot rotate a single device.",
+                });
+                return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
+            };
+            let token_hash = match registry.revoke(device_id) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Device '{device_id}' not found; nothing revoked."),
+                    });
+                    return Ok((StatusCode::NOT_FOUND, Json(body)));
+                }
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Device registry error: {e}"),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            };
+            state.pairing.revoke_token_hash(&token_hash);
+            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Token revoked in memory but config persist failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "new pairing code generated via admin endpoint"
+                "single device token revoked via admin endpoint"
             );
-            let body = serde_json::json!({
-                "success": true,
-                "pairing_required": state.pairing.require_pairing(),
-                "pairing_code": code,
-                "message": "New pairing code generated — use this one-time code to pair"
-            });
-            Ok((StatusCode::OK, Json(body)))
+            Some(format!(
+                "Revoked the bearer token for device '{device_id}'."
+            ))
         }
-        None => {
-            let body = serde_json::json!({
-                "success": false,
-                "pairing_required": false,
-                "pairing_code": null,
-                "message": "Pairing is disabled for this gateway"
-            });
-            Ok((StatusCode::BAD_REQUEST, Json(body)))
-        }
+        None => None,
+    };
+
+    let code = state
+        .pairing
+        .generate_new_pairing_code()
+        .expect("require_pairing checked above");
+    if rotate.is_none() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "new pairing code generated via admin endpoint"
+        );
     }
+
+    let message = match revocation_message {
+        Some(revoked) => {
+            format!("{revoked} Use this one-time code to re-pair.")
+        }
+        None => "New pairing code generated — use this one-time code to pair".to_string(),
+    };
+
+    let body = serde_json::json!({
+        "success": true,
+        "pairing_required": true,
+        "pairing_code": code,
+        "message": message,
+    });
+    Ok((StatusCode::OK, Json(body)))
 }
 
 /// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).
@@ -3279,6 +3403,251 @@ mod tests {
             format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
             "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
         );
+    }
+
+    /// Build an AppState wired with a real pairing guard, on-disk config path,
+    /// and an optional device registry so the admin paircode handler's
+    /// revoke + persist paths can be exercised end to end.
+    fn admin_paircode_state(
+        tmp: &tempfile::TempDir,
+        require_pairing: bool,
+        with_registry: bool,
+    ) -> AppState {
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: registry,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    /// Pair a device into both the pairing guard and the device registry,
+    /// returning the plaintext token so the test can assert it is revoked.
+    async fn pair_device(state: &AppState, device_id: &str) -> String {
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing enabled");
+        let token = state
+            .pairing
+            .try_pair(&code, device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state.device_registry.as_ref().unwrap().register(
+            PairingGuard::token_hash(&token),
+            api_pairing::DeviceInfo {
+                id: device_id.to_string(),
+                name: None,
+                device_type: None,
+                paired_at: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+                ip_address: None,
+                capabilities: None,
+            },
+        );
+        token
+    }
+
+    async fn admin_paircode_response_json(
+        result: Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = result.into_response();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Default `?` absent path still just adds a client; existing tokens live.
+    #[tokio::test]
+    async fn admin_paircode_new_without_rotate_keeps_existing_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "add-another-client path must not revoke existing tokens"
+        );
+    }
+
+    /// `?rotate=all` revokes every token, clears the registry, persists, and
+    /// still issues a fresh code.
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_all_revokes_everything() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token_a = pair_device(&state, "dev-a").await;
+        let token_b = pair_device(&state, "dev-b").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("all".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(!state.pairing.is_authenticated(&token_a));
+        assert!(!state.pairing.is_authenticated(&token_b));
+        assert!(
+            state.config.read().gateway.paired_tokens.is_empty(),
+            "rotate=all must persist an empty token set"
+        );
+        assert!(
+            state.device_registry.as_ref().unwrap().list().is_empty(),
+            "rotate=all must clear the device registry"
+        );
+    }
+
+    /// `?rotate=<id>` revokes only that device and leaves the rest valid.
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_device_revokes_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token_a = pair_device(&state, "dev-a").await;
+        let token_b = pair_device(&state, "dev-b").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("dev-a".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(!state.pairing.is_authenticated(&token_a));
+        assert!(
+            state.pairing.is_authenticated(&token_b),
+            "targeted rotate must not touch other devices"
+        );
+        let old_hash = PairingGuard::token_hash(&token_a);
+        assert!(
+            !state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&old_hash)
+        );
+    }
+
+    /// Unknown device id returns 404 and revokes nothing.
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_unknown_device_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("ghost".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "a not-found rotate must not revoke any token"
+        );
+    }
+
+    /// Pairing disabled returns 400 regardless of rotate intent.
+    #[tokio::test]
+    async fn admin_paircode_new_pairing_disabled_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("all".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
     }
 
     #[test]

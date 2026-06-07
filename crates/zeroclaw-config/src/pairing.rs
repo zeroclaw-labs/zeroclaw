@@ -249,6 +249,19 @@ impl PairingGuard {
         tokens.remove(token_hash)
     }
 
+    /// Revoke every paired token at once. Returns the number of tokens
+    /// invalidated. This is the "rotate after compromise — nuke everything"
+    /// path: when an operator does not know which token leaked, the only safe
+    /// action is to invalidate all of them and force every client to re-pair.
+    /// The caller must persist `tokens()` to config so a daemon restart does
+    /// not resurrect the revoked set.
+    pub fn revoke_all_tokens(&self) -> usize {
+        let mut tokens = self.paired_tokens.lock();
+        let count = tokens.len();
+        tokens.clear();
+        count
+    }
+
     /// Generate a new pairing code that pairs an additional client.
     ///
     /// Does not revoke existing tokens. To rotate a compromised token,
@@ -855,6 +868,25 @@ mod tests {
         assert!(guard.revoke_token("zc_drop"));
         assert!(guard.is_authenticated("zc_keep"));
         assert!(!guard.is_authenticated("zc_drop"));
+    }
+
+    /// `revoke_all_tokens` invalidates every paired token and reports the
+    /// count. This is the "rotate after compromise — nuke everything" path.
+    #[test]
+    async fn revoke_all_tokens_invalidates_every_token() {
+        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
+        assert_eq!(guard.revoke_all_tokens(), 3);
+        assert!(!guard.is_authenticated("zc_a"));
+        assert!(!guard.is_authenticated("zc_b"));
+        assert!(!guard.is_authenticated("zc_c"));
+        assert!(!guard.is_paired());
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn revoke_all_tokens_on_empty_set_returns_zero() {
+        let guard = PairingGuard::new(true, &[]);
+        assert_eq!(guard.revoke_all_tokens(), 0);
     }
 
     // ── Atomic pairing-code generation ───────────────────────
