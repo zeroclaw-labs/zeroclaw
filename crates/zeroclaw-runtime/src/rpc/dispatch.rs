@@ -644,12 +644,50 @@ impl RpcDispatcher {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        let resuming = req.session_id.is_some();
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let config = self.ctx.config.read().clone();
-        let cwd_path = req.cwd.as_deref().map(std::path::Path::new);
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+
+        // Resuming an ACP session with no caller cwd: recover the original
+        // working directory from the persisted store so the rehydrated session
+        // keeps its own cwd instead of falling back to the agent workspace dir.
+        // The loaded data is reused below so history is not fetched twice.
+        let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
+        if resuming
+            && req.cwd.is_none()
+            && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && let Some(ref store) = self.ctx.acp_session_store
+        {
+            let store_cloned = store.clone();
+            let sid = session_id.clone();
+            if let Ok(Ok(Some(data))) =
+                tokio::task::spawn_blocking(move || store_cloned.load_session(&sid)).await
+            {
+                preloaded_acp = Some(data);
+            }
+        }
+
+        // The session cwd: caller-supplied wins, then a resumed ACP session's
+        // persisted cwd, then the agent's workspace dir.
+        let cwd = req
+            .cwd
+            .clone()
+            .or_else(|| preloaded_acp.as_ref().map(|d| d.workspace_dir.clone()))
+            .unwrap_or_else(|| {
+                config
+                    .agent_workspace_dir(&req.agent_alias)
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        let cwd_path = Some(std::path::Path::new(&cwd));
         let tui_env = req
             .tui_id
             .as_deref()
@@ -684,12 +722,6 @@ impl RpcDispatcher {
         ));
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        let cwd = req.cwd.clone().unwrap_or_else(|| {
-            config
-                .agent_workspace_dir(&req.agent_alias)
-                .to_string_lossy()
-                .to_string()
-        });
         self.ctx
             .sessions
             .insert(
@@ -752,19 +784,24 @@ impl RpcDispatcher {
         let mut message_count = 0;
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
-                let Some(ref store) = self.ctx.acp_session_store else {
-                    self.ctx.sessions.remove(&session_id).await;
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        "ACP session store is not available",
-                    ));
-                };
+                // Reuse the data already loaded for cwd recovery on resume so the
+                // store isn't hit twice; otherwise fall through to the restore-
+                // aware load-or-create path below.
+                let loaded = if let Some(data) = preloaded_acp.take() {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                } else {
+                    let Some(ref store) = self.ctx.acp_session_store else {
+                        self.ctx.sessions.remove(&session_id).await;
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            "ACP session store is not available",
+                        ));
+                    };
 
-                let store_cloned = store.clone();
-                let sid = session_id.clone();
-                let alias = req.agent_alias.clone();
-                let cwd_owned = cwd.clone();
-                let loaded =
+                    let store_cloned = store.clone();
+                    let sid = session_id.clone();
+                    let alias = req.agent_alias.clone();
+                    let cwd_owned = cwd.clone();
                     tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
                         match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
@@ -779,7 +816,8 @@ impl RpcDispatcher {
                             }
                         }
                     })
-                    .await;
+                    .await
+                };
                 match loaded {
                     Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
                         message_count = data.messages.len();
@@ -3691,6 +3729,55 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
+        );
+    }
+
+    /// Resuming an ACP session with no caller cwd must recover the original
+    /// working directory from the persisted store, not fall back to the agent
+    /// workspace dir. Regression: a reconnect showed the wrong cwd because the
+    /// resume path defaulted the cwd instead of reading the retained session's.
+    #[tokio::test]
+    async fn acp_resume_recovers_persisted_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-cwd-resume-001";
+        let original_cwd = tmp.path().join("project-dir").to_string_lossy().to_string();
+
+        // First create the session with an explicit cwd.
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+                "cwd": original_cwd,
+            }))
+            .await
+            .expect("initial session/new should succeed");
+        assert_eq!(created["workspace_dir"], original_cwd);
+        assert_eq!(
+            acp_store.load_session(sid).unwrap().unwrap().workspace_dir,
+            original_cwd
+        );
+
+        // Resume with NO cwd: the daemon must report the persisted cwd, not the
+        // agent workspace dir.
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("resume session/new should succeed");
+        assert_eq!(
+            resumed["workspace_dir"], original_cwd,
+            "resume must keep the retained session's cwd, not default it"
         );
     }
 

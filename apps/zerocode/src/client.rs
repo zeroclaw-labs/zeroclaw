@@ -700,14 +700,6 @@ impl RpcClient {
         self.connection_state.lock().unwrap().clone()
     }
 
-    /// Returns `true` when the daemon connection is known to be dead.
-    pub fn is_disconnected(&self) -> bool {
-        matches!(
-            self.connection_state(),
-            ConnectionState::Disconnected { .. }
-        )
-    }
-
     // ── Notifications ─────────────────────────────────────────────
 
     /// Get a receiver for server-initiated notifications.
