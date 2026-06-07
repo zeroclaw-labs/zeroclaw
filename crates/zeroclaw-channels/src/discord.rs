@@ -1381,6 +1381,18 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
 /// satisfied; otherwise a Discord message that contained only an image,
 /// PDF, ZIP, video, or audio with no caption would never reach the
 /// media pipeline.
+/// Whether a Discord message `type` represents a real user turn the bot should
+/// act on, versus a system/auto message it must ignore.
+///
+/// Only `DEFAULT` (0) and `REPLY` (19) are conversational. Everything else is a
+/// system message: notably `THREAD_CREATED` (18) — posted in the parent channel
+/// when a thread is created — and `THREAD_STARTER_MESSAGE` (21), plus joins,
+/// pins, boosts, etc. Acting on `THREAD_CREATED` is what made the bot "respond
+/// to a thread's birth message".
+fn is_conversational_message_type(message_type: u64) -> bool {
+    matches!(message_type, 0 | 19)
+}
+
 fn admit_discord_message(
     content: &str,
     has_attachments: bool,
@@ -1881,6 +1893,20 @@ impl Channel for DiscordChannel {
                     let Some(d) = event.get("d") else {
                         continue;
                     };
+
+                    // Skip non-conversational system messages. Discord posts a
+                    // MESSAGE_CREATE of type 18 (THREAD_CREATED) in the parent
+                    // channel when a thread is born — authored by the human who
+                    // created it, with the thread name as content — which would
+                    // otherwise pass the admit gate and make the bot "reply" to
+                    // the thread's birth. Type 21 (THREAD_STARTER_MESSAGE), pins,
+                    // joins, etc. are likewise not user turns. Only DEFAULT (0)
+                    // and REPLY (19) are real messages to act on. Absent `type`
+                    // defaults to 0 for forward-compatibility.
+                    let message_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if !is_conversational_message_type(message_type) {
+                        continue;
+                    }
 
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
@@ -2849,6 +2875,19 @@ mod tests {
         assert!(contains_bot_mention("hi <@12345>", "12345"));
         assert!(contains_bot_mention("hi <@!12345>", "12345"));
         assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn thread_created_and_system_messages_are_not_conversational() {
+        // The bug: THREAD_CREATED (18) was treated as a normal message, so the
+        // bot replied to a thread's birth. It and other system types must be
+        // rejected; only DEFAULT (0) and REPLY (19) are real user turns.
+        assert!(is_conversational_message_type(0)); // DEFAULT
+        assert!(is_conversational_message_type(19)); // REPLY
+        assert!(!is_conversational_message_type(18)); // THREAD_CREATED
+        assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
+        assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
+        assert!(!is_conversational_message_type(7)); // USER_JOIN
     }
 
     #[test]
