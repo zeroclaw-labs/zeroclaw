@@ -1719,12 +1719,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     if first_row_h == 1 {
         let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
-        let label = crate::i18n::t("zc-chat-first-message-label");
         let msg = state.first_message.as_deref().unwrap_or_default();
-        let line = Line::from(vec![
-            Span::styled(format!("{label} "), theme::thought_style()),
-            Span::styled(msg.to_string(), theme::dim_style()),
-        ]);
+        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
         f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
     }
 

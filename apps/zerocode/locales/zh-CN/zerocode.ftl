@@ -261,7 +261,6 @@ zc-chat-thinking-visible = 思考输出：可见
 zc-chat-thinking-hidden = 思考输出：已隐藏
 zc-chat-label-you = 你：
 zc-chat-label-agent = 代理：
-zc-chat-first-message-label = 会话的第一条消息：
 zc-chat-loading-agents = 正在加载代理…
 zc-chat-loading-agents-msg = 正在加载代理...
 zc-chat-picker-header = 选择一个代理
