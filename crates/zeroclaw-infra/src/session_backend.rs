@@ -168,6 +168,15 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Quick existence check used by the gateway to avoid resurrecting a
+    /// session that the user just deleted (#7126). The default impl falls
+    /// back to `get_session_metadata`; production backends should override
+    /// with the cheapest query consistent with how `delete_session` decides
+    /// what to wipe (SQLite: a `SELECT 1` against `session_metadata`).
+    fn session_exists(&self, session_key: &str) -> bool {
+        self.get_session_metadata(session_key).is_some()
+    }
+
     /// Set or update the human-readable name for a session.
     fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
         Ok(())

@@ -10006,7 +10006,8 @@ pub struct CronJobDecl {
     /// Model override for agent jobs.
     #[serde(default)]
     pub model: Option<String>,
-    /// Allowlist of tool names for agent jobs.
+    /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
+    /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.
@@ -11226,6 +11227,7 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// Port to listen on for incoming webhooks.
     #[tab(Advanced)]
+    #[serde(default = "default_webhook_channel_port")]
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
     #[tab(Advanced)]
@@ -11269,6 +11271,10 @@ pub struct WebhookConfig {
     /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_max_delay_ms: Option<u64>,
+}
+
+fn default_webhook_channel_port() -> u16 {
+    8090
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -16497,6 +16503,30 @@ mod tests {
     use tokio::sync::MutexGuard;
     use tokio::test;
 
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array.entries"]
+    struct ObjectArraySecretEntry {
+        pub name: String,
+        #[secret]
+        pub token: Option<String>,
+        #[secret]
+        pub headers: HashMap<String, String>,
+    }
+
+    impl crate::config::HasPropKind for Vec<ObjectArraySecretEntry> {
+        const PROP_KIND: crate::config::PropKind = crate::config::PropKind::ObjectArray;
+
+        fn display_secret_terminals() -> Vec<&'static str> {
+            ObjectArraySecretEntry::secret_field_terminals()
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array"]
+    struct ObjectArraySecretFixture {
+        pub entries: Vec<ObjectArraySecretEntry>,
+    }
+
     // ── Tilde expansion ───────────────────────────────────────
 
     #[test]
@@ -18825,6 +18855,12 @@ bot_token = "xoxb-tok"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    #[test]
+    async fn webhook_config_port_defaults_when_omitted() {
+        let p: WebhookConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.port, 8090);
     }
 
     #[test]
@@ -23309,6 +23345,72 @@ allowed_users = []
                 || has_term("password")
                 || has_term("secret")
         })
+    }
+
+    #[test]
+    async fn object_array_prop_display_redacts_nested_secret_fields() {
+        let fixture = ObjectArraySecretFixture {
+            entries: vec![
+                ObjectArraySecretEntry {
+                    name: "primary".to_string(),
+                    token: Some("nested-token-credential".to_string()),
+                    headers: HashMap::from([
+                        (
+                            "Authorization".to_string(),
+                            "Bearer nested-header-credential".to_string(),
+                        ),
+                        ("X-Tenant".to_string(), "tenant-credential".to_string()),
+                    ]),
+                },
+                ObjectArraySecretEntry {
+                    name: "unset-secret".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+            ],
+        };
+
+        let display_value = fixture
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "test.object_array.entries")
+            .expect("object-array field should be surfaced")
+            .display_value;
+        let readback = fixture
+            .get_prop("test.object_array.entries")
+            .expect("object-array field should be readable");
+
+        for rendered in [&display_value, &readback] {
+            assert!(
+                !rendered.contains("nested-token-credential"),
+                "object-array display/readback must redact scalar nested secrets: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Bearer nested-header-credential"),
+                "object-array display/readback must redact nested secret map values: {rendered}"
+            );
+            assert!(
+                !rendered.contains("tenant-credential"),
+                "object-array display/readback must redact every value in nested secret maps: {rendered}"
+            );
+            assert!(
+                rendered.contains("primary"),
+                "non-secret object-array fields should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("unset-secret"),
+                "non-secret fields on entries with unset secrets should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("****"),
+                "redacted object-array output should show masked placeholders: {rendered}"
+            );
+        }
+
+        assert!(
+            display_value.contains(r#""token":null"#),
+            "JSON display should preserve unset optional secrets as null, not a populated mask: {display_value}"
+        );
     }
 
     #[test]
