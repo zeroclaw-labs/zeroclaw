@@ -199,7 +199,6 @@ zc-dashboard-help-next-tab = Next tab
 zc-dashboard-help-prev-tab = Previous tab
 zc-dashboard-help-jump-tab = Jump to tab
 zc-dashboard-help-refresh = Refresh now
-zc-dashboard-help-quit = Quit TUI
 zc-dashboard-help-this-help = This help
 zc-dashboard-help-apply-search = Apply search
 zc-dashboard-help-cancel-search = Cancel search
@@ -306,6 +305,20 @@ zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
 
+# Model picker slash commands
+zc-model-picker-hint = Type a model name after /model, or Tab to autocomplete.
+zc-model-provider-picker-hint = Type a model_provider after /model-provider, then pick a model with /model.
+zc-model-picker-title = Select model
+zc-model-provider-picker-title = Select model_provider
+zc-model-switch-applying = Applying model change…
+zc-model-switch-model-ok = Model switched to { $model }.
+zc-model-switch-provider-ok = model_provider switched to { $provider } (model: { $model }).
+zc-model-switch-failed = Model switch failed: { $error }
+zc-model-catalog-no-provider = Could not resolve this agent's model_provider from config.
+zc-model-catalog-empty = No models available for the active model_provider.
+zc-model-catalog-loading = Loading models…
+zc-model-provider-catalog-failed = Could not load model_providers: { $error }
+
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
 
@@ -319,7 +332,6 @@ zc-chat-help-select-agent = Select agent
 zc-chat-help-quit = Quit
 zc-chat-help-switch-session = Switch session
 zc-chat-help-close = Close
-zc-chat-help-submit-name = Submit name
 zc-chat-help-cancel = Cancel
 zc-chat-help-approve = Approve
 zc-chat-help-always-approve = Always approve
@@ -336,7 +348,6 @@ zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-toggle-thinking-cmd = Toggle thinking visibility
 zc-chat-help-new-session = New session
 zc-chat-help-session-list = Session list
-zc-chat-help-rename-session = Rename session
 
 zc-chat-approval-title = Approve tool call: { $tool }  [{ $secs }s]
 zc-chat-approval-action-allow = Allow
@@ -344,14 +355,12 @@ zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
 
-zc-chat-rename-prompt = New name:
-zc-chat-rename-action-submit = submit
-zc-chat-rename-action-cancel = cancel
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 
 zc-config-breadcrumb-root = Config
+zc-config-section-detail-hint = { $open } or { $into } to open this section
 zc-config-breadcrumb-new = New
 
 zc-config-personality-over-limit = Over { $limit } char limit — cannot save

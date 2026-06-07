@@ -156,7 +156,6 @@ keyactions! {
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
-        RenameSession           [Chord::ctrl('r')] => "rename session",
         DeleteSession           [] => "delete session",
         CancelTurn              [Chord::ctrl('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",
@@ -238,9 +237,10 @@ keyactions! {
 
 keyactions! {
     pub enum QuickstartTabAction ("quickstart") {
-        Up     [Chord::key(KeyCode::Up)] => "prev",
-        Down   [Chord::key(KeyCode::Down)] => "next",
+        Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter  [Chord::key(KeyCode::Enter)] => "open",
+        Back   [Chord::char('q'), Chord::key(KeyCode::Esc)] => "leave",
         Create [Chord::char('c'), Chord::char('C')] => "create agent",
     }
 }

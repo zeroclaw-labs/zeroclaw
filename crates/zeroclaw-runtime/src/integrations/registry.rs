@@ -236,6 +236,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let entries = all_integrations(&config);
@@ -261,6 +263,8 @@ mod tests {
             IMessageConfig {
                 enabled: true,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let entries = all_integrations(&config);
@@ -301,6 +305,8 @@ mod tests {
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let entries = all_integrations(&config);
