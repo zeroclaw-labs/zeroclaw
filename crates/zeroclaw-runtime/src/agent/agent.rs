@@ -25,6 +25,68 @@ use zeroclaw_tool_call_parser::strip_think_tags;
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+/// Build a fresh `ModelProvider` box for a dotted `<type>.<alias>` reference,
+/// resolving the model from the override (when supplied) or the configured
+/// entry. Mirrors the model_provider-construction path in [`Agent::from_config`]
+/// so a live session switch produces the same wiring a fresh agent would.
+/// Returns the built box plus the resolved `(model_provider_name, model_name)`
+/// for attribution.
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    let (model_provider_name, model_provider_alias) = model_provider_ref
+        .split_once('.')
+        .map(|(t, a)| (t.to_string(), a.to_string()))
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
+            ))
+        })?;
+
+    let entry = config
+        .providers
+        .models
+        .find(&model_provider_name, &model_provider_alias);
+    let model_name = model_override
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            entry
+                .and_then(|e| e.model.as_deref())
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider `{model_provider_ref}` has no `model` configured and no model \
+                 override was supplied"
+            ))
+        })?;
+
+    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        config,
+        &model_provider_name,
+        &model_provider_alias,
+    );
+
+    let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
+        config,
+        model_provider_ref,
+        entry.and_then(|e| e.api_key.as_deref()),
+        entry.and_then(|e| e.uri.as_deref()),
+        &config.reliability,
+        &config.model_routes,
+        &model_name,
+        &model_provider_runtime_options,
+    )?;
+
+    Ok((model_provider, model_provider_name, model_name))
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -823,6 +885,14 @@ impl Agent {
 
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
+    }
+
+    pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
+        self.model_provider = model_provider;
+    }
+
+    pub fn set_model_provider_name(&mut self, model_provider_name: String) {
+        self.model_provider_name = model_provider_name;
     }
 
     /// Return the names of all registered tools.  Test-only — avoids
@@ -3055,6 +3125,30 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::observability_traits::ObserverMetric;
+
+    #[test]
+    fn build_session_model_provider_rejects_undotted_ref() {
+        let config = Config::default();
+        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
+            Ok(_) => panic!("undotted ref must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("<type>.<alias>"), "got: {err}");
+    }
+
+    #[test]
+    fn build_session_model_provider_requires_a_model() {
+        // No configured entry and no override → cannot resolve a model name.
+        let config = Config::default();
+        let err = match build_session_model_provider(&config, "anthropic.default", None) {
+            Ok(_) => panic!("missing model must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("no `model` configured"),
+            "got: {err}"
+        );
+    }
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,

@@ -49,7 +49,6 @@ impl Chord {
     }
 
     /// `Ctrl+K` on most platforms; `⌘K` on darwin.
-    #[allow(dead_code)]
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         if self.modifiers.contains(KeyModifiers::CONTROL) {

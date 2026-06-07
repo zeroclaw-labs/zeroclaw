@@ -248,13 +248,30 @@ pub async fn run(
                     frame.area(),
                 );
             }
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
+            // The info bar appears as a dedicated row between the content and
+            // the status bar, only while the active pane has a message to show.
+            let info_message = match mode {
+                Mode::Chat => chat_pane.info_message().cloned(),
+                _ => None,
+            };
+            let has_info = info_message.is_some();
+            let constraints: Vec<Constraint> = if has_info {
+                vec![
+                    Constraint::Length(1), // mode bar
+                    Constraint::Min(0),    // content
+                    Constraint::Length(1), // info bar
+                    Constraint::Length(1), // status bar
+                ]
+            } else {
+                vec![
                     Constraint::Length(1), // mode bar
                     Constraint::Min(0),    // content
                     Constraint::Length(1), // status bar
-                ])
+                ]
+            };
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
                 .split(frame.area());
 
             bar_area = chunks[0];
@@ -270,6 +287,18 @@ pub async fn run(
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
             }
 
+            let status_idx = if has_info {
+                // Render the info bar in its own row above the status bar.
+                let info_area = chunks[2];
+                let bar = crate::widgets::InfoBar::new(info_message.as_ref());
+                if let Some(widget) = bar.widget(info_area.width as usize) {
+                    frame.render_widget(widget, info_area);
+                }
+                3
+            } else {
+                2
+            };
+
             let (ctx_input, ctx_max) = match mode {
                 Mode::Chat => chat_pane.ctx_tokens(),
                 Mode::Acp => acp_pane.ctx_tokens(),
@@ -277,7 +306,7 @@ pub async fn run(
             };
             draw_status_bar(
                 frame,
-                chunks[2],
+                chunks[status_idx],
                 &conn_state,
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
