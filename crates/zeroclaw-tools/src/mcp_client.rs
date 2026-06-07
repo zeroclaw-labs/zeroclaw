@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
-use crate::mcp_transport::{McpTransportConn, create_transport};
+use crate::mcp_transport::{McpTransportConn, McpTransportError, create_transport};
 use zeroclaw_config::schema::McpServerConfig;
 
 /// Timeout for receiving a response from an MCP server during init/list.
@@ -28,6 +28,56 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 
 /// Maximum allowed tool call timeout (seconds) — hard safety ceiling.
 const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Maximum automatic reconnect attempts on a stale session or dropped
+/// transport before the tool-call error is surfaced to the caller.
+const MAX_RECONNECT_ATTEMPTS: u32 = 2;
+
+/// Fixed backoff between reconnect attempts (milliseconds).
+const RECONNECT_BACKOFF_MS: u64 = 500;
+
+/// Perform the MCP `initialize` + `notifications/initialized` handshake on a
+/// transport. Shared by the initial [`McpServer::connect`] and the
+/// reconnect-after-stale-session path in [`McpServer::call_tool`].
+async fn handshake(transport: &mut dyn McpTransportConn, server_name: &str) -> Result<()> {
+    let init_req = JsonRpcRequest::new(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "zeroclaw",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+    );
+
+    let init_resp = timeout(
+        Duration::from_secs(RECV_TIMEOUT_SECS),
+        transport.send_and_recv(&init_req),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "MCP server `{server_name}` timed out after {RECV_TIMEOUT_SECS}s waiting for initialize response"
+        )
+    })??;
+
+    if init_resp.error.is_some() {
+        bail!(
+            "MCP server `{server_name}` rejected initialize: {:?}",
+            init_resp.error
+        );
+    }
+
+    // Notify the server the client is initialized (notifications expect no
+    // response). Best effort — ignore errors.
+    let notif = JsonRpcRequest::notification("notifications/initialized", json!({}));
+    let _ = transport.send_and_recv(&notif).await;
+
+    Ok(())
+}
 
 // ── Internal server state ──────────────────────────────────────────────────
 
@@ -60,46 +110,8 @@ impl McpServer {
             )
         })?;
 
-        // Initialize handshake
-        let id = 1u64;
-        let init_req = JsonRpcRequest::new(
-            id,
-            "initialize",
-            json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "zeroclaw",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        );
-
-        let init_resp = timeout(
-            Duration::from_secs(RECV_TIMEOUT_SECS),
-            transport.send_and_recv(&init_req),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "MCP server `{}` timed out after {}s waiting for initialize response",
-                config.name, RECV_TIMEOUT_SECS
-            )
-        })??;
-
-        if init_resp.error.is_some() {
-            bail!(
-                "MCP server `{}` rejected initialize: {:?}",
-                config.name,
-                init_resp.error
-            );
-        }
-
-        // Notify server that client is initialized (no response expected for notifications)
-        // For notifications, we send but don't wait for response
-        let notif = JsonRpcRequest::notification("notifications/initialized", json!({}));
-        // Best effort - ignore errors for notifications
-        let _ = transport.send_and_recv(&notif).await;
+        // Initialize handshake (initialize + initialized notification)
+        handshake(transport.as_mut(), &config.name).await?;
 
         // Fetch available tools
         let id = 2u64;
@@ -176,12 +188,6 @@ impl McpServer {
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let mut inner = self.inner.lock().await;
-        let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let req = JsonRpcRequest::new(
-            id,
-            "tools/call",
-            json!({ "name": tool_name, "arguments": arguments }),
-        );
 
         // Use per-server tool timeout if configured, otherwise default.
         // Cap at MAX_TOOL_TIMEOUT_SECS for safety.
@@ -191,34 +197,95 @@ impl McpServer {
             .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
             .min(MAX_TOOL_TIMEOUT_SECS);
 
-        let resp = timeout(
-            Duration::from_secs(tool_timeout),
-            inner.transport.send_and_recv(&req),
-        )
-        .await
-        .map_err(|_| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "mcp_server": &inner.config.name,
-                        "tool": tool_name,
-                        "timeout_secs": tool_timeout,
-                    })),
-                "mcp_client: tool call timed out"
+        // Bounded reconnect loop: a stale session (server restart) or a dropped
+        // transport (SSE stream EOF) is recovered by resetting the session and
+        // re-running the handshake, then retrying the call. Genuine tool errors
+        // (including `isError`) and timeouts are surfaced immediately and never
+        // retried.
+        let mut attempt = 0u32;
+        let resp = loop {
+            let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+            let req = JsonRpcRequest::new(
+                id,
+                "tools/call",
+                json!({ "name": tool_name, "arguments": arguments }),
             );
-            anyhow::Error::msg(format!(
-                "MCP server `{}` timed out after {}s during tool call `{tool_name}`",
-                inner.config.name, tool_timeout
-            ))
-        })?
-        .with_context(|| {
-            format!(
-                "MCP server `{}` error during tool call `{tool_name}`",
-                inner.config.name
+
+            let send_result = timeout(
+                Duration::from_secs(tool_timeout),
+                inner.transport.send_and_recv(&req),
             )
-        })?;
+            .await
+            .map_err(|_| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "mcp_server": &inner.config.name,
+                            "tool": tool_name,
+                            "timeout_secs": tool_timeout,
+                        })),
+                    "mcp_client: tool call timed out"
+                );
+                anyhow::Error::msg(format!(
+                    "MCP server `{}` timed out after {}s during tool call `{tool_name}`",
+                    inner.config.name, tool_timeout
+                ))
+            })?;
+
+            match send_result {
+                Ok(resp) => break resp,
+                Err(err) => {
+                    // Reconnect only on recoverable transport errors, within budget.
+                    let recoverable_reason = err
+                        .downcast_ref::<McpTransportError>()
+                        .map(|te| te.to_string());
+                    if let Some(reason) = recoverable_reason
+                        && attempt < MAX_RECONNECT_ATTEMPTS
+                    {
+                        attempt += 1;
+                        let server_name = inner.config.name.clone();
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reconnect
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "mcp_server": &server_name,
+                                "tool": tool_name,
+                                "attempt": attempt,
+                                "max_attempts": MAX_RECONNECT_ATTEMPTS,
+                                "reason": &reason,
+                            })),
+                            "mcp_client: reconnecting after transport error and retrying tool call"
+                        );
+                        tokio::time::sleep(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
+                        inner.transport.reset().await.with_context(|| {
+                            format!(
+                                "MCP server `{server_name}` failed to reset transport during reconnect"
+                            )
+                        })?;
+                        handshake(inner.transport.as_mut(), &server_name)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "MCP server `{server_name}` failed to re-handshake during reconnect"
+                                )
+                            })?;
+                        continue;
+                    }
+                    return Err(err).with_context(|| {
+                        format!(
+                            "MCP server `{}` error during tool call `{tool_name}`",
+                            inner.config.name
+                        )
+                    });
+                }
+            }
+        };
 
         if let Some(err) = resp.error {
             bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
@@ -724,5 +791,147 @@ done
             sleep(Duration::from_millis(20)).await;
         }
         panic!("stdio MCP child process {child_pid} survived after registry drop");
+    }
+
+    // ── Reconnect on stale session (streamable HTTP) ───────────────────────
+
+    fn http_server_config(uri: String) -> McpServerConfig {
+        McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(uri),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_reconnects_on_stale_session() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // initialize → 200 + session header. Hit twice: initial connect plus the
+        // reconnect that follows the stale-session error.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "echo", "description": "d", "inputSchema": {"type": "object"}}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // First tools/call → 404 (stale session). Highest priority, single use,
+        // so after it is exhausted the success mock below takes over.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Retried tools/call after reconnect → success.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 3, "result": {"ok": true}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let srv = McpServer::connect(http_server_config(server.uri()))
+            .await
+            .expect("connect");
+        let result = srv
+            .call_tool("echo", json!({}))
+            .await
+            .expect("call_tool should succeed after reconnect");
+        assert_eq!(result, json!({"ok": true}));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_tool_does_not_retry_on_tool_error() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // initialize is expected exactly once — a genuine tool error must NOT
+        // trigger a reconnect (which would re-run initialize).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "echo", "description": "d", "inputSchema": {"type": "object"}}]}
+            })))
+            .mount(&server)
+            .await;
+
+        // tools/call → JSON-RPC error body over HTTP 200 (a real tool failure).
+        // Expected exactly once: no retry.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 3, "error": {"code": -32000, "message": "boom"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let srv = McpServer::connect(http_server_config(server.uri()))
+            .await
+            .expect("connect");
+        let err = srv
+            .call_tool("echo", json!({}))
+            .await
+            .expect_err("tool error should surface");
+        assert!(err.to_string().contains("boom"), "got: {err}");
+        server.verify().await;
     }
 }
