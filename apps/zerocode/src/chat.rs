@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -83,9 +83,9 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
-    /// Background-fetched git branch updates: (session_id, branch).
-    git_branch_tx: mpsc::Sender<(String, Option<String>)>,
-    git_branch_rx: mpsc::Receiver<(String, Option<String>)>,
+    /// Background-fetched git status updates: (session_id, branch, hash).
+    git_branch_tx: mpsc::Sender<GitStatusUpdate>,
+    git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
     /// Background model-catalog fetch result, routed back so the Loading
@@ -94,6 +94,20 @@ pub(crate) struct Chat {
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
     phase: ChatPhase,
     pane_kind: PaneKind,
+    /// List rect of the agent picker, recorded each draw so mouse clicks in the
+    /// PickAgent phase can map a row to a selection. Default until first draw.
+    pick_agent_list_area: Rect,
+    /// Double-click tracker for the agent picker: a second click on the same row
+    /// confirms (enters the session), matching the keyboard Enter.
+    pick_agent_double_click: crate::mouse::DoubleClickTracker,
+}
+
+/// Result of one background `session/git_branch` poll, routed back to the UI
+/// thread over `git_branch_tx`.
+struct GitStatusUpdate {
+    session_id: String,
+    branch: Option<String>,
+    hash: Option<String>,
 }
 
 /// Result of a background model-catalog fetch, routed back so the Loading
@@ -129,6 +143,8 @@ impl Chat {
                 loading: true,
             },
             pane_kind,
+            pick_agent_list_area: Rect::default(),
+            pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
         }
     }
 
@@ -270,12 +286,13 @@ impl Chat {
     }
 
     fn drain_git_branch_results(&mut self) {
-        while let Ok((sid, branch)) = self.git_branch_rx.try_recv() {
+        while let Ok(update) = self.git_branch_rx.try_recv() {
             self.git_branch_inflight = false;
             if let ChatPhase::Active(ref mut state) = self.phase
-                && state.session_id == sid
+                && state.session_id == update.session_id
             {
-                state.git_branch = branch;
+                state.git_branch = update.branch;
+                state.git_hash = update.hash;
                 state.git_branch_last_fetch = Some(Instant::now());
             }
         }
@@ -312,12 +329,18 @@ impl Chat {
         let rpc = self.rpc.clone();
         let tx = self.git_branch_tx.clone();
         tokio::spawn(async move {
-            let branch = rpc
-                .session_git_branch(&sid)
-                .await
-                .ok()
-                .and_then(|r| r.branch);
-            let _ = tx.send((sid, branch)).await;
+            let result = rpc.session_git_branch(&sid).await.ok();
+            let (branch, hash) = match result {
+                Some(r) => (r.branch, r.hash),
+                None => (None, None),
+            };
+            let _ = tx
+                .send(GitStatusUpdate {
+                    session_id: sid,
+                    branch,
+                    hash,
+                })
+                .await;
         });
     }
 
@@ -335,7 +358,7 @@ impl Chat {
                 list_state,
                 loading,
             } => {
-                draw_agent_picker(
+                let list_area = draw_agent_picker(
                     frame,
                     area,
                     agents,
@@ -343,6 +366,7 @@ impl Chat {
                     *loading,
                     &self.pane_kind.name(),
                 );
+                self.pick_agent_list_area = list_area;
             }
             ChatPhase::PickCwd { explorer, .. } => {
                 explorer.render(frame, area);
@@ -573,19 +597,23 @@ impl Chat {
                             // Load persisted message history.
                             if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
                                 for m in msgs.messages {
-                                    match m.role.as_str() {
-                                        "user" => {
+                                    match m.role() {
+                                        crate::client::MessageRole::User => {
+                                            if state.first_message.is_none() {
+                                                state.first_message = Some(m.content.clone());
+                                            }
                                             state.entries.push(ChatEntry::UserMessage {
                                                 text: Some(Arc::<str>::from(m.content)),
                                                 attachments: vec![],
                                             });
                                         }
-                                        "assistant" => {
+                                        crate::client::MessageRole::Assistant => {
                                             state.entries.push(ChatEntry::AgentMessage(
                                                 Arc::<str>::from(m.content),
                                             ));
                                         }
-                                        _ => {}
+                                        crate::client::MessageRole::System
+                                        | crate::client::MessageRole::Other => {}
                                     }
                                 }
                                 state.mark_dirty_full(); // bulk session load
@@ -1205,10 +1233,47 @@ impl Chat {
         }
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+    pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
             explorer.handle_mouse(mouse);
+            return;
+        }
+
+        // Agent picker: click highlights a row, double-click confirms (enters
+        // the session), wheel moves the selection.
+        if matches!(self.phase, ChatPhase::PickAgent { loading: false, .. }) {
+            let mut confirm_alias: Option<String> = None;
+            if let ChatPhase::PickAgent {
+                agents, list_state, ..
+            } = &mut self.phase
+            {
+                let list_area = self.pick_agent_list_area;
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(idx) = mouse::list_click_index(
+                            mouse.row,
+                            list_area,
+                            list_state.offset(),
+                            agents.len(),
+                        ) {
+                            list_state.select(Some(idx));
+                            if self.pick_agent_double_click.click(mouse.column, mouse.row) {
+                                confirm_alias = agents.get(idx).cloned();
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(mouse::list_scroll(i, agents.len(), up, 1)));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(alias) = confirm_alias {
+                self.pick_or_start_session(&alias).await;
+            }
             return;
         }
 
@@ -1258,7 +1323,7 @@ impl Chat {
                 return;
             }
 
-            use crossterm::event::{KeyModifiers as KM, MouseButton};
+            use crossterm::event::KeyModifiers as KM;
             let col = mouse.column;
             let row = mouse.row;
             match mouse.kind {
@@ -1501,6 +1566,29 @@ impl crate::widgets::HelpContext for Chat {
 
 // ── Agent picker rendering ───────────────────────────────────────
 
+/// Build the agent-picker nav hint from the live keymap (browse up/down + the
+/// modal confirm chord), never hardcoded literals.
+fn picker_nav_keys() -> String {
+    use crate::keymap::{ChatTabAction, Chord, ModalAction, RebindableActions};
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |c: &Chord| {
+        let d = c.display();
+        if !parts.contains(&d) {
+            parts.push(d);
+        }
+    };
+    for c in ChatTabAction::BrowseUp.resolved() {
+        push(&c);
+    }
+    for c in ChatTabAction::BrowseDown.resolved() {
+        push(&c);
+    }
+    for c in ModalAction::Confirm.resolved() {
+        push(&c);
+    }
+    parts.join("/")
+}
+
 fn draw_agent_picker(
     frame: &mut Frame,
     area: Rect,
@@ -1508,7 +1596,7 @@ fn draw_agent_picker(
     list_state: &mut ListState,
     loading: bool,
     tab_title: &str,
-) {
+) -> Rect {
     let block = Block::default()
         .title(Span::styled(format!(" {tab_title} "), theme::title_style()))
         .borders(Borders::ALL)
@@ -1530,7 +1618,7 @@ fn draw_agent_picker(
             ])
             .split(inner);
         frame.render_widget(p, vert[1]);
-        return;
+        return Rect::default();
     }
 
     let chunks = Layout::default()
@@ -1548,7 +1636,10 @@ fn draw_agent_picker(
             theme::body_style(),
         ),
         Span::styled(
-            crate::i18n::t_args("zc-chat-picker-header-hint", &[("keys", "Up/Down, Enter")]),
+            crate::i18n::t_args(
+                "zc-chat-picker-header-hint",
+                &[("keys", &picker_nav_keys())],
+            ),
             theme::dim_style(),
         ),
     ]));
@@ -1560,6 +1651,15 @@ fn draw_agent_picker(
         .collect();
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
+    // The list rect is unbordered, but `mouse::list_click_index` assumes a
+    // 1-cell top border. Hand back a rect shifted up one row (and one taller) so
+    // the helper's border compensation lands on the true first item.
+    Rect::new(
+        chunks[1].x,
+        chunks[1].y.saturating_sub(1),
+        chunks[1].width,
+        chunks[1].height + 1,
+    )
 }
 
 // ── Error rendering ──────────────────────────────────────────────
@@ -1607,7 +1707,8 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
 
     // Optional CWD line just above the input bar (bottom of conv_area).
-    // Cwd left-aligned, optional git branch right-aligned.
+    // Renders `<cwd> - (branch) (hash)`, all left-aligned; the branch and hash
+    // segments are appended only when the daemon's git poll has resolved them.
     let actual_conv = if let Some(ref cwd) = state.cwd {
         if conv_area.height > 1 {
             let cwd_row = Rect::new(
@@ -1616,27 +1717,22 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 conv_area.width,
                 1,
             );
+            let mut line = format!(" {cwd}");
+            if state.git_branch.is_some() || state.git_hash.is_some() {
+                line.push_str(" -");
+                if let Some(ref branch) = state.git_branch {
+                    line.push_str(&format!(" ({branch})"));
+                }
+                if let Some(ref hash) = state.git_hash {
+                    line.push_str(&format!(" ({hash})"));
+                }
+            }
+            line.push(' ');
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {} ", cwd),
-                    theme::dim_style(),
-                )))
-                .alignment(Alignment::Left),
+                Paragraph::new(Line::from(Span::styled(line, theme::dim_style())))
+                    .alignment(Alignment::Left),
                 cwd_row,
             );
-            // Branch is right-aligned over the same row. Paragraph paints over
-            // the trailing cells; left-aligned cwd above paints first so the
-            // two don't fight unless they overlap (cwd narrower than row).
-            if let Some(ref branch) = state.git_branch {
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(" ({branch}) "),
-                        theme::dim_style(),
-                    )))
-                    .alignment(Alignment::Right),
-                    cwd_row,
-                );
-            }
             Rect::new(
                 conv_area.x,
                 conv_area.y,
@@ -1965,13 +2061,36 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         transient = true;
     }
 
-    let inner_height = area.height.saturating_sub(2);
+    // Reserve a pinned top row inside the panel for the session's first user
+    // message — a recovery reminder that stays put across scroll and reload.
+    let show_first = state
+        .first_message
+        .as_deref()
+        .is_some_and(|m| !m.is_empty());
+    let first_row_h: u16 = if show_first && area.height > 2 { 1 } else { 0 };
+
+    let inner_height = area.height.saturating_sub(2).saturating_sub(first_row_h);
 
     let block = theme::panel_block(&format!(" {} ", state.title()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    let p = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    if first_row_h == 1 {
+        let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
+        let msg = state.first_message.as_deref().unwrap_or_default();
+        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
+        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
+    }
+
+    // Conversation paragraph fills the inner area below the pinned row.
+    let body_area = Rect::new(
+        inner.x,
+        inner.y + first_row_h,
+        inner.width,
+        inner.height.saturating_sub(first_row_h),
+    );
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
 
     let total_rows = if transient {
         p.line_count(inner_width) as u16
@@ -1986,7 +2105,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     };
 
     let p = p.scroll((scroll, 0));
-    f.render_widget(p, area);
+    f.render_widget(p, body_area);
 
     state.last_total_rows = total_rows;
     state.last_inner_height = inner_height;
@@ -1994,8 +2113,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // Project each entry's line range into screen coords. Off-viewport
     // ranges get no rect.
-    let body_x = area.x + 1;
-    let body_y = area.y + 1;
+    let body_x = body_area.x;
+    let body_y = body_area.y;
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
@@ -2721,6 +2840,13 @@ pub struct ChatState {
     /// interval (`GIT_BRANCH_REFRESH_INTERVAL`). `None` means either "not a
     /// git repo" or "not fetched yet".
     pub git_branch: Option<String>,
+    /// First user message of the session, pulled from the persisted message
+    /// store. Shown as a pinned recovery row at the top of the panel so the
+    /// original ask stays visible across scroll and after a session reload.
+    pub first_message: Option<String>,
+    /// Cached short commit hash for `cwd`, refreshed alongside `git_branch`.
+    /// `None` means "not a git repo", "unborn branch", or "not fetched yet".
+    pub git_hash: Option<String>,
     /// Monotonic timestamp of the last completed `session/git_branch` reply,
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
@@ -2797,6 +2923,8 @@ impl ChatState {
             model: None,
             cwd: None,
             git_branch: None,
+            first_message: None,
+            git_hash: None,
             git_branch_last_fetch: None,
             input_bar: InputBarState::new(),
             entries: Vec::new(),
@@ -3332,6 +3460,12 @@ impl ChatState {
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        if self.first_message.is_none()
+            && let Some(ref t) = text
+            && !t.trim().is_empty()
+        {
+            self.first_message = Some(t.clone());
+        }
         self.entries.push(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
@@ -3367,6 +3501,8 @@ impl ChatState {
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
+        self.first_message = None;
+        self.git_hash = None;
         self.git_branch_last_fetch = None;
         // Context usage is per-session; clear so we don't show stale numbers
         // from the previous session before the first LLM call fires a new
@@ -3545,6 +3681,42 @@ mod tests {
             ));
         }
         assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
+    async fn agent_picker_click_selects_row() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            list_state,
+            loading: false,
+        };
+        // Stored rect is the draw's shifted form: list_click_index treats (y+1)
+        // as the first item. With y=1, first item maps to row 2.
+        chat.pick_agent_list_area = Rect::new(1, 1, 20, 6);
+        // Click the third item → row 2 + 2 = 4.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, Rect::new(0, 0, 40, 10)).await;
+        if let ChatPhase::PickAgent { list_state, .. } = &chat.phase {
+            assert_eq!(
+                list_state.selected(),
+                Some(2),
+                "click selects the clicked row"
+            );
+        } else {
+            panic!("expected PickAgent phase");
+        }
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
@@ -4051,5 +4223,44 @@ mod tests {
         // padding. The truncation rule collapses every column to `…`.
         let out = markdown_to_lines("| A |\n|---|\n| 1 |\n", 0);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn title_includes_short_session_hash() {
+        let s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        assert_eq!(s.title(), "personal_code  40be773");
+    }
+
+    #[test]
+    fn title_with_session_name_keeps_hash() {
+        let mut s = ChatState::new("40be7731122334455".to_string(), "personal_code".to_string());
+        s.session_name = Some("my work".to_string());
+        assert_eq!(s.title(), "personal_code  — my work  40be773");
+    }
+
+    #[test]
+    fn first_message_captures_first_user_message_only() {
+        let mut s = state();
+        assert!(s.first_message.is_none());
+        s.push_user_message(Some("the original ask".to_string()), Vec::new());
+        s.push_user_message(Some("a follow up".to_string()), Vec::new());
+        assert_eq!(s.first_message.as_deref(), Some("the original ask"));
+    }
+
+    #[test]
+    fn first_message_ignores_empty_text() {
+        let mut s = state();
+        s.push_user_message(Some("   ".to_string()), Vec::new());
+        assert!(s.first_message.is_none());
+        s.push_user_message(Some("real".to_string()), Vec::new());
+        assert_eq!(s.first_message.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn reset_for_session_clears_first_message() {
+        let mut s = state();
+        s.push_user_message(Some("ask".to_string()), Vec::new());
+        s.reset_for_session("sess-2".to_string(), None);
+        assert!(s.first_message.is_none());
     }
 }

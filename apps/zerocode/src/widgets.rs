@@ -15,7 +15,10 @@ pub struct HelpEntry {
 }
 
 impl HelpEntry {
-    pub fn new(keys: Vec<impl Into<String>>, action: impl Into<String>) -> Self {
+    pub fn new<K: Into<String>>(
+        keys: impl IntoIterator<Item = K>,
+        action: impl Into<String>,
+    ) -> Self {
         Self {
             keys: keys.into_iter().map(Into::into).collect(),
             action: action.into(),
@@ -35,6 +38,14 @@ impl HelpEntry {
         Self {
             keys: vec![],
             action: String::new(),
+        }
+    }
+
+    /// Keyless description row (no key column, just text).
+    pub fn desc(action: impl Into<String>) -> Self {
+        Self {
+            keys: vec![],
+            action: action.into(),
         }
     }
 

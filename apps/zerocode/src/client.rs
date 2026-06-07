@@ -86,6 +86,7 @@ pub mod method {
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
+    pub const SESSION_KILL: &str = "session/kill";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -1098,6 +1099,16 @@ impl RpcClient {
         .await
     }
 
+    pub async fn session_kill(&self, session_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .call(
+                method::SESSION_KILL,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn session_rename(
         &self,
         session_id: &str,
@@ -1689,6 +1700,8 @@ pub struct SessionConfigureResult {
 pub struct SessionGitBranchResult {
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1897,6 +1910,37 @@ pub struct SessionMessagesResult {
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+}
+
+impl MessageEntry {
+    /// Classify the wire `role` string into the closed set the UI renders.
+    /// Unknown roles map to [`MessageRole::Other`] so surfaces can fall back
+    /// without string-matching at the call site.
+    pub fn role(&self) -> MessageRole {
+        MessageRole::from_wire(&self.role)
+    }
+}
+
+/// Closed taxonomy of persisted message roles, as they arrive over the
+/// `session/messages` wire. The daemon emits these as strings; this is the
+/// single place that maps the wire form into a type the UI matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Other,
+}
+
+impl MessageRole {
+    fn from_wire(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "system" => Self::System,
+            _ => Self::Other,
+        }
+    }
 }
 
 // ── TUI identity types ───────────────────────────────────────────

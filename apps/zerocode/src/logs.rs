@@ -1249,14 +1249,11 @@ impl crate::widgets::HelpContext for Logs<'_> {
                 E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
                 E::key("?", crate::i18n::t("zc-logs-help-this-help")),
                 E::spacer(),
-                E::new(
-                    Vec::<String>::new(),
-                    format!(
-                        "{}: {}",
-                        crate::i18n::t("zc-logs-help-mouse-label"),
-                        crate::i18n::t("zc-logs-help-mouse-desc"),
-                    ),
-                ),
+                E::desc(format!(
+                    "{}: {}",
+                    crate::i18n::t("zc-logs-help-mouse-label"),
+                    crate::i18n::t("zc-logs-help-mouse-desc"),
+                )),
             ])
         }
     }
