@@ -33,10 +33,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{RwLock, broadcast};
+use zeroclaw_hardware::util::{serial_open_baud, should_open_serial_nonexclusive};
 
 const PTY_FIRMWARE_PATH: &str = "/tmp/zc-sim-firmware";
 const PTY_HOST_PATH: &str = "/tmp/zc-sim-esp32";
@@ -44,6 +46,8 @@ const PTY_HOST_PATH: &str = "/tmp/zc-sim-esp32";
 // docker-compose mapping `127.0.0.1:8080:8080` keeps the demo loopback-only.
 const HTTP_BIND: &str = "0.0.0.0:8080";
 const BAUD: u32 = 115_200;
+const PTY_OPEN_ATTEMPTS: usize = 50;
+const PTY_OPEN_MAX_RETRY_DELAY_MS: u64 = 250;
 const LED_PIN: u8 = 2;
 const SUPPORTED_PINS: &[u8] = &[2, 5, 12, 13, 14];
 
@@ -149,17 +153,24 @@ async fn main() -> Result<()> {
     let mut socat = spawn_socat().context(
         "failed to start socat (install with `brew install socat` or `apt install socat`)",
     )?;
-    eprintln!(
-        "socat pty pair ready (host={}, firmware={})",
-        PTY_HOST_PATH, PTY_FIRMWARE_PATH
-    );
 
     // 2. Set up shared state + broadcast channel.
     let (tx, _rx) = broadcast::channel::<Snapshot>(64);
     let state = AppState::new(tx);
 
     // 3. Open the firmware end of the pty.
-    let port = open_firmware_serial().await?;
+    let port = match open_firmware_serial().await {
+        Ok(port) => port,
+        Err(e) => {
+            let _ = socat.kill();
+            let _ = socat.wait();
+            return Err(e);
+        }
+    };
+    eprintln!(
+        "socat pty pair ready (host={}, firmware={})",
+        PTY_HOST_PATH, PTY_FIRMWARE_PATH
+    );
 
     // 4. Run the HTTP server and the pty event loop concurrently.
     let http_state = state.clone();
@@ -190,6 +201,7 @@ async fn main() -> Result<()> {
     }
 
     let _ = socat.kill();
+    let _ = socat.wait();
     Ok(())
 }
 
@@ -205,31 +217,129 @@ fn spawn_socat() -> Result<std::process::Child> {
             &format!("pty,raw,echo=0,link={PTY_HOST_PATH}"),
             &format!("pty,raw,echo=0,link={PTY_FIRMWARE_PATH}"),
         ])
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        // Let socat's diagnostic output (PTY device names, errors) go to the terminal.
+        // This helps debug pty creation issues on macOS.
+        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
         .spawn()?;
     Ok(child)
 }
 
 async fn open_firmware_serial() -> Result<tokio_serial::SerialStream> {
     use tokio_serial::SerialPortBuilderExt;
-    // Wait for socat to create the symlink (it takes ~50ms in practice).
-    for attempt in 0..40 {
-        if std::path::Path::new(PTY_FIRMWARE_PATH).exists() {
-            break;
+
+    let mut announced_paths = false;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=PTY_OPEN_ATTEMPTS {
+        let host_path = match resolve_pty_slave_path(PTY_HOST_PATH) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                last_err = Some(anyhow::Error::msg(format!(
+                    "socat has not created {PTY_HOST_PATH} yet"
+                )));
+                sleep_before_pty_open_retry(attempt).await;
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                sleep_before_pty_open_retry(attempt).await;
+                continue;
+            }
+        };
+
+        let firmware_path = match resolve_pty_slave_path(PTY_FIRMWARE_PATH) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                last_err = Some(anyhow::Error::msg(format!(
+                    "socat has not created {PTY_FIRMWARE_PATH} yet"
+                )));
+                sleep_before_pty_open_retry(attempt).await;
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                sleep_before_pty_open_retry(attempt).await;
+                continue;
+            }
+        };
+
+        if !announced_paths {
+            eprintln!(
+                "socat pty pair resolved (host={} -> {}, firmware={} -> {})",
+                PTY_HOST_PATH,
+                host_path.display(),
+                PTY_FIRMWARE_PATH,
+                firmware_path.display()
+            );
+            announced_paths = true;
         }
-        if attempt == 39 {
-            return Err(anyhow::Error::msg(format!(
-                "socat did not create {} within 2s",
-                PTY_FIRMWARE_PATH
-            )));
+
+        let mut builder =
+            tokio_serial::new(PTY_FIRMWARE_PATH, serial_open_baud(PTY_FIRMWARE_PATH, BAUD));
+        if should_open_serial_nonexclusive(PTY_FIRMWARE_PATH) {
+            builder = builder.exclusive(false);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        match builder.open_native_async() {
+            Ok(port) => return Ok(port),
+            Err(e) => {
+                last_err = Some(anyhow::Error::new(e).context(format!(
+                    "open attempt {attempt} for {PTY_FIRMWARE_PATH} -> {}",
+                    firmware_path.display()
+                )));
+                sleep_before_pty_open_retry(attempt).await;
+            }
+        }
     }
-    let port = tokio_serial::new(PTY_FIRMWARE_PATH, BAUD)
-        .open_native_async()
-        .with_context(|| format!("failed to open {PTY_FIRMWARE_PATH}"))?;
-    Ok(port)
+
+    Err(last_err
+        .unwrap_or_else(|| anyhow::Error::msg("unknown open error after retries"))
+        .context(format!(
+            "failed to open firmware pty after {PTY_OPEN_ATTEMPTS} attempts"
+        )))
+}
+
+fn resolve_pty_slave_path(link: &str) -> Result<Option<PathBuf>> {
+    let link_path = Path::new(link);
+    let metadata = match std::fs::symlink_metadata(link_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("failed to inspect {link}")),
+    };
+    if !metadata.file_type().is_symlink() {
+        anyhow::bail!("{link} exists but is not a symlink to a pty slave");
+    }
+
+    let target = std::fs::canonicalize(link_path)
+        .with_context(|| format!("failed to resolve pty symlink {link}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        let target_metadata = std::fs::metadata(&target)
+            .with_context(|| format!("failed to inspect pty target {}", target.display()))?;
+        if !target_metadata.file_type().is_char_device() {
+            anyhow::bail!(
+                "{link} resolves to {}, which is not a character device",
+                target.display()
+            );
+        }
+    }
+
+    Ok(Some(target))
+}
+
+async fn sleep_before_pty_open_retry(attempt: usize) {
+    if attempt < PTY_OPEN_ATTEMPTS {
+        tokio::time::sleep(pty_open_retry_delay(attempt)).await;
+    }
+}
+
+fn pty_open_retry_delay(attempt: usize) -> Duration {
+    let attempt = u64::try_from(attempt).unwrap_or(u64::MAX);
+    let delay_ms = (25 * attempt).clamp(50, PTY_OPEN_MAX_RETRY_DELAY_MS);
+    Duration::from_millis(delay_ms)
 }
 
 async fn run_pty_loop(port: tokio_serial::SerialStream, state: AppState) -> Result<()> {

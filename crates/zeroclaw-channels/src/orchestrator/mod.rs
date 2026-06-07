@@ -1196,8 +1196,8 @@ async fn load_runtime_config_and_provider(
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut parsed: Config =
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
+    let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
+        .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
 
     if let Some(zeroclaw_dir) = path.parent() {
@@ -1205,6 +1205,9 @@ async fn load_runtime_config_and_provider(
             zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         parsed.decrypt_secrets(&store)?;
     }
+    let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
+    parsed.env_overridden_paths = applied.paths;
+    parsed.pre_override_snapshots = applied.snapshots;
 
     let resolved = resolved_runtime_provider(&parsed, model_provider)?;
     Ok((parsed, resolved))
@@ -8952,6 +8955,49 @@ mod tests {
             "expected `zeroclaw quickstart` reference, got: {msg}"
         );
     }
+
+    #[tokio::test]
+    async fn channel_runtime_reload_applies_env_overrides_after_migration() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "openrouter"
+
+[agents.demo]
+provider = "openrouter"
+model = "meta-llama/llama-3.1-8b-instruct"
+temperature = 0.3
+"#,
+        )
+        .unwrap();
+
+        let env_name = "ZEROCLAW_providers__models__openrouter__agent_demo__api_key";
+        // SAFETY: this test owns this specific env-var key and restores it
+        // before returning. The value is synthetic and not a real credential.
+        unsafe { std::env::set_var(env_name, "sk-or-v1-test-channel-reload") };
+
+        let result = load_runtime_config_and_defaults(&config_path, "openrouter.agent_demo").await;
+
+        // SAFETY: undo the test-only process env mutation above.
+        unsafe { std::env::remove_var(env_name) };
+
+        let (config, defaults) = result.unwrap();
+        assert_eq!(
+            defaults.api_key.as_deref(),
+            Some("sk-or-v1-test-channel-reload")
+        );
+        assert!(
+            config
+                .env_overridden_paths
+                .contains("providers.models.openrouter.agent_demo.api_key")
+        );
+    }
+
     use zeroclaw_runtime::observability::NoopObserver;
     use zeroclaw_runtime::tools::{Tool, ToolResult};
 

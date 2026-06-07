@@ -64,7 +64,13 @@ enabled = false
 # ─── Safety ────────────────────────────────────────────────────────────────
 [autonomy]
 max_actions_per_hour = 60
-# Smart-room named devices + raw gpio fallbacks + capabilities
+# Expose only smart-room named devices + raw gpio fallbacks + capabilities.
+# `auto_approve` controls approval prompts; `allowed_tools` controls which tools
+# the model can see/call at all.
+allowed_tools = [
+    "set_device", "read_device",
+    "gpio_write", "gpio_read", "hardware_capabilities"
+]
 auto_approve = [
     "set_device", "read_device",
     "gpio_write", "gpio_read", "hardware_capabilities"
@@ -76,13 +82,13 @@ provider = "openrouter"
 model = "meta-llama/llama-3.1-8b-instruct"  # Good balance for tool use; swap for a stronger model on OpenRouter as needed (e.g. sonnet, gpt-4o, etc.)
 temperature = 0.3
 
-# ─── Telegram channel for end-to-end test (message the bot to talk to the agent) ─
+# ─── Telegram channel for host-mode end-to-end test ────────────────────────
 # Set TELEGRAM_BOT_TOKEN in demo/.env (get from @BotFather).
-# After copying config, the run script will substitute if present.
+# The host run script injects it via ZEROCLAW_channels__telegram__default__bot_token
+# at runtime so the secret does not need to live in this TOML.
 # For testing, receive all messages from the bot chat (adjust as needed for your setup).
 [channels_config.telegram]
 enabled = true
 bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 mention_only = false
 stream_mode = "partial"
-

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Switch the running container from sim-only mode (default CMD) to daemon mode
-# so the Telegram channel orchestrator runs alongside the simulator.
+# Switch the running container from sim-only mode (default CMD) to daemon mode.
 #
 # Daemon mode wires the channel orchestrator → agent loop → gpio peripheral.
-# Messages from Telegram → agent → tool calls → simulator → frontend updates.
+# This Docker image is intentionally simulator/local-chat focused; use
+# run-agent-host.sh for the Telegram channel demo.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -25,7 +25,7 @@ for i in {1..40}; do
 done
 
 echo "Starting zeroclaw daemon inside the demo container..."
-echo "This enables the Telegram channel (if configured) alongside the simulator."
+echo "This Docker image does not include the Telegram channel; use ./demo/run-agent-host.sh for Telegram."
 echo "Press Ctrl-C to stop the daemon. The simulator will keep running."
 echo
 echo "Note: shell scripts in demo/ are English-only (demo harness)."

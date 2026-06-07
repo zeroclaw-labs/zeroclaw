@@ -4214,6 +4214,13 @@ async fn main() -> Result<()> {
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
+                #[cfg(feature = "hardware")]
+                zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                    Box::pin(async move {
+                        zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                    })
+                }));
+
                 let cancel = tokio_util::sync::CancellationToken::new();
                 Box::pin(channels::start_channels(config, None, cancel)).await
             }

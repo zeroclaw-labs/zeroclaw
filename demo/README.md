@@ -1,7 +1,9 @@
 # ZeroClaw ESP32 Smart Room Demo
 
 Simulated ESP32 + ZeroClaw agent + browser visualization. Hardware-free.
-Runs entirely inside a Docker container — nothing executes on the host.
+The Docker path runs the simulator plus an in-container interactive agent. The
+recommended Telegram path runs the simulator and channel agent directly on the
+host to keep the setup light and explicit.
 
 ## Architecture
 
@@ -30,7 +32,8 @@ and `/dev/pts` namespace (necessary for pty handoff).
 The agent's tool surface is heavily constrained (see `zeroclaw.toml.example`):
 only the smartroom tools (`set_device` / `read_device`) plus raw `gpio_*` and
 `hardware_capabilities` are available. All other surfaces (shell, browser,
-web search, MCP, etc.) are disabled. The container provides defence in depth.
+web search, MCP, etc.) are disabled. For the Docker path, the container
+provides defence in depth around the simulator and local interactive chat.
 
 ## Low-storage / MacBook Air development path (recommended for limited disk)
 
@@ -50,18 +53,18 @@ brew install socat
 mkdir -p demo/data/config
 cp -n demo/zeroclaw.toml.example demo/data/config/config.toml || true
 
-# 4. (Optional but for Telegram test) Edit the copied config to set your real bot_token if not using the run script substitution, or set TELEGRAM_BOT_TOKEN in .env (the host script will substitute).
+# 4. Keep secrets in demo/.env. The host script injects them at runtime and does not persist them into config.toml.
 
 # 5. Terminal 1 – start simulator + visualizer
 ./demo/run-sim-host.sh
 
 # Wait for "frontend ready: http://127.0.0.1:8080", then open the URL. You should see the simulated room (lamps, fan, motion sensor etc.).
 
-# 6. Terminal 2 – start the agent (it will connect to Telegram if token configured)
+# 6. Terminal 2 – start the channel agent (it will poll Telegram if token configured)
 ./demo/run-agent-host.sh
 ```
 
-Then, from your Telegram (chat with the bot you created with the token), paste the system primer from `demo/PROMPTS.md` and use natural language exactly as in the prompts (e.g. "It's getting dark and chilly. I'm settling in to read for an hour.") 
+The agent terminal prints a one-time Telegram bind code. From your Telegram chat with the bot, send `/bind <code>` first. After the bot confirms binding, paste the system primer from `demo/PROMPTS.md` and use natural language exactly as in the prompts (e.g. "It's getting dark and chilly. I'm settling in to read for an hour.")
 
 The agent should use the smartroom tools, the commands go over the pty to the sim, and you see the visualizer update live.
 
@@ -69,17 +72,19 @@ This gives you the full functional vignette (smartroom tools → pty → simulat
 
 ## Packaged demo (Docker) – requires decent disk
 
-Use this path when you want the one-command "everything in a container" experience for demos or sharing.
+Use this path when you want the one-command simulator plus local interactive
+agent experience in a container. It does not include the Telegram channel; use
+the host path above for Telegram.
 
 **Requirements**
 - Docker Desktop with **at least 60-80 GB** allocated to the disk image (see Settings → Resources)
-- An OpenRouter key (for the LLM) + optional Telegram bot token for comms test
+- An OpenRouter key for the LLM
 
 **One-time setup**
 
 ```bash
 cp demo/.env.template demo/.env
-$EDITOR demo/.env   # set OPENROUTER_API_KEY (and TELEGRAM_BOT_TOKEN for test)
+$EDITOR demo/.env   # set OPENROUTER_API_KEY
 ```
 
 **Build (heavy first time)**
@@ -143,7 +148,7 @@ demo/
 ├── .gitignore
 ├── run-sim.sh           ← `docker compose up`
 ├── run-zeroclaw.sh      ← interactive agent inside container
-└── run-daemon.sh        ← optional full daemon + Telegram path
+└── run-daemon.sh        ← optional Docker daemon path, without Telegram
 ```
 
 The simulator binary and visualizer live in:
@@ -173,6 +178,11 @@ in Settings → Resources. The hardware-feature build needs ~3GB peak.
 `board = "esp32-sim"` (or `"esp32"`) under `[peripherals.boards]`. The smartroom
 tools are only registered for those board types.
 
+**Telegram shows tool approval prompts for normal chat** — check that
+`risk_profiles.default.allowed_tools` only lists the smartroom tools. An empty
+allowlist exposes every registered built-in tool to the model, including
+session/admin tools that are not part of this demo.
+
 ## Quick start (recommended)
 
 ```bash
@@ -197,5 +207,5 @@ The browser visualizer is at http://127.0.0.1:8080.
 - All shell scripts in `demo/` are intentionally English-only (demo material).
 - This harness exercises the full peripheral + dev-sim + smartroom path from the
   split PRs. It is not intended as a production template.
-- For the original Telegram end-to-end path, see `run-daemon.sh` and configure
-  a channel in the mounted config (advanced).
+- For Telegram end-to-end testing, use `run-agent-host.sh`; it builds with the
+  `channel-telegram` feature and runs the channel orchestrator directly.
