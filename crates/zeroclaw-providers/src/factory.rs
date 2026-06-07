@@ -150,6 +150,32 @@ pub fn apply_compat_options(
     Box::new(p)
 }
 
+/// Build an `OpenAiResponsesModelProvider` from the per-alias runtime options,
+/// applying the same `max_tokens` / `reasoning_effort` overrides every family
+/// that speaks the responses wire shares. Returns `None` unless `wire_api`
+/// selects the responses protocol, so a caller can route with a single
+/// `if let Some(p) = build_responses_provider_if_requested(..)` and fall
+/// through to its chat-completions build otherwise.
+fn build_responses_provider_if_requested(
+    wire_api: Option<zeroclaw_config::schema::WireApi>,
+    alias: &str,
+    base_url: Option<&str>,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> Option<Box<dyn ModelProvider>> {
+    if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
+        return None;
+    }
+    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key);
+    if let Some(mt) = opts.provider_max_tokens {
+        p = p.with_max_tokens(Some(mt));
+    }
+    if let Some(ref effort) = opts.reasoning_effort {
+        p = p.with_reasoning_effort(Some(effort.clone()));
+    }
+    Some(Box::new(p))
+}
+
 pub(crate) fn build_kimi_code_compat(
     alias: &str,
     key: Option<&str>,
@@ -715,15 +741,10 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
             ));
         }
         // Responses wire protocol with standard API key — full streaming tool calls.
-        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
-            let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, api_url, key);
-            if let Some(mt) = opts.provider_max_tokens {
-                p = p.with_max_tokens(Some(mt));
-            }
-            if let Some(ref effort) = opts.reasoning_effort {
-                p = p.with_reasoning_effort(Some(effort.clone()));
-            }
-            return Ok(Box::new(p));
+        if let Some(p) =
+            build_responses_provider_if_requested(self.base.wire_api, alias, api_url, key, opts)
+        {
+            return Ok(p);
         }
         // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
@@ -1095,19 +1116,14 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("llama.cpp");
-        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
-            let mut p = crate::openai::OpenAiResponsesModelProvider::new(
-                alias,
-                Some(base_url),
-                Some(llama_cpp_key),
-            );
-            if let Some(mt) = opts.provider_max_tokens {
-                p = p.with_max_tokens(Some(mt));
-            }
-            if let Some(ref effort) = opts.reasoning_effort {
-                p = p.with_reasoning_effort(Some(effort.clone()));
-            }
-            return Ok(Box::new(p));
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            Some(base_url),
+            Some(llama_cpp_key),
+            opts,
+        ) {
+            return Ok(p);
         }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
@@ -1189,16 +1205,14 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
                  `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
-        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
-            let mut p =
-                crate::openai::OpenAiResponsesModelProvider::new(alias, Some(base_url), key);
-            if let Some(mt) = opts.provider_max_tokens {
-                p = p.with_max_tokens(Some(mt));
-            }
-            if let Some(ref effort) = opts.reasoning_effort {
-                p = p.with_reasoning_effort(Some(effort.clone()));
-            }
-            return Ok(Box::new(p));
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            Some(base_url),
+            key,
+            opts,
+        ) {
+            return Ok(p);
         }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
@@ -1229,16 +1243,10 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
                  `[model_providers.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
-        if self.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
-            let mut p =
-                crate::openai::OpenAiResponsesModelProvider::new(alias, Some(base_url), key);
-            if let Some(mt) = opts.provider_max_tokens {
-                p = p.with_max_tokens(Some(mt));
-            }
-            if let Some(ref effort) = opts.reasoning_effort {
-                p = p.with_reasoning_effort(Some(effort.clone()));
-            }
-            return Ok(Box::new(p));
+        if let Some(p) =
+            build_responses_provider_if_requested(self.wire_api, alias, Some(base_url), key, opts)
+        {
+            return Ok(p);
         }
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,

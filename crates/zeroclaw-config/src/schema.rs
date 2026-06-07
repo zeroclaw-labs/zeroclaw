@@ -14588,7 +14588,26 @@ impl Config {
     /// Adding a new warning: append a check here, pick a stable `code`,
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
-        Vec::new()
+        let mut warnings = Vec::new();
+        // `wire_api` is only honored by bring-your-own-endpoint families; on a
+        // branded family with a fixed wire protocol it is silently ignored.
+        // Surface that so an operator who sets it on, e.g., `mistral` learns it
+        // has no effect instead of debugging unexpected runtime behavior.
+        for (family, alias, entry) in self.providers.models.iter_entries() {
+            if entry.wire_api.is_some() && !crate::provider_aliases::family_honors_wire_api(family)
+            {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "wire_api_not_supported_for_family",
+                    format!(
+                        "wire_api is set on `{family}.{alias}` but the `{family}` family has a \
+                         fixed wire protocol and ignores it. wire_api only takes effect on the \
+                         openai, llamacpp, and custom (openai-compatible) families."
+                    ),
+                    format!("providers.models.{family}.{alias}.wire_api"),
+                ));
+            }
+        }
+        warnings
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -20686,6 +20705,35 @@ group_policy = "disabled"
         assert_eq!(
             hardened_mode, 0o600,
             "Saving config should restore owner-only permissions (0600)"
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
+        let mut config = Config::default();
+        // mistral has a fixed wire protocol and ignores wire_api.
+        config
+            .providers
+            .models
+            .ensure("mistral", "primary")
+            .unwrap()
+            .wire_api = Some(WireApi::Responses);
+        // custom honors wire_api — must NOT warn.
+        config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .unwrap()
+            .wire_api = Some(WireApi::Responses);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1, "exactly the mistral entry should warn");
+        let w = &warnings[0];
+        assert_eq!(w.code, "wire_api_not_supported_for_family");
+        assert_eq!(w.path, "providers.models.mistral.primary.wire_api");
+        assert!(
+            !warnings.iter().any(|w| w.path.contains("custom.vllm")),
+            "custom honors wire_api and must not warn",
         );
     }
 
