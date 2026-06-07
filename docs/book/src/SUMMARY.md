@@ -4,7 +4,7 @@
 - [Philosophy](./philosophy.md)
 
 - [Getting Started](./getting-started/index.md)
-  - [Quick start](./getting-started/quick-start.md)
+  - [Quickstart](./getting-started/quickstart.md)
   - [YOLO mode](./getting-started/yolo.md)
   - [Multi-model setup](./getting-started/multi-model-setup.md)
   - [zerocode](./getting-started/tui.md)

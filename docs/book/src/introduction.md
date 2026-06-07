@@ -10,7 +10,7 @@ This site is the documentation. Everything under **Reference → CLI** and **Ref
 
 ## Where to start
 
-- New to ZeroClaw? → [Quick start](./getting-started/quick-start.md)
+- New to ZeroClaw? → [Quickstart](./getting-started/quickstart.md)
 - Just want it running fast without safety prompts? → [YOLO mode](./getting-started/yolo.md)
 - Installing on a specific platform? → [Linux](./setup/linux.md) · [macOS](./setup/macos.md) · [Windows](./setup/windows.md) · [Docker](./setup/container.md)
 - Understanding the architecture? → [Architecture overview](./architecture/overview.md)

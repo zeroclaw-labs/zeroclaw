@@ -380,5 +380,5 @@ rm -rf ~/.zeroclaw        # optional — deletes config + history
 
 - [Service management](./service.md) — how the first-party backends work on other platforms
 - [Reference → Config](../reference/config.md) — config file layout
-- [Quick start](../getting-started/quick-start.md) — first conversation
+- [Quickstart](../getting-started/quickstart.md) — first conversation
 - [Operations → Overview](../ops/overview.md) — running in production
