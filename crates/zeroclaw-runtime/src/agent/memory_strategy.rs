@@ -43,6 +43,19 @@ impl DefaultMemoryStrategy {
     ) -> Self {
         Self::new(memory, memory_config, workspace_dir)
     }
+
+    /// Build a strategy using the effective per-agent recall limit resolved by
+    /// the caller while preserving the rest of the live memory configuration.
+    pub fn with_config_and_limit(
+        memory: Arc<dyn Memory>,
+        memory_config: zeroclaw_config::schema::MemoryConfig,
+        workspace_dir: impl Into<std::path::PathBuf>,
+        limit: usize,
+    ) -> Self {
+        let mut strategy = Self::new(memory, memory_config, workspace_dir);
+        strategy.limit = limit.max(1);
+        strategy
+    }
 }
 
 #[async_trait::async_trait]

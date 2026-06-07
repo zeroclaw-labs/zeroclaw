@@ -102,6 +102,12 @@ pub struct Config {
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
     pub dirty_paths: std::collections::HashSet<String>,
+    /// Security-critical sections the resilient loader reset to `Default`
+    /// because the on-disk block was malformed. Non-empty = posture may be
+    /// weaker than intended; exposure gating should refuse to trust the
+    /// instance until repaired. Never serialized — a load-time signal.
+    #[serde(skip)]
+    pub degraded_security: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -119,11 +125,13 @@ pub struct Config {
     /// Model-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "requires_follow_up"]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos for embedding requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "requires_follow_up"]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Observability backend configuration (`[observability]`).
@@ -665,6 +673,7 @@ pub enum AuthMode {
 pub struct ModelProviderConfig {
     /// Secret API token for this model_provider — grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -696,6 +705,8 @@ pub struct ModelProviderConfig {
     /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
     /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider — only override if you're forcing an unusual combination.
     #[tab(Advanced)]
@@ -704,6 +715,7 @@ pub struct ModelProviderConfig {
     /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "is_false")]
+    #[credential_class = "external_auth_store"]
     pub requires_openai_auth: bool,
     /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[tab(Model)]
@@ -3674,6 +3686,7 @@ pub struct TranscriptionConfig {
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Whisper API endpoint URL (Groq transcription provider).
@@ -3690,6 +3703,11 @@ pub struct TranscriptionConfig {
     /// Whisper API request.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Optional global audio size upper bound in bytes, enforced before
+    /// dispatching to any transcription provider. Provider-specific caps still
+    /// apply.
+    #[serde(default)]
+    pub max_audio_bytes: Option<usize>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -3728,6 +3746,7 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: default_transcription_max_duration_secs(),
             openai: None,
             deepgram: None,
@@ -3780,6 +3799,8 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     /// Optional environment variables for stdio transport.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub env: HashMap<String, String>,
     /// Optional HTTP headers for HTTP/SSE transports. Treated as secret —
     /// the values commonly carry Bearer tokens for the upstream MCP server.
@@ -3880,6 +3901,9 @@ pub struct NodesConfig {
     pub max_nodes: usize,
     /// Optional bearer token for node authentication.
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_token: Option<String>,
 }
 
@@ -3958,6 +3982,7 @@ impl Default for TtsConfig {
 pub struct TtsProviderConfig {
     /// API key (openai, elevenlabs, google).
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Model name. OpenAI uses this for `tts-1`/`tts-1-hd`; elevenlabs uses
@@ -4142,6 +4167,7 @@ pub struct TranscriptionProviderConfig {
     /// API key for the transcription provider.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Optional language hint passed to the provider (ISO-639-1 like `"en"` /
@@ -4321,6 +4347,7 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// local endpoints.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
     /// Optional language hint (passed through to the local endpoint).
@@ -4393,6 +4420,7 @@ pub struct OpenAiSttConfig {
     /// OpenAI API key for Whisper transcription.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Whisper model name (default: "whisper-1").
@@ -4408,6 +4436,7 @@ pub struct DeepgramSttConfig {
     /// Deepgram API key.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Deepgram model name (default: "nova-2").
@@ -4423,6 +4452,7 @@ pub struct AssemblyAiSttConfig {
     /// AssemblyAI API key.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
@@ -4435,6 +4465,7 @@ pub struct GoogleSttConfig {
     /// Google Cloud API key.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// BCP-47 language code (default: "en-US").
@@ -4455,6 +4486,7 @@ pub struct LocalWhisperConfig {
     /// Omit for unauthenticated local endpoints.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
@@ -5275,6 +5307,7 @@ pub struct GatewayConfig {
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub paired_tokens: Vec<String>,
 
@@ -5289,6 +5322,7 @@ pub struct GatewayConfig {
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
+    #[credential_class = "public_value"]
     pub trust_forwarded_headers: bool,
 
     /// Optional URL path prefix for reverse-proxy deployments.
@@ -5572,6 +5606,9 @@ pub struct NodeTransportConfig {
     pub enabled: bool,
     /// Shared secret for HMAC authentication between nodes.
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub shared_secret: String,
     /// Maximum age of signed requests in seconds (replay protection).
     #[serde(default = "default_max_request_age")]
@@ -5640,6 +5677,7 @@ pub struct ComposioConfig {
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Default entity ID for multi-user setups
@@ -5683,6 +5721,7 @@ pub struct Microsoft365Config {
     /// Azure AD client secret (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_secret: Option<String>,
     /// Authentication flow: "client_credentials" or "device_code"
@@ -5746,6 +5785,7 @@ impl Default for Microsoft365Config {
 pub struct SecretsConfig {
     /// Enable encryption for API keys and tokens in config.toml
     #[serde(default = "default_true")]
+    #[credential_class = "public_value"]
     pub encrypt: bool,
 }
 
@@ -5770,6 +5810,7 @@ pub struct BrowserComputerUseConfig {
     /// Optional bearer token for computer-use sidecar
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Per-action request timeout in milliseconds
@@ -5999,6 +6040,7 @@ pub struct FirecrawlConfig {
     pub enabled: bool,
     /// Environment variable name for the Firecrawl API key
     #[serde(default = "default_firecrawl_api_key_env")]
+    #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
     /// Firecrawl API base URL
     #[serde(default = "default_firecrawl_api_url")]
@@ -6193,16 +6235,19 @@ pub struct WebSearchConfig {
     /// Brave Search API key (required if search_provider is "brave")
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
     /// Tavily Search API key (required if search_provider is "tavily")
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub tavily_api_key: Option<String>,
     /// Jina AI API key (required if search_provider is "jina")
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub jina_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
@@ -6862,6 +6907,7 @@ impl Default for LinkedInImageConfig {
 pub struct ImageProviderStabilityConfig {
     /// Environment variable name holding the API key.
     #[serde(default = "default_stability_api_key_env")]
+    #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
     /// Stability model identifier.
     #[serde(default = "default_stability_model")]
@@ -6891,9 +6937,11 @@ impl Default for ImageProviderStabilityConfig {
 pub struct ImageProviderImagenConfig {
     /// Environment variable name holding the API key.
     #[serde(default = "default_imagen_api_key_env")]
+    #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
     /// Environment variable for the Google Cloud project ID.
     #[serde(default = "default_imagen_project_id_env")]
+    #[credential_class = "legacy_env_path"]
     pub project_id_env: String,
     /// Vertex AI region.
     #[serde(default = "default_imagen_region")]
@@ -6927,6 +6975,7 @@ impl Default for ImageProviderImagenConfig {
 pub struct ImageProviderDalleConfig {
     /// Environment variable name holding the OpenAI API key.
     #[serde(default = "default_dalle_api_key_env")]
+    #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
     /// DALL-E model identifier.
     #[serde(default = "default_dalle_model")]
@@ -6963,6 +7012,7 @@ impl Default for ImageProviderDalleConfig {
 pub struct ImageProviderFluxConfig {
     /// Environment variable name holding the fal.ai API key.
     #[serde(default = "default_flux_api_key_env")]
+    #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
     /// Flux model identifier.
     #[serde(default = "default_flux_model")]
@@ -7006,6 +7056,7 @@ pub struct ImageGenConfig {
 
     /// Environment variable name holding the fal.ai API key.
     #[serde(default = "default_image_gen_api_key_env")]
+    #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
 }
 
@@ -7066,6 +7117,8 @@ pub struct FileUploadConfig {
     /// Static HTTP headers attached to every upload request. Same shape as
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
 
@@ -7282,6 +7335,7 @@ pub struct ClaudeCodeConfig {
     pub max_output_bytes: usize,
     /// Extra env vars passed to the claude subprocess (e.g. ANTHROPIC_API_KEY for API-key billing)
     #[serde(default)]
+    #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
 }
 
@@ -7376,6 +7430,7 @@ pub struct CodexCliConfig {
     pub max_output_bytes: usize,
     /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
     #[serde(default)]
+    #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
 }
 
@@ -7420,6 +7475,7 @@ pub struct GeminiCliConfig {
     pub max_output_bytes: usize,
     /// Extra env vars passed to the gemini subprocess (e.g. GOOGLE_API_KEY)
     #[serde(default)]
+    #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
 }
 
@@ -7464,6 +7520,7 @@ pub struct OpenCodeCliConfig {
     pub max_output_bytes: usize,
     /// Extra env vars passed to the opencode subprocess
     #[serde(default)]
+    #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
 }
 
@@ -8624,6 +8681,7 @@ pub struct QdrantStorageConfig {
     /// API key for Qdrant Cloud or secured instances.
     /// Falls back to `QDRANT_API_KEY` env var if unset.
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
@@ -8970,6 +9028,8 @@ pub struct ObservabilityConfig {
     /// Authorization = "Bearer sk-..."
     /// ```
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
     /// Log persistence mode: "none" | "rolling" | "full".
@@ -9248,6 +9308,7 @@ pub struct RiskProfileConfig {
     /// Block high-risk commands even when allowlisted.
     pub block_high_risk_commands: bool,
     /// Environment variable names passed through to shell subprocesses.
+    #[credential_class = "legacy_env_path"]
     pub shell_env_passthrough: Vec<String>,
     /// Tools that never require approval in this profile.
     pub auto_approve: Vec<String>,
@@ -9582,6 +9643,9 @@ pub struct ReliabilityConfig {
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_keys: Vec<String>,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
@@ -9948,7 +10012,8 @@ pub struct CronJobDecl {
     /// Model override for agent jobs.
     #[serde(default)]
     pub model: Option<String>,
-    /// Allowlist of tool names for agent jobs.
+    /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
+    /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.
@@ -10162,6 +10227,7 @@ pub struct CloudflareTunnelConfig {
     /// Cloudflare Tunnel token (from Zero Trust dashboard)
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub token: String,
 }
@@ -10185,6 +10251,7 @@ pub struct NgrokTunnelConfig {
     /// ngrok auth token
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_token: String,
     /// Optional custom domain
@@ -10207,6 +10274,7 @@ pub struct OpenVpnTunnelConfig {
     pub config_file: String,
     /// Optional path to auth credentials file (`--auth-user-pass`).
     #[serde(default)]
+    #[credential_class = "path_only_reference"]
     pub auth_file: Option<String>,
     /// Advertised address once VPN is connected (e.g., `"10.8.0.2:42617"`).
     /// When omitted the tunnel falls back to `http://{local_host}:{local_port}`.
@@ -10243,6 +10311,7 @@ pub struct PinggyTunnelConfig {
     /// Pinggy access token (optional — free tier works without one).
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub token: Option<String>,
     /// Server region: `"us"` (USA), `"eu"` (Europe), `"ap"` (Asia), `"br"` (South America), `"au"` (Australia), or omit for auto.
@@ -11164,6 +11233,7 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// Port to listen on for incoming webhooks.
     #[tab(Advanced)]
+    #[serde(default = "default_webhook_channel_port")]
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
     #[tab(Advanced)]
@@ -11207,6 +11277,10 @@ pub struct WebhookConfig {
     /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_max_delay_ms: Option<u64>,
+}
+
+fn default_webhook_channel_port() -> u16 {
+    8090
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -11264,6 +11338,7 @@ pub struct MatrixConfig {
     /// Matrix access token for the bot account. When unset, the channel
     /// falls back to password login using `user_id` + `password`.
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
@@ -11307,12 +11382,14 @@ pub struct MatrixConfig {
     /// Optional Matrix recovery key for automatic E2EE key backup restore.
     /// When set, ZeroClaw recovers room keys and cross-signing secrets on startup.
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub recovery_key: Option<String>,
     /// Optional login password for Matrix account (used for initial login flow).
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
@@ -12391,6 +12468,7 @@ pub struct NevisConfig {
     /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_secret: Option<String>,
 
@@ -13199,6 +13277,7 @@ pub struct NotionConfig {
     pub enabled: bool,
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: String,
     #[serde(default)]
@@ -13295,6 +13374,7 @@ pub struct JiraConfig {
     /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// Actions the agent is permitted to call.
@@ -13594,6 +13674,7 @@ impl Default for Config {
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -14425,8 +14506,14 @@ impl Config {
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
-            let mut config: Config = crate::migration::migrate_to_current(&contents)
-                .context("Failed to migrate config")?;
+            // Daemon load must never hard-fail on a malformed config — the
+            // operator needs the process up to repair it. The resilient path
+            // degrades (dropping invalid blocks to defaults); security-critical
+            // drops are recorded on `degraded_security` for exposure gating.
+            // Strict validation lives in `zeroclaw config migrate`.
+            let salvage = crate::migration::migrate_to_current_salvaged(&contents);
+            let mut config: Config = salvage.config;
+            config.degraded_security = salvage.dropped_security;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -14630,6 +14717,13 @@ impl Config {
                 RequiredFieldEmpty,
                 "gateway.host",
                 "gateway.host must not be empty"
+            );
+        }
+        if matches!(self.transcription.max_audio_bytes, Some(0)) {
+            validation_bail!(
+                InvalidNumericRange,
+                "transcription.max_audio_bytes",
+                "transcription.max_audio_bytes must be greater than zero"
             );
         }
         // Heartbeat agent: when heartbeat is enabled, the agent field
@@ -16422,6 +16516,30 @@ mod tests {
     use tokio::sync::MutexGuard;
     use tokio::test;
 
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array.entries"]
+    struct ObjectArraySecretEntry {
+        pub name: String,
+        #[secret]
+        pub token: Option<String>,
+        #[secret]
+        pub headers: HashMap<String, String>,
+    }
+
+    impl crate::config::HasPropKind for Vec<ObjectArraySecretEntry> {
+        const PROP_KIND: crate::config::PropKind = crate::config::PropKind::ObjectArray;
+
+        fn display_secret_terminals() -> Vec<&'static str> {
+            ObjectArraySecretEntry::secret_field_terminals()
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array"]
+    struct ObjectArraySecretFixture {
+        pub entries: Vec<ObjectArraySecretEntry>,
+    }
+
     // ── Tilde expansion ───────────────────────────────────────
 
     #[test]
@@ -17007,6 +17125,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -17729,6 +17848,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -17864,6 +17984,10 @@ default_temperature = 0.7
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig {
                     api_key: Some("root-credential".into()),
+                    extra_headers: HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer provider-header-credential".to_string(),
+                    )]),
                     ..Default::default()
                 },
             },
@@ -17880,6 +18004,28 @@ default_temperature = 0.7
                 ..PostgresStorageConfig::default()
             },
         );
+        config.storage.qdrant.insert(
+            "default".to_string(),
+            QdrantStorageConfig {
+                api_key: Some("qdrant-credential".into()),
+                ..QdrantStorageConfig::default()
+            },
+        );
+        config.reliability.api_keys = vec![
+            "rotation-credential-a".into(),
+            "rotation-credential-b".into(),
+        ];
+        config.node_transport.shared_secret = "node-shared-credential".into();
+        config.nodes.auth_token = Some("nodes-auth-credential".into());
+        config.observability.backend = "otel".into();
+        config.observability.otel_headers = Some(HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer otel-credential".to_string(),
+        )]));
+        config.file_upload.headers = HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer upload-credential".to_string(),
+        )]);
         config.channels.lark.insert(
             "feishu".to_string(),
             LarkConfig {
@@ -17935,6 +18081,7 @@ default_temperature = 0.7
             name: "primary".into(),
             transport: McpTransport::Sse,
             url: Some("https://mcp.example.invalid/sse".into()),
+            env: HashMap::from([("MCP_API_KEY".to_string(), "mcp-env-credential".to_string())]),
             headers: HashMap::from([
                 ("Authorization".to_string(), "Bearer mcp-cred".to_string()),
                 ("X-Tenant".to_string(), "tenant-42".to_string()),
@@ -17947,6 +18094,30 @@ default_temperature = 0.7
         let contents = tokio::fs::read_to_string(config.config_path.clone())
             .await
             .unwrap();
+        for plaintext in [
+            "root-credential",
+            "Bearer provider-header-credential",
+            "composio-credential",
+            "browser-credential",
+            "brave-credential",
+            "tavily-credential",
+            "postgres://user:pw@host/db",
+            "qdrant-credential",
+            "rotation-credential-a",
+            "rotation-credential-b",
+            "node-shared-credential",
+            "nodes-auth-credential",
+            "Bearer otel-credential",
+            "Bearer upload-credential",
+            "mcp-env-credential",
+            "Bearer mcp-cred",
+            "tenant-42",
+        ] {
+            assert!(
+                !contents.contains(plaintext),
+                "saved TOML must not contain plaintext credential `{plaintext}`"
+            );
+        }
         let stored: Config = crate::migration::migrate_to_current(&contents).unwrap();
         let store = crate::secrets::SecretStore::new(&dir, true);
 
@@ -17958,6 +18129,18 @@ default_temperature = 0.7
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
+
+        let provider_header = stored
+            .providers
+            .models
+            .find("anthropic", "default")
+            .and_then(|e| e.extra_headers.get("Authorization"))
+            .unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(provider_header));
+        assert_eq!(
+            store.decrypt(provider_header).unwrap(),
+            "Bearer provider-header-credential"
+        );
 
         let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(
@@ -18010,6 +18193,55 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(storage_db_url).unwrap(),
             "postgres://user:pw@host/db"
+        );
+
+        let qdrant_key = stored
+            .storage
+            .qdrant
+            .get("default")
+            .and_then(|q| q.api_key.as_deref())
+            .unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(qdrant_key));
+        assert_eq!(store.decrypt(qdrant_key).unwrap(), "qdrant-credential");
+
+        for key in &stored.reliability.api_keys {
+            assert!(crate::secrets::SecretStore::is_encrypted(key));
+        }
+        assert_eq!(
+            store.decrypt(&stored.reliability.api_keys[0]).unwrap(),
+            "rotation-credential-a"
+        );
+        assert_eq!(
+            store.decrypt(&stored.reliability.api_keys[1]).unwrap(),
+            "rotation-credential-b"
+        );
+
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            &stored.node_transport.shared_secret
+        ));
+        assert_eq!(
+            store.decrypt(&stored.node_transport.shared_secret).unwrap(),
+            "node-shared-credential"
+        );
+
+        let nodes_auth = stored.nodes.auth_token.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(nodes_auth));
+        assert_eq!(store.decrypt(nodes_auth).unwrap(), "nodes-auth-credential");
+
+        let otel_auth = stored
+            .observability
+            .otel_headers
+            .as_ref()
+            .and_then(|h| h.get("Authorization"))
+            .unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(otel_auth));
+        assert_eq!(store.decrypt(otel_auth).unwrap(), "Bearer otel-credential");
+
+        let upload_auth = stored.file_upload.headers.get("Authorization").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(upload_auth));
+        assert_eq!(
+            store.decrypt(upload_auth).unwrap(),
+            "Bearer upload-credential"
         );
 
         let feishu = stored.channels.lark.get("feishu").unwrap();
@@ -18073,8 +18305,14 @@ default_temperature = 0.7
                 "mcp.servers.primary.headers.{key} must be encrypted on save"
             );
         }
+        let mcp_env = mcp_server.env.get("MCP_API_KEY").unwrap();
+        assert!(
+            crate::secrets::SecretStore::is_encrypted(mcp_env),
+            "mcp.servers.primary.env.MCP_API_KEY must be encrypted on save"
+        );
         let auth = mcp_server.headers.get("Authorization").unwrap();
         let tenant = mcp_server.headers.get("X-Tenant").unwrap();
+        assert_eq!(store.decrypt(mcp_env).unwrap(), "mcp-env-credential");
         assert_eq!(store.decrypt(auth).unwrap(), "Bearer mcp-cred");
         assert_eq!(store.decrypt(tenant).unwrap(), "tenant-42");
 
@@ -18632,6 +18870,12 @@ bot_token = "xoxb-tok"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    #[test]
+    async fn webhook_config_port_defaults_when_omitted() {
+        let p: WebhookConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.port, 8090);
     }
 
     #[test]
@@ -20024,6 +20268,99 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_assigns_degraded_security_for_malformed_section() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // `[security] audit` must be a table; a scalar forces the security
+        // section to drop to its default on the resilient daemon path.
+        fs::write(
+            &config_path,
+            r#"schema_version = 3
+audit = "should-be-a-table-not-a-string"
+
+[security]
+audit = "should-be-a-table-not-a-string"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            config.degraded_security.iter().any(|s| s == "security"),
+            "load_or_init must surface a dropped [security] section on degraded_security, got {:?}",
+            config.degraded_security
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_marks_whole_config_degraded_for_unparseable_file() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // Not valid TOML at all: the whole config defaults, so every
+        // security-critical section is lost at once. load_or_init must surface
+        // that on degraded_security so the serving gate refuses to start.
+        fs::write(&config_path, "this is not valid TOML {{{")
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            !config.degraded_security.is_empty(),
+            "load_or_init must surface a whole-config loss on degraded_security, got {:?}",
+            config.degraded_security
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
         config.providers.models.openrouter.insert(
@@ -20716,6 +21053,7 @@ group_policy = "disabled"
         assert!(tc.api_url.contains("groq.com"));
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
+        assert!(tc.max_audio_bytes.is_none());
         assert_eq!(tc.max_duration_secs, 120);
         assert!(!tc.transcribe_non_ptt_audio);
     }
@@ -20732,6 +21070,61 @@ group_policy = "disabled"
         assert!(parsed.transcription.enabled);
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+    }
+
+    #[test]
+    async fn config_roundtrip_with_transcription_max_audio_bytes() {
+        let mut config = Config::default();
+        config.transcription.max_audio_bytes = Some(65_536);
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed = parse_test_config(&toml_str);
+
+        assert_eq!(parsed.transcription.max_audio_bytes, Some(65_536));
+    }
+
+    #[test]
+    async fn transcription_max_audio_bytes_round_trips_through_prop_path() {
+        let mut config = Config::default();
+
+        assert_eq!(
+            config
+                .get_prop("transcription.max_audio_bytes")
+                .unwrap()
+                .as_str(),
+            "<unset>"
+        );
+
+        config
+            .set_prop("transcription.max_audio_bytes", "65536")
+            .unwrap();
+        assert_eq!(config.transcription.max_audio_bytes, Some(65_536));
+        assert_eq!(
+            config.get_prop("transcription.max_audio_bytes").unwrap(),
+            "65536"
+        );
+
+        config
+            .set_prop("transcription.max_audio_bytes", "")
+            .unwrap();
+        assert!(config.transcription.max_audio_bytes.is_none());
+        assert_eq!(
+            config.get_prop("transcription.max_audio_bytes").unwrap(),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    async fn config_validate_rejects_zero_transcription_max_audio_bytes() {
+        let mut config = Config::default();
+        config.transcription.max_audio_bytes = Some(0);
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transcription.max_audio_bytes must be greater than zero"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -22901,6 +23294,231 @@ allowed_users = []
                 result.unwrap_err()
             );
         }
+    }
+
+    /// Audit gate for RFC #6971 Phase 0: any credential-shaped property path
+    /// that reaches the CLI/gateway/TUI property surface must have an explicit
+    /// classification. This catches future config additions whose names imply
+    /// credential handling before they silently land without a security call.
+    #[test]
+    async fn credential_shaped_prop_fields_have_explicit_classification() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        config
+            .providers
+            .models
+            .anthropic
+            .insert("default".into(), AnthropicModelProviderConfig::default());
+        config
+            .providers
+            .tts
+            .openai
+            .insert("default".into(), OpenAITtsProviderConfig::default());
+        config.providers.transcription.openai.insert(
+            "default".into(),
+            OpenAiTranscriptionProviderConfig::default(),
+        );
+        config.providers.transcription.local_whisper.insert(
+            "default".into(),
+            LocalWhisperTranscriptionProviderConfig::default(),
+        );
+        config
+            .channels
+            .matrix
+            .insert("default".into(), MatrixConfig::default());
+        config
+            .storage
+            .qdrant
+            .insert("default".into(), QdrantStorageConfig::default());
+
+        let fields = config.prop_fields();
+        let missing: Vec<_> = fields
+            .iter()
+            .filter(|field| credential_shaped_prop_path(&field.name))
+            .filter(|field| field.credential_class.is_none())
+            .map(|field| field.name.clone())
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "credential-shaped config fields need explicit classification: {missing:?}"
+        );
+
+        let unmarked_secrets: Vec<_> = fields
+            .iter()
+            .filter(|field| {
+                field.credential_class
+                    == Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+            })
+            .filter(|field| !field.is_secret && !Config::prop_is_secret(&field.name))
+            .map(|field| field.name.clone())
+            .collect();
+
+        assert!(
+            unmarked_secrets.is_empty(),
+            "EncryptedSecret classifications must route through #[secret]: {unmarked_secrets:?}"
+        );
+    }
+
+    #[test]
+    async fn prop_fields_carry_credential_classification_from_schema_fields() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        config.providers.models.openai.insert(
+            "codex".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config
+            .providers
+            .tts
+            .openai
+            .insert("default".into(), OpenAITtsProviderConfig::default());
+        config.providers.transcription.local_whisper.insert(
+            "default".into(),
+            LocalWhisperTranscriptionProviderConfig::default(),
+        );
+        config
+            .channels
+            .matrix
+            .insert("default".into(), MatrixConfig::default());
+
+        let fields = config.prop_fields();
+        let class_for = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .and_then(|field| field.credential_class)
+        };
+
+        assert_eq!(
+            class_for("providers.models.openai.codex.requires_openai_auth"),
+            Some(crate::config::CredentialSurfaceClass::ExternalAuthStore)
+        );
+        assert_eq!(
+            class_for("providers.tts.openai.default.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+        assert_eq!(
+            class_for("providers.transcription.local_whisper.default.bearer_token"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+        assert_eq!(
+            class_for("channels.matrix.default.access_token"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+        assert_eq!(
+            class_for("model_routes"),
+            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+        );
+        assert_eq!(
+            class_for("embedding_routes"),
+            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+        );
+        assert!(Config::prop_is_secret(
+            "providers.tts.openai.default.api_key"
+        ));
+        assert!(Config::prop_is_secret(
+            "providers.transcription.local_whisper.default.bearer_token"
+        ));
+        assert!(Config::prop_is_secret(
+            "channels.matrix.default.access_token"
+        ));
+    }
+
+    fn credential_shaped_prop_path(path: &str) -> bool {
+        path.split('.').any(|part| {
+            let normalized = part.replace('_', "-");
+            let has_term = |needle| normalized.split('-').any(|term| term == needle);
+            normalized.contains("api-key")
+                || normalized.contains("api-token")
+                || normalized.contains("auth-file")
+                || normalized.contains("auth-header")
+                || normalized.contains("auth-token")
+                || normalized.contains("bearer-token")
+                || normalized.contains("bot-token")
+                || normalized.contains("access-token")
+                || normalized.contains("refresh-token")
+                || normalized.contains("verification-token")
+                || normalized.contains("paired-tokens")
+                || part == "token"
+                || has_term("credential")
+                || has_term("env")
+                || has_term("header")
+                || has_term("headers")
+                || has_term("password")
+                || has_term("secret")
+        })
+    }
+
+    #[test]
+    async fn object_array_prop_display_redacts_nested_secret_fields() {
+        let fixture = ObjectArraySecretFixture {
+            entries: vec![
+                ObjectArraySecretEntry {
+                    name: "primary".to_string(),
+                    token: Some("nested-token-credential".to_string()),
+                    headers: HashMap::from([
+                        (
+                            "Authorization".to_string(),
+                            "Bearer nested-header-credential".to_string(),
+                        ),
+                        ("X-Tenant".to_string(), "tenant-credential".to_string()),
+                    ]),
+                },
+                ObjectArraySecretEntry {
+                    name: "unset-secret".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+            ],
+        };
+
+        let display_value = fixture
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "test.object_array.entries")
+            .expect("object-array field should be surfaced")
+            .display_value;
+        let readback = fixture
+            .get_prop("test.object_array.entries")
+            .expect("object-array field should be readable");
+
+        for rendered in [&display_value, &readback] {
+            assert!(
+                !rendered.contains("nested-token-credential"),
+                "object-array display/readback must redact scalar nested secrets: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Bearer nested-header-credential"),
+                "object-array display/readback must redact nested secret map values: {rendered}"
+            );
+            assert!(
+                !rendered.contains("tenant-credential"),
+                "object-array display/readback must redact every value in nested secret maps: {rendered}"
+            );
+            assert!(
+                rendered.contains("primary"),
+                "non-secret object-array fields should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("unset-secret"),
+                "non-secret fields on entries with unset secrets should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("****"),
+                "redacted object-array output should show masked placeholders: {rendered}"
+            );
+        }
+
+        assert!(
+            display_value.contains(r#""token":null"#),
+            "JSON display should preserve unset optional secrets as null, not a populated mask: {display_value}"
+        );
     }
 
     #[test]
