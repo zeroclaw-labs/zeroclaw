@@ -2000,7 +2000,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
             ),
             E::key("1–7", crate::i18n::t("zc-dashboard-help-jump-tab")),
             E::key("r", crate::i18n::t("zc-dashboard-help-refresh")),
-            E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
             E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
         ];
 
@@ -2036,7 +2035,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("r", crate::i18n::t("zc-dashboard-help-refresh-short")),
                 E::key("/", crate::i18n::t("zc-dashboard-help-search")),
                 E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
-                E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
             ];
             if self.tab == Tab::Sessions {

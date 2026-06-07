@@ -175,7 +175,6 @@ zc-dashboard-help-next-tab = 次のタブ
 zc-dashboard-help-prev-tab = 前のタブ
 zc-dashboard-help-jump-tab = タブへ移動
 zc-dashboard-help-refresh = 今すぐ更新
-zc-dashboard-help-quit = TUIを終了
 zc-dashboard-help-this-help = このヘルプ
 zc-dashboard-help-apply-search = 検索を適用
 zc-dashboard-help-cancel-search = 検索をキャンセル

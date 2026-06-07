@@ -175,7 +175,6 @@ zc-dashboard-help-next-tab = Onglet suivant
 zc-dashboard-help-prev-tab = Onglet précédent
 zc-dashboard-help-jump-tab = Aller à l'onglet
 zc-dashboard-help-refresh = Actualiser maintenant
-zc-dashboard-help-quit = Quitter le TUI
 zc-dashboard-help-this-help = Cette aide
 zc-dashboard-help-apply-search = Appliquer la recherche
 zc-dashboard-help-cancel-search = Annuler la recherche

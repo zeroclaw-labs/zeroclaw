@@ -175,7 +175,6 @@ zc-dashboard-help-next-tab = 下一个标签页
 zc-dashboard-help-prev-tab = 上一个标签页
 zc-dashboard-help-jump-tab = 跳转标签页
 zc-dashboard-help-refresh = 立即刷新
-zc-dashboard-help-quit = 退出 TUI
 zc-dashboard-help-this-help = 此帮助
 zc-dashboard-help-apply-search = 应用搜索
 zc-dashboard-help-cancel-search = 取消搜索

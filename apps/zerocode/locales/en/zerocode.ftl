@@ -199,7 +199,6 @@ zc-dashboard-help-next-tab = Next tab
 zc-dashboard-help-prev-tab = Previous tab
 zc-dashboard-help-jump-tab = Jump to tab
 zc-dashboard-help-refresh = Refresh now
-zc-dashboard-help-quit = Quit TUI
 zc-dashboard-help-this-help = This help
 zc-dashboard-help-apply-search = Apply search
 zc-dashboard-help-cancel-search = Cancel search
