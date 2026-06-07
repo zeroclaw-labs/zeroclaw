@@ -3541,10 +3541,14 @@ pub const REPLY_QUEUE_DEPTH_CEILING: u16 = 1024;
 /// them and the overflow log is the right signal.
 pub const DEFAULT_REPLY_QUEUE_DEPTH: u16 = 16;
 
-/// Per-(channel, recipient) recipient cap on the pacing wrapper's LRU.
-/// Protects against unbounded growth when a bot legitimately serves many
-/// thousands of distinct peers. Not exposed in config — promote to a
-/// schema field if an operator reports hitting it.
+/// Idle-state LRU cap on the pacing wrapper's per-recipient rows.
+/// Bounds growth when a bot legitimately serves many thousands of distinct
+/// peers. Eviction only reclaims idle rows (no queued sends, no running
+/// worker, no in-flight dispatch), so under a pathological all-active burst
+/// the row count can temporarily exceed this target until rows become idle —
+/// it is not an unconditional hard bound. Each recipient's queue depth stays
+/// bounded regardless. Not exposed in config — promote to a schema field if
+/// an operator reports hitting it.
 pub const PACING_RECIPIENT_CAP: usize = 1024;
 
 /// Validate that a temperature value is within the allowed range.

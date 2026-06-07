@@ -14,8 +14,11 @@
 //! left enqueues. A worker task drains the queue at the floor rate.
 //! When the queue is full the newest send is dropped and a `WARN` is
 //! emitted carrying enough attribution to diagnose the source without
-//! leaking message body. See `PACING_RECIPIENT_CAP` for the upper bound
-//! on distinct recipient state retained.
+//! leaking message body. `PACING_RECIPIENT_CAP` bounds the number of
+//! distinct recipient rows retained via idle-state LRU eviction — only
+//! rows with no queued work and no running worker are eligible, so the
+//! cap is a target for idle state, not an unconditional hard bound on a
+//! pathological all-active burst.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -96,6 +99,13 @@ struct RecipientState {
     /// `true` while a worker task owns this recipient's queue. Prevents
     /// spawning a second worker for the same recipient.
     worker_running: bool,
+    /// `true` while an immediate-path dispatch for this recipient is awaiting
+    /// the inner channel's wire call. Set under the lock before the immediate
+    /// dispatch is released and cleared under the lock when it returns. A send
+    /// that arrives while this is set enqueues instead of taking a second
+    /// immediate path, so a single slow inner send cannot put two wire calls
+    /// in flight to the same recipient and undercut the floor.
+    in_flight: bool,
     /// Sequence counter so the LRU eviction picks the least-recently-touched
     /// recipient when the cap is hit.
     last_touched: u64,
@@ -132,10 +142,11 @@ impl RecipientMap {
         self.touch_counter
     }
 
-    /// Evict the least-recently-touched recipient when the cap is reached.
-    /// Only enforced on insert paths (existing rows are not affected, so an
-    /// active queue can never be discarded out from under its worker — a
-    /// recipient with a queue is by definition recently touched).
+    /// Evict the least-recently-touched idle recipient when the cap is
+    /// reached. Only rows with no queue, no running worker, and no in-flight
+    /// dispatch are eligible, so an active recipient is never discarded out
+    /// from under its worker or a pending immediate send. If every row is
+    /// active the cap is exceeded until one becomes idle.
     fn evict_if_over_cap(&mut self) {
         if self.inner.len() < PACING_RECIPIENT_CAP {
             return;
@@ -146,7 +157,7 @@ impl RecipientMap {
         let victim = self
             .inner
             .iter()
-            .filter(|(_, s)| s.queue.is_empty() && !s.worker_running)
+            .filter(|(_, s)| s.queue.is_empty() && !s.worker_running && !s.in_flight)
             .min_by_key(|(_, s)| s.last_touched)
             .map(|(k, _)| k.clone());
         if let Some(key) = victim {
@@ -215,12 +226,18 @@ impl PacedChannel {
                     next_allowed_at: now,
                     queue: VecDeque::new(),
                     worker_running: false,
+                    in_flight: false,
                     last_touched: touch,
                 });
             state.last_touched = touch;
 
-            if state.queue.is_empty() && !state.worker_running && now >= state.next_allowed_at {
+            if state.queue.is_empty()
+                && !state.worker_running
+                && !state.in_flight
+                && now >= state.next_allowed_at
+            {
                 state.next_allowed_at = now + self.min_interval;
+                state.in_flight = true;
                 (Some(op), None, false)
             } else if state.queue.len() >= self.queue_depth {
                 ::zeroclaw_log::record!(
@@ -250,7 +267,27 @@ impl PacedChannel {
 
         let (immediate, awaited, spawn_worker) = decision;
         if let Some(op) = immediate {
-            return op.dispatch(&self.inner).await;
+            let result = op.dispatch(&self.inner).await;
+            // Clear the in-flight marker under the lock. Sends that arrived
+            // during this dispatch enqueued behind it (the `in_flight` gate);
+            // hand them to a drain worker so they still observe the floor.
+            let spawn = {
+                let mut map = self.recipients.lock().await;
+                if let Some(state) = map.inner.get_mut(&recipient_key) {
+                    state.in_flight = false;
+                    let needs_worker = !state.queue.is_empty() && !state.worker_running;
+                    if needs_worker {
+                        state.worker_running = true;
+                    }
+                    needs_worker
+                } else {
+                    false
+                }
+            };
+            if spawn {
+                self.spawn_drain_worker(recipient_key);
+            }
+            return result;
         }
         if let Some(rx) = awaited {
             if spawn_worker {
@@ -737,6 +774,98 @@ mod tests {
             counting.sends.load(Ordering::SeqCst),
             1,
             "only the first send should reach inner.send; the finalize must not",
+        );
+    }
+
+    /// A channel whose `send` blocks until the test releases a gate, so the
+    /// test can hold an immediate-path dispatch in flight and race a second
+    /// send against it.
+    struct GatedChannel {
+        sends: AtomicUsize,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl Attributable for GatedChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "gated"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for GatedChannel {
+        fn name(&self) -> &str {
+            "gated"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            // Block until the test grants a permit, then count the send.
+            let permit = self.gate.acquire().await.unwrap();
+            permit.forget();
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A slow inner send must not let a second concurrent send to the same
+    /// recipient take a second immediate path. The `in_flight` marker forces
+    /// the racing send to enqueue, so only one wire call is ever in flight to
+    /// a recipient at a time even when the inner send outlasts the floor.
+    #[tokio::test]
+    async fn slow_immediate_send_forces_concurrent_send_to_enqueue() {
+        let gated = Arc::new(GatedChannel {
+            sends: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let inner: Arc<dyn Channel> = gated.clone();
+        // Sub-second floor: by the time the second send arrives the floor has
+        // already elapsed, so only the `in_flight` marker — not the floor —
+        // can keep the second send off the immediate path.
+        let cfg = PacingFixture {
+            interval_secs: 1,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        let paced_a = Arc::clone(&paced);
+
+        // Send A takes the immediate path and blocks inside inner.send.
+        let a = zeroclaw_spawn::spawn!(async move {
+            paced_a.send(&SendMessage::new("a", "alice")).await.unwrap();
+        });
+        // Wait until A is parked inside inner.send (in flight).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            gated.sends.load(Ordering::SeqCst),
+            0,
+            "A is gated; no send has completed yet",
+        );
+
+        // Send B races in while A is in flight and the floor has elapsed.
+        let paced_b = Arc::clone(&paced);
+        let b = zeroclaw_spawn::spawn!(async move {
+            paced_b.send(&SendMessage::new("b", "alice")).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // B must have enqueued, not dispatched: still zero completed sends and
+        // nothing new reached the inner channel while A holds the gate.
+        assert_eq!(
+            gated.sends.load(Ordering::SeqCst),
+            0,
+            "B must enqueue behind the in-flight A, not take a second immediate path",
+        );
+
+        // Release both: A completes, then the worker drains B at the floor.
+        gated.gate.add_permits(2);
+        a.await.unwrap();
+        b.await.unwrap();
+        assert_eq!(
+            gated.sends.load(Ordering::SeqCst),
+            2,
+            "both sends eventually dispatch exactly once each",
         );
     }
 }
