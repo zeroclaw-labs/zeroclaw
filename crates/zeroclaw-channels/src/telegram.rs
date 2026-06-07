@@ -360,6 +360,9 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Default minimum interval between Telegram draft edits.
+const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -453,7 +456,7 @@ impl TelegramChannel {
             pairing,
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
+            draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
@@ -512,7 +515,11 @@ impl TelegramChannel {
         draft_update_interval_ms: u64,
     ) -> Self {
         self.stream_mode = stream_mode;
-        self.draft_update_interval_ms = draft_update_interval_ms;
+        self.draft_update_interval_ms = if draft_update_interval_ms == 0 {
+            TELEGRAM_DRAFT_UPDATE_INTERVAL_MS
+        } else {
+            draft_update_interval_ms
+        };
         self
     }
 
@@ -711,7 +718,7 @@ impl TelegramChannel {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw onboard channels` first",
+                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot-token=<token>` to configure.",
                     self.alias
                 );
             }
@@ -4189,6 +4196,22 @@ mod tests {
         .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
+    }
+
+    #[test]
+    fn with_streaming_uses_default_for_zero_draft_update_interval() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0);
+
+        assert_eq!(
+            ch.draft_update_interval_ms,
+            TELEGRAM_DRAFT_UPDATE_INTERVAL_MS
+        );
     }
 
     #[tokio::test]

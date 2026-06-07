@@ -1090,7 +1090,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     for line in s.lines() {
         // Collect indented continuation lines for YAML block scalars (>- or |)
         if let Some(ref key) = collecting_multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 multiline_parts.push(line.trim().to_string());
                 continue;
             }
@@ -2208,6 +2211,33 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. The parser must not truncate the description at it.
+        let frontmatter = "name: x\ndescription: >-\n  para one\n\n  para two\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        let desc = meta.description.expect("description should be parsed");
+        assert!(
+            desc.contains("para one"),
+            "first paragraph missing: {desc:?}"
+        );
+        assert!(
+            desc.contains("para two"),
+            "second paragraph after blank line was truncated: {desc:?}"
+        );
+        assert_eq!(meta.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_simple_frontmatter_block_scalar_stops_at_next_key() {
+        // A real, non-indented next key must still terminate the block scalar.
+        let frontmatter = "description: >-\n  hello\n  world\nversion: 1.2.3\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        assert_eq!(meta.description.as_deref(), Some("hello world"));
+        assert_eq!(meta.version.as_deref(), Some("1.2.3"));
+    }
 
     #[test]
     fn test_is_registry_source_accepts_bare_names() {

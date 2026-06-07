@@ -95,7 +95,7 @@ If a provider returns the entire response in one shot (older OpenAI-compat endpo
 
 ## Code references
 
-- `crates/zeroclaw-api/src/provider.rs` — `Provider` trait, `StreamEvent` enum
+- `crates/zeroclaw-api/src/model_provider.rs` — `ModelProvider` trait, `StreamEvent` enum
 - `crates/zeroclaw-providers/src/compatible.rs` — OpenAI-compat SSE parser
 - `crates/zeroclaw-providers/src/anthropic.rs` — Anthropic streaming
 - `crates/zeroclaw-providers/src/ollama.rs` — Ollama streaming

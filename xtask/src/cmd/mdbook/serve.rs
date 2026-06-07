@@ -9,7 +9,7 @@ use std::sync::{
 
 const PORT: u16 = 3000;
 
-pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
+pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     ensure_cargo_tool("mdbook", "mdbook")?;
@@ -40,7 +40,8 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     }
 
     let book = book_dir(&root);
-    let out_dir = book.join("book");
+    let tag_dir = tag.unwrap_or("master");
+    let out_dir = book.join("book").join(tag_dir);
 
     // Lang switcher always advertises every locale from locales.toml — switching
     // to an unbuilt locale will 404 in single-locale mode, which is fine for
@@ -57,18 +58,18 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     match locale {
         Some(code) => {
             println!("==> Building locale '{code}' for serve...");
-            build_one_locale(&book, code)?;
+            build_one_locale(&book, tag_dir, code)?;
         }
         None => {
             println!("==> Building all locales for serve...");
-            crate::cmd::mdbook::build::build_locales(&root)?;
+            crate::cmd::mdbook::build::build_locales(&root, tag)?;
         }
     }
-    crate::cmd::mdbook::build::assemble(&root)?;
+    crate::cmd::mdbook::build::assemble(&root, tag)?;
 
     // Watch the active locale for live-reload (rebuilds book/{locale}/ on change)
     let mut watch = Command::new(mdbook_program()?)
-        .args(["watch", "-d", &format!("book/{watch_locale}")])
+        .args(["watch", "-d", &format!("book/{}/{}", tag_dir, watch_locale)])
         .env("MDBOOK_BOOK__LANGUAGE", &watch_locale)
         .current_dir(&book)
         .stdout(Stdio::null())
@@ -132,10 +133,11 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     result
 }
 
-fn build_one_locale(book: &Path, locale: &str) -> anyhow::Result<()> {
+fn build_one_locale(book: &Path, tag_dir: &str, locale: &str) -> anyhow::Result<()> {
+    let dest = format!("book/{}/{}", tag_dir, locale);
     run_cmd(
         Command::new(mdbook_program()?)
-            .args(["build", "-d", &format!("book/{locale}")])
+            .args(["build", "-d", &dest])
             .env("MDBOOK_BOOK__LANGUAGE", locale)
             .current_dir(book),
     )
@@ -145,8 +147,10 @@ async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
     use axum::Router;
     use tower_http::services::ServeDir;
 
-    let app =
-        Router::new().fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
+    let shared_dir = dir.parent().unwrap().join("_shared");
+    let app = Router::new()
+        .nest_service("/_shared", ServeDir::new(&shared_dir))
+        .fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
     axum::serve(listener, app).await?;
     Ok(())

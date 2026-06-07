@@ -11,7 +11,13 @@ preferred-dark-theme = "default-dark"
 git-repository-url = "https://github.com/zeroclaw-labs/zeroclaw"
 edit-url-template = "https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/{path}"
 site-url = "/"
-additional-js = ["theme/lang-switcher.js", "theme/pc-enhance.js", "mermaid.min.js", "mermaid-init.js"]
+additional-js = [
+  "theme/version-selector.js",
+  "theme/lang-switcher.js",
+  "theme/pc-enhance.js",
+  "mermaid.min.js",
+  "mermaid-init.js",
+]
 additional-css = ["theme/pc-themes.css", "theme/custom.css"]
 
 [output.html.search]

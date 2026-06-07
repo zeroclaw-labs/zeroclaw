@@ -25,7 +25,7 @@ cd zeroclaw
 1. Detects your distribution and architecture
 2. Asks whether you want a prebuilt binary or to build from source (the default is interactive — non-interactive shells default to prebuilt when available)
 3. Places the binary at `~/.cargo/bin/zeroclaw`
-4. Runs `zeroclaw onboard` to complete first-time setup
+4. Runs `zeroclaw quickstart` to complete first-time setup
 
 Flags:
 
@@ -34,7 +34,7 @@ Flags:
 ./install.sh --source                        # always build from source
 ./install.sh --minimal                       # kernel only (~6.6 MB)
 ./install.sh --source --features agent-runtime,channel-discord   # custom features
-./install.sh --skip-onboard                  # install only; run `zeroclaw onboard` later
+./install.sh --skip-quickstart                  # install only; run `zeroclaw quickstart` later
 ./install.sh --list-features                 # print available features and exit
 ./install.sh --help                          # full flag reference
 ```
@@ -43,7 +43,7 @@ Flags:
 
 ```bash
 brew install zeroclaw
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 Homebrew-on-Linux installs follow Homebrew's service path convention — your workspace lives under `$HOMEBREW_PREFIX/var/zeroclaw/` instead of `~/.zeroclaw/`. See [Service management](./service.md) for why this matters.
@@ -100,7 +100,7 @@ sudo usermod -aG gpio,spi,i2c $USER
 Re-run the installer — it detects the existing install and upgrades in place:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-onboard
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
 ```
 
 Or from a clone:
@@ -108,7 +108,7 @@ Or from a clone:
 ```bash
 cd /path/to/zeroclaw
 git pull
-./install.sh --skip-onboard
+./install.sh --skip-quickstart
 ```
 
 If installed via Homebrew instead:
