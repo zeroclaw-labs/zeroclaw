@@ -899,7 +899,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
-        _opts: &ModelProviderRuntimeOptions,
+        opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         // Reads typed Azure alias fields directly. Operator sets these
         // under `[model_providers.azure.<alias>]` or via the schema-mirror
@@ -946,6 +946,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
                 resource,
                 deployment,
                 api_version,
+                opts.reasoning_effort.clone(),
             ),
         ))
     }
