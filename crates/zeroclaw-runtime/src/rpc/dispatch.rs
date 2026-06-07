@@ -695,12 +695,23 @@ impl RpcDispatcher {
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        // ACP (Code) sessions never get the long-term-memory tools or backend.
+        // The exclusion is derived from `chat_mode` on the server rather than
+        // trusted from the wire `exclude_memory` flag, so a client that omits
+        // or falsifies the flag cannot smuggle memory access into a Code
+        // session. A non-ACP caller may still opt in explicitly.
+        let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            || req.exclude_memory == Some(true);
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &req.agent_alias,
             cwd_path,
             false,
-            req.exclude_memory.unwrap_or(false),
+            exclude_memory,
             tui_env,
         )
         .await
@@ -1086,12 +1097,18 @@ impl RpcDispatcher {
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
+        // Reaped ACP sessions always rehydrate as `ChatMode::Acp` (see the
+        // insert below), so the recovered agent must enforce the same
+        // server-side memory-tool exclusion as a fresh `session/new` ACP
+        // session — otherwise session recovery silently restores the
+        // long-term-memory backend and tools the ACP invariant forbids.
+        let exclude_memory = true;
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &data.agent_alias,
             cwd_path,
             false,
-            false,
+            exclude_memory,
             tui_env,
         )
         .await
@@ -3450,13 +3467,7 @@ mod tests {
     // helpers: `RpcContext::minimal`, `RpcDispatcher::handle_session_new_for_test`,
     // and `Agent::tool_names`.
 
-    const MEMORY_TOOLS: &[&str] = &[
-        "memory_recall",
-        "memory_store",
-        "memory_forget",
-        "memory_export",
-        "memory_purge",
-    ];
+    use zeroclaw_tools::MEMORY_TOOL_NAMES as MEMORY_TOOLS;
 
     fn make_acp_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
@@ -3543,6 +3554,47 @@ mod tests {
             assert!(
                 !tool_names.contains(&mem_tool),
                 "ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_chat_mode_strips_memory_tools_without_exclude_flag() {
+        // The server must derive memory exclusion from `chat_mode: acp`, not
+        // trust the wire `exclude_memory` flag. A Code session that omits the
+        // flag entirely must still come up with no memory tools.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-no-flag-session-001"
+        });
+
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-no-flag-session-001")
+            .await
+            .expect("session must be registered in the store after session/new");
+
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "ACP chat_mode must strip `{mem_tool}` even without exclude_memory — \
+                 tool list: {tool_names:?}"
             );
         }
     }
@@ -3751,6 +3803,47 @@ mod tests {
             resumed["workspace_dir"], original_cwd,
             "resume must keep the retained session's cwd, not default it"
         );
+    }
+
+    /// The ACP memory-tool invariant must survive session recovery: a reaped
+    /// ACP session that rehydrates must come back with NONE of the long-term
+    /// memory tools, exactly like a fresh `session/new` ACP session. Without
+    /// the server-side exclusion on the rehydrate path, recovery would silently
+    /// restore the memory backend and tools the ACP boundary forbids.
+    #[tokio::test]
+    async fn reaped_acp_session_rehydrates_without_memory_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-reaped-mem-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        // Reap the in-memory session, leaving the durable row to rehydrate from.
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("a reaped ACP session must rehydrate to a working agent");
+
+        let agent = recovered.lock().await;
+        let tool_names = agent.tool_names();
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "rehydrated ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
+            );
+        }
     }
 
     /// A deliberately killed ACP session must not be treated like a merely
