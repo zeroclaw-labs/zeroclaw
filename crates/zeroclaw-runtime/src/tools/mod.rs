@@ -1276,14 +1276,19 @@ pub fn all_tools_with_runtime(
                     let details = host.tool_plugin_details();
                     let count = details.len();
                     for (manifest, wasm_path) in details {
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                        // Namespace plugin tools (`<plugin>__<tool>`) and wrap them
+                        // in RateLimitedTool so they get the same rate-limit/approval
+                        // treatment as native and MCP tools (previously pushed bare).
+                        let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
                             wasm_path.to_path_buf(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             manifest.allowed_hosts.clone(),
                             manifest.env_allowlist.clone(),
-                        )));
+                        )
+                        .with_prefixed_name(&manifest.name);
+                        tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
                     }
                     ::zeroclaw_log::record!(
                         INFO,

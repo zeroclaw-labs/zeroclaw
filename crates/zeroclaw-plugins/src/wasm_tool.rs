@@ -116,6 +116,14 @@ impl WasmTool {
             env_allowlist,
         }
     }
+
+    /// Namespace the exposed tool name as `<plugin>__<tool>` (the same `__`
+    /// convention MCP uses) so plugin tools can't collide with or shadow native
+    /// or MCP tools. The plugin's internal `execute` export is unaffected.
+    pub fn with_prefixed_name(mut self, plugin_name: &str) -> Self {
+        self.name = format!("{plugin_name}__{}", self.name);
+        self
+    }
 }
 
 /// The JSON Schema returned when a plugin lacks a `tool_metadata` export or fails
@@ -183,5 +191,23 @@ impl Tool for WasmTool {
                 error: Some("plugin execution timed out".into()),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_tool_name() {
+        let tool = WasmTool::new(
+            "generate_music".into(),
+            "desc".into(),
+            serde_json::json!({}),
+            PathBuf::from("/x.wasm"),
+            vec![],
+        )
+        .with_prefixed_name("ace-step");
+        assert_eq!(tool.name(), "ace-step__generate_music");
     }
 }
