@@ -834,6 +834,61 @@ fn timestamp_channel_user_content(content: &str) -> String {
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
+fn channel_history_content_for_user_turn(content: &str) -> String {
+    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+    if image_refs.is_empty() {
+        return content.to_string();
+    }
+
+    let mut cleaned = cleaned.trim().to_string();
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+
+    if cleaned.is_empty() {
+        "[Image attachment processed by vision model]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn restore_current_user_turn_media_payload(
+    turns: &mut [ChatMessage],
+    history_content: &str,
+    full_content: &str,
+) {
+    if history_content == full_content {
+        return;
+    }
+
+    if let Some(turn) = turns
+        .iter_mut()
+        .rev()
+        .find(|turn| turn.role == "user" && turn.content == history_content)
+    {
+        turn.content = full_content.to_string();
+    }
+}
+
+fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
+    if turns.len() <= 1 {
+        return;
+    }
+
+    let last_idx = turns.len() - 1;
+    for turn in &mut turns[..last_idx] {
+        if turn.content.contains("[IMAGE:") {
+            turn.content = channel_history_content_for_user_turn(&turn.content);
+        }
+    }
+
+    let current = turns.pop();
+    turns.retain(|turn| !turn.content.trim().is_empty());
+    if let Some(current) = current {
+        turns.push(current);
+    }
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -1476,32 +1531,37 @@ fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_tu
         return;
     };
 
-    // Walk backwards to find the boundary: count user messages to
-    // identify which turns are "recent" (protected from stripping).
+    // Walk backwards to find the oldest user message that still belongs to the
+    // most recent `keep_turns` exchanges. Everything before that boundary is
+    // old enough to strip. If the session has fewer than `keep_turns` user
+    // turns, preserve every message.
     let mut user_count = 0;
-    let mut protect_from = turns.len();
+    let mut strip_before = 0;
     for (i, turn) in turns.iter().enumerate().rev() {
         if turn.role == "user" {
             user_count += 1;
-            if user_count > keep_turns {
-                // Everything before this index is old enough to strip.
-                protect_from = i + 1; // protect from next message onward
+            if user_count == keep_turns {
+                strip_before = i;
                 break;
             }
         }
     }
 
+    if user_count < keep_turns {
+        return;
+    }
+
     // Remove tool and intermediate assistant messages before the boundary.
     // An "intermediate assistant" is one whose content looks like a tool
-    // call (contains `<tool_call>` or starts with `{\"tool_call`).
+    // call, either in legacy XML / JSON forms or in native `tool_calls` JSON.
     let mut i = 0;
-    while i < protect_from && i < turns.len() {
+    while i < strip_before && i < turns.len() {
         let dominated = turns[i].role == "tool"
             || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
         if dominated {
             turns.remove(i);
             // Adjust boundary since we removed an element.
-            protect_from = protect_from.saturating_sub(1);
+            strip_before = strip_before.saturating_sub(1);
         } else {
             i += 1;
         }
@@ -1514,7 +1574,43 @@ fn is_tool_call_content(content: &str) -> bool {
     let trimmed = content.trim();
     trimmed.contains("<tool_call>")
         || trimmed.starts_with("{\"tool_call\"")
-        || trimmed.starts_with("{\"name\"")
+        || is_named_tool_call_json(trimmed)
+        || is_native_tool_call_json(trimmed)
+}
+
+fn is_named_tool_call_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+
+    value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .is_some_and(|name| {
+            !name.is_empty()
+                && (value.get("args").is_some()
+                    || value.get("arguments").is_some()
+                    || value.get("parameters").is_some())
+        })
+}
+
+fn is_native_tool_call_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+
+    let Some(tool_calls) = value.get("tool_calls").and_then(|calls| calls.as_array()) else {
+        return false;
+    };
+
+    !tool_calls.is_empty()
+        && tool_calls.iter().all(|call| {
+            call.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|name| name.as_str())
+                .or_else(|| call.get("name").and_then(|name| name.as_str()))
+                .is_some()
+        })
 }
 
 fn rollback_orphan_user_turn(
@@ -3586,16 +3682,17 @@ async fn process_channel_message_body(
             return;
         }
     };
+    let history_user_content = channel_history_content_for_user_turn(&msg.content);
     if ctx.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
+        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &msg.content,
+                &history_user_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -3628,16 +3725,18 @@ async fn process_channel_message_body(
     };
 
     // Preserve the dated user turn before the LLM call so interrupted requests
-    // keep the same temporal context as CLI turns.
+    // keep the same temporal context as CLI turns. Keep history compact so
+    // inline image payloads are not reloaded into later requests.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
+    let timestamped_history_content = timestamp_channel_user_content(&history_user_content);
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_content),
+        ChatMessage::user(&timestamped_history_content),
     );
 
     // Build history from per-sender conversation cache.
-    let prior_turns_raw = if force_fresh_session {
+    let mut prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&timestamped_content)]
     } else {
         ctx.conversation_histories
@@ -3647,6 +3746,13 @@ async fn process_channel_message_body(
             .cloned()
             .unwrap_or_default()
     };
+    if !force_fresh_session {
+        restore_current_user_turn_media_payload(
+            &mut prior_turns_raw,
+            &timestamped_history_content,
+            &timestamped_content,
+        );
+    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -3666,29 +3772,10 @@ async fn process_channel_message_body(
         }
     }
 
-    // Strip [IMAGE:] markers from *older* history messages when the active
-    // model_provider does not support vision. This prevents "history poisoning"
-    // where a previously-sent image marker gets reloaded from the JSONL
-    // session file and permanently breaks the conversation (fixes #3674).
-    // We skip the last turn (the current message) so the vision check can
-    // still reject fresh image sends with a proper error.
-    if !active_model_provider.supports_vision() && prior_turns.len() > 1 {
-        let last_idx = prior_turns.len() - 1;
-        for turn in &mut prior_turns[..last_idx] {
-            if turn.content.contains("[IMAGE:") {
-                let (cleaned, _refs) =
-                    zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
-                turn.content = cleaned;
-            }
-        }
-        // Drop older turns that became empty after marker removal (e.g. image-only messages).
-        // Keep the last turn (current message) intact.
-        let current = prior_turns.pop();
-        prior_turns.retain(|turn| !turn.content.trim().is_empty());
-        if let Some(current) = current {
-            prior_turns.push(current);
-        }
-    }
+    // Strip [IMAGE:] markers from older cached turns before context
+    // compression. The current message keeps its full payload so vision still
+    // works for the active turn; historical turns keep compact annotations.
+    strip_historical_image_payloads(&mut prior_turns);
 
     // Proactively trim conversation history before sending to the model_provider
     // to prevent context-window-exceeded errors (bug #3460).
@@ -4732,7 +4819,11 @@ async fn process_channel_message_body(
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                    && rollback_orphan_user_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        &timestamped_history_content,
+                    );
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -9236,6 +9327,29 @@ mod tests {
         );
     }
 
+    fn seed_sender_history(ctx: &ChannelRuntimeContext, sender: &str, turns: Vec<ChatMessage>) {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.push(sender.to_string(), turns);
+    }
+
+    fn cloned_sender_history(ctx: &ChannelRuntimeContext, sender: &str) -> Vec<ChatMessage> {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.peek(sender).cloned().unwrap_or_default()
+    }
+
+    fn history_signature(turns: &[ChatMessage]) -> Vec<(String, String)> {
+        turns
+            .iter()
+            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .collect()
+    }
+
     #[test]
     fn agent_router_multi_routes_each_alias_to_its_owning_agent() {
         // Two enabled agents, each owning one Discord bot. A message tagged
@@ -10832,6 +10946,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        vision: bool,
     }
 
     #[async_trait::async_trait]
@@ -10859,6 +10974,10 @@ BTC is currently around $65,000 based on latest tool output."#
             let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
             calls.push(snapshot);
             Ok(format!("response-{}", calls.len()))
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for HistoryCaptureModelProvider {
@@ -15307,6 +15426,137 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_sends_image_payload_without_persisting_it() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            vision: true,
+            ..Default::default()
+        });
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            default_model_provider: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-image-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-image".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "sticker.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let current_user = calls[0]
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .expect("provider call should include current user message");
+        assert!(current_user.1.contains("[IMAGE:data:image/png;base64,"));
+        assert!(current_user.1.contains("please inspect this"));
+        drop(calls);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek("test-channel_chat-image_alice")
+            .expect("history should be stored for sender");
+        assert_eq!(turns[0].role, "user");
+        assert!(turns[0].content.starts_with('['));
+        assert!(turns[0].content.contains("[Image: sticker.png attached"));
+        assert!(turns[0].content.contains("please inspect this"));
+        assert!(!turns[0].content.contains("[IMAGE:data:"));
+        assert!(!turns[0].content.contains("AQIDBA"));
+    }
+
+    #[tokio::test]
     async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -16302,6 +16552,53 @@ This is an example JSON object for profile settings."#;
     fn normalize_empty_input() {
         let result = normalize_cached_channel_turns(vec![]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn channel_history_content_for_user_turn_strips_inline_image_payload() {
+        let content =
+            "[Image: sticker.webp attached]\n[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?";
+
+        let history_content = channel_history_content_for_user_turn(content);
+
+        assert_eq!(
+            history_content,
+            "[Image: sticker.webp attached]\n\nwhat is this?"
+        );
+        assert!(!history_content.contains("[IMAGE:data:"));
+        assert!(!history_content.contains("abcd"));
+    }
+
+    #[test]
+    fn channel_history_content_for_image_only_turn_keeps_compact_placeholder() {
+        let history_content =
+            channel_history_content_for_user_turn("[IMAGE:data:image/png;base64,abcd]");
+
+        assert_eq!(
+            history_content,
+            "[Image attachment processed by vision model]"
+        );
+    }
+
+    #[test]
+    fn strip_historical_image_payloads_preserves_current_turn_payload() {
+        let mut turns = vec![
+            ChatMessage::user("[Image: old.png attached]\n[IMAGE:data:image/png;base64,old]"),
+            ChatMessage::assistant("I saw the old image."),
+            ChatMessage::user("[Image: now.png attached]\n[IMAGE:data:image/png;base64,current]"),
+        ];
+
+        strip_historical_image_payloads(&mut turns);
+
+        assert_eq!(turns.len(), 3);
+        assert!(turns[0].content.contains("[Image: old.png attached]"));
+        assert!(!turns[0].content.contains("[IMAGE:data:"));
+        assert!(!turns[0].content.contains("base64,old"));
+        assert!(
+            turns[2]
+                .content
+                .contains("[IMAGE:data:image/png;base64,current]")
+        );
     }
 
     // ── E2E: photo [IMAGE:] marker rejected by non-vision model_provider ───
@@ -18051,6 +18348,115 @@ Done."#;
         ));
         assert!(!is_tool_call_content("The iPad has been blocked."));
         assert!(!is_tool_call_content(""));
+    }
+
+    #[test]
+    fn is_tool_call_content_does_not_misclassify_regular_name_json() {
+        assert!(!is_tool_call_content(
+            "{\"name\":\"Alice\",\"role\":\"admin\"}"
+        ));
+    }
+
+    #[test]
+    fn strip_old_tool_context_preserves_recent_tool_context_when_history_within_keep_window() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-short";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("block the iPad"),
+                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::assistant("Done, iPad is blocked."),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 2);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            turns.len(),
+            4,
+            "tool context in protected turns must not be stripped"
+        );
+        assert_eq!(turns[1].role, "assistant");
+        assert!(turns[1].content.contains("tool_call"));
+        assert_eq!(turns[2].role, "tool");
+    }
+
+    #[test]
+    fn strip_old_tool_context_strips_tool_context_before_keep_window_boundary() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-boundary";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("first task"),
+                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+                ChatMessage::tool("ok"),
+                ChatMessage::assistant("first task done"),
+                ChatMessage::user("second task"),
+                ChatMessage::assistant("second task done"),
+                ChatMessage::user("third task"),
+                ChatMessage::assistant("third task done"),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 2);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            history_signature(&turns),
+            vec![
+                ("user".to_string(), "first task".to_string()),
+                ("assistant".to_string(), "first task done".to_string()),
+                ("user".to_string(), "second task".to_string()),
+                ("assistant".to_string(), "second task done".to_string()),
+                ("user".to_string(), "third task".to_string()),
+                ("assistant".to_string(), "third task done".to_string()),
+            ],
+            "tool context older than the protected keep window should be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_old_tool_context_removes_native_tool_call_assistant_messages() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-native";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("first task"),
+                ChatMessage::assistant(
+                    r#"{"content":"Need to call tool","tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+                ),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::assistant("first task done"),
+                ChatMessage::user("second task"),
+                ChatMessage::assistant("second task done"),
+                ChatMessage::user("third task"),
+                ChatMessage::assistant("third task done"),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 1);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            history_signature(&turns),
+            vec![
+                ("user".to_string(), "first task".to_string()),
+                ("assistant".to_string(), "first task done".to_string()),
+                ("user".to_string(), "second task".to_string()),
+                ("assistant".to_string(), "second task done".to_string()),
+                ("user".to_string(), "third task".to_string()),
+                ("assistant".to_string(), "third task done".to_string()),
+            ],
+            "native assistant tool-call JSON should be stripped together with old tool results"
+        );
     }
 
     #[test]
