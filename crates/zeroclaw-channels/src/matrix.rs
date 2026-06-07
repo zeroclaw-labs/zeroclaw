@@ -1851,6 +1851,16 @@ mod inbound {
             ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
         }
 
+        // Self-anchored roots carry their own event_id as the outbound
+        // anchor. This is a delivery/threading detail — not a conversation
+        // boundary. Strip it from interruption_scope_id so in-flight
+        // cancellation keys match the sender+room scope used by
+        // conversation_history_key.
+        let interruption_scope = match outbound_anchor.as_deref() {
+            Some(anchor) if anchor == ev.event_id.as_str() => None,
+            _ => outbound_anchor.clone(),
+        };
+
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
             sender: sender.to_string(),
@@ -1863,7 +1873,7 @@ mod inbound {
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: outbound_anchor.clone(),
-            interruption_scope_id: outbound_anchor,
+            interruption_scope_id: interruption_scope,
             attachments,
             subject: None,
         };
