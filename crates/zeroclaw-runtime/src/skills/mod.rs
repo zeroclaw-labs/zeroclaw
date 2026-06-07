@@ -83,12 +83,26 @@ impl ::zeroclaw_api::attribution::Attributable for Skill {
 pub struct SkillTool {
     pub name: String,
     pub description: String,
-    /// "shell", "http", "script"
+    /// "shell", "http", "script", "builtin", "mcp"
     pub kind: String,
-    /// The command/URL/script to execute
+    /// The command/URL/script to execute (unused for builtin/mcp kinds)
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// For `kind = "builtin"`: the name of the built-in tool to delegate to.
+    /// For `kind = "mcp"`: the prefixed MCP tool name `{server}__{tool}`
+    /// (e.g. `images__generate`).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// For `kind = "builtin"` / `kind = "mcp"`: arguments fixed by the skill
+    /// manifest. These are **locked** — they are applied on top of the
+    /// caller-supplied args and cannot be overridden by the model. This is
+    /// what scopes a delegated tool (e.g. `target = "composio"` +
+    /// `locked_args = { action_name = "TEXT_TO_PDF" }` exposes exactly one
+    /// action). Accepts the legacy key `default_args` for compatibility.
+    #[serde(default, alias = "default_args")]
+    pub locked_args: HashMap<String, String>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -246,15 +260,22 @@ pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier
 /// Build the install-time tier banner. `Official` skills get a single
 /// informational line; everything else (including `Featured` and the
 /// missing-tag fallback) gets the Community warn block.
-pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
-    let version_label = version.unwrap_or("?");
-    let args = [("name", name), ("version", version_label)];
-    let key = match tier {
+/// Pure: the Fluent key for a tier's install banner. Split out so tests can
+/// resolve it against the English catalogue without depending on the process
+/// locale.
+fn install_tier_banner_key(tier: SkillTier) -> &'static str {
+    match tier {
         SkillTier::Official => "cli-skills-install-tier-official",
         SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => {
             "cli-skills-install-tier-community"
         }
-    };
+    }
+}
+
+pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+    let version_label = version.unwrap_or("?");
+    let args = [("name", name), ("version", version_label)];
+    let key = install_tier_banner_key(tier);
     let mut banner = crate::i18n::get_required_cli_string_with_args(key, &args);
     if !banner.ends_with('\n') {
         banner.push('\n');
@@ -1069,7 +1090,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     for line in s.lines() {
         // Collect indented continuation lines for YAML block scalars (>- or |)
         if let Some(ref key) = collecting_multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 multiline_parts.push(line.trim().to_string());
                 continue;
             }
@@ -1269,12 +1293,12 @@ pub fn skills_to_prompt_with_mode(
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
                 .collect();
 
             if !registered.is_empty() {
@@ -1319,12 +1343,77 @@ pub fn skills_to_prompt_with_mode(
 /// Convert skill tools into callable `Tool` trait objects.
 ///
 /// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
-/// (for `shell`/`script` kinds) or `SkillHttpTool` (for `http` kind),
-/// enabling them to appear as first-class callable tool specs rather than
-/// only as XML in the system prompt.
+/// (for `shell`/`script` kinds), `SkillHttpTool` (for `http` kind), or
+/// `SkillBuiltinTool` (for `builtin` kind), enabling them to appear as
+/// first-class callable tool specs rather than only as XML in the system
+/// prompt.
+///
+/// The `builtin` kind requires the unfiltered tool registry. Use
+/// [`skills_to_tools_with_context`] to register that kind.
 pub fn skills_to_tools(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
+) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    skills_to_tools_with_context(skills, security, &[])
+}
+
+/// Convert skill tools into callable `Tool` trait objects with full context.
+///
+/// `unfiltered_registry` provides the pre-policy tool list for `builtin`
+/// delegation.
+/// Resolve a skill elevation tool (`kind = "builtin"` or `kind = "mcp"`).
+///
+/// Both kinds delegate to a tool resolved by name from `resolution_registry`
+/// (built-in tools + MCP tool wrappers). The only difference is `kind_label`,
+/// used for diagnostics. Returns `None` (after a WARN) when the `target` is
+/// missing or not resolvable, so a misconfigured manifest is skipped, never
+/// fatal.
+fn resolve_elevated_tool(
+    skill_name: &str,
+    tool: &SkillTool,
+    kind_label: &str,
+    resolution_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+) -> Option<Box<dyn zeroclaw_api::tool::Tool>> {
+    let Some(target_name) = tool.target.as_deref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "Skill tool {}.{} has kind='{}' but no 'target' field, skipping",
+                skill_name, tool.name, kind_label
+            )
+        );
+        return None;
+    };
+    match resolution_registry.iter().find(|t| t.name() == target_name) {
+        Some(target) => Some(Box::new(crate::skills::skill_tool::SkillBuiltinTool::new(
+            skill_name,
+            tool,
+            std::sync::Arc::clone(target),
+            tool.locked_args.clone(),
+        ))),
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Skill tool {}.{} targets {} '{}' which was not found in the \
+                     resolution registry (for MCP, use the prefixed name \
+                     '{{server}}__{{tool}}' and ensure the server is connected), skipping",
+                    skill_name, tool.name, kind_label, target_name
+                )
+            );
+            None
+        }
+    }
+}
+
+pub fn skills_to_tools_with_context(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
@@ -1346,6 +1435,20 @@ pub fn skills_to_tools(
                         &skill.name,
                         tool,
                     )));
+                }
+                "builtin" => {
+                    if let Some(t) =
+                        resolve_elevated_tool(&skill.name, tool, "builtin", unfiltered_registry)
+                    {
+                        tools.push(t);
+                    }
+                }
+                "mcp" => {
+                    if let Some(t) =
+                        resolve_elevated_tool(&skill.name, tool, "MCP", unfiltered_registry)
+                    {
+                        tools.push(t);
+                    }
                 }
                 other => {
                     ::zeroclaw_log::record!(
@@ -2110,6 +2213,33 @@ mod registry_tests {
     use super::*;
 
     #[test]
+    fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. The parser must not truncate the description at it.
+        let frontmatter = "name: x\ndescription: >-\n  para one\n\n  para two\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        let desc = meta.description.expect("description should be parsed");
+        assert!(
+            desc.contains("para one"),
+            "first paragraph missing: {desc:?}"
+        );
+        assert!(
+            desc.contains("para two"),
+            "second paragraph after blank line was truncated: {desc:?}"
+        );
+        assert_eq!(meta.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_simple_frontmatter_block_scalar_stops_at_next_key() {
+        // A real, non-indented next key must still terminate the block scalar.
+        let frontmatter = "description: >-\n  hello\n  world\nversion: 1.2.3\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        assert_eq!(meta.description.as_deref(), Some("hello world"));
+        assert_eq!(meta.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
     fn test_is_registry_source_accepts_bare_names() {
         assert!(is_registry_source("auto-coder"));
         assert!(is_registry_source("web-researcher"));
@@ -2189,9 +2319,22 @@ mod registry_tests {
         );
     }
 
+    /// Resolve a tier banner against the English catalogue only — locale- and
+    /// filesystem-independent, mirroring build_install_tier_banner's assembly.
+    fn english_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+        let version_label = version.unwrap_or("?");
+        let args = [("name", name), ("version", version_label)];
+        let mut banner =
+            crate::i18n::get_english_cli_string_with_args(install_tier_banner_key(tier), &args);
+        if !banner.ends_with('\n') {
+            banner.push('\n');
+        }
+        banner
+    }
+
     #[test]
     fn build_install_tier_banner_official_is_single_line() {
-        let banner = build_install_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
+        let banner = english_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
         assert!(banner.contains("Official (zeroclaw-labs maintained)"));
         assert!(banner.contains("Installing auto-coder v0.3.0"));
         assert!(!banner.contains("not audited"));
@@ -2201,8 +2344,7 @@ mod registry_tests {
 
     #[test]
     fn build_install_tier_banner_community_warns() {
-        let banner =
-            build_install_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
+        let banner = english_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
         assert!(banner.contains("Community submission"));
         assert!(banner.contains("not audited by ZeroClaw"));
         assert!(banner.contains("zeroclaw skills audit discord-moderator"));
@@ -2210,14 +2352,14 @@ mod registry_tests {
 
     #[test]
     fn build_install_tier_banner_featured_uses_community_warning() {
-        let banner = build_install_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
+        let banner = english_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
         assert!(banner.contains("Community submission"));
         assert!(banner.contains("not audited by ZeroClaw"));
     }
 
     #[test]
     fn build_install_tier_banner_unknown_falls_back_to_community() {
-        let banner = build_install_tier_banner("legacy", None, SkillTier::Unknown);
+        let banner = english_tier_banner("legacy", None, SkillTier::Unknown);
         assert!(banner.contains("Community submission"));
         assert!(banner.contains("not audited by ZeroClaw"));
         // Missing version is rendered as `v?` rather than panicking.

@@ -33,16 +33,22 @@ pub async fn handle_command(
         crate::SkillCommands::List => {
             let skills = load_skills_with_config(workspace_dir, config);
             if skills.is_empty() {
-                println!("No skills installed.");
+                println!("{}", get_required_cli_string("cli-skills-none-installed"));
                 println!();
-                println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
+                println!("{}", get_required_cli_string("cli-skills-create-hint"));
                 println!(
-                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md"
+                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md" // i18n-exempt: literal shell command example
                 );
                 println!();
-                println!("  Or install: zeroclaw skills install <source>");
+                println!("{}", get_required_cli_string("cli-skills-install-hint"));
             } else {
-                println!("Installed skills ({}):", skills.len());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-installed-header",
+                        &[("count", &skills.len().to_string())],
+                    )
+                );
                 println!();
                 for skill in &skills {
                     println!(
@@ -63,7 +69,13 @@ pub async fn handle_command(
                         );
                     }
                     if !skill.tags.is_empty() {
-                        println!("    Tags:  {}", skill.tags.join(", "));
+                        println!(
+                            "    {}",
+                            get_required_cli_string_with_args(
+                                "cli-skills-tags",
+                                &[("tags", &skill.tags.join(", "))],
+                            )
+                        );
                     }
                 }
             }

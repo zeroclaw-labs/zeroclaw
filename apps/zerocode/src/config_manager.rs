@@ -1,0 +1,3707 @@
+use std::io::{self, Stdout};
+use std::path::Path;
+
+use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
+use anyhow::Result;
+use crossterm::{
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::Modifier,
+    text::{Line, Span},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
+};
+
+use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
+use crate::theme;
+
+pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+
+pub(crate) fn init_terminal() -> Result<Term> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+    )?;
+    // Keyboard progressive enhancement (Kitty protocol) is optional — it
+    // enables key-release/repeat reporting on capable terminals. Legacy
+    // Windows consoles (conhost) don't support it and return an error; treat
+    // it as best-effort so an unsupported console degrades gracefully instead
+    // of aborting startup.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        );
+    }
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
+    disable_raw_mode()?;
+    // Pop the enhancement flags best-effort — if they were never pushed (or the
+    // terminal doesn't support them), popping is a harmless no-op we ignore.
+    let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
+    execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    Ok(())
+}
+
+// ── Screen stack ─────────────────────────────────────────────────
+
+enum Screen {
+    SectionList,
+    TypeList {
+        section_idx: usize,
+    },
+    AliasList {
+        section_idx: usize,
+        /// For TypedFamilyMap: the family path (e.g. "providers.models.anthropic").
+        /// For OneTierAliasMap: the section key itself (e.g. "agents").
+        map_path: String,
+        breadcrumb: Vec<String>,
+    },
+    AliasCreate {
+        section_idx: usize,
+        map_path: String,
+        breadcrumb: Vec<String>,
+    },
+    FieldList {
+        section_idx: usize,
+        prefix: String,
+        breadcrumb: Vec<String>,
+    },
+    FieldEdit {
+        section_idx: usize,
+        prefix: String,
+        breadcrumb: Vec<String>,
+        field_idx: usize,
+    },
+}
+
+enum FilterAction {
+    /// Key was consumed by the filter (typed, navigated, dismissed).
+    Consumed,
+    /// Key was not handled — caller should process it normally.
+    Passthrough,
+    /// Enter pressed — caller should act on the currently-selected filtered item.
+    Accept,
+}
+
+enum FilterEditAction {
+    Cancel,
+    Accept,
+    Backspace,
+    CursorUp,
+    CursorDown,
+}
+
+// ── Config section sub-tabs ──────────────────────────────────────
+
+/// Top-level Config sub-tab: the daemon RPC editor (`zeroclaw`) first,
+/// the local client config (`zerocode`) second.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigSection {
+    Zeroclaw,
+    Zerocode,
+}
+
+const CONFIG_SECTIONS: [ConfigSection; 2] = [ConfigSection::Zeroclaw, ConfigSection::Zerocode];
+
+impl ConfigSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Zeroclaw => "zeroclaw",
+            Self::Zerocode => "zerocode",
+        }
+    }
+}
+
+// ── Keymap-derived chord glyphs (footers + help) ─────────────────
+//
+// Footer hints and the help overlay must show the live, possibly-overridden
+// chord for each action — never a hardcoded glyph.
+
+/// First display chord for a `ConfigTabAction`, or its fallback label.
+fn tab_key(action: crate::keymap::ConfigTabAction) -> String {
+    use crate::keymap::RebindableActions;
+    action
+        .resolved()
+        .first()
+        .map(crate::keymap::Chord::display)
+        .unwrap_or_default()
+}
+
+/// All display chords for a `ConfigTabAction`, joined for help rows.
+fn tab_keys(action: crate::keymap::ConfigTabAction) -> Vec<String> {
+    use crate::keymap::RebindableActions;
+    action
+        .resolved()
+        .iter()
+        .map(crate::keymap::Chord::display)
+        .collect()
+}
+
+/// First display chord for a `ConfigEditorAction` (Enter/Esc/Ctrl+S in edits).
+fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
+    use crate::keymap::RebindableActions;
+    action
+        .resolved()
+        .first()
+        .map(crate::keymap::Chord::display)
+        .unwrap_or_default()
+}
+
+/// Joined up/down display chords for list navigation footers.
+fn nav_keys() -> String {
+    use crate::keymap::ConfigTabAction as A;
+    tab_keys(A::Up)
+        .into_iter()
+        .chain(tab_keys(A::Down))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Up+down display chords as a vec, for help rows that render each chord.
+fn nav_keys_split() -> Vec<String> {
+    use crate::keymap::ConfigTabAction as A;
+    tab_keys(A::Up)
+        .into_iter()
+        .chain(tab_keys(A::Down))
+        .collect()
+}
+
+/// Left+right display chords, used by composite-tab switch help rows.
+fn switch_tabs_keys() -> Vec<String> {
+    use crate::keymap::ConfigTabAction as A;
+    tab_keys(A::TabLeft)
+        .into_iter()
+        .chain(tab_keys(A::TabRight))
+        .collect()
+}
+
+// ── App state ────────────────────────────────────────────────────
+
+pub(crate) struct App<'a> {
+    rpc: &'a RpcClient,
+    section: ConfigSection,
+    zerocode: crate::zerocode_pane::ZerocodePane,
+    section_tab_area: Option<Rect>,
+    screen: Screen,
+    sections: Vec<ConfigSectionEntry>,
+    templates: Vec<ConfigTemplateEntry>,
+    section_cursor: usize,
+    // Type list (TypedFamilyMap families)
+    types: Vec<ConfigTemplateEntry>,
+    type_alias_counts: Vec<usize>,
+    type_cursor: usize,
+    // Alias list
+    aliases: Vec<String>,
+    alias_enabled: Vec<Option<bool>>,
+    alias_cursor: usize,
+    // Field list
+    fields: Vec<ConfigFieldEntry>,
+    field_cursor: usize,
+    // Edit state
+    edit_buf: String,
+    // Enum/bool select state
+    select_cursor: usize,
+    select_items: Vec<String>,
+    status_msg: Option<String>,
+    // Filter state: None = inactive, Some(buf) = active filter
+    filter: Option<String>,
+    filter_cursor: usize,
+    // Tab state for field list
+    active_tab: usize,
+    tab_names: Vec<ConfigTab>,
+    // Personality editor state (composite tab on agents)
+    personality_files: Vec<crate::client::PersonalityFileEntry>,
+    personality_cursor: usize,
+    personality_agent: String,
+    personality_content: String,
+    personality_loaded: String,
+    personality_active_file: Option<String>,
+    personality_max_chars: usize,
+    // Skills editor state (composite tab on skill-bundles)
+    skills_list: Vec<crate::client::SkillListEntry>,
+    skills_cursor: usize,
+    skills_bundle: String,
+    skills_active: Option<String>,
+    skills_body: String,
+    skills_body_loaded: String,
+    skills_frontmatter: crate::client::SkillFrontmatter,
+    skills_frontmatter_loaded: crate::client::SkillFrontmatter,
+    // Mouse support
+    last_main_area: Rect,
+    last_list_offset: usize,
+    last_tab_area: Option<Rect>,
+    double_click: crate::mouse::DoubleClickTracker,
+}
+
+impl<'a> App<'a> {
+    pub(crate) fn new(rpc: &'a RpcClient, config_dir: &Path) -> Self {
+        Self {
+            rpc,
+            section: ConfigSection::Zeroclaw,
+            zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
+            section_tab_area: None,
+            screen: Screen::SectionList,
+            sections: Vec::new(),
+            templates: Vec::new(),
+            section_cursor: 0,
+            types: Vec::new(),
+            type_alias_counts: Vec::new(),
+            type_cursor: 0,
+            aliases: Vec::new(),
+            alias_enabled: Vec::new(),
+            alias_cursor: 0,
+            fields: Vec::new(),
+            field_cursor: 0,
+            edit_buf: String::new(),
+            select_cursor: 0,
+            select_items: Vec::new(),
+            status_msg: None,
+            filter: None,
+            filter_cursor: 0,
+            active_tab: 0,
+            tab_names: Vec::new(),
+            personality_files: Vec::new(),
+            personality_cursor: 0,
+            personality_agent: String::new(),
+            personality_content: String::new(),
+            personality_loaded: String::new(),
+            personality_active_file: None,
+            personality_max_chars: 20_000,
+            skills_list: Vec::new(),
+            skills_cursor: 0,
+            skills_bundle: String::new(),
+            skills_active: None,
+            skills_body: String::new(),
+            skills_body_loaded: String::new(),
+            skills_frontmatter: Default::default(),
+            skills_frontmatter_loaded: Default::default(),
+            last_main_area: Rect::default(),
+            last_list_offset: 0,
+            last_tab_area: None,
+            double_click: crate::mouse::DoubleClickTracker::new(),
+        }
+    }
+
+    /// Load initial data from the daemon. Call once before draw/handle_key.
+    pub(crate) async fn init(&mut self) -> Result<()> {
+        self.sections = self.rpc.config_sections().await?;
+        self.templates = self.rpc.config_templates().await?;
+        Ok(())
+    }
+
+    /// Draw the current screen into the given area, beneath the Config
+    /// section sub-tab bar (`zeroclaw` / `zerocode`).
+    pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        self.draw_section_tab_bar(frame, chunks[0]);
+        self.section_tab_area = Some(chunks[0]);
+        let body = chunks[1];
+
+        if self.section == ConfigSection::Zerocode {
+            self.zerocode.draw(frame, body);
+            return;
+        }
+
+        // Clone values out of `screen` so draw methods can take `&mut self`.
+        match &self.screen {
+            Screen::SectionList => self.draw_section_list(frame, body),
+            Screen::TypeList { section_idx } => {
+                let si = *section_idx;
+                self.draw_type_list(frame, body, si);
+            }
+            Screen::AliasList {
+                section_idx,
+                breadcrumb,
+                ..
+            } => {
+                let si = *section_idx;
+                let bc = breadcrumb.clone();
+                self.draw_alias_list(frame, body, si, &bc);
+            }
+            Screen::AliasCreate { breadcrumb, .. } => {
+                let bc = breadcrumb.clone();
+                self.draw_alias_create(frame, body, &bc);
+            }
+            Screen::FieldList {
+                section_idx,
+                breadcrumb,
+                ..
+            } => {
+                let si = *section_idx;
+                let bc = breadcrumb.clone();
+                self.draw_field_list(frame, body, si, &bc);
+            }
+            Screen::FieldEdit {
+                breadcrumb,
+                field_idx,
+                ..
+            } => {
+                let bc = breadcrumb.clone();
+                let fi = *field_idx;
+                self.draw_field_edit(frame, body, &bc, fi);
+            }
+        }
+    }
+
+    fn draw_section_tab_bar(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
+        for (i, sec) in CONFIG_SECTIONS.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", theme::dim_style()));
+            }
+            let style = if *sec == self.section {
+                theme::accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                theme::dim_style()
+            };
+            spans.push(Span::styled(sec.label(), style));
+        }
+        // Surface the zerocode pane's last status inline on the bar.
+        if self.section == ConfigSection::Zerocode
+            && let Some(msg) = self.zerocode.status()
+        {
+            spans.push(Span::styled("   ", theme::dim_style()));
+            spans.push(Span::styled(msg.to_string(), theme::warn_style()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Handle a key event. Returns `Ok(true)` when the user wants to
+    /// quit the entire TUI (never triggered from Config; use Ctrl+C at the app level).
+    pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        self.status_msg = None;
+
+        // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
+        // zerocode) from anywhere — neither is bound inside the daemon
+        // editor or the zerocode pane, so there is no shadowing.
+        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+            self.cycle_section(1);
+            self.sync_zerocode_locales().await;
+            return Ok(false);
+        }
+        if key.code == KeyCode::BackTab {
+            self.cycle_section(-1);
+            self.sync_zerocode_locales().await;
+            return Ok(false);
+        }
+
+        if self.section == ConfigSection::Zerocode {
+            self.zerocode.handle_key(key);
+            self.sync_zerocode_locales().await;
+            return Ok(false);
+        }
+
+        match &self.screen {
+            Screen::SectionList => {
+                return self.handle_section_list(key).await;
+            }
+            Screen::TypeList { .. } => self.handle_type_list(key).await?,
+            Screen::AliasList { .. } => self.handle_alias_list(key).await?,
+            Screen::AliasCreate { .. } => self.handle_alias_create(key).await?,
+            Screen::FieldList { .. } => self.handle_field_list(key, term).await?,
+            Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
+        }
+        Ok(false)
+    }
+
+    fn cycle_section(&mut self, delta: isize) {
+        let i = CONFIG_SECTIONS
+            .iter()
+            .position(|s| *s == self.section)
+            .unwrap_or(0) as isize;
+        let n = CONFIG_SECTIONS.len() as isize;
+        self.section = CONFIG_SECTIONS[(((i + delta) % n + n) % n) as usize];
+    }
+
+    /// Handle a mouse event forwarded from the app event loop.
+    pub(crate) async fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        _area: Rect,
+        term: &mut Term,
+    ) -> Result<()> {
+        use crate::mouse;
+
+        // Section tab-bar click switches sub-tab in either section.
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some(bar) = self.section_tab_area
+            && mouse::in_rect(mouse.column, mouse.row, bar)
+        {
+            let labels: Vec<&str> = CONFIG_SECTIONS.iter().map(|s| s.label()).collect();
+            if let Some(idx) = mouse::tab_click_index(mouse.column, mouse.row, bar, &labels, 3) {
+                self.section = CONFIG_SECTIONS[idx];
+                return Ok(());
+            }
+        }
+
+        // The zerocode pane owns its own mouse handling. Drain the locale
+        // sync afterward so a mouse-driven "Download locale file" (or a
+        // click into the Locale tab) triggers the lazy list/fetch RPC the
+        // same way the key path does — otherwise the request is queued and
+        // never sent, leaving the tab stuck on "loading locales…".
+        if self.section == ConfigSection::Zerocode {
+            self.zerocode.handle_mouse(mouse);
+            self.sync_zerocode_locales().await;
+            return Ok(());
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Tab bar click (FieldList only).
+                if let Some(tab_rect) = self.last_tab_area
+                    && mouse::in_rect(mouse.column, mouse.row, tab_rect)
+                {
+                    let labels: Vec<&str> = self.tab_names.iter().map(|t| t.label()).collect();
+                    // Each rendered label is "▸ <label>" (active, +2 chars) or
+                    // "<label>" (inactive). For hit testing we use the plain
+                    // label width + 2 for the active tab's prefix. However
+                    // `tab_click_index` just walks fixed widths, so build
+                    // display labels matching what draw_field_list renders.
+                    let display: Vec<String> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            if i == self.active_tab {
+                                format!("▸ {l}")
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect();
+                    let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
+                    if let Some(idx) = mouse::tab_click_index(
+                        mouse.column,
+                        mouse.row,
+                        tab_rect,
+                        &display_refs,
+                        3, // " │ " separator
+                    ) && idx != self.active_tab
+                        && idx < self.tab_names.len()
+                    {
+                        self.active_tab = idx;
+                        self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
+                        self.deactivate_filter();
+                        self.on_tab_switched(term).await?;
+                    }
+                    return Ok(());
+                }
+
+                // List area click.
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                    let count = self.visible_count();
+                    if let Some(pos) = mouse::list_click_index(
+                        mouse.row,
+                        self.last_main_area,
+                        self.last_list_offset,
+                        count,
+                    ) {
+                        let is_double = self.double_click.click(mouse.column, mouse.row);
+                        self.set_visible_cursor(pos);
+                        if is_double {
+                            self.activate_mouse(term).await?;
+                        }
+                    }
+                }
+            }
+
+            MouseEventKind::ScrollUp
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
+            {
+                let cur = self.visible_cursor();
+                let count = self.visible_count();
+                let next = mouse::list_scroll(cur, count, true, 3);
+                self.set_visible_cursor(next);
+            }
+
+            MouseEventKind::ScrollDown
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
+            {
+                let cur = self.visible_cursor();
+                let count = self.visible_count();
+                let next = mouse::list_scroll(cur, count, false, 3);
+                self.set_visible_cursor(next);
+            }
+
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ── Mouse helper methods ─────────────────────────────────────
+
+    /// Number of visible items for the current screen (respecting filters).
+    fn visible_count(&self) -> usize {
+        match &self.screen {
+            Screen::SectionList => {
+                let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
+                self.filtered_indices(&labels).len()
+            }
+            Screen::TypeList { .. } => {
+                let names: Vec<String> = self
+                    .types
+                    .iter()
+                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+                    .collect();
+                self.filtered_indices(&names).len()
+            }
+            Screen::AliasList { .. } => {
+                let vis = self.filtered_indices(&self.aliases);
+                // +1 for [+ Add] when not filtering
+                if self.filter.is_none() {
+                    vis.len() + 1
+                } else {
+                    vis.len()
+                }
+            }
+            Screen::AliasCreate { .. } => 0,
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    match self.tab_names[self.active_tab] {
+                        ConfigTab::Personality => {
+                            if self.personality_active_file.is_some() {
+                                0
+                            } else {
+                                self.personality_files.len()
+                            }
+                        }
+                        ConfigTab::Skills => {
+                            if self.skills_active.is_some() {
+                                0
+                            } else {
+                                self.skills_list.len()
+                            }
+                        }
+                        _ => self.visible_field_count(),
+                    }
+                } else {
+                    self.visible_field_count()
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    self.filtered_indices(&self.select_items).len()
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Compute the display label for each tab-visible field. Labels are paths
+    /// relative to the current screen prefix so nested fields stay distinct
+    /// (e.g. `tool_receipts.enabled` instead of just `enabled`).
+    fn field_labels_for_tab(&self, tab_indices: &[usize]) -> Vec<String> {
+        let screen_prefix: &str = match &self.screen {
+            Screen::FieldList { prefix, .. } => prefix.as_str(),
+            _ => "",
+        };
+        tab_indices
+            .iter()
+            .map(|&i| {
+                let path = self.fields[i].path.as_str();
+                let rel = if !screen_prefix.is_empty() {
+                    path.strip_prefix(screen_prefix)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .unwrap_or(path)
+                } else {
+                    path
+                };
+                if rel.is_empty() {
+                    path.rsplit('.').next().unwrap_or(path).to_string()
+                } else {
+                    rel.to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// Helper: visible field count for the regular (non-composite) field list.
+    fn visible_field_count(&self) -> usize {
+        let tab_indices = self.tab_field_indices();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
+        let filter_vis = self.filtered_indices(&tab_names);
+        filter_vis.len()
+    }
+
+    /// Current cursor position in visible (filtered) coordinates.
+    fn visible_cursor(&self) -> usize {
+        match &self.screen {
+            Screen::SectionList => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    let labels: Vec<String> =
+                        self.sections.iter().map(|s| s.label.clone()).collect();
+                    self.filtered_indices(&labels)
+                        .iter()
+                        .position(|&i| i == self.section_cursor)
+                        .unwrap_or(0)
+                }
+            }
+            Screen::TypeList { .. } => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    let names: Vec<String> = self
+                        .types
+                        .iter()
+                        .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+                        .collect();
+                    self.filtered_indices(&names)
+                        .iter()
+                        .position(|&i| i == self.type_cursor)
+                        .unwrap_or(0)
+                }
+            }
+            Screen::AliasList { .. } => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    self.alias_cursor
+                }
+            }
+            Screen::AliasCreate { .. } => 0,
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    match self.tab_names[self.active_tab] {
+                        ConfigTab::Personality => self.personality_cursor,
+                        ConfigTab::Skills => self.skills_cursor,
+                        _ => self.visible_field_cursor(),
+                    }
+                } else {
+                    self.visible_field_cursor()
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    self.select_cursor
+                }
+            }
+        }
+    }
+
+    /// Helper: current field cursor in visible coordinates.
+    fn visible_field_cursor(&self) -> usize {
+        if self.filter.is_some() {
+            return self.filter_cursor;
+        }
+        let tab_indices = self.tab_field_indices();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
+        let filter_vis = self.filtered_indices(&tab_names);
+        let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
+        visible
+            .iter()
+            .position(|&i| i == self.field_cursor)
+            .unwrap_or(0)
+    }
+
+    /// Set the cursor from a visible (filtered) position.
+    fn set_visible_cursor(&mut self, pos: usize) {
+        match &self.screen {
+            Screen::SectionList => {
+                let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
+                let visible = self.filtered_indices(&labels);
+                if self.filter.is_some() {
+                    self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                } else if let Some(&orig) = visible.get(pos) {
+                    self.section_cursor = orig;
+                }
+            }
+            Screen::TypeList { .. } => {
+                let names: Vec<String> = self
+                    .types
+                    .iter()
+                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+                    .collect();
+                let visible = self.filtered_indices(&names);
+                if self.filter.is_some() {
+                    self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                } else if let Some(&orig) = visible.get(pos) {
+                    self.type_cursor = orig;
+                }
+            }
+            Screen::AliasList { .. } => {
+                if self.filter.is_some() {
+                    let visible = self.filtered_indices(&self.aliases);
+                    self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                } else {
+                    let total = if self.filter.is_none() {
+                        self.aliases.len() + 1 // +1 for [+ Add]
+                    } else {
+                        self.aliases.len()
+                    };
+                    self.alias_cursor = pos.min(total.saturating_sub(1));
+                }
+            }
+            Screen::AliasCreate { .. } => {}
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    match self.tab_names[self.active_tab] {
+                        ConfigTab::Personality => {
+                            self.personality_cursor =
+                                pos.min(self.personality_files.len().saturating_sub(1));
+                        }
+                        ConfigTab::Skills => {
+                            self.skills_cursor = pos.min(self.skills_list.len().saturating_sub(1));
+                        }
+                        _ => self.set_visible_field_cursor(pos),
+                    }
+                } else {
+                    self.set_visible_field_cursor(pos);
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    let visible = self.filtered_indices(&self.select_items);
+                    if self.filter.is_some() {
+                        self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                    } else if pos < visible.len() {
+                        self.select_cursor = pos;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper: set field cursor from visible position.
+    fn set_visible_field_cursor(&mut self, pos: usize) {
+        let tab_indices = self.tab_field_indices();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
+        let filter_vis = self.filtered_indices(&tab_names);
+        let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
+        if self.filter.is_some() {
+            self.filter_cursor = pos.min(filter_vis.len().saturating_sub(1));
+        } else if let Some(&orig) = visible.get(pos) {
+            self.field_cursor = orig;
+        }
+    }
+
+    /// Activate the currently selected item (double-click equivalent of Enter).
+    async fn activate_mouse(&mut self, term: &mut Term) -> Result<()> {
+        match &self.screen {
+            Screen::SectionList => {
+                let idx = self.section_cursor;
+                self.enter_section(idx).await?;
+            }
+            Screen::TypeList { .. } => {
+                let idx = self.type_cursor;
+                self.enter_type(idx).await?;
+            }
+            Screen::AliasList { .. } => {
+                if self.alias_cursor < self.aliases.len() {
+                    let idx = self.alias_cursor;
+                    self.enter_alias(idx).await?;
+                }
+                // If on [+ Add], double-click does nothing — use keyboard.
+            }
+            Screen::AliasCreate { .. } => {}
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    // Double-click on personality file or skill opens editor —
+                    // that requires async loading which mirrors the Enter key
+                    // handler. For now, no-op on composite tabs.
+                } else if self.field_cursor < self.fields.len() {
+                    self.enter_field_edit(self.field_cursor, term).await;
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    let visible = self.filtered_indices(&self.select_items);
+                    let cursor = if self.filter.is_some() {
+                        self.filter_cursor
+                    } else {
+                        self.select_cursor
+                    };
+                    if let Some(&orig) = visible.get(cursor) {
+                        self.commit_select(orig).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── Data loading ─────────────────────────────────────────────
+
+    fn types_for_section(&self, section_key: &str) -> Vec<ConfigTemplateEntry> {
+        let prefix = format!("{}.", section_key);
+        self.templates
+            .iter()
+            .filter(|t| t.path.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    async fn load_type_alias_counts(&mut self) -> Result<()> {
+        self.type_alias_counts.clear();
+        for tmpl in &self.types {
+            let count = self
+                .rpc
+                .config_map_keys(&tmpl.path)
+                .await
+                .map(|k| k.len())
+                .unwrap_or(0);
+            self.type_alias_counts.push(count);
+        }
+        Ok(())
+    }
+
+    /// Bridge the sync zerocode pane to the async RPC client: lazily load the
+    /// locale registry when the Locale tab needs it, and drain a queued
+    /// "download locale file" request. Errors surface to the pane status line —
+    /// no crash, no orphaned request.
+    async fn sync_zerocode_locales(&mut self) {
+        if self.section != ConfigSection::Zerocode {
+            return;
+        }
+        if self.zerocode.locale_needs_list() {
+            match self.rpc.locales_list().await {
+                Ok(locales) => self.zerocode.set_locales(locales),
+                // Surface the failure instead of silently retrying forever on
+                // every keypress with the tab stuck on "loading locales…".
+                Err(e) => self.zerocode.report_list_error(&e.to_string()),
+            }
+        }
+        if let Some(locale) = self.zerocode.take_pending_fetch() {
+            match self.rpc.locales_fetch(&locale, &[]).await {
+                Ok(res) => self
+                    .zerocode
+                    .apply_fetched(&locale, &res.catalogs, &res.skipped),
+                Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
+            }
+        }
+    }
+
+    async fn load_aliases(&mut self, map_path: &str) -> Result<()> {
+        self.aliases = self.rpc.config_map_keys(map_path).await?;
+        self.alias_enabled.clear();
+        for alias in &self.aliases {
+            let enabled_path = format!("{}.{}.enabled", map_path, alias);
+            let fields = self
+                .rpc
+                .config_list(Some(&enabled_path))
+                .await
+                .unwrap_or_default();
+            let status = fields.first().and_then(|f| {
+                f.value
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "true")
+            });
+            self.alias_enabled.push(status);
+        }
+        self.alias_cursor = 0;
+        Ok(())
+    }
+
+    async fn load_fields(&mut self, prefix: &str) -> Result<()> {
+        self.fields = self.rpc.config_list(Some(prefix)).await?;
+        self.field_cursor = 0;
+        // Compute distinct tab names in field-declaration order.
+        let mut tabs = Vec::new();
+        for f in &self.fields {
+            if !f.tab.is_none() && !tabs.contains(&f.tab) {
+                tabs.push(f.tab);
+            }
+        }
+        // Append composite tabs for agents and skill-bundles.
+        let mut has_composite = false;
+        if prefix.starts_with("agents.") {
+            tabs.push(ConfigTab::Personality);
+            has_composite = true;
+            // Extract agent alias from prefix (agents.<alias>).
+            let agent = prefix.strip_prefix("agents.").unwrap_or("").to_string();
+            self.personality_agent = agent;
+            self.personality_active_file = None;
+            self.personality_files.clear();
+            self.personality_cursor = 0;
+        }
+        if prefix.starts_with("skill-bundles.") {
+            tabs.push(ConfigTab::Skills);
+            has_composite = true;
+            let bundle = prefix
+                .strip_prefix("skill-bundles.")
+                .unwrap_or("")
+                .to_string();
+            self.skills_bundle = bundle;
+            self.skills_active = None;
+            self.skills_list.clear();
+            self.skills_cursor = 0;
+        }
+        // When composite tabs exist and some fields have no tab annotation,
+        // prepend a "Settings" tab so those fields remain accessible.
+        if has_composite && self.fields.iter().any(|f| f.tab == ConfigTab::None) {
+            tabs.insert(0, ConfigTab::Settings);
+            // Re-tag un-annotated fields so tab_field_indices() finds them.
+            for f in &mut self.fields {
+                if f.tab == ConfigTab::None {
+                    f.tab = ConfigTab::Settings;
+                }
+            }
+        }
+        self.tab_names = tabs;
+        self.active_tab = 0;
+        // Eagerly load composite-tab data so it's ready when the user
+        // switches to that tab (avoids showing an empty list).
+        if has_composite {
+            if prefix.starts_with("agents.") {
+                let _ = self.load_personality_files().await;
+            }
+            if prefix.starts_with("skill-bundles.") {
+                let _ = self.load_skills_list().await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh field values from the server WITHOUT disturbing UI state
+    /// (active tab, cursor, scroll, filter). Used on tab/pane transitions
+    /// so values stay current after out-of-band edits. Silent on failure —
+    /// retains the previously loaded data so the user sees no flicker.
+    async fn reload_fields_silent(&mut self, prefix: &str) {
+        let Ok(new_fields) = self.rpc.config_list(Some(prefix)).await else {
+            return;
+        };
+        // Preserve the synthesised Settings/composite tab promotion logic
+        // from load_fields(): if a Settings tab exists, retag un-annotated
+        // fields so tab_field_indices() keeps finding them.
+        let has_settings_tab = self.tab_names.contains(&ConfigTab::Settings);
+        let mut new_fields = new_fields;
+        if has_settings_tab {
+            for f in &mut new_fields {
+                if f.tab == ConfigTab::None {
+                    f.tab = ConfigTab::Settings;
+                }
+            }
+        }
+        self.fields = new_fields;
+        // Clamp cursor in case fields shrank.
+        if !self.fields.is_empty() && self.field_cursor >= self.fields.len() {
+            self.field_cursor = self.fields.len() - 1;
+        }
+    }
+
+    /// Convenience: silently reload whichever prefix the current FieldList
+    /// is displaying. No-op when the current screen is not a FieldList.
+    async fn reload_current_field_list_silent(&mut self) {
+        let prefix = match &self.screen {
+            Screen::FieldList { prefix, .. } => prefix.clone(),
+            _ => return,
+        };
+        self.reload_fields_silent(&prefix).await;
+    }
+
+    /// Indices of fields visible under the active tab (all fields when no tabs).
+    fn tab_field_indices(&self) -> Vec<usize> {
+        if self.tab_names.is_empty() {
+            return (0..self.fields.len()).collect();
+        }
+        let active = &self.tab_names[self.active_tab];
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.tab == *active)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Whether the active tab is a composite (custom-rendered) tab.
+    fn is_composite_tab(&self) -> bool {
+        if self.tab_names.is_empty() {
+            return false;
+        }
+        matches!(
+            self.tab_names[self.active_tab],
+            ConfigTab::Personality | ConfigTab::Skills
+        )
+    }
+
+    async fn load_personality_files(&mut self) -> Result<()> {
+        let result = self
+            .rpc
+            .personality_list(Some(&self.personality_agent))
+            .await?;
+        self.personality_files = result.files;
+        self.personality_max_chars = result.max_chars;
+        self.personality_cursor = 0;
+        self.personality_active_file = None;
+        self.personality_content.clear();
+        self.personality_loaded.clear();
+        Ok(())
+    }
+
+    async fn load_personality_file(&mut self, filename: &str) -> Result<()> {
+        let result = self
+            .rpc
+            .personality_get(&self.personality_agent, filename)
+            .await?;
+        let content = result.content.unwrap_or_default();
+        self.personality_loaded = content.clone();
+        self.personality_content = content;
+        self.personality_active_file = Some(filename.to_string());
+        Ok(())
+    }
+
+    async fn load_skills_list(&mut self) -> Result<()> {
+        let result = self.rpc.skills_list(Some(&self.skills_bundle)).await?;
+        self.skills_list = result.skills;
+        self.skills_cursor = 0;
+        self.skills_active = None;
+        self.skills_body.clear();
+        self.skills_body_loaded.clear();
+        self.skills_frontmatter = Default::default();
+        self.skills_frontmatter_loaded = Default::default();
+        Ok(())
+    }
+
+    async fn load_skill(&mut self, name: &str) -> Result<()> {
+        let result = self.rpc.skills_read(&self.skills_bundle, name).await?;
+        self.skills_body_loaded = result.body.clone();
+        self.skills_body = result.body;
+        self.skills_frontmatter_loaded = result.frontmatter.clone();
+        self.skills_frontmatter = result.frontmatter;
+        self.skills_active = Some(name.to_string());
+        Ok(())
+    }
+
+    // ── Section list ─────────────────────────────────────────────
+
+    async fn handle_section_list(&mut self, key: KeyEvent) -> Result<bool> {
+        let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
+        let visible = self.filtered_indices(&labels);
+
+        match self.handle_filter_key(key, visible.len()) {
+            FilterAction::Consumed => return Ok(false),
+            FilterAction::Accept => {
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.section_cursor = orig;
+                    self.deactivate_filter();
+                    return self.enter_section(orig).await;
+                }
+                return Ok(false);
+            }
+            FilterAction::Passthrough => {}
+        }
+
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => return Ok(false),
+            Some(ConfigTabAction::Up) => {
+                self.section_cursor = self.section_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.section_cursor + 1 < self.sections.len() => {
+                self.section_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                return self.enter_section(self.section_cursor).await;
+            }
+            // Right drills into the highlighted section, mirroring the zerocode
+            // tab's cursor model (Enter and Right both step inward).
+            Some(ConfigTabAction::TabRight) => {
+                return self.enter_section(self.section_cursor).await;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn enter_section(&mut self, idx: usize) -> Result<bool> {
+        if let Some(section) = self.sections.get(idx) {
+            let section_key = section.key.clone();
+            match section.shape {
+                Some(SectionShape::TypedFamilyMap) => {
+                    self.types = self.types_for_section(&section_key);
+                    self.type_cursor = 0;
+                    self.load_type_alias_counts().await?;
+                    self.screen = Screen::TypeList { section_idx: idx };
+                }
+                Some(SectionShape::OneTierAliasMap) => {
+                    self.load_aliases(&section_key).await?;
+                    self.screen = Screen::AliasList {
+                        section_idx: idx,
+                        map_path: section_key.clone(),
+                        breadcrumb: vec![section_key],
+                    };
+                }
+                Some(SectionShape::DirectForm) | Some(SectionShape::BackendPicker) | None => {
+                    self.load_fields(&section_key).await?;
+                    self.screen = Screen::FieldList {
+                        section_idx: idx,
+                        prefix: section_key.clone(),
+                        breadcrumb: vec![section_key],
+                    };
+                }
+            }
+            self.status_msg = None;
+        }
+        Ok(false)
+    }
+
+    // ── Type list (TypedFamilyMap) ───────────────────────────────
+
+    async fn handle_type_list(&mut self, key: KeyEvent) -> Result<()> {
+        let type_names: Vec<String> = self
+            .types
+            .iter()
+            .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+            .collect();
+        let visible = self.filtered_indices(&type_names);
+
+        match self.handle_filter_key(key, visible.len()) {
+            FilterAction::Consumed => return Ok(()),
+            FilterAction::Accept => {
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.deactivate_filter();
+                    return self.enter_type(orig).await;
+                }
+                return Ok(());
+            }
+            FilterAction::Passthrough => {}
+        }
+
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
+                self.screen = Screen::SectionList;
+                self.status_msg = None;
+            }
+            Some(ConfigTabAction::Up) => {
+                self.type_cursor = self.type_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.type_cursor + 1 < self.types.len() => {
+                self.type_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                self.enter_type(self.type_cursor).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn enter_type(&mut self, orig_idx: usize) -> Result<()> {
+        if let (Some(tmpl), Screen::TypeList { section_idx }) =
+            (self.types.get(orig_idx), &self.screen)
+        {
+            let section_idx = *section_idx;
+            let map_path = tmpl.path.clone();
+            let type_name = map_path.rsplit('.').next().unwrap_or(&map_path).to_string();
+            let section_key = self.sections[section_idx].key.clone();
+            self.load_aliases(&map_path).await?;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb: vec![section_key, type_name],
+            };
+            self.status_msg = None;
+        }
+        Ok(())
+    }
+
+    // ── Alias list ───────────────────────────────────────────────
+
+    async fn handle_alias_list(&mut self, key: KeyEvent) -> Result<()> {
+        let visible = self.filtered_indices(&self.aliases);
+        // +1 for [+ Add] (only when not filtering)
+        let has_add = self.filter.is_none();
+        let visible_total = if has_add {
+            visible.len() + 1
+        } else {
+            visible.len()
+        };
+
+        match self.handle_filter_key(key, visible.len()) {
+            FilterAction::Consumed => return Ok(()),
+            FilterAction::Accept => {
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.deactivate_filter();
+                    return self.enter_alias(orig).await;
+                }
+                return Ok(());
+            }
+            FilterAction::Passthrough => {}
+        }
+
+        let add_pos = visible.len(); // position of [+ Add] in the rendered list
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
+                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+                if let Screen::AliasList {
+                    section_idx,
+                    breadcrumb,
+                    ..
+                } = screen
+                    && breadcrumb.len() >= 2
+                {
+                    self.types = self.types_for_section(&self.sections[section_idx].key);
+                    self.screen = Screen::TypeList { section_idx };
+                }
+                self.status_msg = None;
+            }
+            Some(ConfigTabAction::Up) => {
+                self.alias_cursor = self.alias_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
+                self.alias_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                if has_add && self.alias_cursor == add_pos {
+                    if let Screen::AliasList {
+                        section_idx,
+                        map_path,
+                        breadcrumb,
+                        ..
+                    } = &self.screen
+                    {
+                        self.edit_buf.clear();
+                        self.screen = Screen::AliasCreate {
+                            section_idx: *section_idx,
+                            map_path: map_path.clone(),
+                            breadcrumb: breadcrumb.clone(),
+                        };
+                    }
+                } else if self.alias_cursor < self.aliases.len() {
+                    self.enter_alias(self.alias_cursor).await?;
+                }
+            }
+            Some(ConfigTabAction::ToggleSecret) if self.alias_cursor < self.aliases.len() => {
+                if let Screen::AliasList { map_path, .. } = &self.screen {
+                    let alias = self.aliases[self.alias_cursor].clone();
+                    let map_path = map_path.clone();
+                    match self.rpc.config_map_key_delete(&map_path, &alias).await {
+                        Ok(()) => {
+                            self.status_msg = Some(format!("Deleted {alias}"));
+                            self.load_aliases(&map_path).await?;
+                            if self.alias_cursor > 0 && self.alias_cursor >= self.aliases.len() {
+                                self.alias_cursor = self.aliases.len().saturating_sub(1);
+                            }
+                        }
+                        Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn enter_alias(&mut self, orig_idx: usize) -> Result<()> {
+        if let Some(alias) = self.aliases.get(orig_idx)
+            && let Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+                ..
+            } = &self.screen
+        {
+            let prefix = format!("{}.{}", map_path, alias);
+            let mut bc = breadcrumb.clone();
+            bc.push(alias.clone());
+            let si = *section_idx;
+            self.load_fields(&prefix).await?;
+            self.screen = Screen::FieldList {
+                section_idx: si,
+                prefix,
+                breadcrumb: bc,
+            };
+            self.status_msg = None;
+        }
+        Ok(())
+    }
+
+    // ── Alias creation ───────────────────────────────────────────
+
+    async fn handle_alias_create(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                if let Screen::AliasCreate {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                    ..
+                } = std::mem::replace(&mut self.screen, Screen::SectionList)
+                {
+                    self.load_aliases(&map_path).await?;
+                    self.screen = Screen::AliasList {
+                        section_idx,
+                        map_path,
+                        breadcrumb,
+                    };
+                }
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                let name = self.edit_buf.trim().to_string();
+                if name.is_empty() {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-empty"));
+                    return Ok(());
+                }
+                if let Screen::AliasCreate {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                    ..
+                } = std::mem::replace(&mut self.screen, Screen::SectionList)
+                {
+                    match self.rpc.config_map_key_create(&map_path, &name).await {
+                        Ok(()) => {
+                            let prefix = format!("{}.{}", map_path, name);
+                            let mut bc = breadcrumb;
+                            bc.push(name);
+                            self.load_fields(&prefix).await?;
+                            self.screen = Screen::FieldList {
+                                section_idx,
+                                prefix,
+                                breadcrumb: bc,
+                            };
+                            self.status_msg = None;
+                        }
+                        Err(e) => {
+                            self.status_msg = Some(format!("Create failed: {e}"));
+                            self.load_aliases(&map_path).await?;
+                            self.screen = Screen::AliasList {
+                                section_idx,
+                                map_path,
+                                breadcrumb,
+                            };
+                        }
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                self.edit_buf.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.edit_buf.push(c);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── Field list ───────────────────────────────────────────────
+
+    async fn handle_field_list(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        // Composite tabs get their own handler; only ←/→/Esc fall through.
+        if self.is_composite_tab() {
+            match self.tab_names[self.active_tab] {
+                ConfigTab::Personality => {
+                    return self.handle_personality_tab(key, term).await;
+                }
+                ConfigTab::Skills => return self.handle_skills_tab(key, term).await,
+                _ => {}
+            }
+        }
+
+        // Fields visible under active tab, then filtered by `/` query.
+        let tab_indices = self.tab_field_indices();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
+        let filter_vis = self.filtered_indices(&tab_names);
+        // Map back to original field indices.
+        let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
+
+        match self.handle_filter_key(key, visible.len()) {
+            FilterAction::Consumed => return Ok(()),
+            FilterAction::Accept => {
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.deactivate_filter();
+                    self.field_cursor = orig;
+                    self.enter_field_edit(orig, term).await;
+                }
+                return Ok(());
+            }
+            FilterAction::Passthrough => {}
+        }
+
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::TabLeft) if !self.tab_names.is_empty() => {
+                self.active_tab = self.active_tab.saturating_sub(1);
+                self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
+                self.deactivate_filter();
+                self.on_tab_switched(term).await?;
+                return Ok(());
+            }
+            Some(ConfigTabAction::TabRight) if !self.tab_names.is_empty() => {
+                if self.active_tab + 1 < self.tab_names.len() {
+                    self.active_tab += 1;
+                }
+                self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
+                self.deactivate_filter();
+                self.on_tab_switched(term).await?;
+                return Ok(());
+            }
+            Some(ConfigTabAction::Back) => {
+                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+                if let Screen::FieldList {
+                    section_idx,
+                    breadcrumb,
+                    ..
+                } = screen
+                    && breadcrumb.len() >= 2
+                {
+                    let mut bc = breadcrumb;
+                    bc.pop();
+                    let section_key = &self.sections[section_idx].key;
+                    let map_path = if bc.len() == 1 {
+                        section_key.clone()
+                    } else {
+                        format!("{}.{}", section_key, bc[1..].join("."))
+                    };
+                    self.load_aliases(&map_path).await?;
+                    self.screen = Screen::AliasList {
+                        section_idx,
+                        map_path,
+                        breadcrumb: bc,
+                    };
+                }
+                self.status_msg = None;
+            }
+            Some(ConfigTabAction::Up) => {
+                if let Some(pos) = visible.iter().position(|&i| i == self.field_cursor) {
+                    if pos > 0 {
+                        self.field_cursor = visible[pos - 1];
+                    }
+                } else if let Some(&first) = visible.first() {
+                    self.field_cursor = first;
+                }
+            }
+            Some(ConfigTabAction::Down) => {
+                if let Some(pos) = visible.iter().position(|&i| i == self.field_cursor) {
+                    if pos + 1 < visible.len() {
+                        self.field_cursor = visible[pos + 1];
+                    }
+                } else if let Some(&first) = visible.first() {
+                    self.field_cursor = first;
+                }
+            }
+            Some(ConfigTabAction::Enter) if visible.contains(&self.field_cursor) => {
+                self.enter_field_edit(self.field_cursor, term).await;
+            }
+            Some(ConfigTabAction::DeleteRow) => {
+                if let Some(field) = self.fields.get(self.field_cursor) {
+                    let prop = field.path.clone();
+                    let saved_cursor = self.field_cursor;
+                    if let Screen::FieldList { prefix, .. } = &self.screen {
+                        let prefix = prefix.clone();
+                        match self.rpc.config_delete(&prop).await {
+                            Ok(()) => {
+                                self.status_msg = Some(format!("Reset {prop}"));
+                                self.load_fields(&prefix).await?;
+                                self.field_cursor =
+                                    saved_cursor.min(self.fields.len().saturating_sub(1));
+                            }
+                            Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ── Composite tab helpers ──────────────────────────────────────
+
+    /// Called after ←/→ tab switch — loads data for composite tabs.
+    async fn on_tab_switched(&mut self, term: &mut Term) -> Result<()> {
+        // Silent refresh of the underlying field list so values stay
+        // current after out-of-band edits — no flicker, no status churn.
+        self.reload_current_field_list_silent().await;
+
+        if !self.is_composite_tab() {
+            return Ok(());
+        }
+        match self.tab_names[self.active_tab] {
+            ConfigTab::Personality if self.personality_files.is_empty() => {
+                self.status_msg = Some(crate::i18n::t("zc-config-status-loading-personality"));
+                let _ = self.draw(term);
+                match self.load_personality_files().await {
+                    Ok(()) => self.status_msg = None,
+                    Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                }
+            }
+            ConfigTab::Skills if self.skills_list.is_empty() => {
+                self.status_msg = Some(crate::i18n::t("zc-config-status-loading-skills"));
+                let _ = self.draw(term);
+                match self.load_skills_list().await {
+                    Ok(()) => self.status_msg = None,
+                    Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ── Personality tab handler ──────────────────────────────────
+
+    async fn handle_personality_tab(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        // Two modes: file picker (no active file) or editor (active file).
+        if self.personality_active_file.is_some() {
+            return self.handle_personality_editor(key, term).await;
+        }
+
+        // Tab navigation still works on composite tabs.
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::TabLeft) => {
+                self.active_tab = self.active_tab.saturating_sub(1);
+                self.deactivate_filter();
+                self.on_tab_switched(term).await?;
+                return Ok(());
+            }
+            Some(ConfigTabAction::TabRight) if self.active_tab + 1 < self.tab_names.len() => {
+                self.active_tab += 1;
+                self.deactivate_filter();
+                self.on_tab_switched(term).await?;
+                return Ok(());
+            }
+            Some(ConfigTabAction::Back) => {
+                // Back to alias list (reuse the normal Esc logic).
+                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+                if let Screen::FieldList {
+                    section_idx,
+                    breadcrumb,
+                    ..
+                } = screen
+                    && breadcrumb.len() >= 2
+                {
+                    let mut bc = breadcrumb;
+                    bc.pop();
+                    let section_key = &self.sections[section_idx].key;
+                    let map_path = if bc.len() == 1 {
+                        section_key.clone()
+                    } else {
+                        format!("{}.{}", section_key, bc[1..].join("."))
+                    };
+                    self.load_aliases(&map_path).await?;
+                    self.screen = Screen::AliasList {
+                        section_idx,
+                        map_path,
+                        breadcrumb: bc,
+                    };
+                }
+                self.status_msg = None;
+                return Ok(());
+            }
+            Some(ConfigTabAction::Up) => {
+                self.personality_cursor = self.personality_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down)
+                if self.personality_cursor + 1 < self.personality_files.len() =>
+            {
+                self.personality_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                if let Some(file) = self.personality_files.get(self.personality_cursor) {
+                    let filename = file.filename.clone();
+                    self.status_msg = Some(format!("Loading {filename}..."));
+                    let _ = self.draw(term);
+                    match self.load_personality_file(&filename).await {
+                        Ok(()) => {
+                            // Try $EDITOR first; fall back to inline editor.
+                            match edit_in_external_editor(
+                                term,
+                                &self.personality_content,
+                                &filename,
+                            ) {
+                                Ok(edited) => {
+                                    self.personality_content = edited;
+                                    if self.personality_content != self.personality_loaded {
+                                        // Auto-save after $EDITOR.
+                                        let agent = self.personality_agent.clone();
+                                        let content = self.personality_content.clone();
+                                        match self
+                                            .rpc
+                                            .personality_put(&agent, &filename, &content)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                self.personality_loaded =
+                                                    self.personality_content.clone();
+                                                self.status_msg = Some(format!("Saved {filename}"));
+                                                let _ = self.load_personality_files().await;
+                                            }
+                                            Err(e) => {
+                                                self.status_msg = Some(format!("Save failed: {e}"));
+                                            }
+                                        }
+                                    } else {
+                                        self.status_msg = None;
+                                    }
+                                    self.personality_active_file = None;
+                                }
+                                Err(_) => {
+                                    self.status_msg = None;
+                                }
+                            }
+                        }
+                        Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                    }
+                }
+            }
+            Some(ConfigTabAction::ApplyTemplate) => {
+                // Fill selected file from default template.
+                if let Some(file) = self.personality_files.get(self.personality_cursor) {
+                    let filename = file.filename.clone();
+                    let agent = self.personality_agent.clone();
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-fetching-templates"));
+                    let _ = self.draw(term);
+                    match self.rpc.personality_templates(Some(&agent)).await {
+                        Ok(result) => {
+                            if let Some(tmpl) = result.files.iter().find(|f| f.filename == filename)
+                            {
+                                self.personality_content = tmpl.content.clone();
+                                self.personality_loaded.clear();
+                                self.personality_active_file = Some(filename.clone());
+
+                                // Try $EDITOR, fall back to inline.
+                                match edit_in_external_editor(
+                                    term,
+                                    &self.personality_content,
+                                    &filename,
+                                ) {
+                                    Ok(edited) => {
+                                        self.personality_content = edited;
+                                        if !self.personality_content.is_empty() {
+                                            let content = self.personality_content.clone();
+                                            match self
+                                                .rpc
+                                                .personality_put(&agent, &filename, &content)
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    self.personality_loaded =
+                                                        self.personality_content.clone();
+                                                    self.status_msg =
+                                                        Some(format!("Saved {filename}"));
+                                                    let _ = self.load_personality_files().await;
+                                                }
+                                                Err(e) => {
+                                                    self.status_msg =
+                                                        Some(format!("Save failed: {e}"));
+                                                }
+                                            }
+                                        } else {
+                                            self.status_msg = None;
+                                        }
+                                        self.personality_active_file = None;
+                                    }
+                                    Err(_) => {
+                                        self.status_msg =
+                                            Some(format!("Template loaded for {filename}"));
+                                    }
+                                }
+                            } else {
+                                self.status_msg =
+                                    Some(format!("No template available for {filename}"));
+                            }
+                        }
+                        Err(e) => self.status_msg = Some(format!("Template fetch failed: {e}")),
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_personality_editor(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                // Back to file picker. Warn if dirty.
+                if self.personality_content != self.personality_loaded {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-unsaved-discarded"));
+                }
+                self.personality_active_file = None;
+            }
+            Some(ConfigEditorAction::Save) => {
+                if let Some(filename) = &self.personality_active_file {
+                    let filename = filename.clone();
+                    let agent = self.personality_agent.clone();
+                    let content = self.personality_content.clone();
+                    if content.chars().count() > self.personality_max_chars {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-personality-over-limit",
+                            &[("limit", &self.personality_max_chars.to_string())],
+                        ));
+                        return Ok(());
+                    }
+                    self.status_msg = Some(format!("Saving {filename}..."));
+                    let _ = self.draw(term);
+                    match self.rpc.personality_put(&agent, &filename, &content).await {
+                        Ok(_) => {
+                            self.personality_loaded = self.personality_content.clone();
+                            self.status_msg = Some(format!("Saved {filename}"));
+                            let _ = self.load_personality_files().await;
+                            self.personality_active_file = Some(filename);
+                        }
+                        Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.personality_content.push('\n');
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                self.personality_content.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.personality_content.push(c);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── Skills tab handler ───────────────────────────────────────
+
+    async fn handle_skills_tab(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        // Two modes: skill picker (no active skill) or editor (active skill).
+        if self.skills_active.is_some() {
+            return self.handle_skills_editor(key, term).await;
+        }
+
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::TabLeft) => {
+                self.active_tab = self.active_tab.saturating_sub(1);
+                self.deactivate_filter();
+                self.on_tab_switched(term).await?;
+                return Ok(());
+            }
+            Some(ConfigTabAction::TabRight) => {
+                if self.active_tab + 1 < self.tab_names.len() {
+                    self.active_tab += 1;
+                }
+                self.deactivate_filter();
+                self.on_tab_switched(term).await?;
+                return Ok(());
+            }
+            Some(ConfigTabAction::Back) => {
+                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+                if let Screen::FieldList {
+                    section_idx,
+                    breadcrumb,
+                    ..
+                } = screen
+                    && breadcrumb.len() >= 2
+                {
+                    let mut bc = breadcrumb;
+                    bc.pop();
+                    let section_key = &self.sections[section_idx].key;
+                    let map_path = if bc.len() == 1 {
+                        section_key.clone()
+                    } else {
+                        format!("{}.{}", section_key, bc[1..].join("."))
+                    };
+                    self.load_aliases(&map_path).await?;
+                    self.screen = Screen::AliasList {
+                        section_idx,
+                        map_path,
+                        breadcrumb: bc,
+                    };
+                }
+                self.status_msg = None;
+                return Ok(());
+            }
+            Some(ConfigTabAction::Up) => {
+                self.skills_cursor = self.skills_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.skills_cursor + 1 < self.skills_list.len() => {
+                self.skills_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                if let Some(skill) = self.skills_list.get(self.skills_cursor) {
+                    let name = skill.name.clone();
+                    self.status_msg = Some(format!("Loading {name}..."));
+                    let _ = self.draw(term);
+                    match self.load_skill(&name).await {
+                        Ok(()) => {
+                            let hint = format!("{name}.SKILL.md");
+                            match edit_in_external_editor(term, &self.skills_body, &hint) {
+                                Ok(edited) => {
+                                    self.skills_body = edited;
+                                    if self.skills_body != self.skills_body_loaded {
+                                        let bundle = self.skills_bundle.clone();
+                                        let fm = self.skills_frontmatter.clone();
+                                        let body = self.skills_body.clone();
+                                        match self
+                                            .rpc
+                                            .skills_write(&bundle, &name, &fm, &body)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                self.skills_body_loaded = self.skills_body.clone();
+                                                self.status_msg = Some(format!("Saved {name}"));
+                                            }
+                                            Err(e) => {
+                                                self.status_msg = Some(format!("Save failed: {e}"));
+                                            }
+                                        }
+                                    } else {
+                                        self.status_msg = None;
+                                    }
+                                    self.skills_active = None;
+                                }
+                                Err(_) => {
+                                    self.status_msg = None;
+                                    // $EDITOR unavailable — falls into inline editor.
+                                }
+                            }
+                        }
+                        Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                    }
+                }
+            }
+            Some(ConfigTabAction::ToggleSecret) => {
+                if let Some(skill) = self.skills_list.get(self.skills_cursor) {
+                    let name = skill.name.clone();
+                    let bundle = self.skills_bundle.clone();
+                    self.status_msg = Some(format!("Deleting {name}..."));
+                    let _ = self.draw(term);
+                    match self.rpc.skills_delete(&bundle, &name).await {
+                        Ok(_) => {
+                            self.status_msg = Some(format!("Archived {name}"));
+                            let _ = self.load_skills_list().await;
+                        }
+                        Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_skills_editor(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                if self.skills_body != self.skills_body_loaded {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-unsaved-discarded"));
+                }
+                self.skills_active = None;
+            }
+            Some(ConfigEditorAction::Save) => {
+                if let Some(name) = &self.skills_active {
+                    let name = name.clone();
+                    let bundle = self.skills_bundle.clone();
+                    let frontmatter = self.skills_frontmatter.clone();
+                    let body = self.skills_body.clone();
+                    self.status_msg = Some(format!("Saving {name}..."));
+                    let _ = self.draw(term);
+                    match self
+                        .rpc
+                        .skills_write(&bundle, &name, &frontmatter, &body)
+                        .await
+                    {
+                        Ok(_) => {
+                            self.skills_body_loaded = self.skills_body.clone();
+                            self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
+                            self.status_msg = Some(format!("Saved {name}"));
+                        }
+                        Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.skills_body.push('\n');
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                self.skills_body.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.skills_body.push(c);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn enter_field_edit(&mut self, idx: usize, term: &mut Term) {
+        self.prepare_edit_at(idx);
+
+        // Model field inside a provider alias → fetch available models.
+        let field_path = self.fields[idx].path.clone();
+        let field_current = self.fields[idx]
+            .value
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if field_path.ends_with(".model") && field_path.starts_with("providers.models.") {
+            // providers.models.<family>.<alias>.model → segment at index 2
+            let segments: Vec<&str> = field_path.split('.').collect();
+            if segments.len() >= 4 {
+                let family = segments[2].to_string();
+
+                // Show loading indicator before the blocking RPC call.
+                self.status_msg = Some(format!("Fetching models for {family}..."));
+                let _ = self.draw(term);
+
+                match self.rpc.catalog_models(&family).await {
+                    Ok(res) if !res.models.is_empty() => {
+                        self.select_cursor = res
+                            .models
+                            .iter()
+                            .position(|m| m == &field_current)
+                            .unwrap_or(0);
+                        self.select_items = res.models;
+                        self.status_msg = None;
+                    }
+                    Ok(_) => {
+                        self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
+                    }
+                    Err(_) => {
+                        self.status_msg =
+                            Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
+                    }
+                }
+            }
+        }
+
+        // `risk_profile` / `runtime_profile` inside an agent alias →
+        // present a picker populated from the matching map's aliases.
+        // agents.<alias>.risk_profile     → list keys of risk_profiles.*
+        // agents.<alias>.runtime_profile  → list keys of runtime_profiles.*
+        if field_path.starts_with("agents.") {
+            let segs: Vec<&str> = field_path.split('.').collect();
+            // Expect agents.<alias>.<field>
+            if segs.len() == 3 {
+                let map_path = match segs[2] {
+                    "risk_profile" => Some("risk_profiles"),
+                    "runtime_profile" => Some("runtime_profiles"),
+                    _ => None,
+                };
+                if let Some(map_path) = map_path {
+                    self.status_msg = Some(format!("Loading {map_path}..."));
+                    let _ = self.draw(term);
+                    match self.rpc.config_list(Some(map_path)).await {
+                        Ok(entries) => {
+                            let prefix = format!("{map_path}.");
+                            let mut aliases: Vec<String> = entries
+                                .iter()
+                                .filter_map(|e| e.path.strip_prefix(&prefix))
+                                .filter_map(|rest| rest.split('.').next())
+                                .map(|s| s.to_string())
+                                .collect();
+                            aliases.sort();
+                            aliases.dedup();
+                            if !aliases.is_empty() {
+                                self.select_cursor = aliases
+                                    .iter()
+                                    .position(|v| v == &field_current)
+                                    .unwrap_or(0);
+                                self.select_items = aliases;
+                                self.status_msg = None;
+                            } else {
+                                self.status_msg =
+                                    Some(format!("No {map_path} defined — enter manually"));
+                            }
+                        }
+                        Err(_) => {
+                            self.status_msg =
+                                Some(format!("{map_path} fetch failed — enter manually"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Screen::FieldList {
+            section_idx,
+            prefix,
+            breadcrumb,
+            ..
+        } = &self.screen
+        {
+            self.screen = Screen::FieldEdit {
+                section_idx: *section_idx,
+                prefix: prefix.clone(),
+                breadcrumb: breadcrumb.clone(),
+                field_idx: idx,
+            };
+        }
+    }
+
+    fn prepare_edit_at(&mut self, idx: usize) {
+        let kind = self.fields[idx].kind;
+        let value = self.fields[idx]
+            .value
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let variants = self.fields[idx].enum_variants.clone();
+
+        match kind {
+            PropKind::Bool => {
+                self.select_items = vec!["true".into(), "false".into()];
+                self.select_cursor = match value.as_deref() {
+                    Some("true") => 0,
+                    Some("false") => 1,
+                    _ => 0,
+                };
+            }
+            PropKind::Enum => {
+                self.select_items = variants;
+                let current = value.as_deref().unwrap_or("");
+                self.select_cursor = self
+                    .select_items
+                    .iter()
+                    .position(|v| v == current)
+                    .unwrap_or(0);
+            }
+            PropKind::StringArray => {
+                // Deserialize the JSON array into one entry-per-line for editing.
+                self.select_items.clear();
+                let raw = value.unwrap_or_default();
+                let entries: Vec<String> =
+                    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+                self.edit_buf = entries.join("\n");
+            }
+            _ => {
+                self.select_items.clear();
+                self.edit_buf = value.unwrap_or_default();
+            }
+        }
+    }
+
+    fn is_select_edit(&self) -> bool {
+        !self.select_items.is_empty()
+    }
+
+    // ── Filter helpers ───────────────────────────────────────────
+
+    fn activate_filter(&mut self) {
+        self.filter = Some(String::new());
+        self.filter_cursor = 0;
+    }
+
+    fn deactivate_filter(&mut self) {
+        self.filter = None;
+    }
+
+    fn filtered_indices<S: AsRef<str>>(&self, items: &[S]) -> Vec<usize> {
+        match &self.filter {
+            None => (0..items.len()).collect(),
+            Some(buf) if buf.is_empty() => (0..items.len()).collect(),
+            Some(buf) => {
+                let needle = buf.to_lowercase();
+                items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.as_ref().to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        }
+    }
+
+    fn handle_filter_key(&mut self, key: KeyEvent, filtered_len: usize) -> FilterAction {
+        use crate::keymap::Chord;
+        if self.filter.is_none() {
+            return match key.code {
+                KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.activate_filter();
+                    FilterAction::Consumed
+                }
+                _ => FilterAction::Passthrough,
+            };
+        }
+        let editor_chord = if Chord::key(KeyCode::Esc).matches(&key) {
+            Some(FilterEditAction::Cancel)
+        } else if Chord::key(KeyCode::Enter).matches(&key) {
+            Some(FilterEditAction::Accept)
+        } else if Chord::key(KeyCode::Backspace).matches(&key) {
+            Some(FilterEditAction::Backspace)
+        } else if Chord::key(KeyCode::Up).matches(&key) || Chord::char('k').matches(&key) {
+            Some(FilterEditAction::CursorUp)
+        } else if Chord::key(KeyCode::Down).matches(&key) || Chord::char('j').matches(&key) {
+            Some(FilterEditAction::CursorDown)
+        } else {
+            None
+        };
+        match editor_chord {
+            Some(FilterEditAction::Cancel) => {
+                self.deactivate_filter();
+                FilterAction::Consumed
+            }
+            Some(FilterEditAction::Accept) => FilterAction::Accept,
+            Some(FilterEditAction::Backspace) => {
+                if let Some(buf) = &mut self.filter {
+                    buf.pop();
+                    if self.filter_cursor >= filtered_len {
+                        self.filter_cursor = filtered_len.saturating_sub(1);
+                    }
+                }
+                FilterAction::Consumed
+            }
+            Some(FilterEditAction::CursorUp) => {
+                self.filter_cursor = self.filter_cursor.saturating_sub(1);
+                FilterAction::Consumed
+            }
+            Some(FilterEditAction::CursorDown) => {
+                if self.filter_cursor + 1 < filtered_len {
+                    self.filter_cursor += 1;
+                }
+                FilterAction::Consumed
+            }
+            None => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(buf) = &mut self.filter
+                {
+                    buf.push(c);
+                    self.filter_cursor = 0;
+                }
+                FilterAction::Consumed
+            }
+        }
+    }
+
+    // ── Field edit ───────────────────────────────────────────────
+
+    async fn handle_field_edit(&mut self, key: KeyEvent) -> Result<()> {
+        if self.is_select_edit() {
+            return self.handle_select_edit(key).await;
+        }
+        // For StringArray fields, Enter adds a new line (new entry), Ctrl+S saves.
+        let is_string_array = matches!(&self.screen, Screen::FieldEdit { field_idx, .. }
+            if self.fields[*field_idx].kind == PropKind::StringArray);
+
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+
+        if is_string_array {
+            match action {
+                Some(ConfigEditorAction::Cancel) => {
+                    self.pop_to_field_list().await?;
+                }
+                Some(ConfigEditorAction::Confirm) => {
+                    self.edit_buf.push('\n');
+                }
+                Some(ConfigEditorAction::Backspace) => {
+                    self.edit_buf.pop();
+                }
+                Some(ConfigEditorAction::Save) => {
+                    if let Screen::FieldEdit {
+                        prefix, field_idx, ..
+                    } = &self.screen
+                    {
+                        let prop = self.fields[*field_idx].path.clone();
+                        let prefix = prefix.clone();
+                        let entries: Vec<String> = self
+                            .edit_buf
+                            .lines()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        let value = serde_json::Value::Array(
+                            entries.into_iter().map(serde_json::Value::String).collect(),
+                        );
+                        match self.rpc.config_set(&prop, value).await {
+                            Ok(()) => {
+                                self.status_msg = Some(format!("Set {prop}"));
+                                self.load_fields(&prefix).await?;
+                                self.pop_to_field_list_keep_cursor().await?;
+                            }
+                            Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                        }
+                    }
+                }
+                _ => {
+                    if let KeyCode::Char(c) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        self.edit_buf.push(c);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                self.pop_to_field_list().await?;
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                if let Screen::FieldEdit {
+                    prefix, field_idx, ..
+                } = &self.screen
+                {
+                    let field = &self.fields[*field_idx];
+                    let prop = field.path.clone();
+                    let value = serde_json::Value::String(self.edit_buf.clone());
+                    let prefix = prefix.clone();
+                    match self.rpc.config_set(&prop, value).await {
+                        Ok(()) => {
+                            self.status_msg = Some(format!("Set {prop}"));
+                            self.load_fields(&prefix).await?;
+                            self.pop_to_field_list_keep_cursor().await?;
+                        }
+                        Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                self.edit_buf.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.edit_buf.push(c);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_select_edit(&mut self, key: KeyEvent) -> Result<()> {
+        let visible = self.filtered_indices(&self.select_items);
+
+        match self.handle_filter_key(key, visible.len()) {
+            FilterAction::Consumed => return Ok(()),
+            FilterAction::Accept => {
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.deactivate_filter();
+                    return self.commit_select(orig).await;
+                }
+                return Ok(());
+            }
+            FilterAction::Passthrough => {}
+        }
+
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
+                self.deactivate_filter();
+                self.pop_to_field_list().await?;
+            }
+            Some(ConfigTabAction::Up) => {
+                self.select_cursor = self.select_cursor.saturating_sub(1);
+            }
+            Some(ConfigTabAction::Down) if self.select_cursor + 1 < visible.len() => {
+                self.select_cursor += 1;
+            }
+            Some(ConfigTabAction::Enter) => {
+                if let Some(&orig) = visible.get(self.select_cursor) {
+                    return self.commit_select(orig).await;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn commit_select(&mut self, orig_idx: usize) -> Result<()> {
+        if let Some(chosen) = self.select_items.get(orig_idx)
+            && let Screen::FieldEdit {
+                prefix, field_idx, ..
+            } = &self.screen
+        {
+            let prop = self.fields[*field_idx].path.clone();
+            let value = serde_json::Value::String(chosen.clone());
+            let prefix = prefix.clone();
+            match self.rpc.config_set(&prop, value).await {
+                Ok(()) => {
+                    self.status_msg = Some(format!("Set {prop}"));
+                    self.load_fields(&prefix).await?;
+                    self.pop_to_field_list_keep_cursor().await?;
+                }
+                Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    async fn pop_to_field_list(&mut self) -> Result<()> {
+        if let Screen::FieldEdit {
+            section_idx,
+            prefix,
+            breadcrumb,
+            ..
+        } = std::mem::replace(&mut self.screen, Screen::SectionList)
+        {
+            // Silent refresh so values reflect any saves while editing.
+            self.reload_fields_silent(&prefix).await;
+            self.screen = Screen::FieldList {
+                section_idx,
+                prefix,
+                breadcrumb,
+            };
+        }
+        Ok(())
+    }
+
+    async fn pop_to_field_list_keep_cursor(&mut self) -> Result<()> {
+        if let Screen::FieldEdit {
+            section_idx,
+            prefix,
+            breadcrumb,
+            field_idx,
+        } = std::mem::replace(&mut self.screen, Screen::SectionList)
+        {
+            // Silent refresh — preserves cursor below.
+            self.reload_fields_silent(&prefix).await;
+            self.field_cursor = field_idx.min(self.fields.len().saturating_sub(1));
+            self.screen = Screen::FieldList {
+                section_idx,
+                prefix,
+                breadcrumb,
+            };
+        }
+        Ok(())
+    }
+
+    // ── Drawing ──────────────────────────────────────────────────
+
+    fn draw(&mut self, term: &mut Term) -> Result<()> {
+        term.draw(|frame| {
+            let area = frame.area();
+            self.draw_into(frame, area);
+        })?;
+        Ok(())
+    }
+
+    fn draw_section_list(&mut self, frame: &mut Frame, area: Rect) {
+        let r = regions(area);
+
+        render_breadcrumb(
+            frame,
+            r.breadcrumb,
+            &[crate::i18n::t("zc-config-breadcrumb-root")],
+        );
+
+        if let Some(buf) = &self.filter {
+            render_filter_bar(frame, r.help, buf);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("ZeroClaw v{}", self.rpc.server_version),
+                    theme::dim_style(),
+                )),
+                r.help,
+            );
+        }
+
+        let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
+        let visible = self.filtered_indices(&labels);
+
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|&i| {
+                let s = &self.sections[i];
+                let badge = if s.completed { " ✓" } else { "" };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{}{badge}", s.label),
+                    theme::body_style(),
+                )))
+            })
+            .collect();
+
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            // Map the real cursor to the visible position
+            visible
+                .iter()
+                .position(|&i| i == self.section_cursor)
+                .unwrap_or(0)
+        };
+
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(cursor.min(items.len().saturating_sub(1))));
+        }
+
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(" Sections "))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            r.main,
+            &mut state,
+        );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = None;
+
+        let hints = if self.filter.is_some() {
+            format!(
+                "{}  {}=open  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
+        } else {
+            "?=help".to_string()
+        };
+        self.draw_footer(frame, r, &hints);
+    }
+
+    fn draw_type_list(&mut self, frame: &mut Frame, area: Rect, section_idx: usize) {
+        let r = regions(area);
+        let section = &self.sections[section_idx];
+
+        render_breadcrumb(
+            frame,
+            r.breadcrumb,
+            &[
+                crate::i18n::t("zc-config-breadcrumb-root"),
+                section.label.clone(),
+            ],
+        );
+
+        if let Some(buf) = &self.filter {
+            render_filter_bar(frame, r.help, buf);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(&section.help, theme::dim_style()))
+                    .wrap(Wrap { trim: false }),
+                r.help,
+            );
+        }
+
+        let type_names: Vec<String> = self
+            .types
+            .iter()
+            .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+            .collect();
+        let visible = self.filtered_indices(&type_names);
+
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|&i| {
+                let name = &type_names[i];
+                let count = self.type_alias_counts.get(i).copied().unwrap_or(0);
+                let mut spans = vec![Span::styled(name.to_string(), theme::body_style())];
+                if count > 0 {
+                    spans.push(Span::styled(format!("  ({count})"), theme::accent_style()));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible
+                .iter()
+                .position(|&i| i == self.type_cursor)
+                .unwrap_or(0)
+        };
+
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(cursor.min(items.len().saturating_sub(1))));
+        }
+
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&format!(" {} ", section.label)))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            r.main,
+            &mut state,
+        );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = None;
+
+        let hints = if self.filter.is_some() {
+            format!(
+                "{}  {}=open  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
+        } else {
+            "?=help".to_string()
+        };
+        self.draw_footer(frame, r, &hints);
+    }
+
+    fn draw_alias_list(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        section_idx: usize,
+        breadcrumb: &[String],
+    ) {
+        let r = regions(area);
+        let section = &self.sections[section_idx];
+
+        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        bc.extend(breadcrumb.iter().cloned());
+        render_breadcrumb(frame, r.breadcrumb, &bc);
+
+        if let Some(buf) = &self.filter {
+            render_filter_bar(frame, r.help, buf);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(&section.help, theme::dim_style()))
+                    .wrap(Wrap { trim: false }),
+                r.help,
+            );
+        }
+
+        let visible = self.filtered_indices(&self.aliases);
+
+        let mut items: Vec<ListItem> = visible
+            .iter()
+            .map(|&i| {
+                let a = &self.aliases[i];
+                let mut spans = vec![Span::styled(a.clone(), theme::body_style())];
+                match self.alias_enabled.get(i).copied().flatten() {
+                    Some(true) => spans.push(Span::styled("  ✓", theme::accent_style())),
+                    Some(false) => spans.push(Span::styled("  disabled", theme::dim_style())),
+                    None => {}
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        // Only show [+ Add] when not filtering
+        if self.filter.is_none() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "[+ Add]",
+                theme::accent_style(),
+            ))));
+        }
+
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            self.alias_cursor
+        };
+
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(cursor.min(items.len().saturating_sub(1))));
+        }
+
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(" Aliases "))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            r.main,
+            &mut state,
+        );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = None;
+
+        let hints = if self.filter.is_some() {
+            format!(
+                "{}  {}=open  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
+        } else {
+            "?=help".to_string()
+        };
+        self.draw_footer(frame, r, &hints);
+    }
+
+    fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
+        let r = regions(area);
+
+        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        bc.extend(breadcrumb.iter().cloned());
+        bc.push(crate::i18n::t("zc-config-breadcrumb-new"));
+        render_breadcrumb(frame, r.breadcrumb, &bc);
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                crate::i18n::t("zc-config-alias-create-hint"),
+                theme::dim_style(),
+            )),
+            r.help,
+        );
+
+        let input_display = format!("{}{}", self.edit_buf, "█");
+        let input = Paragraph::new(Line::from(Span::styled(
+            input_display,
+            theme::input_style(),
+        )))
+        .block(theme::panel_block(" Alias name "));
+        frame.render_widget(input, r.main);
+
+        let footer = format!(
+            "{}={}  {}={}",
+            editor_key(crate::keymap::ConfigEditorAction::Confirm),
+            crate::i18n::t("zc-config-footer-action-create"),
+            editor_key(crate::keymap::ConfigEditorAction::Cancel),
+            crate::i18n::t("zc-config-footer-action-cancel"),
+        );
+        self.draw_footer(frame, r, &footer);
+    }
+
+    fn draw_field_list(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        _section_idx: usize,
+        breadcrumb: &[String],
+    ) {
+        let has_tabs = !self.tab_names.is_empty();
+
+        // Breadcrumb first, then optional tab bar, then the rest.
+        let mut r = regions(area);
+
+        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        bc.extend(breadcrumb.iter().cloned());
+        render_breadcrumb(frame, r.breadcrumb, &bc);
+
+        // When tabs are present, split the help row into tab bar + help.
+        // The help area is 2 rows: use the first for tabs, second for help.
+        let tab_area = if has_tabs {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(r.help);
+            r.help = split[1];
+            Some(split[0])
+        } else {
+            None
+        };
+
+        // Tab bar
+        if let Some(tab_rect) = tab_area {
+            let mut spans = Vec::new();
+            for (i, name) in self.tab_names.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" │ ", theme::dim_style()));
+                }
+                let label = name.label();
+                if i == self.active_tab {
+                    spans.push(Span::styled(
+                        format!("▸ {label}"),
+                        theme::accent_style().add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(label, theme::dim_style()));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), tab_rect);
+        }
+
+        // Composite tabs get custom rendering.
+        if self.is_composite_tab() {
+            self.last_tab_area = tab_area;
+            match self.tab_names[self.active_tab] {
+                ConfigTab::Personality => {
+                    self.draw_personality_tab(frame, r);
+                    return;
+                }
+                ConfigTab::Skills => {
+                    self.draw_skills_tab(frame, r);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Fields visible under active tab, then filtered by `/` query.
+        let tab_indices = self.tab_field_indices();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
+        let filter_vis = self.filtered_indices(&tab_names);
+        let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
+
+        if let Some(buf) = &self.filter {
+            render_filter_bar(frame, r.help, buf);
+        } else if let Some(field) = self.fields.get(self.field_cursor) {
+            frame.render_widget(
+                Paragraph::new(Span::styled(&field.description, theme::dim_style()))
+                    .wrap(Wrap { trim: false }),
+                r.help,
+            );
+        }
+
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|&i| {
+                let f = &self.fields[i];
+                let short_name =
+                    &tab_names[tab_indices.iter().position(|&ti| ti == i).unwrap_or(0)];
+                let val_display = if f.is_secret {
+                    "••••••".to_string()
+                } else {
+                    f.value
+                        .as_ref()
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| "<unset>".to_string())
+                };
+
+                let env_marker = if f.is_env_overridden { " [env]" } else { "" };
+                let line = format!("{short_name} = {val_display}{env_marker}");
+
+                let style = if f.populated {
+                    theme::body_style()
+                } else {
+                    theme::dim_style()
+                };
+                ListItem::new(Line::from(Span::styled(line, style)))
+            })
+            .collect();
+
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible
+                .iter()
+                .position(|&i| i == self.field_cursor)
+                .unwrap_or(0)
+        };
+
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(cursor.min(items.len().saturating_sub(1))));
+        }
+
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(" Fields "))
+                .highlight_style(theme::selected_style())
+                .highlight_symbol("› "),
+            r.main,
+            &mut state,
+        );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = tab_area;
+
+        let hints = if self.filter.is_some() {
+            format!(
+                "{}  {}=edit  {}=clear filter",
+                nav_keys(),
+                tab_key(crate::keymap::ConfigTabAction::Enter),
+                tab_key(crate::keymap::ConfigTabAction::Back),
+            )
+        } else {
+            "?=help".to_string()
+        };
+        self.draw_footer(frame, r, &hints);
+    }
+
+    // ── Composite tab draw methods ──────────────────────────────
+
+    fn draw_personality_tab(&mut self, frame: &mut Frame, r: Regions) {
+        if let Some(filename) = &self.personality_active_file {
+            // Editor mode: show file content as editable text.
+            let dirty = self.personality_content != self.personality_loaded;
+            let char_count = self.personality_content.chars().count();
+            let status = format!(
+                "{filename}  {char_count}/{} chars{}",
+                self.personality_max_chars,
+                if dirty { "  [modified]" } else { "" },
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(status, theme::dim_style())),
+                r.help,
+            );
+
+            // Show last ~N lines that fit the area, with a cursor block.
+            let height = r.main.height.saturating_sub(2) as usize; // border eats 2
+            let lines: Vec<&str> = self.personality_content.split('\n').collect();
+            let start = lines.len().saturating_sub(height);
+            let mut visible_lines: Vec<Line> = lines[start..]
+                .iter()
+                .map(|l| Line::from(Span::styled(*l, theme::body_style())))
+                .collect();
+            // Append cursor to last line.
+            if let Some(last) = visible_lines.last_mut() {
+                let mut spans = last.spans.clone();
+                spans.push(Span::styled("█", theme::input_style()));
+                *last = Line::from(spans);
+            }
+
+            frame.render_widget(
+                Paragraph::new(visible_lines).block(theme::panel_block(&format!(" {filename} "))),
+                r.main,
+            );
+
+            let footer = format!(
+                "{}={}  {}={}",
+                editor_key(crate::keymap::ConfigEditorAction::Save),
+                crate::i18n::t("zc-config-footer-action-save"),
+                editor_key(crate::keymap::ConfigEditorAction::Cancel),
+                crate::i18n::t("zc-config-footer-action-back-to-files"),
+            );
+            self.draw_footer(frame, r, &footer);
+        } else {
+            // File picker mode.
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    crate::i18n::t("zc-config-personality-help-blurb"),
+                    theme::dim_style(),
+                ))
+                .wrap(Wrap { trim: false }),
+                r.help,
+            );
+
+            let items: Vec<ListItem> = self
+                .personality_files
+                .iter()
+                .map(|f| {
+                    let dot = if f.exists { "●" } else { "○" };
+                    let size = if f.exists {
+                        format!("  ({} B)", f.size)
+                    } else {
+                        String::new()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{dot} "),
+                            if f.exists {
+                                theme::accent_style()
+                            } else {
+                                theme::dim_style()
+                            },
+                        ),
+                        Span::styled(f.filename.clone(), theme::body_style()),
+                        Span::styled(size, theme::dim_style()),
+                    ]))
+                })
+                .collect();
+
+            let mut state = ListState::default();
+            if !items.is_empty() {
+                state.select(Some(
+                    self.personality_cursor.min(items.len().saturating_sub(1)),
+                ));
+            }
+
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(theme::panel_block(" Personality Files "))
+                    .highlight_style(theme::selected_style())
+                    .highlight_symbol("› "),
+                r.main,
+                &mut state,
+            );
+            self.last_main_area = r.main;
+            self.last_list_offset = state.offset();
+
+            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
+            self.draw_footer(frame, r, &footer);
+        }
+    }
+
+    fn draw_skills_tab(&mut self, frame: &mut Frame, r: Regions) {
+        if let Some(name) = &self.skills_active {
+            // Editor mode.
+            let dirty = self.skills_body != self.skills_body_loaded;
+            let status = format!(
+                "{}  {}{}",
+                name,
+                self.skills_frontmatter.description,
+                if dirty { "  [modified]" } else { "" },
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(status, theme::dim_style())).wrap(Wrap { trim: false }),
+                r.help,
+            );
+
+            let height = r.main.height.saturating_sub(2) as usize;
+            let lines: Vec<&str> = self.skills_body.split('\n').collect();
+            let start = lines.len().saturating_sub(height);
+            let mut visible_lines: Vec<Line> = lines[start..]
+                .iter()
+                .map(|l| Line::from(Span::styled(*l, theme::body_style())))
+                .collect();
+            if let Some(last) = visible_lines.last_mut() {
+                let mut spans = last.spans.clone();
+                spans.push(Span::styled("█", theme::input_style()));
+                *last = Line::from(spans);
+            }
+
+            frame.render_widget(
+                Paragraph::new(visible_lines)
+                    .block(theme::panel_block(&format!(" SKILL.md — {name} "))),
+                r.main,
+            );
+
+            let footer = format!(
+                "{}={}  {}={}",
+                editor_key(crate::keymap::ConfigEditorAction::Save),
+                crate::i18n::t("zc-config-footer-action-save"),
+                editor_key(crate::keymap::ConfigEditorAction::Cancel),
+                crate::i18n::t("zc-config-footer-action-back-to-skills"),
+            );
+            self.draw_footer(frame, r, &footer);
+        } else {
+            // Skill picker mode.
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    crate::i18n::t_args(
+                        "zc-config-skills-help-blurb",
+                        &[
+                            (
+                                "enter_chord",
+                                &tab_key(crate::keymap::ConfigTabAction::Enter),
+                            ),
+                            (
+                                "archive_chord",
+                                &tab_key(crate::keymap::ConfigTabAction::ToggleSecret),
+                            ),
+                        ],
+                    ),
+                    theme::dim_style(),
+                ))
+                .wrap(Wrap { trim: false }),
+                r.help,
+            );
+
+            let items: Vec<ListItem> = self
+                .skills_list
+                .iter()
+                .map(|s| {
+                    ListItem::new(Line::from(Span::styled(
+                        s.name.clone(),
+                        theme::body_style(),
+                    )))
+                })
+                .collect();
+
+            let mut state = ListState::default();
+            if !items.is_empty() {
+                state.select(Some(self.skills_cursor.min(items.len().saturating_sub(1))));
+            }
+
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(theme::panel_block(" Skills "))
+                    .highlight_style(theme::selected_style())
+                    .highlight_symbol("› "),
+                r.main,
+                &mut state,
+            );
+            self.last_main_area = r.main;
+            self.last_list_offset = state.offset();
+
+            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
+            self.draw_footer(frame, r, &footer);
+        }
+    }
+
+    fn draw_field_edit(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        breadcrumb: &[String],
+        field_idx: usize,
+    ) {
+        let r = regions(area);
+        let field = &self.fields[field_idx];
+        let short_name = field.path.rsplit('.').next().unwrap_or(&field.path);
+
+        let mut bc: Vec<String> = vec![crate::i18n::t("zc-config-breadcrumb-root")];
+        bc.extend(breadcrumb.iter().cloned());
+        bc.push(short_name.to_string());
+        render_breadcrumb(frame, r.breadcrumb, &bc);
+
+        if self.is_select_edit() {
+            // Enum, Bool, or model select — with optional `/` filter.
+            if let Some(buf) = &self.filter {
+                render_filter_bar(frame, r.help, buf);
+            } else {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(&field.description, theme::dim_style()))
+                        .wrap(Wrap { trim: false }),
+                    r.help,
+                );
+            }
+
+            let visible = self.filtered_indices(&self.select_items);
+            let items: Vec<ListItem> = visible
+                .iter()
+                .map(|&i| {
+                    ListItem::new(Line::from(Span::styled(
+                        self.select_items[i].clone(),
+                        theme::body_style(),
+                    )))
+                })
+                .collect();
+
+            let cursor = if self.filter.is_some() {
+                self.filter_cursor
+            } else {
+                self.select_cursor
+            };
+
+            let mut state = ListState::default();
+            if !items.is_empty() {
+                state.select(Some(cursor.min(items.len().saturating_sub(1))));
+            }
+
+            let title = match field.kind {
+                PropKind::Bool => format!(" {short_name} (toggle) "),
+                PropKind::Enum => format!(" {short_name} (select) "),
+                _ => format!(" {short_name} "),
+            };
+
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(theme::panel_block(&title))
+                    .highlight_style(theme::selected_style())
+                    .highlight_symbol("› "),
+                r.main,
+                &mut state,
+            );
+            self.last_main_area = r.main;
+            self.last_list_offset = state.offset();
+            self.last_tab_area = None;
+
+            let hints = if self.filter.is_some() {
+                format!(
+                    "{}  {}=save  {}=clear filter",
+                    nav_keys(),
+                    tab_key(crate::keymap::ConfigTabAction::Enter),
+                    tab_key(crate::keymap::ConfigTabAction::Back),
+                )
+            } else {
+                "?=help".to_string()
+            };
+            self.draw_footer(frame, r, &hints);
+        } else {
+            // Text input (masked for secrets) — help text always visible.
+            frame.render_widget(
+                Paragraph::new(Span::styled(&field.description, theme::dim_style()))
+                    .wrap(Wrap { trim: false }),
+                r.help,
+            );
+            let type_prefix = crate::i18n::t("zc-config-field-type-prefix");
+            let kind_hint = if field.is_secret {
+                let suffix = crate::i18n::t("zc-config-field-type-secret-suffix");
+                format!("{type_prefix} {} {suffix}", field.kind.wire_name())
+            } else if field.kind == PropKind::StringArray {
+                let suffix = crate::i18n::t_args(
+                    "zc-config-field-type-string-array-suffix",
+                    &[("newline_chord", "Enter"), ("save_chord", "Ctrl+S")],
+                );
+                format!("{type_prefix} {} {suffix}", field.kind.wire_name())
+            } else {
+                format!("{type_prefix} {}", field.kind.wire_name())
+            };
+
+            if field.kind == PropKind::StringArray {
+                // Multi-line display: each array entry on its own line.
+                let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                    kind_hint.clone(),
+                    theme::dim_style(),
+                ))];
+                let buf_lines: Vec<&str> = self.edit_buf.split('\n').collect();
+                for (i, l) in buf_lines.iter().enumerate() {
+                    let is_last = i + 1 == buf_lines.len();
+                    let text = if is_last {
+                        format!("{l}█")
+                    } else {
+                        l.to_string()
+                    };
+                    lines.push(Line::from(Span::styled(text, theme::input_style())));
+                }
+                frame.render_widget(
+                    Paragraph::new(lines).block(theme::panel_block(&format!(
+                        " {short_name} (string_array) "
+                    ))),
+                    r.main,
+                );
+                let footer = format!(
+                    "{}={}  {}={}  {}={}",
+                    editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                    crate::i18n::t("zc-config-footer-action-new-line"),
+                    editor_key(crate::keymap::ConfigEditorAction::Save),
+                    crate::i18n::t("zc-config-footer-action-save"),
+                    editor_key(crate::keymap::ConfigEditorAction::Cancel),
+                    crate::i18n::t("zc-config-footer-action-cancel"),
+                );
+                self.draw_footer(frame, r, &footer);
+                return;
+            }
+
+            let input_display = if field.is_secret {
+                format!("{}█", "•".repeat(self.edit_buf.len()))
+            } else {
+                format!("{}█", self.edit_buf)
+            };
+
+            let input = Paragraph::new(vec![
+                Line::from(Span::styled(&kind_hint, theme::dim_style())),
+                Line::from(Span::styled(input_display, theme::input_style())),
+            ])
+            .block(theme::panel_block(&format!(" {short_name} ")));
+
+            frame.render_widget(input, r.main);
+
+            let footer = format!(
+                "{}={}  {}={}",
+                editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                crate::i18n::t("zc-config-footer-action-save"),
+                editor_key(crate::keymap::ConfigEditorAction::Cancel),
+                crate::i18n::t("zc-config-footer-action-cancel"),
+            );
+            self.draw_footer(frame, r, &footer);
+        }
+    }
+
+    fn draw_footer(&self, frame: &mut Frame, r: Regions, hints: &str) {
+        if let Some(msg) = &self.status_msg {
+            frame.render_widget(
+                Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
+                r.status,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(Span::styled(hints, theme::dim_style())),
+            r.hints,
+        );
+    }
+
+    /// Handle a bracketed-paste payload. Routes pasted text into whichever
+    /// text-input surface is currently active (filter, edit buffer, alias
+    /// create, personality/skills editor). Filters out the bracket-paste
+    /// terminator bytes and normalises CRLF.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        // Normalise line endings — bracketed paste can deliver \r, \r\n,
+        // or \n depending on terminal.
+        let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        // Filter active: paste goes into the filter buffer.
+        if let Some(buf) = self.filter.as_mut() {
+            for c in cleaned.chars() {
+                if c == '\n' {
+                    continue;
+                } // filter is single-line
+                buf.push(c);
+            }
+            return;
+        }
+
+        match &self.screen {
+            Screen::AliasCreate { .. } => {
+                // Aliases are single-line identifiers.
+                for c in cleaned.chars() {
+                    if c == '\n' {
+                        continue;
+                    }
+                    self.edit_buf.push(c);
+                }
+            }
+            Screen::FieldEdit { field_idx, .. } => {
+                if self.is_select_edit() {
+                    return; // No text input on select screens.
+                }
+                let is_string_array = self
+                    .fields
+                    .get(*field_idx)
+                    .map(|f| f.kind == PropKind::StringArray)
+                    .unwrap_or(false);
+                if is_string_array {
+                    // Preserve newlines so each pasted line becomes a new entry.
+                    self.edit_buf.push_str(&cleaned);
+                } else {
+                    // Scalar fields: strip newlines.
+                    for c in cleaned.chars() {
+                        if c == '\n' {
+                            continue;
+                        }
+                        self.edit_buf.push(c);
+                    }
+                }
+            }
+            Screen::FieldList { .. } => {
+                if self.personality_active_file.is_some() {
+                    self.personality_content.push_str(&cleaned);
+                } else if self.skills_active.is_some() {
+                    self.skills_body.push_str(&cleaned);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the pane is in a text-input mode (filter, edit buf, alias create, editors).
+    pub(crate) fn wants_text_input(&self) -> bool {
+        if self.section == ConfigSection::Zerocode {
+            return self.zerocode.wants_text_input();
+        }
+        if self.filter.is_some() {
+            return true;
+        }
+        match &self.screen {
+            Screen::AliasCreate { .. } => true,
+            Screen::FieldEdit { .. } if !self.is_select_edit() => true,
+            Screen::FieldList { .. } => {
+                self.personality_active_file.is_some() || self.skills_active.is_some()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl crate::widgets::HelpContext for App<'_> {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::HelpEntry as E;
+        // Section switch is available in either sub-tab.
+        let section_nav = E::new(
+            vec!["Tab", "Shift+Tab"],
+            crate::i18n::t("zc-config-help-switch-section"),
+        );
+        if self.section == ConfigSection::Zerocode {
+            let mut node = self.zerocode.help_context();
+            node.entries.insert(0, section_nav);
+            return node;
+        }
+        let mut node = self.zeroclaw_help_context();
+        node.entries.insert(0, section_nav);
+        node
+    }
+}
+
+impl App<'_> {
+    fn zeroclaw_help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
+        use crate::widgets::{HelpEntry as E, HelpNode};
+
+        // All chords resolve from the live keymap so overrides/vim/emacs show.
+        let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
+        let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
+        let help = || E::key("?", crate::i18n::t("zc-config-help-this-help"));
+        let filter = || E::key("/", crate::i18n::t("zc-config-help-filter"));
+        let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
+        let back = || k(A::Back, "zc-config-help-back");
+        let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
+
+        match &self.screen {
+            Screen::SectionList => {
+                if self.filter.is_some() {
+                    HelpNode::entries(vec![
+                        nav(),
+                        k(A::Enter, "zc-config-help-open-section"),
+                        clear_filter(),
+                        help(),
+                    ])
+                } else {
+                    let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
+                    HelpNode::entries(vec![
+                        nav(),
+                        E::new(open, crate::i18n::t("zc-config-help-open-section")),
+                        filter(),
+                        k(A::Back, "zc-config-help-quit"),
+                        help(),
+                        E::spacer(),
+                        mouse_open(),
+                    ])
+                }
+            }
+            Screen::TypeList { .. } => {
+                if self.filter.is_some() {
+                    HelpNode::entries(vec![
+                        nav(),
+                        k(A::Enter, "zc-config-help-open-type"),
+                        clear_filter(),
+                        help(),
+                    ])
+                } else {
+                    let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
+                    HelpNode::entries(vec![
+                        nav(),
+                        E::new(open, crate::i18n::t("zc-config-help-open-type")),
+                        filter(),
+                        back(),
+                        help(),
+                        E::spacer(),
+                        mouse_open(),
+                    ])
+                }
+            }
+            Screen::AliasList { .. } => {
+                if self.filter.is_some() {
+                    HelpNode::entries(vec![
+                        nav(),
+                        k(A::Enter, "zc-config-help-open-alias"),
+                        clear_filter(),
+                        help(),
+                    ])
+                } else {
+                    let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
+                    HelpNode::entries(vec![
+                        nav(),
+                        E::new(open, crate::i18n::t("zc-config-help-open-alias")),
+                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        filter(),
+                        back(),
+                        help(),
+                        E::spacer(),
+                        mouse_open(),
+                    ])
+                }
+            }
+            Screen::AliasCreate { .. } => HelpNode::entries(vec![
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                    crate::i18n::t("zc-config-help-create-alias"),
+                ),
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                    crate::i18n::t("zc-config-help-cancel"),
+                ),
+                help(),
+            ]),
+            Screen::FieldList { .. } => {
+                if self.filter.is_some() {
+                    HelpNode::entries(vec![
+                        nav(),
+                        k(A::Enter, "zc-config-help-edit-field"),
+                        clear_filter(),
+                        help(),
+                    ])
+                } else if self.is_composite_tab() {
+                    match self.tab_names.get(self.active_tab) {
+                        Some(ConfigTab::Personality) => {
+                            if self.personality_active_file.is_some() {
+                                HelpNode::entries(vec![
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                                        crate::i18n::t("zc-config-help-save"),
+                                    ),
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                                        crate::i18n::t("zc-config-help-back-to-files"),
+                                    ),
+                                    help(),
+                                ])
+                            } else {
+                                HelpNode::entries(vec![
+                                    E::new(
+                                        switch_tabs_keys(),
+                                        crate::i18n::t("zc-config-help-switch-tabs"),
+                                    ),
+                                    nav(),
+                                    k(A::Enter, "zc-config-help-edit-file"),
+                                    k(A::ApplyTemplate, "zc-config-help-fill-from-template"),
+                                    back(),
+                                    help(),
+                                    E::spacer(),
+                                    E::key("Mouse", crate::i18n::t("zc-config-help-mouse-tabs")),
+                                ])
+                            }
+                        }
+                        Some(ConfigTab::Skills) => {
+                            if self.skills_active.is_some() {
+                                HelpNode::entries(vec![
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                                        crate::i18n::t("zc-config-help-save"),
+                                    ),
+                                    E::new(
+                                        vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                                        crate::i18n::t("zc-config-help-back-to-skills"),
+                                    ),
+                                    help(),
+                                ])
+                            } else {
+                                HelpNode::entries(vec![
+                                    E::new(
+                                        switch_tabs_keys(),
+                                        crate::i18n::t("zc-config-help-switch-tabs"),
+                                    ),
+                                    nav(),
+                                    k(A::Enter, "zc-config-help-edit-skill"),
+                                    k(A::ToggleSecret, "zc-config-help-archive-skill"),
+                                    back(),
+                                    help(),
+                                    E::spacer(),
+                                    E::key("Mouse", crate::i18n::t("zc-config-help-mouse-tabs")),
+                                ])
+                            }
+                        }
+                        _ => self.field_list_context(),
+                    }
+                } else {
+                    self.field_list_context()
+                }
+            }
+            Screen::FieldEdit { field_idx, .. } => {
+                let is_string_array = self
+                    .fields
+                    .get(*field_idx)
+                    .map(|f| f.kind == PropKind::StringArray)
+                    .unwrap_or(false);
+                if self.is_select_edit() {
+                    if self.filter.is_some() {
+                        HelpNode::entries(vec![
+                            nav(),
+                            k(A::Enter, "zc-config-help-save-selection"),
+                            clear_filter(),
+                            help(),
+                        ])
+                    } else {
+                        HelpNode::entries(vec![
+                            nav(),
+                            k(A::Enter, "zc-config-help-save-selection"),
+                            filter(),
+                            k(A::Back, "zc-config-help-cancel"),
+                            help(),
+                            E::spacer(),
+                            E::key("Mouse", crate::i18n::t("zc-config-help-mouse-save")),
+                        ])
+                    }
+                } else if is_string_array {
+                    HelpNode::entries(vec![
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                            crate::i18n::t("zc-config-help-new-line-entry"),
+                        ),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                            crate::i18n::t("zc-config-help-save-array"),
+                        ),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                            crate::i18n::t("zc-config-help-cancel"),
+                        ),
+                        help(),
+                    ])
+                } else {
+                    HelpNode::entries(vec![
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                            crate::i18n::t("zc-config-help-save-value"),
+                        ),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                            crate::i18n::t("zc-config-help-cancel"),
+                        ),
+                        help(),
+                    ])
+                }
+            }
+        }
+    }
+}
+
+impl App<'_> {
+    fn field_list_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
+        use crate::widgets::{HelpEntry as E, HelpNode};
+        let has_tabs = !self.tab_names.is_empty();
+        let mut entries = Vec::new();
+        if has_tabs {
+            entries.push(E::new(
+                switch_tabs_keys(),
+                crate::i18n::t("zc-config-help-switch-tabs"),
+            ));
+        }
+        entries.push(E::new(
+            nav_keys_split(),
+            crate::i18n::t("zc-config-help-navigate"),
+        ));
+        entries.push(E::new(
+            tab_keys(A::Enter),
+            crate::i18n::t("zc-config-help-edit-field"),
+        ));
+        entries.push(E::new(
+            tab_keys(A::DeleteRow),
+            crate::i18n::t("zc-config-help-reset-default"),
+        ));
+        entries.push(E::key("/", crate::i18n::t("zc-config-help-filter")));
+        entries.push(E::new(
+            tab_keys(A::Back),
+            crate::i18n::t("zc-config-help-back"),
+        ));
+        entries.push(E::key("?", crate::i18n::t("zc-config-help-this-help")));
+        entries.push(E::spacer());
+        let mouse = if has_tabs {
+            crate::i18n::t("zc-config-help-mouse-tabs-edit")
+        } else {
+            crate::i18n::t("zc-config-help-mouse-edit")
+        };
+        entries.push(E::key("Mouse", mouse));
+        HelpNode::entries(entries)
+    }
+}
+
+// ── Layout ───────────────────────────────────────────────────────
+
+struct Regions {
+    breadcrumb: Rect,
+    help: Rect,
+    main: Rect,
+    status: Rect,
+    hints: Rect,
+}
+
+fn regions(area: Rect) -> Regions {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // breadcrumb
+            Constraint::Length(2), // help
+            Constraint::Min(4),    // main
+            Constraint::Length(1), // status
+            Constraint::Length(1), // hints
+        ])
+        .split(area);
+
+    Regions {
+        breadcrumb: chunks[0],
+        help: chunks[1],
+        main: chunks[2],
+        status: chunks[3],
+        hints: chunks[4],
+    }
+}
+
+fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str) {
+    let display = format!("/{buf}█");
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(display, theme::input_style()))),
+        area,
+    );
+}
+
+fn render_breadcrumb(frame: &mut Frame, area: Rect, segments: &[String]) {
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ›  ", theme::dim_style()));
+        }
+        let style = if i == segments.len() - 1 {
+            theme::accent_style().add_modifier(Modifier::BOLD)
+        } else {
+            theme::heading_style()
+        };
+        spans.push(Span::styled(seg.clone(), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── $EDITOR helper ───────────────────────────────────────────────
+
+/// Open `content` in `$EDITOR` (or `$VISUAL`). Returns `Ok(edited)` on
+/// success, or `Err(reason)` if the editor could not be launched / exited
+/// non-zero. The caller falls back to the inline TUI editor on `Err`.
+fn edit_in_external_editor(
+    term: &mut Term,
+    content: &str,
+    filename_hint: &str,
+) -> Result<String, String> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
+
+    // Write content to a temp file with the right extension.
+    let dir = std::env::temp_dir();
+    let tmp_path = dir.join(filename_hint);
+    std::fs::write(&tmp_path, content).map_err(|e| format!("tmp write: {e}"))?;
+
+    // Suspend TUI: leave alternate screen + disable raw mode so the
+    // child process gets a normal terminal.
+    let _ = execute!(
+        term.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+
+    // Launch via `sh -c` so $EDITOR values with flags (e.g. "vim -u NONE",
+    // "code --wait") work correctly.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"{}\"", editor, tmp_path.display()))
+        .status();
+
+    // Restore TUI.
+    let _ = enable_raw_mode();
+    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            term.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        );
+    }
+    // Force a full redraw so ratatui repaints everything.
+    let _ = term.clear();
+
+    match status {
+        Ok(s) if s.success() => {
+            let edited =
+                std::fs::read_to_string(&tmp_path).map_err(|e| format!("tmp read: {e}"))?;
+            let _ = std::fs::remove_file(&tmp_path);
+            Ok(edited)
+        }
+        Ok(s) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(format!("{editor} exited with {s}"))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(format!("failed to launch {editor}: {e}"))
+        }
+    }
+}
