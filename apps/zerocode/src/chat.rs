@@ -724,7 +724,7 @@ impl Chat {
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
         if state.pending_approval().is_none() && !state.in_browse_mode() {
-            let action = state.input_bar.handle_key(key);
+            let action = state.input_bar.handle_key(key, state.turn_in_flight);
             match action {
                 InputBarAction::Submit { text, attachments } => {
                     state.clear_info_notice();

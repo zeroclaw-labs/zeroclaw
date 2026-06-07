@@ -31,9 +31,6 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
-/// Cursor blink interval in milliseconds.
-const CURSOR_BLINK_MS: u128 = 500;
-
 /// Slash commands available for auto-complete.
 const SLASH_COMMANDS: &[&str] = &[
     "/attach",
@@ -420,12 +417,6 @@ pub(crate) struct InputBarState {
     /// Cached inner width from the most recent render.
     last_inner_width: u16,
 
-    // Phase 2: Cursor blink
-    /// Whether the cursor is currently in the visible phase of the blink cycle.
-    cursor_visible: bool,
-    /// Instant of the last blink toggle.
-    last_blink: Instant,
-
     // Phase 4: Text selection
     /// Text selection range as byte offsets (start, end) where start <= end.
     selection: Option<(usize, usize)>,
@@ -452,8 +443,6 @@ impl InputBarState {
             scroll_offset: 0,
             last_input_area: Rect::default(),
             last_inner_width: 0,
-            cursor_visible: true,
-            last_blink: Instant::now(),
             selection: None,
             selection_anchor: None,
             autocomplete_matches: Vec::new(),
@@ -496,14 +485,6 @@ impl InputBarState {
     /// or file explorer open). Used to suppress single-char keybindings.
     pub fn wants_text_input(&self) -> bool {
         !self.input.is_empty() || self.file_explorer.is_some()
-    }
-
-    // ── Blink helpers ────────────────────────────────────────
-
-    /// Reset the blink cycle so the cursor is immediately visible.
-    fn reset_blink(&mut self) {
-        self.cursor_visible = true;
-        self.last_blink = Instant::now();
     }
 
     // ── Selection helpers ────────────────────────────────────
@@ -718,7 +699,7 @@ impl InputBarState {
     // ── Key handling ─────────────────────────────────────────
 
     /// Process a key event. Returns an action for the parent pane.
-    pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
+    pub fn handle_key(&mut self, key: KeyEvent, turn_in_flight: bool) -> InputBarAction {
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -755,8 +736,10 @@ impl InputBarState {
             return InputBarAction::Consumed;
         }
 
-        // Reset blink on any keystroke.
-        self.reset_blink();
+        // Don't handle input while agent is responding.
+        if turn_in_flight {
+            return InputBarAction::NotHandled;
+        }
 
         use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
         let action = IbWidgetAction::from_chord(&key);
@@ -880,7 +863,6 @@ impl InputBarState {
 
     /// Handle bracketed paste event.
     pub fn handle_paste(&mut self, text: &str) -> InputBarAction {
-        self.reset_blink();
         let trimmed = text.trim();
         if clipboard::looks_like_file_path(trimmed)
             && let Ok(att) = PendingAttachment::from_path(trimmed)
@@ -938,7 +920,6 @@ impl InputBarState {
                     self.cursor = visual_to_cursor(&self.input, target_row, inner_x, width);
                     self.selection_anchor = Some(self.cursor);
                     self.selection = None;
-                    self.reset_blink();
                 }
                 true
             }
@@ -959,7 +940,6 @@ impl InputBarState {
                     } else {
                         Some((start, end))
                     };
-                    self.reset_blink();
                 }
                 true
             }
@@ -1319,18 +1299,11 @@ impl InputBarState {
             f.render_widget(p, input_area);
         }
 
-        // Cursor blink logic.
-        let now = Instant::now();
-        if now.duration_since(self.last_blink).as_millis() >= CURSOR_BLINK_MS {
-            self.cursor_visible = !self.cursor_visible;
-            self.last_blink = now;
-        }
-
-        // Cursor positioning — suppress when file explorer overlay is active.
+        // Terminal owns cursor blinking; a software blink that skips
+        // set_cursor_position can latch the cursor hidden.
         if show_cursor && !turn_in_flight && inner_width > 0 && self.file_explorer.is_none() {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 
-            // Auto-scroll to keep cursor visible.
             if cursor_row < self.scroll_offset {
                 self.scroll_offset = cursor_row;
             }
@@ -1338,12 +1311,10 @@ impl InputBarState {
                 self.scroll_offset = cursor_row - visible_rows + 1;
             }
 
-            if self.cursor_visible {
-                let screen_row = cursor_row - self.scroll_offset;
-                let cx = input_area.x + 1 + cursor_col;
-                let cy = input_area.y + 1 + screen_row;
-                f.set_cursor_position((cx, cy));
-            }
+            let screen_row = cursor_row - self.scroll_offset;
+            let cx = input_area.x + 1 + cursor_col;
+            let cy = input_area.y + 1 + screen_row;
+            f.set_cursor_position((cx, cy));
         }
 
         // Scroll indicators on the right border when content overflows.
