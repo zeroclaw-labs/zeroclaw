@@ -46,6 +46,14 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    /// Terminal field names whose values must be redacted when this type is
+    /// displayed as an object/object-array prop. Most prop kinds have no
+    /// nested secret surface; Configurable object-array element types can
+    /// override this by delegating to their generated `secret_field_terminals`.
+    fn display_secret_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -148,6 +156,10 @@ impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
 }
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -160,6 +172,17 @@ impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
 }
 impl HasPropKind for Vec<crate::schema::ToolFilterGroup> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+
+/// Security classification for credential-shaped config surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSurfaceClass {
+    EncryptedSecret,
+    PathOnlyReference,
+    PublicValue,
+    ExternalAuthStore,
+    LegacyEnvPath,
+    RequiresFollowUp,
 }
 
 /// Tab grouping for config fields and UI surfaces. Each variant maps to a
@@ -283,6 +306,8 @@ pub struct PropFieldInfo {
     /// Subject to the same write-only / no-readback rules as `#[secret]`.
     /// Reserved for future schema additions; currently no fields are derived.
     pub derived_from_secret: bool,
+    /// Explicit security classification for credential-shaped surfaces.
+    pub credential_class: Option<CredentialSurfaceClass>,
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
@@ -318,6 +343,8 @@ impl std::fmt::Debug for PropFieldInfo {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("is_secret", &self.is_secret)
+            .field("credential_class", &self.credential_class)
+            .field("tab", &self.tab)
             .finish_non_exhaustive()
     }
 }
