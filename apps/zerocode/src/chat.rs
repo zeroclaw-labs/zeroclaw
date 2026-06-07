@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -99,6 +99,12 @@ pub(crate) struct Chat {
     /// reattach to this agent automatically; the resume id is only dropped when
     /// the user manually picks a different agent.
     resume_agent_alias: Option<String>,
+    /// List rect of the agent picker, recorded each draw so mouse clicks in the
+    /// PickAgent phase can map a row to a selection. Default until first draw.
+    pick_agent_list_area: Rect,
+    /// Double-click tracker for the agent picker: a second click on the same row
+    /// confirms (enters the session), matching the keyboard Enter.
+    pick_agent_double_click: crate::mouse::DoubleClickTracker,
 }
 
 /// Result of one background `session/git_branch` poll, routed back to the UI
@@ -131,6 +137,8 @@ impl Chat {
             pane_kind,
             resume_session_id: None,
             resume_agent_alias: None,
+            pick_agent_list_area: Rect::default(),
+            pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
         }
     }
 
@@ -414,7 +422,7 @@ impl Chat {
                 list_state,
                 loading,
             } => {
-                draw_agent_picker(
+                let list_area = draw_agent_picker(
                     frame,
                     area,
                     agents,
@@ -422,6 +430,7 @@ impl Chat {
                     *loading,
                     &self.pane_kind.name(),
                 );
+                self.pick_agent_list_area = list_area;
             }
             ChatPhase::PickCwd { explorer, .. } => {
                 explorer.render(frame, area);
@@ -912,10 +921,47 @@ impl Chat {
         false
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+    pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
             explorer.handle_mouse(mouse);
+            return;
+        }
+
+        // Agent picker: click highlights a row, double-click confirms (enters
+        // the session), wheel moves the selection.
+        if matches!(self.phase, ChatPhase::PickAgent { loading: false, .. }) {
+            let mut confirm_alias: Option<String> = None;
+            if let ChatPhase::PickAgent {
+                agents, list_state, ..
+            } = &mut self.phase
+            {
+                let list_area = self.pick_agent_list_area;
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(idx) = mouse::list_click_index(
+                            mouse.row,
+                            list_area,
+                            list_state.offset(),
+                            agents.len(),
+                        ) {
+                            list_state.select(Some(idx));
+                            if self.pick_agent_double_click.click(mouse.column, mouse.row) {
+                                confirm_alias = agents.get(idx).cloned();
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(mouse::list_scroll(i, agents.len(), up, 1)));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(alias) = confirm_alias {
+                self.pick_or_start_session(&alias).await;
+            }
             return;
         }
 
@@ -965,7 +1011,7 @@ impl Chat {
                 return;
             }
 
-            use crossterm::event::{KeyModifiers as KM, MouseButton};
+            use crossterm::event::KeyModifiers as KM;
             let col = mouse.column;
             let row = mouse.row;
             match mouse.kind {
@@ -1191,6 +1237,29 @@ impl crate::widgets::HelpContext for Chat {
 
 // ── Agent picker rendering ───────────────────────────────────────
 
+/// Build the agent-picker nav hint from the live keymap (browse up/down + the
+/// modal confirm chord), never hardcoded literals.
+fn picker_nav_keys() -> String {
+    use crate::keymap::{ChatTabAction, Chord, ModalAction, RebindableActions};
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |c: &Chord| {
+        let d = c.display();
+        if !parts.contains(&d) {
+            parts.push(d);
+        }
+    };
+    for c in ChatTabAction::BrowseUp.resolved() {
+        push(&c);
+    }
+    for c in ChatTabAction::BrowseDown.resolved() {
+        push(&c);
+    }
+    for c in ModalAction::Confirm.resolved() {
+        push(&c);
+    }
+    parts.join("/")
+}
+
 fn draw_agent_picker(
     frame: &mut Frame,
     area: Rect,
@@ -1198,7 +1267,7 @@ fn draw_agent_picker(
     list_state: &mut ListState,
     loading: bool,
     tab_title: &str,
-) {
+) -> Rect {
     let block = Block::default()
         .title(Span::styled(format!(" {tab_title} "), theme::title_style()))
         .borders(Borders::ALL)
@@ -1220,7 +1289,7 @@ fn draw_agent_picker(
             ])
             .split(inner);
         frame.render_widget(p, vert[1]);
-        return;
+        return Rect::default();
     }
 
     let chunks = Layout::default()
@@ -1238,7 +1307,10 @@ fn draw_agent_picker(
             theme::body_style(),
         ),
         Span::styled(
-            crate::i18n::t_args("zc-chat-picker-header-hint", &[("keys", "Up/Down, Enter")]),
+            crate::i18n::t_args(
+                "zc-chat-picker-header-hint",
+                &[("keys", &picker_nav_keys())],
+            ),
             theme::dim_style(),
         ),
     ]));
@@ -1250,6 +1322,15 @@ fn draw_agent_picker(
         .collect();
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
+    // The list rect is unbordered, but `mouse::list_click_index` assumes a
+    // 1-cell top border. Hand back a rect shifted up one row (and one taller) so
+    // the helper's border compensation lands on the true first item.
+    Rect::new(
+        chunks[1].x,
+        chunks[1].y.saturating_sub(1),
+        chunks[1].width,
+        chunks[1].height + 1,
+    )
 }
 
 // ── Error rendering ──────────────────────────────────────────────
@@ -3253,6 +3334,42 @@ mod tests {
         assert_eq!(params["session_id"], "sess-prev");
 
         init.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_picker_click_selects_row() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            list_state,
+            loading: false,
+        };
+        // Stored rect is the draw's shifted form: list_click_index treats (y+1)
+        // as the first item. With y=1, first item maps to row 2.
+        chat.pick_agent_list_area = Rect::new(1, 1, 20, 6);
+        // Click the third item → row 2 + 2 = 4.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, Rect::new(0, 0, 40, 10)).await;
+        if let ChatPhase::PickAgent { list_state, .. } = &chat.phase {
+            assert_eq!(
+                list_state.selected(),
+                Some(2),
+                "click selects the clicked row"
+            );
+        } else {
+            panic!("expected PickAgent phase");
+        }
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {

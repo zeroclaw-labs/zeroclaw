@@ -58,8 +58,8 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
-        self.inner.handle_mouse(mouse, area);
+    pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_mouse(mouse, area).await;
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
