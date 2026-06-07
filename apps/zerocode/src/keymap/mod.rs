@@ -59,6 +59,13 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
         .find_map(|(c, a)| c.matches(event).then_some(*a))
 }
 
+/// Rendered, OS-aware key labels for an action's currently-resolved
+/// chords (e.g. `["Tab"]`, `["⌘K"]`). Help surfaces use this so the keys
+/// they advertise track the live keybinding registry instead of literals.
+pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
+    action.resolved().iter().map(Chord::display).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

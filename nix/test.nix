@@ -31,6 +31,9 @@
 #      with the correct ownership, and the unit starts cleanly. Regression
 #      guard for the previous `StateDirectory = baseNameOf dataDir` shape
 #      that silently created the wrong directory.
+#   8. A second instance may share another instance's user/group when it sets
+#      `createUser = false`, matching the documented "bring your own user"
+#      contract.
 #
 # A no-op stub binary stands in for the real `zeroclaw daemon` so the test
 # does not depend on a working ZeroClaw build. The stub validates everything
@@ -129,6 +132,20 @@ in
         };
       };
 
+      # Fifth instance shares the `test` user/group but does not ask the
+      # module to create them again. This is the documented shared-user
+      # contract and should not trip the eval-time uniqueness assertion.
+      services.zeroclaw.instances.shared-user = {
+        package = stubPackage;
+        user = "zeroclaw-test";
+        group = "zeroclaw-test";
+        createUser = false;
+        dataDir = "/var/lib/zeroclaw-shared-user";
+        settings = {
+          default_provider = "anthropic";
+        };
+      };
+
       # `yq -p toml` (binary name from `pkgs.yq-go`) parses the rendered
       # TOML for the round-trip check.
       environment.systemPackages = [
@@ -213,5 +230,16 @@ in
         # of the configured /srv/zeroclaw-srv path.
         machine.fail("test -d /var/lib/zeroclaw-srv")
         machine.succeed("test -f /srv/zeroclaw-srv/config.toml")
+
+    with subtest("shared user is allowed when createUser=false"):
+        machine.wait_for_unit("zeroclaw-shared-user.service", timeout=30)
+        machine.succeed("test -d /var/lib/zeroclaw-shared-user")
+        owner_shared = machine.succeed(
+            "stat -c '%U:%G' /var/lib/zeroclaw-shared-user"
+        ).strip()
+        assert owner_shared == "zeroclaw-test:zeroclaw-test", (
+            f"unexpected owner {owner_shared}"
+        )
+        machine.succeed("test -f /var/lib/zeroclaw-shared-user/config.toml")
   '';
 }

@@ -6,7 +6,9 @@
 /// An entry with all-empty keys/action renders as a blank spacer row.
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
-    /// Keys that trigger this action, e.g. ["↑", "k"].
+    /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
+    /// owned so registry-derived chord labels (`Chord::display`) can be
+    /// used alongside static literals.
     pub keys: Vec<String>,
     /// Human-readable description of the action.
     pub action: String,
@@ -295,6 +297,132 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     out
 }
 
+// ── PickerModal ─────────────────────────────────────────────────────────────
+
+use ratatui::{
+    Frame,
+    layout::Rect,
+    widgets::{Block, Borders, Clear, List, ListItem, ListState},
+};
+
+/// A reusable centered modal list picker over a `Vec<String>`. Owns its items,
+/// cursor, and an optional title; renders a bordered, scrollable list with the
+/// highlighted row styled. The caller owns the state (see [`PickerState`]) and
+/// keys; this type is the renderer plus cursor-movement helpers so other
+/// surfaces can reuse it.
+pub struct PickerModal<'a> {
+    title: &'a str,
+    items: &'a [String],
+    cursor: usize,
+}
+
+impl<'a> PickerModal<'a> {
+    pub fn new(title: &'a str, items: &'a [String], cursor: usize) -> Self {
+        Self {
+            title,
+            items,
+            cursor,
+        }
+    }
+
+    /// Render the modal centered within `area`. No-op when there are no items.
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        if self.items.is_empty() {
+            return;
+        }
+
+        // Width: longest item (clamped), plus borders/padding. Height: one row
+        // per item plus borders, clamped to the available area.
+        let longest = self
+            .items
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(self.title.chars().count());
+        let inner_w = longest + 2; // 1 col padding each side
+        let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
+        let box_h = (self.items.len() + 2).clamp(3, area.height as usize) as u16;
+
+        let x = area.x + area.width.saturating_sub(box_w) / 2;
+        let y = area.y + area.height.saturating_sub(box_h) / 2;
+        let modal_rect = Rect::new(x, y, box_w, box_h);
+
+        frame.render_widget(Clear, modal_rect);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(crate::theme::overlay_border_style())
+            .style(crate::theme::fill_style())
+            .title(Span::styled(
+                format!(" {} ", self.title),
+                crate::theme::heading_style(),
+            ));
+
+        let items: Vec<ListItem> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let style = if i == self.cursor {
+                    crate::theme::selected_style()
+                } else {
+                    crate::theme::body_style()
+                };
+                ListItem::new(Span::styled(label.clone(), style))
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(self.cursor.min(self.items.len().saturating_sub(1))));
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(crate::theme::selected_style());
+
+        frame.render_stateful_widget(list, modal_rect, &mut list_state);
+    }
+}
+
+/// Owned state for a [`PickerModal`]: the items and the current cursor. Caller
+/// holds this and drives it with the movement helpers; the widget borrows it for
+/// rendering. Reusable by any surface that needs a string picker.
+#[derive(Debug, Clone, Default)]
+pub struct PickerState {
+    pub items: Vec<String>,
+    pub cursor: usize,
+}
+
+impl PickerState {
+    /// Build a picker over `items`, pre-selecting `default` when present (else
+    /// the first row).
+    pub fn new(items: Vec<String>, default: Option<&str>) -> Self {
+        let cursor = default
+            .and_then(|d| items.iter().position(|i| i == d))
+            .unwrap_or(0);
+        Self { items, cursor }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        if self.cursor + 1 < self.items.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The currently highlighted value, if any.
+    pub fn selected(&self) -> Option<&str> {
+        self.items.get(self.cursor).map(String::as_str)
+    }
+}
+
 #[cfg(test)]
 mod info_bar_tests {
     use super::*;
@@ -350,5 +478,48 @@ mod info_bar_tests {
         let bar = InfoBar::new(Some(&m));
         assert!(bar.has_content());
         assert!(bar.widget(80).is_some());
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    #[test]
+    fn new_defaults_to_first_when_no_default() {
+        let p = PickerState::new(vec!["a".into(), "b".into()], None);
+        assert_eq!(p.cursor, 0);
+        assert_eq!(p.selected(), Some("a"));
+    }
+
+    #[test]
+    fn new_preselects_default_when_present() {
+        let p = PickerState::new(vec!["a".into(), "b".into(), "c".into()], Some("b"));
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.selected(), Some("b"));
+    }
+
+    #[test]
+    fn new_default_absent_falls_back_to_first() {
+        let p = PickerState::new(vec!["a".into(), "b".into()], Some("zzz"));
+        assert_eq!(p.cursor, 0);
+    }
+
+    #[test]
+    fn movement_clamps_at_bounds() {
+        let mut p = PickerState::new(vec!["a".into(), "b".into()], None);
+        p.move_up(); // already at top
+        assert_eq!(p.cursor, 0);
+        p.move_down();
+        assert_eq!(p.cursor, 1);
+        p.move_down(); // already at bottom
+        assert_eq!(p.cursor, 1);
+    }
+
+    #[test]
+    fn empty_picker_has_no_selection() {
+        let p = PickerState::default();
+        assert!(p.is_empty());
+        assert_eq!(p.selected(), None);
     }
 }

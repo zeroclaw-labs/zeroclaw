@@ -37,6 +37,8 @@ const SLASH_COMMANDS: &[&str] = &[
     "/attachments",
     "/clear-queue",
     "/detach",
+    "/model",
+    "/model-provider",
     "/toggle-thinking",
 ];
 
@@ -68,6 +70,18 @@ pub(crate) enum InputBarAction {
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
     ToggleThinking,
+    /// User chose a model directly (`/model <name>`) — parent applies it via
+    /// `session/configure`.
+    SetModel(String),
+    /// User chose a model_provider directly (`/model-provider <name>`) — parent
+    /// applies it via `session/configure`.
+    SetModelProvider(String),
+    /// User typed `/model` with no argument — parent opens the model picker
+    /// modal over the cached model catalog.
+    OpenModelPicker,
+    /// User typed `/model-provider` with no argument — parent opens the
+    /// two-stage model_provider picker modal.
+    OpenModelProviderPicker,
     /// Key was not handled by the input bar — parent should handle it.
     NotHandled,
 }
@@ -83,6 +97,14 @@ enum SlashCommand<'a> {
     /// rather than silently clearing the whole queue.
     ClearQueue(Option<usize>),
     ToggleThinking,
+    /// `/model <name>` — switch model directly.
+    Model(&'a str),
+    /// `/model` (no arg) — open the model picker modal.
+    ModelPicker,
+    /// `/model-provider <name>` — switch model_provider directly.
+    ModelProvider(&'a str),
+    /// `/model-provider` (no arg) — open the two-stage model_provider picker.
+    ModelProviderPicker,
     NotACommand,
 }
 
@@ -106,6 +128,24 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::ListAttachments
     } else if trimmed == "/toggle-thinking" {
         SlashCommand::ToggleThinking
+    } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
+        let name = name.trim();
+        if name.is_empty() {
+            SlashCommand::ModelProviderPicker
+        } else {
+            SlashCommand::ModelProvider(name)
+        }
+    } else if trimmed == "/model-provider" {
+        SlashCommand::ModelProviderPicker
+    } else if let Some(name) = trimmed.strip_prefix("/model ") {
+        let name = name.trim();
+        if name.is_empty() {
+            SlashCommand::ModelPicker
+        } else {
+            SlashCommand::Model(name)
+        }
+    } else if trimmed == "/model" {
+        SlashCommand::ModelPicker
     } else {
         SlashCommand::NotACommand
     }
@@ -425,11 +465,39 @@ pub(crate) struct InputBarState {
 
     // Phase 6: Auto-complete
     /// Filtered list of matching slash commands.
-    autocomplete_matches: Vec<&'static str>,
+    /// Candidate completions for the popup. Command names (`/model`) and
+    /// argument values (model / model_provider names) both land here as owned
+    /// strings.
+    autocomplete_matches: Vec<String>,
+    /// What the current popup is completing — drives whether Tab replaces the
+    /// whole input or only the trailing argument token.
+    autocomplete_target: AutocompleteTarget,
     /// Index of the currently highlighted match in the popup.
     autocomplete_index: Option<usize>,
     /// Whether the autocomplete popup is visible.
     autocomplete_active: bool,
+
+    /// Cached model catalog for the active model_provider, pushed in by the app
+    /// layer (the input bar is synchronous and cannot fetch). Filtered for
+    /// `/model <partial>` argument autocomplete.
+    model_catalog: Vec<String>,
+    /// Which model_provider `model_catalog` was fetched for; lets the app layer
+    /// decide whether a refetch is needed on provider change.
+    model_catalog_provider: Option<String>,
+    /// Cached model_provider names for `/model-provider <partial>` autocomplete.
+    provider_catalog: Vec<String>,
+}
+
+/// What the autocomplete popup is currently offering, so Tab-completion knows
+/// how much of the input to rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutocompleteTarget {
+    /// Completing a slash-command name (replaces the whole input).
+    Command,
+    /// Completing the `/model <arg>` value (replaces only the argument).
+    ModelArg,
+    /// Completing the `/model-provider <arg>` value (replaces only the argument).
+    ModelProviderArg,
 }
 
 impl InputBarState {
@@ -446,8 +514,12 @@ impl InputBarState {
             selection: None,
             selection_anchor: None,
             autocomplete_matches: Vec::new(),
+            autocomplete_target: AutocompleteTarget::Command,
             autocomplete_index: None,
             autocomplete_active: false,
+            model_catalog: Vec::new(),
+            model_catalog_provider: None,
+            provider_catalog: Vec::new(),
         }
     }
 
@@ -511,34 +583,150 @@ impl InputBarState {
     // ── Auto-complete helpers ────────────────────────────────
 
     fn update_autocomplete(&mut self) {
-        let text = self.input.trim();
+        // Own the trimmed input so subsequent `&mut self` calls don't conflict
+        // with a borrow of `self.input`.
+        let text = self.input.trim_start().to_string();
+
+        // Command-name completion: a single `/token` with no space yet.
         if text.starts_with('/') && !text.contains(' ') {
-            let prefix = text;
+            let prefix = text.as_str();
+            self.autocomplete_target = AutocompleteTarget::Command;
             self.autocomplete_matches = SLASH_COMMANDS
                 .iter()
                 .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
-                .copied()
+                .map(|c| (*c).to_string())
                 .collect();
-            self.autocomplete_active = !self.autocomplete_matches.is_empty();
-            if self.autocomplete_active && self.autocomplete_index.is_none() {
-                self.autocomplete_index = Some(0);
-            }
-            if let Some(idx) = self.autocomplete_index
-                && idx >= self.autocomplete_matches.len()
-            {
-                self.autocomplete_index = Some(self.autocomplete_matches.len().saturating_sub(1));
-            }
-        } else {
-            self.autocomplete_active = false;
-            self.autocomplete_matches.clear();
-            self.autocomplete_index = None;
+            self.finalize_autocomplete();
+            return;
         }
+
+        // Argument completion: `/model <partial>` or `/model-provider <partial>`.
+        // model_provider is checked first — its prefix is longer and `/model `
+        // would otherwise swallow it.
+        if let Some(partial) = text.strip_prefix("/model-provider ") {
+            let partial = partial.trim_start().to_string();
+            self.set_arg_matches(AutocompleteTarget::ModelProviderArg, &partial);
+            return;
+        }
+        if let Some(partial) = text.strip_prefix("/model ") {
+            let partial = partial.trim_start().to_string();
+            self.set_arg_matches(AutocompleteTarget::ModelArg, &partial);
+            return;
+        }
+
+        self.autocomplete_active = false;
+        self.autocomplete_matches.clear();
+        self.autocomplete_index = None;
+    }
+
+    /// Filter the relevant cached catalog by `partial` (case-insensitive
+    /// substring) and populate the popup. Empty `partial` lists the whole
+    /// catalog so the user sees options immediately after the space.
+    fn set_arg_matches(&mut self, target: AutocompleteTarget, partial: &str) {
+        let catalog = match target {
+            AutocompleteTarget::ModelArg => &self.model_catalog,
+            AutocompleteTarget::ModelProviderArg => &self.provider_catalog,
+            AutocompleteTarget::Command => return,
+        };
+        let needle = partial.to_ascii_lowercase();
+        self.autocomplete_target = target;
+        self.autocomplete_matches = catalog
+            .iter()
+            .filter(|c| needle.is_empty() || c.to_ascii_lowercase().contains(&needle))
+            .filter(|c| c.as_str() != partial)
+            .cloned()
+            .collect();
+        self.finalize_autocomplete();
+    }
+
+    /// Shared tail of the autocomplete update: toggle visibility and clamp the
+    /// highlighted index.
+    fn finalize_autocomplete(&mut self) {
+        self.autocomplete_active = !self.autocomplete_matches.is_empty();
+        if self.autocomplete_active && self.autocomplete_index.is_none() {
+            self.autocomplete_index = Some(0);
+        }
+        if let Some(idx) = self.autocomplete_index
+            && idx >= self.autocomplete_matches.len()
+        {
+            self.autocomplete_index = Some(self.autocomplete_matches.len().saturating_sub(1));
+        }
+    }
+
+    /// Replace the input's catalog cache for argument autocomplete. Called by
+    /// the app layer after an async `catalog_models` / model_provider fetch.
+    pub fn set_model_catalog(&mut self, model_provider: String, models: Vec<String>) {
+        self.model_catalog = models;
+        self.model_catalog_provider = Some(model_provider);
+    }
+
+    /// The model_provider the cached model catalog was fetched for, if any.
+    pub fn model_catalog_provider(&self) -> Option<&str> {
+        self.model_catalog_provider.as_deref()
+    }
+
+    /// The cached model catalog (for the model_provider in
+    /// [`Self::model_catalog_provider`]).
+    pub fn model_catalog(&self) -> &[String] {
+        &self.model_catalog
+    }
+
+    /// Replace the cached model_provider list for `/model-provider` autocomplete.
+    pub fn set_provider_catalog(&mut self, providers: Vec<String>) {
+        self.provider_catalog = providers;
     }
 
     fn dismiss_autocomplete(&mut self) {
         self.autocomplete_active = false;
         self.autocomplete_matches.clear();
         self.autocomplete_index = None;
+    }
+
+    /// Apply a chosen popup entry to the input. A command choice replaces the
+    /// whole line (and, for the model commands, appends a space so argument
+    /// autocomplete kicks in immediately). An argument choice rewrites only the
+    /// value after the command prefix.
+    fn apply_autocomplete_choice(&mut self, choice: &str) {
+        match self.autocomplete_target {
+            AutocompleteTarget::Command => {
+                let takes_arg = choice == "/model" || choice == "/model-provider";
+                self.input = if takes_arg {
+                    format!("{choice} ")
+                } else {
+                    choice.to_string()
+                };
+            }
+            AutocompleteTarget::ModelArg => {
+                self.input = format!("/model {choice}");
+            }
+            AutocompleteTarget::ModelProviderArg => {
+                self.input = format!("/model-provider {choice}");
+            }
+        }
+        self.cursor = self.input.len();
+    }
+
+    /// Enter pressed while the autocomplete popup is open: accept the
+    /// highlighted match. A command completion that still expects an argument
+    /// (`/model `, `/model-provider `) only fills the input so the user can keep
+    /// typing or pick from the argument popup; any other accepted completion is
+    /// a runnable line, so submit it in the same keystroke.
+    fn accept_completion_on_submit(&mut self) -> InputBarAction {
+        let Some(idx) = self.autocomplete_index else {
+            return self.handle_enter();
+        };
+        let Some(choice) = self.autocomplete_matches.get(idx).cloned() else {
+            return self.handle_enter();
+        };
+        let target = self.autocomplete_target;
+        self.apply_autocomplete_choice(&choice);
+        self.dismiss_autocomplete();
+        let fills_only = target == AutocompleteTarget::Command
+            && (choice == "/model" || choice == "/model-provider");
+        if fills_only {
+            return InputBarAction::Consumed;
+        }
+        self.handle_enter()
     }
 
     // ── Text editing ─────────────────────────────────────────
@@ -765,9 +953,8 @@ impl InputBarState {
                 if let Some(idx) = self.autocomplete_index
                     && idx < self.autocomplete_matches.len()
                 {
-                    let cmd = self.autocomplete_matches[idx].to_string();
-                    self.input = cmd;
-                    self.cursor = self.input.len();
+                    let choice = self.autocomplete_matches[idx].clone();
+                    self.apply_autocomplete_choice(&choice);
                     self.dismiss_autocomplete();
                 }
                 return InputBarAction::Consumed;
@@ -784,6 +971,9 @@ impl InputBarState {
                     self.autocomplete_index = Some((idx + 1).min(max));
                 }
                 return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::Submit) if self.autocomplete_active => {
+                return self.accept_completion_on_submit();
             }
             Some(IbWidgetAction::NewLine) => {
                 self.push_input_char('\n');
@@ -1039,6 +1229,12 @@ impl InputBarState {
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+                SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
+                SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
+                SlashCommand::ModelProvider(name) => {
+                    InputBarAction::SetModelProvider(name.to_string())
+                }
+                SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
                 SlashCommand::NotACommand => {
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
@@ -1383,7 +1579,7 @@ impl InputBarState {
                 } else {
                     theme::body_style()
                 };
-                ListItem::new(Span::styled(*cmd, style))
+                ListItem::new(Span::styled(cmd.clone(), style))
             })
             .collect();
 
@@ -1411,13 +1607,25 @@ impl crate::widgets::HelpContext for InputBarState {
             return explorer.help_context();
         }
         if self.autocomplete_active {
+            use crate::keymap::{InputBarAction as Ib, action_key_labels};
+            // Both Enter (Submit, contextual) and the dedicated accept
+            // chord (Tab by default) accept the highlighted completion —
+            // advertise whatever the live registry has them bound to.
+            let mut accept_keys = action_key_labels(Ib::Submit);
+            accept_keys.extend(action_key_labels(Ib::AutocompleteAccept));
             return HelpNode::entries(vec![
                 E::new(
                     vec!["↑", "↓"],
                     crate::i18n::t("zc-input-help-completions-navigate"),
                 ),
-                E::key("Tab", crate::i18n::t("zc-input-help-completions-accept")),
-                E::key("Esc", crate::i18n::t("zc-input-help-completions-dismiss")),
+                E::new(
+                    accept_keys,
+                    crate::i18n::t("zc-input-help-completions-accept"),
+                ),
+                E::new(
+                    action_key_labels(Ib::AutocompleteCancel),
+                    crate::i18n::t("zc-input-help-completions-dismiss"),
+                ),
             ]);
         }
         HelpNode::entries(vec![
@@ -1620,6 +1828,190 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_commands() {
+        assert!(matches!(
+            parse_slash_command("/model"),
+            SlashCommand::ModelPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/model "),
+            SlashCommand::ModelPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/model gpt-4o"),
+            SlashCommand::Model("gpt-4o")
+        ));
+        assert!(matches!(
+            parse_slash_command("/model-provider"),
+            SlashCommand::ModelProviderPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/model-provider anthropic.default"),
+            SlashCommand::ModelProvider("anthropic.default")
+        ));
+        // `/model-provider` must NOT be parsed as `/model` with arg "-provider".
+        assert!(!matches!(
+            parse_slash_command("/model-provider"),
+            SlashCommand::Model(_)
+        ));
+    }
+
+    #[test]
+    fn model_arg_autocomplete_filters_cached_catalog() {
+        let mut bar = InputBarState::new();
+        bar.set_model_catalog(
+            "anthropic.default".into(),
+            vec![
+                "claude-sonnet-4-6".into(),
+                "claude-opus-4".into(),
+                "gpt-4o".into(),
+            ],
+        );
+        bar.insert_text("/model claude");
+        assert!(bar.autocomplete_active);
+        assert_eq!(bar.autocomplete_target, AutocompleteTarget::ModelArg);
+        assert!(
+            bar.autocomplete_matches
+                .iter()
+                .any(|s| s == "claude-opus-4")
+        );
+        assert!(!bar.autocomplete_matches.iter().any(|s| s == "gpt-4o"));
+    }
+
+    #[test]
+    fn model_arg_empty_lists_whole_catalog() {
+        let mut bar = InputBarState::new();
+        bar.set_model_catalog("anthropic.default".into(), vec!["a".into(), "b".into()]);
+        bar.insert_text("/model ");
+        assert!(bar.autocomplete_active);
+        assert_eq!(bar.autocomplete_matches.len(), 2);
+    }
+
+    #[test]
+    fn provider_arg_autocomplete_filters_cached_catalog() {
+        let mut bar = InputBarState::new();
+        bar.set_provider_catalog(vec![
+            "anthropic".into(),
+            "openai".into(),
+            "openrouter".into(),
+        ]);
+        bar.insert_text("/model-provider open");
+        assert!(bar.autocomplete_active);
+        assert_eq!(
+            bar.autocomplete_target,
+            AutocompleteTarget::ModelProviderArg
+        );
+        assert!(bar.autocomplete_matches.iter().any(|s| s == "openai"));
+        assert!(bar.autocomplete_matches.iter().any(|s| s == "openrouter"));
+        assert!(!bar.autocomplete_matches.iter().any(|s| s == "anthropic"));
+    }
+
+    #[test]
+    fn model_command_autocomplete_appends_space() {
+        let mut bar = InputBarState::new();
+        bar.apply_autocomplete_choice("/model");
+        assert_eq!(bar.input(), "/model ");
+    }
+
+    #[test]
+    fn model_arg_autocomplete_rewrites_only_arg() {
+        let mut bar = InputBarState::new();
+        bar.autocomplete_target = AutocompleteTarget::ModelArg;
+        bar.apply_autocomplete_choice("claude-opus-4");
+        assert_eq!(bar.input(), "/model claude-opus-4");
+    }
+
+    #[test]
+    fn model_picker_command_returns_open_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::OpenModelPicker
+        ));
+    }
+
+    #[test]
+    fn enter_accepts_highlighted_model_arg_and_submits() {
+        let mut bar = InputBarState::new();
+        bar.set_model_catalog(
+            "anthropic.default".into(),
+            vec!["claude-opus-4-8".into(), "claude-sonnet-4-6".into()],
+        );
+        bar.insert_text("/model ");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        // First catalog entry is accepted and the line is submitted in one
+        // keystroke — no picker modal.
+        assert!(matches!(action, InputBarAction::SetModel(m) if m == "claude-opus-4-8"));
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn enter_on_model_command_completion_fills_without_submitting() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/mod");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        // `/model` still needs an argument: accept-and-fill, do not open the
+        // picker or submit.
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "/model ");
+    }
+
+    #[test]
+    fn enter_accepts_highlighted_provider_arg_and_submits() {
+        let mut bar = InputBarState::new();
+        bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);
+        bar.insert_text("/model-provider open");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        assert!(matches!(action, InputBarAction::SetModelProvider(p) if p == "openai"));
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn completion_help_keys_come_from_keymap_registry() {
+        use crate::keymap::{Chord, InputBarAction as Ib, action_key_labels};
+        use crate::widgets::HelpContext;
+        let mut bar = InputBarState::new();
+        bar.insert_text("/mod");
+        assert!(bar.autocomplete_active);
+        let node = bar.help_context();
+        let accept = node
+            .entries
+            .iter()
+            .find(|e| e.action == crate::i18n::t("zc-input-help-completions-accept"))
+            .expect("accept entry present");
+        // Labels track the live bindings for Submit + AutocompleteAccept,
+        // not hardcoded literals.
+        assert!(accept.keys.contains(&Chord::key(KeyCode::Tab).display()));
+        let mut expected = action_key_labels(Ib::Submit);
+        expected.extend(action_key_labels(Ib::AutocompleteAccept));
+        assert_eq!(accept.keys, expected);
+    }
+
+    #[test]
+    fn model_provider_picker_command_returns_open_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model-provider");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::OpenModelProviderPicker
+        ));
+    }
+
+    #[test]
+    fn model_command_with_arg_returns_set_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model gpt-4o");
+        match bar.handle_enter() {
+            InputBarAction::SetModel(m) => assert_eq!(m, "gpt-4o"),
+            _ => panic!("expected SetModel"),
+        }
+    }
+
+    #[test]
     fn paste_text_inserts() {
         let mut bar = InputBarState::new();
         let action = bar.handle_paste("some pasted text");
@@ -1788,9 +2180,9 @@ mod tests {
         bar.insert_text("/attach");
         // "/attach" is a prefix of "/attachments", so popup shows.
         assert!(bar.autocomplete_active);
-        assert!(bar.autocomplete_matches.contains(&"/attachments"));
+        assert!(bar.autocomplete_matches.iter().any(|s| s == "/attachments"));
         // "/attach" itself is excluded (exact match).
-        assert!(!bar.autocomplete_matches.contains(&"/attach"));
+        assert!(!bar.autocomplete_matches.iter().any(|s| s == "/attach"));
     }
 
     #[test]
@@ -1821,7 +2213,11 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("/toggle");
         assert!(bar.autocomplete_active);
-        assert!(bar.autocomplete_matches.contains(&"/toggle-thinking"));
+        assert!(
+            bar.autocomplete_matches
+                .iter()
+                .any(|s| s == "/toggle-thinking")
+        );
     }
 
     #[test]

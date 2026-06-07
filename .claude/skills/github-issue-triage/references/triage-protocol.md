@@ -284,6 +284,8 @@ Activity is defined as: a follow-up comment or update from the **original author
 
 `status:in-progress` is a routing signal, not a permanent stale exemption by itself. During stale passes, verify that an open linked PR still exists. If the PR has closed without resolving the issue, remove or replace `status:in-progress` only after presenting the exact label change to the user.
 
+Target policy: `status:no-stale` protects an issue only when the reason and active owner or steward path are visible through the contributor-visible sources defined in the maintainer Project board contract. Assignees count as active owners. Public issue fields count only when they are visible to normal issue readers; organization-only or private issue and Project fields do not satisfy the contributor-visible requirement. Labels can identify the likely area, but they are not an owner source by themselves. Until the stale-exemption audit and repair packet lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
+
 ### Stale enforcement steps
 
 1. Fetch all open issues with `createdAt`, `author`, `labels`, `comments`, and `reactionGroups` fields.
@@ -301,6 +303,7 @@ Activity is defined as: a follow-up comment or update from the **original author
 
 4. Before proposing stale action, verify exclusions against current state:
    - Check current labels for `priority:p0`, `type:rfc`, and `status:no-stale`.
+   - For `status:no-stale`, inspect the cited visible source first: assignee, issue body/comment, Public issue field, public Project field, or linked public tracker entry. Record whether both the reason and active owner or steward path are present. If the issue does not cite a visible source or the source is ambiguous, add it to the stale-exemption audit findings and present the proposed correction to the user; reserve exhaustive source gathering for the stale-exemption audit/repair packet.
    - For `status:blocked`, fetch the issue body and relevant maintainer comments or tracker entry, then verify the recorded blocker and whether it is still unresolved. If not, present the label correction to the user first and do not treat the issue as exempt until the user approves the change.
    - Check the open PR batch for issue references before relying on `status:in-progress` or stale eligibility. Fall back to a per-issue PR search only when the batch result is ambiguous.
    - Check opening-post reactions for the 10-or-more 👍 threshold.
@@ -423,7 +426,7 @@ For issues, risk labels estimate likely fix blast radius from the report. Reasse
 - `status:accepted` — RFC or work item accepted by the team; not stale-exempt by itself
 - `status:blocked` — waiting on external blocker; exempt from stale while the blocker is recorded and unresolved
 - `status:in-progress` — linked open PR exists; verify live PR state before stale decisions
-- `status:no-stale` — explicitly exempt from stale automation for accepted or otherwise long-lived work that is not already protected by another exclusion; maintainer-applied with a recorded reason
+- `status:no-stale` — explicitly exempt from stale automation for accepted or otherwise long-lived work that is not already protected by another exclusion; target policy requires a recorded reason and contributor-visible active owner or steward path, with existing gaps handled by the stale-exemption audit packet
 
 ### Resolution
 
