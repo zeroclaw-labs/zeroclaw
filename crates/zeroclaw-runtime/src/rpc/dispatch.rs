@@ -58,6 +58,7 @@ pub enum Method {
     SessionDelete,
     SessionRename,
     SessionApprove,
+    SessionKill,
 
     // Memory
     MemoryList,
@@ -159,6 +160,7 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionRename, "session/rename"),
         (Method::SessionApprove, "session/approve"),
+        (Method::SessionKill, "session/kill"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -420,6 +422,7 @@ impl RpcDispatcher {
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
             Method::SessionRename => self.handle_session_rename(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params),
+            Method::SessionKill => self.handle_session_kill(&req.params).await,
 
             // Memory
             Method::MemoryList => self.handle_memory_list(&req.params).await,
@@ -552,28 +555,6 @@ impl RpcDispatcher {
         };
 
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
-        let reclaimed = self.ctx.sessions.reclaim(&tui_id).await;
-        for (session_key, agent_alias) in &reclaimed {
-            use ::zeroclaw_log::Instrument as _;
-            let span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                session_key = %session_key,
-                agent_alias = %agent_alias,
-                owner_tui_id = %tui_id,
-                channel = "rpc",
-            );
-            async {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Agent),
-                    "TUI reconnected within grace; session reclaimed"
-                );
-            }
-            .instrument(span)
-            .await;
-        }
         self.ctx
             .tui_registry
             .register(super::tui_identity::TuiEntry {
@@ -758,51 +739,83 @@ impl RpcDispatcher {
             }
         }
 
+        enum AcpSessionNewLoad {
+            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
         let mut message_count = 0;
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
-                if let Some(ref store) = self.ctx.acp_session_store {
-                    let store_cloned = store.clone();
-                    let sid = session_id.clone();
-                    let alias = req.agent_alias.clone();
-                    let cwd_owned = cwd.clone();
-                    let loaded = tokio::task::spawn_blocking(move || {
-                        match store_cloned.load_session(&sid) {
-                            Ok(Some(data)) => Ok(Some(data)),
-                            Ok(None) => store_cloned
-                                .create_session(&sid, &alias, &cwd_owned)
-                                .map(|_| None),
-                            Err(e) => Err(e),
+                let Some(ref store) = self.ctx.acp_session_store else {
+                    self.ctx.sessions.remove(&session_id).await;
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        "ACP session store is not available",
+                    ));
+                };
+
+                let store_cloned = store.clone();
+                let sid = session_id.clone();
+                let alias = req.agent_alias.clone();
+                let cwd_owned = cwd.clone();
+                let loaded =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                        match store_cloned.load_session_for_restore(&sid)? {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session(&sid, &alias, &cwd_owned)?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
                         }
                     })
                     .await;
-                    match loaded {
-                        Ok(Ok(Some(data))) => {
-                            message_count = data.messages.len();
-                            self.ctx
-                                .sessions
-                                .seed_conversation_history(&session_id, data.messages)
-                                .await;
-                        }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
-                                "Failed to load or create ACP session"
-                            );
-                        }
-                        Err(join) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
-                                "ACP session load task panicked"
-                            );
-                        }
+                match loaded {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        message_count = data.messages.len();
+                        self.ctx
+                            .sessions
+                            .seed_conversation_history(&session_id, data.messages)
+                            .await;
+                    }
+                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
+                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                        self.ctx.sessions.remove(&session_id).await;
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                    Ok(Err(e)) => {
+                        self.ctx.sessions.remove(&session_id).await;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
+                            "Failed to load or create ACP session"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to load or create ACP session: {e}"),
+                        ));
+                    }
+                    Err(join) => {
+                        self.ctx.sessions.remove(&session_id).await;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
+                            "ACP session load task failed"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("ACP session load task failed: {join}"),
+                        ));
                     }
                 }
             }
@@ -891,19 +904,146 @@ impl RpcDispatcher {
         })
     }
 
-    /// Rebuild a reaped ACP session from its durable row so a fresh prompt
-    /// recovers to a working session instead of hanging. Returns the live agent
-    /// on success, `None` only when the durable row is genuinely gone.
+    async fn handle_session_kill(&self, params: &Value) -> RpcResult {
+        let req: SessionKillParams = parse_params(params)?;
+        let sid = &req.session_id;
+
+        let chat_mode = self
+            .ctx
+            .sessions
+            .chat_mode(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .unwrap_or_default();
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %sid,
+            agent_alias = %agent_alias,
+            channel = "rpc",
+        );
+        let _guard = span.enter();
+
+        if matches!(chat_mode, ChatMode::Acp) {
+            let store = self
+                .ctx
+                .acp_session_store
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+            let sid_owned = sid.to_string();
+            let marked =
+                tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
+            match marked {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "session/kill: live ACP session had no durable row to tombstone"
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+            }
+        }
+
+        let killed = self.ctx.sessions.kill_session(sid).await;
+        if killed {
+            crate::util::release_freed_heap();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "session/kill: session terminated by admin"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "session/kill: session vanished between existence check and kill (concurrent close?)"
+            );
+        }
+
+        to_result(SessionKillResult {
+            session_id: req.session_id,
+            killed,
+        })
+    }
+
+    /// Rebuild a reaped ACP session from a restorable durable row so a fresh
+    /// prompt recovers to a working session instead of hanging. Returns the
+    /// live agent on success; returns `None` for missing, killed, or unreadable
+    /// durable state.
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
         let store = self.ctx.acp_session_store.clone()?;
         let sid_owned = sid.to_string();
-        let loaded = tokio::task::spawn_blocking(move || store.load_session(&sid_owned)).await;
+        let loaded =
+            tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
         let data = match loaded {
-            Ok(Ok(Some(data))) => data,
-            _ => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                    "session/prompt: refusing to rehydrate admin-killed ACP session"
+                );
+                return None;
+            }
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "session/prompt: failed to query ACP killed marker before rehydrate"
+                );
+                return None;
+            }
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "session/prompt: ACP killed-marker query task failed before rehydrate"
+                );
+                return None;
+            }
         };
 
         let config = self.ctx.config.read().clone();
@@ -3527,6 +3667,111 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
+        );
+    }
+
+    /// A deliberately killed ACP session must not be treated like a merely
+    /// reaped session. The durable transcript remains available, but the next
+    /// prompt must not silently resurrect the killed live session.
+    #[tokio::test]
+    async fn killed_acp_session_does_not_rehydrate_from_durable_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-killed-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "freshly created session must be live in memory"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "durable row must exist before kill"
+        );
+
+        dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("session/kill should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "session/kill must remove the live in-memory agent"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "session/kill must preserve durable history"
+        );
+
+        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        assert!(
+            recovered.is_none(),
+            "admin-killed ACP sessions must stay killed instead of rehydrating \
+             from durable history on the next prompt"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "failed rehydrate must leave the session absent from memory"
+        );
+    }
+
+    /// `session/new` is also a durable ACP restore path. It must not bypass the
+    /// killed-session tombstone by loading the preserved transcript into a new
+    /// live agent with the same session_id.
+    #[tokio::test]
+    async fn killed_acp_session_new_with_same_id_does_not_restore() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-killed-new-001";
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": true,
+            "chat_mode": "acp",
+            "session_id": sid,
+        });
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("initial session/new should succeed");
+        dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("session/kill should succeed");
+
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "session/kill must preserve durable history"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "session/kill must remove the live in-memory agent"
+        );
+
+        let restored = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            restored.is_err(),
+            "session/new must not restore an admin-killed ACP session"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "rejected session/new must not leave a live agent behind"
         );
     }
 

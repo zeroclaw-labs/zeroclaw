@@ -658,13 +658,18 @@ impl OpenAiCompatibleModelProvider {
             .next()
             .unwrap_or(model)
             .to_ascii_lowercase();
+        // gpt-5*-chat-latest (gpt-5-chat-latest, gpt-5.1-chat-latest, ...) are
+        // OpenAI's non-reasoning chat-router models; the Chat Completions API
+        // rejects reasoning_effort for them. Treat them as a distinct family, the
+        // same way the native openai.rs provider already special-cases them.
+        let is_gpt5_chat_latest = id.starts_with("gpt-5") && id.ends_with("-chat-latest");
         let is_openai_reasoning_model = id == "o1"
             || id.starts_with("o1-")
             || id == "o3"
             || id.starts_with("o3-")
             || id == "o4"
             || id.starts_with("o4-")
-            || id.starts_with("gpt-5");
+            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
         let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
 
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
@@ -4039,6 +4044,16 @@ mod tests {
         assert_eq!(
             model_provider.reasoning_effort_for_model("openai/gpt-5"),
             Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5-chat-latest"),
+            None,
+            "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5.1-chat-latest"),
+            None,
+            "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
         );
         assert_eq!(
             model_provider.reasoning_effort_for_model("gpt-4-codex"),

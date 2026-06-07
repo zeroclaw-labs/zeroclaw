@@ -21,7 +21,7 @@ use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
 
 /// Which sub-pane of the zerocode tab is focused.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Theme,
     Presets,
@@ -37,6 +37,16 @@ const FOCI: [Focus; 5] = [
     Focus::Locale,
     Focus::Connection,
 ];
+
+/// Which side of the split holds the live cursor. `Sections` is the left list
+/// of section names; `Detail` is the right pane for the highlighted section. The
+/// inactive side keeps a dimmed "you are here" highlight so the user never loses
+/// their place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaneCursor {
+    Sections,
+    Detail,
+}
 
 impl Focus {
     fn fluent_key(self) -> &'static str {
@@ -100,6 +110,9 @@ struct Capture {
 pub(crate) struct ZerocodePane {
     config_dir: PathBuf,
     focus: Focus,
+    /// Which split side holds the live cursor. Section navigation is on the left
+    /// (Sections); entering a section moves the cursor to the right (Detail).
+    cursor: PaneCursor,
     // Theme
     themes: Vec<String>,
     theme_cursor: usize,
@@ -151,6 +164,7 @@ impl ZerocodePane {
         let mut pane = Self {
             config_dir: config_dir.to_path_buf(),
             focus: Focus::Theme,
+            cursor: PaneCursor::Sections,
             themes,
             theme_cursor,
             presets,
@@ -222,6 +236,16 @@ impl ZerocodePane {
         }
     }
 
+    /// Highlight style + symbol for a detail-pane list: active (full) when the
+    /// cursor is in the detail, dimmed "you are here" when it has stepped back to
+    /// the section list.
+    fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
+        match self.cursor {
+            PaneCursor::Detail => (theme::selected_style(), "› "),
+            PaneCursor::Sections => (theme::selected_inactive_style(), "  "),
+        }
+    }
+
     fn draw_focus_list(&self, frame: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = FOCI
             .iter()
@@ -234,11 +258,17 @@ impl ZerocodePane {
             .collect();
         let mut state = ListState::default();
         state.select(FOCI.iter().position(|f| *f == self.focus));
+        // Active highlight when the cursor lives in the section list; a dimmed
+        // "you are here" highlight when the cursor has stepped into the detail.
+        let (style, symbol) = match self.cursor {
+            PaneCursor::Sections => (theme::selected_style(), "› "),
+            PaneCursor::Detail => (theme::selected_inactive_style(), "  "),
+        };
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" zerocode "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(style)
+                .highlight_symbol(symbol),
             area,
             &mut state,
         );
@@ -257,8 +287,8 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Theme "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
             area,
             &mut state,
         );
@@ -277,8 +307,8 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Keybinding Presets "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
             area,
             &mut state,
         );
@@ -312,8 +342,8 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Keybindings (Enter to rebind) "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
             area,
             &mut state,
         );
@@ -379,8 +409,8 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(" Locale (Enter to select / download) "))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
             area,
             &mut state,
         );
@@ -469,8 +499,8 @@ impl ZerocodePane {
                 .block(theme::panel_block(&crate::i18n::t(
                     "zc-zerocode-conn-title",
                 )))
-                .highlight_style(theme::selected_style())
-                .highlight_symbol("› "),
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
             area,
             &mut state,
         );
@@ -656,16 +686,47 @@ impl ZerocodePane {
         }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
-            Some(ConfigTabAction::Up) => self.move_cursor(-1),
-            Some(ConfigTabAction::Down) => self.move_cursor(1),
-            Some(ConfigTabAction::TabLeft) => self.cycle_focus(-1),
-            Some(ConfigTabAction::TabRight) => self.cycle_focus(1),
-            Some(ConfigTabAction::Enter) => self.activate(),
-            Some(ConfigTabAction::DeleteRow) if self.focus == Focus::Bindings => {
+            // Up/Down move within whichever side holds the cursor: the section
+            // list on the left, or the detail rows on the right.
+            Some(ConfigTabAction::Up) => match self.cursor {
+                PaneCursor::Sections => self.cycle_focus(-1),
+                PaneCursor::Detail => self.move_cursor(-1),
+            },
+            Some(ConfigTabAction::Down) => match self.cursor {
+                PaneCursor::Sections => self.cycle_focus(1),
+                PaneCursor::Detail => self.move_cursor(1),
+            },
+            // Right enters the detail pane; at the detail level it is a no-op
+            // (deepest level — cross-tab nav stays on the global PaneNav chord).
+            Some(ConfigTabAction::TabRight) => self.enter_detail(),
+            // Left walks back to the section list; at the section level it is a
+            // no-op ("home").
+            Some(ConfigTabAction::TabLeft) => self.leave_detail(),
+            // Enter: from Sections steps into the detail; from Detail activates
+            // the highlighted row.
+            Some(ConfigTabAction::Enter) => match self.cursor {
+                PaneCursor::Sections => self.enter_detail(),
+                PaneCursor::Detail => self.activate(),
+            },
+            // Back walks one level toward home: Detail -> Sections, then stays.
+            Some(ConfigTabAction::Back) => self.leave_detail(),
+            Some(ConfigTabAction::DeleteRow)
+                if self.cursor == PaneCursor::Detail && self.focus == Focus::Bindings =>
+            {
                 self.reset_row();
             }
             _ => {}
         }
+    }
+
+    /// Move the cursor into the detail pane for the highlighted section.
+    fn enter_detail(&mut self) {
+        self.cursor = PaneCursor::Detail;
+    }
+
+    /// Move the cursor back to the section list. No-op if already there (home).
+    fn leave_detail(&mut self) {
+        self.cursor = PaneCursor::Sections;
     }
 
     fn cycle_focus(&mut self, delta: isize) {
@@ -902,59 +963,96 @@ impl ZerocodePane {
     // ── Contextual help ──────────────────────────────────────────
 
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::{HelpEntry as E, HelpNode};
+        // Render the live chords for an action, never a hardcoded glyph, so the
+        // help tracks the actual (possibly overridden) keymap.
+        let keys = |a: A| -> Vec<String> {
+            use crate::keymap::RebindableActions;
+            a.resolved().iter().map(Chord::display).collect()
+        };
+
         if self.capture.is_some() {
             return HelpNode::entries(vec![
                 E::key("any key", crate::i18n::t("zc-zerocode-capture-assign")),
-                E::key("Esc", crate::i18n::t("zc-zerocode-capture-cancel")),
+                E::new(keys(A::Back), crate::i18n::t("zc-zerocode-capture-cancel")),
             ]);
         }
-        let mut entries = vec![
+
+        let mouse = || {
             E::new(
-                vec!["←", "→", "h", "l"],
-                crate::i18n::t("zc-zerocode-help-switch-pane"),
-            ),
-            E::new(
-                vec!["↑", "↓", "j", "k"],
-                crate::i18n::t("zc-zerocode-help-navigate"),
-            ),
-        ];
+                Vec::<String>::new(),
+                format!(
+                    "{}: {}",
+                    crate::i18n::t("zc-zerocode-help-mouse-label"),
+                    crate::i18n::t("zc-zerocode-help-mouse-desc"),
+                ),
+            )
+        };
+
+        // Cursor in the section list: navigate sections and step into one.
+        if self.cursor == PaneCursor::Sections {
+            return HelpNode::entries(vec![
+                E::new(
+                    [keys(A::Up), keys(A::Down)].concat(),
+                    crate::i18n::t("zc-zerocode-help-choose-section"),
+                ),
+                E::new(
+                    [keys(A::TabRight), keys(A::Enter)].concat(),
+                    crate::i18n::t("zc-zerocode-help-open-section"),
+                ),
+                E::spacer(),
+                mouse(),
+            ]);
+        }
+
+        // Cursor in the detail pane: navigate rows, act, walk back.
+        let mut entries = vec![E::new(
+            [keys(A::Up), keys(A::Down)].concat(),
+            crate::i18n::t("zc-zerocode-help-navigate-rows"),
+        )];
         match self.focus {
             Focus::Theme => {
-                entries.push(E::key(
-                    "Enter",
+                entries.push(E::new(
+                    keys(A::Enter),
                     crate::i18n::t("zc-zerocode-help-apply-theme"),
                 ));
             }
             Focus::Presets => {
-                entries.push(E::key(
-                    "Enter",
+                entries.push(E::new(
+                    keys(A::Enter),
                     crate::i18n::t("zc-zerocode-help-apply-preset"),
                 ));
             }
             Focus::Bindings => {
-                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-rebind")));
-                entries.push(E::key(
-                    "d",
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-rebind"),
+                ));
+                entries.push(E::new(
+                    keys(A::DeleteRow),
                     crate::i18n::t("zc-zerocode-help-reset-default"),
                 ));
             }
             Focus::Locale => {
-                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-locale")));
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-locale"),
+                ));
             }
             Focus::Connection => {
-                entries.push(E::key("Enter", crate::i18n::t("zc-zerocode-help-conn")));
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-conn"),
+                ));
             }
         }
-        entries.push(E::spacer());
         entries.push(E::new(
-            vec![],
-            format!(
-                "{}: {}",
-                crate::i18n::t("zc-zerocode-help-mouse-label"),
-                crate::i18n::t("zc-zerocode-help-mouse-desc"),
-            ),
+            [keys(A::TabLeft), keys(A::Back)].concat(),
+            crate::i18n::t("zc-zerocode-help-back-to-sections"),
         ));
+        entries.push(E::spacer());
+        entries.push(mouse());
         HelpNode::entries(entries)
     }
 
@@ -972,20 +1070,24 @@ impl ZerocodePane {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Focus column click selects the pane.
+                // Focus column click selects the section and parks the cursor on
+                // the left list.
                 if mouse::in_rect(mouse.column, mouse.row, self.focus_area) {
                     if let Some(idx) =
                         mouse::list_click_index(mouse.row, self.focus_area, 0, FOCI.len())
                     {
                         self.focus = FOCI[idx.min(FOCI.len() - 1)];
+                        self.cursor = PaneCursor::Sections;
                     }
                     return;
                 }
-                // Content list click selects (double-click activates).
+                // Content list click moves the cursor into the detail pane and
+                // selects (double-click activates).
                 if mouse::in_rect(mouse.column, mouse.row, self.content_area) {
                     let len = self.current_len();
                     if let Some(idx) = mouse::list_click_index(mouse.row, self.content_area, 0, len)
                     {
+                        self.cursor = PaneCursor::Detail;
                         self.set_current_cursor(idx);
                         if self.double_click.click(mouse.column, mouse.row) {
                             self.activate();
@@ -1120,10 +1222,13 @@ mod tests {
     fn locale_tab_never_claims_text_input() {
         let dir = tempfile::tempdir().unwrap();
         let mut pane = ZerocodePane::new(dir.path());
+        // Down moves the cursor through the section list (cursor starts left).
         while pane.focus != Focus::Locale {
-            pane.handle_key(key(KeyCode::Right));
+            pane.handle_key(key(KeyCode::Down));
         }
-        // Pressing Enter on the (empty) list must not open any text buffer.
+        // Enter steps into the detail; a second Enter on the (empty) list must
+        // not open any text buffer.
+        pane.handle_key(key(KeyCode::Enter));
         pane.handle_key(key(KeyCode::Enter));
         assert!(!pane.wants_text_input());
     }
@@ -1136,7 +1241,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pane = ZerocodePane::new(dir.path());
         while pane.focus != Focus::Locale {
-            pane.handle_key(key(KeyCode::Right));
+            pane.handle_key(key(KeyCode::Down));
         }
         assert!(pane.locale_needs_list(), "empty list should need a fetch");
         pane.report_list_error("daemon unreachable");
@@ -1151,5 +1256,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pane = ZerocodePane::new(dir.path());
         assert!(!pane.wants_text_input());
+    }
+
+    #[test]
+    fn right_enters_detail_left_returns_to_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        assert_eq!(pane.cursor, PaneCursor::Sections);
+        let start = pane.focus;
+        pane.handle_key(key(KeyCode::Right));
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        assert_eq!(pane.focus, start);
+        pane.handle_key(key(KeyCode::Left));
+        assert_eq!(pane.cursor, PaneCursor::Sections);
+        // Left at the section list is a no-op (home), no cross-tab jump.
+        pane.handle_key(key(KeyCode::Left));
+        assert_eq!(pane.cursor, PaneCursor::Sections);
+        assert_eq!(pane.focus, start);
+    }
+
+    #[test]
+    fn esc_walks_back_to_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.handle_key(key(KeyCode::Right));
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        pane.handle_key(key(KeyCode::Esc));
+        assert_eq!(pane.cursor, PaneCursor::Sections);
+        pane.handle_key(key(KeyCode::Esc));
+        assert_eq!(pane.cursor, PaneCursor::Sections);
+    }
+
+    #[test]
+    fn up_down_navigate_sections_when_cursor_in_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let first = pane.focus;
+        pane.handle_key(key(KeyCode::Down));
+        assert_ne!(
+            pane.focus, first,
+            "Down in Sections moves to the next section"
+        );
+        assert_eq!(pane.cursor, PaneCursor::Sections);
     }
 }

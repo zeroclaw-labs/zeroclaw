@@ -279,11 +279,13 @@
           - "src/runtime/**"
           - "crates/zeroclaw-runtime/src/**"
 
-"onboard":
+"quickstart":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/onboard/**"
-          - "crates/zeroclaw-runtime/src/onboard/**"
+          - "crates/zeroclaw-runtime/src/quickstart/**"
+          - "crates/zeroclaw-gateway/src/api_quickstart.rs"
+          - "apps/zerocode/src/quickstart_pane.rs"
+          - "web/src/pages/quickstart/**"
 
 "provider":
   - changed-files:
