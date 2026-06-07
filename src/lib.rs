@@ -172,16 +172,35 @@ Displays the pairing code for connecting new clients without \
 restarting the gateway. Requires the gateway to be running.
 
 With --new, generates a fresh pairing code even if the gateway \
-was previously paired (useful for adding additional clients).
+was previously paired (useful for adding additional clients). This \
+does NOT revoke existing tokens.
+
+With --rotate, revokes ALL paired bearer tokens, clears the device \
+registry, and issues a fresh code. Use this after a suspected token \
+leak when you do not know which token was compromised; every client \
+must re-pair.
+
+With --rotate-device <id>, revokes just that device's bearer token \
+and issues a fresh code for re-pairing that one device.
 
 Examples:
-  zeroclaw gateway get-paircode       # show current pairing code
-  zeroclaw gateway get-paircode --new # generate a new pairing code
+  zeroclaw gateway get-paircode               # show current pairing code
+  zeroclaw gateway get-paircode --new         # add another client (no revocation)
+  zeroclaw gateway get-paircode --rotate      # revoke ALL tokens, then issue a code
+  zeroclaw gateway get-paircode --rotate-device dash-1  # revoke one device's token
   zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
     GetPaircode {
-        /// Generate a new pairing code (even if already paired)
+        /// Generate a new pairing code for adding a client (does not revoke existing tokens)
         #[arg(long)]
         new: bool,
+
+        /// Revoke ALL paired tokens and clear the device registry, then issue a new code
+        #[arg(long, conflicts_with_all = ["new", "rotate_device"])]
+        rotate: bool,
+
+        /// Revoke a single device's bearer token by id, then issue a new code
+        #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
+        rotate_device: Option<String>,
 
         /// Port of the running gateway to query; defaults to config gateway.port
         #[arg(short, long)]

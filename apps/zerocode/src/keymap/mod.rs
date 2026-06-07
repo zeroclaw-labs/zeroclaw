@@ -134,6 +134,58 @@ mod tests {
         check("quickstart_modal", QuickstartModalAction::bindings());
     }
 
+    #[test]
+    fn no_cross_enum_global_shadow() {
+        let global = GlobalAction::bindings();
+        let panes: &[(&str, Vec<Chord>)] = &[
+            (
+                "chat",
+                ChatTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "logs",
+                LogsTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "dashboard",
+                DashboardTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "config",
+                ConfigTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+            (
+                "quickstart",
+                QuickstartTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
+        ];
+        for (gc, ga) in &global {
+            for (label, chords) in panes {
+                for pc in chords {
+                    assert!(
+                        gc != pc,
+                        "global {ga:?} chord {gc:?} shadows a {label} action sharing it"
+                    );
+                }
+            }
+        }
+    }
+
     /// Every rebindable enum's TAG and serialized variant names must be
     /// snake_case — the action-key wire form (`"<tag>.<variant>"`) is
     /// only valid snake_case, and kebab-case is banned project-wide.

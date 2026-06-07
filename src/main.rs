@@ -3405,20 +3405,46 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                Some(zeroclaw::GatewayCommands::GetPaircode {
+                    new,
+                    rotate,
+                    rotate_device,
+                    port,
+                    host,
+                }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
 
-                    // Fetch live pairing code from running gateway
-                    // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(&host, port, config.gateway.path_prefix.as_deref(), new)
-                        .await
+                    let action = if rotate {
+                        PaircodeAction::RotateAll
+                    } else if let Some(id) = rotate_device {
+                        PaircodeAction::RotateDevice(id)
+                    } else if new {
+                        PaircodeAction::AddClient
+                    } else {
+                        PaircodeAction::Show
+                    };
+                    let rotating = action.is_rotation();
+
+                    match fetch_paircode(
+                        &host,
+                        port,
+                        config.gateway.path_prefix.as_deref(),
+                        &action,
+                    )
+                    .await
                     {
-                        Ok(Some(code)) => {
+                        Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
                             );
                             println!();
+                            if let Some(message) = message.as_deref() {
+                                if rotating {
+                                    println!("  ✅ {message}");
+                                    println!();
+                                }
+                            }
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
                             println!("  └──────────────┘");
@@ -3439,8 +3465,10 @@ async fn main() -> Result<()> {
                                 )
                             );
                         }
-                        Ok(None) => {
-                            if config.gateway.require_pairing {
+                        Ok(PaircodeResult::NoCode { message }) => {
+                            if let Some(message) = message {
+                                println!("⚠️  {message}");
+                            } else if config.gateway.require_pairing {
                                 println!(
                                     "🔐 Gateway pairing is enabled, but no active pairing code available."
                                 );
@@ -5679,27 +5707,87 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
     }
 }
 
-/// Fetch the current pairing code from a running gateway.
-/// If `new` is true, generates a fresh pairing code via POST request.
+/// What the `get-paircode` CLI command should do against the running gateway.
+///
+/// Keeps the "add another client" path distinct from the destructive
+/// "rotate after compromise" paths (#6984) without resorting to bare flag
+/// booleans threaded through the fetch helper.
+#[cfg(feature = "agent-runtime")]
+enum PaircodeAction {
+    /// GET the current code; do not mint or revoke anything.
+    Show,
+    /// Issue a fresh code for an additional client; revoke nothing.
+    AddClient,
+    /// Revoke every paired token + clear the registry, then issue a code.
+    RotateAll,
+    /// Revoke a single device's token, then issue a code.
+    RotateDevice(String),
+}
+
+#[cfg(feature = "agent-runtime")]
+impl PaircodeAction {
+    /// True when the action mints a new code (POST), false for `Show` (GET).
+    fn mints_code(&self) -> bool {
+        !matches!(self, PaircodeAction::Show)
+    }
+
+    /// True when the action revokes existing tokens.
+    fn is_rotation(&self) -> bool {
+        matches!(
+            self,
+            PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_)
+        )
+    }
+
+    /// The `rotate` query value to send, if any.
+    fn rotate_query(&self) -> Option<String> {
+        match self {
+            PaircodeAction::RotateAll => Some("all".to_string()),
+            PaircodeAction::RotateDevice(id) => Some(id.clone()),
+            PaircodeAction::Show | PaircodeAction::AddClient => None,
+        }
+    }
+}
+
+/// Outcome of a `get-paircode` request.
+#[cfg(feature = "agent-runtime")]
+enum PaircodeResult {
+    /// A code was returned (with an optional human-readable message).
+    Code {
+        code: String,
+        message: Option<String>,
+    },
+    /// No code is available (with an optional explanatory message from the
+    /// gateway, e.g. a revoke that succeeded but could not issue a code).
+    NoCode { message: Option<String> },
+}
+
+/// Fetch or generate the gateway pairing code from a running gateway.
+///
+/// `Show` issues a GET; the other actions POST to `/admin/paircode/new`,
+/// optionally carrying a `rotate` query so the gateway revokes the matching
+/// tokens before minting the new code.
 #[cfg(feature = "agent-runtime")]
 async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
-    new: bool,
-) -> Result<Option<String>> {
+    action: &PaircodeAction,
+) -> Result<PaircodeResult> {
     let client = reqwest::Client::new();
 
-    let response = if new {
-        // Generate a new pairing code via POST
-        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+    let response = if action.mints_code() {
+        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+        if let Some(rotate) = action.rotate_query() {
+            url.push_str("?rotate=");
+            url.push_str(&urlencoding::encode(&rotate));
+        }
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
     } else {
-        // Get existing pairing code via GET
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
@@ -5719,37 +5807,50 @@ async fn fetch_paircode(
         anyhow::Error::msg(format!("Failed to connect to gateway: {e}"))
     })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"status": status.as_u16()})),
-            "gateway paircode fetch returned non-success status"
-        );
-        anyhow::bail!("Gateway responded with status: {status}");
-    }
-
+    // A rotation that revoked tokens but could not issue a code (registry
+    // disabled, device not found, persist failure) returns a non-2xx with an
+    // explanatory message in the body. Surface that message rather than
+    // collapsing it into a bare status line, so the operator knows what
+    // state the gateway is in after the revoke attempt.
+    let status = response.status();
     let json: serde_json::Value = response.json().await.map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                .with_attrs(
+                    ::serde_json::json!({"error": format!("{}", e), "status": status.as_u16()})
+                ),
             "gateway paircode response: JSON parse failed"
         );
-        anyhow::Error::msg(format!("Failed to parse response: {e}"))
+        anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
 
+    let message = json
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
-        return Ok(None);
+        if !status.is_success() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"status": status.as_u16()})),
+                "gateway paircode fetch returned non-success status"
+            );
+        }
+        return Ok(PaircodeResult::NoCode { message });
     }
 
-    Ok(json
-        .get("pairing_code")
-        .and_then(|v| v.as_str())
-        .map(String::from))
+    match json.get("pairing_code").and_then(|v| v.as_str()) {
+        Some(code) => Ok(PaircodeResult::Code {
+            code: code.to_string(),
+            message,
+        }),
+        None => Ok(PaircodeResult::NoCode { message }),
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -6350,14 +6451,72 @@ mod tests {
 
         match cli.command {
             Commands::Gateway {
-                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+                gateway_command:
+                    Some(zeroclaw::GatewayCommands::GetPaircode {
+                        new,
+                        rotate,
+                        rotate_device,
+                        port,
+                        host,
+                    }),
             } => {
                 assert!(new);
+                assert!(!rotate);
+                assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }
+    }
+
+    /// `--rotate` parses and is mutually exclusive with `--new` and
+    /// `--rotate-device` so the destructive path cannot be silently combined
+    /// with "add another client".
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_rotate_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "get-paircode", "--rotate"])
+            .expect("gateway get-paircode --rotate should parse");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { rotate, .. }),
+            } => assert!(rotate),
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--rotate-device",
+            "dash-1",
+        ])
+        .expect("gateway get-paircode --rotate-device should parse");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { rotate_device, .. }),
+            } => assert_eq!(rotate_device.as_deref(), Some("dash-1")),
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["zeroclaw", "gateway", "get-paircode", "--new", "--rotate"])
+                .is_err(),
+            "--new and --rotate must conflict"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "gateway",
+                "get-paircode",
+                "--rotate",
+                "--rotate-device",
+                "dash-1"
+            ])
+            .is_err(),
+            "--rotate and --rotate-device must conflict"
+        );
     }
 
     /// Regression for PR #6192: when the user passes `--port`/`--host` to

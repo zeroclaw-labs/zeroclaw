@@ -83,7 +83,6 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
-    pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_KILL: &str = "session/kill";
     // Dashboard
@@ -701,14 +700,6 @@ impl RpcClient {
         self.connection_state.lock().unwrap().clone()
     }
 
-    /// Returns `true` when the daemon connection is known to be dead.
-    pub fn is_disconnected(&self) -> bool {
-        matches!(
-            self.connection_state(),
-            ConnectionState::Disconnected { .. }
-        )
-    }
-
     // ── Notifications ─────────────────────────────────────────────
 
     /// Get a receiver for server-initiated notifications.
@@ -1090,18 +1081,6 @@ impl RpcClient {
             )
             .await?;
         Ok(())
-    }
-
-    pub async fn session_rename(
-        &self,
-        session_id: &str,
-        name: &str,
-    ) -> Result<SessionRenameResult> {
-        self.call(
-            method::SESSION_RENAME,
-            serde_json::json!({ "session_id": session_id, "name": name }),
-        )
-        .await
     }
 
     // ── Dashboard helpers ────────────────────────────────────────
@@ -1665,10 +1644,6 @@ pub struct SessionGitBranchResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionApproveResult {}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SessionRenameResult {}
 
 #[derive(Debug, Clone)]
 pub enum ApprovalDecision {
