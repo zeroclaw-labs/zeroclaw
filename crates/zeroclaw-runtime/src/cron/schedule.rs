@@ -73,7 +73,15 @@ pub fn validate_schedule(schedule: &Schedule, now: DateTime<Utc>) -> Result<()> 
         }
         Schedule::At { at } => {
             if *at <= now {
-                anyhow::bail!("Invalid schedule: 'at' must be in the future");
+                anyhow::bail!(
+                    "Invalid schedule: 'at' must be in the future \
+                     (now_utc={}, now_local={}, at_utc={}, at_local={}, delta_seconds={})",
+                    now.to_rfc3339(),
+                    now.with_timezone(&chrono::Local).to_rfc3339(),
+                    at.to_rfc3339(),
+                    at.with_timezone(&chrono::Local).to_rfc3339(),
+                    (*at - now).num_seconds()
+                );
             }
             Ok(())
         }

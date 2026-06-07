@@ -542,4 +542,4 @@ cli-channels-cli-always = {"  "}✅ CLI (siempre disponible)
 cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
-cli-channels-configure-hint = Para configurar:      zeroclaw onboard
+cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>

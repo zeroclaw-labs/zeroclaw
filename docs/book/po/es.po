@@ -31694,98 +31694,7 @@ msgstr "Escribir el `AGENTS.md` de nivel raíz para `crates/zeroclaw-api` (antic
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)"
-msgstr "**Última actualización:** [Fecha]  \n**Autor:** Comité de Gobernanza de Complementos (PGC)  \n**Estado:** Vigente"
-"**Última actualización:** [Fecha]  \n"
-"**Autor:** Comité de Gobernanza de Complementos (PGC)  \n"
-"**Estado:** Vigente**Última actualización:** [Fecha]  \n"
-"**Autor:** Comité de Gobernanza de Complementos (PGC)  \n"
-"**Estado:** Vigente# Documento de Gobernanza del Registro de Complementos (Plugin Registry)\n"
-"\n"
-"## 1. Introducción\n"
-"\n"
-"Este documento establece las políticas, procedimientos y responsabilidades para la gobernanza del Registro de Complementos (Plugin Registry). El objetivo es garantizar la seguridad, integridad y calidad de los complementos publicados, protegiendo a los usuarios finales y manteniendo la confianza en la plataforma.\n"
-"\n"
-"## 2. Control y Autoridad del Registro\n"
-"\n"
-"### 2.1. Entidad Responsable\n"
-"El Registro de Complementos es administrado por el **Comité de Gobernanza de Complementos** (Plugin Governance Committee, PGC), un grupo multidisciplinario compuesto por:\n"
-"- Representantes de la organización principal del proyecto.\n"
-"- Mantenedores de seguridad (Security Maintainers).\n"
-"- Representantes de la comunidad seleccionados por votación.\n"
-"\n"
-"### 2.2. Control de Infraestructura\n"
-"- **Acceso de Escritura:** Solo los administradores del PGC tienen acceso de escritura a la base de datos del registro y a los sistemas de publicación automatizados.\n"
-"- **Acceso de Lectura:** Público. Cualquier usuario puede buscar, descargar y auditar los metadatos de los complementos.\n"
-"- **Código Fuente:** El código del registro y las herramientas de validación son de código abierto y se encuentran en el repositorio público del proyecto.\n"
-"\n"
-"## 3. Proceso de Revisión de Complementos\n"
-"\n"
-"### 3.1. Criterios de Aceptación\n"
-"Todo complemento debe cumplir con los siguientes criterios antes de ser publicado:\n"
-"1. **Seguridad:** No debe contener código malicioso, backdoors, ni dependencias vulnerables conocidas.\n"
-"2. **Calidad del Código:** Debe seguir las guías de estilo y estándares de la comunidad.\n"
-"3. **Documentación:** Debe incluir una descripción clara, instrucciones de instalación y un archivo `README.md`.\n"
-"4. **Licencia:** Debe especificar una licencia compatible con el proyecto.\n"
-"\n"
-"### 3.2. Proceso de Revisión\n"
-"1. **Subida Inicial:** El desarrollador sube el complemento a través de la CLI oficial.\n"
-"2. **Validación Automatizada:**\n"
-"   - Escaneo de vulnerabilidades en dependencias.\n"
-"   - Verificación de firmas digitales.\n"
-"   - Pruebas de linting y formato.\n"
-"3. **Revisión Humana (Opcional para complementos de alto riesgo):**\n"
-"   - Complementos con permisos elevados o acceso a datos sensibles son revisados por al menos dos miembros del PGC.\n"
-"   - Complementos estándar pasan por una revisión aleatoria periódica.\n"
-"4. **Aprobación o Rechazo:**\n"
-"   - Si pasa la validación, se publica automáticamente.\n"
-"   - Si falla, se notifica al desarrollador con los motivos específicos.\n"
-"\n"
-"## 4. Revocación de Complementos Comprometidos\n"
-"\n"
-"### 4.1. Definición de \"Comprometido\"\n"
-"Un complemento se considera comprometido si:\n"
-"- Se descubre que contiene código malicioso.\n"
-"- Se explota una vulnerabilidad crítica que no ha sido parcheada en un tiempo razonable.\n"
-"- El mantenedor original ha abandonado el proyecto sin transferencia de mantenimiento.\n"
-"- Se viola gravemente la licencia o los términos de servicio.\n"
-"\n"
-"### 4.2. Procedimiento de Revocación\n"
-"1. **Detección:**\n"
-"   - Reportes de usuarios.\n"
-"   - Alertas automáticas del sistema de monitoreo de seguridad.\n"
-"   - Auditorías internas del PGC.\n"
-"2. **Investigación:**\n"
-"   - El PGC investiga el incidente en un plazo de 24-48 horas.\n"
-"   - Se notifica al mantenedor del complemento (si es posible) para dar oportunidad de respuesta.\n"
-"3. **Decisión:**\n"
-"   - Si se confirma la amenaza, el PGC vota para revocar el complemento.\n"
-"   - Se documenta la razón de la revocación en el historial público del registro.\n"
-"4. **Ejecución:**\n"
-"   - El complemento se marca como \"Descontinuado\" (Deprecated) y luego \"Revocado\" (Revoked).\n"
-"   - Las versiones anteriores se eliminan de los repositorios públicos.\n"
-"   - Se notifica a los usuarios afectados a través de canales oficiales.\n"
-"\n"
-"### 4.3. Apelación\n"
-"Los mantenedores de complementos revocados pueden presentar una apelación al PGC dentro de los 7 días hábiles siguientes a la revocación. La decisión final del PGC es vinculante.\n"
-"\n"
-"## 5. Transparencia y Auditoría\n"
-"\n"
-"- **Registros Públicos:** Todas las acciones de publicación, actualización y revocación se registran en un log público inmutable.\n"
-"- **Informes de Seguridad:** El PGC publica informes trimestrales sobre incidentes de seguridad y medidas tomadas.\n"
-"- **Auditorías Externas:** Se permiten auditorías externas por parte de terceros de confianza, previa solicitud y aprobación del PGC.\n"
-"\n"
-"## 6. Actualización de este Documento\n"
-"\n"
-"Las enmiendas a este documento de gobernanza requieren:\n"
-"- Una propuesta pública en el repositorio del proyecto.\n"
-"- Un período de comentarios de al menos 14 días.\n"
-"- Aprobación por mayoría de dos tercios del PGC.\n"
-"\n"
-"---\n"
-"\n"
-"**Última actualización:** [Fecha]  \n"
-"**Autor:** Comité de Gobernanza de Complementos (PGC)  \n"
-"**Estado:** Vigente"
+msgstr "Escribir el documento de gobernanza de Plugin Registry (quién controla el registro, cómo se revisan los plugins y cómo se revocan los plugins comprometidos)"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the WIT interface documentation alongside the `wit/` files (generated from WIT + hand-written explanation)"
@@ -48140,3 +48049,147 @@ msgstr "🔵 Decisión del equipo"
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "🟡 Conditional"
 msgstr "🟡 Condicional"
+
+#: src/SUMMARY.md
+msgid "Channels & Integrations"
+msgstr "Canales e integraciones"
+
+#: src/SUMMARY.md src/developing/index.md
+msgid "Extending & Plugins"
+msgstr "Extensiones y plugins"
+
+#: src/SUMMARY.md
+msgid "Foundations (RFCs)"
+msgstr "Fundamentos (RFC)"
+
+#: src/SUMMARY.md
+msgid "Hardware & Boards"
+msgstr "Hardware y placas"
+
+#: src/SUMMARY.md src/setup/index.md
+msgid "Installation"
+msgstr "Instalación"
+
+#: src/SUMMARY.md
+msgid "Operations & Deployment"
+msgstr "Operaciones y despliegue"
+
+#: src/SUMMARY.md
+msgid "Security & Autonomy"
+msgstr "Seguridad y autonomía"
+
+#: src/SUMMARY.md
+msgid "Standard Operating Procedures"
+msgstr "Procedimientos operativos estándar"
+
+#: src/SUMMARY.md
+msgid "Tools & Extensibility"
+msgstr "Herramientas y extensibilidad"
+
+#: src/getting-started/index.md
+msgid "Start here if you are installing ZeroClaw for the first time or choosing the simplest path to a working agent."
+msgstr "Empieza aquí si instalas ZeroClaw por primera vez o eliges la ruta más sencilla hacia un agente funcional."
+
+#: src/getting-started/index.md
+msgid "[Quick start](./quick-start.md) covers installation, onboarding, and the first chat."
+msgstr "[Inicio rápido](./quick-start.md) cubre la instalación, la incorporación y el primer chat."
+
+#: src/getting-started/index.md
+msgid "[YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset."
+msgstr "[Modo YOLO](./yolo.md) documenta el preset de desarrollo local más rápido e inseguro."
+
+#: src/getting-started/index.md
+msgid "[Multi-model setup](./multi-model-setup.md) explains provider and route basics."
+msgstr "[Configuración multimodelo](./multi-model-setup.md) explica los conceptos básicos de proveedores y rutas."
+
+#: src/getting-started/index.md
+msgid "[zerocode](./tui.md) introduces the terminal UI."
+msgstr "[zerocode](./tui.md) presenta la interfaz de terminal."
+
+#: src/getting-started/index.md
+msgid "[Language and translations](./language.md) covers locale selection."
+msgstr "[Idioma y traducciones](./language.md) cubre la selección de configuración regional."
+
+#: src/setup/index.md
+msgid "Choose the installation path for your operating system or deployment target."
+msgstr "Elige la ruta de instalación para tu sistema operativo o destino de despliegue."
+
+#: src/setup/index.md
+msgid "[Docker and containers](./container.md)"
+msgstr "[Docker y contenedores](./container.md)"
+
+#: src/reference/index.md
+msgid "Reference material for operators and integrators who need exact command, configuration, environment, and API details."
+msgstr "Material de referencia para operadores e integradores que necesitan detalles exactos de comandos, configuración, entorno y API."
+
+#: src/reference/index.md
+msgid "[CLI](./cli.md)"
+msgstr "[CLI](./cli.md)"
+
+#: src/reference/index.md
+msgid "[Config](./config.md)"
+msgstr "[Configuración](./config.md)"
+
+#: src/reference/index.md
+msgid "[Environment variables](./env-vars.md)"
+msgstr "[Variables de entorno](./env-vars.md)"
+
+#: src/reference/index.md
+msgid "[API rustdoc](../api.md)"
+msgstr "[API rustdoc](../api.md)"
+
+#: src/reference/index.md
+msgid "[Gateway HTTP API](../gateway/api.md)"
+msgstr "[API HTTP de la gateway](../gateway/api.md)"
+
+#: src/reference/index.md
+msgid "[Web dashboard](../gateway/web-dashboard.md)"
+msgstr "[Panel web](../gateway/web-dashboard.md)"
+
+#: src/developing/index.md
+msgid "Use these pages when extending ZeroClaw or working on project tooling."
+msgstr "Usa estas páginas al extender ZeroClaw o trabajar en las herramientas del proyecto."
+
+#: src/developing/index.md
+msgid "[Plugin protocol](./plugin-protocol.md)"
+msgstr "[Protocolo de plugins](./plugin-protocol.md)"
+
+#: src/developing/index.md
+msgid "[Extension examples](./extension-examples.md)"
+msgstr "[Ejemplos de extensiones](./extension-examples.md)"
+
+#: src/developing/index.md
+msgid "[Building the docs locally](./building-docs.md)"
+msgstr "[Construir la documentación localmente](./building-docs.md)"
+
+#: src/developing/index.md
+msgid "[Building the web dashboard](./web.md)"
+msgstr "[Construir el panel web](./web.md)"
+
+#: src/contributing/index.md
+msgid "Start here before opening issues, proposing architecture changes, or submitting pull requests."
+msgstr "Empieza aquí antes de abrir issues, proponer cambios de arquitectura o enviar pull requests."
+
+#: src/contributing/index.md
+msgid "[Architecture and contribution map](./architecture-map.md)"
+msgstr "[Mapa de arquitectura y contribución](./architecture-map.md)"
+
+#: src/contributing/index.md
+msgid "[Privacy and PII discipline](./privacy.md)"
+msgstr "[Disciplina de privacidad y PII](./privacy.md)"
+
+#: src/contributing/index.md
+msgid "[Testing](./testing.md)"
+msgstr "[Pruebas](./testing.md)"
+
+#: src/contributing/index.md
+msgid "[PR review protocol](./pr-review-protocol.md)"
+msgstr "[Protocolo de revisión de PR](./pr-review-protocol.md)"
+
+#: src/contributing/index.md
+msgid "[Multi-agent setup](./multi-agent-setup.md)"
+msgstr "[Configuración multiagente](./multi-agent-setup.md)"
+
+#: src/contributing/index.md
+msgid "[Contributor License Agreement](./cla.md)"
+msgstr "[Acuerdo de licencia de colaborador](./cla.md)"
