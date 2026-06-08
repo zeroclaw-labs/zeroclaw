@@ -2315,7 +2315,10 @@ fn optional_channel_routes() -> Router<AppState> {
     #[cfg(feature = "channel-nextcloud")]
     let router = router
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
-        .route("/nextcloud-talk/{alias}", post(handle_nextcloud_talk_webhook_alias));
+        .route(
+            "/nextcloud-talk/{alias}",
+            post(handle_nextcloud_talk_webhook_alias),
+        );
     #[cfg(feature = "channel-email")]
     let router = router.route("/webhook/gmail", post(handle_gmail_push_webhook));
     router
@@ -2954,8 +2957,15 @@ async fn handle_linq_webhook_impl(
         return api_webhook::not_found("linq");
     };
     let signing_secret = state.linq_signing_secrets.get(alias_key).cloned();
-    let resp =
-        process_linq_webhook(&state, alias_key, linq, signing_secret.as_deref(), headers, body).await;
+    let resp = process_linq_webhook(
+        &state,
+        alias_key,
+        linq,
+        signing_secret.as_deref(),
+        headers,
+        body,
+    )
+    .await;
     api_webhook::tag_deprecation(resp.into_response(), resolved, "linq")
 }
 
@@ -6897,7 +6907,11 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         // Explicit alias path carries no deprecation header.
-        assert!(resp.headers().get(api_webhook::DEPRECATION_HEADER).is_none());
+        assert!(
+            resp.headers()
+                .get(api_webhook::DEPRECATION_HEADER)
+                .is_none()
+        );
 
         // The other instance's token must NOT verify against `work`.
         let resp = handle_whatsapp_verify_alias(
@@ -6942,11 +6956,17 @@ mod tests {
         state.whatsapp =
             HashMap::from([("default".to_string(), whatsapp_instance("default", "tok"))]);
 
-        let resp =
-            handle_whatsapp_verify(State(state), Query(verify_query("tok", "challenge-default")))
-                .await;
+        let resp = handle_whatsapp_verify(
+            State(state),
+            Query(verify_query("tok", "challenge-default")),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get(api_webhook::DEPRECATION_HEADER).is_some());
+        assert!(
+            resp.headers()
+                .get(api_webhook::DEPRECATION_HEADER)
+                .is_some()
+        );
     }
 
     /// The alias path preserves per-instance signature auth.
