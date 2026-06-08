@@ -21,9 +21,11 @@ import {
   CheckCircle,
   ChevronDown,
   Clock,
+  Pause,
   Pencil,
   Play,
   Plus,
+  Power,
   RefreshCw,
   Trash2,
   X,
@@ -449,6 +451,17 @@ export default function Cron() {
       setError(err instanceof Error ? err.message : t('cron.delete_error'));
     } finally {
       setConfirmDelete(null);
+    }
+  };
+
+  // Pause/resume a job without deleting it — toggles the existing `enabled`
+  // flag the scheduler already honours.
+  const handleToggleEnabled = async (job: CronJob) => {
+    try {
+      const updated = await patchCronJob(job.id, { enabled: !job.enabled });
+      setJobs((prev) => prev.map((j) => (j.id === job.id ? updated : j)));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('cron.edit_error'));
     }
   };
 
@@ -1031,6 +1044,19 @@ export default function Cron() {
                             <RefreshCw className="h-4 w-4 animate-spin" />
                           ) : (
                             <Play className="h-4 w-4" />
+                          )}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleToggleEnabled(job)}
+                          title={job.enabled ? t('cron.pause') : t('cron.resume')}
+                          aria-label={job.enabled ? t('cron.pause') : t('cron.resume')}
+                        >
+                          {job.enabled ? (
+                            <Pause className="h-4 w-4" />
+                          ) : (
+                            <Power className="h-4 w-4" />
                           )}
                         </Button>
                         <Button
