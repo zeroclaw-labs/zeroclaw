@@ -128,10 +128,10 @@ impl CounterfactualEngine {
         self.simulations.len()
     }
 
-    pub fn path_integral_select(
+    pub fn path_integral_select<R: rand::Rng + ?Sized>(
         &mut self,
         scenarios: &[Scenario],
-        rng: &mut dyn rand_core::RngCore,
+        rng: &mut R,
     ) -> Option<SimulationResult> {
         if scenarios.is_empty() {
             return None;
@@ -158,7 +158,7 @@ impl CounterfactualEngine {
             .map(|a| a.norm_sqr() / total_norm_sq)
             .collect();
 
-        use rand::Rng;
+        use rand::RngExt;
         let r: f64 = rng.random();
         let mut cumulative = 0.0;
         for (i, p) in probabilities.iter().enumerate() {

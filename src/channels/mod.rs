@@ -1,4 +1,9 @@
 pub use zeroclaw_channels::orchestrator::*;
+// Channel trait + message types moved to `zeroclaw_api::channel` during the
+// crate split; pre-split callers use `crate::channels::traits::{Channel, SendMessage}`.
+pub mod traits {
+    pub use zeroclaw_api::channel::*;
+}
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 #[cfg(feature = "channel-telegram")]

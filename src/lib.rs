@@ -140,6 +140,11 @@ pub mod life;
 // x0-broken-legacy.
 #[cfg(feature = "x0-broken-legacy")]
 pub mod onboard;
+// `skillforge` is declared in the binary crate (main.rs); the onboard wizard
+// lives in the lib crate and needs `crate::skillforge::SkillForgeConfig`, so
+// declare the re-export shim here too under the same gate.
+#[cfg(feature = "x0-broken-legacy")]
+pub mod skillforge;
 // quantum modules depend on rand 0.10's Rng::random API + num_complex
 // serde feature; pending a rebuild. Gated behind x0-broken-legacy.
 #[cfg(feature = "x0-broken-legacy")]

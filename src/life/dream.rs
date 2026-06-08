@@ -57,7 +57,7 @@ impl DreamEngine {
             return Ok(None);
         }
 
-        let recent = memory.recall("*", 20, None).await.unwrap_or_default();
+        let recent = memory.recall("*", 20, None, None, None).await.unwrap_or_default();
         if recent.is_empty() {
             return Ok(None);
         }
@@ -85,7 +85,7 @@ impl DreamEngine {
                 Some(&system),
                 "Dream: synthesize memories",
                 "claude-haiku-4-5",
-                1.2,
+                Some(1.2),
             )
             .await?;
 

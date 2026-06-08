@@ -321,9 +321,9 @@ impl LifeLoop {
             {
                 let state = self.emotional_state.lock().await;
                 self.observer.record_event(&ObserverEvent::LifeTick {
-                    valence: state.valence,
-                    arousal: state.arousal,
-                    curiosity: state.curiosity,
+                    valence: f64::from(state.valence),
+                    arousal: f64::from(state.arousal),
+                    curiosity: f64::from(state.curiosity),
                 });
                 state.save(&self.config.emotional_persistence_path);
             }

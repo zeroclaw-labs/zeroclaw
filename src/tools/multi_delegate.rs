@@ -174,7 +174,7 @@ impl MultiDelegateTool {
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> =
-            match providers::create_provider(&agent_config.provider, provider_credential) {
+            match providers::create_model_provider(&agent_config.provider, provider_credential) {
                 Ok(p) => p,
                 Err(e) => {
                     self.cleanup_pool(agent_name, index);
@@ -210,7 +210,7 @@ impl MultiDelegateTool {
 
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            provider.chat_with_system(system, &full_prompt, &agent_config.model, temperature),
+            provider.chat_with_system(system, &full_prompt, &agent_config.model, Some(temperature)),
         )
         .await;
 

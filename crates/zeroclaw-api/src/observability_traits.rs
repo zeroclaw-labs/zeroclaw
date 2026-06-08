@@ -142,6 +142,28 @@ pub enum ObserverEvent {
         /// Harm score in `[0, 1]` produced by the gate.
         score: f64,
     },
+    /// Emitted once per autonomous "life loop" tick with the current
+    /// emotional-state dimensions. Fork-only; backends may no-op.
+    LifeTick {
+        /// Emotional valence dimension.
+        valence: f64,
+        /// Emotional arousal dimension.
+        arousal: f64,
+        /// Curiosity dimension.
+        curiosity: f64,
+    },
+    /// Emitted when the life loop autonomously initiates contact.
+    LifeInitiative {
+        /// What triggered the initiative (e.g. `"auto"`).
+        trigger: String,
+        /// Truncated preview of the generated message.
+        message_preview: String,
+    },
+    /// Emitted when a background "dream" synthesis completes.
+    LifeDreamComplete {
+        /// Truncated preview of the dream insight.
+        insight_preview: String,
+    },
 }
 
 /// Numeric metrics emitted by the agent runtime.

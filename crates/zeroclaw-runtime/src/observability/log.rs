@@ -174,6 +174,46 @@ impl Observer for LogObserver {
                     "conscience.verdict"
                 );
             }
+            ObserverEvent::LifeTick {
+                valence,
+                arousal,
+                curiosity,
+            } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "valence": valence,
+                            "arousal": arousal,
+                            "curiosity": curiosity,
+                        })),
+                    "life.tick"
+                );
+            }
+            ObserverEvent::LifeInitiative {
+                trigger,
+                message_preview,
+            } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "trigger": trigger,
+                            "message_preview": message_preview,
+                        })),
+                    "life.initiative"
+                );
+            }
+            ObserverEvent::LifeDreamComplete { insight_preview } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "insight_preview": insight_preview,
+                        })),
+                    "life.dream_complete"
+                );
+            }
         }
     }
 

@@ -387,7 +387,10 @@ impl Observer for OtelObserver {
             | ObserverEvent::DeploymentCompleted { .. }
             | ObserverEvent::DeploymentFailed { .. }
             | ObserverEvent::RecoveryCompleted { .. }
-            | ObserverEvent::ConscienceVerdict { .. } => {
+            | ObserverEvent::ConscienceVerdict { .. }
+            | ObserverEvent::LifeTick { .. }
+            | ObserverEvent::LifeInitiative { .. }
+            | ObserverEvent::LifeDreamComplete { .. } => {
                 // DORA deployment events + conscience verdicts: OTel pass-
                 // through not yet implemented (verdicts surface via the log
                 // observer; structured-trace mapping is future work).
