@@ -11,9 +11,15 @@ This page is the operations-side companion to [Setup → Service management](../
 
 On desktop Linux, enable user-service lingering so the user service persists across logouts:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 loginctl enable-linger $USER
 ```
+
+</div>
 
 Without lingering, a user-scope systemd service stops when the last session closes.
 
@@ -50,10 +56,16 @@ Force an immediate exit with `SIGKILL` if you must, but expect the conversation 
 
 Skip the service and run the daemon directly:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service stop     # free the gateway port if the service is running
 zeroclaw daemon
 ```
+
+</div>
 
 `zeroclaw daemon` runs in the foreground, logs to stderr, and is the same process the service runs, just without the service harness. Useful when:
 
@@ -69,9 +81,15 @@ Terminate with Ctrl-C, same graceful shutdown semantics as SIGTERM.
 
 Add to a drop-in:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 systemctl --user edit zeroclaw.service
 ```
+
+</div>
 
 ```ini
 [Service]
@@ -82,10 +100,16 @@ LimitNOFILE=16384        # if opening many channel sockets
 
 Reload and restart:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 systemctl --user daemon-reload
 systemctl --user restart zeroclaw
 ```
+
+</div>
 
 ### macOS: launchd
 
@@ -101,10 +125,16 @@ Edit `~/Library/LaunchAgents/com.zeroclaw.daemon.plist`:
 
 Unload + load the plist to apply:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 ```
+
+</div>
 
 ### Docker
 
@@ -128,10 +158,16 @@ Each ZeroClaw instance owns one workspace. To run two:
 2. Create `~/.zeroclaw-home/` and `~/.zeroclaw-work/` (or wherever)
 3. Run two services pointing at different workspaces:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ZEROCLAW_WORKSPACE=~/.zeroclaw-home zeroclaw service install --name zeroclaw-home
 ZEROCLAW_WORKSPACE=~/.zeroclaw-work zeroclaw service install --name zeroclaw-work
 ```
+
+</div>
 
 Each gets its own unit file / plist, its own gateway port (configurable in each config), and its own channel bindings. Memory stays separate; a Telegram bot in one workspace doesn't know about the other.
 
@@ -139,13 +175,19 @@ Don't point two daemons at the same workspace. SQLite is single-writer; the seco
 
 ## Observing restarts and crashes
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Linux
 journalctl --user -u zeroclaw --since "1 day ago" | grep -E 'Started|Stopped|failed'
 
 # macOS
 log show --predicate 'process == "zeroclaw"' --last 1d | grep -E 'start|stop|error'
 ```
+
+</div>
 
 If you're seeing repeated restarts, enable debug logging (`RUST_LOG=debug` via the unit file's `Environment=`) and let one more crash happen to capture the full trace.
 

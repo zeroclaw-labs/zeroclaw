@@ -16,16 +16,28 @@ returns a "not available" message.
 web_dist_dir = "/absolute/path/to/zeroclaw/web/dist"   # NOTE: no ~, no $HOME
 ```
 
+<div class="os-tabs-src">
+
+#### sh
+
 ```sh
 # Equivalent env-var override (in-memory only, never persisted)
 export ZEROCLAW_gateway__web_dist_dir="/absolute/path/to/zeroclaw/web/dist"
 ```
 
+</div>
+
 Then build the bundle once:
+
+<div class="os-tabs-src">
+
+#### sh
 
 ```sh
 cargo web build
 ```
+
+</div>
 
 …and restart the daemon. The startup log changes from
 
@@ -79,12 +91,18 @@ You have three options. Pick whichever matches how you installed ZeroClaw.
 
 ### A) Source checkout (developers / packagers)
 
+<div class="os-tabs-src">
+
+#### sh
+
 ```sh
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 cargo web build           # alias for `cargo run -p xtask --bin web -- build`
                           # auto-runs `npm install` on first run
 ```
+
+</div>
 
 The bundle lands in `web/dist/`. Point `web_dist_dir` at the absolute path of
 that directory, or run the daemon from the repo root and let auto-detect
@@ -158,9 +176,15 @@ web_dist_dir = "/home/alice/zeroclaw/web/dist"
 Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded. Pre-expand
 them in the env var if you set the value that way:
 
+<div class="os-tabs-src">
+
+#### sh
+
 ```sh
 export ZEROCLAW_gateway__web_dist_dir="$HOME/zeroclaw/web/dist"   # shell expands $HOME
 ```
+
+</div>
 
 Companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961) adds
 the targeted "looks like an unexpanded `~` / `$VAR`,

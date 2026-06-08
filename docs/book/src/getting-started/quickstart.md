@@ -8,28 +8,7 @@ where you are.
 
 ## Install
 
-Pick one:
-
-**Linux / macOS (one-liner):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
-```
-
-**Homebrew (macOS, Linux):**
-
-```bash
-brew install zeroclaw
-```
-
-**Windows:** run `setup.bat` from the latest release, or see
-[Setup → Windows](../setup/windows.md).
-
-**From source** (inside a clone):
-
-```bash
-./install.sh
-```
+{{#include ../_snippets/install.md}}
 
 This builds and installs both `zeroclaw` and the `zerocode` terminal interface.
 Run it with no flags for an interactive picker that lets you choose the build
@@ -47,9 +26,15 @@ type, which apps to install, and which optional features to compile in.
 
 The fastest path on a headless box or over SSH:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw quickstart
 ```
+
+</div>
 
 You answer one prompt per step in the terminal. The built-in `cli` channel
 works immediately, so Channels and Peer groups can be skipped. For an
@@ -78,9 +63,15 @@ option that lists the matching aliases already in your config.
 
 With the daemon running, open the dashboard in a browser:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon
 ```
+
+</div>
 
 `zeroclaw daemon` runs the full runtime: the gateway, your configured channels,
 the scheduler, and the heartbeat monitor. (`zeroclaw gateway` starts only the

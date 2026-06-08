@@ -10,31 +10,55 @@ Run all of these. The data informs every step that follows.
 
 1. **PR overview**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr view <number> --repo zeroclaw-labs/zeroclaw
    ```
+
+   </div>
 
    Description, labels, linked issues, validation evidence.
 
 2. **Top-level conversation**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr view <number> --comments --repo zeroclaw-labs/zeroclaw
    ```
 
+   </div>
+
 3. **Inline threads (every reply chain)**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh api repos/zeroclaw-labs/zeroclaw/pulls/<number>/comments --paginate
    ```
+
+   </div>
 
    Read full reply chains before drawing any conclusion about whether something is open or settled. Note author commitments made in replies, they're load-bearing.
 
 4. **Formal reviews**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh api repos/zeroclaw-labs/zeroclaw/pulls/<number>/reviews --paginate
    ```
+
+   </div>
 
    Note which `CHANGES_REQUESTED` are still active (not superseded by a later `APPROVED` or `DISMISSED`). Check whether you've already reviewed this PR.
 
@@ -55,9 +79,15 @@ Run all of these. The data informs every step that follows.
 
 6. **Diff**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr diff <number> --repo zeroclaw-labs/zeroclaw
    ```
+
+   </div>
 
    Read the full diff. Cross-check author commitments from step 3 against what actually shipped. Cross-check against the local repository where the change lands.
 
@@ -136,11 +166,17 @@ Write as a thoughtful senior contributor who has read everything and cares about
 
 Write the review body to a file under `tmp/review-<number>.md` first: this is the source of truth for what was posted and lets the user inspect before publishing. Then:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 gh pr review <number> --repo zeroclaw-labs/zeroclaw \
   <--approve | --request-changes | --comment> \
   --body-file tmp/review-<number>.md
 ```
+
+</div>
 
 Always show the full draft and get explicit approval from the human before posting. Continuation words like "next" or "move on" don't count as approval, only an unambiguous "yes" / "approve" / "go" does.
 

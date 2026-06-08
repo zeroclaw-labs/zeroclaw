@@ -43,9 +43,15 @@ If you're capturing an incident trace, log payload, or external response in a te
 
 Before pushing, scan the staged diff specifically for identity leakage:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git diff --cached
 ```
+
+</div>
 
 The shapes to look for: anything that looks like an email, a URL with a non-public hostname, a long random-looking string that might be a token, a name that isn't yours and didn't come from a project-scoped placeholder.
 

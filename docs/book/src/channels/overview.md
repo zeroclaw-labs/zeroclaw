@@ -6,11 +6,17 @@ Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one 
 
 The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, and Telegram. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Pre-built binaries use this lean default. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./install.sh --source --preset full
 cargo build --features channels-full
 cargo build --no-default-features --features "agent-runtime,gateway,channel-discord"
 ```
+
+</div>
 
 ## Categories
 

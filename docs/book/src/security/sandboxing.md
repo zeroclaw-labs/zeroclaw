@@ -82,19 +82,41 @@ Limitations:
 
 User-namespace-based sandbox from Flatpak. Confines filesystem and can block network. Requires `bubblewrap` installed.
 
-```bash
-sudo apt install bubblewrap       # Debian/Ubuntu
-sudo pacman -S bubblewrap         # Arch
-sudo dnf install bubblewrap       # Fedora
+<div class="os-tabs-src">
+
+#### Debian/Ubuntu
+
+```sh
+sudo apt install bubblewrap
 ```
+
+#### Arch
+
+```sh
+sudo pacman -S bubblewrap
+```
+
+#### Fedora
+
+```sh
+sudo dnf install bubblewrap
+```
+
+</div>
 
 ### Firejail
 
 SUID-based sandbox. Older but widely available.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo apt install firejail
 ```
+
+</div>
 
 Firejail's default profile is fairly permissive; ZeroClaw applies a custom profile. Pass extra args with `firejail_args` on the risk profile.
 
@@ -102,9 +124,15 @@ Firejail's default profile is fairly permissive; ZeroClaw applies a custom profi
 
 Works anywhere Docker does. The Docker runtime kind (`[runtime] kind = "docker"`) runs each shell invocation in an ephemeral container; see the `[runtime.docker]` block above for image and resource controls.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker build -t zeroclaw-sandbox:local dev/sandbox/   # build the bundled toolkit image
 ```
+
+</div>
 
 ```toml
 [runtime]

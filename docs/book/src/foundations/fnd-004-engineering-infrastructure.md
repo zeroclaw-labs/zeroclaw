@@ -139,9 +139,15 @@ The post-format jobs run in parallel after formatting passes. This means a forma
 
 The current clippy invocation runs against the default feature set of the root crate. The correct invocation for a multi-crate workspace is:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+</div>
 
 The `--workspace` flag ensures every crate in the workspace is linted, not just the root. The `--all-targets` flag includes tests, benchmarks, and examples. Combined with `--features ci-all` for the feature-gated check, this gives a complete picture.
 
@@ -528,13 +534,19 @@ The action pinning policy, advisory triage process, conventional commit requirem
 
 Add a `Running CI Locally` section to the contributing documentation that shows contributors how to replicate the CI checks on their own machine before pushing:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # What CI runs — run these before pushing
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
 cargo deny check
 ```
+
+</div>
 
 #### Success Metrics for Phase 4
 

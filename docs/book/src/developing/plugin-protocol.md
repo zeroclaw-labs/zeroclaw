@@ -262,7 +262,11 @@ pub fn execute(input: String) -> FnResult<String> {
 
 ### Building
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install the WASM target (once)
 rustup target add wasm32-wasip1
 
@@ -270,19 +274,27 @@ rustup target add wasm32-wasip1
 cargo build --target wasm32-wasip1 --release
 ```
 
+</div>
+
 The output `.wasm` file is at
 `target/wasm32-wasip1/release/<crate_name>.wasm`. Copy it alongside your
 `manifest.toml`.
 
 ### Installing
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Copy to plugin directory
 zeroclaw plugin install /path/to/my-plugin/
 
 # Or manually
 cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ```
+
+</div>
 
 ## Configuration
 

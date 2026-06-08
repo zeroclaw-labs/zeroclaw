@@ -4,13 +4,19 @@ The web dashboard at `web/` is a Vite + React + TypeScript app. Its TypeScript A
 
 ## Quickstart
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo web build         # production bundle into web/dist/
 cargo web dev           # vite dev server with HMR
 cargo web check         # typecheck only (gen-api + tsc -b)
 cargo web gen-api       # regenerate web/src/lib/api-generated.ts
 cargo web install       # npm install in web/
 ```
+
+</div>
 
 `cargo web` is an alias for `cargo run -p xtask --bin web --` (defined in `.cargo/config.toml`). Every subcommand auto-runs `npm install` if `web/node_modules/` is missing.
 
@@ -45,10 +51,16 @@ Generating on demand keeps the runtime `build_spec()` as the single contract sou
 
 CI does not run `cargo web build`: the lint/build/test jobs use a `web/dist/.gitkeep` placeholder so the gateway crate compiles without the bundle. Producing a release artifact that includes the dashboard is a separate step:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo web build
 cargo build --release --features gateway
 ```
+
+</div>
 
 The gateway loads `web/dist/` from the filesystem at runtime via `static_files.rs`, so the Rust compile and the web build are decoupled. Ship the populated `web/dist/` alongside the binary for installs that should serve the dashboard.
 

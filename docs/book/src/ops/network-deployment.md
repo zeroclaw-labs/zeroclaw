@@ -79,32 +79,39 @@ The gateway stays bound to `127.0.0.1`, the proxy does the listening.
 
 ### Install
 
-For a Pi running Raspberry Pi OS:
+Clone and run the installer. With no flags it drops into an interactive picker
+where you choose the build type and which features to compile in — including the
+hardware features for GPIO/I2C/SPI. On the Pi it also uses the Pi-tuned cargo
+profiles; see [Raspberry Pi setup](../hardware/raspberry-pi-setup.md) for swap
+setup and the per-model build matrix.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --prebuilt
+<div class="os-tabs-src">
+
+#### Raspberry Pi OS
+
+```sh
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+./install.sh
 ```
 
-Prefer `--prebuilt` on a Pi, compiling from source can take 30+ minutes.
+#### Alpine
 
-For a Pi running Alpine:
-
-```bash
-apk add curl rust cargo openssl-dev pkgconf
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+```sh
+apk add curl rust cargo openssl-dev pkgconf git
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+./install.sh
 ```
 
-### Hardware features
+</div>
 
-```bash
-cargo install --locked --path . --features "hardware peripheral-rpi"
-```
-
-Grants access to GPIO, I2C, SPI via `rppal`. The stock service unit already adds the user to the `gpio`, `spi`, `i2c` groups.
+Grants access to GPIO, I2C, SPI via `rppal` when you pick the hardware features.
+The stock service unit already adds the user to the `gpio`, `spi`, `i2c` groups.
 
 ### Checklist
 
-- [ ] Install the binary (prefer prebuilt on a Pi)
+- [ ] Install the binary (`./install.sh` — pick your features in the picker)
 - [ ] Run `zeroclaw quickstart`
 - [ ] Configure your channels. Telegram needs no port; webhooks need a tunnel
 - [ ] Install the service: `zeroclaw service install && zeroclaw service start`
@@ -115,9 +122,15 @@ Grants access to GPIO, I2C, SPI via `rppal`. The stock service unit already adds
 
 OpenRC services run system-wide. Install as root:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo zeroclaw service install
 ```
+
+</div>
 
 Creates:
 
@@ -127,17 +140,29 @@ Creates:
 
 Enable and start:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo rc-update add zeroclaw default
 sudo rc-service zeroclaw start
 sudo rc-service zeroclaw status
 ```
 
+</div>
+
 Logs:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo tail -f /var/log/zeroclaw/error.log
 ```
+
+</div>
 
 ### OpenRC notes
 
@@ -155,9 +180,16 @@ If you see this:
 1. `ps aux | grep zeroclaw` and confirm only one daemon is running
 2. Check you don't have `cargo run --bin zeroclaw -- channel start telegram` from a dev session hanging around
 3. If stale, reset Telegram's poll session:
-   ```bash
+
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    curl -X POST "https://api.telegram.org/bot$TOKEN/close"
    ```
+
+   </div>
 
 ## Exposing webhooks safely
 

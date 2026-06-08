@@ -260,11 +260,17 @@ log_persistence_path = "state/runtime-trace.jsonl"
 
 Then query traces:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw doctor traces --contains "retry"
 zeroclaw doctor traces --contains "429"
 zeroclaw doctor traces --contains "model_provider"
 ```
+
+</div>
 
 ## Best practices
 

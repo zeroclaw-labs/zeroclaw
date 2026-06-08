@@ -34,9 +34,15 @@ See [Architecture → Crates](./architecture/crates.md) for a plain-English desc
 
 The rustdoc ships with every doc deploy. For local builds:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo mdbook refs     # generates CLI + config reference + rustdoc
 cargo mdbook build    # rebuilds the full book including rustdoc bridge
 ```
+
+</div>
 
 See [Maintainers → Docs & Translations](./maintainers/docs-and-translations.md).

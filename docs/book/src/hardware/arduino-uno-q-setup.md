@@ -43,10 +43,16 @@ Build with `--features hardware` to include Uno Q support.
 
 ### 1.2 Verify SSH Access
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ssh arduino@<UNO_Q_IP>
 # Enter the password you set
 ```
+
+</div>
 
 ---
 
@@ -54,7 +60,11 @@ ssh arduino@<UNO_Q_IP>
 
 ### Option A: Build on the Device (Simpler, ~20–40 min)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # SSH into Uno Q
 ssh arduino@<UNO_Q_IP>
 
@@ -78,9 +88,15 @@ cargo build --release --features hardware
 sudo cp target/release/zeroclaw /usr/local/bin/
 ```
 
+</div>
+
 ### Option B: Cross-Compile on Mac (Faster)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # On your Mac — add aarch64 target
 rustup target add aarch64-unknown-linux-gnu
 
@@ -96,6 +112,8 @@ scp target/aarch64-unknown-linux-gnu/release/zeroclaw arduino@<UNO_Q_IP>:~/
 ssh arduino@<UNO_Q_IP> "sudo mv ~/zeroclaw /usr/local/bin/"
 ```
 
+</div>
+
 If cross-compile fails, use Option A and build on the device.
 
 ---
@@ -104,7 +122,11 @@ If cross-compile fails, use Option A and build on the device.
 
 ### 3.1 Run Quickstart (or Create Config Manually)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ssh arduino@<UNO_Q_IP>
 
 # Quick config
@@ -115,6 +137,8 @@ mkdir -p ~/.zeroclaw/workspace
 nano ~/.zeroclaw/config.toml
 ```
 
+</div>
+
 ### 3.2 Minimal config
 
 At minimum, configure one `[providers.models.<type>.<alias>]` entry with `api_key` / `model`, one `[agents.<alias>]` that references it via `model_provider = "<type>.<alias>"`, and one `[channels.telegram.<alias>]` with your `bot_token`. Bind the channel to the agent via `channels = ["telegram.<alias>"]` on the agent. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
@@ -123,12 +147,18 @@ At minimum, configure one `[providers.models.<type>.<alias>]` entry with `api_ke
 
 ## Phase 4: Run ZeroClaw Daemon
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ssh arduino@<UNO_Q_IP>
 
 # Run daemon (Telegram polling works over WiFi)
 zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
+
+</div>
 
 **At this point:** Telegram chat works. Send messages to your bot, ZeroClaw responds. No GPIO yet.
 
@@ -141,14 +171,26 @@ ZeroClaw includes the Bridge app and setup command.
 ### 5.1 Deploy Bridge App
 
 **From your computer** (with zeroclaw repo):
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw peripheral setup-uno-q --host 192.168.0.48
 ```
 
+</div>
+
 **From the Uno Q** (SSH'd in):
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw peripheral setup-uno-q
 ```
+
+</div>
 
 This copies the Bridge app to `~/ArduinoApps/uno-q-bridge` and starts it.
 
@@ -158,9 +200,15 @@ Enable `[peripherals]` and add a `[[peripherals.boards]]` entry with `board = "a
 
 ### 5.3 Run ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
+
+</div>
 
 Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"*, ZeroClaw uses `gpio_write` via the Bridge.
 

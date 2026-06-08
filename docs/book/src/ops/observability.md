@@ -117,7 +117,11 @@ and rejects unknowns with `400`. The response includes
 
 Examples:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # All WARN+ events since the daemon started.
 curl "$ZEROCLAW_GATEWAY/api/logs?severity_min=13"
 
@@ -130,6 +134,8 @@ curl "$ZEROCLAW_GATEWAY/api/logs?channel=discord.glados"
 # A single agent turn:
 curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 ```
+
+</div>
 
 Pagination is reverse-cursor. The response includes
 `next_cursor: [timestamp, id] | null`; pass these back as `until_ts` +

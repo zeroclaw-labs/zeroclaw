@@ -17,11 +17,17 @@ Common key patterns:
 
 ### 2.1 Definition-level CLI
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw sop list
 zeroclaw sop validate [name]
 zeroclaw sop show <name>
 ```
+
+</div>
 
 ### 2.2 Runtime run-state tools
 

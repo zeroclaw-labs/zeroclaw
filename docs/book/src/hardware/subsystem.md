@@ -19,15 +19,27 @@ See [Peripherals design](./hardware-peripherals-design.md) for the architecture.
 
 At compile time:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo build --release --features hardware
 ```
 
+</div>
+
 Or, if you want only specific boards:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo build --release --features "hardware board-nucleo board-arduino"
 ```
+
+</div>
 
 ## Runtime tools
 
@@ -56,7 +68,11 @@ path = "/dev/ttyACM0"
 
 The most common hardware target. A minimal setup:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # install
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 
@@ -66,6 +82,8 @@ sudo usermod -aG gpio,spi,i2c $USER
 # install as user service (ensures hardware group membership is inherited)
 zeroclaw service install
 ```
+
+</div>
 
 The stock systemd unit sets `SupplementaryGroups=gpio spi i2c`.
 

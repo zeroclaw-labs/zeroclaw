@@ -62,10 +62,16 @@ ignore_stories = true
 
 Start the daemon first, then start ZeroClaw channels:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 signal-cli daemon --http 127.0.0.1:8686
 zeroclaw channel start
 ```
+
+</div>
 
 Use `zeroclaw channel doctor` to confirm ZeroClaw can load the configured channel. If the channel fails at runtime, check that `http_url` points at the daemon, the account is registered in `signal-cli`, and the build includes `channel-signal`.
 

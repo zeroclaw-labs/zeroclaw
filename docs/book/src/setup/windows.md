@@ -10,9 +10,15 @@ Install, update, run as a scheduled task / Windows Service, and uninstall on Win
 
 Download the latest ZeroClaw release, unzip, and run:
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 setup.bat
 ```
+
+</div>
 
 Flags:
 
@@ -36,14 +42,24 @@ For source builds, `setup.bat` now prints the exact `cargo build ...` command it
 
 ### Option 2: Scoop
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 scoop install zeroclaw
 zeroclaw quickstart
 ```
 
+</div>
+
 ### Option 3: From source
 
 Requires Rust (`rustup`) and Visual Studio Build Tools:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 git clone https://github.com/zeroclaw-labs/zeroclaw
@@ -51,6 +67,8 @@ cd zeroclaw
 cargo install --locked --path .
 zeroclaw quickstart
 ```
+
+</div>
 
 ## System dependencies
 
@@ -67,10 +85,16 @@ Windows has two options: a scheduled task (user session) or a Windows Service (s
 
 ### Scheduled task (recommended for single-user machines)
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 zeroclaw service install
 zeroclaw service start
 ```
+
+</div>
 
 This creates a task that runs under your user account and starts on login. Managed via Task Scheduler (`taskschd.msc`).
 
@@ -80,9 +104,15 @@ Logs go to `%LOCALAPPDATA%\ZeroClaw\logs\`.
 
 Running as a true service requires Administrator privileges during install. Open an elevated `cmd.exe` and:
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 zeroclaw service install
 ```
+
+</div>
 
 When run elevated, the installer registers a Windows Service under `LocalSystem` instead of a user-scoped scheduled task. Consider creating a dedicated service account if the agent touches user-scoped resources.
 
@@ -94,18 +124,34 @@ Full details: [Service management](./service.md).
 
 Re-download the latest release and re-run `setup.bat --prebuilt` (or whichever flag you used originally). Then:
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 zeroclaw service restart
 ```
 
+</div>
+
 ### Scoop
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 scoop update zeroclaw
 zeroclaw service restart
 ```
 
+</div>
+
 ### From source
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 cd C:\path\to\zeroclaw
@@ -114,16 +160,28 @@ cargo install --locked --path . --force
 zeroclaw service restart
 ```
 
+</div>
+
 ## Uninstall
 
 Stop and remove the service:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 zeroclaw service stop
 zeroclaw service uninstall
 ```
 
+</div>
+
 Remove the binary:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 :: setup.bat
@@ -136,12 +194,20 @@ del "%USERPROFILE%\.cargo\bin\zeroclaw.exe"
 scoop uninstall zeroclaw
 ```
 
+</div>
+
 Remove config and workspace (optional, this deletes conversation history):
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 rmdir /s /q "%USERPROFILE%\.zeroclaw"
 rmdir /s /q "%LOCALAPPDATA%\ZeroClaw"
 ```
+
+</div>
 
 ## Gotchas
 

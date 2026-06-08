@@ -4,7 +4,11 @@ This guide explains how to add new hardware boards and custom tools to ZeroClaw.
 
 ## Quick Start: Add a Board via CLI
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Add a board (updates ~/.zeroclaw/config.toml)
 zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
 zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
@@ -13,6 +17,8 @@ zeroclaw peripheral add rpi-gpio native   # for Raspberry Pi GPIO (Linux)
 # Restart daemon to apply
 zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
+
+</div>
 
 ## Supported Boards
 
@@ -60,9 +66,15 @@ builtin_led: 13
 
 With the `rag-pdf` feature, ZeroClaw can index PDF files:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo build --features hardware,rag-pdf
 ```
+
+</div>
 
 Place PDFs in the datasheet directory. They are extracted and chunked for RAG.
 

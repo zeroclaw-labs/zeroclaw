@@ -43,11 +43,17 @@ graph LR
 
 3. Validate and inspect definitions:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    zeroclaw sop list
    zeroclaw sop validate
    zeroclaw sop show deploy-prod
    ```
+
+   </div>
 
 4. Trigger runs via configured event sources, or manually from an agent turn with `sop_execute`.
 

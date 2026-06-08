@@ -4,7 +4,11 @@ The docs site you're reading is published from `docs/book/`. You can build the s
 
 ## One-command quickstart
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo mdbook serve                       # serve all locales at http://localhost:3000/en/
 cargo mdbook serve --locale ja           # live-reload against Japanese source
 cargo mdbook build                       # static build of every locale into docs/book/book/
@@ -16,6 +20,8 @@ cargo mdbook sync --locale ja --force    # force-retranslate one locale
 cargo mdbook stats                       # show translated/fuzzy/untranslated per locale
 cargo mdbook check                       # validate .po format (run before a translation PR)
 ```
+
+</div>
 
 > Always go through the `cargo mdbook …` wrapper. Running `mdbook build` directly from `docs/book/` skips the xtask step that renders `theme/lang-switcher.js` from `locales.toml`, which fails the build with `failed to open theme/lang-switcher.js for hashing`.
 
@@ -64,10 +70,16 @@ Expected unavoidable churn:
 
 Quick stability check after a small docs edit:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo mdbook sync
 git diff --numstat -- docs/book/po
 ```
+
+</div>
 Routine English docs PRs do not need to include generated `.po` churn when the sync output is broad and hard to review. Keep the prose PR focused, leave the generated catalog refresh for a dedicated translation-cache PR, and say so in the PR body:
 
 > Skipped committing generated `.po` updates: this is an English docs-only change, and `cargo mdbook sync` would produce broad gettext catalog churn. Translation-cache updates are deferred to a dedicated follow-up PR.
@@ -89,23 +101,39 @@ Include `.po` updates only when one of these is true:
    Everything else (`lang-switcher.js`, CI, `cargo fluent fill`, `cargo mdbook sync`) reads from this file automatically.
 
 2. Bootstrap and fill the docs translations:
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    cargo mdbook sync --locale xx --provider ollama
    ```
+
+   </div>
    If the `.po` file doesn't exist it's bootstrapped automatically, then all entries are filled.
 
 3. Validate and preview:
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    cargo mdbook check              # exits non-zero on format errors
    cargo mdbook stats              # show coverage counts
    cargo mdbook serve --locale xx
    ```
 
+   </div>
+
 ## Release translation workflow
 
 Before tagging a release, run a full translation pass locally and commit the updated `.po` files.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Fast delta pass (only new or changed strings since last release)
 cargo mdbook sync --provider ollama
 
@@ -115,6 +143,8 @@ cargo mdbook sync --provider ollama --force
 cargo mdbook check   # validate before committing
 cargo mdbook stats   # review coverage
 ```
+
+</div>
 
 The model used is whatever is configured in `[providers.models.<name>]` in `config.toml`.
 

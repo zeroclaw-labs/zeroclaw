@@ -75,13 +75,19 @@ Idempotency keys are namespaced per endpoint (`/webhook` vs `/sop/*`).
 
 ### 3.4 Example Request
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -X POST http://127.0.0.1:42617/sop/deploy \
   -H "Authorization: Bearer <token>" \
   -H "X-Idempotency-Key: $(uuidgen)" \
   -H "Content-Type: application/json" \
   -d '{"message":"deploy-service-a"}'
 ```
+
+</div>
 
 Typical response:
 

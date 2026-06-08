@@ -120,10 +120,16 @@ docker/*
 
 Export the current effective policy:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
 gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
 ```
+
+</div>
 
 Any PR that adds or changes a `uses:` action source must include an allowlist impact note in its body. Avoid broad wildcard exceptions; expand the allowlist only for verified missing actions.
 

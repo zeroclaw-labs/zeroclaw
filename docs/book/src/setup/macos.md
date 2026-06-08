@@ -8,17 +8,29 @@ Install, update, run as a LaunchAgent, and uninstall on macOS (Intel or Apple Si
 
 ### Option 1: `install.sh` via curl (fastest)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
+</div>
+
 ### Option 2: `install.sh` from a clone
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 ./install.sh
 ```
+
+</div>
 
 ### What the installer does
 
@@ -28,7 +40,11 @@ cd zeroclaw
 
 Flags:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./install.sh --prebuilt                      # always prebuilt, skip the prompt
 ./install.sh --source                        # always build from source
 ./install.sh --minimal                       # foundation only, no default features
@@ -38,20 +54,34 @@ Flags:
 ./install.sh --help                          # full flag reference
 ```
 
+</div>
+
 ### Option 3: Homebrew
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 brew install zeroclaw
 zeroclaw quickstart
 ```
+
+</div>
 
 Gets you `brew services` integration. Binary lives at `$HOMEBREW_PREFIX/bin/zeroclaw`.
 
 **Workspace location gotcha:** with Homebrew, the service user and the CLI user may be different, so the workspace lives at `$HOMEBREW_PREFIX/var/zeroclaw/` rather than `~/.zeroclaw/`. Point CLI invocations at the same workspace:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
 ```
+
+</div>
 
 Add that to your shell profile if you want it permanent.
 
@@ -68,24 +98,42 @@ Most features work with a stock macOS install. Optional extras:
 
 ## Running as a service
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service install   # writes ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 zeroclaw service start
 zeroclaw service status
 ```
 
+</div>
+
 Logs go to `~/Library/Logs/ZeroClaw/`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 tail -f ~/Library/Logs/ZeroClaw/zeroclaw.log
 ```
 
+</div>
+
 For Homebrew installs, prefer:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 brew services start zeroclaw
 brew services info zeroclaw
 ```
+
+</div>
 
 Both methods produce the same end state, a loaded LaunchAgent that starts on login. Pick one and stick with it.
 
@@ -95,30 +143,52 @@ Full details: [Service management](./service.md).
 
 Re-run the installer, it detects the existing install and upgrades in place:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
 zeroclaw service restart
 ```
 
+</div>
+
 Or from a clone:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cd /path/to/zeroclaw
 git pull
 ./install.sh --skip-quickstart
 zeroclaw service restart
 ```
 
+</div>
+
 If installed via Homebrew instead:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 brew update && brew upgrade zeroclaw
 brew services restart zeroclaw
 ```
 
+</div>
+
 ## Uninstall
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # stop and unregister the service
 zeroclaw service stop
 zeroclaw service uninstall
@@ -130,9 +200,15 @@ brew uninstall zeroclaw
 rm ~/.cargo/bin/zeroclaw
 ```
 
+</div>
+
 Remove config and workspace (optional: this deletes conversation history):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Homebrew workspace
 rm -rf "$HOMEBREW_PREFIX/var/zeroclaw"
 
@@ -142,6 +218,8 @@ rm -rf ~/.zeroclaw ~/.config/zeroclaw
 # Logs
 rm -rf ~/Library/Logs/ZeroClaw
 ```
+
+</div>
 
 ## Gotchas
 

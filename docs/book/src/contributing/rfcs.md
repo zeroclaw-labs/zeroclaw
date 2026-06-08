@@ -65,9 +65,15 @@ Large RFCs often ship across multiple PRs over several releases. The RFC's track
 
 Open RFCs are the best primary source for "what's coming next" in ZeroClaw. Browse:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 gh issue list --repo zeroclaw-labs/zeroclaw --label type:rfc --state open
 ```
+
+</div>
 
 As of writing, notable open RFCs:
 

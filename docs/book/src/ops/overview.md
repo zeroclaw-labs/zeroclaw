@@ -37,16 +37,27 @@ Four signals matter:
 
 Is the process running?
 
-```bash
-# Linux
+<div class="os-tabs-src">
+
+#### Linux
+
+```sh
 systemctl --user is-active zeroclaw
+```
 
-# macOS
+#### macOS
+
+```sh
 launchctl list | grep -c com.zeroclaw.daemon
+```
 
-# Windows
+#### Windows
+
+```cmd
 sc query ZeroClaw | findstr STATE
 ```
+
+</div>
 
 If it's dying repeatedly, check [Troubleshooting → Daemon keeps restarting](./troubleshooting.md).
 
@@ -54,9 +65,15 @@ If it's dying repeatedly, check [Troubleshooting → Daemon keeps restarting](./
 
 Are channels connected? The gateway exposes `/health/channels`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -s http://localhost:42617/health/channels | jq
 ```
+
+</div>
 
 ```json
 {
@@ -73,9 +90,15 @@ Monitor `status != "connected"` on push-based channels.
 
 Are LLM calls succeeding? `/health/providers`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -s http://localhost:42617/health/providers | jq
 ```
+
+</div>
 
 ```json
 {

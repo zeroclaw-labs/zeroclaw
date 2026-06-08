@@ -84,9 +84,15 @@ Use the peer identifier shape that the active backend reports. Cloud API usually
 
 Prefer `zeroclaw config set` for WhatsApp fields:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config set channels.whatsapp.default.session-path ~/.zeroclaw/state/whatsapp-web/session.db
 ```
+
+</div>
 
 `zeroclaw channel add <type> <CONFIG>` is not the recommended setup path for WhatsApp. It takes a JSON object at the CLI layer, but current channel setup is routed through `zeroclaw config set` so secret handling, pairing, and peer authorization stay explicit.
 
@@ -94,8 +100,14 @@ zeroclaw config set channels.whatsapp.default.session-path ~/.zeroclaw/state/wha
 
 After configuring one mode, start the channel runner:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw channel start
 ```
+
+</div>
 
 Use `zeroclaw channel doctor` for a first check. For Web mode, also confirm the binary was built with `whatsapp-web`; for Cloud API mode, confirm the webhook tunnel and Meta verify token agree.

@@ -85,9 +85,15 @@ model = "qwen3.6:35b-a3b"
 
 The generic env-override mechanism (`ZEROCLAW_<dotted_path_with_double_underscores>=<value>`) can set the same field at runtime without editing `config.toml`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ZEROCLAW_providers__models__ollama__home__uri=http://ollama:11434 zeroclaw agent -a assistant
 ```
+
+</div>
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
 

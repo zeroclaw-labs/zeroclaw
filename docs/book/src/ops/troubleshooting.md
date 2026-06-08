@@ -4,9 +4,15 @@ Common failure modes, in the order you're likely to encounter them.
 
 First stop for any issue:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw doctor
 ```
+
+</div>
 
 Runs a series of checks and prints a summary. Most of what follows is the detailed version of what `doctor` flags.
 
@@ -16,9 +22,15 @@ Runs a series of checks and prints a summary. Most of what follows is the detail
 
 ### `cargo` not found
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
+
+</div>
 
 Or pass `--prebuilt` to `install.sh` / `setup.bat` to skip Rust entirely.
 
@@ -26,16 +38,27 @@ Or pass `--prebuilt` to `install.sh` / `setup.bat` to skip Rust entirely.
 
 Install the baseline toolchain for your distro, then re-run `./install.sh`:
 
-```bash
-# Debian / Ubuntu
+<div class="os-tabs-src">
+
+#### Debian/Ubuntu
+
+```sh
 sudo apt install build-essential pkg-config
+```
 
-# Fedora / RHEL
+#### Fedora/RHEL
+
+```sh
 sudo dnf group install development-tools && sudo dnf install pkg-config
+```
 
-# Arch
+#### Arch
+
+```sh
 sudo pacman -S base-devel
 ```
+
+</div>
 
 Full per-distro list: [Setup → Linux](../setup/linux.md).
 
@@ -54,24 +77,42 @@ Options:
 
 The Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) and TLS/crypto native deps (`aws-lc-sys`, `ring`) are the main cost. Opt out if you don't need them:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo build --release --locked --no-default-features --features "default-lean"
 ```
 
+</div>
+
 Or check what's happening:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo check --timings
 # report at target/cargo-timings/cargo-timing.html
 ```
+
+</div>
 
 ### `zeroclaw: command not found` after install
 
 `cargo install` puts binaries in `~/.cargo/bin/`. Add to PATH:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
+
+</div>
 
 Persist in your shell profile.
 
@@ -83,10 +124,16 @@ Persist in your shell profile.
 
 `zeroclaw quickstart` does not have a `--force` flag, it intentionally leaves an existing `~/.zeroclaw/config.toml` alone. To run a fresh quickstart on a stale install, delete the directory and start over:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 rm -rf ~/.zeroclaw
 zeroclaw quickstart
 ```
+
+</div>
 
 Or, to edit a single stale field instead of wiping everything, use `zeroclaw config set <key>=<value>` directly.
 
@@ -94,16 +141,28 @@ Or, to edit a single stale field instead of wiping everything, use `zeroclaw con
 
 Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works) while the default config dir is `~/.zeroclaw/`. Set `ZEROCLAW_WORKSPACE` to the Homebrew path before running quickstart so the two paths line up:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
 zeroclaw quickstart
 ```
 
+</div>
+
 Or manually symlink once:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ln -s "$HOMEBREW_PREFIX/var/zeroclaw" ~/.zeroclaw
 ```
+
+</div>
 
 ---
 
@@ -119,11 +178,17 @@ Symptoms:
 
 Checks (substitute `<alias>` with the configured agent alias from `[agents.<alias>]`):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw auth status
 zeroclaw auth login --provider openai-codex --device-code
 zeroclaw agent -a <alias> -m "hello"
 ```
+
+</div>
 
 For normal subscription auth the provider entry should look like this (the surrounding agent + risk profile follow the canonical [Minimal working example](../providers/configuration.md#minimal-working-example)):
 
@@ -154,16 +219,28 @@ Check journald / the platform log (see [Logs & observability](./observability.md
 
 Enable debug logging and catch the next failure:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service stop
 RUST_LOG=debug zeroclaw daemon
 ```
 
+</div>
+
 ### Gateway unreachable
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -sv http://localhost:42617/health
 ```
+
+</div>
 
 If connection refused: daemon isn't running, or it's bound to a different interface. Check `[gateway] host` / `port` in config.
 
@@ -185,27 +262,45 @@ Discord tokens expire if you regenerate them in the Developer Portal. Slack bot 
 
 For either:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw channel doctor discord
 zeroclaw channel doctor slack
 ```
+
+</div>
 
 ### Matrix: "unknown device"
 
 If you re-onboarded without keeping device keys, the homeserver sees a new device that hasn't been verified. Re-verify from another logged-in client, or reset the key store:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 rm -rf ~/.zeroclaw/workspace/matrix-crypto
 # re-run pairing flow on next channel start
 ```
+
+</div>
 
 ### IMAP polling stopped
 
 Most often an auth failure, provider rotated the password or the app-password expired. Check:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 journalctl --user -u zeroclaw -n 200 | grep -i imap
 ```
+
+</div>
 
 ---
 
@@ -253,10 +348,16 @@ Playwright downloads Chromium (~150 MB) on first launch. Let it finish. If it ke
 
 ### Service installed but shows inactive
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service start
 zeroclaw service status
 ```
+
+</div>
 
 Use `zeroclaw service logs` to tail the installed service logs. Add `--follow` to stream new entries or `--lines <count>` to change how much history is shown. If the wrapper is unavailable or you need to inspect the platform directly, use:
 
@@ -266,17 +367,29 @@ Use `zeroclaw service logs` to tail the installed service logs. Add `--follow` t
 
 If that succeeds interactively but the service dies in the background, it's almost always config or permissions, read the journal:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 journalctl --user -u zeroclaw --since "5 minutes ago"
 ```
+
+</div>
 
 ### Service can't find config
 
 The service and CLI may resolve config differently if they run as different users or with different env vars. Force-print the path the daemon sees:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config list
 ```
+
+</div>
 
 If the paths differ between `zeroclaw config list` (as you) and the service (as its user), either:
 
@@ -290,12 +403,18 @@ If the paths differ between `zeroclaw config list` (as you) and the service (as 
 
 Gather diagnostics and file an issue:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw --version
 zeroclaw doctor
 zeroclaw channel doctor
 journalctl --user -u zeroclaw --since "1 hour ago" > zeroclaw-log.txt
 ```
+
+</div>
 
 Sanitise `zeroclaw-log.txt` (redact channel tokens if any slipped through, they shouldn't) and attach it to the issue. See [Contributing → Communication](../contributing/communication.md) for where.
 

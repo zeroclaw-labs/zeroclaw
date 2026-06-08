@@ -82,9 +82,15 @@ Parser behavior:
 
 Use:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw sop validate
 zeroclaw sop validate <name>
 ```
+
+</div>
 
 Validation warns on empty names/descriptions, missing triggers, missing steps, and step numbering gaps.

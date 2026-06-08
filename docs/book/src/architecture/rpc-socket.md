@@ -18,17 +18,23 @@ same machine do not collide.
 
 Override with the `ZEROCLAW_SOCKET` environment variable on either platform:
 
-```bash
-# Unix
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 export ZEROCLAW_SOCKET=/tmp/my-zeroclaw.sock
 zeroclaw daemon
 ```
 
+#### PowerShell
+
 ```powershell
-# Windows
 $env:ZEROCLAW_SOCKET = '\\.\pipe\my-zeroclaw'
 zeroclaw daemon
 ```
+
+</div>
 
 ## Wire protocol
 
@@ -113,15 +119,27 @@ explicitly stopped.
 
 Start the daemon in one terminal:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon
 ```
 
+</div>
+
 In a second terminal on Unix, connect with `socat`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 socat READLINE UNIX-CONNECT:~/.local/share/zeroclaw/daemon.sock
 ```
+
+</div>
 
 Paste lines one at a time:
 

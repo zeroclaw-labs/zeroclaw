@@ -14,10 +14,16 @@ For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` f
 
 A minimal instruction-only skill can be just a Markdown file:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 mkdir -p ~/.zeroclaw/workspace/skills/release-check
 $EDITOR ~/.zeroclaw/workspace/skills/release-check/SKILL.md
 ```
+
+</div>
 
 ```markdown
 # Release check
@@ -75,38 +81,68 @@ Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Ke
 
 List installed skills:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills list
 ```
 
+</div>
+
 Audit an installed skill or a local skill directory:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills audit release-check
 zeroclaw skills audit ./release-check
 ```
 
+</div>
+
 Install a skill from a local directory, Git URL, registry name, or ClawHub source:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills install ./release-check
 zeroclaw skills install https://example.com/zeroclaw-release-check.git
 zeroclaw skills install release-check
 zeroclaw skills install clawhub:release-check
 ```
 
+</div>
+
 Remove an installed skill:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills remove release-check
 ```
 
+</div>
+
 Run `TEST.sh` validation for one skill, or omit the name to test all installed skills:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills test release-check
 zeroclaw skills test --verbose
 ```
+
+</div>
 
 `zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
 

@@ -109,9 +109,15 @@ Set `ZEROCODE_COLOR` to override detection:
 | `256` | xterm-256 |
 | `16`, `ansi` | 16 ANSI colours |
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ZEROCODE_COLOR=256 zerocode
 ```
+
+</div>
 
 Any unrecognised value is ignored and normal detection runs.
 
@@ -132,15 +138,27 @@ set -as terminal-features ",*:RGB"
 
 Then restart the tmux server so the change takes effect:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 tmux kill-server
 ```
+
+</div>
 
 Reattach, and zerocode's truecolor output will render correctly.
 
 As an alternative that needs no tmux change, force a lower depth that does not
 rely on truecolor passthrough:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ZEROCODE_COLOR=256 zerocode
 ```
+
+</div>

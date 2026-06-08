@@ -2,7 +2,11 @@
 
 ZeroClaw ships with first-class service integration for systemd (Linux), launchctl (macOS), and Task Scheduler / Windows Service (Windows). All three are driven by one CLI surface:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service install     # register the service
 zeroclaw service start       # start it
 zeroclaw service stop        # stop it
@@ -10,6 +14,8 @@ zeroclaw service restart     # stop + start
 zeroclaw service status      # running / stopped, last exit code
 zeroclaw service uninstall   # remove it
 ```
+
+</div>
 
 The platform-specific backends are implemented in `crates/zeroclaw-runtime/src/service/`. You don't have to think about them, but knowing what they produce helps when debugging.
 
@@ -27,28 +33,46 @@ The unit:
 
 ### Manual control
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 systemctl --user start zeroclaw
 systemctl --user stop zeroclaw
 systemctl --user status zeroclaw
 systemctl --user enable zeroclaw     # start on login
 ```
 
+</div>
+
 ### Logs
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 journalctl --user -u zeroclaw -f        # follow
 journalctl --user -u zeroclaw --since "1h ago"
 ```
+
+</div>
 
 ### System-scope (root) service
 
 If you need ZeroClaw to start before user login (headless SBCs, VPSes), run the install command as root:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo zeroclaw service install
 sudo systemctl enable --now zeroclaw
 ```
+
+</div>
 
 When invoked with sudo/root, `zeroclaw service install` creates a system-scope unit at `/etc/systemd/system/zeroclaw.service` and provisions a dedicated `zeroclaw` service user.
 
@@ -56,21 +80,33 @@ When invoked with sudo/root, `zeroclaw service install` creates a system-scope u
 
 Detected automatically when `/run/openrc` exists (Alpine, some Gentoo configs).
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service install   # writes /etc/init.d/zeroclaw
 rc-service zeroclaw start
 rc-update add zeroclaw default    # start on boot
 ```
 
+</div>
+
 ## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 launchctl list | grep zeroclaw
 launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 ```
+
+</div>
 
 Logs go to `~/Library/Logs/ZeroClaw/zeroclaw.log` (stdout) and `zeroclaw.err` (stderr).
 
@@ -78,11 +114,17 @@ Logs go to `~/Library/Logs/ZeroClaw/zeroclaw.log` (stdout) and `zeroclaw.err` (s
 
 If installed via Homebrew, `brew services` is the preferred interface:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 brew services start zeroclaw
 brew services restart zeroclaw
 brew services info zeroclaw
 ```
+
+</div>
 
 Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both end up writing a plist; having both around confuses `launchctl`.
 
@@ -98,26 +140,44 @@ Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → Z
 
 Logs go to `%LOCALAPPDATA%\ZeroClaw\logs\`:
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 type %LOCALAPPDATA%\ZeroClaw\logs\zeroclaw.log
 ```
 
+</div>
+
 ### Windows Service (system-scope)
 
 For servers or multi-user Windows installs, run `zeroclaw service install` from an Administrator prompt:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 :: Administrator cmd.exe
 zeroclaw service install
 ```
 
+</div>
+
 Running elevated causes the installer to register a real Windows Service under `LocalSystem` instead of a user-scoped scheduled task. Control via `services.msc` or:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 sc query ZeroClaw
 sc start ZeroClaw
 sc stop ZeroClaw
 ```
+
+</div>
 
 ## Config path resolution
 
@@ -130,9 +190,15 @@ The service reads config from whichever workspace it was installed against. Orde
 
 If your service seems to ignore config changes, check which path the daemon is reading:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config list
 ```
+
+</div>
 
 The first few lines of its output show the config file path it resolved against.
 

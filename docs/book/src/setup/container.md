@@ -16,7 +16,11 @@ Multi-arch: `linux/amd64`, `linux/arm64`.
 
 ## Minimum run
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker run -d \
   --name zeroclaw \
   -v zeroclaw-data:/zeroclaw-data \
@@ -24,11 +28,19 @@ docker run -d \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
+</div>
+
 The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config: you still need to run quickstart before it's useful:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker exec -it zeroclaw zeroclaw quickstart
 ```
+
+</div>
 
 ## Compose
 
@@ -49,9 +61,15 @@ services:
 
 After the container starts, run quickstart:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker compose exec zeroclaw zeroclaw quickstart
 ```
+
+</div>
 
 Drop `ZEROCLAW_ALLOW_PUBLIC_BIND` if you only need local access.
 
@@ -66,14 +84,24 @@ macOS has no native Linux kernel, so every option (Docker Desktop, Podman, OrbSt
 | Interface | GUI app + CLI | CLI-first (`colima start/stop`), scriptable |
 | Best when | minimal fuss, polished UX | everything OSS, config in code |
 
-```bash
-# OrbStack — provides the docker CLI:
-brew install --cask orbstack
+<div class="os-tabs-src">
 
-# Colima — docker CLI talks to colima's VM:
+#### OrbStack
+
+```sh
+# Provides the docker CLI:
+brew install --cask orbstack
+```
+
+#### Colima
+
+```sh
+# docker CLI talks to colima's VM:
 brew install colima docker docker-compose   # docker-compose = the Compose v2 plugin; install if you need `docker compose`
 colima start --cpu 4 --memory 8   # add --network-address to expose the VM IP to macOS
 ```
+
+</div>
 
 Performance is comparable for typical dev workloads; the real differentiators are licensing (commercial vs OSS) and UX preference, not raw speed; benchmark both on your own machine if idle RAM or build throughput matters. Either way you drive the engine inside the VM with `docker`; systemd quadlets (below) are a Linux-host feature and don't apply on macOS.
 
@@ -114,19 +142,31 @@ WantedBy=multi-user.target default.target
 
 Deploy (idempotent, safe to re-run; re-applying converges the running container, never duplicates it):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo cp zeroclaw.container /etc/containers/systemd/
 sudo systemctl daemon-reload      # generator turns .container into zeroclaw.service
 sudo systemctl restart zeroclaw
 ```
 
+</div>
+
 Then onboard once, and manage it like any service:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo podman exec -it zeroclaw zeroclaw onboard
 systemctl status zeroclaw
 journalctl -u zeroclaw -f
 ```
+
+</div>
 
 There is no `systemctl enable` step for generated units: the `[Install] WantedBy=` line is what brings it up on boot.
 
@@ -138,13 +178,19 @@ There is no `systemctl enable` step for generated units: the `[Install] WantedBy
 
 The image expects config at `/zeroclaw-data/.zeroclaw/config.toml`. Mount your local config in:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker run -d --name zeroclaw \
   -v $(pwd)/my-config.toml:/zeroclaw-data/.zeroclaw/config.toml:ro \
   -v zeroclaw-state:/zeroclaw-data/workspace \
   -p 42617:42617 \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
+
+</div>
 
 For container workloads, set `uri` on each `[providers.models.<type>.<alias>]` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The `ZEROCLAW_providers__models__<type>__<alias>__uri=...` env override can do the same at runtime without editing `config.toml`.
 
@@ -199,15 +245,27 @@ spec:
 
 If you log out of the web UI while running in a container, the existing paircode becomes invalid. Generate a new one to log back in:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker exec -it zeroclaw zeroclaw gateway get-paircode --new
 ```
 
+</div>
+
 For Compose deployments, use `docker compose exec` instead:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker compose exec zeroclaw zeroclaw gateway get-paircode --new
 ```
+
+</div>
 
 ## Gotchas
 

@@ -8,10 +8,16 @@ The release workflows (`release-stable-manual.yml`) automatically use `CHANGELOG
 
 ### Default: last stable tag → HEAD
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 PREV_TAG=$(git tag --sort=-creatordate | grep -vE '\-beta\.' | head -1)
 echo "Range: ${PREV_TAG}..HEAD"
 ```
+
+</div>
 
 ### User-specified range
 
@@ -25,23 +31,41 @@ Accept any of the following and normalize to `<from>..<to>`:
 
 Verify both refs exist before proceeding:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git rev-parse --verify <ref> 2>/dev/null || echo "ERROR: ref not found"
 ```
+
+</div>
 
 ## 2. Collect and categorise commits
 
 ### Collect
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git log <from>..<to> --pretty=format:"%H %h %s" --no-merges
 ```
 
+</div>
+
 Save full SHAs for the contributor resolution step:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git log <from>..<to> --pretty=format:"%H" --no-merges > /tmp/zc-commits.txt
 ```
+
+</div>
 
 ### Categorise
 
@@ -102,9 +126,15 @@ Paginate in batches of 100 commits. Use `pageInfo.endCursor` while `hasNextPage`
 
 Run via `gh`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 gh api graphql -f query='<query>'
 ```
+
+</div>
 
 ### Filter list: exclude all of the following
 
@@ -195,10 +225,16 @@ Write to `CHANGELOG-next.md` at the repository root; that's the path the release
 
 ### Commit
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git add CHANGELOG-next.md
 git commit -m "chore(release): add CHANGELOG-next.md for vX.Y.Z"
 ```
+
+</div>
 
 Replace `vX.Y.Z` with the next release version. Ask the user for confirmation before committing.
 
@@ -206,9 +242,15 @@ Replace `vX.Y.Z` with the next release version. Ask the user for confirmation be
 
 Push to the open release PR branch on `zeroclaw-labs/zeroclaw`:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git push upstream <branch>
 ```
+
+</div>
 
 Don't push directly to `master`.
 

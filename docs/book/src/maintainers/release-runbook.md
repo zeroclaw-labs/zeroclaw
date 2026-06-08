@@ -55,9 +55,15 @@ version = "X.Y.Z"
 
 Sync all other version references:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 bash scripts/release/bump-version.sh X.Y.Z
 ```
+
+</div>
 
 This updates README badges, the Tauri config, and
 workflow description examples. Commit everything together:
@@ -71,11 +77,17 @@ CI is green.
 
 **Confirm the merge landed correctly:**
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git fetch origin
 git show origin/master:Cargo.toml | grep '^version'
 # Must show: version = "X.Y.Z"
 ```
+
+</div>
 
 ---
 
@@ -113,9 +125,15 @@ real `GITHUB_TOKEN` to every workflow run:
    Windows). Authenticate once: `gh auth login`.
 2. Install the `act` extension:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh extension install nektos/gh-act
    ```
+
+   </div>
 
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
@@ -131,25 +149,43 @@ file, artifact server, action SHA pre-fetching).
 
 Make sure your working tree matches the merged master tip from step 2:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git fetch upstream
 git checkout upstream/master
 ```
 
+</div>
+
 List what's runnable across every workflow file:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./scripts/dev/act-local.sh --list
 ```
+
+</div>
 
 Run a specific job, pick interactively, or run every dry-run-safe
 job:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./scripts/dev/act-local.sh release-stable-manual:web   # one job
 ./scripts/dev/act-local.sh                              # interactive picker
 ./scripts/dev/act-local.sh --all                        # every dry-run-safe job
 ```
+
+</div>
 
 The first run pulls the runner image (~1.5 GB) and primes the Rust build
 cache via `Swatinem/rust-cache`; subsequent runs are much faster. The
@@ -332,12 +368,18 @@ restart the workflow.
 **publish succeeded but CHANGELOG-next.md is still on master:** Remove it
 manually:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git checkout master && git pull --ff-only origin master
 git rm CHANGELOG-next.md
 git commit -m "chore: remove CHANGELOG-next.md after vX.Y.Z release"
 git push origin master
 ```
+
+</div>
 
 **A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
 corresponding manually-triggerable sub-workflow. Re-run the specific one with

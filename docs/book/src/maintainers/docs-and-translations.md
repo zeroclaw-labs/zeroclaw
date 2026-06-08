@@ -36,7 +36,11 @@ App strings live in `crates/zeroclaw-runtime/locales/`. English is the source of
 
 > The `apps/zerocode` TUI maintains an independent Fluent catalogue (`apps/zerocode/locales/`), see [zerocode strings](#zerocode-strings-fluent-independent) below. `cargo fluent` walks **both** catalogue roots (runtime + zerocode), so every subcommand below covers both by default.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo fluent stats                                                   # coverage per locale, per catalogue
 cargo fluent check                                                   # validate .ftl syntax across both catalogues
 cargo fluent fill --locale ja --model-provider anthropic.<alias>             # fill missing keys (default batch 50)
@@ -45,12 +49,20 @@ cargo fluent fill --locale ja --model-provider anthropic.<alias> --force     # r
 cargo fluent scan                                                    # find stale or missing keys vs Rust source
 ```
 
+</div>
+
 **Scoping to one catalogue**: every subcommand takes `--catalog <runtime|zerocode>` (default: both). To translate only the TUI:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo fluent fill --locale ja --model-provider anthropic.<alias> --catalog zerocode
 cargo fluent check --catalog zerocode                                # syntax-check only zerocode
 ```
+
+</div>
 
 An unknown `--catalog` value errors with the valid choices.
 
@@ -103,13 +115,19 @@ Locale comes from a top-level `locale` field in `zerocode-config.toml`. When uns
 
 Doc translations live in `docs/book/po/`. `cargo mdbook sync` runs extract → merge → strip obsolete → AI-fill in one step. Without `--model-provider`, sync still runs extract + merge and reports how many strings need translation: partial translations fall back to English at render time.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo mdbook sync --model-provider anthropic.<alias>              # delta fill
 cargo mdbook sync --model-provider anthropic.<alias> --force      # quality pass: retranslate all entries
 cargo mdbook sync --model-provider anthropic.<alias> --batch 1    # write after every entry (safest resume)
 cargo mdbook sync --locale ja --model-provider anthropic.<alias>  # single locale
 cargo mdbook sync --model-provider anthropic.<alias> --config-dir ~/.zeroclaw  # qualified alias + explicit config dir
 ```
+
+</div>
 
 `--model-provider` resolves through the same shared runtime provider path as `cargo fluent` (any configured family/alias, per-family endpoint + auth + wire protocol, `SecretStore` decryption, `--config-dir` support). Unlike `cargo fluent`, which sends a whole batch as one JSON object, the gettext filler issues **one request per source string** to keep the `msgid → msgstr` mapping unambiguous, so `--batch` controls how often the `.po` is flushed to disk (the checkpoint interval), not the request size. A full-catalogue locale is thousands of sequential requests; for routine delta fills a cheap local Ollama alias is the economical choice.
 
@@ -133,15 +151,27 @@ Maintainers should accept the routine English docs exception documented in [Buil
 
 2. Translate the app strings:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    cargo fluent fill --locale <code> --provider ollama
    ```
 
+   </div>
+
 3. Bootstrap and fill the docs `.po` file:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    cargo mdbook sync --locale <code> --provider ollama
    ```
+
+   </div>
 
 4. For zerocode parity, copy `apps/zerocode/locales/en/zerocode.ftl` to `apps/zerocode/locales/<code>/zerocode.ftl` and translate the values by hand. `cargo fluent` does not yet operate on the zerocode catalogue; the file can be dropped into any of the disk-search paths or embedded in-tree once translated.
 

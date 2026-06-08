@@ -8,17 +8,29 @@ Install, update, run as a service, and uninstall, all Linux distributions.
 
 ### Option 1: `install.sh` via curl (fastest)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
+</div>
+
 ### Option 2: `install.sh` from a clone
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 ./install.sh
 ```
+
+</div>
 
 ### What the installer does
 
@@ -29,7 +41,11 @@ cd zeroclaw
 
 Flags:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./install.sh --prebuilt                      # always prebuilt, skip the prompt
 ./install.sh --source                        # always build from source
 ./install.sh --minimal                       # foundation only, no default features
@@ -39,12 +55,20 @@ Flags:
 ./install.sh --help                          # full flag reference
 ```
 
+</div>
+
 ### Option 3: Homebrew (Linuxbrew)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 brew install zeroclaw
 zeroclaw quickstart
 ```
+
+</div>
 
 Homebrew-on-Linux installs follow Homebrew's service path convention, your workspace lives under `$HOMEBREW_PREFIX/var/zeroclaw/` instead of `~/.zeroclaw/`. See [Service management](./service.md) for why this matters.
 
@@ -65,17 +89,29 @@ Most deployments don't need any of these.
 
 Systemd is the default. OpenRC is detected and supported as a fallback.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service install
 zeroclaw service start
 zeroclaw service status
 ```
 
+</div>
+
 Logs go to the systemd journal by default:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 journalctl --user -u zeroclaw -f
 ```
+
+</div>
 
 Full details: [Service management](./service.md).
 
@@ -83,58 +119,104 @@ Full details: [Service management](./service.md).
 
 On a Raspberry Pi or similar SBC, build with the hardware feature:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./install.sh --source --features hardware
 ```
 
+</div>
+
 The stock systemd unit includes `SupplementaryGroups=gpio spi i2c` so the service user can access hardware without running as root. Verify your user is in those groups:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 getent group gpio spi i2c
 sudo usermod -aG gpio,spi,i2c $USER
 # re-login for group changes to take effect
 ```
 
+</div>
+
 ## Update
 
 Re-run the installer, it detects the existing install and upgrades in place:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
 ```
 
+</div>
+
 Or from a clone:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cd /path/to/zeroclaw
 git pull
 ./install.sh --skip-quickstart
 ```
 
+</div>
+
 If installed via Homebrew instead:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 brew update && brew upgrade zeroclaw
 ```
 
+</div>
+
 After updating, restart the service:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service restart
 ```
+
+</div>
 
 ## Uninstall
 
 Stop and remove the service:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service stop
 zeroclaw service uninstall
 ```
 
+</div>
+
 Remove the binary:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # cargo install / bootstrap
 rm ~/.cargo/bin/zeroclaw
 
@@ -142,11 +224,19 @@ rm ~/.cargo/bin/zeroclaw
 brew uninstall zeroclaw
 ```
 
+</div>
+
 Remove config and workspace (optional: this deletes conversation history):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 rm -rf ~/.zeroclaw ~/.config/zeroclaw
 ```
+
+</div>
 
 ## Next
 

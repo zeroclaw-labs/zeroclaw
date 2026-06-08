@@ -2,11 +2,21 @@
 
 Every operator env-var override uses a single schema-mirror grammar. The tail of a `ZEROCLAW_*` env var is the dotted prop-path that `zeroclaw config set` accepts, with each `__` (double underscore) separating path segments and each single `_` either a snake-case joiner inside a field name (`api_key` → `api-key` in `set_prop`) or a literal char inside an alias key.
 
+<div class="os-tabs-src">
+
+#### sh
+
 ```sh
 ZEROCLAW_<dotted_path_with_double_underscores>=<value>
 ```
 
+</div>
+
 ## Examples
+
+<div class="os-tabs-src">
+
+#### sh
 
 ```sh
 # Inject a typed-family alias credential
@@ -38,6 +48,8 @@ ZEROCLAW_storage__qdrant__home__collection=zeroclaw
 ZEROCLAW_storage__qdrant__home__api_key=...
 ```
 
+</div>
+
 The mapping from env-var name to TOML path is mechanical:
 
 | TOML | Env var |
@@ -53,11 +65,17 @@ The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen, substitute
 
 These env vars decide *where* the config file and instance data live, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface. They resolve in the order `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE` (deprecated):
 
+<div class="os-tabs-src">
+
+#### sh
+
 ```sh
 ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location (takes precedence)
 ZEROCLAW_DATA_DIR=/srv/zeroclaw           # instance data directory (canonical)
 ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DATA_DIR
 ```
+
+</div>
 
 The gateway's web-dashboard location is configured via the standard
 schema-mirror form `ZEROCLAW_gateway__web_dist_dir`, see
@@ -108,6 +126,10 @@ For example, `[providers.models.anthropic.home] api_key = "sk-..."` lives at the
 
 The schema-mirror grammar is the canonical way to inject values, but `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `QDRANT_URL` / etc. are still common names in `.env` files and CI configs. One-line shell expansions point a schema-mirror name at the ecosystem-default value:
 
+<div class="os-tabs-src">
+
+#### sh
+
 ```sh
 # POSIX (bash, zsh, sh) — drop into ~/.bashrc / ~/.zshrc / .env / Dockerfile
 export ZEROCLAW_providers__models__anthropic__home__api_key="$ANTHROPIC_API_KEY"
@@ -118,12 +140,16 @@ export ZEROCLAW_storage__qdrant__home__api_key="$QDRANT_API_KEY"
 export ZEROCLAW_gateway__request_timeout_secs="$GATEWAY_TIMEOUT_SECS"
 ```
 
+#### PowerShell
+
 ```powershell
 # PowerShell — drop into $PROFILE
 $env:ZEROCLAW_providers__models__anthropic__home__api_key = $env:ANTHROPIC_API_KEY
 $env:ZEROCLAW_providers__models__openai__home__api_key    = $env:OPENAI_API_KEY
 $env:ZEROCLAW_storage__qdrant__home__url                  = $env:QDRANT_URL
 ```
+
+</div>
 
 Substitute the alias name in place of `home` to match your `config.toml`. For multiple aliases on the same family, repeat the line with each alias.
 

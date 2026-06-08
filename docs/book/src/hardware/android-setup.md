@@ -21,7 +21,11 @@ Download from [F-Droid](https://f-droid.org/packages/com.termux/) (recommended) 
 
 ### 2. Download ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Check your architecture
 uname -m
 # aarch64 = 64-bit, armv7l/armv8l = 32-bit
@@ -36,9 +40,15 @@ curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zero
 tar xzf zeroclaw-armv7-linux-androideabi.tar.gz
 ```
 
+</div>
+
 ### 3. Install and Run
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 chmod +x zeroclaw
 mv zeroclaw $PREFIX/bin/
 
@@ -49,16 +59,24 @@ zeroclaw --version
 zeroclaw quickstart
 ```
 
+</div>
+
 ## Direct Installation via ADB
 
 For advanced users who want to run ZeroClaw outside Termux:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # From your computer with ADB
 adb push zeroclaw /data/local/tmp/
 adb shell chmod +x /data/local/tmp/zeroclaw
 adb shell /data/local/tmp/zeroclaw --version
 ```
+
+</div>
 
 > ⚠️ Running outside Termux requires a rooted device or specific permissions for full functionality.
 
@@ -72,7 +90,11 @@ adb shell /data/local/tmp/zeroclaw --version
 
 To build for Android yourself:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install Android NDK
 # Add targets
 rustup target add armv7-linux-androideabi aarch64-linux-android
@@ -86,12 +108,20 @@ cargo build --release --target armv7-linux-androideabi
 cargo build --release --target aarch64-linux-android
 ```
 
+</div>
+
 ## Troubleshooting
 
 ### "Permission denied"
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 chmod +x zeroclaw
 ```
+
+</div>
 
 ### "not found" or linker errors
 Make sure you downloaded the correct architecture for your device.

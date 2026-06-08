@@ -4,9 +4,15 @@
 
 On the same machine as the daemon, no extra configuration is needed:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zerocode
 ```
+
+</div>
 
 zerocode finds the daemon's local endpoint automatically: `<data_dir>/data/daemon.sock`
 on Unix, `\\.\pipe\zeroclaw-<hash>` on Windows. If the daemon isn't running,

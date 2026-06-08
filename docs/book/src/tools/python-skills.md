@@ -44,18 +44,30 @@ Prefer installing Python packages at image build time, in a reviewed local virtu
 
 ZeroClaw deliberately blocks inline interpreter execution such as:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 python3 -c 'print("hello")'
 python3 -m http.server
 python3 -m pip install requests
 node -e 'console.log(process.env)'
 ```
 
+</div>
+
 For Python skills, put code in an auditable script file and run that file:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 python3 skills/portfolio/run.py
 ```
+
+</div>
 
 This makes the executable file reviewable by the skill audit path and avoids turning a shell command string into an arbitrary code container.
 
@@ -103,9 +115,15 @@ WORKDIR /workspace
 
 Build it:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 docker build -f Dockerfile.skill-exec -t zeroclaw-python-skills:local .
 ```
+
+</div>
 
 Point ZeroClaw at the image:
 

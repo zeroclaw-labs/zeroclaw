@@ -295,9 +295,15 @@ When running `zeroclaw acp` as a subprocess, the command starts the server uncon
 
 **As a subprocess (typical IDE integration):**
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw acp
 ```
+
+</div>
 
 The binary reads stdin, writes stdout, exits on EOF.
 
@@ -305,17 +311,29 @@ The binary reads stdin, writes stdout, exits on EOF.
 
 Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw-acp-bridge
 ```
 
+</div>
+
 The bridge reads the gateway address and auth token from the same `config.toml` as the daemon. When the daemon runs with a non-default config directory (e.g. `--config-dir /tmp/zeroclaw`), point the bridge at the same directory:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw-acp-bridge --config-dir /tmp/zeroclaw
 # or equivalently:
 zeroclaw-acp-bridge --config-dir=/tmp/zeroclaw
 ```
+
+</div>
 
 You can also supply the bearer token directly via `ZEROCLAW_ACP_BRIDGE_TOKEN` if you prefer not to rely on the cached token file.
 

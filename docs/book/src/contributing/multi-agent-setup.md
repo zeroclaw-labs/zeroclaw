@@ -113,9 +113,15 @@ The schema validator will refuse to load if a `[peer_groups.<name>]` still lists
 
 Look at the merged log stream; every line should now carry `[<alias>]` or `[system]` prefixes:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon 2>&1 | grep '\[researcher\]'   # researcher's lines only
 zeroclaw daemon 2>&1 | grep '\[system\]'       # boot/migration/scheduler lines only
 ```
+
+</div>
 
 If the boundary checks are working, `file_read /dev/null` from any agent succeeds (POSIX device-file allowlist), `file_read` outside the workspace + access list fails with `Path escapes workspace directory`, and `file_write` to a read-only allowlisted sibling fails with the same message.

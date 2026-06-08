@@ -32,15 +32,25 @@ All config management goes through `zeroclaw config`. Do not hand-edit `~/.zeroc
 
 Easiest: set each Matrix field with `zeroclaw config set` (see below). For the fastest one-shot bring-up, the most ergonomic path is to set the required fields back-to-back:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config set channels.matrix.homeserver https://matrix.example.com
 zeroclaw config set channels.matrix.access-token   # prompts, input masked
 zeroclaw config set channels.matrix.allowed-users '["*"]'
 ```
 
+</div>
+
 Or set individual fields directly:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config set channels.matrix.homeserver https://matrix.example.com
 zeroclaw config set channels.matrix.access-token           # prompts, input masked
 zeroclaw config set channels.matrix.user-id @bot:matrix.example.com
@@ -50,6 +60,8 @@ zeroclaw config set channels.matrix.allowed-rooms '["!room:matrix.example.com"]'
 zeroclaw config set channels.matrix.ack-reactions true       # default: true (👀 → ✅)
 zeroclaw config set channels.matrix.reply-in-thread true     # default: true
 ```
+
+</div>
 
 Required: `homeserver`, `access-token`, `allowed-users`. Strongly recommended for E2EE: `user-id` and `device-id`. `allowed-rooms` is optional; leave empty to allow every room the bot has joined, or list explicit IDs/aliases to restrict. For the full field index, see the [Config reference](../reference/config.md).
 
@@ -70,11 +82,17 @@ If your operator account already has a token (e.g. you copied it from another de
 
 Run this once. Replace `your.homeserver`, the bot username, password, and pick any short `device_id` string (alphanumeric, no spaces; this is the *server-side* device label that ZeroClaw will reuse on every restart):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -sS -X POST "https://your.homeserver/_matrix/client/v3/login" \
   -H "Content-Type: application/json" \
   -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"YOUR_BOT_USERNAME"},"password":"YOUR_PASSWORD","device_id":"NEW_DEVICE_ID"}'
 ```
+
+</div>
 
 Response:
 
@@ -84,11 +102,17 @@ Response:
 
 ### Step 2: Apply both values to ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config set channels.matrix.access-token    # paste the access_token (input is masked)
 zeroclaw config set channels.matrix.device-id NEWDEVICE
 zeroclaw config set channels.matrix.user-id @bot:example.com
 ```
+
+</div>
 
 Restart for the new values to take effect: `zeroclaw service restart`.
 
@@ -132,17 +156,23 @@ Work through in order.
 >
 > The non-secret fields *are* retrievable:
 >
-> ```bash
+> ```sh
 > MATRIX_HOMESERVER=$(zeroclaw config get channels.matrix.homeserver)
 > MATRIX_USER=$(zeroclaw config get channels.matrix.user-id)
 > ```
 
 With `MATRIX_TOKEN` set, validate the token server-side:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
   "$MATRIX_HOMESERVER/_matrix/client/v3/account/whoami"
 ```
+
+</div>
 
 - Returned `user_id` must match the bot account.
 - If `device_id` is missing from the response, set it manually (see §5H).
@@ -160,9 +190,15 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 ZeroClaw suppresses `matrix_sdk`, `matrix_sdk_base`, and `matrix_sdk_crypto` to `warn` by default; they're noisy at `info`. Restore SDK output for debugging:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info zeroclaw daemon
 ```
+
+</div>
 
 ### F. Message formatting (Markdown)
 
@@ -182,10 +218,16 @@ ZeroClaw needs a stable `device_id` for E2EE session restore. Without it, a new 
 
 #### Option 1: `whoami` (easiest)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
   "https://your.homeserver/_matrix/client/v3/account/whoami"
 ```
+
+</div>
 
 Response includes `device_id` if the token is bound to a device session:
 
@@ -202,9 +244,15 @@ If `device_id` is missing, the token was created without a device login (e.g. vi
 3. Copy the Device ID for the active session.
 4. Apply:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config set channels.matrix.device-id ABCDEF1234
 ```
+
+</div>
 
 Then `zeroclaw service restart`. Keep `device-id` stable: changing it forces a new device registration, which breaks existing key sharing and verification.
 
@@ -220,38 +268,68 @@ A fresh login creates a new device with a new `device_id`, sidestepping the OTK 
 
 1. Stop ZeroClaw.
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    zeroclaw service stop
    ```
 
+   </div>
+
 2. Get a fresh access token and `device_id`:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    curl -sS -X POST "https://matrix.org/_matrix/client/v3/login" \
      -H "Content-Type: application/json" \
      -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"YOUR_BOT_USERNAME"},"password":"YOUR_PASSWORD","device_id":"NEW_DEVICE_ID"}'
    ```
 
+   </div>
+
    Save the returned `access_token` and `device_id`.
 
 3. Delete the local crypto store:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    rm -rf ~/.zeroclaw/state/matrix/
    ```
 
+   </div>
+
 4. Apply the new credentials:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    zeroclaw config set channels.matrix.access-token <new_token>
    zeroclaw config set channels.matrix.device-id <new_device_id>
    ```
 
+   </div>
+
 5. Restart:
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    zeroclaw service start
    ```
+
+   </div>
 
 #### What to expect on first restart
 
@@ -278,17 +356,29 @@ A recovery key lets ZeroClaw automatically restore room keys and cross-signing s
 
 Apply the recovery key to ZeroClaw:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config set channels.matrix.recovery-key    # input masked
 ```
+
+</div>
 
 Then `zeroclaw service restart`. The recovery key is encrypted at rest immediately.
 
 #### Step 3: Restart
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw service restart
 ```
+
+</div>
 
 On startup you should see:
 
@@ -302,9 +392,15 @@ From now on, even if the local crypto store is deleted, ZeroClaw recovers automa
 
 Matrix-channel-specific diagnostics:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 RUST_LOG=zeroclaw::channels::matrix=debug zeroclaw daemon
 ```
+
+</div>
 
 Surfaces:
 
@@ -316,9 +412,15 @@ Surfaces:
 
 For SDK-level detail as well:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemon
 ```
+
+</div>
 
 ## 7. Operational notes
 

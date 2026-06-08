@@ -35,9 +35,15 @@ Full field reference: [Config](../reference/config.md).
 
 ## Gateway endpoint
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon
 ```
+
+</div>
 
 Configure your Talk bot's webhook URL to point at:
 

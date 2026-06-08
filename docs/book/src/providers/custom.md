@@ -33,9 +33,15 @@ ZeroClaw ships canonical slots for popular local-inference stacks. They're all O
 
 ### llama.cpp: slot `llamacpp`
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
 ```
+
+</div>
 
 ```toml
 [providers.models.llamacpp.local]
@@ -68,9 +74,15 @@ Other model families use different template variable names, check your model's c
 
 ### SGLang: slot `sglang`
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
 ```
+
+</div>
 
 ```toml
 [providers.models.sglang.local]
@@ -80,9 +92,15 @@ model = "meta-llama/Llama-3.1-8B-Instruct"
 
 ### vLLM: slot `vllm`
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
+
+</div>
 
 ```toml
 [providers.models.vllm.local]
@@ -113,11 +131,17 @@ When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProv
 
 Regardless of approach:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw config list                          # loads config; any validation failures print to stderr
 zeroclaw models refresh --provider <type>.<alias>   # list models the endpoint advertises
 zeroclaw agent -a <alias> -m "hello"          # smoke-test against the agent at `[agents.<alias>]`
 ```
+
+</div>
 
 ## Implementing a new `ModelProvider` trait
 
@@ -177,9 +201,15 @@ See `anthropic.rs` as a reference for a provider with a fully custom wire format
 ### Model not found
 
 - List what the endpoint advertises:
-  ```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
   curl -sS "$URI/models" -H "Authorization: Bearer $API_KEY" | jq
   ```
+
+</div>
 - If the endpoint doesn't implement `/models`, send a direct chat request and read the error, most endpoints return the expected model family in the error body.
 - Gateway services often expose only a subset of upstream models.
 

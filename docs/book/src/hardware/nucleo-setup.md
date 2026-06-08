@@ -19,11 +19,17 @@ The agent uses the `hardware_board_info` tool to return chip name, architecture,
 
 **CLI alternative:**
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo build --features hardware,probe
 zeroclaw hardware info
 zeroclaw hardware discover
 ```
+
+</div>
 
 ---
 
@@ -60,19 +66,31 @@ Protocol: newline-delimited JSON. Request: `{"id":"1","cmd":"gpio_write","args":
 
 From the zeroclaw repo root:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw peripheral flash-nucleo
 ```
+
+</div>
 
 This builds `firmware/nucleo` and runs `probe-rs run --chip STM32F401RETx`. The firmware runs immediately after flashing.
 
 ### 1.3 Manual Flash (Alternative)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cd firmware/nucleo
 cargo build --release --target thumbv7em-none-eabihf
 probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/nucleo
 ```
+
+</div>
 
 ---
 
@@ -93,15 +111,27 @@ Enable `[peripherals]` and add a `[[peripherals.boards]]` entry for the Nucleo (
 
 ## Phase 4: Run and Test
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
+</div>
+
 Or use the agent directly:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw agent -a assistant --message "Turn on the LED on pin 13"
 ```
+
+</div>
 
 Pin 13 = PA5 = User LED (LD2) on Nucleo-F401RE.
 

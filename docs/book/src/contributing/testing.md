@@ -21,7 +21,11 @@ Plus two non-test directories:
 
 ## Running tests
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo test                                  # unit + component + integration + system
 cargo test --lib                            # unit only
 cargo test --test component                 # component only
@@ -32,6 +36,8 @@ cargo test --test integration agent         # filter within a level
 ./dev/ci.sh all                             # full CI battery
 ./dev/ci.sh test-component                  # level-specific CI commands
 ```
+
+</div>
 
 ## Picking a level for a new test
 

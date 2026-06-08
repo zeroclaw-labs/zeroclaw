@@ -27,9 +27,15 @@ Fastest path. No compiler, no swap, no OOM risk.
 
 ### Using the install script
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 ```
+
+</div>
 
 The script auto-detects your architecture (`aarch64` or `armv7`) and installs the matching release binary into `$CARGO_HOME/bin/zeroclaw` (defaulting to `~/.cargo/bin/zeroclaw`). Make sure that directory is on your `PATH`.
 
@@ -37,7 +43,11 @@ The script auto-detects your architecture (`aarch64` or `armv7`) and installs th
 
 Pick the matching tarball from the [latest release](https://github.com/zeroclaw-labs/zeroclaw/releases/latest):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # 64-bit (Pi 4/5 with 64-bit Raspberry Pi OS)
 curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-unknown-linux-gnu.tar.gz
 tar xzf zeroclaw-aarch64-unknown-linux-gnu.tar.gz
@@ -49,14 +59,22 @@ tar xzf zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz
 sudo install -m 0755 zeroclaw /usr/local/bin/
 ```
 
+</div>
+
 ### Check your architecture
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 uname -m
 # aarch64 → 64-bit (use the aarch64 binary)
 # armv7l  → 32-bit (use the armv7 binary)
 # armv6l  → Pi 1 / Zero (not currently supported, see #4623)
 ```
+
+</div>
 
 ## Option 2: Cross-Compile From Another Machine
 
@@ -64,7 +82,11 @@ If you already have a beefier machine, cross-compiling is faster than building o
 
 ### From macOS (Apple Silicon or Intel)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install the cross-compilation target
 rustup target add aarch64-unknown-linux-gnu
 
@@ -81,11 +103,17 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 ```
 
+</div>
+
 > **Note:** earlier drafts of this guide suggested `aarch64-elf-gcc` from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc. It will not produce a working Raspberry Pi OS binary. Use the `messense/macos-cross-toolchains` tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).
 
 ### From Linux x86_64
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install cross-compilation toolchain
 sudo apt-get install -y gcc-aarch64-linux-gnu
 
@@ -103,22 +131,34 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 ```
 
+</div>
+
 ## Option 3: Build on the Pi
 
 Possible on Pi 4/5 if you set up swap and pick the right profile. Expect 20-40 minutes on a Pi 5 (8 GB), longer on Pi 4.
 
 ### Step 1: Install Rust toolchain
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
+
+</div>
 
 ### Step 2: Add swap (critical for Pi 5 with ≤ 8 GB or any Pi 4)
 
 The default `release` profile peaks around 8-10 GB RSS during fat LTO linking. Without swap, that triggers the OOM-killer mid-link.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Create a 4 GB swap file
 sudo fallocate -l 4G /swapfile
 sudo chmod 600 /swapfile
@@ -132,11 +172,17 @@ free -h
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
+</div>
+
 ### Step 3: Choose a build profile
 
 The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile (`codegen-units = 8`, `lto = "thin"`) drops peak RAM by ~half, with only minor runtime impact.
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
@@ -150,13 +196,21 @@ cargo build --profile release-fast
 cargo build --profile ci
 ```
 
+</div>
+
 ### Step 4: Install the binary
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # From the build profile you used:
 sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
 # or target/release-fast/zeroclaw, or target/ci/zeroclaw
 ```
+
+</div>
 
 ### Building with GPIO support
 
@@ -189,17 +243,27 @@ The trade-off: Podman's rootless network model uses slirp4netns (or pasta on new
 
 ### Quick install (Raspberry Pi OS Bookworm/Trixie)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo apt-get install -y podman
 # Optional: shorter aliases — many docker-compose flows just work with podman-compose
 sudo apt-get install -y podman-compose
 ```
 
+</div>
+
 ### Running ZeroClaw under Podman
 
 The published OCI image works under Podman without modification:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 podman pull ghcr.io/zeroclaw-labs/zeroclaw:latest
 
 podman run --rm -d \
@@ -209,6 +273,8 @@ podman run --rm -d \
   ghcr.io/zeroclaw-labs/zeroclaw:latest \
   daemon --host 0.0.0.0 --port 42617
 ```
+
+</div>
 
 > **Bind gotcha:** ZeroClaw defaults to `127.0.0.1` for the gateway. Inside a container that means the gateway is unreachable from the host. Always pass `--host 0.0.0.0` (or set `ZEROCLAW_BIND=0.0.0.0`) when running in a container.
 
@@ -239,10 +305,16 @@ RestartSec=10
 WantedBy=multi-user.target default.target
 ```
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 systemctl --user daemon-reload
 systemctl --user start zeroclaw.service
 ```
+
+</div>
 
 For rootless setups, also run `loginctl enable-linger $USER` so the service starts before you log in.
 
@@ -250,22 +322,38 @@ For rootless setups, also run `loginctl enable-linger $USER` so the service star
 
 ### 1. Initialize ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw quickstart
 ```
+
+</div>
 
 This walks you through provider auth, gateway config, and creates `~/.zeroclaw/config.toml`.
 
 ### 2. Verify it works
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw doctor
 zeroclaw agent -a assistant -m "what's 2+2?"
 ```
 
+</div>
+
 ### 3. Run as a persistent service
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install and start the systemd user service
 zeroclaw service install
 systemctl --user enable --now zeroclaw
@@ -274,13 +362,21 @@ systemctl --user enable --now zeroclaw
 loginctl enable-linger $USER
 ```
 
+</div>
+
 ### 4. Run as a foreground daemon
 
 For dev / debugging:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon --host 0.0.0.0 --port 42617
 ```
+
+</div>
 
 ### 5. Enable channels
 
@@ -291,10 +387,16 @@ ZeroClaw can connect to chat platforms (Matrix, Mattermost, Discord, Telegram, e
 If you want skills to drive GPIO pins (LEDs, buttons, sensors, etc.):
 
 1. Add your user to the `gpio` group:
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    sudo usermod -aG gpio $USER
    # Log out and back in for the group change to take effect
    ```
+
+   </div>
 2. Use the `peripherals` crate's GPIO bindings from your skills. See [Hardware → Peripherals design](./hardware-peripherals-design.md) for the abstraction model.
 
 ## Troubleshooting
@@ -319,18 +421,30 @@ Architecture mismatch. Check `uname -m` and download the matching binary. `aarch
 
 ### GPIO permission denied
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo usermod -aG gpio $USER
 # Log out and back in
 ```
+
+</div>
 
 ### Service won't start after reboot
 
 Make sure user-level systemd persists across logout:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 loginctl enable-linger $USER
 ```
+
+</div>
 
 ### Container can't reach gateway from host
 

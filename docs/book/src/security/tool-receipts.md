@@ -59,9 +59,15 @@ The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receip
 
 ### In debug logs
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 RUST_LOG=zeroclaw_runtime::agent=debug zeroclaw daemon
 ```
+
+</div>
 
 Produces:
 

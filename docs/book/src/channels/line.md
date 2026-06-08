@@ -29,10 +29,16 @@ Configure the LINE channel under `[channels.line]` with at minimum `channel_acce
 
 If you prefer not to store credentials in the config file, omit the token fields and export them as environment variables instead:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 export LINE_CHANNEL_ACCESS_TOKEN="your-channel-access-token"
 export LINE_CHANNEL_SECRET="your-channel-secret"
 ```
+
+</div>
 
 Environment variables take precedence over empty config fields.
 
@@ -44,9 +50,15 @@ LINE delivers messages by posting to your webhook URL. The embedded server liste
 
 **For local development (ngrok):**
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ngrok http 8443
 ```
+
+</div>
 
 Copy the `https://` URL ngrok provides (e.g. `https://abc123.ngrok.io`).
 
@@ -65,15 +77,27 @@ Copy the `https://` URL ngrok provides (e.g. `https://abc123.ngrok.io`).
 
 ## 5. Start ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 ./target/release/zeroclaw --config zeroclaw.toml
 ```
 
+</div>
+
 Or via daemon mode:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon
 ```
+
+</div>
 
 **Startup log signal:**
 
