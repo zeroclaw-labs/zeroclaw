@@ -335,6 +335,7 @@ impl Tool for ShellTool {
         // `output()` pipes stdio implicitly; `spawn()` does not.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -496,6 +497,24 @@ mod tests {
                 .contains(&json!("command"))
         );
         assert!(schema["properties"]["approved"].is_object());
+    }
+
+    #[tokio::test]
+    async fn shell_stdin_is_eof_not_the_terminal() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let fut = tool.execute(json!({"command": "cat"}));
+        let res = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
+        assert!(
+            res.is_ok(),
+            "a stdin-reading command hung — stdin is not null and may reach the terminal"
+        );
+        assert!(res.unwrap().expect("cat should return a result").success);
     }
 
     #[tokio::test]

@@ -164,7 +164,7 @@ impl SecretStore {
             .map_err(|_| {
                 ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string()})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
                      Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
-                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw onboard`.");
+                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw quickstart`.");
                 anyhow::Error::msg(
                     "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)"
                 )
