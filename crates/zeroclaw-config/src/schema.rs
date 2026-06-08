@@ -12235,6 +12235,7 @@ impl AmqpConfig {
     /// Checks:
     /// - `amqp_url` uses a valid scheme (`amqp://` or `amqps://`)
     /// - `amqps://` connections carry a CA certificate
+    /// - `client_cert` and `client_key` are supplied together (mutual TLS)
     /// - the exchange is non-empty
     /// - at least one routing key is bound
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -12250,6 +12251,20 @@ impl AmqpConfig {
 
         if is_tls && self.ca_cert.is_none() {
             anyhow::bail!("amqps:// requires ca_cert to verify the broker");
+        }
+
+        match (self.client_cert.is_some(), self.client_key.is_some()) {
+            (true, false) => {
+                anyhow::bail!(
+                    "client_cert is set but client_key is missing (both are required for mutual TLS)"
+                )
+            }
+            (false, true) => {
+                anyhow::bail!(
+                    "client_key is set but client_cert is missing (both are required for mutual TLS)"
+                )
+            }
+            _ => {}
         }
 
         if self.exchange.is_empty() {
@@ -16998,6 +17013,43 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    async fn amqp_validate_requires_paired_client_cert_and_key() {
+        let base = AmqpConfig {
+            enabled: true,
+            amqp_url: "amqps://broker.example.org:5671/%2Fpublic".into(),
+            exchange: "amq.topic".into(),
+            routing_keys: vec!["org.example.release".into()],
+            ca_cert: Some(std::path::PathBuf::from("/etc/ssl/ca.pem")),
+            ..AmqpConfig::default()
+        };
+
+        // Both absent: server-auth only, valid.
+        assert!(base.validate().is_ok());
+
+        // Cert without key: invalid.
+        let cert_only = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            ..base.clone()
+        };
+        assert!(cert_only.validate().is_err());
+
+        // Key without cert: invalid.
+        let key_only = AmqpConfig {
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base.clone()
+        };
+        assert!(key_only.validate().is_err());
+
+        // Both present: valid.
+        let both = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base
+        };
+        assert!(both.validate().is_ok());
+    }
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
