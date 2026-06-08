@@ -354,6 +354,9 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Per-chat draft state: (last accumulated text, current status line).
+    /// Used to merge tool-progress into the single draft message.
+    draft_progress: Mutex<std::collections::HashMap<String, (String, String)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,6 +403,7 @@ impl TelegramChannel {
             proxy_url: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            draft_progress: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -473,6 +477,53 @@ impl TelegramChannel {
             self.tts_config = Some(config);
         }
         self
+    }
+
+    /// Edit the draft message with the given display text.
+    async fn edit_draft_text(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            let mut end = 0;
+            for (idx, ch) in text.char_indices() {
+                let next = idx + ch.len_utf8();
+                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
+                    break;
+                }
+                end = next;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": display_text,
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            self.last_draft_edit
+                .lock()
+                .insert(chat_id.to_string(), std::time::Instant::now());
+        } else {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Telegram editMessageText failed ({status}): {err}");
+        }
+
+        Ok(())
     }
 
     /// Parse reply_target into (chat_id, optional thread_id).
@@ -2449,6 +2500,10 @@ impl Channel for TelegramChannel {
         self.stream_mode != StreamMode::Off
     }
 
+    fn consolidates_tool_progress(&self) -> bool {
+        self.stream_mode != StreamMode::Off
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         if self.stream_mode == StreamMode::Off {
             return Ok(None);
@@ -2514,20 +2569,62 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            for (idx, ch) in text.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = next;
+        let message_id_parsed = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
+                return Ok(());
             }
-            &text[..end]
-        } else {
-            text
         };
+
+        // Combine content text with current progress status footer
+        let status_suffix = self
+            .draft_progress
+            .lock()
+            .get(&chat_id)
+            .map(|(_, status)| status.clone())
+            .unwrap_or_default();
+        self.draft_progress
+            .lock()
+            .entry(chat_id.clone())
+            .and_modify(|(content, _)| *content = text.to_string())
+            .or_insert_with(|| (text.to_string(), String::new()));
+
+        let combined = if status_suffix.is_empty() {
+            text.to_string()
+        } else {
+            format!("{text}\n\n{status_suffix}")
+        };
+
+        self.edit_draft_text(&chat_id, message_id_parsed, &combined)
+            .await
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+
+        // Rate-limit edits per chat (same as update_draft)
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(&chat_id) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    // Still store the status even if rate-limited — next
+                    // update_draft call will include it.
+                    self.draft_progress
+                        .lock()
+                        .entry(chat_id)
+                        .and_modify(|(_, status)| *status = text.to_string())
+                        .or_insert_with(|| (String::new(), text.to_string()));
+                    return Ok(());
+                }
+            }
+        }
 
         let message_id_parsed = match message_id.parse::<i64>() {
             Ok(id) => id,
@@ -2537,30 +2634,24 @@ impl Channel for TelegramChannel {
             }
         };
 
-        let body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id_parsed,
-            "text": display_text,
-        });
+        // Update stored status and get the last known content text
+        let content = {
+            let mut progress = self.draft_progress.lock();
+            let entry = progress
+                .entry(chat_id.clone())
+                .and_modify(|(_, status)| *status = text.to_string())
+                .or_insert_with(|| (String::new(), text.to_string()));
+            entry.0.clone()
+        };
 
-        let resp = self
-            .client
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await?;
-
-        if resp.status().is_success() {
-            self.last_draft_edit
-                .lock()
-                .insert(chat_id.clone(), std::time::Instant::now());
+        let combined = if content.is_empty() {
+            text.to_string()
         } else {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            tracing::debug!("Telegram editMessageText failed ({status}): {err}");
-        }
+            format!("{content}\n\n{text}")
+        };
 
-        Ok(())
+        self.edit_draft_text(&chat_id, message_id_parsed, &combined)
+            .await
     }
 
     async fn finalize_draft(
@@ -2572,8 +2663,9 @@ impl Channel for TelegramChannel {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
-        // Clean up rate-limit tracking for this chat
+        // Clean up rate-limit tracking and progress state for this chat
         self.last_draft_edit.lock().remove(&chat_id);
+        self.draft_progress.lock().remove(&chat_id);
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
@@ -2727,6 +2819,7 @@ impl Channel for TelegramChannel {
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         let (chat_id, _) = Self::parse_reply_target(recipient);
         self.last_draft_edit.lock().remove(&chat_id);
+        self.draft_progress.lock().remove(&chat_id);
 
         let message_id = match message_id.parse::<i64>() {
             Ok(id) => id,

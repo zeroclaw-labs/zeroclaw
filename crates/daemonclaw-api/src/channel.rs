@@ -149,6 +149,12 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Whether this channel merges tool-call progress into the draft message
+    /// instead of receiving separate per-tool notification messages.
+    fn consolidates_tool_progress(&self) -> bool {
+        false
+    }
+
     /// Minimum delay (ms) between sending each paragraph in multi-message mode.
     fn multi_message_delay_ms(&self) -> u64 {
         800
