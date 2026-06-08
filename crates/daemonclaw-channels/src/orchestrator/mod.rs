@@ -3563,10 +3563,12 @@ async fn process_channel_message(
             );
             // Close the orphan user turn so subsequent messages don't
             // inherit this timed-out request as unfinished context.
+            // Use a neutral closure — avoid language the model will parrot
+            // as a refusal on the next turn.
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
-                ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                ChatMessage::assistant("[Previous response was interrupted by a network timeout. Ready for the next message.]"),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
@@ -3633,10 +3635,16 @@ async fn dispatch_worker(
             )
         };
 
-        if interrupt_enabled && let Some(previous) = previous {
+        // Runtime commands (/new, /stop) always cancel in-flight requests
+        // even when interrupt_on_new_message is off — they are explicit
+        // user directives, not conversational follow-ups.
+        let is_runtime_command = parse_runtime_command(&msg.channel, &msg.content).is_some()
+            || is_stop_command(&msg.content);
+        if (interrupt_enabled || is_runtime_command) && let Some(previous) = previous {
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
+                forced_by_command = is_runtime_command,
                 "Interrupting previous in-flight request for sender"
             );
             previous.cancellation.cancel();
@@ -6093,14 +6101,14 @@ mod tests {
     fn normalize_preserves_timeout_marker_after_orphan_user_turn() {
         let turns = vec![
             ChatMessage::user("run a long task"),
-            ChatMessage::assistant("[Task timed out — not continuing this request]"),
+            ChatMessage::assistant("[Previous response was interrupted by a network timeout. Ready for the next message.]"),
             ChatMessage::user("next question"),
         ];
 
         let normalized = normalize_cached_channel_turns(turns);
         assert_eq!(normalized.len(), 3);
         assert_eq!(normalized[1].role, "assistant");
-        assert!(normalized[1].content.contains("Task timed out"));
+        assert!(normalized[1].content.contains("interrupted by a network timeout"));
         assert_eq!(normalized[2].content, "next question");
     }
 
