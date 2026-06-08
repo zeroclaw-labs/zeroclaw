@@ -13137,6 +13137,7 @@ dependencies = [
  "aardvark-sys",
  "anyhow",
  "async-trait",
+ "axum",
  "console",
  "dialoguer",
  "directories",
@@ -13153,10 +13154,12 @@ dependencies = [
  "tokio",
  "tokio-serial",
  "toml 1.1.2+spec-1.1.0",
+ "tracing-subscriber",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
+ "zeroclaw-spawn",
  "zeroclaw-tools",
 ]
 

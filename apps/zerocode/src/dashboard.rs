@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use std::sync::Arc;
+
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
     MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
@@ -63,8 +65,8 @@ impl Tab {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-pub(crate) struct Dashboard<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Dashboard {
+    rpc: Arc<RpcClient>,
     connect_label: String,
     insecure_tls: bool,
     tab: Tab,
@@ -123,8 +125,8 @@ pub(crate) struct Dashboard<'a> {
     double_click: mouse::DoubleClickTracker,
 }
 
-impl<'a> Dashboard<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str, insecure_tls: bool) -> Self {
+impl Dashboard {
+    pub(crate) fn new(rpc: Arc<RpcClient>, connect_label: &str, insecure_tls: bool) -> Self {
         Self {
             rpc,
             connect_label: connect_label.to_string(),
@@ -750,11 +752,15 @@ impl<'a> Dashboard<'a> {
             )));
             lines.push(Line::from(""));
             for msg in &self.session_messages {
-                let role_style = match msg.role.as_str() {
-                    "user" => theme::user_label_style(),
-                    "assistant" => theme::agent_label_style(),
-                    "system" => theme::dim_style().add_modifier(Modifier::BOLD),
-                    _ => theme::body_style().add_modifier(Modifier::BOLD),
+                let role_style = match msg.role() {
+                    crate::client::MessageRole::User => theme::user_label_style(),
+                    crate::client::MessageRole::Assistant => theme::agent_label_style(),
+                    crate::client::MessageRole::System => {
+                        theme::dim_style().add_modifier(Modifier::BOLD)
+                    }
+                    crate::client::MessageRole::Other => {
+                        theme::body_style().add_modifier(Modifier::BOLD)
+                    }
                 };
                 lines.push(Line::from(Span::styled(
                     format!("[{}]", msg.role),
@@ -1684,6 +1690,19 @@ impl<'a> Dashboard<'a> {
                 self.search_buf.clear();
                 self.last_poll = None; // re-poll for server-side search
             }
+            Some(DashboardTabAction::KillSession) if self.tab == Tab::Sessions => {
+                if let Some(idx) = self.selected_session_index() {
+                    let sid = self.sessions[idx].session_id.clone();
+                    let _ = self.rpc.session_kill(&sid).await;
+                    self.detail_open = false;
+                    self.detail_scroll = 0;
+                    self.session_messages.clear();
+                    self.session_messages_id = None;
+                    self.session_messages_total = 0;
+                    self.session_messages_start = 0;
+                    self.last_poll = None;
+                }
+            }
             _ => {}
         }
         false
@@ -1971,7 +1990,7 @@ impl<'a> Dashboard<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Dashboard<'_> {
+impl crate::widgets::HelpContext for Dashboard {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
 
@@ -1987,7 +2006,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
             ),
             E::key("1–7", crate::i18n::t("zc-dashboard-help-jump-tab")),
             E::key("r", crate::i18n::t("zc-dashboard-help-refresh")),
-            E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
             E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
         ];
 
@@ -1999,7 +2017,7 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
         }
 
         if self.detail_open {
-            return HelpNode::entries(vec![
+            let mut entries = vec![
                 E::new(
                     vec!["Esc", "Enter"],
                     crate::i18n::t("zc-dashboard-help-close-detail"),
@@ -2023,9 +2041,15 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("r", crate::i18n::t("zc-dashboard-help-refresh-short")),
                 E::key("/", crate::i18n::t("zc-dashboard-help-search")),
                 E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
-                E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
-            ]);
+            ];
+            if self.tab == Tab::Sessions {
+                entries.push(E::key(
+                    "X",
+                    crate::i18n::t("zc-dashboard-help-kill-session"),
+                ));
+            }
+            return HelpNode::entries(entries);
         }
 
         // Per-tab bindings — only show what actually works on this tab.
@@ -2078,8 +2102,9 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
 
 fn truncate(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
-    if first_line.len() > max {
-        format!("{}...", &first_line[..max])
+    if first_line.chars().count() > max {
+        let truncated: String = first_line.chars().take(max).collect();
+        format!("{truncated}...")
     } else {
         first_line.to_string()
     }
@@ -2138,5 +2163,57 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.0}K", bytes as f64 / 1024.0)
     } else {
         format!("{bytes}B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // Regression: byte-index slicing panicked when the byte length exceeded
+        // `max` but `max` landed inside a multi-byte char. This 35-char CJK
+        // string is 105 bytes, so `&s[..40]` used to panic mid-character even
+        // though the string is well under the 40-*character* budget.
+        let s = "用户询问桌面文件列表，助手列出了桌面上的文件夹和文件，包括名称和大小。";
+        assert_eq!(s.chars().count(), 35);
+        assert!(s.len() > 40);
+        // Under the character budget -> returned unchanged, no panic.
+        assert_eq!(truncate(s, 40), s);
+    }
+
+    #[test]
+    fn truncate_multibyte_at_char_boundary() {
+        // Over the character budget: truncates on a char boundary and appends
+        // the ellipsis without panicking.
+        let s = "一二三四五六七八九十甲乙丙丁";
+        let result = truncate(s, 10);
+        assert_eq!(result, "一二三四五六七八九十...");
+        assert_eq!(result.chars().count(), 13);
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // 10 CJK chars (30 bytes) must not be truncated at a max of 20 chars.
+        let s = "一二三四五六七八九十";
+        assert_eq!(truncate(s, 20), s);
+    }
+
+    #[test]
+    fn truncate_short_ascii_unchanged() {
+        assert_eq!(truncate("hello", 40), "hello");
+    }
+
+    #[test]
+    fn truncate_long_ascii() {
+        let s = "a".repeat(50);
+        let result = truncate(&s, 40);
+        assert_eq!(result, format!("{}...", "a".repeat(40)));
+    }
+
+    #[test]
+    fn truncate_uses_first_line_only() {
+        assert_eq!(truncate("first\nsecond", 40), "first");
     }
 }
