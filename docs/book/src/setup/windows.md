@@ -152,5 +152,5 @@ rmdir /s /q "%LOCALAPPDATA%\ZeroClaw"
 ## Next
 
 - [Service management](./service.md)
-- [Quick start](../getting-started/quick-start.md)
+- [Quickstart](../getting-started/quickstart.md)
 - [Operations → Overview](../ops/overview.md)

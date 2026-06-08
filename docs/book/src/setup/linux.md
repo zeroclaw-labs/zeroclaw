@@ -151,5 +151,5 @@ rm -rf ~/.zeroclaw ~/.config/zeroclaw
 ## Next
 
 - [Service management](./service.md) — systemd unit details, logs, auto-start
-- [Quick start](../getting-started/quick-start.md) — once installed, getting talking
+- [Quickstart](../getting-started/quickstart.md) — once installed, getting talking
 - [Operations → Overview](../ops/overview.md) — running in production

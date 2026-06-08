@@ -471,6 +471,9 @@ pub async fn run(
             if mode == Mode::Logs {
                 logs_pane.tick().await;
             }
+            if mode == Mode::Quickstart {
+                quickstart.tick().await;
+            }
             continue;
         }
 

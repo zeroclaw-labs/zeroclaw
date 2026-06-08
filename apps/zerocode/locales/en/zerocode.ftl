@@ -315,6 +315,10 @@ zc-quickstart-help-external-peers = Comma- or newline-separated. Blank = no exte
 zc-quickstart-status-submitting = Submitting…
 zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat will open when reconnected…
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
+zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
+zc-quickstart-status-more-errors = { " " }(+{ $count } more)
+zc-quickstart-model-loading = Loading models for { $provider }…
+zc-quickstart-model-catalog-empty = (catalog unavailable — type a model name)
 zc-quickstart-status-can-create = All selectors ✓. Press `{ $chord }` to Create.
 zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when every selector is ✓.
 
