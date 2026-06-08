@@ -11,9 +11,9 @@ the shape of the events, and how to query them.
 ## Config (`[observability]`)
 
 Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
-`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 8192`. A fresh
+`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`. A fresh
 install produces a 200-event rolling JSONL at
-`~/.zeroclaw/state/runtime-trace.jsonl`, and the dashboard's Logs page
+`~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
 
 `log_persistence = "none"` disables persistence entirely. The broadcast

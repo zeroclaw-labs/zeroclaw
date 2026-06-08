@@ -26,13 +26,13 @@ Keep the split based on update frequency:
 
 The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
 
-Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security:*`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in the [Project board contract](./pr-workflow.md#project-board-contract).
+Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in the [Project board contract](./pr-workflow.md#project-board-contract).
 
 Use assignees for active work. Use area stewardship for routing responsibility when nobody is implementing yet. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes.
 
 ## Canonical spelling
 
-Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `security:policy`, and similar labels. The size and risk families intentionally keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`.
+Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `tool:security`, and similar labels. The size and risk families intentionally keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`.
 
 Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
 
@@ -72,27 +72,27 @@ Applied automatically by `pr-path-labeler.yml` (the only labeling automation cur
 | `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
-| `agent` | `src/agent/**` |
-| `channel` | `src/channels/**` |
-| `gateway` | `src/gateway/**` |
-| `config` | `src/config/**` |
-| `cron` | `src/cron/**` |
-| `daemon` | `src/daemon/**` |
-| `doctor` | `src/doctor/**` |
-| `health` | `src/health/**` |
-| `heartbeat` | `src/heartbeat/**` |
-| `integration` | `src/integrations/**` |
-| `memory` | `src/memory/**` |
-| `security` | `src/security/**` |
-| `runtime` | `src/runtime/**` |
-| `onboard` | `src/onboard/**` |
-| `provider` | `src/providers/**` |
-| `service` | `src/service/**` |
-| `skillforge` | `src/skillforge/**` |
-| `skills` | `src/skills/**` |
-| `tool` | `src/tools/**` |
-| `tunnel` | `src/tunnel/**` |
-| `observability` | `src/observability/**` |
+| `agent` | `src/agent/**`, `crates/zeroclaw-runtime/src/agent/**` |
+| `channel` | `src/channels/**`, `crates/zeroclaw-channels/src/**` |
+| `gateway` | `src/gateway/**`, `crates/zeroclaw-gateway/src/**` |
+| `config` | `src/config/**`, `crates/zeroclaw-config/src/**` |
+| `cron` | `src/cron/**`, `crates/zeroclaw-runtime/src/cron/**` |
+| `daemon` | `src/daemon/**`, `crates/zeroclaw-runtime/src/daemon/**` |
+| `doctor` | `src/doctor/**`, `crates/zeroclaw-runtime/src/doctor/**` |
+| `health` | `src/health/**`, `crates/zeroclaw-runtime/src/health/**` |
+| `heartbeat` | `src/heartbeat/**`, `crates/zeroclaw-runtime/src/heartbeat/**` |
+| `integration` | `src/integrations/**`, `crates/zeroclaw-runtime/src/integrations/**` |
+| `memory` | `src/memory/**`, `crates/zeroclaw-memory/src/**` |
+| `security` | `src/security/**`, `crates/zeroclaw-runtime/src/security/**` |
+| `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
+| `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
+| `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
+| `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
+| `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
+| `skills` | `src/skills/**`, `crates/zeroclaw-runtime/src/skills/**` |
+| `tool` | `src/tools/**`, `crates/zeroclaw-tools/src/**` |
+| `tunnel` | `src/tunnel/**`, `crates/zeroclaw-runtime/src/tunnel/**` |
+| `observability` | `src/observability/**`, `crates/zeroclaw-runtime/src/observability/**` |
 | `tests` | `tests/**` |
 | `scripts` | `scripts/**` |
 | `dev` | `dev/**` |
@@ -109,7 +109,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
 | `channel:dingtalk` | `dingtalk.rs` |
-| `channel:discord` | `discord.rs` |
+| `channel:discord` | `discord.rs`, `discord_history.rs` |
 | `channel:email` | `email_channel.rs`, `gmail_push.rs` |
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |
@@ -130,7 +130,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:twitter` | `twitter.rs` |
 | `channel:wati` | `wati.rs` |
 | `channel:webhook` | `webhook.rs` |
-| `channel:wecom` | `wecom.rs` |
+| `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
 | `channel:whatsapp` | `whatsapp.rs`, `whatsapp_storage.rs`, `whatsapp_web.rs` |
 
 ### Per-provider labels
@@ -194,7 +194,7 @@ For PRs, risk labels describe the actual diff under review: touched paths, behav
 | `risk: high` | Touches a high-risk path, or large security-adjacent change |
 | `risk: manual` | Maintainer override that freezes automated risk recalculation |
 
-High-risk paths: `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
+High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
 
 When uncertain, treat as higher risk.
 

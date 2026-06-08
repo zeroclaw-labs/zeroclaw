@@ -25,32 +25,26 @@ Without lingering, a user-scope systemd service stops when the last session clos
 
 ## Restart behaviour
 
-The stock unit (`~/.config/systemd/user/zeroclaw.service`) uses:
+The installed systemd user unit (`~/.config/systemd/user/zeroclaw.service`) uses:
 
 ```ini
-Restart=on-failure
-RestartSec=10s
+Restart=always
+RestartSec=3
 ```
 
-The agent exits cleanly on config errors (`exit 2`) and is not restarted; this prevents a flapping service from chewing CPU while you fix the config. For other exit codes, systemd restarts with a 10-second backoff.
+systemd restarts the daemon on any exit with a 3-second backoff. There is no exit-code allowlist, so a daemon that fails fast on a bad config will flap; fix the config and `systemctl --user restart zeroclaw` rather than relying on the service to give up.
 
-On macOS, the LaunchAgent plist has `KeepAlive = true` with `SuccessfulExit = false`. Same semantics as `on-failure`.
+On macOS, the LaunchAgent (`~/Library/LaunchAgents/com.zeroclaw.daemon.plist`) sets `RunAtLoad` and `KeepAlive` to `true`, so launchd keeps the daemon running and relaunches it whenever it exits.
 
-On Windows, the Task Scheduler task is configured with "Restart if task fails", retry every 10s, up to 10 times.
+On Windows, `zeroclaw service install` registers a Task Scheduler task triggered `ONLOGON` at the `LIMITED` run level. It starts the daemon at logon; it does not add an automatic restart-on-failure policy.
 
 ## Graceful shutdown
 
-The daemon traps `SIGTERM` (Unix) or `CTRL_CLOSE_EVENT` (Windows):
+On Unix the daemon traps `SIGINT` and `SIGTERM`; on Windows it traps Ctrl+C (`ctrl_c`). Any of these triggers a clean shutdown: the daemon stops its channel server and the gateway listener and exits.
 
-1. Stop accepting new channel events
-2. Drain in-flight agent loops (up to `[daemon] shutdown_grace_secs`, default 30)
-3. Flush tool receipts and conversation memory to SQLite
-4. Disconnect channels and close the gateway listener
-5. Exit 0
+`SIGHUP` is ignored (the daemon stays running). A reload requested via the `/admin/reload` endpoint restarts the daemon loop in place rather than exiting.
 
-If the agent is mid-tool-call when shutdown starts, the tool is given the grace period to finish. After that, `SIGKILL` ends it; the receipt is marked interrupted.
-
-Force an immediate exit with `SIGKILL` if you must, but expect the conversation memory for in-flight sessions to be incomplete.
+Conversation memory and session state are written to SQLite incrementally during operation, not buffered until shutdown, so a clean stop does not depend on a flush step. Tool receipts are in-band HMAC tokens in the conversation, not a separate on-disk log. A hard `SIGKILL` skips the clean channel teardown but does not corrupt already-committed memory; only an agent turn that was mid-write is lost.
 
 ## Manual start for debugging
 
@@ -152,26 +146,24 @@ services:
 
 ## Running multiple workspaces
 
-Each ZeroClaw instance owns one workspace. To run two:
-
-1. Install the binary once
-2. Create `~/.zeroclaw-home/` and `~/.zeroclaw-work/` (or wherever)
-3. Run two services pointing at different workspaces:
+Each ZeroClaw daemon owns one config directory (which contains its `data/` dir). To run two side by side, give each its own config directory via `--config-dir` (or the `ZEROCLAW_CONFIG_DIR` env var):
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-ZEROCLAW_WORKSPACE=~/.zeroclaw-home zeroclaw service install --name zeroclaw-home
-ZEROCLAW_WORKSPACE=~/.zeroclaw-work zeroclaw service install --name zeroclaw-work
+zeroclaw --config-dir ~/.zeroclaw-home daemon
+zeroclaw --config-dir ~/.zeroclaw-work daemon
 ```
 
 </div>
 
-Each gets its own unit file / plist, its own gateway port (configurable in each config), and its own channel bindings. Memory stays separate; a Telegram bot in one workspace doesn't know about the other.
+Each instance reads its own `config.toml`, its own `data/` (memory, sessions), its own gateway port (set per config), and its own channel bindings. Memory stays separate; a Telegram bot in one config dir doesn't know about the other.
 
-Don't point two daemons at the same workspace. SQLite is single-writer; the second will fail on startup.
+`zeroclaw service install` always installs a single unit pointed at the default config directory; it has no flag to name or parameterize instances. To run more than one as a persistent service, hand-author a second unit file (copy `~/.config/systemd/user/zeroclaw.service` to a new name) whose `ExecStart` passes `--config-dir <dir>`, then enable it separately.
+
+Don't point two daemons at the same config directory. SQLite is single-writer; the second will fail on startup.
 
 ## Observing restarts and crashes
 

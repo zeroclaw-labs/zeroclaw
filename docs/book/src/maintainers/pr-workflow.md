@@ -84,9 +84,8 @@ Branch protection on `master`:
 - Require status checks before merge.
 - Require check `CI Required Gate`.
 - Require pull request reviews before merge.
-- Require CODEOWNERS review for protected paths.
-- For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`); keep branch / ruleset bypass limited to org owners.
-- Default workflow-owner allowlist is configured via the `WORKFLOW_OWNER_LOGINS` repository variable (see CODEOWNERS for the current list).
+- Require CODEOWNERS review for protected paths. `.github/**` (including `.github/workflows/**`) is owned by the maintainers listed in `.github/CODEOWNERS`, so workflow changes need an owning maintainer's review.
+- Keep branch / ruleset bypass limited to org owners.
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push.
 - All contributor PRs target `master` directly.
@@ -98,7 +97,7 @@ Before requesting review, the PR has all of these:
 - PR template fully completed.
 - Scope boundary explicit (what changed / what did not).
 - Validation evidence attached, actual command output, not "CI will check."
-- Security & privacy and rollback fields completed for risky paths.
+- Security & privacy, compatibility, and (for risky paths) rollback fields completed.
 - Privacy and data-hygiene rules satisfied, neutral, project-scoped test wording. See [Privacy](../contributing/privacy.md).
 - Identity-like wording, where unavoidable, uses ZeroClaw / project-native labels.
 
@@ -155,7 +154,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - First maintainer triage target: **within 48 hours**.
 - Blocked PRs get one actionable checklist comment, not a series of partial reviews.
-- `status:no-stale` is reserved for accepted or otherwise long-lived work with a recorded stale-exemption reason and contributor-visible active owner or steward path when the issue is not already protected by another stale exclusion. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
+- `status:no-stale` is reserved for accepted or otherwise long-lived work and is governed by the [issue ownership path](#issue-ownership-path): it needs a recorded stale-exemption reason and a contributor-visible owner or steward path. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 
@@ -165,15 +164,17 @@ The reviewer-side queue management, backlog pruning order, stale handling, label
 
 ## Security and stability rules
 
-These paths require stricter review and stronger test evidence:
+These paths require stricter review and stronger test evidence. The canonical
+high-risk path set is defined in [Labels → Risk labels](./labels.md#risk-labels).
+In review terms that set covers:
 
-- `crates/zeroclaw-runtime/src/security/`
-- The rest of `crates/zeroclaw-runtime/`
+- `crates/zeroclaw-runtime/` (including `src/security/`)
 - `crates/zeroclaw-gateway/` (ingress, authentication, pairing)
 - `crates/zeroclaw-tools/` (anything with execution capability)
-- Filesystem access boundaries.
-- Network and authentication behavior.
-- `.github/workflows/` and the release pipeline.
+- `.github/workflows/` and the release pipeline
+
+Filesystem access boundaries and network/authentication behavior inside those
+crates carry the same scrutiny even when the diff looks small.
 
 **Minimum for risky PRs:** threat / risk statement, mitigation notes, rollback steps.
 

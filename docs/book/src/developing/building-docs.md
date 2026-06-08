@@ -56,9 +56,9 @@ When English source changes, `cargo mdbook sync` runs two stages:
 1. **Extract**: `mdbook-xgettext` regenerates `po/messages.pot` from the current English source
 2. **Merge**: `msgmerge` updates each locale's `.po` file, new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point
 
-Then the command counts fuzzy + untranslated entries. If there's a delta and `--provider` is given, the `fill-translations` tool translates only those entries. **Unchanged strings cost nothing**: the `.po` file cache means re-running against unchanged source is a no-op.
+Then the command counts fuzzy + untranslated entries. If there's a delta and `--model-provider` is given, the `fill-translations` tool translates only those entries. **Unchanged strings cost nothing**: the `.po` file cache means re-running against unchanged source is a no-op.
 
-Without `--provider`, `cargo mdbook sync` still runs extract + merge and reports how many strings need translation. Strings without a `msgstr` fall back to English at render time, partial translations are valid.
+Without `--model-provider`, `cargo mdbook sync` still runs extract + merge and reports how many strings need translation. Strings without a `msgstr` fall back to English at render time, partial translations are valid.
 
 `cargo mdbook sync` normalizes generated gettext catalogs with stable output rules (`msgcat --sort-output --no-wrap --add-location=file`). That keeps diffs focused on real source changes and avoids global line-number churn from small edits.
 
@@ -101,7 +101,7 @@ Include `.po` updates only when one of these is true:
    #### sh
 
    ```sh
-   cargo mdbook sync --locale xx --provider ollama
+   cargo mdbook sync --locale xx --model-provider ollama
    ```
 
    </div>
@@ -130,10 +130,10 @@ Before tagging a release, run a full translation pass locally and commit the upd
 
 ```sh
 # Fast delta pass (only new or changed strings since last release)
-cargo mdbook sync --provider ollama
+cargo mdbook sync --model-provider ollama
 
 # OR: quality pass — re-translate everything
-cargo mdbook sync --provider ollama --force
+cargo mdbook sync --model-provider ollama --force
 
 cargo mdbook check   # validate before committing
 cargo mdbook stats   # review coverage

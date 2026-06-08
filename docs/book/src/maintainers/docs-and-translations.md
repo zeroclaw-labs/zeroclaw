@@ -13,7 +13,7 @@ Local models via [Ollama](https://ollama.com) are a first-class option: no API k
 
 ## Provider configuration
 
-Ollama is the current canonical source for docs. Ensure you have [Ollama](https://ollama.com/) installed and have `qwen3.6:35-a3b` pulled, then configure an Ollama provider entry. `uri` is the full endpoint URL and is **optional**: leave it unset to use the provider family's default endpoint (resolved by the runtime provider stack). Set it only to point at a self-hosted gateway or proxy. Any configured family works (Anthropic, OpenAI, OpenRouter, Ollama, …); the translation tools build the real runtime provider, so each family's endpoint, auth header, and wire protocol are handled for you: no OpenAI-compatibility requirement.
+Ollama is the current canonical source for docs. Ensure you have [Ollama](https://ollama.com/) installed and have `qwen3:30b-a3b` pulled, then configure an Ollama provider entry. `uri` is the full endpoint URL and is **optional**: leave it unset to use the provider family's default endpoint (resolved by the runtime provider stack). Set it only to point at a self-hosted gateway or proxy. Any configured family works (Anthropic, OpenAI, OpenRouter, Ollama, …); the translation tools build the real runtime provider, so each family's endpoint, auth header, and wire protocol are handled for you: no OpenAI-compatibility requirement.
 
 ## Building the docs locally
 
@@ -23,7 +23,7 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 
 App strings live in `crates/zeroclaw-runtime/locales/`. English is the source of truth and is embedded at compile time.
 
-> **Runtime loading caveat (verify before relying on this).** As of this writing, only `en` and `zh-CN` are wired into the runtime: `crates/zeroclaw-runtime/src/i18n.rs` embeds them via `include_str!`, and `builtin_cli_ftl_source()` returns `None` for every other locale. A disk-override path exists (`load_ftl_from_disk` → `workspace_dir_from_config`) but it resolves a top-level `workspace_dir` config key that no longer exists in v0.8.0 and falls back to `~/.zeroclaw/workspace`, which v0.8.0 does not create. **So a freshly filled `ja/cli.ftl` is generated and committed, but is not actually loaded at runtime** until either the locale is added to `builtin_cli_ftl_source()` or the disk-override path is repaired. Confirm the current state in `i18n.rs` rather than trusting this note.
+> **Runtime loading caveat (verify before relying on this).** Only `en` and `zh-CN` are wired into the runtime as built-ins: `crates/zeroclaw-runtime/src/i18n.rs` embeds `en` via `include_str!`, and `builtin_cli_ftl_source()` returns the embedded `zh-CN` catalogue for `zh-CN` and `None` for every other locale. A disk-override path exists: `load_ftl_from_disk` resolves `zeroclaw_config::schema::ftl_locale_dir(locale)`, i.e. `<config-dir>/data/ftl/<locale>/cli.ftl` (the same location `zeroclaw locales fetch` populates). **So a freshly filled `ja/cli.ftl` is generated and committed, but is not loaded at runtime** unless either the locale is added to `builtin_cli_ftl_source()` or the filled `cli.ftl` is placed under `<config-dir>/data/ftl/ja/`. Confirm the current state in `i18n.rs` and `zeroclaw_config::schema::ftl_locale_dir` rather than trusting this note.
 
 > The `apps/zerocode` TUI maintains an independent Fluent catalogue (`apps/zerocode/locales/`), see [zerocode strings](#zerocode-strings-fluent-independent) below. `cargo fluent` walks **both** catalogue roots (runtime + zerocode), so every subcommand below covers both by default.
 
@@ -141,7 +141,7 @@ Maintainers should accept the routine English docs exception documented in [Buil
    #### sh
 
    ```sh
-   cargo fluent fill --locale <code> --provider ollama
+   cargo fluent fill --locale <code> --model-provider ollama
    ```
 
    </div>
@@ -153,12 +153,12 @@ Maintainers should accept the routine English docs exception documented in [Buil
    #### sh
 
    ```sh
-   cargo mdbook sync --locale <code> --provider ollama
+   cargo mdbook sync --locale <code> --model-provider ollama
    ```
 
    </div>
 
-4. For zerocode parity, copy `apps/zerocode/locales/en/zerocode.ftl` to `apps/zerocode/locales/<code>/zerocode.ftl` and translate the values by hand. `cargo fluent` does not yet operate on the zerocode catalogue; the file can be dropped into any of the disk-search paths or embedded in-tree once translated.
+4. The `cargo fluent fill` run in step 2 already generates `apps/zerocode/locales/<code>/zerocode.ftl` in the same pass, since `cargo fluent` walks both the runtime and zerocode catalogues. No manual zerocode step is needed; verify coverage with `cargo fluent stats`.
 
 Everything else, `lang-switcher.js`, CI deploy target list, `cargo mdbook locales` output, reads from `locales.toml` automatically.
 
@@ -168,8 +168,8 @@ Translation quality varies significantly by language and model.
 
 | Locale | Well-supported by | Notes |
 |---|---|---|
-| `ja`, `zh-CN` | qwen3.6 family, any frontier hosted model | Qwen is Chinese-first; Japanese also strong |
-| `es`, `fr` | qwen3.6, mistral, gemma3, hosted | Romance languages are broadly well-trained |
+| `ja`, `zh-CN` | qwen3 family, any frontier hosted model | Qwen is Chinese-first; Japanese also strong |
+| `es`, `fr` | qwen3, mistral, gemma3, hosted | Romance languages are broadly well-trained |
 | Low-resource locales | Hosted frontier models only | Local models often hallucinate words |
 
 For release-grade passes, prefer a hosted frontier model via `--force`. For ongoing delta fills during development, a local Ollama model is fine and free.

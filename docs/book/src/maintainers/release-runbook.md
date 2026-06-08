@@ -12,28 +12,26 @@ Last verified against the `0.8.0-beta` cycle.
 
 ---
 
-## The process in six steps
+## The process in seven steps
 
 1. Generate `CHANGELOG-next.md` using the changelog skill
 2. Open and merge a version bump PR
 3. Dry-run the release workflows locally with `act`
 4. Trigger the `Release Stable` workflow via manual dispatch
-5. Approve the three environment gates when prompted
+5. Approve the two environment gates when prompted
 6. Verify the release exists and assets are downloadable
+7. Versioned documentation deployment
 
-That is the entire process. Everything else (Docker, crates.io, Scoop, AUR,
-Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
+That is the entire process. Everything else (Docker, website redeploy, Scoop,
+AUR, Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
 need to do anything for those unless a job explicitly fails.
 
 ---
 
 ## Step 1: Generate CHANGELOG-next.md
 
-Use the changelog-generation skill to produce `CHANGELOG-next.md`:
-
-```text
-.claude/skills/changelog-generation/SKILL.md
-```
+Run the `changelog-generation` skill to produce `CHANGELOG-next.md`. Its full
+procedure lives at `.claude/skills/changelog-generation/SKILL.md`.
 
 The skill generates the changelog from the git log between the last stable tag
 and HEAD, resolves contributors via GitHub GraphQL, and writes the file. Commit
@@ -213,7 +211,7 @@ Everything else is skipped with a logged reason:
 ==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
-==> skip daily-audit:audit (not on dry-run-safe allowlist)
+==> skip daily-audit:advisories (not on dry-run-safe allowlist)
 ==> skip tweet-release:tweet (not on dry-run-safe allowlist)
 ```
 
@@ -243,7 +241,7 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`crates-io`, `docker`, `publish`): the
+- Environment-gated jobs (`publish`, `docker`): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
@@ -277,15 +275,14 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Three jobs are gated by GitHub environment protection rules. When each becomes
+Two jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve all three when they appear:
+Approve both when they appear:
 
 | Environment | Job | What it does |
 |---|---|---|
 | `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
-| `crates-io` | `crates-io` | Publishes crates to crates.io |
 | `docker` | `docker` | Pushes images to GHCR |
 
 If you miss the approval window and a job times out, re-run only the failed
@@ -302,10 +299,13 @@ Once `publish` completes, confirm:
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
-[ ] CHANGELOG-next.md is gone from master (the publish job removes it automatically)
 ```
 
-You do not need to manually verify Docker, crates.io, or distribution channels
+`CHANGELOG-next.md` is intentionally left on `master` after the release: the
+publish job only reads it as the release body, it does not delete it. The next
+release cycle overwrites it, so no manual cleanup is required.
+
+You do not need to manually verify Docker or the distribution channels
 unless a job in the workflow run shows red. Check the workflow run summary; if
 all jobs are green, you are done.
 
@@ -313,7 +313,7 @@ all jobs are green, you are done.
 
 ## Step 7: Versioned documentation deployment
 
-ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is pushed, the `Deploy mdBook docs to Pages` workflow automatically builds and deploys the documentation for that version.
+ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is pushed, the `Deploy mdBook docs to Pages` workflow automatically builds and deploys the documentation for that version. This runs automatically after the tag from step 4 lands; the bootstrap and version-floor details below are reference material for when you need to recreate `gh-pages` or change the supported-version window.
 
 ### What happens automatically
 
@@ -359,22 +359,6 @@ you typed the wrong version. Fix the mismatch and re-trigger.
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
-**publish succeeded but CHANGELOG-next.md is still on master:** Remove it
-manually:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-git checkout master && git pull --ff-only origin master
-git rm CHANGELOG-next.md
-git commit -m "chore: remove CHANGELOG-next.md after vX.Y.Z release"
-git push origin master
-```
-
-</div>
-
 **A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
 corresponding manually-triggerable sub-workflow. Re-run the specific one with
 `dry_run: true` first to confirm the fix, then `dry_run: false`. These are
@@ -382,23 +366,23 @@ nice-to-have: a failed Scoop job does not invalidate the release itself.
 
 ---
 
-## Workflows you must not touch
+## Removed legacy workflows
 
-The following workflows exist in `.github/workflows/` but are dangerous and
-scheduled for deletion in v0.7.4 (#5915). Do not trigger them. Do not extend
-them.
+Several auto-publishing workflows that previously lived in `.github/workflows/`
+have been deleted because they bypassed review or published irreversibly. They
+are no longer present; if any reappears in a PR, treat it as a regression and
+block it:
 
-| Workflow | Why it is dangerous |
+| Workflow | Why it was removed |
 |---|---|
-| `release-beta-on-push.yml` | Publishes automatically on every push to master |
-| `publish-crates-auto.yml` | Auto-publishes to crates.io on any version change, irreversible |
-| `version-sync.yml` | Commits directly to master as a bot, bypasses review |
-| `checks-on-pr.yml` | Duplicate CI: produces confusing conflicting status |
+| `release-beta-on-push.yml` | Published automatically on every push to master |
+| `publish-crates-auto.yml` | Auto-published to crates.io on any version change, irreversible |
+| `version-sync.yml` | Committed directly to master as a bot, bypassing review |
+| `checks-on-pr.yml` | Duplicate CI: produced confusing conflicting status |
 | `pre-release-validate.yml` | Unused generated checklist; this runbook replaces it |
 
-All other workflows not listed above are either frozen until v0.7.5 or
-actively maintained. See `docs/contributing/ci-map.md` for the full inventory
-once it is rewritten in #5917.
+The full inventory of the workflows that remain (automatic and manual) lives
+in [CI & Actions](./ci-and-actions.md).
 
 ---
 
@@ -406,7 +390,7 @@ once it is rewritten in #5917.
 
 This runbook and `release-stable-manual.yml` are a bridge, not a destination.
 
-In v0.7.5 the goal is:
+The target end state:
 
 - release-plz manages version bumps and changelogs automatically
 - A single `release.yml` replaces the current patchwork of sub-workflows

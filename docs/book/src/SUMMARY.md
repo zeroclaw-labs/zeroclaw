@@ -125,4 +125,3 @@
   - [Labels](./maintainers/labels.md)
   - [Superseding PRs](./maintainers/superseding.md)
   - [Release runbook](./maintainers/release-runbook.md)
-  - [Changelog generation](./maintainers/changelog-generation.md)

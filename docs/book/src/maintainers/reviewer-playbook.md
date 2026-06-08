@@ -23,7 +23,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 |---|---|---|---|
 | `risk: low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent local validation, no behavior ambiguity |
 | `risk: medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk: high` | `crates/zeroclaw-runtime/src/security/`, the rest of `crates/zeroclaw-runtime/`, `crates/zeroclaw-gateway/`, `crates/zeroclaw-tools/`, `.github/workflows/` | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
+| `risk: high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
 
 When uncertain, treat as higher risk.
 
@@ -139,7 +139,7 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 
 ## Weekly queue hygiene
 
-- Walk the stale queue. Apply `status:no-stale` only when accepted or otherwise long-lived work has a recorded reason to stay open, a visible active owner or steward path, and no other stale exclusion already applies. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
+- Walk the stale queue. Apply `status:no-stale` only under the rules in the [Project board contract](./pr-workflow.md#issue-ownership-path); treat existing `status:no-stale` issues missing a recorded reason or owner path as audit findings rather than automatic stale candidates.
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 

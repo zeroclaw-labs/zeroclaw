@@ -10,4 +10,3 @@ This section covers everything beyond day-to-day development: docs, translations
 - [Labels](./labels.md): single source of truth for every label and its automation status
 - [Superseding PRs](./superseding.md): when to supersede, attribution rules, PR and commit templates
 - [Release runbook](./release-runbook.md): verification, tag cut, monitor, post-release validation, downstream publishers
-- [Changelog generation](./changelog-generation.md): protocol for assembling `CHANGELOG-next.md` between stable releases
