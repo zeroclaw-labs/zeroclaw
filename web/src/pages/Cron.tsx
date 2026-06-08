@@ -363,9 +363,10 @@ export default function Cron() {
 
     try {
       if (isEditing) {
-        const existingTimezone = scheduleTimezone(modalJob as CronJob);
+        const existingJob = modalJob as CronJob;
+        const existingTimezone = scheduleTimezone(existingJob);
         const timezone = formTimezone.trim();
-        const patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string } = {
+        const patch: Parameters<typeof patchCronJob>[1] = {
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
@@ -376,11 +377,29 @@ export default function Cron() {
         }
         if (isAgent) {
           patch.prompt = formPrompt.trim();
+          if (formModel.trim()) patch.model = formModel.trim();
+          patch.session_target = formSessionTarget;
+          const parsedTools = formAllowedTools
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (parsedTools.length > 0) patch.allowed_tools = parsedTools;
         } else {
           patch.command = formCommand.trim();
         }
+        if (formDeliveryMode === 'announce') {
+          patch.delivery = {
+            mode: 'announce',
+            channel: formDeliveryChannel.trim(),
+            to: formDeliveryTo.trim(),
+            best_effort: formDeliveryBestEffort,
+          };
+        } else if (!existingJob.delivery || existingJob.delivery.mode !== 'none') {
+          // If user selected "none" but job had delivery, explicitly clear it
+          patch.delivery = { mode: 'none' };
+        }
         const updated = await patchCronJob(
-          (modalJob as CronJob).id,
+          existingJob.id,
           patch,
         );
         setJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));

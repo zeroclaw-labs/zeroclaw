@@ -1457,6 +1457,11 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    delivery?: CronDelivery;
+    model?: string;
+    session_target?: string;
+    allowed_tools?: string[];
+    delete_after_run?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(

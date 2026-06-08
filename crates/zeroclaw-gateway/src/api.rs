@@ -120,6 +120,20 @@ pub struct CronPatchBody {
     /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
     /// the current state unchanged.
     pub enabled: Option<bool>,
+    /// Update the delivery config. `None` leaves the current config unchanged.
+    /// To clear delivery, pass `{ mode: "none" }`.
+    pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+    /// Override the model for agent jobs. `None` leaves the current model unchanged.
+    /// To clear a previously-set model override, pass an empty string.
+    pub model: Option<String>,
+    /// Override the session target for agent jobs ("main" or "isolated").
+    /// `None` leaves the current setting unchanged.
+    pub session_target: Option<String>,
+    /// Override the allowed tools list for agent jobs. `None` leaves unchanged.
+    /// To clear, pass an empty array.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Override the delete_after_run setting. `None` leaves unchanged.
+    pub delete_after_run: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -636,6 +650,11 @@ pub async fn handle_api_cron_patch(
         command,
         prompt,
         enabled,
+        delivery,
+        model,
+        session_target,
+        allowed_tools,
+        delete_after_run,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -693,12 +712,22 @@ pub async fn handle_api_cron_patch(
         (command.or(prompt), None)
     };
 
+    let session_target = match session_target {
+        Some(st) if !st.is_empty() => Some(zeroclaw_runtime::cron::SessionTarget::parse(&st)),
+        _ => None,
+    };
+
     let patch = zeroclaw_runtime::cron::CronJobPatch {
         name,
         schedule,
         command: patch_command,
         prompt: patch_prompt,
         enabled,
+        delivery,
+        model,
+        session_target,
+        delete_after_run,
+        allowed_tools,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
