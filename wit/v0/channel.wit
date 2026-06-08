@@ -75,13 +75,15 @@ interface channel {
 
     /// The operator's response to a channel-presented approval prompt.
     @unstable(feature = plugins-wit-v0)
-    enum approval-response {
+    variant approval-response {
         /// Execute this one call.
         approve,
         /// Deny this call.
         deny,
         /// Execute and add the tool to the session-scoped allowlist.
         always-approve,
+        /// Deny this call and supply an edited replacement for the arguments.
+        deny-with-edit(string),
     }
 
     /// Bitmask of optional capabilities this plugin implements.
