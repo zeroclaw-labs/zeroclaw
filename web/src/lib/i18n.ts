@@ -559,6 +559,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.allowed_tools_placeholder': 'e.g. shell, file_read, memory_store',
     'cron.trigger': 'Run now',
     'cron.trigger_error': 'Failed to trigger job',
+    'cron.pause': 'Pause',
+    'cron.resume': 'Resume',
     'cron.dismiss': 'Dismiss',
 
     // Integrations
