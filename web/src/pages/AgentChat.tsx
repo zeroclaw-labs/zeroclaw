@@ -207,7 +207,18 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+    /* translate="no" / notranslate (#7057): browser auto-translation (e.g.
+       Chrome → Google Translate) rewrites text nodes into <font> wrappers.
+       React reconciliation then trips "Failed to execute 'removeChild' on
+       'Node'" and unmounts the view. The crash repro surface spans every
+       dynamic-text region on this page: streaming output, ReactMarkdown
+       message bodies, the {error} banner above the toolbar, and
+       ApprovalBanner (whose <pre>{argumentsSummary}</pre> and per-second
+       remainingSec re-render are at least as crash-prone as streaming).
+       Hoisting the opt-out to the outermost container covers all of them
+       with a single ancestor. Static UI chrome here localizes through
+       t() i18n, so losing browser translation on it is intentional. */
+    <div translate="no" className="notranslate flex flex-col h-[calc(100vh-3.5rem)]">
       {/* Header with model selector */}
       <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
         <div className="flex items-center gap-2">
@@ -328,8 +339,10 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
         </div>
       )}
 
-      {/* Messages area */}
-      <div className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}>
+      {/* Messages area. */}
+      <div
+        className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+      >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
             <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>

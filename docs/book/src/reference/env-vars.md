@@ -24,6 +24,9 @@ ZEROCLAW_channels__matrix__homeserver=https://matrix.example.org
 ZEROCLAW_gateway__request_timeout_secs=120
 ZEROCLAW_gateway__long_running_request_timeout_secs=900
 
+# Point the gateway at a built web dashboard (absolute path; no ~ / $HOME)
+ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist
+
 # Inject webhook signing secrets
 ZEROCLAW_channels__whatsapp__home__app_secret=...
 ZEROCLAW_channels__linq__home__signing_secret=...
@@ -42,17 +45,24 @@ The mapping from env-var name to TOML path is mechanical:
 | `[providers.models.anthropic.home] api_key = "..."` | `ZEROCLAW_providers__models__anthropic__home__api_key=...` |
 | `[channels.matrix] homeserver = "..."` | `ZEROCLAW_channels__matrix__homeserver=...` |
 | `[gateway] request_timeout_secs = 120` | `ZEROCLAW_gateway__request_timeout_secs=120` |
+| `[gateway] web_dist_dir = "/srv/zeroclaw/web/dist"` | `ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist` |
 
 The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen — substitute whatever names your `config.toml` actually uses.
 
 ## Bootstrap (uppercase tail)
 
-Two env vars decide *where* the config file lives, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface:
+These env vars decide *where* the config file and instance data live, before any `Config` exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface. They resolve in the order `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE` (deprecated):
 
 ```sh
-ZEROCLAW_WORKSPACE=/srv/zeroclaw          # workspace root
-ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location
+ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location (takes precedence)
+ZEROCLAW_DATA_DIR=/srv/zeroclaw           # instance data directory (canonical)
+ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DATA_DIR
 ```
+
+The gateway's web-dashboard location is configured via the standard
+schema-mirror form `ZEROCLAW_gateway__web_dist_dir` — see
+[Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full
+setting reference.
 
 ## Persistence boundary
 

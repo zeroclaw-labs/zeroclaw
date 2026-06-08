@@ -12,6 +12,7 @@
 //!
 //! The pipeline is **opt-in** via `[media_pipeline] enabled = true` in config.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use zeroclaw_config::schema::MediaPipelineConfig;
 
 use super::super::transcription::TranscriptionManager;
@@ -124,13 +125,14 @@ impl<'a> MediaPipeline<'a> {
     ///
     /// When vision is available, the image will be passed through to the
     /// model_provider as an `[IMAGE:]` marker and described by the model in the
-    /// normal flow. Here we only add a placeholder annotation so the agent
-    /// knows an image is present.
+    /// normal flow.
     fn process_image(&self, attachment: &MediaAttachment) -> String {
         if self.vision_available {
+            let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
+            let b64 = STANDARD.encode(&attachment.data);
             format!(
-                "[Image: {} attached, will be processed by vision model]",
-                attachment.file_name
+                "[Image: {} attached, will be processed by vision model]\n[IMAGE:data:{};base64,{}]",
+                attachment.file_name, mime, b64
             )
         } else {
             format!("[Image: {} attached]", attachment.file_name)
@@ -266,6 +268,10 @@ mod tests {
             result.contains("[Image: photo.jpg attached, will be processed by vision model]"),
             "expected vision annotation, got: {result}"
         );
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "expected image data marker, got: {result}"
+        );
         assert!(result.contains("check this"));
     }
 
@@ -278,6 +284,10 @@ mod tests {
         assert!(
             result.contains("[Image: photo.jpg attached]"),
             "expected basic image annotation, got: {result}"
+        );
+        assert!(
+            !result.contains("[IMAGE:data:"),
+            "non-vision path must not inline image data, got: {result}"
         );
     }
 

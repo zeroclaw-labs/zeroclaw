@@ -105,7 +105,7 @@ Grants access to GPIO, I2C, SPI via `rppal`. The stock service unit already adds
 ### Checklist
 
 - [ ] Install the binary (prefer prebuilt on a Pi)
-- [ ] Run `zeroclaw onboard`
+- [ ] Run `zeroclaw quickstart`
 - [ ] Configure your channels — Telegram needs no port; webhooks need a tunnel
 - [ ] Install the service: `zeroclaw service install && zeroclaw service start`
 - [ ] For LAN access: set `[gateway] host = "0.0.0.0"` + `allow_public_bind = true`

@@ -1081,7 +1081,7 @@ async fn concurrent_sends_all_recorded() {
 
     for i in 0..20 {
         let ch = Arc::clone(&ch);
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.send(&SendMessage::new(format!("msg_{i}"), format!("user_{i}")))
                 .await
                 .unwrap();
@@ -1102,7 +1102,7 @@ async fn concurrent_typing_events_all_recorded() {
 
     for i in 0..10 {
         let ch = Arc::clone(&ch);
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.start_typing(&format!("user_{i}")).await.unwrap();
             ch.stop_typing(&format!("user_{i}")).await.unwrap();
         }));
@@ -1130,7 +1130,7 @@ async fn concurrent_reactions_all_recorded() {
     for (i, emoji) in emojis.iter().enumerate() {
         let ch = Arc::clone(&ch);
         let emoji = emoji.to_string();
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.add_reaction("chan_1", &format!("msg_{i}"), &emoji)
                 .await
                 .unwrap();
