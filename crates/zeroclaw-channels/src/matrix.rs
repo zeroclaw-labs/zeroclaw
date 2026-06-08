@@ -4425,7 +4425,7 @@ mod tests {
         use std::{
             env,
             sync::Arc,
-            time::{Duration, SystemTime, UNIX_EPOCH},
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
         };
 
         use matrix_sdk::config::SyncSettings;
@@ -4552,6 +4552,168 @@ mod tests {
                 let state = channel.streaming_state.read().await;
                 assert!(state.partial.is_empty());
             }
+        }
+
+        /// Reviewer-requested smoke: keep a configured Matrix channel idle for
+        /// longer than 30 seconds and confirm `/sync` no longer errors at the
+        /// 30-second cadence that motivated this PR.
+        ///
+        /// The pre-fix failure mode was two-pronged:
+        ///   1. `SyncSettings::default()` sends no `?timeout=` parameter, so an
+        ///      idle homeserver replies immediately and the SDK busy-polls.
+        ///   2. `Client::builder()` falls back to the SDK's 30s default request
+        ///      timeout, so every 30s window races the HTTP deadline and any
+        ///      idle long-poll that did manage to start errors out at ~30s.
+        ///
+        /// This test exercises both fixes against a real homeserver:
+        ///   * `ensure_client()` builds the client with `CLIENT_REQUEST_TIMEOUT`
+        ///     applied to the underlying `RequestConfig`.
+        ///   * Each `sync_once` call passes `SYNC_LONGPOLL_TIMEOUT` so the
+        ///     homeserver holds the request open.
+        ///
+        /// We then assert three things over a >30s soak window:
+        ///   * No `sync_once` call returns an error (rules out the 30s HTTP
+        ///     deadline tripping mid-long-poll).
+        ///   * Each individual `sync_once` call takes long enough to indicate
+        ///     the server actually long-polled (rules out the busy-poll path
+        ///     where every iteration returns instantly because no `?timeout=`
+        ///     was sent).
+        ///   * The number of round-trips over the soak window stays modest
+        ///     (defense-in-depth against a regression that reintroduces busy
+        ///     polling).
+        ///
+        /// Tunables via env (sensible defaults so the test stays "short" per
+        /// reviewer guidance — ~35s wall-time by default):
+        ///   * `ZEROCLAW_MATRIX_SMOKE_IDLE_SECS` — total soak duration in
+        ///     seconds (default `35`, must be > 30).
+        ///   * `ZEROCLAW_MATRIX_SMOKE_MIN_LONGPOLL_MS` — minimum wall-time a
+        ///     single `sync_once` call must take before we consider it a real
+        ///     long-poll (default `1000`). The homeserver is free to return
+        ///     early when events arrive; this only guards against the pre-fix
+        ///     "every call returns in <100ms" pattern.
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable idle test room"]
+        async fn idle_sync_does_not_error_at_30s_cadence() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+
+            let idle_secs: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(35);
+            assert!(
+                idle_secs > 30,
+                "idle soak must exceed 30s to exercise the pre-fix failure window; got {idle_secs}s"
+            );
+            let min_longpoll_ms: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_MIN_LONGPOLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000);
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: StreamMode::Off,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            // Building the client exercises `CLIENT_REQUEST_TIMEOUT` on the
+            // underlying `RequestConfig`. If that constant ever regresses below
+            // `SYNC_LONGPOLL_TIMEOUT`, the very first long-poll below will
+            // error out at the HTTP deadline.
+            let client = channel.ensure_client().await.expect("matrix client");
+
+            // Prime the sync token with a single bounded sync_once so the
+            // subsequent loop measures true idle long-poll behavior rather
+            // than the initial state-fetch round-trip.
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let soak = Duration::from_secs(idle_secs);
+            let min_longpoll = Duration::from_millis(min_longpoll_ms);
+            let deadline = Instant::now() + soak;
+            let mut call_count: u32 = 0;
+            let mut short_longpoll_count: u32 = 0;
+            let mut max_call: Duration = Duration::from_millis(0);
+
+            while Instant::now() < deadline {
+                let started = Instant::now();
+                let result = client
+                    .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                    .await;
+                let elapsed = started.elapsed();
+
+                // Primary reviewer assertion: idle `/sync` must not error out.
+                // The pre-fix bug surfaced as a request-deadline error at ~30s
+                // when the HTTP timeout fired before the long-poll returned.
+                result.unwrap_or_else(|e| {
+                    panic!(
+                        "idle sync_once errored after {elapsed:?} (call #{call_count}); this is the 30s-cadence regression \
+                         the PR aims to fix: {e}"
+                    )
+                });
+
+                call_count += 1;
+                if elapsed > max_call {
+                    max_call = elapsed;
+                }
+                if elapsed < min_longpoll {
+                    short_longpoll_count += 1;
+                }
+            }
+
+            // Defense-in-depth against the other half of the pre-fix bug: a
+            // missing `?timeout=` made the homeserver reply instantly, so the
+            // SDK would busy-poll. With `SYNC_LONGPOLL_TIMEOUT` set, an idle
+            // room should produce only a handful of round-trips per 30s.
+            assert!(
+                call_count > 0,
+                "expected at least one sync_once call during the {idle_secs}s soak"
+            );
+            assert!(
+                max_call >= min_longpoll,
+                "every sync_once call returned in <{min_longpoll:?} (max observed: {max_call:?}); \
+                 homeserver appears to be replying without honoring `?timeout=` — likely the pre-fix \
+                 busy-poll regression. call_count={call_count}"
+            );
+            // Allow a couple of legitimate early returns (e.g. presence pings)
+            // but flag anything that smells like a tight busy-poll loop.
+            let busy_poll_budget = ((idle_secs / 5).max(2)) as u32;
+            assert!(
+                short_longpoll_count <= busy_poll_budget,
+                "{short_longpoll_count} of {call_count} sync_once calls returned in <{min_longpoll:?} \
+                 (budget for an idle room over {idle_secs}s is {busy_poll_budget}); this matches the \
+                 pre-fix busy-poll pattern"
+            );
+
+            // Mirror the validation-evidence shape requested on the PR: emit a
+            // concise note so a captured `cargo test -- --nocapture` run reads
+            // like the reviewer's "short Matrix smoke result" ask.
+            eprintln!(
+                "matrix idle-sync smoke: soak={idle_secs}s, sync_once_calls={call_count}, \
+                 max_call={max_call:?}, short_calls={short_longpoll_count}, no errors at 30s cadence"
+            );
         }
     }
 
