@@ -9511,8 +9511,10 @@ mod tests {
 
     #[test]
     fn max_in_flight_messages_for_config_uses_channel_budget() {
-        let mut config = zeroclaw_config::schema::ChannelsConfig::default();
-        config.max_concurrent_per_channel = 8;
+        let config = zeroclaw_config::schema::ChannelsConfig {
+            max_concurrent_per_channel: 8,
+            ..Default::default()
+        };
 
         assert_eq!(max_in_flight_messages_for_config(3, &config), 24);
     }
