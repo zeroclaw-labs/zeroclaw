@@ -3092,13 +3092,13 @@ impl Config {
 
     // ── Effective per-agent runtime tunables ──────────────────────────
     //
-    // Precedence: `[runtime_profiles.<profile>].<field>` (when explicitly
-    // set / non-sentinel) wins over `[agents.<alias>].<field>`. This
-    // matches the documented "None inherits" semantics on
-    // `RuntimeProfileConfig` and the precedence that
-    // `crates/zeroclaw-runtime/src/tools/delegate.rs` already applies for
-    // subagent dispatch. The agent inline field remains the fallback so
-    // configs that only set the agent value keep working unchanged.
+    // Runtime tunables live on `[runtime_profiles.<profile>]`, referenced by an
+    // agent via `agents.<alias>.runtime_profile`. A profile value that is
+    // explicitly set (non-sentinel, i.e. `> 0` for `max_tool_iterations`) is
+    // authoritative; otherwise the global default applies. Agent-inline copies
+    // of these tunable keys are inert — superseded by runtime profiles (see the
+    // `agent_level_tunable_keys_are_inert` test) — so they are deliberately not
+    // consulted here as a fallback (#6877).
 
     #[must_use]
     pub fn effective_max_tool_iterations(&self, agent_alias: &str) -> usize {
@@ -18158,6 +18158,38 @@ strict_tool_parsing = true
         assert_eq!(agent.resolved.max_tool_iterations, 10);
         assert_eq!(agent.resolved.tool_dispatcher, "auto");
         assert!(!agent.resolved.strict_tool_parsing);
+    }
+
+    #[test]
+    async fn runtime_profile_max_tool_iterations_is_honored() {
+        // #6877: `[runtime_profiles.*].max_tool_iterations` must actually take
+        // effect. It previously had no effect (the value had to be set on
+        // `[agents.*]`); now agent-inline is inert and the profile is the
+        // authoritative surface, so this guards the resolved value.
+        let raw = r#"
+[runtime_profiles.fast]
+max_tool_iterations = 25
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_unset_max_tool_iterations_uses_default() {
+        // A profile that does not set max_tool_iterations (sentinel 0) falls
+        // back to the global default rather than 0.
+        let raw = r#"
+[runtime_profiles.fast]
+max_history_messages = 80
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
     }
 
     #[test]
