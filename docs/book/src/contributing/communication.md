@@ -58,7 +58,7 @@ Core maintainers and their focus areas:
 
 Do not file public issues for security vulnerabilities.
 
-Email: `security@zeroclaw.dev`
+Report privately through GitHub's [private vulnerability reporting](https://github.com/zeroclaw-labs/zeroclaw/security/advisories/new) (Security Advisories).
 
 Include:
 
@@ -66,7 +66,7 @@ Include:
 - Reproduction (minimal, please)
 - Impact assessment
 
-We aim to acknowledge within 48 hours and publish a patch + advisory within 14 days for critical issues. Coordinated disclosure is appreciated.
+We aim to acknowledge within 48 hours, assess within 1 week, and ship a fix within 2 weeks for critical issues. Coordinated disclosure is appreciated.
 
 See `SECURITY.md` in the repo root for the full policy.
 

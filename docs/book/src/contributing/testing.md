@@ -54,17 +54,17 @@ Every test binary includes `mod support;`, making the shared mocks available as 
 
 | Module | Contents |
 |---|---|
-| `mock_provider.rs` | `MockProvider` (FIFO scripted), `RecordingProvider` (captures requests), `TraceLlmProvider` (JSON fixture replay) |
+| `mock_model_provider.rs` | `MockModelProvider` (FIFO scripted), `RecordingModelProvider` (captures requests), `TraceLlmModelProvider` (JSON fixture replay) |
 | `mock_tools.rs` | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool` |
 | `mock_channel.rs` | `TestChannel` (captures sends, records typing events) |
-| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryLoader` |
+| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryStrategy` |
 | `trace.rs` | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()` |
 | `assertions.rs` | `verify_expects()` for declarative trace assertion |
 
 Typical usage:
 
 ```rust
-use crate::support::{MockProvider, EchoTool, CountingTool};
+use crate::support::{MockModelProvider, EchoTool, CountingTool};
 use crate::support::helpers::{build_agent, text_response, tool_response};
 ```
 
@@ -74,7 +74,7 @@ Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fi
 
 How it works:
 
-1. `TraceLlmProvider` loads a fixture and implements the `Provider` trait.
+1. `TraceLlmModelProvider` loads a fixture and implements the `ModelProvider` trait.
 2. Each `provider.chat()` call returns the next step from the fixture in FIFO order.
 3. Real tools execute normally (`EchoTool` actually processes its arguments).
 4. After all turns, `verify_expects()` checks declarative assertions.

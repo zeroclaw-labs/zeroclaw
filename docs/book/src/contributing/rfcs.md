@@ -46,8 +46,8 @@ Filed RFCs go through a discussion window (default 7 days, longer for larger pro
 Per RFC #5577, RFCs are ratified by a two-thirds maintainer majority. The outcomes:
 
 - **Accepted**: issue closed with the `status:accepted` label and a maintainer comment summarising the final shape. Implementation PRs can then proceed.
-- **Rejected**: issue closed with `status:rejected` label and a rationale. The record lives; re-proposing requires a materially different take.
-- **Deferred**: issue stays open with `status:deferred`; revisit later.
+- **Rejected**: issue closed with a maintainer comment giving the rationale. The record lives; re-proposing requires a materially different take.
+- **Deferred**: issue stays open with a maintainer comment noting it's parked; revisit later. Add `status:blocked` when it's waiting on a specific prerequisite.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
 
 ## Implementing an accepted RFC
@@ -75,12 +75,13 @@ gh issue list --repo zeroclaw-labs/zeroclaw --label type:rfc --state open
 
 </div>
 
-As of writing, notable open RFCs:
+The list above is the canonical source. A snapshot of notable open RFCs at time of writing (browse the live list for the current set):
 
-- **#5787**: Replace TOML i18n with Mozilla Fluent (this branch is the implementation)
-- **#5890**: Multi-agent UX flow design
-- **#5626**: Observability defaults (policy question: Prometheus on/off in v0.8 defaults)
-- **#5934**: Documentation implementation tracking (multi-phase rollout of RFC #5576)
+- **#6808**: Work Lanes, Board Automation, and Label Cleanup (governance, in progress)
+- **#6971**: Security UX, runtime credential boundaries, and isolation defaults
+- **#6996**: Granular sandbox policy: filesystem and network restrictions
+- **#7218**: A2A agent discovery (`.well-known/agent-card.json`) for multi-agent installs
+- **#7184**: Move translated `.ftl` and `.po` files into a git submodule
 
 ## Ratified foundational RFCs
 

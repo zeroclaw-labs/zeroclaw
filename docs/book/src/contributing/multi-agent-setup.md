@@ -13,7 +13,7 @@ Throughout this walkthrough the existing single agent is called `primary` (subst
 
 ## Add a second agent
 
-Add another agent through the gateway dashboard, zerocode, or `zeroclaw config set`. The runtime creates `<install>/agents/<alias>/workspace/` on first agent-loop entry and seeds default identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`) when they don't exist. Edit those identity files to give the agent its persona; the agent loop reads them on every start.
+Add another agent through the gateway dashboard, zerocode, or `zeroclaw config set`. The runtime creates `<install>/agents/<alias>/workspace/` on first agent-loop entry. On every start the agent loop reads the workspace personality files when they exist — `SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, and `MEMORY.md` — and injects whatever is present into the system prompt. Create and edit those files to give the agent its persona. (`BOOTSTRAP.md` is a first-run scaffold the agent reads once and removes; the dashboard exposes the rest for editing.)
 
 {{#config-where agents}}
 
