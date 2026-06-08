@@ -391,6 +391,31 @@ impl DelegateTool {
         Ok(Arc::new(target_policy))
     }
 
+    fn build_target_provider(
+        &self,
+        model_provider: &str,
+        provider_type: &str,
+        credential: Option<&str>,
+    ) -> anyhow::Result<Box<dyn ModelProvider>> {
+        if let Some(config) = self.root_config.as_deref()
+            && let Some((family, alias)) = model_provider.split_once('.')
+        {
+            let mut options =
+                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
+            if options.zeroclaw_dir.is_none() {
+                options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
+            }
+            return zeroclaw_providers::create_model_provider_for_alias(
+                config, family, alias, credential, &options,
+            );
+        }
+        zeroclaw_providers::create_model_provider_with_options(
+            provider_type,
+            credential,
+            &self.provider_runtime_options,
+        )
+    }
+
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
     fn resolve_brain(&self, model_provider: &str) -> (String, Option<String>, String, Option<f64>) {
         if let Some((type_key, alias_key)) = model_provider.split_once('.')
@@ -496,6 +521,20 @@ impl DelegateTool {
     /// Directory where background delegate results are stored.
     fn results_dir(&self) -> PathBuf {
         self.workspace_dir.join("delegate_results")
+    }
+
+    /// Persist a background result atomically: write to a sibling temp file then
+    /// rename onto the final path, so a concurrent reader never observes a
+    /// half-written (or zero-length) JSON document.
+    async fn write_result_atomic(
+        result_path: &Path,
+        result: &BackgroundDelegateResult,
+    ) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(result)?;
+        let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        tokio::fs::rename(&tmp_path, result_path).await?;
+        Ok(())
     }
 
     /// Validate that a user-provided task_id is a valid UUID to prevent
@@ -760,23 +799,22 @@ impl DelegateTool {
         }
 
         // Create model_provider for this agent
-        let model_provider: Box<dyn ModelProvider> =
-            match zeroclaw_providers::create_model_provider_with_options(
-                &provider_type,
-                credential.as_deref(),
-                &self.provider_runtime_options,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
-                        )),
-                    });
-                }
-            };
+        let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
+            &agent_config.model_provider,
+            &provider_type,
+            credential.as_deref(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                    )),
+                });
+            }
+        };
 
         // Build the message
         let full_prompt = if context.is_empty() {
@@ -952,8 +990,7 @@ impl DelegateTool {
             finished_at: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
-        let json_bytes = serde_json::to_vec_pretty(&initial_result)?;
-        tokio::fs::write(&result_path, &json_bytes).await?;
+        Self::write_result_atomic(&result_path, &initial_result).await?;
 
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
@@ -1057,9 +1094,7 @@ impl DelegateTool {
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                if let Ok(bytes) = serde_json::to_vec_pretty(&final_result) {
-                    let _ = tokio::fs::write(&result_path, &bytes).await;
-                }
+                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1439,8 +1474,7 @@ impl DelegateTool {
         result.status = BackgroundTaskStatus::Cancelled;
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        let bytes = serde_json::to_vec_pretty(&result)?;
-        tokio::fs::write(&result_path, &bytes).await?;
+        Self::write_result_atomic(&result_path, &result).await?;
 
         Ok(ToolResult {
             success: true,
@@ -1836,8 +1870,9 @@ mod tests {
         let mut last_result = None;
 
         loop {
-            if let Ok(content) = std::fs::read_to_string(&result_path) {
-                let result: BackgroundDelegateResult = serde_json::from_str(&content).unwrap();
+            if let Ok(content) = std::fs::read_to_string(&result_path)
+                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
+            {
                 if result.status != BackgroundTaskStatus::Running {
                     return result;
                 }
@@ -3862,6 +3897,66 @@ mod tests {
         assert!(
             chain.contains("requires the same risk profile as the caller"),
             "expected same-profile rejection, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
+        };
+        let mut config = Config::default();
+        config.providers.models.custom.insert(
+            "vllm".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                    model: Some("Qwen3.6-27B".to_string()),
+                    wire_api: Some(WireApi::Responses),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.vllm".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_root_config(Arc::clone(&config));
+
+        // Drives the exact build path `run` takes. With root_config + a
+        // dotted model_provider, the alias-aware factory must read the
+        // target's `custom.vllm` entry and honor wire_api = responses.
+        let provider = tool
+            .build_target_provider("custom.vllm", "custom", None)
+            .expect("target provider builds offline");
+        assert_eq!(
+            provider.default_wire_api(),
+            "responses",
+            "delegate must build the target with its declared responses wire API"
+        );
+
+        // Regression guard: the pre-fix path (bare factory, no config/alias
+        // context) cannot see the per-alias config — for the custom family it
+        // errors on the missing uri it can't resolve, which is exactly the
+        // "error in the provider" the bug report described. Either way it does
+        // not yield a working responses provider.
+        let stale = zeroclaw_providers::create_model_provider_with_options(
+            "custom",
+            None,
+            &tool.provider_runtime_options,
+        );
+        let stale_is_responses = stale
+            .map(|p| p.default_wire_api() == "responses")
+            .unwrap_or(false);
+        assert!(
+            !stale_is_responses,
+            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
         );
     }
 }
