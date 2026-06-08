@@ -1,9 +1,9 @@
 [workspace]
-members = [".", "crates/daemonclaw-api", "crates/daemonclaw-infra", "crates/daemonclaw-config", "crates/daemonclaw-providers", "crates/daemonclaw-memory", "crates/daemonclaw-channels", "crates/daemonclaw-tools", "crates/daemonclaw-runtime", "crates/daemonclaw-tui", "crates/daemonclaw-plugins", "crates/daemonclaw-gateway", "crates/daemonclaw-hardware", "crates/daemonclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/daemonclaw-macros", "apps/tauri"]
+members = [".", "crates/daemonclaw-api", "crates/daemonclaw-infra", "crates/daemonclaw-config", "crates/daemonclaw-providers", "crates/daemonclaw-memory", "crates/daemonclaw-channels", "crates/daemonclaw-tools", "crates/daemonclaw-runtime", "crates/daemonclaw-tui", "crates/daemonclaw-plugins", "crates/daemonclaw-gateway", "crates/daemonclaw-hardware", "crates/daemonclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/daemonclaw-macros", "crates/daemonclaw-identity", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.29"
+version = "0.7.30"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeliveryBoyTech/daemonclaw"
@@ -24,6 +24,7 @@ daemonclaw-gateway = { path = "crates/daemonclaw-gateway", version = "0.7.3" }
 daemonclaw-hardware = { path = "crates/daemonclaw-hardware", version = "0.7.3" }
 daemonclaw-tool-call-parser = { path = "crates/daemonclaw-tool-call-parser", version = "0.7.3" }
 daemonclaw-macros = { path = "crates/daemonclaw-macros", version = "0.7.3" }
+daemonclaw-identity = { path = "crates/daemonclaw-identity", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
@@ -78,6 +79,7 @@ daemonclaw-gateway = { workspace = true, optional = true }
 daemonclaw-hardware = { workspace = true, optional = true }
 daemonclaw-tool-call-parser.workspace = true
 daemonclaw-macros.workspace = true
+daemonclaw-identity = { workspace = true, optional = true }
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -241,6 +243,7 @@ default = [
 # Without this, you get the kernel: config + providers + memory + CLI chat.
 agent-runtime = [
     "dep:daemonclaw-runtime", "dep:daemonclaw-channels", "dep:daemonclaw-tools",
+    "dep:daemonclaw-identity",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",
