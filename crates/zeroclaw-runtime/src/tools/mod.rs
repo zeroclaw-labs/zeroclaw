@@ -246,11 +246,17 @@ pub fn default_tools_with_runtime(
     let persistent_writes = runtime.has_filesystem_access();
     vec![
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
+            PathGuardedTool::new(
+                ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileReadTool::new_with_persistence(security.clone(), persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -261,7 +267,10 @@ pub fn default_tools_with_runtime(
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileEditTool::new_with_persistence(security.clone(), persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -490,13 +499,17 @@ pub fn all_tools_with_runtime(
                     } else {
                         root_config.shell_tool.timeout_secs
                     })
-                    .with_tui_env(tui_env),
+                    .with_tui_env(tui_env)
+                    .with_persistent_writes(persistent_writes),
                 security.clone(),
             ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileReadTool::new_with_persistence(security.clone(), persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
@@ -507,7 +520,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileEditTool::new_with_persistence(security.clone(), persistent_writes),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
@@ -997,11 +1013,12 @@ pub fn all_tools_with_runtime(
 
     // Standalone image generation tool (config-gated)
     if root_config.image_gen.enabled {
-        tool_arcs.push(Arc::new(ImageGenTool::new(
+        tool_arcs.push(Arc::new(ImageGenTool::new_with_persistence(
             security.clone(),
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
+            persistent_writes,
         )));
     }
 
@@ -1038,9 +1055,10 @@ pub fn all_tools_with_runtime(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        tool_arcs.push(Arc::new(FileDownloadTool::new(
+        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
             security.clone(),
             root_config.file_download.clone(),
+            persistent_writes,
         )));
     }
 
@@ -1350,6 +1368,114 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    /// A runtime that reports an ephemeral workspace (no host persistence) while
+    /// delegating real shell execution to `NativeRuntime`. Used to exercise the
+    /// registration wiring of `has_filesystem_access()` -> `persistent_writes`.
+    struct EphemeralRuntime(NativeRuntime);
+
+    impl RuntimeAdapter for EphemeralRuntime {
+        fn name(&self) -> &str {
+            "ephemeral-test"
+        }
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+        fn has_filesystem_access(&self) -> bool {
+            false
+        }
+        fn storage_path(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+        fn supports_long_running(&self) -> bool {
+            false
+        }
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &std::path::Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            self.0.build_shell_command(command, workspace_dir)
+        }
+    }
+
+    /// End-to-end wiring test (issue #4627): tools registered via
+    /// `default_tools_with_runtime` against an ephemeral runtime must surface the
+    /// loud warning (shell/file_read/file_edit) or refuse outright (file_write).
+    /// The per-tool unit tests construct tools directly with the flag; this is
+    /// the only test that proves `has_filesystem_access()` is actually threaded
+    /// through registration to all four tools.
+    #[tokio::test]
+    async fn registered_tools_warn_or_block_on_ephemeral_runtime() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::write(tmp.path().join("notes.txt"), "data")
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            max_actions_per_hour: 100,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(EphemeralRuntime(NativeRuntime::new()));
+        let tools = default_tools_with_runtime(security, runtime);
+        let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
+
+        // shell: warns on the executed command.
+        let r = by_name("shell")
+            .execute(serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+        assert!(
+            r.output.contains("EPHEMERAL WORKSPACE"),
+            "shell must warn, got: {}",
+            r.output
+        );
+
+        // file_read: warns on a successful text read.
+        let r = by_name("file_read")
+            .execute(serde_json::json!({"path": "notes.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            r.success && r.output.contains("EPHEMERAL WORKSPACE"),
+            "file_read must warn, got: {r:?}"
+        );
+
+        // file_edit: warns on a successful edit.
+        let r = by_name("file_edit")
+            .execute(
+                serde_json::json!({"path": "notes.txt", "old_string": "data", "new_string": "x"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.success && r.output.contains("EPHEMERAL WORKSPACE"),
+            "file_edit must warn, got: {r:?}"
+        );
+
+        // file_write: refuses outright (does not warn-and-write).
+        let r = by_name("file_write")
+            .execute(serde_json::json!({"path": "new.txt", "content": "x"}))
+            .await
+            .unwrap();
+        assert!(
+            !r.success,
+            "file_write must refuse on ephemeral, got: {r:?}"
+        );
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("ephemeral workspace"),
+            "file_write error must name the cause, got: {:?}",
+            r.error
+        );
+        assert!(
+            !tmp.path().join("new.txt").exists(),
+            "file_write must not write anything on ephemeral"
+        );
     }
 
     #[test]
