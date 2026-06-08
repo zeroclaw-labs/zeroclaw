@@ -1019,3 +1019,77 @@ body,
   border-bottom-color: var(--pc-accent);
   background: var(--pc-bg, transparent);
 }
+
+/* ── Theme-aware syntax highlighting ─────────────────────────────────────────
+   highlight.js applies .hljs-* token classes client-side. mdBook only ships
+   two highlight stylesheets (light + ayu), which don't track the custom
+   palettes in pc-themes.css. Map every token group to the active theme's
+   --pc-* variables so highlighting always matches the current theme. The vars
+   change per theme, so one ruleset covers all of them. */
+:root {
+  --pc-hl-comment: var(--pc-text-muted);
+  --pc-hl-keyword: var(--pc-accent);
+  --pc-hl-string: var(--links);
+  --pc-hl-number: var(--pc-accent-light);
+  --pc-hl-literal: var(--pc-accent-light);
+  --pc-hl-title: var(--pc-text-primary);
+  --pc-hl-attr: var(--pc-text-primary);
+  --pc-hl-section: var(--pc-accent);
+  --pc-hl-meta: var(--pc-text-muted);
+  --pc-hl-type: var(--links);
+  --pc-hl-variable: var(--pc-text-primary);
+  --pc-hl-default: var(--pc-text-secondary);
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--pc-hl-comment) !important;
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-builtin {
+  color: var(--pc-hl-keyword) !important;
+}
+.hljs-string,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition,
+.hljs-template-tag,
+.hljs-template-variable {
+  color: var(--pc-hl-string) !important;
+}
+.hljs-number,
+.hljs-regexp,
+.hljs-link {
+  color: var(--pc-hl-number) !important;
+}
+.hljs-literal,
+.hljs-type,
+.hljs-params {
+  color: var(--pc-hl-literal) !important;
+}
+.hljs-title,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--pc-hl-title) !important;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-tag {
+  color: var(--pc-hl-attr) !important;
+}
+.hljs-section,
+.hljs-meta-keyword {
+  color: var(--pc-hl-section) !important;
+  font-weight: 600;
+}
+.hljs-meta {
+  color: var(--pc-hl-meta) !important;
+}
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+.hljs-deletion { color: var(--pc-hl-comment) !important; }
