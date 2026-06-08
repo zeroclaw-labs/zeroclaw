@@ -131,6 +131,7 @@ Nearly all of the above landed after beta-1. The items that are specifically new
 - **zerocode reaches feature-complete for beta**: the Config, Code, Chat, Logs, and Dashboard panes are all live, with syntax-highlighted diffs (inkjet/tree-sitter), markdown rendering in chat, locally-configurable themes and keybindings, per-OS key dispatch, an independent Fluent catalogue with a download-from-upstream locale tab, and a `--version` flag that flags daemon-version mismatches.
 - **New tools**: `file_download`, `file_upload_bundle`, and `execute_pipeline` result mode; honest gateway channel readiness (#6985); `channel_send` with `default_target` (#6665).
 - **CLI Fluent routing** with per-user locale fetch and on-disk catalogue loading.
+- **Per-field MCP server editor**: `[[mcp.servers]]` is editable as a map-keyed section in the zerocode TUI — `+ Add` a server keyed by `name`, then edit `transport` / `command` / `url` / `headers` / `env` / `tool_timeout_secs` as individual fields, with rename via the existing `config_map_key_rename` RPC. The dashboard's JSON-array editor and hand-editing `config.toml` still work unchanged; this is the runtime capability that the dashboard will migrate onto in a follow-up. Opted in via a new `#[natural_key]` field attribute on the `Configurable` derive — only `mcp.servers` uses it for this beta; the other `Vec<T>` schema sections keep their existing behaviour.
 
 ## Bug Fixes
 
@@ -145,6 +146,7 @@ Nearly all of the above landed after beta-1. The items that are specifically new
 | Memory | Tolerate concurrent SQLite schema migrations (#6432); fix a migration guard that missed a missing UNIQUE constraint |
 | Windows | Remove manual MANIFEST linker flags fixing CVT1100/LNK1123 (#6987); local IPC parity via named pipes |
 | Onboarding | onboard `--help` no longer advertises removed flags; quickstart `expect()` replaced with proper error propagation; deny-with-edit replacement sanitized before reuse |
+| Config error reporting | Property-access errors from nested structs and map-keyed sections now propagate to the caller instead of being silently swallowed by fallthrough logic. Typos in property paths surface as actionable `Unknown property` errors pointing at the exact path. No on-disk or wire-format changes; operators editing config via the TUI, dashboard, or RPC see more specific error messages for the same misuses. |
 
 ## Breaking Changes
 
