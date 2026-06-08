@@ -1852,8 +1852,10 @@ pub async fn run_tool_call_loop(
 
         // Native tool-call providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
+        // Skip if already forwarded during live streaming to avoid duplication.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
+                && !response_streamed_live
                 && let Some(ref tx) = on_delta
             {
                 let mut narration = display_text.clone();
