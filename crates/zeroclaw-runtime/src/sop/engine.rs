@@ -327,9 +327,23 @@ impl SopEngine {
             anyhow::Error::msg(format!("Active run not found: {run_id}"))
         })?;
 
+        // A deterministic run paused at a checkpoint resumes through the
+        // deterministic piping path: the checkpoint step is recorded as
+        // completed and its output (or the previous step's) is piped forward.
+        if run.status == SopRunStatus::PausedCheckpoint {
+            let piped = run
+                .step_results
+                .last()
+                .map(|r| serde_json::Value::String(r.output.clone()))
+                .unwrap_or(serde_json::Value::Null);
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+            return self.advance_deterministic_step(run_id, piped);
+        }
+
         if run.status != SopRunStatus::WaitingApproval {
             bail!(
-                "Run {run_id} is not waiting for approval (status: {})",
+                "Run {run_id} is not waiting for approval or paused at a checkpoint (status: {})",
                 run.status
             );
         }
@@ -2395,6 +2409,51 @@ type = "manual"
         assert!(
             matches!(action, SopRunAction::Failed { .. }),
             "a failed deterministic step must fail the run"
+        );
+    }
+
+    #[test]
+    fn deterministic_checkpoint_resumes_through_approve_step() {
+        // The sop_approve tool calls approve_step. A deterministic run paused at
+        // a checkpoint must resume through it, not bail. deterministic_sop is
+        // step1=Execute, step2=Checkpoint, step3=Execute.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
+        let action = engine.start_run("det-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Advance step 1 -> pauses at the step-2 checkpoint.
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        // Approve the checkpoint via the public path -> yields step 3.
+        let action = engine.approve_step(&run_id).unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "approving a deterministic checkpoint must resume to the next step"
+        );
+
+        // Advance step 3 -> run completes.
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 3,
+                    status: SopStepStatus::Completed,
+                    output: "s3-out".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "deterministic run should complete after the post-checkpoint step"
         );
     }
 }
