@@ -155,7 +155,6 @@ sudo tail -f /var/log/zeroclaw/error.log
 ### OpenRC notes
 
 - Service runs as `zeroclaw:zeroclaw` (least privilege)
-- Config path is fixed: `/etc/zeroclaw/config.toml`
 - System-wide only: no user-level OpenRC services
 - All service operations need `sudo`
 

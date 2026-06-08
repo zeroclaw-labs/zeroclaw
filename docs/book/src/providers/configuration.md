@@ -1,8 +1,6 @@
 # Provider Configuration
 
-Every model provider lives at `[providers.models.<type>.<alias>]` in `~/.zeroclaw/config.toml`. `<type>` is the canonical family slot (`anthropic`, `openai`, `azure`, `gemini`, `groq`, `moonshot`, ...). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
-
-{{#config-where providers}}
+Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot with its endpoint). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
 
 ## Minimal working example
 
@@ -22,23 +20,7 @@ For every family, the URL is resolved in this order:
 
 ## Family slots
 
-Run `cargo doc --open -p zeroclaw-config` (or read [`crates/zeroclaw-config/src/providers.rs`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/crates/zeroclaw-config/src/providers.rs)) for the complete list. Highlights:
-
-| Slot | Notes |
-|---|---|
-| `anthropic` | API key or OAuth (`sk-ant-oat-*`) |
-| `openai` | GPT, o-series; the OpenAI Codex subscription variant is `providers.models.openai.<alias>` with `wire_api = "responses"` and `requires_openai_auth = true` |
-| `azure` | Typed: `resource`, `deployment`, `api_version`, all set on the alias entry |
-| `gemini` | Google's API; `gemini_cli` is the CLI-shells-out variant |
-| `bedrock` | AWS-credentials chain, region template |
-| `ollama` | Local inference; `uri` defaults to `http://localhost:11434` |
-| `openrouter` | Multi-vendor routing layer (treated as a single provider; see [Routing](./routing.md)) |
-| `groq`, `mistral`, `xai`, `deepseek`, ... | OpenAI-compatible endpoints, each with its own canonical slot |
-| `moonshot`, `qwen`, `glm`, `minimax`, `zai`, `doubao`, ... | Multi-region families; pick the region with `endpoint = "<variant>"` on the alias entry |
-| `lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm` | Local-server defaults (`http://localhost:<port>/v1`) |
-| `custom` | Catch-all for OpenAI-compatible endpoints not covered above; `uri` is required |
-
-There is one canonical key per vendor: no synonyms.
+Every slot, its default endpoint, and whether it runs locally is in the [Catalog](./catalog.md#all-slots). There is one canonical key per vendor: no synonyms.
 
 ## Credentials
 
@@ -63,15 +45,7 @@ Several providers accept OAuth or subscription-style tokens instead of raw API k
 
 When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama), set `uri` to a host-reachable address. The generic env-override mechanism (`ZEROCLAW_<dotted_path_with_double_underscores>=<value>`) can set the same field at runtime without editing config:
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-ZEROCLAW_providers__models__ollama__home__uri=http://ollama:11434 zeroclaw agent -a assistant
-```
-
-</div>
+{{#env-var container}}
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
 

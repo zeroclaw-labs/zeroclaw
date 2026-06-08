@@ -120,7 +120,7 @@ sudo apt-get install -y gcc-aarch64-linux-gnu
 # Add target
 rustup target add aarch64-unknown-linux-gnu
 
-# Configure linker (~/.cargo/config.toml)
+# Configure linker
 # [target.aarch64-unknown-linux-gnu]
 # linker = "aarch64-linux-gnu-gcc"
 
@@ -332,7 +332,7 @@ zeroclaw quickstart
 
 </div>
 
-This walks you through provider auth, gateway config, and creates `~/.zeroclaw/config.toml`.
+This walks you through provider auth, gateway config, and creates your ZeroClaw config.
 
 ### 2. Verify it works
 

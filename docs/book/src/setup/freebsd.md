@@ -93,11 +93,11 @@ zeroclaw quickstart
 
 </div>
 
-This creates `~/.zeroclaw/` with a starter `config.toml` and walks you through provider setup. Config layout and precedence are identical to every other platform: see [Reference → Config](../reference/config.md).
+This creates `~/.zeroclaw/` with a starter config and walks you through provider setup. Config layout and precedence are identical to every other platform: see [Reference → Config](../reference/config.md).
 
 ## Provider authentication
 
-API-key providers need nothing FreeBSD-specific: set the key in `config.toml` or the environment and you're done.
+API-key providers need nothing FreeBSD-specific: set the key through the gateway, zerocode, `zeroclaw config set`, or the environment and you're done.
 
 For OAuth-based providers (e.g. an OpenAI/Codex ChatGPT subscription), import the credential with:
 

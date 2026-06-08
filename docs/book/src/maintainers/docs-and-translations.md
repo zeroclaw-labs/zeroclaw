@@ -7,7 +7,7 @@ ZeroClaw has two independent translation layers:
 | **App strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
 | **Docs** | gettext (`.po`) | Everything in this mdBook |
 
-They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<kind>.<alias>]` and pass `--model-provider <alias>` to the fill commands. Any configured alias is choosable: a bare alias (`--model-provider <alias>`), or a `kind.alias` qualifier (`--model-provider anthropic.<alias>`) when the same alias exists under more than one kind. The resolver reads `uri`, `model`, and `api_key` straight from the matched entry; a missing `uri` or `model` is a hard error, not a guessed default.
+They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint under `providers.models.<kind>.<alias>` and pass `--model-provider <alias>` to the fill commands. Any configured alias is choosable: a bare alias (`--model-provider <alias>`), or a `kind.alias` qualifier (`--model-provider anthropic.<alias>`) when the same alias exists under more than one kind. The resolver reads `uri`, `model`, and `api_key` straight from the matched entry; a missing `uri` or `model` is a hard error, not a guessed default.
 
 Local models via [Ollama](https://ollama.com) are a first-class option: no API keys required, no per-call cost. A hosted provider is also fine for release-grade quality. Translation is a local operation. Run `cargo mdbook sync` for dedicated translation-cache PRs, release translation passes, and new locales; routine English docs PRs may defer broad generated `.po` churn to a focused follow-up.
 
@@ -90,7 +90,7 @@ Chord glyphs like `Ctrl+C`, `Esc`, `Shift+Up` are protocol, not language. The `H
 
 ### Locale resolution
 
-Locale comes from a top-level `locale` field in `zerocode-config.toml`. When unset, `i18n::detect_locale()` reads a single file: `<config-dir>/zerocode-config.toml`, where the config dir is resolved as `--config-dir`, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`, and otherwise falls back to `en`. zerocode resolves its locale independently from its own `zerocode-config.toml`; it does not share the daemon's lookup.
+Locale comes from a top-level `locale` field in zerocode's config. When unset, `i18n::detect_locale()` reads the config dir resolved as `--config-dir`, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`, and otherwise falls back to `en`. zerocode resolves its locale independently from its own config; it does not share the daemon's lookup.
 
 ### Adding strings
 

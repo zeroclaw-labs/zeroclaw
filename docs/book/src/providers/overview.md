@@ -6,11 +6,11 @@ Why "model" provider? We use the phrase "model provider" consistently, there are
 
 ## Configuration shape
 
-Providers are typed by family, addressed as `providers.models.<type>.<alias>`. `<type>` is the canonical family slot (`anthropic`, `openai`, `azure`, `gemini`, `ollama`, `openrouter`, `groq`, `moonshot`, ...). There is one slot per vendor, with no synonyms: `azure_openai`, `azure-openai`, and `claude` (for Anthropic) are not accepted.
+Providers are typed by family, addressed as `providers.models.<type>.<alias>`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot). There is one slot per vendor, with no synonyms: `azure_openai`, `azure-openai`, and `claude` (for Anthropic) are not accepted.
 
 `<alias>` is your operator-assigned instance name. Use it to distinguish multiple instances of the same provider, e.g. an `openai.work` and an `openai.personal` against the same vendor.
 
-{{#config-where providers}}
+{{#config-where providers.models}}
 
 See [Configuration](./configuration.md) for the full schema and [Catalog](./catalog.md) for a worked example per family.
 

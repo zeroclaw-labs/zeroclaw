@@ -9,7 +9,7 @@ This guide explains how to add new hardware boards and custom tools to ZeroClaw.
 #### sh
 
 ```sh
-# Add a board (updates ~/.zeroclaw/config.toml)
+# Add a board
 zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
 zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
 zeroclaw peripheral add rpi-gpio native   # for Raspberry Pi GPIO (Linux)
@@ -32,7 +32,7 @@ zeroclaw daemon --host 127.0.0.1 --port 42617
 
 ## Manual Config
 
-Boards are configured under `[peripherals]` and `[[peripherals.boards]]` in `~/.zeroclaw/config.toml`. See the [Config reference](../reference/config.md) for the full field index, including `datasheet_dir` (RAG source).
+Boards are configured under `peripherals` and `peripherals.boards`. See the [Config reference](../reference/config.md) for the full field index, including `datasheet_dir` (RAG source).
 
 ## Adding a Datasheet (RAG)
 

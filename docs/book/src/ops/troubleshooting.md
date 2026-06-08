@@ -122,7 +122,7 @@ Persist in your shell profile.
 
 ### Quickstart won't overwrite an existing config
 
-`zeroclaw quickstart` does not have a `--force` flag, it intentionally leaves an existing `~/.zeroclaw/config.toml` alone. To run a fresh quickstart on a stale install, delete the directory and start over:
+`zeroclaw quickstart` does not have a `--force` flag, it intentionally leaves an existing install alone. To run a fresh quickstart on a stale install, delete the directory and start over:
 
 <div class="os-tabs-src">
 

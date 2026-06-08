@@ -2782,7 +2782,7 @@ impl RpcDispatcher {
                 let completed = wizard
                     .map(|w| zeroclaw_config::sections::section_has_signal(&config, w))
                     .unwrap_or(false);
-                let label = humanize_section_key(&key);
+                let label = zeroclaw_config::sections::humanize_section_key(&key);
                 ConfigSectionEntry {
                     help: section_help(&key).to_string(),
                     has_picker,
@@ -3134,21 +3134,6 @@ impl RpcDispatcher {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-/// Humanize a section key for display (`risk-profiles` → `Risk profiles`).
-fn humanize_section_key(key: &str) -> String {
-    match key {
-        "providers.models" => return "Model providers".to_string(),
-        "providers.tts" => return "TTS providers".to_string(),
-        "providers.transcription" => return "Transcription providers".to_string(),
-        _ => {}
-    }
-    let mut s = key.replace(['_', '-'], " ");
-    if let Some(c) = s.get_mut(0..1) {
-        c.make_ascii_uppercase();
-    }
-    s
-}
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))

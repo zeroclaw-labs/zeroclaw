@@ -50,13 +50,13 @@ The schema validator at config load enforces:
 
 ## Inspect the install
 
-Every configured agent lives under an `[agents.<alias>]` block in `config.toml` with its risk profile, model provider, memory backend, and channel set.
+Every configured agent lives under an `agents.<alias>` entry with its risk profile, model provider, memory backend, and channel set.
 
 {{#config-where agents}}
 
 ## Delete an agent
 
-1. Remove the `[agents.<alias>]` block (and any nested `[agents.<alias>.workspace]` / `[agents.<alias>.memory]` tables) from `config.toml`.
+1. Remove the `agents.<alias>` entry (and any nested `workspace` / `memory` tables) through the gateway, zerocode, or `zeroclaw config set`.
 2. Strip the alias from every `[peer_groups.<name>]` block's `agents` list.
 3. Remove the workspace dir: `rm -rf <install>/agents/<alias>/workspace/`.
 4. Optional cleanup of the agent's memory rows (they retain `agent_id = <alias-uuid>` attribution but no live agent maps to that UUID anymore):

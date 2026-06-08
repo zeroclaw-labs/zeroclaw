@@ -30,7 +30,7 @@ docker run -d \
 
 </div>
 
-The official image already binds `[::]` with `allow_public_bind = true` and `require_pairing = false` baked into its default config, so the published port is reachable out of the box. The {{#env-var-name gateway.allow_public_bind}} override below only matters if you bind-mount your own `config.toml` (which replaces the baked one) that defaults to localhost.
+The official image already binds `[::]` with `allow_public_bind = true` and `require_pairing = false` baked into its default config, so the published port is reachable out of the box. The {{#env-var-name gateway.allow_public_bind}} override below only matters if you bind-mount your own config (which replaces the baked one) that defaults to localhost.
 
 The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config: you still need to run quickstart before it's useful:
 
@@ -178,7 +178,7 @@ There is no `systemctl enable` step for generated units: the `[Install] WantedBy
 
 ## Config inside containers
 
-The image expects config at `/zeroclaw-data/.zeroclaw/config.toml`. Mount your local config in:
+The image expects config under `/zeroclaw-data/.zeroclaw/`. Mount your local config in:
 
 <div class="os-tabs-src">
 
@@ -194,7 +194,7 @@ docker run -d --name zeroclaw \
 
 </div>
 
-For container workloads, set `uri` on each `[providers.models.<type>.<alias>]` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The generic env-override mechanism can set the same field at runtime without editing `config.toml`:
+For container workloads, set `uri` on each `providers.models.<type>.<alias>` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The generic env-override mechanism can set the same field at runtime without editing the config:
 
 {{#env-var container}}
 
@@ -277,7 +277,7 @@ docker compose exec zeroclaw zeroclaw gateway get-paircode --new
 - **macOS hostname quirks (Docker Desktop, colima, Rancher Desktop).** `host.docker.internal` works out of the box on **Docker Desktop** for macOS. On **colima**, it is only reachable if you installed with `colima start --network-address` (otherwise the container can't see the host at all; connect via the VM's gateway IP, usually `192.168.5.2`, or tunnel through a shared network). **Rancher Desktop** behaves like Docker Desktop for recent versions but has had `host.docker.internal` resolve-failures on older releases. If provider calls fail with `connection refused` to `host.docker.internal`, verify with `docker run --rm alpine getent hosts host.docker.internal`: empty output means the hostname isn't resolvable and you need an explicit IP.
 - **Host-side services.** If a provider is Ollama on the host, `uri = "http://host.docker.internal:11434"` (under `[providers.models.ollama.<alias>]`) works on Docker Desktop. On Linux Docker you may need `--add-host=host.docker.internal:host-gateway`.
 - **Memory persistence.** Agent memory (the SQLite `brain.db`) lives under the config directory at `/zeroclaw-data/.zeroclaw/agents/<alias>/workspace/memory/`, with shared instance databases under `/zeroclaw-data/data/`. Mounting `/zeroclaw-data` persists all of it; skip the volume and every restart loses conversation history.
-- **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default `config.toml` and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist`, outside the mount, so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
+- **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default config and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist`, outside the mount, so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
 - **No hardware passthrough by default.** GPIO / USB need explicit `--device` flags (`--device /dev/ttyUSB0`), and the container user needs matching GID for `dialout`/`gpio` groups.
 
 ## Next

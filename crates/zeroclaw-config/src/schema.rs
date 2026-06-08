@@ -5846,7 +5846,7 @@ impl Default for Microsoft365Config {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "secrets"]
 pub struct SecretsConfig {
-    /// Enable encryption for API keys and tokens in config.toml
+    /// Enable encryption for API keys and tokens at rest
     #[serde(default = "default_true")]
     #[credential_class = "public_value"]
     pub encrypt: bool,

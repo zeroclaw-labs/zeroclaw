@@ -1,27 +1,27 @@
-# Themes & terminal colours
+# Themes & terminal colors
 
-zerocode ships a set of named colour themes, lets each agent carry its own theme
-in the Code and Chat panes, and adapts its colour output to what the terminal
+zerocode ships a set of named color themes, lets each agent carry its own theme
+in the Code and Chat panes, and adapts its color output to what the terminal
 can render.
 
-All theme settings live in zerocode's own `zerocode-config.toml`, independent of
+All theme settings live in zerocode's own config, independent of
 which daemon zerocode connects to.
 
 ## Choosing a theme
 
 Open the **Config** pane, switch to the **zerocode** section, and select the
 **Theme** tab. Navigate with `↑`/`k` and `↓`/`j`; press `Enter` to apply. The
-choice takes effect immediately and is written to `zerocode-config.toml`. The
-highlighted row previews the theme's palette inline, a strip of colour
+choice takes effect immediately and is persisted to zerocode's config. The
+highlighted row previews the theme's palette inline, a strip of color
 blocks for its canvas, title, heading, body, warn, and tool roles, so you can
-see the colours before applying.
+see the colors before applying.
 
 ### Available themes
 
 Two themes are authored directly in zerocode because they have no registry
 entry:
 
-- **`terminal`**: inherits your terminal's own colours. Every role is left to
+- **`terminal`**: inherits your terminal's own colors. Every role is left to
   the terminal default and the app skips painting a background, so a tuned shell
   palette shows through untouched.
 - **`icy_blue`**: the default on non-macOS platforms.
@@ -60,26 +60,26 @@ none). The footer shows the keys.
 - `d` clears the highlighted agent's override.
 
 Assignments and clears apply **live**: the Code/Chat pane re-themes on the
-next frame without restarting zerocode, and are persisted to
-`zerocode-config.toml`. An override naming an unknown theme falls back to the
+next frame without restarting zerocode, and are persisted to zerocode's
+config. An override naming an unknown theme falls back to the
 `terminal` theme, same as the global setting.
 
-## Terminal colour depth
+## Terminal color depth
 
-zerocode detects how much colour your terminal can render and adapts its output
+zerocode detects how much color your terminal can render and adapts its output
 once, on first paint:
 
 - **Truecolor (24-bit)** is the default for virtually every terminal. zerocode
-  emits 24-bit colour, which modern terminals, and terminal multiplexers
+  emits 24-bit color, which modern terminals, and terminal multiplexers
   configured for it, render directly.
-- **xterm-256** is used for macOS Terminal.app, which lacks 24-bit colour
+- **xterm-256** is used for macOS Terminal.app, which lacks 24-bit color
   (detected via `TERM_PROGRAM=Apple_Terminal`). iTerm2, kitty, WezTerm, Ghostty,
   and other truecolor terminals are unaffected.
-- **ANSI-16** is used only for a genuinely low-colour terminal: `TERM` unset, or
-  `dumb`, `ansi`, or any `*-16color` value. Themed colours are down-converted to
-  the nearest of the 16 ANSI colours.
+- **ANSI-16** is used only for a genuinely low-color terminal: `TERM` unset, or
+  `dumb`, `ansi`, or any `*-16color` value. Themed colors are down-converted to
+  the nearest of the 16 ANSI colors.
 
-When a depth below truecolor is in effect, every themed colour (including the
+When a depth below truecolor is in effect, every themed color (including the
 preview swatches) is snapped to the nearest renderable value.
 
 ### Forcing a depth
@@ -90,7 +90,7 @@ Set `ZEROCODE_COLOR` to override detection:
 |---|---|
 | `truecolor`, `24bit`, `24` | 24-bit truecolor |
 | `256` | xterm-256 |
-| `16`, `ansi` | 16 ANSI colours |
+| `16`, `ansi` | 16 ANSI colors |
 
 <div class="os-tabs-src">
 
@@ -104,12 +104,12 @@ ZEROCODE_COLOR=256 zerocode
 
 Any unrecognised value is ignored and normal detection runs.
 
-### tmux: colours look wrong or washed out
+### tmux: colors look wrong or washed out
 
 If you run zerocode inside tmux, commonly over SSH to a Raspberry Pi or other
 remote host, and the palette renders flat or near-monochrome, the cause is
 almost always tmux not advertising truecolor (RGB) support for the outer
-terminal. zerocode emits 24-bit colour, but tmux only forwards it to your
+terminal. zerocode emits 24-bit color, but tmux only forwards it to your
 terminal when it knows the terminal supports RGB.
 
 Tell tmux the client supports RGB by adding this to the **remote** machine's

@@ -13,7 +13,7 @@ ZeroClaw includes everything needed for Arduino Uno Q. **Clone the repo and foll
 | Bridge app | `firmware/uno-q-bridge/` | MCU sketch + Python socket server (port 9999) for GPIO |
 | Bridge tools | `crates/zeroclaw-hardware/src/peripherals/uno_q_bridge.rs` | `gpio_read` / `gpio_write` tools that talk to the Bridge over TCP |
 | Setup command | `crates/zeroclaw-hardware/src/peripherals/uno_q_setup.rs` | `zeroclaw peripheral setup-uno-q` deploys the Bridge via scp + arduino-app-cli |
-| Config schema | `board = "arduino-uno-q"`, `transport = "bridge"` | Supported in `config.toml` |
+| Config schema | `board = "arduino-uno-q"`, `transport = "bridge"` | Configurable via the gateway, zerocode, or `zeroclaw config set` |
 
 Build with `--features hardware` to include Uno Q support.
 
@@ -131,10 +131,6 @@ ssh arduino@<UNO_Q_IP>
 
 # Quick config
 zeroclaw quickstart --api-key YOUR_OPENROUTER_KEY --model-provider openrouter
-
-# Or create config manually
-mkdir -p ~/.zeroclaw/workspace
-nano ~/.zeroclaw/config.toml
 ```
 
 </div>
@@ -229,7 +225,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Message your Telegram bot: it responds |
 | 11 | `zeroclaw peripheral setup-uno-q` (deploys Bridge) |
-| 12 | Add `[peripherals]` block with `board = "arduino-uno-q"` to `config.toml` |
+| 12 | Add a `peripherals` board with `board = "arduino-uno-q"` via the gateway, zerocode, or `zeroclaw config set` |
 | 13 | Restart daemon (`zeroclaw daemon …`), GPIO commands now work |
 
 ---

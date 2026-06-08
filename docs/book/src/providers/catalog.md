@@ -54,24 +54,11 @@ Local inference via KiloCLI.
 
 ---
 
-## OpenAI-compatible families
+## All slots
 
-Every OpenAI-compatible vendor has its own canonical slot. There is no generic `kind = "openai-compatible"` selector: pick the slot that matches your provider, or use `custom` for endpoints not listed here.
+Every canonical slot, its default endpoint, and whether it runs locally, generated from the provider registry. Slots with no fixed default (`—`) need `uri` set on the alias entry (Azure, `custom`, multi-region families, CLI shims).
 
-| Slot | Default endpoint | Notes |
-|---|---|---|
-| `groq` | `https://api.groq.com/openai` | Native tool streaming hints supported |
-| `mistral` | `https://api.mistral.ai` | |
-| `xai` | `https://api.x.ai` | |
-| `deepseek` | `https://api.deepseek.com` | DeepSeek V3 / R1 |
-| `cohere`, `perplexity`, `cerebras`, `sambanova`, `hyperbolic` | per vendor | Standard OpenAI shape |
-| `deepinfra`, `huggingface`, `together`, `fireworks` | per vendor | |
-| `ai21`, `reka`, `baseten`, `nscale`, `anyscale`, `nebius` | per vendor | |
-| `friendli`, `stepfun`, `aihubmix`, `siliconflow` | per vendor | |
-| `astrai`, `avian`, `deepmyst`, `venice`, `novita`, `nvidia` | per vendor | |
-| `vercel`, `cloudflare`, `ovh` | per vendor gateway | |
-| `lepton`, `synthetic`, `opencode` | per vendor | |
-| `lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm` | `http://localhost:<port>/v1` | Local-server slots with sensible defaults |
+{{#model-provider-catalog-table}}
 
 For a worked example per family, see [Configuration](./configuration.md). If your vendor isn't listed, use the `custom` slot ([Custom providers](./custom.md)).
 
@@ -99,12 +86,7 @@ For Z.AI's Anthropic-compatible API, use `[providers.models.anthropic.zai]` with
 
 ### Doubao / Volcengine: slot `doubao`
 
-### Other Chinese-region slots
-
-- `yi`
-- `hunyuan`
-- `qianfan`
-- `baichuan`
+The remaining Chinese-region slots (`yi`, `hunyuan`, `qianfan`, `baichuan`) appear in the all-slots table above; select the region with the typed `endpoint` field on the alias entry.
 
 ---
 

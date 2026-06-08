@@ -141,7 +141,7 @@ cargo mdbook stats   # review coverage
 
 </div>
 
-The model used is whatever is configured in `[providers.models.<name>]` in `config.toml`.
+The model used is whatever is configured under `providers.models.<name>`.
 
 ## Tips
 

@@ -70,7 +70,7 @@ That's it. zerocode reconnects automatically if the connection drops.
 
 ## Config reference
 
-The `[wss]` section in `config.toml`:
+The `wss` section:
 
 | Field | Default | Description |
 |-------|---------|-------------|

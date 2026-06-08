@@ -4,7 +4,7 @@ This page documents the architecture and operator-facing surface of the multi-ag
 
 ## Vocabulary
 
-- **Install dir**: the directory holding everything ZeroClaw owns on a host. Typically `~/.zeroclaw/`. Equivalent to the dir containing `config.toml`.
+- **Install dir**: the directory holding everything ZeroClaw owns on a host. Typically `~/.zeroclaw/`.
 - **Agent**: a configured `[agents.<alias>]` block: a join table of references (`risk_profile`, `model_provider`, `channels`), a per-agent workspace dir, and a per-agent memory backend selection. Each agent picks one memory backend at creation; that choice is immutable for the agent's lifetime.
 - **Aliased workspace**: `<install>/agents/<alias>/workspace/`. One per agent. Holds the agent's identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `BOOTSTRAP.md`, `MEMORY.md`) and any operator data the agent owns.
 - **SubAgent**: a runtime-spawned ephemeral child run that inherits its parent's identity, security policy, and memory allowlist. See [SubAgents](./subagents.md) for the full surface (lifecycle, spawn sites, the depth-1 cap, what gets returned to the parent).
@@ -46,7 +46,7 @@ The agent-loop entry binds `agent_alias` as a tracing-span field; SubAgent spawn
 
 - `zeroclaw agent -a <alias>`: runs the configured agent at `[agents.<alias>]`.
 
-Agents are added by editing `[agents.<alias>]` blocks in `config.toml`. The runtime creates the per-agent workspace dir under `<install>/agents/<alias>/workspace/` and seeds bootstrap identity files on first agent-loop entry. See the [setup walkthrough](../contributing/multi-agent-setup.md) for full operator guidance.
+Agents are added through the gateway, zerocode, or `zeroclaw config set`. The runtime creates the per-agent workspace dir under `<install>/agents/<alias>/workspace/` and seeds bootstrap identity files on first agent-loop entry. See the [setup walkthrough](../contributing/multi-agent-setup.md) for full operator guidance.
 
 {{#config-where agents}}
 

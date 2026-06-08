@@ -2423,7 +2423,7 @@ enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
         /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
         #[arg(long)]
@@ -4141,11 +4141,21 @@ async fn main() -> Result<()> {
             );
             println!("  ID (use in config)  DESCRIPTION"); // i18n-exempt: literal command/identifier example
             println!("  ─────────────────── ───────────");
-            for p in &model_providers {
-                let is_configured = configured_types.contains(p.name);
-                let marker = if is_configured { " (configured)" } else { "" };
-                let local_tag = if p.local { " [local]" } else { "" };
-                println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+            for category in zeroclaw_providers::ModelProviderCategory::all() {
+                let in_category: Vec<_> = model_providers
+                    .iter()
+                    .filter(|p| p.category == *category)
+                    .collect();
+                if in_category.is_empty() {
+                    continue;
+                }
+                println!("\n  {}:", category.as_str());
+                for p in in_category {
+                    let is_configured = configured_types.contains(p.name);
+                    let marker = if is_configured { " (configured)" } else { "" };
+                    let local_tag = if p.local { " [local]" } else { "" };
+                    println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+                }
             }
             println!(
                 "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \

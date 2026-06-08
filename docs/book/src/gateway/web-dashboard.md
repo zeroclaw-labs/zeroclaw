@@ -2,7 +2,7 @@
 
 The gateway daemon ships its HTTP API in the binary, but the web dashboard
 HTML/JS/CSS lives on disk in a `web/dist/` directory produced by Vite. The
-`gateway.web_dist_dir` setting (and its `ZEROCLAW_gateway__web_dist_dir`
+`gateway.web_dist_dir` setting (and its {{#env-var-name gateway.web_dist_dir}}
 schema-mirror env-var override) tells the daemon where that directory is.
 When neither the setting nor a known fallback location contains a built
 `index.html`, the gateway boots in **API-only mode** and the dashboard URL
@@ -10,16 +10,7 @@ returns a "not available" message.
 
 ## TL;DR
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-# Equivalent env-var override (in-memory only, never persisted)
-export ZEROCLAW_gateway__web_dist_dir="/absolute/path/to/zeroclaw/web/dist"
-```
-
-</div>
+{{#env-var web_dist}}
 
 Then build the bundle once:
 
@@ -50,7 +41,7 @@ Web dashboard: serving from /absolute/path/to/zeroclaw/web/dist
 `gateway.web_dist_dir` is an `Option<String>` pointing at the directory that
 contains a built `index.html`. At gateway start, the daemon:
 
-1. Reads the value from `config.toml` (or the env-var override).
+1. Reads the configured value (or the env-var override).
 2. Verifies the directory exists AND contains `index.html` on this machine.
 3. If yes, serves the dashboard from that path.
 4. If no, logs a WARN ("path doesn't contain `index.html` on this machine;
@@ -122,13 +113,13 @@ The official Docker image places the bundle at `/zeroclaw-data/web/dist`
 
 The value is resolved with the standard config-layer order:
 
-1. `ZEROCLAW_gateway__web_dist_dir` (schema-mirror env var, see
+1. {{#env-var-name gateway.web_dist_dir}} (schema-mirror env var, see
    [Environment variables](../reference/env-vars.md))
-2. `gateway.web_dist_dir` in `config.toml`
+2. The configured `gateway.web_dist_dir`
 3. Auto-detect (the five candidates above)
 
 Env-var overrides apply to the in-memory `Config` only; they are never
-written back to `config.toml`.
+persisted.
 
 ## Schema-mirror grammar: deriving `ZEROCLAW_gateway__web_dist_dir`
 
@@ -149,7 +140,7 @@ Env var:    ZEROCLAW_gateway__web_dist_dir
 
 The same three steps produce env-var names for every other gateway knob,
 e.g. `gateway.request_timeout_secs` becomes
-`ZEROCLAW_gateway__request_timeout_secs`.
+{{#env-var-name gateway.request_timeout_secs}}.
 
 ## Common pitfalls
 
@@ -157,15 +148,7 @@ e.g. `gateway.request_timeout_secs` becomes
 
 A literal tilde is **not** expanded by the gateway — use an absolute path for `gateway.web_dist_dir`. Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded; pre-expand them in the env var if you set the value that way:
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-export ZEROCLAW_gateway__web_dist_dir="$HOME/zeroclaw/web/dist"   # shell expands $HOME
-```
-
-</div>
+{{#env-var web_dist_home}}
 
 Companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961) adds
 the targeted "looks like an unexpanded `~` / `$VAR`,
@@ -180,17 +163,17 @@ write `/home/alice/zeroclaw/web/dist` instead of `~/zeroclaw/web/dist`).
 ### Relative paths resolve against CWD, not the config file
 
 `web_dist_dir = "web/dist"` is interpreted relative to the daemon's working
-directory at start time, not relative to the location of `config.toml`. If
+directory at start time, not relative to the config location. If
 you ship a config to another host or invoke the daemon from a different
 directory (e.g. via systemd), the relative form will look in the wrong place.
-**Use absolute paths in `config.toml`.**
+**Use absolute paths for `web_dist_dir`.**
 
 ### "Stale path" WARN at startup
 
 ```text
 WARN gateway.web_dist_dir points at a path that doesn't contain index.html
 on this machine; falling back to auto-detect. Update or remove the setting
-in config.toml to silence this warning.
+to silence this warning.
 ```
 
 This means the path is syntactically valid but the file isn't there yet.

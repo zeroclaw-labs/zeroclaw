@@ -172,11 +172,11 @@ The CLI installs only a per-user ONLOGON task; it does not register a `LocalSyst
 
 The service reads config from whichever directory resolved at install time. Precedence (first match wins):
 
-1. `$ZEROCLAW_CONFIG_DIR` (config lives directly at `$ZEROCLAW_CONFIG_DIR/config.toml`)
+1. `$ZEROCLAW_CONFIG_DIR` (config lives directly under `$ZEROCLAW_CONFIG_DIR`)
 2. `$ZEROCLAW_DATA_DIR`
-3. `$ZEROCLAW_WORKSPACE` (**deprecated** — prefer `ZEROCLAW_DATA_DIR`; resolves either `$ZEROCLAW_WORKSPACE/config.toml` or the legacy sibling `.zeroclaw/config.toml`)
+3. `$ZEROCLAW_WORKSPACE` (**deprecated** — prefer `ZEROCLAW_DATA_DIR`; resolves either `$ZEROCLAW_WORKSPACE` or the legacy sibling `.zeroclaw/`)
 4. On macOS only, the Homebrew config dir (`$HOMEBREW_PREFIX/var/zeroclaw/`) when installed via Homebrew
-5. Default `~/.zeroclaw/config.toml` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\config.toml` (Windows)
+5. Default `~/.zeroclaw/` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\` (Windows)
 
 `ZEROCLAW_CONFIG_DIR` overrides everything; setting it alongside `ZEROCLAW_DATA_DIR` or `ZEROCLAW_WORKSPACE` logs a warning and ignores the others.
 

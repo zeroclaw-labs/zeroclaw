@@ -14,52 +14,13 @@ ZEROCLAW_<dotted_path_with_double_underscores>=<value>
 
 ## Examples
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-# Inject a typed-family alias credential
-ZEROCLAW_providers__models__anthropic__home__api_key=sk-ant-...
-
-# Set a model on a non-default OpenRouter alias (alias with underscore is fine)
-ZEROCLAW_providers__models__openrouter__prod_v2__model=anthropic/claude-sonnet-4-6
-ZEROCLAW_providers__models__openrouter__prod_v2__api_key=sk-or-...
-
-# Toggle and configure a channel
-ZEROCLAW_channels__matrix__enabled=true
-ZEROCLAW_channels__matrix__homeserver=https://matrix.example.org
-
-# Override gateway runtime knobs
-ZEROCLAW_gateway__request_timeout_secs=120
-ZEROCLAW_gateway__long_running_request_timeout_secs=900
-
-# Point the gateway at a built web dashboard (absolute path; no ~ / $HOME)
-ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist
-
-# Inject webhook signing secrets
-ZEROCLAW_channels__whatsapp__home__app_secret=...
-ZEROCLAW_channels__linq__home__signing_secret=...
-ZEROCLAW_channels__nextcloud_talk__home__webhook_secret=...
-
-# Inject Qdrant memory backend connection
-ZEROCLAW_storage__qdrant__home__url=https://qdrant.example.com
-ZEROCLAW_storage__qdrant__home__collection=zeroclaw
-ZEROCLAW_storage__qdrant__home__api_key=...
-```
-
-</div>
+{{#env-var example}}
 
 The mapping from env-var name to TOML path is mechanical:
 
-| TOML | Env var |
-|---|---|
-| `[providers.models.anthropic.home] api_key = "..."` | `ZEROCLAW_providers__models__anthropic__home__api_key=...` |
-| `[channels.matrix] homeserver = "..."` | `ZEROCLAW_channels__matrix__homeserver=...` |
-| `[gateway] request_timeout_secs = 120` | `ZEROCLAW_gateway__request_timeout_secs=120` |
-| `[gateway] web_dist_dir = "/srv/zeroclaw/web/dist"` | `ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist` |
+{{#env-var-table}}
 
-The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen, substitute whatever names your `config.toml` actually uses.
+The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen, substitute whatever names your config actually uses.
 
 ## Bootstrap (uppercase tail)
 
@@ -78,7 +39,7 @@ ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DA
 </div>
 
 The gateway's web-dashboard location is configured via the standard
-schema-mirror form `ZEROCLAW_gateway__web_dist_dir`, see
+schema-mirror form {{#env-var-name gateway.web_dist_dir}}, see
 [Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full
 setting reference.
 
@@ -116,7 +77,7 @@ The override state is surfaced wherever the config is rendered, with a 💉 indi
 
 Three mechanical steps to derive an env-var name from any TOML key:
 
-1. **Prefix the path with `ZEROCLAW_`.** The dotted TOML path is the source of truth, find the field in your `config.toml` (or in `zeroclaw config schema`).
+1. **Prefix the path with `ZEROCLAW_`.** The dotted config path is the source of truth, find the field via `zeroclaw config schema`.
 2. **Replace `.` with `__`** (double underscore, the path separator).
 3. **Field name stays as-is** (snake_case). Aliases stay as-is. Nothing else transforms.
 
@@ -126,32 +87,9 @@ For example, `[providers.models.anthropic.home] api_key = "sk-..."` lives at the
 
 The schema-mirror grammar is the canonical way to inject values, but `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `QDRANT_URL` / etc. are still common names in `.env` files and CI configs. One-line shell expansions point a schema-mirror name at the ecosystem-default value:
 
-<div class="os-tabs-src">
+{{#env-var-bridge}}
 
-#### sh
-
-```sh
-# POSIX (bash, zsh, sh) — drop into ~/.bashrc / ~/.zshrc / .env / Dockerfile
-export ZEROCLAW_providers__models__anthropic__home__api_key="$ANTHROPIC_API_KEY"
-export ZEROCLAW_providers__models__openai__home__api_key="$OPENAI_API_KEY"
-export ZEROCLAW_providers__models__openrouter__home__api_key="$OPENROUTER_API_KEY"
-export ZEROCLAW_storage__qdrant__home__url="$QDRANT_URL"
-export ZEROCLAW_storage__qdrant__home__api_key="$QDRANT_API_KEY"
-export ZEROCLAW_gateway__request_timeout_secs="$GATEWAY_TIMEOUT_SECS"
-```
-
-#### PowerShell
-
-```powershell
-# PowerShell — drop into $PROFILE
-$env:ZEROCLAW_providers__models__anthropic__home__api_key = $env:ANTHROPIC_API_KEY
-$env:ZEROCLAW_providers__models__openai__home__api_key    = $env:OPENAI_API_KEY
-$env:ZEROCLAW_storage__qdrant__home__url                  = $env:QDRANT_URL
-```
-
-</div>
-
-Substitute the alias name in place of `home` to match your `config.toml`. For multiple aliases on the same family, repeat the line with each alias.
+Substitute the alias name in place of `home` to match your config. For multiple aliases on the same family, repeat the line with each alias.
 
 ## OAuth and CLI-path fields
 

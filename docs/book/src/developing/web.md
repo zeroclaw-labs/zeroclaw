@@ -18,7 +18,7 @@ cargo web install       # npm install in web/
 
 </div>
 
-`cargo web` is an alias for `cargo run -p xtask --bin web --` (defined in `.cargo/config.toml`). Every subcommand auto-runs `npm install` if `web/node_modules/` is missing.
+`cargo web` is an alias for `cargo run -p xtask --bin web --` (defined in the cargo config). Every subcommand auto-runs `npm install` if `web/node_modules/` is missing.
 
 ## What gets generated
 

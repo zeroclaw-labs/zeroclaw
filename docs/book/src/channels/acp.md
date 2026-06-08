@@ -311,7 +311,7 @@ zeroclaw-acp-bridge
 
 </div>
 
-The bridge reads the gateway address and auth token from the same `config.toml` as the daemon. When the daemon runs with a non-default config directory (e.g. `--config-dir /tmp/zeroclaw`), point the bridge at the same directory:
+The bridge reads the gateway address and auth token from the same config as the daemon. When the daemon runs with a non-default config directory (e.g. `--config-dir /tmp/zeroclaw`), point the bridge at the same directory:
 
 <div class="os-tabs-src">
 

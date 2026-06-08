@@ -159,7 +159,7 @@ zeroclaw --config-dir ~/.zeroclaw-work daemon
 
 </div>
 
-Each instance reads its own `config.toml`, its own `data/` (memory, sessions), its own gateway port (set per config), and its own channel bindings. Memory stays separate; a Telegram bot in one config dir doesn't know about the other.
+Each instance reads its own config, its own `data/` (memory, sessions), its own gateway port (set per config), and its own channel bindings. Memory stays separate; a Telegram bot in one config dir doesn't know about the other.
 
 `zeroclaw service install` always installs a single unit pointed at the default config directory; it has no flag to name or parameterize instances. To run more than one as a persistent service, hand-author a second unit file (copy `~/.config/systemd/user/zeroclaw.service` to a new name) whose `ExecStart` passes `--config-dir <dir>`, then enable it separately.
 

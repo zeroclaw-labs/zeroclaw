@@ -23,7 +23,6 @@ zeroclaw service (systemd / launchctl / Windows Service)
   │   ├── cron scheduler              — scheduled SOPs and jobs
   │   └── agent loop (per session)    — provider call + tool execution
   ├── data dir                        — ~/.zeroclaw/data/ (memory/, sessions/, state/)
-  ├── config.toml                     — ~/.zeroclaw/config.toml
   ├── .secret_key                     — ~/.zeroclaw/.secret_key (secrets-store master key)
   └── platform logs                   — journald / launchctl / Event Log
 ```
@@ -137,7 +136,6 @@ For multi-tenant hosting, see the proposal in #2765 (closed, historical, the arc
 
 What to back up:
 
-- `~/.zeroclaw/config.toml`: contains channel credentials (encrypted if using the secrets store)
 - `~/.zeroclaw/data/memory/*.db`: SQLite conversation memory (`brain.db`, plus `audit.db`)
 - `~/.zeroclaw/data/sessions/`: persisted session state
 - `~/.zeroclaw/.secret_key`: master key for the encrypted secrets store (if used). **Without it, the config's encrypted secrets are unrecoverable.**
