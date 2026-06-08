@@ -99,6 +99,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-irc"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Twitch"),
+        type_keys: &["twitch"],
+        compiled: cfg!(feature = "channel-twitch"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Lark"),
         type_keys: &["lark", "feishu"],
         compiled: cfg!(feature = "channel-lark"),

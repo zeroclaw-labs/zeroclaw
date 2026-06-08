@@ -4148,12 +4148,12 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            let model_provider = match &model_command {
-                ModelCommands::Refresh { model_provider, .. }
-                | ModelCommands::List { model_provider } => model_provider.as_deref(),
-                _ => None,
+            let (model_provider, show_names) = match &model_command {
+                ModelCommands::Refresh { model_provider, .. } => (model_provider.as_deref(), false),
+                ModelCommands::List { model_provider } => (model_provider.as_deref(), true),
+                _ => (None, false),
             };
-            doctor::run_models(&config, model_provider, false).await
+            doctor::run_models(&config, model_provider, false, show_names).await
         }
 
         Commands::Providers => {
@@ -4196,7 +4196,7 @@ async fn main() -> Result<()> {
             Some(DoctorCommands::Models {
                 model_provider,
                 use_cache,
-            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache).await,
+            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache, false).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,

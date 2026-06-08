@@ -98,6 +98,7 @@ pub enum ChannelKind {
     Signal,
     Slack,
     Telegram,
+    Twitch,
     Twitter,
     VoiceCall,
     VoiceWake,
