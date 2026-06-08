@@ -39,7 +39,7 @@ wire_api               = "responses"
 requires_openai_auth   = true
 ```
 
-OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"` to route through `POST /v1/responses` and `requires_openai_auth = true` to pull credentials from `OPENAI_API_KEY` / `~/.codex/auth.json` instead of an `api_key` field on the entry.
+OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"` to route through `POST /v1/responses` and `requires_openai_auth = true` to pull credentials from the OAuth profile imported from `~/.codex/auth.json` instead of an `api_key` field on the entry. The subscription path does not read `OPENAI_API_KEY` — that variable applies only to the metered `openai` API-key mode.
 
 ### Ollama — slot `ollama`
 
