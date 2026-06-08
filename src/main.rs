@@ -494,7 +494,7 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to providers.models.<type>.<alias>.temperature)
+        /// Temperature (0.0 - 2.0, defaults to `providers.models.<type>.<alias>.temperature`)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -707,7 +707,7 @@ Examples:
     /// Browse the shared workspace one directory at a time
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-List children of a directory under <install>/shared/. Paths are relative \
+List children of a directory under `<install>`/shared/. Paths are relative \
 to the shared workspace root; `..` traversal that escapes the root is \
 rejected. Used by the dashboard's skill-bundle directory picker and by \
 operators who want to inspect what's installed.
@@ -943,7 +943,7 @@ Examples:
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
-repository and install them under <config-dir>/data/ftl/<locale>/, where the \
+repository and install them under `<config-dir>/data/ftl/<locale>/`, where the \
 runtime and zerocode loaders read them.
 
 Pass a single locale. By default every catalogue is fetched; restrict with \
