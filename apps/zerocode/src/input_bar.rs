@@ -887,7 +887,7 @@ impl InputBarState {
     // ── Key handling ─────────────────────────────────────────
 
     /// Process a key event. Returns an action for the parent pane.
-    pub fn handle_key(&mut self, key: KeyEvent, turn_in_flight: bool) -> InputBarAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -922,11 +922,6 @@ impl InputBarState {
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
-        }
-
-        // Don't handle input while agent is responding.
-        if turn_in_flight {
-            return InputBarAction::NotHandled;
         }
 
         use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
@@ -1940,7 +1935,7 @@ mod tests {
         );
         bar.insert_text("/model ");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         // First catalog entry is accepted and the line is submitted in one
         // keystroke — no picker modal.
         assert!(matches!(action, InputBarAction::SetModel(m) if m == "claude-opus-4-8"));
@@ -1952,7 +1947,7 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("/mod");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         // `/model` still needs an argument: accept-and-fill, do not open the
         // picker or submit.
         assert!(matches!(action, InputBarAction::Consumed));
@@ -1965,7 +1960,7 @@ mod tests {
         bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);
         bar.insert_text("/model-provider open");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(action, InputBarAction::SetModelProvider(p) if p == "openai"));
         assert!(!bar.autocomplete_active);
     }
