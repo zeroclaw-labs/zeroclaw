@@ -8,69 +8,33 @@ ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Eve
 
 The on-disk JSONL append happens last and only when persistence is enabled; the Observer bridge and broadcast hook fire unconditionally.
 
-The `tracing` crate is `zeroclaw-log`'s implementation detail for the common path: the `record!` / `scope!` / `attribution_span!` macros expand to `zeroclaw_log::__private::tracing` so a typical call site never names a tracing type. The `record!` macro is the workspace-wide deny gate for direct `tracing::info!`/`warn!`/etc. (enforced via the workspace `clippy.toml`). A few crates still carry a `tracing` or `tracing-subscriber` dependency for their own bootstrap or fmt needs (`zeroclaw-api`, `zeroclaw-spawn`, `zeroclaw-providers`, `zeroclaw-hardware`), and a handful of `.rs` files outside `crates/zeroclaw-log/` name tracing types directly. The macro path is the convention; it is not a hard ban enforced everywhere.
+## Read this first: attribution is not attrs
 
-## The `record!` macro
+Every log event carries two completely separate channels of structured data. Confusing them is the single most common mistake at a call site, so internalize the split before anything else:
 
-The macro is locked-shape: it takes a level, a single `Event` expression, and a message literal.
+| | **Attribution** (`zeroclaw.*`) | **Attrs** (`attributes.*`) |
+|---|---|---|
+| **Answers** | *Who* did it and *under what context* | *What* specifically happened |
+| **Examples** | `channel`, `agent_alias`, `model_provider`, `tool`, `session_key`, `cron_job_id` | `bytes_received`, `tokens_used`, `status_code`, error payloads |
+| **Source** | **Spans.** Opened at entry points, walked by the layer. | **The call site.** `Event::with_attrs(json!({...}))`. |
+| **Appears at the call site?** | **Never.** Not a `record!` argument. | Yes — that's the only place it can come from. |
 
-```rust
-use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
+The rule that falls out of this: **if a value identifies who or what scope an event belongs to, it comes from a span and must never appear at the call site.** Attribution flows in automatically from `attribution_span!` / `scope!` wrappers opened higher up the stack; the layer walks the span scope leaf→root when an event fires and merges every contribution into the event's `zeroclaw.*` block. The call site that fires `record!` names none of it.
 
-record!(INFO, Event::new(module_path!(), Action::Start), "starting step");
-record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), "tool failed");
-```
+Because attribution is the load-bearing half of this split and the half that trips people up, it comes first.
 
-`module_path!()` is the canonical source of the event name: it's the Rust module path of the call site (e.g. `zeroclaw_channels::telegram`), so events are searchable, jump-to-source-able, and impossible to typo. The same convention is used at every `record!` site in the workspace.
+## Attribution: it all comes from spans
 
-The macro injects `file!()` and `line!()` automatically. The `LogCaptureLayer` attaches them to the event's `attributes` map as `_file` and `_line` so operators jump to source from a log viewer.
+**Attribution is never a call-site argument.** Read that again. Channel composite, agent_alias, model_provider, tool, session_key, cron_job_id — none of these are ever typed into a `record!` call. They flow in through tracing spans opened at entry points and walked by the layer when an event fires. If you find yourself wanting to pass `agent_alias` or `tool` to `record!`, stop: the value is already in scope through a span, or it should be, and the fix is to open or fix the span, not to thread the value into the call site.
 
-### Call-site contract
+The mechanism, end to end:
 
-Every `record!` call is a single line of code that says **what happened**, not **who did it or under what context**.
+1. A "thing" (channel, provider, agent, tool, cron job, memory backend, …) implements `Attributable` once, next to its struct.
+2. Its entry point wraps work in `attribution_span!(self)`, which opens a tracing span carrying that thing's role and alias.
+3. Every `record!` fired anywhere inside that span — directly or nested arbitrarily deep — inherits the attribution automatically.
+4. When the event fires, the layer walks the span scope **leaf→root**, merges every `Attributable`'s contribution, and writes the merged `zeroclaw.*` block. The call site named none of it.
 
-- The single positional argument after the level is an `Event` expression.
-- The next argument is a string literal for the human-readable message.
-- That is everything. Channel, agent_alias, provider, tool, session_key, cron_job_id, model: none of those are call-site arguments. They flow in from spans (see [Attribution](#attribution)).
-
-The shape is enforced by the `Event` struct: unknown fields are a compile error.
-
-### When attrs are warranted
-
-`Event::with_attrs(serde_json::json!({...}))` is for per-event measurements and ad-hoc data that exist nowhere in the surrounding scope. Concretely:
-
-- Per-event measurements: `bytes_received`, `tokens_used`, `retry_count`, `status_code`, `queue_depth`.
-- Error payloads when the error is the event itself: anyhow chain text, HTTP error body, parse-error details.
-- External-system identifiers: a remote API's `request_id`, an upstream trace header.
-- Derived state captured at this instant: in-flight count, retry-after seconds.
-
-**Attrs are NOT for** anything that comes from the surrounding scope: channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Those belong in a wrapping `attribution_span!` or `scope!`.
-
-The serde rule: pass the **raw value**, never `format!("{}", v)` or `format!("{:?}", v)`. `serde_json::json!` serializes strings as strings, numbers as numbers, `Vec<T>` as arrays, `Option<T>` as null-or-value. Wrap with `.to_string()` only when the type doesn't `impl Serialize` (e.g. `anyhow::Error`, `reqwest::Error`, `std::io::Error`, `Path::Display`, `StatusCode`).
-
-### Placeholder rule
-
-Rust string-literal placeholders like `"raw error body: {body}"` are forbidden inside `record!` messages. Rust 2021's implicit format-string capture does not flow through `record!`: every `{var}` becomes a literal substring with no substitution. The conversion rule:
-
-```rust
-// BAD — {body} is a literal, never interpolated
-record!(WARN, Event::new(module_path!(), Action::Fail), "raw error body: {body}");
-
-// GOOD — body in attrs, message is plain prose
-record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), "raw error body");
-```
-
-## `Event`, `Action`, `EventOutcome`, `EventCategory`
-
-All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding a value is the only point of change: call sites do not invent strings.
-
-- `Action`: closed verb set, snake-cased on disk via `strum::IntoStaticStr`: `Start`, `Complete`, `Fail`, `Cancel`, `Skip`, `Timeout`, `Retry`, `Inbound`, `Outbound`, `Send`, `Receive`, `Connect`, `Disconnect`, `Reconnect`, `Spawn`, `Kill`, `Tick`, `Trigger`, `Schedule`, `Approve`, `Reject`, `Defer`, `Read`, `Write`, `Delete`, `List`, `Query`, `Invoke`, `Dispatch`, `Resolve`, `Register`, `Unregister`, `Load`, `Save`, `Migrate`, `Validate`, `Note`.
-- `EventOutcome`: `Success`, `Failure`, `Unknown`. `Unknown` is the default and is skipped on serialization (omitted from the on-disk `event.outcome`), so a row with no `outcome` key is implicitly `Unknown`.
-- `EventCategory`: `Agent`, `Channel`, `Cron`, `Memory`, `Tool`, `Provider`, `Session`, `System`, `Internal`. Derived from the innermost role span unless overridden via `Event::with_category(...)`.
-
-## Attribution
-
-Alias-bound attribution (channel composite, agent_alias, model_provider, tool, cron_job_id, …) is never a call-site argument. It flows through tracing spans opened at entry points and walked by the layer.
+This is the whole point of the design: per-thing logging code is zero. You impl the trait once and wrap the entry point once; every emission underneath is attributed for free.
 
 ### The `Attributable` trait
 
@@ -109,9 +73,9 @@ pub enum Role {
 
 `ChannelKind`, `ToolKind`, `CronKind`, `MemoryKind`, and the four `ProviderKind` sub-enums (`ModelProviderKind`, `TtsProviderKind`, `TranscriptionProviderKind`, `TunnelProviderKind`) are all closed. The variant's snake_case form via `strum::IntoStaticStr` is the canonical `<type>` portion of the `<type>.<alias>` composite. Adding a new implementation: extend the relevant `Kind` enum, that's it.
 
-### Opening a span
+### Opening a span — do this at every entry point
 
-Wrap an entry-point's work with `attribution_span!(thing)`. The macro returns a `Span` carrying the thing's role and alias as structured fields. `.instrument(span)` the future (or `let _g = span.entered()` in sync code).
+Wrap an entry-point's work with `attribution_span!(thing)`. The macro returns a `Span` carrying the thing's role and alias as structured fields. `.instrument(span)` the future (or `let _g = span.entered()` in sync code). **A spawned task that does not re-establish the span loses attribution** — every `tokio::spawn` body that emits must carry the same `attribution_span!` / `scope!` the parent used, or its emissions land un-attributed.
 
 ```rust
 use zeroclaw_log::Instrument;
@@ -126,9 +90,9 @@ async move {
 
 The layer walks the span scope leaf→root when an event fires, merges every `Attributable`'s contribution into the event's `zeroclaw.*` attribution block, and emits the composite (`channel = "telegram.clamps"`, `channel_type = "telegram"`, `channel_alias = "clamps"`) without the call site naming any of those keys.
 
-### The `scope!` macro
+### The `scope!` macro — non-role context
 
-For per-scope identifiers that aren't tied to a role-bearing `Attributable` thing, sender id, message id, turn id, request id, use `scope!`:
+`attribution_span!` is for role-bearing `Attributable` things. For per-scope identifiers that aren't tied to one — sender id, message id, turn id, request id — use `scope!`:
 
 ```rust
 zeroclaw_log::scope!(
@@ -138,7 +102,69 @@ zeroclaw_log::scope!(
 ).await
 ```
 
-Field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES` (in `crates/zeroclaw-log/src/event.rs`) land in the typed attribution slot; everything else lands in the event `attributes` map for every descendant emission.
+`scope!` straddles the attribution/attrs line deliberately: field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES` (in `crates/zeroclaw-log/src/event.rs`) land in the typed `zeroclaw.*` attribution slot; everything else lands in the event `attributes` map for every descendant emission. Either way the value rides on every nested `record!` without being a call-site argument.
+
+## The `record!` macro and its call-site contract
+
+The `tracing` crate is `zeroclaw-log`'s implementation detail: the `record!` / `scope!` / `attribution_span!` macros expand to `zeroclaw_log::__private::tracing` so a call site never names a tracing type. The log-event macros themselves — `tracing::{trace,debug,info,warn,error}`, `log::*`, `std::dbg`, plus bare `anyhow::anyhow!` — are **hard-banned workspace-wide** as `disallowed-macros` in `clippy.toml`. With `-D warnings` in CI, any direct `tracing::info!` etc. **fails the build**, with a clippy message naming `::zeroclaw_log::record!` as the replacement. This is not a convention; it is enforced.
+
+The only exemptions are the few files inside `crates/zeroclaw-log/` that bootstrap the pipeline and carry a local `#![allow(clippy::disallowed_macros)]`. A handful of crates (`zeroclaw-api`, `zeroclaw-spawn`, `zeroclaw-providers`, `zeroclaw-hardware`, `zeroclaw-log`) still list `tracing` / `tracing-subscriber` in `Cargo.toml`, but only for span and subscriber plumbing — not for emitting log macros. The dependency being present does not license calling the banned macros. (`tokio::spawn` is banned the same way via `disallowed-methods`; use `::zeroclaw_spawn::spawn!` so spawned tasks inherit the caller's attribution span.)
+
+The macro is locked-shape: it takes a level, a single `Event` expression, and a message literal.
+
+```rust
+use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
+
+record!(INFO, Event::new(module_path!(), Action::Start), "starting step");
+record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), "tool failed");
+```
+
+`module_path!()` is the canonical source of the event name: it's the Rust module path of the call site (e.g. `zeroclaw_channels::telegram`), so events are searchable, jump-to-source-able, and impossible to typo. The same convention is used at every `record!` site in the workspace.
+
+The macro injects `file!()` and `line!()` automatically. The `LogCaptureLayer` attaches them to the event's `attributes` map as `_file` and `_line` so operators jump to source from a log viewer.
+
+### Call-site contract
+
+Every `record!` call is a single line of code that says **what happened**, not **who did it or under what context**.
+
+- The single positional argument after the level is an `Event` expression.
+- The next argument is a string literal for the human-readable message.
+- That is everything. Channel, agent_alias, provider, tool, session_key, cron_job_id, model: none of those are call-site arguments. They flow in from spans (see [Attribution: it all comes from spans](#attribution-it-all-comes-from-spans)).
+
+The shape is enforced by the `Event` struct: unknown fields are a compile error.
+
+### When attrs are warranted
+
+`Event::with_attrs(serde_json::json!({...}))` is for per-event measurements and ad-hoc data that exist nowhere in the surrounding scope. Concretely:
+
+- Per-event measurements: `bytes_received`, `tokens_used`, `retry_count`, `status_code`, `queue_depth`.
+- Error payloads when the error is the event itself: anyhow chain text, HTTP error body, parse-error details.
+- External-system identifiers: a remote API's `request_id`, an upstream trace header.
+- Derived state captured at this instant: in-flight count, retry-after seconds.
+
+**Attrs are NOT for** anything that comes from the surrounding scope: channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Those belong in a wrapping `attribution_span!` or `scope!`.
+
+The serde rule: pass the **raw value**, never `format!("{}", v)` or `format!("{:?}", v)`. `serde_json::json!` serializes strings as strings, numbers as numbers, `Vec<T>` as arrays, `Option<T>` as null-or-value. Wrap with `.to_string()` only when the type doesn't `impl Serialize` (e.g. `anyhow::Error`, `reqwest::Error`, `std::io::Error`, `Path::Display`, `StatusCode`).
+
+### Placeholder rule
+
+Rust string-literal placeholders like `"raw error body: {body}"` are forbidden inside `record!` messages. Rust 2021's implicit format-string capture does not flow through `record!`: every `{var}` becomes a literal substring with no substitution. The conversion rule:
+
+```rust
+// BAD — {body} is a literal, never interpolated
+record!(WARN, Event::new(module_path!(), Action::Fail), "raw error body: {body}");
+
+// GOOD — body in attrs, message is plain prose
+record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), "raw error body");
+```
+
+## `Event`, `Action`, `EventOutcome`, `EventCategory`
+
+All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding a value is the only point of change: call sites do not invent strings.
+
+- `Action`: closed verb set, snake-cased on disk via `strum::IntoStaticStr`: `Start`, `Complete`, `Fail`, `Cancel`, `Skip`, `Timeout`, `Retry`, `Inbound`, `Outbound`, `Send`, `Receive`, `Connect`, `Disconnect`, `Reconnect`, `Spawn`, `Kill`, `Tick`, `Trigger`, `Schedule`, `Approve`, `Reject`, `Defer`, `Read`, `Write`, `Delete`, `List`, `Query`, `Invoke`, `Dispatch`, `Resolve`, `Register`, `Unregister`, `Load`, `Save`, `Migrate`, `Validate`, `Note`.
+- `EventOutcome`: `Success`, `Failure`, `Unknown`. `Unknown` is the default and is skipped on serialization (omitted from the on-disk `event.outcome`), so a row with no `outcome` key is implicitly `Unknown`.
+- `EventCategory`: `Agent`, `Channel`, `Cron`, `Memory`, `Tool`, `Provider`, `Session`, `System`, `Internal`. Derived from the innermost role span unless overridden via `Event::with_category(...)`.
 
 ## Tool input/output propagation
 
