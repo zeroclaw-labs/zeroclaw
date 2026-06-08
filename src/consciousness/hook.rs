@@ -37,12 +37,19 @@ use crate::cosmic::{
 /// over the lifetime of the Agent.
 pub struct ConsciousnessHook {
     orchestrator: tokio::sync::Mutex<ConsciousnessOrchestrator>,
+    /// The most recent turn's rendered deliberation, injected as a prompt
+    /// prefix by `before_prompt_build`. `None` until the first tick produces
+    /// a non-empty narrative. Stored separately from the tick so the loop's
+    /// per-iteration prompt builds reuse one deliberation per turn rather
+    /// than re-ticking the orchestrator on every tool round.
+    last_deliberation: tokio::sync::Mutex<Option<String>>,
 }
 
 impl ConsciousnessHook {
     pub fn new(settings: &ConsciousnessSettings) -> Self {
         Self {
             orchestrator: tokio::sync::Mutex::new(build_orchestrator(settings)),
+            last_deliberation: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -113,7 +120,37 @@ impl HookHandler for ConsciousnessHook {
             debate_rounds = result.debate_rounds_used,
             "consciousness tick"
         );
+
+        // Render the council's current thought into a compact one-line block.
+        // Empty narratives produce no injection (e.g. a cold first tick).
+        let intention = result.narrative.current_intention.trim();
+        let synthesis = result.narrative.synthesis.trim();
+        let deliberation = if intention.is_empty() && synthesis.is_empty() {
+            None
+        } else {
+            let body: Vec<&str> = [intention, synthesis]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(format!(
+                "[Internal deliberation (coherence {:.2}): {}]",
+                result.coherence,
+                body.join(" ")
+            ))
+        };
+        *self.last_deliberation.lock().await = deliberation;
+
         HookResult::Continue(message)
+    }
+
+    async fn before_prompt_build(&self, prompt: String) -> HookResult<String> {
+        // Inject this turn's deliberation as a prompt prefix so the council's
+        // reasoning actually shapes the model's response. Observe-only when no
+        // deliberation is available (the prompt passes through unchanged).
+        match self.last_deliberation.lock().await.as_deref() {
+            Some(deliberation) => HookResult::Continue(format!("{deliberation}\n\n{prompt}")),
+            None => HookResult::Continue(prompt),
+        }
     }
 }
 
@@ -158,6 +195,16 @@ mod tests {
         match hook.on_message_received(ChannelMessage::default()).await {
             HookResult::Continue(_) => {}
             HookResult::Cancel(reason) => panic!("second tick cancelled: {reason}"),
+        }
+
+        // before_prompt_build returns the prompt, optionally prefixed with the
+        // deliberation block. The original prompt body is always preserved.
+        match hook.before_prompt_build("USER PROMPT".to_string()).await {
+            HookResult::Continue(p) => assert!(
+                p.contains("USER PROMPT"),
+                "prompt body must be preserved, got: {p}"
+            ),
+            HookResult::Cancel(reason) => panic!("prompt build cancelled: {reason}"),
         }
     }
 }
