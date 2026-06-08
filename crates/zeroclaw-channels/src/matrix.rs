@@ -1299,16 +1299,23 @@ mod client {
         }
     }
 
-    /// Create Secure Backup + secret storage for an account that has none.
-    /// Seeds secret storage with the operator's configured `recovery_key` as
-    /// the passphrase, so the same configured value unlocks it on later
-    /// starts. The SDK also returns a freshly generated base58 recovery key;
-    /// it is logged so an operator who prefers the generated key over a
-    /// passphrase can persist it into `channels.matrix.recovery-key`.
+    /// Create or repair Secure Backup for an account whose secret storage is
+    /// absent (`RecoveryState::Disabled`). Seeds secret storage with the
+    /// operator's configured `recovery_key` as the passphrase so the same
+    /// configured value unlocks it on later starts. The SDK returns a freshly
+    /// generated base58 recovery key, logged so an operator who prefers it can
+    /// persist it into `channels.matrix.recovery-key`.
+    ///
+    /// Two shapes of `Disabled` are handled: no backup at all (`enable()`
+    /// creates one), and a stale server-side backup version with no secret
+    /// storage default key (`enable()` returns `BackupExistsOnServer`, so we
+    /// `reset_key()` to rotate fresh secret storage and re-link the backup).
     async fn bootstrap_recovery(
         recovery: &matrix_sdk::encryption::recovery::Recovery,
         passphrase: &str,
     ) {
+        use matrix_sdk::encryption::recovery::RecoveryError;
+
         let enable = recovery.enable().wait_for_backups_to_upload();
         let enable = if passphrase.is_empty() {
             enable
@@ -1316,12 +1323,42 @@ mod client {
             enable.with_passphrase(passphrase)
         };
         match enable.await {
-            Ok(generated_key) => ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"generated_recovery_key": generated_key})),
-                "matrix: Secure Backup bootstrapped (created secret storage + key backup). Keep the generated_recovery_key safe; it (or the configured passphrase) unlocks backup on future starts."
-            ),
+            Ok(generated_key) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"generated_recovery_key": generated_key})),
+                    "matrix: Secure Backup bootstrapped (created secret storage + key backup). Keep the generated_recovery_key safe; it (or the configured passphrase) unlocks backup on future starts."
+                );
+            }
+            // A backup version exists server-side but secret storage is absent
+            // (no m.secret_storage.default_key), so enable() refuses. Rotate
+            // fresh secret storage and re-link the existing backup instead.
+            Err(RecoveryError::BackupExistsOnServer) => {
+                let reset = recovery.reset_key();
+                let reset = if passphrase.is_empty() {
+                    reset
+                } else {
+                    reset.with_passphrase(passphrase)
+                };
+                match reset.await {
+                    Ok(generated_key) => ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(
+                                ::serde_json::json!({"generated_recovery_key": generated_key})
+                            ),
+                        "matrix: Secure Backup repaired (a server-side backup existed without secret storage; rotated fresh secret storage and re-linked). Keep the generated_recovery_key safe."
+                    ),
+                    Err(e) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                        "matrix: failed to repair Secure Backup via reset_key; key backup remains unconfigured for this account"
+                    ),
+                }
+            }
             Err(e) => ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3348,13 +3385,17 @@ impl MatrixChannel {
     }
 
     async fn ensure_client(&self) -> Result<&Client> {
+        use ::zeroclaw_log::__private::tracing::Instrument;
         self.client
-            .get_or_try_init(|| async {
-                let c = client::build(&self.config, &self.state_dir).await?;
-                if let Ok(Some(name)) = c.account().get_display_name().await {
-                    *self.bot_display_name.write().await = Some(name);
+            .get_or_try_init(|| {
+                async {
+                    let c = client::build(&self.config, &self.state_dir).await?;
+                    if let Ok(Some(name)) = c.account().get_display_name().await {
+                        *self.bot_display_name.write().await = Some(name);
+                    }
+                    Ok::<_, anyhow::Error>(c)
                 }
-                Ok::<_, anyhow::Error>(c)
+                .instrument(::zeroclaw_log::attribution_span!(self))
             })
             .await
     }
