@@ -1379,6 +1379,14 @@ async fn main() -> Result<()> {
     #[cfg(feature = "x0-extended")]
     crate::continuity::register_hook_factory();
 
+    // Install the consciousness orchestrator hook so every Agent built after
+    // this point ticks the perceive→debate→decide→act→reflect loop once per
+    // inbound message when config.consciousness.enabled is true. Gated behind
+    // x0-broken-legacy alongside the consciousness module itself.
+    //   src/consciousness/hook.rs (HookHandler implementation)
+    #[cfg(feature = "x0-broken-legacy")]
+    crate::consciousness::hook::register_hook_factory();
+
     let cmd = apply_i18n_to_command(Cli::command());
 
     if std::env::args_os().len() <= 1 {
