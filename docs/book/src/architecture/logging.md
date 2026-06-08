@@ -1,12 +1,14 @@
 # Logging architecture
 
-ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace, agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors, flows through it. The macro feeds a single `LogCaptureLayer` that materializes structured `LogEvent` records and routes them to three sinks at once:
+ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace, agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors, flows through it. The macro fires a `tracing` event that the installed subscriber feeds to two sibling layers: the stderr fmt layer (terminal output) and the `LogCaptureLayer`. The fmt layer prints colored, alias-prefixed lines on stderr (muted unless `--verbose`). The `LogCaptureLayer` materializes a structured `LogEvent` and fans it out, via `writer::record_event`, to:
 
-1. The terminal (via the `tracing-subscriber` fmt layer that `zeroclaw-log` installs internally) so operators see colored, alias-prefixed lines on stderr.
-2. The persisted JSONL log at `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"` or `"full"`).
-3. The process-wide broadcast channel so the dashboard's SSE stream sees every event live.
+1. The Observer bridge (`observer_bridge::forward`) for Prometheus / OTel typed metrics.
+2. The process-wide broadcast channel so the dashboard's SSE stream sees every event live.
+3. The persisted JSONL log at `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"` or `"full"`).
 
-The `tracing` crate is `zeroclaw-log`'s implementation detail. No other workspace crate references `tracing`, `tracing-subscriber`, or `tracing-attributes`. Their Cargo.toml files do not depend on those crates, and no `.rs` file outside `crates/zeroclaw-log/` names a tracing type.
+The on-disk JSONL append happens last and only when persistence is enabled; the Observer bridge and broadcast hook fire unconditionally.
+
+The `tracing` crate is `zeroclaw-log`'s implementation detail for the common path: the `record!` / `scope!` / `attribution_span!` macros expand to `zeroclaw_log::__private::tracing` so a typical call site never names a tracing type. The `record!` macro is the workspace-wide deny gate for direct `tracing::info!`/`warn!`/etc. (enforced via the workspace `clippy.toml`). A few crates still carry a `tracing` or `tracing-subscriber` dependency for their own bootstrap or fmt needs (`zeroclaw-api`, `zeroclaw-spawn`, `zeroclaw-providers`, `zeroclaw-hardware`), and a handful of `.rs` files outside `crates/zeroclaw-log/` name tracing types directly. The macro path is the convention; it is not a hard ban enforced everywhere.
 
 ## The `record!` macro
 
@@ -63,7 +65,7 @@ record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::js
 All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding a value is the only point of change: call sites do not invent strings.
 
 - `Action`: closed verb set, snake-cased on disk via `strum::IntoStaticStr`: `Start`, `Complete`, `Fail`, `Cancel`, `Skip`, `Timeout`, `Retry`, `Inbound`, `Outbound`, `Send`, `Receive`, `Connect`, `Disconnect`, `Reconnect`, `Spawn`, `Kill`, `Tick`, `Trigger`, `Schedule`, `Approve`, `Reject`, `Defer`, `Read`, `Write`, `Delete`, `List`, `Query`, `Invoke`, `Dispatch`, `Resolve`, `Register`, `Unregister`, `Load`, `Save`, `Migrate`, `Validate`, `Note`.
-- `EventOutcome`: `Success`, `Failure`, `Unknown` (the default, terminal outcome correlated to the matching Start via `trace_id`).
+- `EventOutcome`: `Success`, `Failure`, `Unknown`. `Unknown` is the default and is skipped on serialization (omitted from the on-disk `event.outcome`), so a row with no `outcome` key is implicitly `Unknown`.
 - `EventCategory`: `Agent`, `Channel`, `Cron`, `Memory`, `Tool`, `Provider`, `Session`, `System`, `Internal`. Derived from the innermost role span unless overridden via `Event::with_category(...)`.
 
 ## Attribution
@@ -95,10 +97,11 @@ pub enum Role {
     Tool(ToolKind),             // Shell, HttpRequest, FetchUrl, ...
     Cron(CronKind),             // Interval, At, Cron, Once
     Provider(ProviderKind),     // Model, Tts, Transcription, Tunnel
-    Memory(MemoryKind),         // Sqlite, Json, InMemory
+    Memory(MemoryKind),         // Sqlite, Json, InMemory, Markdown, Qdrant, ...
     PeerGroup,
     Skill,
     Mcp,
+    Sop,
     Session,
     System,
 }
@@ -139,15 +142,15 @@ Field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES
 
 ## Tool input/output propagation
 
-The central tool executor (`crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool`) wraps every `Tool::execute(args)` call with start/complete/fail events:
+The central tool executor (`crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool`) wraps every `Tool::execute(args)` call with invoke/complete/fail events. Each event's name is `module_path!()` (the executor's own module), not a hardcoded string; the `Action` and severity distinguish them:
 
-1. Emits `Event::new("tool.invoke.start", Action::Invoke)` with `args` in attrs.
+1. Before running: `record!(DEBUG, Event::new(module_path!(), Action::Invoke).with_category(EventCategory::Tool).with_attrs(...))` with `tool`, `tool_call_id`, and the full `input` in attrs.
 2. Runs `execute(args).await`.
-3. On success: `Event::new("tool.invoke.complete", Action::Complete)` with `Outcome::Success`, the duration, and the output in attrs.
-4. On failure: `Event::new("tool.invoke.fail", Action::Fail)` with `Outcome::Failure`, the duration, and the error/output in attrs.
-5. On panic / `Err`: same fail emission, error chain in attrs.
+3. On success (`r.success`): `record!(DEBUG, ... Action::Complete)` with `Outcome::Success`, the duration, and `tool` / `tool_call_id` / `input` / `output` in attrs.
+4. On tool-reported failure (`!r.success`): `record!(WARN, ... Action::Fail)` with `Outcome::Failure`, the duration, and `tool` / `tool_call_id` / `input` / `error` / `output` in attrs.
+5. On `Err` from `execute`: `record!(ERROR, ... Action::Fail)` with `Outcome::Failure`, the duration, and the debug-formatted error in attrs.
 
-Per-tool `Tool::execute` impls add zero logging code. The matching pair (start ↔ complete/fail) shares a `trace_id` via the surrounding span scope, so a dashboard query can correlate them.
+These events are emitted inside a `scope!`-style span (`target = "zeroclaw_log_internal_scope"`, field `tool = <name>`) opened around the call, so the `tool` field rides on every descendant emission too. Per-tool `Tool::execute` impls add zero logging code.
 
 ## `LogCaptureLayer` and the on-disk schema
 
@@ -155,10 +158,10 @@ The layer in `crates/zeroclaw-log/src/layer.rs` is a `tracing-subscriber` Layer 
 
 1. On span creation/record with target `"zeroclaw_log_internal_attribution"` (the target the `attribution_span!` macro opens with): parses the role + alias fields into a `ZeroclawAttribution` snapshot stored on the span's extensions.
 2. On span creation/record with target `"zeroclaw_log_internal_scope"` (`scope!`-opened): parses ad-hoc kvps and stashes them similarly.
-3. On event emission with target `"zeroclaw_log_event"` (the target the `record!` macro fires through): builds a `LogEvent` from the `zc_*` field set, walks the span scope leaf→root merging every attribution snapshot it finds, parses the `zc_attrs` JSON blob into the event `attributes`, attaches `_file`/`_line` from auto-captured source location, and writes the final event to:
-   - JSONL persistence (`writer.rs`).
-   - Broadcast hook (`broadcast.rs`) for SSE/dashboard subscribers.
-   - Observer bridge (`observer_bridge.rs`) for Prometheus / OTel typed metrics.
+3. On event emission with target `"zeroclaw_log_event"` (the target the `record!` macro fires through): builds a `LogEvent` from the `zc_*` field set, walks the span scope leaf→root merging every attribution snapshot it finds, parses the `zc_attrs` JSON blob into the event `attributes`, attaches `_file`/`_line` from auto-captured source location, and hands the final event to `writer::record_event`, which fans out in this order:
+   - Observer bridge (`observer_bridge.rs`) for Prometheus / OTel typed metrics (unconditional).
+   - Broadcast hook (`broadcast.rs`) for SSE/dashboard subscribers (unconditional).
+   - JSONL persistence (`writer.rs`), appended last and only when `log_persistence` is enabled.
 
 The on-disk JSON shape (`LogEvent` in `event.rs`):
 
@@ -199,10 +202,14 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 The daemon installs the global subscriber via:
 
 ```rust
-zeroclaw_log::install_global_subscriber("info,matrix_sdk=warn,matrix_sdk_base=warn");
+zeroclaw_log::install_global_subscriber(
+    recording_filter.as_deref(),   // Option<&str> — the --log-level flag, if set
+    &default_filter,               // &str — fallback filter when no flag and no RUST_LOG
+    cli.verbose,                   // bool — gates the stderr fmt (terminal) layer
+);
 ```
 
-That single call sets up the agent-alias-prefixed terminal formatter + the `LogCaptureLayer` over a `tracing-subscriber::Registry`. `src/main.rs` is the only place that calls it. Tests use `zeroclaw_log::try_install_capture_subscriber()` + `zeroclaw_log::subscribe_or_install()` to drain emitted events through the broadcast hook without any tracing types named in the test crate.
+Two independent axes: the **recording floor** (what reaches `LogCaptureLayer`, resolved as flag → `RUST_LOG` → default) and **terminal display** (the stderr fmt layer, muted entirely unless `verbose` is true). That single call sets up the agent-alias-prefixed terminal formatter + the `LogCaptureLayer` over a `tracing-subscriber::Registry`. `src/main.rs` is the only place that calls it. Tests use `zeroclaw_log::try_install_capture_subscriber()` + `zeroclaw_log::subscribe_or_install()` to drain emitted events through the broadcast hook without any tracing types named in the test crate.
 
 ## When to extend the closed enums
 
