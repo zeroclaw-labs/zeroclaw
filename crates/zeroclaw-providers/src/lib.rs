@@ -1769,12 +1769,16 @@ fn push_family(
     category: ModelProviderCategory,
     families: &[(&'static str, &'static str, bool)],
 ) {
-    out.extend(families.iter().map(|&(name, display_name, local)| ModelProviderInfo {
-        name,
-        display_name,
-        local,
-        category,
-    }));
+    out.extend(
+        families
+            .iter()
+            .map(|&(name, display_name, local)| ModelProviderInfo {
+                name,
+                display_name,
+                local,
+                category,
+            }),
+    );
 }
 
 /// Return the list of all known model_providers for display in `zeroclaw model_providers list`.
@@ -1783,84 +1787,110 @@ fn push_family(
 /// (display concern vs. construction concern).
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     let mut out: Vec<ModelProviderInfo> = Vec::new();
-    push_family(&mut out, ModelProviderCategory::Primary, &[
-        ("openrouter", "OpenRouter", false),
-        ("anthropic", "Anthropic", false),
-        ("openai", "OpenAI", false),
-        ("telnyx", "Telnyx", false),
-        ("azure", "Azure OpenAI", false),
-        ("ollama", "Ollama", true),
-        ("gemini", "Google Gemini", false),
-    ]);
-    push_family(&mut out, ModelProviderCategory::OpenAiCompatible, &[
-        ("venice", "Venice", false),
-        ("vercel", "Vercel AI Gateway", false),
-        ("cloudflare", "Cloudflare AI", false),
-        ("moonshot", "Moonshot", false),
-        ("synthetic", "Synthetic", false),
-        ("opencode", "OpenCode", false),
-        ("zai", "Z.AI", false),
-        ("glm", "GLM (Zhipu)", false),
-        ("minimax", "MiniMax", false),
-        ("bedrock", "Amazon Bedrock", false),
-        ("qianfan", "Qianfan (Baidu)", false),
-        ("doubao", "Doubao (Volcengine)", false),
-        ("qwen", "Qwen (DashScope / Qwen Code OAuth)", false),
-        ("groq", "Groq", false),
-        ("mistral", "Mistral", false),
-        ("xai", "xAI (Grok)", false),
-        ("deepseek", "DeepSeek", false),
-        ("together", "Together AI", false),
-        ("fireworks", "Fireworks AI", false),
-        ("novita", "Novita AI", false),
-        ("perplexity", "Perplexity", false),
-        ("cohere", "Cohere", false),
-        ("copilot", "GitHub Copilot", false),
-        ("gemini_cli", "Gemini CLI", true),
-        ("kilocli", "KiloCLI", true),
-        ("lmstudio", "LM Studio", true),
-        ("llamacpp", "llama.cpp server", true),
-        ("sglang", "SGLang", true),
-        ("vllm", "vLLM", true),
-        ("osaurus", "Osaurus", true),
-        ("nvidia", "NVIDIA NIM", false),
-        ("siliconflow", "SiliconFlow", false),
-        ("aihubmix", "AiHubMix", false),
-        ("litellm", "LiteLLM", false),
-        ("atomic_chat", "Atomic Chat", true),
-        ("astrai", "Astrai", false),
-        ("deepmyst", "DeepMyst", false),
-        ("custom", "Custom (OpenAI-compatible)", false),
-    ]);
-    push_family(&mut out, ModelProviderCategory::FastInference, &[
-        ("cerebras", "Cerebras", false),
-        ("sambanova", "SambaNova", false),
-        ("hyperbolic", "Hyperbolic", false),
-    ]);
-    push_family(&mut out, ModelProviderCategory::ModelHosting, &[
-        ("deepinfra", "DeepInfra", false),
-        ("huggingface", "Hugging Face", false),
-        ("ai21", "AI21 Labs", false),
-        ("reka", "Reka", false),
-        ("baseten", "Baseten", false),
-        ("nscale", "Nscale", false),
-        ("anyscale", "Anyscale", false),
-        ("nebius", "Nebius AI Studio", false),
-        ("friendli", "Friendli AI", false),
-        ("lepton", "Lepton AI", false),
-    ]);
-    push_family(&mut out, ModelProviderCategory::ChineseAi, &[
-        ("stepfun", "Stepfun", false),
-        ("baichuan", "Baichuan", false),
-        ("yi", "01.AI (Yi)", false),
-        ("hunyuan", "Tencent Hunyuan", false),
-    ]);
-    push_family(&mut out, ModelProviderCategory::CloudEndpoint, &[
-        ("ovh", "OVHcloud AI Endpoints", false),
-        ("avian", "Avian", false),
-    ]);
+    push_family(
+        &mut out,
+        ModelProviderCategory::Primary,
+        &[
+            ("openrouter", "OpenRouter", false),
+            ("anthropic", "Anthropic", false),
+            ("openai", "OpenAI", false),
+            ("telnyx", "Telnyx", false),
+            ("azure", "Azure OpenAI", false),
+            ("ollama", "Ollama", true),
+            ("gemini", "Google Gemini", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::OpenAiCompatible,
+        &[
+            ("venice", "Venice", false),
+            ("vercel", "Vercel AI Gateway", false),
+            ("cloudflare", "Cloudflare AI", false),
+            ("moonshot", "Moonshot", false),
+            ("synthetic", "Synthetic", false),
+            ("opencode", "OpenCode", false),
+            ("zai", "Z.AI", false),
+            ("glm", "GLM (Zhipu)", false),
+            ("minimax", "MiniMax", false),
+            ("bedrock", "Amazon Bedrock", false),
+            ("qianfan", "Qianfan (Baidu)", false),
+            ("doubao", "Doubao (Volcengine)", false),
+            ("qwen", "Qwen (DashScope / Qwen Code OAuth)", false),
+            ("groq", "Groq", false),
+            ("mistral", "Mistral", false),
+            ("xai", "xAI (Grok)", false),
+            ("deepseek", "DeepSeek", false),
+            ("together", "Together AI", false),
+            ("fireworks", "Fireworks AI", false),
+            ("novita", "Novita AI", false),
+            ("perplexity", "Perplexity", false),
+            ("cohere", "Cohere", false),
+            ("copilot", "GitHub Copilot", false),
+            ("gemini_cli", "Gemini CLI", true),
+            ("kilocli", "KiloCLI", true),
+            ("lmstudio", "LM Studio", true),
+            ("llamacpp", "llama.cpp server", true),
+            ("sglang", "SGLang", true),
+            ("vllm", "vLLM", true),
+            ("osaurus", "Osaurus", true),
+            ("nvidia", "NVIDIA NIM", false),
+            ("siliconflow", "SiliconFlow", false),
+            ("aihubmix", "AiHubMix", false),
+            ("litellm", "LiteLLM", false),
+            ("atomic_chat", "Atomic Chat", true),
+            ("astrai", "Astrai", false),
+            ("deepmyst", "DeepMyst", false),
+            ("custom", "Custom (OpenAI-compatible)", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::FastInference,
+        &[
+            ("cerebras", "Cerebras", false),
+            ("sambanova", "SambaNova", false),
+            ("hyperbolic", "Hyperbolic", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::ModelHosting,
+        &[
+            ("deepinfra", "DeepInfra", false),
+            ("huggingface", "Hugging Face", false),
+            ("ai21", "AI21 Labs", false),
+            ("reka", "Reka", false),
+            ("baseten", "Baseten", false),
+            ("nscale", "Nscale", false),
+            ("anyscale", "Anyscale", false),
+            ("nebius", "Nebius AI Studio", false),
+            ("friendli", "Friendli AI", false),
+            ("lepton", "Lepton AI", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::ChineseAi,
+        &[
+            ("stepfun", "Stepfun", false),
+            ("baichuan", "Baichuan", false),
+            ("yi", "01.AI (Yi)", false),
+            ("hunyuan", "Tencent Hunyuan", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::CloudEndpoint,
+        &[
+            ("ovh", "OVHcloud AI Endpoints", false),
+            ("avian", "Avian", false),
+        ],
+    );
     debug_assert_eq!(
-        out.iter().map(|p| p.name).collect::<std::collections::BTreeSet<_>>(),
+        out.iter()
+            .map(|p| p.name)
+            .collect::<std::collections::BTreeSet<_>>(),
         canonical_model_provider_slots()
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),

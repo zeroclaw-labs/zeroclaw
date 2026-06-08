@@ -387,7 +387,10 @@ fn render_model_provider_catalog_table() -> String {
     let providers = zeroclaw_providers::list_model_providers();
     let mut out = String::new();
     for category in C::all() {
-        let rows: Vec<_> = providers.iter().filter(|p| p.category == *category).collect();
+        let rows: Vec<_> = providers
+            .iter()
+            .filter(|p| p.category == *category)
+            .collect();
         if rows.is_empty() {
             continue;
         }
