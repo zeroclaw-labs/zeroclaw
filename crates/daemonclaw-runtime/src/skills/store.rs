@@ -49,11 +49,30 @@ impl SkillStore {
                 std::fs::create_dir_all(&dir)
                     .with_context(|| format!("create {}", dir.display()))?;
             }
+            Self::ensure_manifest(&dir)?;
         }
         let archive = self.archive_dir();
         if !archive.exists() {
             std::fs::create_dir_all(&archive)
                 .with_context(|| format!("create {}", archive.display()))?;
+        }
+        Self::ensure_manifest(&archive)?;
+        Ok(())
+    }
+
+    fn ensure_manifest(dir: &Path) -> Result<()> {
+        let toml = dir.join("SKILL.toml");
+        let md = dir.join("SKILL.md");
+        if !toml.exists() && !md.exists() {
+            let name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("skills");
+            std::fs::write(
+                &toml,
+                format!("[skill]\nname = \"{name}\"\ndescription = \"Skill container\"\n"),
+            )
+            .with_context(|| format!("write {}", toml.display()))?;
         }
         Ok(())
     }
