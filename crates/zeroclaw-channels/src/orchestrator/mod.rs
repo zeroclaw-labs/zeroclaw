@@ -362,7 +362,7 @@ struct ChannelRuntimeContext {
     agent_alias: Arc<String>,
     /// Resolved aliased-agent config for the agent owning this
     /// runtime context. Per-channel agent dispatch (one agent per
-    /// channel.<type>.<alias>) is a follow-up.
+    /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
@@ -8510,7 +8510,14 @@ pub async fn start_channels(
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(config.reliability.clone()),
             provider_runtime_options,
-            workspace_dir: Arc::new(config.data_dir.clone()),
+            // Use this agent's workspace (not the install-wide data dir): the
+            // channel runtime context drives per-message skill reloads, prompt
+            // refresh, and file-access scoping, all of which must resolve to the
+            // same agent workspace that boot-time registration loads from.
+            // Pointing at `config.data_dir` silently breaks per-message skill
+            // activation (candidates load from `<data_dir>/skills`, which is
+            // empty) and mis-scopes file tools.
+            workspace_dir: Arc::new(workspace.clone()),
             message_timeout_secs,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: interrupt_on_new_message,

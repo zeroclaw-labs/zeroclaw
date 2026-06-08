@@ -9,7 +9,7 @@
 //!
 //! Each model_provider call goes through the [`ReliableModelProvider`] wrapper, which adds
 //! automatic retry with exponential backoff and API-key rotation on rate limits.
-//! Model routing across multiple model_providers is available via [`create_routed_model_provider`].
+//! Model routing across multiple model_providers is available via [`create_routed_model_provider_with_options`].
 //!
 //! # Extension
 //!
