@@ -7659,7 +7659,7 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -7679,6 +7679,19 @@ pub struct CodexCliConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_codex_cli_timeout_secs() -> u64 {
@@ -7696,6 +7709,7 @@ impl Default for CodexCliConfig {
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -16445,6 +16459,11 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        // Stamp the current schema version on every write. The in-memory
+        // config is always at `CURRENT_SCHEMA_VERSION` (load-time migration
+        // brings it forward), but pin it explicitly so a full save can never
+        // emit a body-newer-than-label file. See `save_dirty` and #7271.
+        config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
         let zeroclaw_dir = config_path
             .parent()
@@ -16565,6 +16584,19 @@ impl Config {
         for path in &self.dirty_paths {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table);
         }
+
+        // Stamp the current schema version. An incremental save writes
+        // current-schema-shaped sections (e.g. the dashboard saving a single
+        // `agents.<name>.model_provider`) but `schema_version` is never a
+        // dirty path, so without this it keeps whatever an older binary first
+        // wrote on disk. The resulting body-newer-than-label file then crashes
+        // older binaries with an opaque `missing field ...` serde error. See
+        // #7271. `insert` updates the existing key in place (preserving its
+        // position at the top of the file) or appends it when absent.
+        doc.as_table_mut().insert(
+            "schema_version",
+            toml_edit::value(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
+        );
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
@@ -21685,6 +21717,55 @@ group_policy = "disabled"
         assert_eq!(
             hardened_mode, 0o600,
             "Saving config should restore owner-only permissions (0600)"
+        );
+    }
+
+    #[test]
+    async fn save_dirty_stamps_current_schema_version_on_stale_label() {
+        // Regression for #7271. An incremental save writes current-schema-shaped
+        // sections, but `schema_version` is never a dirty path. Without an
+        // explicit stamp, a file first written by an older binary keeps its
+        // stale `schema_version` label while gaining a current-schema body — a
+        // state that crashes older binaries with `missing field ...`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file labeled with a stale schema version so the
+        // incremental path (not the new-file fallback to full `save`) runs.
+        std::fs::write(
+            &config_path,
+            "schema_version = 2\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.observability.backend = "otel".to_string();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains(&format!(
+                "schema_version = {}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            )),
+            "save_dirty must stamp the current schema_version; got:\n{written}"
+        );
+        assert!(
+            !written.contains("schema_version = 2"),
+            "stale schema_version label must be overwritten; got:\n{written}"
+        );
+        // The dirty value still lands, and the stamp sits at the top of the file.
+        assert!(
+            written.contains("backend = \"otel\""),
+            "dirty value must still be written; got:\n{written}"
+        );
+        assert!(
+            written.trim_start().starts_with("schema_version ="),
+            "schema_version should remain the first key; got:\n{written}"
         );
     }
 
