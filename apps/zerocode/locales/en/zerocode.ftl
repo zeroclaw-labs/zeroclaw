@@ -24,6 +24,7 @@ zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 
 zc-zerocode-tab-theme = Theme
+zc-zerocode-tab-agent-theme = Agent Themes
 zc-zerocode-tab-presets = Presets
 zc-zerocode-tab-bindings = Keybindings
 zc-zerocode-tab-locale = Locale
@@ -59,6 +60,9 @@ zc-zerocode-capture-cancel = Cancel capture
 zc-zerocode-help-switch-pane = Switch pane (Theme/Presets/Keybindings)
 zc-zerocode-help-navigate = Navigate
 zc-zerocode-help-apply-theme = Apply theme (live + saved)
+zc-zerocode-help-assign-agent-theme = Assign theme to the selected agent
+zc-zerocode-help-pick-agent = Choose theme for this agent
+zc-zerocode-help-clear-agent-theme = Clear the agent's override
 zc-zerocode-help-apply-preset = Apply preset (overwrites keybindings)
 zc-zerocode-help-rebind = Rebind selected action
 zc-zerocode-help-reset-default = Reset action to default
@@ -68,6 +72,15 @@ zc-zerocode-help-choose-section = Choose section
 zc-zerocode-help-open-section = Open section
 zc-zerocode-help-navigate-rows = Navigate rows
 zc-zerocode-help-back-to-sections = Back to sections
+
+zc-zerocode-agent-modal-title = Select Agent
+zc-zerocode-agent-modal-pick = Pick agent, then choose a theme
+zc-zerocode-agent-theme-loading = Loading agents…
+zc-zerocode-agent-theme-no-agents = No agents configured
+zc-zerocode-agent-theme-none = No override on this agent
+zc-zerocode-agent-theme-set = Override set: { $agent } → { $theme }
+zc-zerocode-agent-theme-cleared = Override cleared for { $agent }
+zc-zerocode-agent-theme-hint = { $assign } assign theme   ·   { $clear } clear override
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
@@ -89,6 +102,29 @@ zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
 zc-input-clipboard-error = Clipboard error: { $error }
+
+zc-queue-empty = Nothing to send.
+zc-cancel-timed-out = Cancel timed out; turn settled locally.
+zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
+zc-queue-title = Queue ({ $count })
+zc-queue-empty-list = No queued messages.
+zc-queue-paused-ghost = Queue paused — press { $key } or send a message to resume
+zc-queue-item-injected = (inject)
+zc-queue-resumed = Queue resumed.
+zc-queue-clear-empty = Queue is already empty.
+zc-queue-cleared-all = Cleared { $count } queued message(s).
+zc-queue-cleared-one = Cleared queued message { $index }.
+zc-queue-clear-invalid = No queued message at index { $index } (queue has { $count }).
+zc-queue-help-resume = Pause/resume queue
+zc-queue-help-nav = Select queued
+zc-queue-help-delete = Delete queued
+zc-queue-help-clear = Clear queue ([N] = position)
+zc-queue-help-edit = Edit queued
+zc-queue-help-resize = Resize queue
+zc-queue-help-enqueue = Queue message
+zc-queue-help-inject = Send now (skip queue)
+zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
+zc-queue-dispatch-failed = Could not send queued message: { $error }
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity
@@ -199,7 +235,6 @@ zc-dashboard-help-next-tab = Next tab
 zc-dashboard-help-prev-tab = Previous tab
 zc-dashboard-help-jump-tab = Jump to tab
 zc-dashboard-help-refresh = Refresh now
-zc-dashboard-help-quit = Quit TUI
 zc-dashboard-help-this-help = This help
 zc-dashboard-help-apply-search = Apply search
 zc-dashboard-help-cancel-search = Cancel search
@@ -270,6 +305,8 @@ zc-quickstart-modal-action-edit-name = type to edit name
 zc-quickstart-modal-action-on-file-rows = on file rows
 zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
+zc-quickstart-field-label-alias = Alias
+zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
 zc-quickstart-action-done = Done
 zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents can still send messages to channels.
 
@@ -300,6 +337,20 @@ zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
 
+# Model picker slash commands
+zc-model-picker-hint = Type a model name after /model, or Tab to autocomplete.
+zc-model-provider-picker-hint = Type a model_provider after /model-provider, then pick a model with /model.
+zc-model-picker-title = Select model
+zc-model-provider-picker-title = Select model_provider
+zc-model-switch-applying = Applying model change…
+zc-model-switch-model-ok = Model switched to { $model }.
+zc-model-switch-provider-ok = model_provider switched to { $provider } (model: { $model }).
+zc-model-switch-failed = Model switch failed: { $error }
+zc-model-catalog-no-provider = Could not resolve this agent's model_provider from config.
+zc-model-catalog-empty = No models available for the active model_provider.
+zc-model-catalog-loading = Loading models…
+zc-model-provider-catalog-failed = Could not load model_providers: { $error }
+
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
 
@@ -313,7 +364,6 @@ zc-chat-help-select-agent = Select agent
 zc-chat-help-quit = Quit
 zc-chat-help-switch-session = Switch session
 zc-chat-help-close = Close
-zc-chat-help-submit-name = Submit name
 zc-chat-help-cancel = Cancel
 zc-chat-help-approve = Approve
 zc-chat-help-always-approve = Always approve
@@ -330,7 +380,6 @@ zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-toggle-thinking-cmd = Toggle thinking visibility
 zc-chat-help-new-session = New session
 zc-chat-help-session-list = Session list
-zc-chat-help-rename-session = Rename session
 
 zc-chat-approval-title = Approve tool call: { $tool }  [{ $secs }s]
 zc-chat-approval-action-allow = Allow
@@ -338,14 +387,12 @@ zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
 
-zc-chat-rename-prompt = New name:
-zc-chat-rename-action-submit = submit
-zc-chat-rename-action-cancel = cancel
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 
 zc-config-breadcrumb-root = Config
+zc-config-section-detail-hint = { $open } or { $into } to open this section
 zc-config-breadcrumb-new = New
 
 zc-config-personality-over-limit = Over { $limit } char limit — cannot save

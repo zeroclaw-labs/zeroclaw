@@ -22,6 +22,13 @@ use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
+    "cron_add",
+    "cron_update",
+    "cron_remove",
+    "cron_run",
+    "schedule",
+];
 
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
@@ -321,6 +328,21 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
         .await
 }
 
+fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
+    let mut policy = base.clone();
+    if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
+        return policy;
+    }
+
+    let excluded = policy.excluded_tools.get_or_insert_with(Vec::new);
+    for tool in CRON_AGENT_DEFAULT_EXCLUDED_TOOLS {
+        if !excluded.iter().any(|existing| existing == tool) {
+            excluded.push((*tool).to_string());
+        }
+    }
+    policy
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -565,8 +587,9 @@ async fn run_agent_job(
     // a future refactor that flips the default can't quietly promote
     // every cron-launched agent to a depth-1 subagent — they're
     // top-level runs by design, despite riding through SubAgentSpawn.
+    let run_security = cron_agent_run_security_policy(subagent_ctx.policy.as_ref(), job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
-        security: Some(subagent_ctx.policy.clone()),
+        security: Some(Arc::new(run_security)),
         memory: None,
         is_subagent: false,
     };
@@ -1117,6 +1140,48 @@ mod tests {
             ..test_job("echo test")
         };
         assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn cron_agent_run_security_policy_excludes_scheduler_mutation_tools_by_default() {
+        let security = SecurityPolicy::default();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = None;
+
+        let policy = cron_agent_run_security_policy(&security, &job);
+
+        for tool in [
+            "cron_add",
+            "cron_update",
+            "cron_remove",
+            "cron_run",
+            "schedule",
+        ] {
+            assert!(
+                !policy.is_tool_allowed(tool),
+                "{tool} must be excluded from default cron agent runs"
+            );
+        }
+        assert!(
+            policy.is_tool_allowed("http_request"),
+            "non-scheduler tools remain available when the base policy is unrestricted"
+        );
+    }
+
+    #[test]
+    fn cron_agent_run_security_policy_respects_explicit_allowed_tools() {
+        let security = SecurityPolicy::default();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = Some(vec!["cron_add".into()]);
+
+        let policy = cron_agent_run_security_policy(&security, &job);
+
+        assert!(
+            policy.is_tool_allowed("cron_add"),
+            "explicit cron job allowed_tools should remain the override for intentional scheduler automation"
+        );
     }
 
     #[tokio::test]

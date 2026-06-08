@@ -87,6 +87,32 @@ impl Selector {
     }
 }
 
+/// Drop validation errors for selectors the user hasn't filled yet.
+///
+/// `revalidate` runs after every selector commit, and the runtime
+/// validates the *whole* submission, short-circuiting at the first
+/// failing step. Mid-build that first failure is almost always a
+/// selector the user simply hasn't reached — e.g. the empty risk
+/// profile, surfacing the instant the model provider is committed. Shown
+/// as a red "1 error(s) — fix selectors and resubmit", it reads as if the
+/// step they just finished broke. Keep only errors for selectors the user
+/// has actually filled; unfilled ones are already tracked as `[ ]` in the
+/// checklist, and submit re-validates the full set with nothing empty to
+/// short-circuit on.
+fn retain_filled_selector_errors(
+    form: &FormState,
+    errors: Vec<QuickstartError>,
+) -> Vec<QuickstartError> {
+    errors
+        .into_iter()
+        .filter(|e| {
+            Selector::ALL
+                .iter()
+                .any(|s| form.is_satisfied(*s) && s.step() == e.step)
+        })
+        .collect()
+}
+
 fn opt(value: &str, label: impl Into<String>, help: impl Into<String>) -> PickerOption {
     PickerOption {
         value: value.to_string(),
@@ -623,6 +649,7 @@ pub struct QuickstartPane {
     /// `open_modal_for`.
     selector_list_rect: Option<Rect>,
     selector_row_rects: Vec<Rect>,
+    leave_requested: bool,
 }
 
 impl QuickstartPane {
@@ -645,7 +672,12 @@ impl QuickstartPane {
             modal_row_rects: Vec::new(),
             selector_list_rect: None,
             selector_row_rects: Vec::new(),
+            leave_requested: false,
         }
+    }
+
+    pub fn take_leave_request(&mut self) -> bool {
+        std::mem::take(&mut self.leave_requested)
     }
 
     pub async fn init(&mut self) -> anyhow::Result<()> {
@@ -657,13 +689,16 @@ impl QuickstartPane {
 
     pub fn help_context(&self) -> HelpNode {
         HelpNode::entries(vec![
-            HelpEntry::new(vec!["↑/↓"], crate::i18n::t("zc-quickstart-help-move")),
+            HelpEntry::new(
+                vec!["j", "k", "↑/↓"],
+                crate::i18n::t("zc-quickstart-help-move"),
+            ),
             HelpEntry::new(vec!["Enter"], crate::i18n::t("zc-quickstart-help-open")),
             HelpEntry::key(
                 "c",
                 crate::i18n::t_args("zc-quickstart-help-create", &[("enter", "Enter")]),
             ),
-            HelpEntry::key("Esc", crate::i18n::t("zc-quickstart-help-leave")),
+            HelpEntry::new(vec!["q", "Esc"], crate::i18n::t("zc-quickstart-help-leave")),
         ])
     }
 
@@ -743,6 +778,10 @@ impl QuickstartPane {
                 if self.can_create() {
                     self.submit().await;
                 }
+                false
+            }
+            Some(QuickstartTabAction::Back) => {
+                self.leave_requested = true;
                 false
             }
             _ => false,
@@ -1467,7 +1506,7 @@ impl QuickstartPane {
                 self.last_errors.clear();
             }
             Ok(crate::client::QuickstartValidateResult::Errors { errors }) => {
-                self.last_errors = errors;
+                self.last_errors = retain_filled_selector_errors(&self.form, errors);
             }
             Err(_) => {
                 // Validation failures on the wire are non-fatal —
@@ -1506,7 +1545,7 @@ impl QuickstartPane {
             } else {
                 None
             };
-        let rows: Vec<FieldFormRow> = fields
+        let mut rows: Vec<FieldFormRow> = fields
             .into_iter()
             .map(|mut d| {
                 if let Some(ref models) = model_catalog
@@ -1537,6 +1576,27 @@ impl QuickstartPane {
                 FieldFormRow { descriptor: d, buf }
             })
             .collect();
+        // Prepend an editable alias row for ModelProvider so users can
+        // choose a custom alias instead of the hardcoded "default".
+        if matches!(section, QuickstartFieldSection::ModelProvider) {
+            let default_alias = "default".to_string();
+            rows.insert(
+                0,
+                FieldFormRow {
+                    descriptor: QuickstartFieldDescriptor {
+                        key: "alias".to_string(),
+                        label: crate::i18n::t("zc-quickstart-field-label-alias"),
+                        help: crate::i18n::t("zc-quickstart-field-help-alias"),
+                        kind: crate::client::QuickstartFieldKind::String,
+                        is_secret: false,
+                        enum_variants: None,
+                        required: true,
+                        default: Some(default_alias.clone()),
+                    },
+                    buf: default_alias,
+                },
+            );
+        }
         let alias = match section {
             QuickstartFieldSection::ModelProvider => "default".to_string(),
             _ => type_key.clone(),
@@ -1586,11 +1646,11 @@ impl QuickstartPane {
                 let mut provider_fields: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 for row in &f.fields {
-                    // `model` is hoisted to `FormState::model` for the
-                    // summary line; every other descriptor flows
-                    // through `provider_fields` keyed by its schema
-                    // identifier (kebab-case).
-                    if row.descriptor.key == "model" {
+                    // `model` and `alias` are hoisted to FormState
+                    // fields; every other descriptor flows through
+                    // `provider_fields` keyed by its schema identifier
+                    // (kebab-case).
+                    if row.descriptor.key == "model" || row.descriptor.key == "alias" {
                         continue;
                     }
                     let value = row.buf.trim();
@@ -1599,7 +1659,15 @@ impl QuickstartPane {
                     }
                 }
                 self.form.provider_type = f.type_key.clone();
-                self.form.provider_alias = f.alias.clone();
+                // Read alias from the editable field row; fall back to
+                // `f.alias` for backward compatibility (non-ModelProvider
+                // sections keep the auto-generated alias path).
+                let alias_value = pick("alias");
+                self.form.provider_alias = if alias_value.is_empty() {
+                    f.alias.clone()
+                } else {
+                    alias_value
+                };
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
@@ -1896,8 +1964,6 @@ fn draw_modal(
                     theme::dim_style(),
                 ),
                 Span::styled(f.type_key.as_str(), theme::accent_style()),
-                Span::styled("    Alias: ", theme::dim_style()),
-                Span::styled(f.alias.as_str(), theme::body_style()),
             ]));
             lines.push(Line::from(""));
             for (i, row) in f.fields.iter().enumerate() {
@@ -2317,6 +2383,48 @@ mod tests {
         let mut f = complete_form();
         f.agent_name.clear();
         assert!(!f.all_selectors_satisfied());
+    }
+
+    fn err(step: QuickstartStep) -> QuickstartError {
+        QuickstartError {
+            step,
+            field: String::new(),
+            message: "boom".into(),
+        }
+    }
+
+    #[test]
+    fn revalidate_hides_errors_for_unfilled_selectors() {
+        // Regression: committing the model provider triggered a full
+        // re-validate. The runtime short-circuits at the first failing
+        // step, so the still-empty risk profile came back as a single
+        // error and the status strip flashed "1 error(s) — fix selectors
+        // and resubmit", as if the provider step had failed.
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+        assert!(f.is_satisfied(Selector::ModelProvider));
+        assert!(!f.is_satisfied(Selector::RiskProfile));
+
+        let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::RiskProfile)]);
+        assert!(
+            kept.is_empty(),
+            "an unfilled selector's error must not surface mid-build: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn revalidate_keeps_errors_for_filled_selectors() {
+        // A real problem with a selector the user *has* filled (e.g. an
+        // alias collision on the model provider) must still surface.
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+
+        let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::ModelProvider)]);
+        assert_eq!(kept.len(), 1, "filled-selector errors must be retained");
     }
 
     #[test]
