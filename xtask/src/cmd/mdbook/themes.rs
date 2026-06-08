@@ -63,6 +63,14 @@ pub fn run(root: &Path) -> Result<()> {
     // index.hbs is tracked but the marker region is regenerated from
     // themes.json, so themes.json stays the single source of truth.
     inject_theme_list(&book.join("theme/index.hbs"), &list)?;
+    // Write the zerocode TUI theme-name list to a derived fragment that
+    // themes.md `{{#include}}`s at build time. Gitignored, like cli.md/config.md
+    // — the names stay sourced from the same registry the TUI build generates
+    // its preset table from, and nothing generated lands in the committed doc.
+    std::fs::write(
+        root.join("docs/book/src/zerocode/zerocode-theme-list.md"),
+        render_doc_theme_names(arr)?,
+    )?;
     println!(
         "==> Generated pc-themes.css + injected {} theme buttons into index.hbs",
         arr.len()
@@ -91,6 +99,31 @@ fn inject_theme_list(hbs_path: &Path, list: &str) -> Result<()> {
     );
     std::fs::write(hbs_path, updated).with_context(|| format!("write {}", hbs_path.display()))?;
     Ok(())
+}
+
+/// Render the dark/light grouped backtick list of snake_case theme names the
+/// TUI exposes. Mirrors `apps/zerocode/build.rs::snake_case`.
+fn render_doc_theme_names(themes: &[Value]) -> Result<String> {
+    let names = |want: &str| -> Result<Vec<String>> {
+        themes
+            .iter()
+            .filter(|t| t.get("scheme").and_then(Value::as_str) == Some(want))
+            .map(|t| {
+                let id = t
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("theme missing id")?;
+                Ok(format!("`{}`", id.replace('-', "_")))
+            })
+            .collect()
+    };
+    let dark = names("dark")?;
+    let light = names("light")?;
+    Ok(format!(
+        "**Dark:** {}\n\n**Light:** {}",
+        dark.join(", "),
+        light.join(", "),
+    ))
 }
 
 fn render_css(themes: &[Value]) -> Result<String> {

@@ -4,7 +4,7 @@
 //!
 //! Every fact about a section (its enum variant, its on-the-wire key,
 //! its UI shape, its help blurb, its canonical position) lives in ONE
-//! table — the [`sections!`] invocation below. The macro expands that
+//! table — the `sections!` invocation below. The macro expands that
 //! table into the [`Section`] enum, every per-variant `match` helper,
 //! and the [`QUICKSTART_SECTIONS`] const, so adding a section is exactly
 //! one row, no hand-listed variant set anywhere else.

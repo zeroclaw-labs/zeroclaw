@@ -98,6 +98,7 @@ pub enum ChannelKind {
     Signal,
     Slack,
     Telegram,
+    Twitch,
     Twitter,
     VoiceCall,
     VoiceWake,
@@ -370,7 +371,7 @@ impl Role {
         }
     }
 
-    /// Closest [`zeroclaw_log::EventCategory`] for this role, used by
+    /// Closest `zeroclaw_log::EventCategory` for this role, used by
     /// the layer to default `event.category` when the call site doesn't
     /// override. Returned as a `&'static str` to keep `zeroclaw-api`
     /// free of a back-dep on `zeroclaw-log`.
