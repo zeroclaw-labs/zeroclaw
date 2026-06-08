@@ -23,6 +23,16 @@ enum Cmd {
     Build,
     /// Regenerate cli.md, config.md, and rustdoc API reference
     Refs,
+    /// mdBook preprocessor: expand `{{#peer-group <channel>}}` directives.
+    /// Invoked by mdBook via book.toml; not run directly.
+    Preprocess {
+        /// `supports <renderer>` probe from mdBook (exit 0 = supported).
+        #[arg(value_name = "ARG")]
+        arg: Option<String>,
+        /// The renderer name mdBook passes after `supports`.
+        #[arg(value_name = "RENDERER")]
+        renderer: Option<String>,
+    },
     /// Sync .po files and AI-fill translation delta
     Sync {
         #[arg(long)]
@@ -70,6 +80,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref(), tag),
         Cmd::Build => cmd::mdbook::build::run(tag),
         Cmd::Refs => cmd::mdbook::refs::run(tag),
+        Cmd::Preprocess { arg, .. } => {
+            if arg.as_deref() == Some("supports") {
+                cmd::mdbook::peer_groups::supports();
+            }
+            cmd::mdbook::peer_groups::run()
+        }
         Cmd::Sync {
             locale,
             force,
