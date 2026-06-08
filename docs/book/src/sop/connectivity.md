@@ -19,7 +19,7 @@ Key behaviors:
 - **Run-start audit:** started runs are persisted via `SopAuditLogger`.
 - **Headless safety:** in non-agent-loop contexts, `process_headless_results` logs `ExecuteStep` actions as pending instead of silently executing them.
 
-Of the defined trigger types, **MQTT** is the only event source wired to a live listener in the daemon. Runs can also be started directly from an agent turn with the `sop_execute` tool. The webhook, cron, and peripheral trigger types are defined and matched by the engine, but no runtime currently feeds those event sources into `dispatch_sop_event` — see [Other Trigger Types](#3-other-trigger-types).
+Of the defined trigger types, **MQTT** is the only event source wired to a live listener in the daemon. Runs can also be started directly from an agent turn with the `sop_execute` tool. The webhook, cron, and peripheral trigger types are defined and matched by the engine, but no runtime currently feeds those event sources into `dispatch_sop_event`. See [Other Trigger Types](#3-other-trigger-types).
 
 ## 2. MQTT Integration
 

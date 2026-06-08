@@ -7,3 +7,4 @@ SOPs are deterministic procedures executed by the `SopEngine`. They provide expl
 - [Cookbook](./cookbook.md): reusable SOP patterns.
 - [Connectivity](./connectivity.md): event fan-in to the SOP engine. MQTT is the wired live source; webhook, cron, and peripheral triggers are defined and matched but not yet routed to a live event source.
 - [Observability](./observability.md): where run state and audit entries are stored.
+- [Worked Example](./example.md): the stagehand StageX auto-update bot, from build to draft PR, driven by a deterministic SOP over an AMQP feed.

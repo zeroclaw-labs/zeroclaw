@@ -94,6 +94,7 @@
   - [Cookbook](./sop/cookbook.md)
   - [Connectivity](./sop/connectivity.md)
   - [Observability](./sop/observability.md)
+  - [Worked Example](./sop/example.md)
 - [Extending & Plugins](./developing/index.md)
   - [Plugin protocol](./developing/plugin-protocol.md)
   - [Extension examples](./developing/extension-examples.md)

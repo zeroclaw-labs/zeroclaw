@@ -28,7 +28,7 @@ graph LR
 
 ## Getting started
 
-1. Set the SOP directory in `config.toml` (required for runtime SOP loading):
+1. Set the SOP directory through the gateway, zerocode, or `zeroclaw config set` (required for runtime SOP loading):
 
 2. Create a SOP directory, for example:
 
