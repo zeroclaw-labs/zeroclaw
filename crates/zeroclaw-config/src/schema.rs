@@ -102,6 +102,12 @@ pub struct Config {
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
     pub dirty_paths: std::collections::HashSet<String>,
+    /// Security-critical sections the resilient loader reset to `Default`
+    /// because the on-disk block was malformed. Non-empty = posture may be
+    /// weaker than intended; exposure gating should refuse to trust the
+    /// instance until repaired. Never serialized — a load-time signal.
+    #[serde(skip)]
+    pub degraded_security: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -686,6 +692,25 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Ordered list of other provider aliases to try when every model on this
+    /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
+    /// `providers.models` and resolves with its own credentials, endpoint, and
+    /// model — a fallback never inherits this alias's key. The walk is
+    /// depth-first: this alias's models are exhausted first, then each fallback
+    /// alias is descended in turn (applying its own `fallback_models` and
+    /// `fallback`). Empty means no provider-level fallback.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<crate::providers::ModelProviderRef>,
+    /// Ordered alternate models to try on THIS provider before falling over to
+    /// the `fallback` aliases. Same endpoint, key, and headers as the primary
+    /// `model` — only the model identifier changes. Use this when a provider
+    /// serves a backup model (e.g. a smaller or older variant) that should be
+    /// tried before leaving the provider entirely. Empty means only `model` is
+    /// tried.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
     /// deterministic, near-verbatim output — fits code, routing, summarization.
     /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
@@ -3512,6 +3537,50 @@ pub const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 120;
 
 /// Default delegate tool timeout for agentic runs: 300 seconds.
 pub const DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
+
+/// Per-channel reply-pacing accessor. Implemented by every `*Config`
+/// struct that participates in outbound pacing so validation and
+/// wrapper construction can walk all of them through a single
+/// abstraction rather than nine duplicated method calls.
+pub trait HasReplyPacing {
+    fn reply_min_interval_secs(&self) -> u64;
+    fn reply_queue_depth_max(&self) -> u16;
+}
+
+macro_rules! impl_reply_pacing {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl HasReplyPacing for $ty {
+            fn reply_min_interval_secs(&self) -> u64 { self.reply_min_interval_secs }
+            fn reply_queue_depth_max(&self) -> u16 { self.reply_queue_depth_max }
+        })+
+    };
+}
+
+/// Inclusive upper bound (seconds) for per-channel `reply_min_interval_secs`.
+pub const REPLY_MIN_INTERVAL_MAX_SECS: u64 = 3600;
+
+/// Inclusive upper bound for per-channel `reply_queue_depth_max`. The lower
+/// bound is `0`, where `0` means "use [`DEFAULT_REPLY_QUEUE_DEPTH`] at the
+/// pacing-wrapper construction site." A non-zero value pins the bound
+/// explicitly. Validator rejects values above this ceiling.
+pub const REPLY_QUEUE_DEPTH_CEILING: u16 = 1024;
+
+/// Fallback queue depth applied at the pacing-wrapper construction site
+/// when a channel's `reply_queue_depth_max` is left at `0`. Sized for the
+/// AI-pacing use case: a paced channel buffering more than this is a sign
+/// the agent is producing replies faster than the floor will ever drain
+/// them and the overflow log is the right signal.
+pub const DEFAULT_REPLY_QUEUE_DEPTH: u16 = 16;
+
+/// Idle-state LRU cap on the pacing wrapper's per-recipient rows.
+/// Bounds growth when a bot legitimately serves many thousands of distinct
+/// peers. Eviction only reclaims idle rows (no queued sends, no running
+/// worker, no in-flight dispatch), so under a pathological all-active burst
+/// the row count can temporarily exceed this target until rows become idle —
+/// it is not an unconditional hard bound. Each recipient's queue depth stays
+/// bounded regardless. Not exposed in config — promote to a schema field if
+/// an operator reports hitting it.
+pub const PACING_RECIPIENT_CAP: usize = 1024;
 
 /// Validate that a temperature value is within the allowed range.
 pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
@@ -7406,7 +7475,7 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -7426,6 +7495,19 @@ pub struct CodexCliConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_codex_cli_timeout_secs() -> u64 {
@@ -7443,6 +7525,7 @@ impl Default for CodexCliConfig {
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -10006,7 +10089,8 @@ pub struct CronJobDecl {
     /// Model override for agent jobs.
     #[serde(default)]
     pub model: Option<String>,
-    /// Allowlist of tool names for agent jobs.
+    /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
+    /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.
@@ -10898,6 +10982,17 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -10997,6 +11092,17 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -11096,6 +11202,17 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -11198,6 +11315,17 @@ pub struct MattermostConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -11226,6 +11354,7 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// Port to listen on for incoming webhooks.
     #[tab(Advanced)]
+    #[serde(default = "default_webhook_channel_port")]
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
     #[tab(Advanced)]
@@ -11256,6 +11385,17 @@ pub struct WebhookConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 
     /// Maximum number of retry attempts for outbound sends on transient failures
     /// (network errors, 429, 5xx). Set to `0` to disable retries. Default: `3`.
@@ -11269,6 +11409,10 @@ pub struct WebhookConfig {
     /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_max_delay_ms: Option<u64>,
+}
+
+fn default_webhook_channel_port() -> u16 {
+    8090
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -11297,6 +11441,17 @@ pub struct IMessageConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for IMessageConfig {
@@ -11404,6 +11559,17 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -11468,6 +11634,17 @@ pub struct SignalConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -11628,6 +11805,17 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -11638,6 +11826,18 @@ impl ChannelConfig for WhatsAppConfig {
         "Business Cloud API"
     }
 }
+
+impl_reply_pacing!(
+    TelegramConfig,
+    DiscordConfig,
+    SlackConfig,
+    MattermostConfig,
+    WebhookConfig,
+    IMessageConfig,
+    MatrixConfig,
+    SignalConfig,
+    WhatsAppConfig,
+);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13662,6 +13862,7 @@ impl Default for Config {
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -14493,8 +14694,14 @@ impl Config {
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
-            let mut config: Config = crate::migration::migrate_to_current(&contents)
-                .context("Failed to migrate config")?;
+            // Daemon load must never hard-fail on a malformed config — the
+            // operator needs the process up to repair it. The resilient path
+            // degrades (dropping invalid blocks to defaults); security-critical
+            // drops are recorded on `degraded_security` for exposure gating.
+            // Strict validation lives in `zeroclaw config migrate`.
+            let salvage = crate::migration::migrate_to_current_salvaged(&contents);
+            let mut config: Config = salvage.config;
+            config.degraded_security = salvage.dropped_security;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -14656,7 +14863,169 @@ impl Config {
     /// Adding a new warning: append a check here, pick a stable `code`,
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
-        Vec::new()
+        let mut warnings = Vec::new();
+        self.collect_fallback_warnings(&mut warnings);
+        // `wire_api` is only honored by bring-your-own-endpoint families; on a
+        // branded family with a fixed wire protocol it is silently ignored.
+        // Surface that so an operator who sets it on, e.g., `mistral` learns it
+        // has no effect instead of debugging unexpected runtime behavior.
+        for (family, alias, entry) in self.providers.models.iter_entries() {
+            if entry.wire_api.is_some() && !crate::provider_aliases::family_honors_wire_api(family)
+            {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "wire_api_not_supported_for_family",
+                    format!(
+                        "wire_api is set on `{family}.{alias}` but the `{family}` family has a \
+                         fixed wire protocol and ignores it. wire_api only takes effect on the \
+                         openai, llamacpp, and custom (openai-compatible) families."
+                    ),
+                    format!("providers.models.{family}.{alias}.wire_api"),
+                ));
+            }
+        }
+        warnings
+    }
+
+    /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
+    /// (a fallback naming an alias that is not configured) and cycles (a
+    /// fallback path that loops back onto itself). Both are warn-and-skip — the
+    /// chain still loads and runs with the offending edge pruned at build time.
+    fn collect_fallback_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (family, alias, cfg) in self.providers.models.iter_entries() {
+            self.collect_fallback_model_warnings(family, alias, cfg, warnings);
+            if cfg.fallback.is_empty() {
+                continue;
+            }
+            let root = format!("{family}.{alias}");
+            let mut visited: Vec<String> = vec![root.clone()];
+            self.walk_fallback(&root, &cfg.fallback, &mut visited, 1, warnings);
+        }
+    }
+
+    /// Surface `fallback_models` entries the build path silently skips: blank
+    /// entries and entries that duplicate the alias's primary `model`. The skip
+    /// itself is safe, but without a warning an operator never learns that a
+    /// listed fallback model is doing nothing.
+    fn collect_fallback_model_warnings(
+        &self,
+        family: &str,
+        alias: &str,
+        cfg: &ModelProviderConfig,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let Some(primary) = cfg.model.as_deref() else {
+            return;
+        };
+        for (i, model) in cfg.fallback_models.iter().enumerate() {
+            let path = format!("providers.models.{family}.{alias}.fallback_models[{i}]");
+            if model.trim().is_empty() {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "empty_fallback_model",
+                    format!(
+                        "fallback_models entry {i} on {family}.{alias} is empty; \
+                         it is skipped at runtime"
+                    ),
+                    path,
+                ));
+            } else if model == primary {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "fallback_model_duplicates_primary",
+                    format!(
+                        "fallback_models entry {model:?} on {family}.{alias} duplicates the \
+                         primary model; it is skipped at runtime"
+                    ),
+                    path,
+                ));
+            }
+        }
+    }
+
+    fn walk_fallback(
+        &self,
+        from: &str,
+        refs: &[crate::providers::ModelProviderRef],
+        visited: &mut Vec<String>,
+        depth: usize,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if depth > crate::providers::MAX_FALLBACK_DEPTH {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "max_fallback_depth_exceeded",
+                format!(
+                    "fallback chain from {from} exceeds the maximum depth of {}; \
+                     deeper links are pruned at runtime",
+                    crate::providers::MAX_FALLBACK_DEPTH
+                ),
+                format!("providers.models.{from}.fallback"),
+            ));
+            return;
+        }
+        for (i, fallback_ref) in refs.iter().enumerate() {
+            let raw = fallback_ref.as_str().trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let path = format!("providers.models.{from}.fallback[{i}]");
+            let Some((family, alias, cfg)) = self.providers.models.find_by_name(raw) else {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "dangling_fallback_ref",
+                    format!(
+                        "fallback {raw:?} on {from} does not resolve to a configured \
+                         providers.models entry; this fallback link is skipped at runtime"
+                    ),
+                    path,
+                ));
+                continue;
+            };
+            let resolved = format!("{family}.{alias}");
+            if visited.iter().any(|v| v == &resolved) {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "fallback_cycle",
+                    format!(
+                        "fallback {raw:?} on {from} closes a cycle \
+                         ({} -> {resolved}); the cycle edge is pruned at runtime",
+                        visited.join(" -> ")
+                    ),
+                    path,
+                ));
+                continue;
+            }
+            visited.push(resolved.clone());
+            self.walk_fallback(&resolved, &cfg.fallback, visited, depth + 1, warnings);
+            visited.pop();
+        }
+    }
+
+    /// Walk every channel HashMap that carries reply pacing fields and yield
+    /// `(dotted-path-prefix, &dyn HasReplyPacing)` pairs. Used by validation
+    /// and by anywhere that wants a single source of truth for which channel
+    /// types participate in pacing.
+    pub fn reply_pacing_entries(&self) -> Vec<(String, &dyn HasReplyPacing)> {
+        let c = &self.channels;
+        fn rows<'a, C: HasReplyPacing>(
+            ch_type: &'static str,
+            map: &'a std::collections::HashMap<String, C>,
+        ) -> impl Iterator<Item = (String, &'a dyn HasReplyPacing)> + 'a {
+            map.iter().map(move |(alias, cfg)| {
+                (
+                    format!("channels.{ch_type}.{alias}"),
+                    cfg as &dyn HasReplyPacing,
+                )
+            })
+        }
+        rows("telegram", &c.telegram)
+            .chain(rows("discord", &c.discord))
+            .chain(rows("slack", &c.slack))
+            .chain(rows("mattermost", &c.mattermost))
+            .chain(rows("webhook", &c.webhook))
+            .chain(rows("imessage", &c.imessage))
+            .chain(rows("matrix", &c.matrix))
+            .chain(rows("signal", &c.signal))
+            .chain(rows("whatsapp", &c.whatsapp))
+            .collect()
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -14688,6 +15057,30 @@ impl Config {
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
+                );
+            }
+        }
+
+        // Reply-pacing bounds — both `reply_min_interval_secs` and
+        // `reply_queue_depth_max` walk through one entry list so adding
+        // a new paced channel only requires extending `reply_pacing_entries`.
+        for (path_prefix, cfg) in self.reply_pacing_entries() {
+            let secs = cfg.reply_min_interval_secs();
+            if secs > REPLY_MIN_INTERVAL_MAX_SECS {
+                let path = format!("{path_prefix}.reply_min_interval_secs");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {secs} is out of range; must be 0..={REPLY_MIN_INTERVAL_MAX_SECS}"
+                );
+            }
+            let depth = cfg.reply_queue_depth_max();
+            if depth > REPLY_QUEUE_DEPTH_CEILING {
+                let path = format!("{path_prefix}.reply_queue_depth_max");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {depth} is out of range; must be 0..={REPLY_QUEUE_DEPTH_CEILING}"
                 );
             }
         }
@@ -16497,6 +16890,30 @@ mod tests {
     use tokio::sync::MutexGuard;
     use tokio::test;
 
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array.entries"]
+    struct ObjectArraySecretEntry {
+        pub name: String,
+        #[secret]
+        pub token: Option<String>,
+        #[secret]
+        pub headers: HashMap<String, String>,
+    }
+
+    impl crate::config::HasPropKind for Vec<ObjectArraySecretEntry> {
+        const PROP_KIND: crate::config::PropKind = crate::config::PropKind::ObjectArray;
+
+        fn display_secret_terminals() -> Vec<&'static str> {
+            ObjectArraySecretEntry::secret_field_terminals()
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+    #[prefix = "test.object_array"]
+    struct ObjectArraySecretFixture {
+        pub entries: Vec<ObjectArraySecretEntry>,
+    }
+
     // ── Tilde expansion ───────────────────────────────────────
 
     #[test]
@@ -16723,6 +17140,85 @@ enabled = true
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    async fn validate_rejects_reply_min_interval_above_upper_bound() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = REPLY_MIN_INTERVAL_MAX_SECS + 1;
+        config.channels.telegram.insert("default".to_string(), tg);
+        let err = config.validate().expect_err("over-bound must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("channels.telegram.default.reply_min_interval_secs"),
+            "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_reply_min_interval_at_upper_bound() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = REPLY_MIN_INTERVAL_MAX_SECS;
+        config.channels.telegram.insert("default".to_string(), tg);
+        config.validate().expect("documented upper bound must pass");
+    }
+
+    #[test]
+    async fn validate_rejects_reply_queue_depth_above_ceiling() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = 1;
+        tg.reply_queue_depth_max = REPLY_QUEUE_DEPTH_CEILING + 1;
+        config.channels.telegram.insert("default".to_string(), tg);
+        let err = config
+            .validate()
+            .expect_err("over-ceiling depth must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("channels.telegram.default.reply_queue_depth_max"),
+            "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_reply_queue_depth_at_ceiling() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = 1;
+        tg.reply_queue_depth_max = REPLY_QUEUE_DEPTH_CEILING;
+        config.channels.telegram.insert("default".to_string(), tg);
+        config.validate().expect("documented ceiling must pass");
+    }
+
+    #[test]
+    async fn validate_accepts_reply_queue_depth_zero_meaning_default() {
+        // depth=0 means "fall back to DEFAULT_REPLY_QUEUE_DEPTH at the
+        // pacing-wrapper construction site." Validator must accept it.
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = 1;
+        tg.reply_queue_depth_max = 0;
+        config.channels.telegram.insert("default".to_string(), tg);
+        config
+            .validate()
+            .expect("zero depth means default; must pass");
     }
 
     #[test]
@@ -17082,6 +17578,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -17171,6 +17668,8 @@ auto_save = true
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
                         excluded_tools: vec![],
+                        reply_min_interval_secs: 0,
+                        reply_queue_depth_max: 0,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -17804,6 +18303,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -18335,6 +18835,8 @@ default_temperature = 0.7
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -18371,6 +18873,8 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -18396,6 +18900,8 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -18452,6 +18958,8 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -18485,6 +18993,8 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -18534,6 +19044,8 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -18558,6 +19070,8 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -18592,6 +19106,8 @@ allowed_users = ["@u:matrix.org"]
                 IMessageConfig {
                     enabled: true,
                     excluded_tools: vec![],
+                    reply_min_interval_secs: 0,
+                    reply_queue_depth_max: 0,
                 },
             )]),
             matrix: HashMap::from([(
@@ -18614,6 +19130,8 @@ allowed_users = ["@u:matrix.org"]
                     reply_in_thread: true,
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
+                    reply_min_interval_secs: 0,
+                    reply_queue_depth_max: 0,
                 },
             )]),
             signal: HashMap::new(),
@@ -18828,6 +19346,12 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn webhook_config_port_defaults_when_omitted() {
+        let p: WebhookConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.port, 8090);
+    }
+
+    #[test]
     async fn webhook_config_retry_fields_default_to_none() {
         let json = r#"{"port":8080}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
@@ -18847,6 +19371,8 @@ bot_token = "xoxb-tok"
             auth_header: None,
             secret: None,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
             max_retries: Some(5),
             retry_base_delay_ms: Some(250),
             retry_max_delay_ms: Some(10_000),
@@ -18889,6 +19415,8 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -18919,6 +19447,8 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -18972,6 +19502,8 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -18999,6 +19531,8 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -19038,6 +19572,8 @@ allowed_numbers = ["+1", "+2"]
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
+                    reply_min_interval_secs: 0,
+                    reply_queue_depth_max: 0,
                 },
             )]),
             linq: HashMap::new(),
@@ -20217,6 +20753,99 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_assigns_degraded_security_for_malformed_section() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // `[security] audit` must be a table; a scalar forces the security
+        // section to drop to its default on the resilient daemon path.
+        fs::write(
+            &config_path,
+            r#"schema_version = 3
+audit = "should-be-a-table-not-a-string"
+
+[security]
+audit = "should-be-a-table-not-a-string"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            config.degraded_security.iter().any(|s| s == "security"),
+            "load_or_init must surface a dropped [security] section on degraded_security, got {:?}",
+            config.degraded_security
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_marks_whole_config_degraded_for_unparseable_file() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        // Not valid TOML at all: the whole config defaults, so every
+        // security-critical section is lost at once. load_or_init must surface
+        // that on degraded_security so the serving gate refuses to start.
+        fs::write(&config_path, "this is not valid TOML {{{")
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            !config.degraded_security.is_empty(),
+            "load_or_init must surface a whole-config loss on degraded_security, got {:?}",
+            config.degraded_security
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
         config.providers.models.openrouter.insert(
@@ -20882,6 +21511,35 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
+        let mut config = Config::default();
+        // mistral has a fixed wire protocol and ignores wire_api.
+        config
+            .providers
+            .models
+            .ensure("mistral", "primary")
+            .unwrap()
+            .wire_api = Some(WireApi::Responses);
+        // custom honors wire_api — must NOT warn.
+        config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .unwrap()
+            .wire_api = Some(WireApi::Responses);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1, "exactly the mistral entry should warn");
+        let w = &warnings[0];
+        assert_eq!(w.code, "wire_api_not_supported_for_family");
+        assert_eq!(w.path, "providers.models.mistral.primary.wire_api");
+        assert!(
+            !warnings.iter().any(|w| w.path.contains("custom.vllm")),
+            "custom honors wire_api and must not warn",
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     async fn world_readable_config_is_detectable() {
@@ -21086,6 +21744,8 @@ require_otp_to_resume = true
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -21928,6 +22588,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -21960,6 +22622,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -21985,6 +22649,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         mx.set_secret("channels.matrix.access_token", "new-token".into())
             .unwrap();
@@ -22011,6 +22677,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -22048,6 +22716,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -22080,6 +22750,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -22121,6 +22793,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config
@@ -22171,6 +22845,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         // Encrypt
@@ -22208,6 +22884,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -22241,6 +22919,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -22269,6 +22949,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         }
     }
 
@@ -23312,6 +23994,72 @@ allowed_users = []
     }
 
     #[test]
+    async fn object_array_prop_display_redacts_nested_secret_fields() {
+        let fixture = ObjectArraySecretFixture {
+            entries: vec![
+                ObjectArraySecretEntry {
+                    name: "primary".to_string(),
+                    token: Some("nested-token-credential".to_string()),
+                    headers: HashMap::from([
+                        (
+                            "Authorization".to_string(),
+                            "Bearer nested-header-credential".to_string(),
+                        ),
+                        ("X-Tenant".to_string(), "tenant-credential".to_string()),
+                    ]),
+                },
+                ObjectArraySecretEntry {
+                    name: "unset-secret".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+            ],
+        };
+
+        let display_value = fixture
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "test.object_array.entries")
+            .expect("object-array field should be surfaced")
+            .display_value;
+        let readback = fixture
+            .get_prop("test.object_array.entries")
+            .expect("object-array field should be readable");
+
+        for rendered in [&display_value, &readback] {
+            assert!(
+                !rendered.contains("nested-token-credential"),
+                "object-array display/readback must redact scalar nested secrets: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Bearer nested-header-credential"),
+                "object-array display/readback must redact nested secret map values: {rendered}"
+            );
+            assert!(
+                !rendered.contains("tenant-credential"),
+                "object-array display/readback must redact every value in nested secret maps: {rendered}"
+            );
+            assert!(
+                rendered.contains("primary"),
+                "non-secret object-array fields should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("unset-secret"),
+                "non-secret fields on entries with unset secrets should remain visible: {rendered}"
+            );
+            assert!(
+                rendered.contains("****"),
+                "redacted object-array output should show masked placeholders: {rendered}"
+            );
+        }
+
+        assert!(
+            display_value.contains(r#""token":null"#),
+            "JSON display should preserve unset optional secrets as null, not a populated mask: {display_value}"
+        );
+    }
+
+    #[test]
     async fn onboard_state_prop_path_uses_top_level_kebab_field_name() {
         let mut config = Config::default();
 
@@ -23831,5 +24579,176 @@ allowed_users = []
                 .classifier_provider
                 .is_empty()
         );
+    }
+
+    fn provider_entry_with_fallback(fallback: &[&str]) -> OpenAIModelProviderConfig {
+        OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                fallback: fallback
+                    .iter()
+                    .map(|s| crate::providers::ModelProviderRef::new(*s))
+                    .collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    async fn fallback_warns_on_dangling_ref() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            provider_entry_with_fallback(&["openai.ghost"]),
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "dangling_fallback_ref");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.openai.primary.fallback[0]"
+        );
+    }
+
+    #[test]
+    async fn fallback_no_warning_when_ref_resolves() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            provider_entry_with_fallback(&["openai.backup"]),
+        );
+        config
+            .providers
+            .models
+            .openai
+            .insert("backup".to_string(), provider_entry_with_fallback(&[]));
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn fallback_warns_on_two_node_cycle() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("a".to_string(), provider_entry_with_fallback(&["openai.b"]));
+        config
+            .providers
+            .models
+            .openai
+            .insert("b".to_string(), provider_entry_with_fallback(&["openai.a"]));
+
+        let cycle_warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "fallback_cycle")
+            .collect();
+        assert!(
+            !cycle_warnings.is_empty(),
+            "a->b->a must surface at least one fallback_cycle warning"
+        );
+    }
+
+    #[test]
+    async fn fallback_self_reference_is_a_cycle() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "loop".to_string(),
+            provider_entry_with_fallback(&["openai.loop"]),
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "fallback_cycle");
+    }
+
+    #[test]
+    async fn fallback_empty_ref_is_skipped() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), provider_entry_with_fallback(&[""]));
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn fallback_warns_when_chain_exceeds_max_depth() {
+        let mut config = Config::default();
+        let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
+        for i in 0..n {
+            let next = if i + 1 < n {
+                vec![format!("openai.a{}", i + 1)]
+            } else {
+                vec![]
+            };
+            let refs: Vec<&str> = next.iter().map(String::as_str).collect();
+            config
+                .providers
+                .models
+                .openai
+                .insert(format!("a{i}"), provider_entry_with_fallback(&refs));
+        }
+
+        let depth_warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "max_fallback_depth_exceeded")
+            .collect();
+        assert!(
+            !depth_warnings.is_empty(),
+            "a chain deeper than MAX_FALLBACK_DEPTH must surface a max_fallback_depth_exceeded warning"
+        );
+    }
+
+    #[test]
+    async fn fallback_models_warns_on_empty_entry() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_fallback_model");
+    }
+
+    #[test]
+    async fn fallback_models_warns_on_duplicate_of_primary() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["gpt-4o".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn fallback_models_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        assert!(config.collect_warnings().is_empty());
     }
 }

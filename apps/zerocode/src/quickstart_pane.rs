@@ -649,6 +649,7 @@ pub struct QuickstartPane {
     /// `open_modal_for`.
     selector_list_rect: Option<Rect>,
     selector_row_rects: Vec<Rect>,
+    leave_requested: bool,
 }
 
 impl QuickstartPane {
@@ -671,7 +672,12 @@ impl QuickstartPane {
             modal_row_rects: Vec::new(),
             selector_list_rect: None,
             selector_row_rects: Vec::new(),
+            leave_requested: false,
         }
+    }
+
+    pub fn take_leave_request(&mut self) -> bool {
+        std::mem::take(&mut self.leave_requested)
     }
 
     pub async fn init(&mut self) -> anyhow::Result<()> {
@@ -683,13 +689,16 @@ impl QuickstartPane {
 
     pub fn help_context(&self) -> HelpNode {
         HelpNode::entries(vec![
-            HelpEntry::new(vec!["↑/↓"], crate::i18n::t("zc-quickstart-help-move")),
+            HelpEntry::new(
+                vec!["j", "k", "↑/↓"],
+                crate::i18n::t("zc-quickstart-help-move"),
+            ),
             HelpEntry::new(vec!["Enter"], crate::i18n::t("zc-quickstart-help-open")),
             HelpEntry::key(
                 "c",
                 crate::i18n::t_args("zc-quickstart-help-create", &[("enter", "Enter")]),
             ),
-            HelpEntry::key("Esc", crate::i18n::t("zc-quickstart-help-leave")),
+            HelpEntry::new(vec!["q", "Esc"], crate::i18n::t("zc-quickstart-help-leave")),
         ])
     }
 
@@ -769,6 +778,10 @@ impl QuickstartPane {
                 if self.can_create() {
                     self.submit().await;
                 }
+                false
+            }
+            Some(QuickstartTabAction::Back) => {
+                self.leave_requested = true;
                 false
             }
             _ => false,
@@ -1860,6 +1873,32 @@ fn generate_run_id() -> String {
     format!("{now:x}-{pid:x}")
 }
 
+/// Wrapped visual-row height of each logical line at `width`, using the
+/// same word-wrap (`Wrap { trim: false }`) the modal body renders with.
+/// Every line occupies at least one row — a blank line still takes a row.
+///
+/// Sizing the modal by logical line count alone left it too short
+/// whenever content soft-wrapped: long risk-profile blurbs pushed the
+/// `yolo` option off-screen, and a long pasted `api_key` pushed the
+/// `model` picker out of view. These heights drive both the box size and
+/// the cursor-tracking scroll so the geometry survives wrapping.
+fn wrapped_row_heights(lines: &[Line], width: u16) -> Vec<u16> {
+    lines
+        .iter()
+        .map(|line| {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1) as u16
+        })
+        .collect()
+}
+
+/// Total wrapped rows a block of lines occupies at `width`.
+fn wrapped_total(lines: &[Line], width: u16) -> u16 {
+    wrapped_row_heights(lines, width).iter().copied().sum()
+}
+
 /// Paint the modal and return `(inner_rect, row_to_cursor)` so the
 /// pane's mouse handler can resolve a click to a cursor index. The
 /// `row_to_cursor` vec maps each body row (top → bottom) to either
@@ -2237,15 +2276,40 @@ fn draw_modal(
     };
 
     let box_w = area.width.saturating_sub(8).min(80);
-    let header_h = header_lines.len() as u16;
-    let total_content = header_h + body_lines.len() as u16;
-    let box_h = (total_content + 4).min(area.height.saturating_sub(4));
+    let block = theme::modal_block(&title).padding(Padding::horizontal(1));
+    // Width left for wrapped text inside the block (its borders plus the
+    // horizontal padding). Measured off the block so it tracks any future
+    // border/padding change rather than hard-coding `box_w - 4`.
+    let inner_width = block
+        .inner(Rect::new(area.x, area.y, box_w, area.height))
+        .width;
+
+    // Size the box from the *wrapped* row counts, not the logical line
+    // counts. Long picker blurbs and long pasted field values (e.g. an
+    // `api_key`) soft-wrap across several rows; sizing by line count alone
+    // left the box too short, so later rows — the `yolo` risk option, the
+    // `model` picker — fell outside the viewport entirely.
+    let body_heights = wrapped_row_heights(&body_lines, inner_width);
+    let header_rows = wrapped_total(&header_lines, inner_width);
+    // Prefix sums: where each logical body line begins in wrapped-row
+    // space. `row_starts[i]` is line `i`'s first row; the trailing entry
+    // is the total wrapped-row count.
+    let mut row_starts: Vec<u16> = Vec::with_capacity(body_heights.len() + 1);
+    let mut acc = 0u16;
+    for h in &body_heights {
+        row_starts.push(acc);
+        acc = acc.saturating_add(*h);
+    }
+    row_starts.push(acc);
+    let body_rows = acc;
+    // content rows + top/bottom border + footer row (+1 slack).
+    let box_h = (header_rows.saturating_add(body_rows).saturating_add(4))
+        .min(area.height.saturating_sub(4));
     let x = area.x + area.width.saturating_sub(box_w) / 2;
     let y = area.y + area.height.saturating_sub(box_h) / 2;
     let rect = Rect::new(x, y, box_w, box_h);
 
     frame.render_widget(Clear, rect);
-    let block = theme::modal_block(&title).padding(Padding::horizontal(1));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -2253,7 +2317,7 @@ fn draw_modal(
     // space is split between an optional header band (per-field help)
     // and the body (form rows / picker entries).
     let inner_content_h = inner.height.saturating_sub(1);
-    let effective_header_h = header_h.min(inner_content_h);
+    let effective_header_h = header_rows.min(inner_content_h);
     let header_rect = Rect::new(inner.x, inner.y, inner.width, effective_header_h);
     let body_rect = Rect::new(
         inner.x,
@@ -2262,24 +2326,35 @@ fn draw_modal(
         inner_content_h.saturating_sub(effective_header_h),
     );
 
-    let body_h = body_rect.height as usize;
-    let body_len = body_lines.len();
-    let scroll_offset: u16 = if body_len > body_h && body_h > 0 {
-        // Pick the cursor line that should stay visible. Modals without
-        // a row cursor (TextInput) leave this as None and the body just
-        // top-aligns; everything else (Picker, FieldForm, ChannelList)
-        // keeps the selected row inside the viewport.
-        let selected_line = match modal {
-            Modal::Picker(p) => cursor_lines.get(p.cursor).copied(),
-            Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
-            Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
-            Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
-            Modal::Agent(a) => cursor_lines.get(a.cursor).copied(),
-            Modal::TextInput(_) => None,
-        };
+    let body_h = body_rect.height;
+    // Which cursor row must stay visible. TextInput has no row cursor, so
+    // its body just top-aligns; everything else keeps the selected row in
+    // view. `selected_line` is a logical body-line index; `row_starts`
+    // maps it into wrapped-row space so the scroll math survives wrapping.
+    let selected_line = match modal {
+        Modal::Picker(p) => cursor_lines.get(p.cursor).copied(),
+        Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
+        Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
+        Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
+        Modal::Agent(a) => cursor_lines.get(a.cursor).copied(),
+        Modal::TextInput(_) => None,
+    };
+    let scroll_offset: u16 = if body_rows > body_h && body_h > 0 {
         match selected_line {
-            Some(sel) if sel >= body_h => (sel + 1 - body_h) as u16,
-            _ => 0,
+            Some(line) => {
+                let start = row_starts.get(line).copied().unwrap_or(0);
+                let end = row_starts.get(line + 1).copied().unwrap_or(body_rows);
+                if end <= body_h {
+                    // Selected row ends within the first screenful — no scroll.
+                    0
+                } else {
+                    // Bring the selected row's bottom to the viewport bottom,
+                    // but never past its top (handles a row taller than the
+                    // viewport, e.g. a long pasted secret rendered as bullets).
+                    (end - body_h).min(start)
+                }
+            }
+            None => 0,
         }
     } else {
         0
@@ -2318,10 +2393,20 @@ fn draw_modal(
     let row_rects: Vec<Rect> = cursor_lines
         .into_iter()
         .map(|line_idx| {
-            let scrolled = (line_idx as u16).checked_sub(scroll_offset);
-            match scrolled {
+            let start = row_starts.get(line_idx).copied().unwrap_or(0);
+            let height = body_heights.get(line_idx).copied().unwrap_or(1).max(1);
+            match start.checked_sub(scroll_offset) {
                 Some(dy) if dy < body_rect.height => {
-                    Rect::new(body_rect.x, body_rect.y + dy, body_rect.width, 1)
+                    // Span the row's full wrapped height (clipped to the
+                    // viewport) so a click on a wrapped continuation row
+                    // still resolves to the right cursor.
+                    let visible = height.min(body_rect.height - dy);
+                    Rect::new(
+                        body_rect.x,
+                        body_rect.y + dy,
+                        body_rect.width,
+                        visible.max(1),
+                    )
                 }
                 _ => Rect::new(0, 0, 0, 0),
             }
@@ -2454,5 +2539,116 @@ mod tests {
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
             .unwrap_or_default();
         assert!(seeded.is_empty());
+    }
+
+    #[test]
+    fn wrapped_total_counts_soft_wrapped_rows() {
+        // Regression: the modal box was sized from logical line count, so
+        // a picker blurb (or pasted value) wider than the box still
+        // counted as one row — leaving later options like `yolo` outside
+        // the viewport. `wrapped_total` must report the real wrapped
+        // height the body Paragraph renders.
+        let long = Line::from("a".repeat(40));
+        assert_eq!(wrapped_total(std::slice::from_ref(&long), 10), 4);
+        // A blank line still occupies one row.
+        let blank = Line::from("");
+        assert_eq!(wrapped_total(std::slice::from_ref(&blank), 10), 1);
+    }
+
+    #[test]
+    fn wrapped_row_heights_are_measured_per_line() {
+        // Each logical line wraps independently; the per-line heights feed
+        // the prefix sums that keep scroll + click hit-testing aligned
+        // when an earlier row (e.g. a long api_key) wraps.
+        let lines = vec![
+            Line::from("short"),
+            Line::from("x".repeat(25)), // 25 / 10 -> 3 rows
+            Line::from("ok"),
+        ];
+        assert_eq!(wrapped_row_heights(&lines, 10), vec![1, 3, 1]);
+        assert_eq!(wrapped_total(&lines, 10), 5);
+    }
+
+    /// Render a modal through a headless `TestBackend` and return the
+    /// `(box_rect, per-cursor hit-rects)` `draw_modal` produced — the same
+    /// geometry the live render path uses, so a test can assert on the
+    /// post-scroll, wrapped-row layout instead of just the measurement
+    /// primitives.
+    fn render_modal_rects(area: Rect, modal: &Modal) -> (Rect, Vec<Rect>) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut out = None;
+        terminal
+            .draw(|frame| {
+                out = Some(draw_modal(frame, area, modal, &[], &[]));
+            })
+            .expect("draw");
+        out.expect("draw_modal ran")
+    }
+
+    fn risk_picker(cursor: usize, help: &str) -> Modal {
+        Modal::Picker(PickerModal {
+            selector: Selector::RiskProfile,
+            purpose: PickerPurpose::DirectChoice,
+            options: vec![
+                opt("locked_down", "Locked Down", help),
+                opt("balanced", "Balanced", help),
+                opt("yolo", "YOLO", help),
+            ],
+            cursor,
+        })
+    }
+
+    #[test]
+    fn picker_keeps_every_option_visible_when_blurbs_wrap() {
+        // #7359 headline: each risk-profile option carries an inline help
+        // blurb that wraps to two rows. The old box was sized from the
+        // logical line count (3), so the last option (`yolo`) fell off the
+        // bottom. With wrapped sizing the box grows to fit all three, and
+        // the hit-rects are spaced by *wrapped* height (>=2 rows apart),
+        // not logical lines (which would be 1 apart — the pre-fix bug).
+        let help = "Applies specific filesystem and approval defaults for day-to-day operation.";
+        let modal = risk_picker(2, help);
+        let area = Rect::new(0, 0, 60, 24);
+        let (rect, rects) = render_modal_rects(area, &modal);
+        assert_eq!(rects.len(), 3);
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.height > 0, "option {i} must be visible, got {r:?}");
+            assert!(
+                in_rect(r.x, r.y, rect),
+                "option {i} must sit inside the modal box {rect:?}, got {r:?}"
+            );
+        }
+        assert!(
+            rects[1].y >= rects[0].y + 2 && rects[2].y >= rects[1].y + 2,
+            "hit-rects must be spaced by wrapped height, not logical lines: {rects:?}"
+        );
+    }
+
+    #[test]
+    fn picker_scrolls_to_keep_selected_option_visible() {
+        // When even the grown box can't fit every wrapped row, the selected
+        // row must scroll into view: its hit-rect is non-zero while an
+        // earlier row that scrolled off the top collapses to a zero rect.
+        // This exercises the row_starts -> scroll_offset -> row_rects chain
+        // that the measurement-helper tests don't reach. On the pre-fix code
+        // (logical-line scroll) the first option's rect stayed non-zero.
+        let help = "Applies specific filesystem and approval defaults, with extra \
+                    explanation to force several wrapped rows inside a narrow modal box.";
+        let modal = risk_picker(2, help);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_rect, rects) = render_modal_rects(area, &modal);
+        assert_eq!(rects.len(), 3);
+        assert!(
+            rects[2].height > 0,
+            "selected option must scroll into view, got {:?}",
+            rects[2]
+        );
+        assert_eq!(
+            rects[0].height, 0,
+            "first option must scroll off the top, got {:?}",
+            rects[0]
+        );
     }
 }

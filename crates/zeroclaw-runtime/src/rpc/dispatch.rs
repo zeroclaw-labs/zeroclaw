@@ -56,7 +56,6 @@ pub enum Method {
     SessionMessages,
     SessionState,
     SessionDelete,
-    SessionRename,
     SessionApprove,
     SessionKill,
 
@@ -158,7 +157,6 @@ impl Method {
         (Method::SessionMessages, "session/messages"),
         (Method::SessionState, "session/state"),
         (Method::SessionDelete, "session/delete"),
-        (Method::SessionRename, "session/rename"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
         // Memory
@@ -420,7 +418,6 @@ impl RpcDispatcher {
             Method::SessionMessages => self.handle_session_messages(&req.params).await,
             Method::SessionState => self.handle_session_state(&req.params).await,
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
-            Method::SessionRename => self.handle_session_rename(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params),
             Method::SessionKill => self.handle_session_kill(&req.params).await,
 
@@ -647,22 +644,71 @@ impl RpcDispatcher {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        let resuming = req.session_id.is_some();
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let config = self.ctx.config.read().clone();
-        let cwd_path = req.cwd.as_deref().map(std::path::Path::new);
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+
+        // Resuming an ACP session with no caller cwd: recover the original
+        // working directory from the persisted store so the rehydrated session
+        // keeps its own cwd instead of falling back to the agent workspace dir.
+        // The loaded data is reused below so history is not fetched twice.
+        let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
+        if resuming
+            && req.cwd.is_none()
+            && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && let Some(ref store) = self.ctx.acp_session_store
+        {
+            let store_cloned = store.clone();
+            let sid = session_id.clone();
+            if let Ok(Ok(Some(data))) =
+                tokio::task::spawn_blocking(move || store_cloned.load_session(&sid)).await
+            {
+                preloaded_acp = Some(data);
+            }
+        }
+
+        // The session cwd: caller-supplied wins, then a resumed ACP session's
+        // persisted cwd, then the agent's workspace dir.
+        let cwd = req
+            .cwd
+            .clone()
+            .or_else(|| preloaded_acp.as_ref().map(|d| d.workspace_dir.clone()))
+            .unwrap_or_else(|| {
+                config
+                    .agent_workspace_dir(&req.agent_alias)
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        let cwd_path = Some(std::path::Path::new(&cwd));
         let tui_env = req
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        // ACP (Code) sessions never get the long-term-memory tools or backend.
+        // The exclusion is derived from `chat_mode` on the server rather than
+        // trusted from the wire `exclude_memory` flag, so a client that omits
+        // or falsifies the flag cannot smuggle memory access into a Code
+        // session. A non-ACP caller may still opt in explicitly.
+        let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            || req.exclude_memory == Some(true);
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &req.agent_alias,
             cwd_path,
             false,
-            req.exclude_memory.unwrap_or(false),
+            exclude_memory,
             tui_env,
         )
         .await
@@ -676,16 +722,6 @@ impl RpcDispatcher {
         ));
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        let cwd = req.cwd.clone().unwrap_or_else(|| {
-            config
-                .agent_workspace_dir(&req.agent_alias)
-                .to_string_lossy()
-                .to_string()
-        });
-        let chat_mode = req
-            .chat_mode
-            .clone()
-            .unwrap_or(crate::rpc::types::ChatMode::Chat);
         self.ctx
             .sessions
             .insert(
@@ -739,51 +775,89 @@ impl RpcDispatcher {
             }
         }
 
+        enum AcpSessionNewLoad {
+            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
         let mut message_count = 0;
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
-                if let Some(ref store) = self.ctx.acp_session_store {
+                // Reuse the data already loaded for cwd recovery on resume so the
+                // store isn't hit twice; otherwise fall through to the restore-
+                // aware load-or-create path below.
+                let loaded = if let Some(data) = preloaded_acp.take() {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                } else {
+                    let Some(ref store) = self.ctx.acp_session_store else {
+                        self.ctx.sessions.remove(&session_id).await;
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            "ACP session store is not available",
+                        ));
+                    };
+
                     let store_cloned = store.clone();
                     let sid = session_id.clone();
                     let alias = req.agent_alias.clone();
                     let cwd_owned = cwd.clone();
-                    let loaded = tokio::task::spawn_blocking(move || {
-                        match store_cloned.load_session(&sid) {
-                            Ok(Some(data)) => Ok(Some(data)),
-                            Ok(None) => store_cloned
-                                .create_session(&sid, &alias, &cwd_owned)
-                                .map(|_| None),
-                            Err(e) => Err(e),
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                        match store_cloned.load_session_for_restore(&sid)? {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session(&sid, &alias, &cwd_owned)?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
                         }
                     })
-                    .await;
-                    match loaded {
-                        Ok(Ok(Some(data))) => {
-                            message_count = data.messages.len();
-                            self.ctx
-                                .sessions
-                                .seed_conversation_history(&session_id, data.messages)
-                                .await;
-                        }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
-                                "Failed to load or create ACP session"
-                            );
-                        }
-                        Err(join) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
-                                "ACP session load task panicked"
-                            );
-                        }
+                    .await
+                };
+                match loaded {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        message_count = data.messages.len();
+                        self.ctx
+                            .sessions
+                            .seed_conversation_history(&session_id, data.messages)
+                            .await;
+                    }
+                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
+                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                        self.ctx.sessions.remove(&session_id).await;
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                    Ok(Err(e)) => {
+                        self.ctx.sessions.remove(&session_id).await;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
+                            "Failed to load or create ACP session"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to load or create ACP session: {e}"),
+                        ));
+                    }
+                    Err(join) => {
+                        self.ctx.sessions.remove(&session_id).await;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
+                            "ACP session load task failed"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("ACP session load task failed: {join}"),
+                        ));
                     }
                 }
             }
@@ -876,9 +950,12 @@ impl RpcDispatcher {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        if self.ctx.sessions.get_agent(sid).await.is_none() {
-            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-        }
+        let chat_mode = self
+            .ctx
+            .sessions
+            .chat_mode(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let agent_alias = self
             .ctx
@@ -894,6 +971,41 @@ impl RpcDispatcher {
             channel = "rpc",
         );
         let _guard = span.enter();
+
+        if matches!(chat_mode, ChatMode::Acp) {
+            let store = self
+                .ctx
+                .acp_session_store
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+            let sid_owned = sid.to_string();
+            let marked =
+                tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
+            match marked {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "session/kill: live ACP session had no durable row to tombstone"
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+            }
+        }
 
         let killed = self.ctx.sessions.kill_session(sid).await;
         if killed {
@@ -921,19 +1033,59 @@ impl RpcDispatcher {
         })
     }
 
-    /// Rebuild a reaped ACP session from its durable row so a fresh prompt
-    /// recovers to a working session instead of hanging. Returns the live agent
-    /// on success, `None` only when the durable row is genuinely gone.
+    /// Rebuild a reaped ACP session from a restorable durable row so a fresh
+    /// prompt recovers to a working session instead of hanging. Returns the
+    /// live agent on success; returns `None` for missing, killed, or unreadable
+    /// durable state.
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
         let store = self.ctx.acp_session_store.clone()?;
         let sid_owned = sid.to_string();
-        let loaded = tokio::task::spawn_blocking(move || store.load_session(&sid_owned)).await;
+        let loaded =
+            tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
         let data = match loaded {
-            Ok(Ok(Some(data))) => data,
-            _ => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                    "session/prompt: refusing to rehydrate admin-killed ACP session"
+                );
+                return None;
+            }
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "session/prompt: failed to query ACP killed marker before rehydrate"
+                );
+                return None;
+            }
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "session/prompt: ACP killed-marker query task failed before rehydrate"
+                );
+                return None;
+            }
         };
 
         let config = self.ctx.config.read().clone();
@@ -942,12 +1094,18 @@ impl RpcDispatcher {
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
+        // Reaped ACP sessions always rehydrate as `ChatMode::Acp` (see the
+        // insert below), so the recovered agent must enforce the same
+        // server-side memory-tool exclusion as a fresh `session/new` ACP
+        // session — otherwise session recovery silently restores the
+        // long-term-memory backend and tools the ACP invariant forbids.
+        let exclude_memory = true;
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &data.agent_alias,
             cwd_path,
             false,
-            false,
+            exclude_memory,
             tui_env,
         )
         .await
@@ -1109,7 +1267,7 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -1205,7 +1363,9 @@ impl RpcDispatcher {
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
         let cancel_cause = self.ctx.sessions.take_cancel_cause(sid);
-        self.ctx.sessions.remove_cancel_token(sid);
+        self.ctx
+            .sessions
+            .remove_cancel_token(sid, cancel_generation);
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -1444,6 +1604,33 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
+        // A model_provider override needs a live provider-box rebuild, which
+        // requires Config — held here, not in the session store. Resolve the
+        // model from the (already-merged) model override or the configured
+        // entry, build the box, and swap it onto the session's agent.
+        if let Some(ref model_provider_ref) = merged.model_provider {
+            let built = {
+                let config = self.ctx.config.read();
+                crate::agent::agent::build_session_model_provider(
+                    &config,
+                    model_provider_ref,
+                    merged.model.as_deref(),
+                )
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
+            };
+            let (model_provider, model_provider_name, model_name) = built;
+            self.ctx
+                .sessions
+                .apply_model_provider(&req.session_id, model_provider, model_provider_name)
+                .await
+                .then_some(())
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            // Keep the agent's model name aligned with the model_provider it now holds.
+            if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+                agent.lock().await.set_model_name(model_name);
+            }
+        }
+
         to_result(SessionConfigureResult {
             session_id: req.session_id,
             overrides: merged,
@@ -1521,10 +1708,11 @@ impl RpcDispatcher {
             .get_workspace_dir(&req.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "session not found"))?;
-        let branch = crate::rpc::git::branch_for(std::path::Path::new(&cwd));
+        let info = crate::rpc::git::head_info(std::path::Path::new(&cwd)).unwrap_or_default();
         to_result(SessionGitBranchResult {
             session_id: req.session_id,
-            branch,
+            branch: info.branch,
+            hash: info.hash,
         })
     }
 
@@ -1726,29 +1914,6 @@ impl RpcDispatcher {
         to_result(SessionDeleteResult {
             session_id: req.session_id,
             deleted: true,
-        })
-    }
-
-    async fn handle_session_rename(&self, params: &Value) -> RpcResult {
-        let req: SessionRenameParams = parse_params(params)?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        // Try all candidate keys — UPDATE on a missing key is a no-op.
-        for key in &[
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ] {
-            backend
-                .set_session_name(key, &req.name)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Rename failed: {e}")))?;
-        }
-        to_result(SessionRenameResult {
-            session_id: req.session_id,
-            name: req.name,
         })
     }
 
@@ -3305,13 +3470,7 @@ mod tests {
     // helpers: `RpcContext::minimal`, `RpcDispatcher::handle_session_new_for_test`,
     // and `Agent::tool_names`.
 
-    const MEMORY_TOOLS: &[&str] = &[
-        "memory_recall",
-        "memory_store",
-        "memory_forget",
-        "memory_export",
-        "memory_purge",
-    ];
+    use zeroclaw_tools::MEMORY_TOOL_NAMES as MEMORY_TOOLS;
 
     fn make_acp_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
@@ -3398,6 +3557,47 @@ mod tests {
             assert!(
                 !tool_names.contains(&mem_tool),
                 "ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_chat_mode_strips_memory_tools_without_exclude_flag() {
+        // The server must derive memory exclusion from `chat_mode: acp`, not
+        // trust the wire `exclude_memory` flag. A Code session that omits the
+        // flag entirely must still come up with no memory tools.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-no-flag-session-001"
+        });
+
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-no-flag-session-001")
+            .await
+            .expect("session must be registered in the store after session/new");
+
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "ACP chat_mode must strip `{mem_tool}` even without exclude_memory — \
+                 tool list: {tool_names:?}"
             );
         }
     }
@@ -3556,6 +3756,153 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
+        );
+    }
+
+    /// Resuming an ACP session with no caller cwd must recover the original
+    /// working directory from the persisted store, not fall back to the agent
+    /// workspace dir. Regression: a reconnect showed the wrong cwd because the
+    /// resume path defaulted the cwd instead of reading the retained session's.
+    #[tokio::test]
+    async fn acp_resume_recovers_persisted_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-cwd-resume-001";
+        let original_cwd = tmp.path().join("project-dir").to_string_lossy().to_string();
+
+        // First create the session with an explicit cwd.
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+                "cwd": original_cwd,
+            }))
+            .await
+            .expect("initial session/new should succeed");
+        assert_eq!(created["workspace_dir"], original_cwd);
+        assert_eq!(
+            acp_store.load_session(sid).unwrap().unwrap().workspace_dir,
+            original_cwd
+        );
+
+        // Resume with NO cwd: the daemon must report the persisted cwd, not the
+        // agent workspace dir.
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("resume session/new should succeed");
+        assert_eq!(
+            resumed["workspace_dir"], original_cwd,
+            "resume must keep the retained session's cwd, not default it"
+        );
+    }
+
+    /// The ACP memory-tool invariant must survive session recovery: a reaped
+    /// ACP session that rehydrates must come back with NONE of the long-term
+    /// memory tools, exactly like a fresh `session/new` ACP session. Without
+    /// the server-side exclusion on the rehydrate path, recovery would silently
+    /// restore the memory backend and tools the ACP boundary forbids.
+    #[tokio::test]
+    async fn reaped_acp_session_rehydrates_without_memory_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-reaped-mem-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        // Reap the in-memory session, leaving the durable row to rehydrate from.
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("a reaped ACP session must rehydrate to a working agent");
+
+        let agent = recovered.lock().await;
+        let tool_names = agent.tool_names();
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "rehydrated ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
+            );
+        }
+    }
+
+    /// A deliberately killed ACP session must not be treated like a merely
+    /// reaped session. The durable transcript remains available, but the next
+    /// prompt must not silently resurrect the killed live session.
+    #[tokio::test]
+    async fn killed_acp_session_does_not_rehydrate_from_durable_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-killed-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "freshly created session must be live in memory"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "durable row must exist before kill"
+        );
+
+        dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("session/kill should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "session/kill must remove the live in-memory agent"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "session/kill must preserve durable history"
+        );
+
+        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        assert!(
+            recovered.is_none(),
+            "admin-killed ACP sessions must stay killed instead of rehydrating \
+             from durable history on the next prompt"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "failed rehydrate must leave the session absent from memory"
         );
     }
 
