@@ -47,3 +47,6 @@ unic-langid = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[build-dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

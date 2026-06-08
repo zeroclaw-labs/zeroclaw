@@ -94,6 +94,21 @@ model = "meta-llama/Llama-3.1-8B-Instruct"
 
 Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern — see the [catalog](./catalog.md).
 
+## Wire protocol — `wire_api = "responses"`
+
+Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit opt-in:
+
+```toml
+[providers.models.custom.vllm]
+uri      = "http://10.0.0.15:8000/v1"
+model    = "Qwen/Qwen3-30B-A3B"
+wire_api = "responses"                  # default is "chat_completions"
+```
+
+When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set `"chat_completions"`, for the default wire.
+
+`wire_api` is only honored by the bring-your-own-endpoint families where the wire is operator-configurable: `openai`, `llamacpp`, and `custom` (plus the generic openai-compatible path). Branded vendor slots (`groq`, `mistral`, `deepseek`, …) have a fixed wire protocol and ignore the field. The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
+
 ## Validation
 
 Regardless of approach:

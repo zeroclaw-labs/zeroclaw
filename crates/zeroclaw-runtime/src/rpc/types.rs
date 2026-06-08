@@ -237,6 +237,8 @@ rpc_type! {
         pub session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hash: Option<String>,
     }
 }
 
@@ -326,20 +328,6 @@ rpc_type! {
     pub struct SessionDeleteResult {
         pub session_id: String,
         pub deleted: bool,
-    }
-}
-
-rpc_type! {
-    pub struct SessionRenameParams {
-        pub session_id: String,
-        pub name: String,
-    }
-}
-
-rpc_type! {
-    pub struct SessionRenameResult {
-        pub session_id: String,
-        pub name: String,
     }
 }
 
