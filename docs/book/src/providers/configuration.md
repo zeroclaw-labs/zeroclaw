@@ -69,7 +69,7 @@ Three ways to supply credentials, in resolution order:
 Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:
 
 - **Anthropic**: `sk-ant-oat-*` OAuth tokens (from Claude Pro/Team) go in `api_key` on `[providers.models.anthropic.<alias>]`.
-- **OpenAI Codex subscription**: set `requires_openai_auth` = true` and leave `api_key` unset on `[providers.models.openai.<alias>]`; the runtime reads the stored Codex login.
+- **OpenAI Codex subscription**: set `requires_openai_auth = true` and leave `api_key` unset on `[providers.models.openai.<alias>]`; the runtime reads the stored Codex login.
 - **Gemini CLI**: `[providers.models.gemini_cli.<alias>]` shells out to the `gemini` CLI; use the CLI's own auth flow.
 - **Qwen / MiniMax**: set `auth_mode = "oauth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
 

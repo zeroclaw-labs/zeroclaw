@@ -67,7 +67,7 @@ Docs: [Tool receipts](./tool-receipts.md).
 
 Beyond the six layers:
 
-- **OTP gating**: `[security.otp]` gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
+- **OTP gating**: `[security.otp] gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
 - **Emergency stop**: `zeroclaw estop` halts all in-flight tool calls. With `[security.estop] enabled = true`, resuming requires an OTP.
 - **Prompt injection guard**: scans model output for known injection patterns before tool calls are validated.
 - **Leak detector**: scans outbound messages for secrets (API key patterns, private keys) and blocks sends that match.

@@ -6,9 +6,9 @@ Run ZeroClaw in Docker, Podman, Kubernetes, or any OCI runtime.
 
 Pushed to GitHub Container Registry (`ghcr.io`) on every stable release:
 
-- `ghcr.io/zeroclaw-labs/`:latest`: latest stable
-- `ghcr.io/zeroclaw-labs/`:v0.7.5`: pinned
-- `ghcr.io/zeroclaw-labs/`:debian`: Debian-based image (larger, broader glibc support)
+- `ghcr.io/zeroclaw-labs/zeroclaw:latest`: latest stable
+- `ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5`: pinned
+- `ghcr.io/zeroclaw-labs/zeroclaw:debian`: Debian-based image (larger, broader glibc support)
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
 

@@ -186,9 +186,9 @@ The dashboard's **Cost** tab shows three panels plus a Window picker
 (today / last 7 days / last 30 days / this month / all time):
 
 - **Spend totals**: daily and monthly totals from `costs.jsonl`.
-- **Spend by agent · <window>**: per-agent rollup over the picked
+- **Spend by agent · `<window>`**: per-agent rollup over the picked
   window. Visible when `track_per_agent` is true.
-- **Spend by model · <window>**: per-model rollup. Each row's model
+- **Spend by model · `<window>`**: per-model rollup. Each row's model
   id is clickable; the click resolves the owning provider type from
   configured aliases and navigates to that provider's Costs tab. When
   the model id isn't bound to any configured provider the click is a

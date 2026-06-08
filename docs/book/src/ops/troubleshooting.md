@@ -47,7 +47,7 @@ Options:
 
 1. **Use a prebuilt**: `./install.sh --prebuilt` skips the toolchain and downloads from GitHub Releases
 2. **Cross-compile on a bigger machine and copy the binary**
-3. **Serialise the build**: `CARGO_BUILD_JOBS=1` cargo build --release --locked`
+3. **Serialise the build**: `CARGO_BUILD_JOBS=1 cargo build --release --locked`
 4. **Add swap** (works for RAM, costs disk, check you have both)
 
 ### Build is very slow
