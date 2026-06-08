@@ -22988,6 +22988,77 @@ allowed_users = []
     }
 
     #[test]
+    async fn mcp_servers_create_map_key_is_idempotent_on_existing_natural_key() {
+        // Regression for the per-field editor contract: the rest of the
+        // natural-key surface (`get_prop` / `set_prop` / `rename_map_key`)
+        // treats duplicate natural keys as `VecRoute::Ambiguous` and
+        // refuses to mutate (see `mcp_servers_routing_is_ambiguous_on_
+        // duplicate_names`). If `create_map_key` always appended, a UI
+        // retry — or any caller that re-issued the same add after an
+        // uncertain RPC response — would drop `mcp.servers` into that
+        // invalid state and leave `mcp.servers.<name>.command` no longer
+        // routing until the operator hand-repaired the duplicate.
+        //
+        // The contract is the same as the `HashMap<String, T>` arm:
+        // re-adding an existing key is `Ok(false)` (idempotent no-op),
+        // not "append a second element that happens to share the key".
+        let mut config = Config::default();
+
+        let first = config
+            .create_map_key("mcp.servers", "fs")
+            .expect("first add should succeed");
+        assert!(first, "first add should report created=true");
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(config.mcp.servers[0].name, "fs");
+
+        // Seed an inner field so we can prove the existing entry's
+        // state is preserved across the no-op second add (rather than,
+        // say, the second call clobbering it with a default).
+        config
+            .set_prop("mcp.servers.fs.command", "/usr/bin/mcp-fs")
+            .expect("set_prop on the freshly-added entry should route");
+
+        // Repeat add for the same natural key. Must report Ok(false)
+        // and must not push a second element.
+        let second = config
+            .create_map_key("mcp.servers", "fs")
+            .expect("repeat add for an existing natural key must not error");
+        assert!(
+            !second,
+            "repeat add for an existing natural key should report created=false (idempotent)"
+        );
+        assert_eq!(
+            config.mcp.servers.len(),
+            1,
+            "repeat add must not append a duplicate; got {} entries",
+            config.mcp.servers.len()
+        );
+        assert_eq!(config.mcp.servers[0].name, "fs");
+
+        // The natural-key surface still routes — the duplicate was
+        // never created, so `set_prop` / `get_prop` are not in the
+        // `VecRoute::Ambiguous` state. The previously-set command
+        // round-trips and a new edit lands on the original entry.
+        assert_eq!(
+            config.get_prop("mcp.servers.fs.command").unwrap(),
+            "/usr/bin/mcp-fs",
+            "existing entry's state must survive the no-op second add"
+        );
+        config
+            .set_prop("mcp.servers.fs.command", "/usr/local/bin/mcp-fs")
+            .expect("set_prop must keep routing after the repeat add");
+        assert_eq!(config.mcp.servers[0].command, "/usr/local/bin/mcp-fs");
+
+        // A genuinely new key is still added: idempotency is per-key,
+        // not "first add wins everything".
+        let third = config
+            .create_map_key("mcp.servers", "github")
+            .expect("a distinct natural key should still be addable");
+        assert!(third, "distinct-key add should report created=true");
+        assert_eq!(config.mcp.servers.len(), 2);
+    }
+
+    #[test]
     async fn mcp_servers_routing_is_ambiguous_on_duplicate_names() {
         // `validate_mcp_config` rejects duplicate `name` at save time,
         // but until the operator repairs the config the in-flight

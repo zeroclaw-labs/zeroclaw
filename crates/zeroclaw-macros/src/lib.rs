@@ -1263,6 +1263,54 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         description: #field_doc,
                     });
                 });
+                // `create_map_key` on a Vec section. Two flavours:
+                //
+                //   * `#[natural_key = "<field>"]` Vec — idempotent, like a
+                //     HashMap section: if an element already carries the
+                //     requested natural key, return `Ok(false)` without
+                //     mutating state. Otherwise append + seed the natural
+                //     key from `map_key`. This is essential: the rest of
+                //     the natural-key surface (per-element `get_prop` /
+                //     `set_prop` / `rename_map_key`) treats duplicate
+                //     natural keys as `VecRoute::Ambiguous` and refuses to
+                //     mutate; an always-append create path would drop the
+                //     editor into that invalid state on a UI retry or a
+                //     repeat add. Matches `HashMap<String, T>` semantics
+                //     (`contains_key` → `Ok(false)`).
+                //
+                //   * Plain `Vec<T>` without `#[natural_key]` — legacy
+                //     always-append behaviour. No natural key exists yet
+                //     to check against, and the section's editor surface
+                //     is the whole-array `ObjectArray` `set_prop` path
+                //     (not per-element). Behaviour unchanged from before
+                //     the natural-key opt-in shipped, so the other seven
+                //     `Vec<T> + #[nested]` schema fields keep their
+                //     existing semantics.
+                let create_dup_check = if let Some(nk_field) = &natural_key_field {
+                    let nk_field_lit = nk_field.clone();
+                    quote! {
+                        // Idempotency check: walk the live Vec and ask
+                        // each element for its natural-key field via the
+                        // inner type's own `get_prop`. If any element
+                        // already reports `map_key`, return `Ok(false)`
+                        // without pushing — same contract as the
+                        // `HashMap<String, T>` arm.
+                        let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                        let nk_path = if inner_prefix.is_empty() {
+                            #nk_field_lit.to_string()
+                        } else {
+                            format!("{inner_prefix}.{}", #nk_field_lit)
+                        };
+                        let already_present = self.#field_ident.iter().any(|e| {
+                            e.get_prop(&nk_path).ok().as_deref() == Some(map_key)
+                        });
+                        if already_present {
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    quote! {}
+                };
                 create_map_key_arms.push(quote! {
                     {
                         let prefix = Self::configurable_prefix();
@@ -1272,6 +1320,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             format!("{prefix}.{}", #vec_field_name_lit)
                         };
                         if section_path == expected {
+                            #create_dup_check
                             let value: #vec_inner_ty = serde_json::from_value(
                                 serde_json::json!({}),
                             ).map_err(|e| format!(
