@@ -129,6 +129,11 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
         return Ok(());
     }
 
+    // Map each hashed chrome file (path relative to the locale dir, e.g.
+    // `theme/custom-abc12345.css`) to its unhashed `_shared`-relative path
+    // (e.g. `theme/custom.css`). The `../` prefix is applied per HTML file
+    // below, because a page's correct depth to the version root — and thus to
+    // `_shared` at the gh-pages root — depends on how deep the page sits.
     let mut replacements = Vec::new();
     let prefixes = [
         "css/chrome",
@@ -178,7 +183,8 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
                     std::fs::create_dir_all(dest.parent().unwrap())?;
                     std::fs::copy(&file, &dest)?;
                     let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
-                    replacements.push((rel_str.clone(), format!("../../_shared/{}", dest_rel_str)));
+                    // Store (locale-relative hashed path, unhashed shared-relative path).
+                    replacements.push((rel_str.clone(), dest_rel_str));
                 }
             }
         }
@@ -187,13 +193,34 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
     for entry in locale_entries() {
         let loc_dir = version_dir.join(&entry.code);
         for file in walk_dir(&loc_dir) {
+            // Depth of this HTML file below the locale dir. mdBook emits chrome
+            // refs as `<../ × (locale_depth + page_depth)>theme/foo-HASH.css`
+            // for an HTML page `page_depth` levels under the locale dir; the
+            // matching `_shared` ref needs the same total `../` count plus one
+            // to clear the version dir up to the gh-pages root where `_shared`
+            // lives. Concretely: page directly in `<tag>/<locale>/` -> `../../`,
+            // one level deeper -> `../../../`, and so on.
+            let page_depth = file
+                .strip_prefix(&loc_dir)
+                .ok()
+                .map(|rel| rel.components().count().saturating_sub(1))
+                .unwrap_or(0);
+            let up = "../".repeat(page_depth + 2);
+
             if file.extension().is_some_and(|e| e == "html")
                 && let Ok(mut content) = std::fs::read_to_string(&file)
             {
                 let mut changed = false;
-                for (from, to) in &replacements {
-                    if content.contains(from) {
-                        content = content.replace(from, to);
+                for (hashed_rel, shared_rel) in &replacements {
+                    // mdBook references the chrome file relative to the page, so
+                    // the on-disk ref is `<../ × page_depth><hashed_rel>`. Match
+                    // and replace at that exact depth with the `_shared` ref at
+                    // the correct depth — never a hardcoded prefix.
+                    let page_up = "../".repeat(page_depth);
+                    let from = format!("{page_up}{hashed_rel}");
+                    let to = format!("{up}_shared/{shared_rel}");
+                    if content.contains(&from) {
+                        content = content.replace(&from, &to);
                         changed = true;
                     }
                 }
