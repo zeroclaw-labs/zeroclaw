@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
@@ -476,35 +476,44 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
         let activeModel = status.model;
 
-        // Prefer the model written to config over the startup status value.
+        // Per-agent model (multi-agent / schema V3). The old global `model` /
+        // `default_model` keys were removed in V3, so the source of truth is THIS
+        // agent's own `agents.<alias>.model_provider` — a ref into
+        // `providers.models.<family>.<alias>`. (Previously this read the global
+        // keys, which now 404, so the button fell back to the daemon's global
+        // status model — the wrong model on every agent page.)
+        let activeRef: string | null = null;
         try {
-          const modelProp = await getProp('model');
-          if (modelProp.populated && typeof modelProp.value === 'string') {
-            activeModel = modelProp.value;
-          } else {
-            const defaultModelProp = await getProp('default_model');
-            if (defaultModelProp.populated && typeof defaultModelProp.value === 'string') {
-              activeModel = defaultModelProp.value;
-            }
+          const refProp = await getProp(`agents.${agentAlias}.model_provider`);
+          // NOTE: GET /api/config/prop returns only `{ path, value }` — it has
+          // no `populated` field (that exists only on /api/config/list). A set
+          // prop has a string value; an unset one returns the "<unset>"
+          // sentinel; a missing path throws. So gate on the value, not
+          // `populated` (which would be undefined here and silently fail).
+          if (typeof refProp.value === 'string' && refProp.value !== '<unset>') {
+            activeRef = refProp.value;
           }
         } catch {
-          // ignore
+          // ignore — fall back to the status value below
         }
-        setCurrentModel(activeModel);
+        if (cancelled) return;
+        // Show the agent's configured provider ref (e.g. "kilo.minimax_m3"),
+        // falling back to the daemon status model only if unset.
+        setCurrentModel(activeRef ?? activeModel);
 
-        // Fetch model_routes from config
+        // Available switch targets = every configured provider ref
+        // (`providers.models.<family>.<alias>`), discovered via config/list.
         try {
-          const routesProp = await getProp('model_routes');
-          if (routesProp.populated && Array.isArray(routesProp.value)) {
-            const models = routesProp.value
-              .map((r) => (r as Record<string, unknown>).model)
-              .filter((m): m is string => typeof m === 'string');
-            setAvailableModels(models.length > 0 ? models : [activeModel]);
-          } else {
-            setAvailableModels([activeModel]);
-          }
+          const list = await listProps('providers.models');
+          if (cancelled) return;
+          const refs = (list.entries ?? [])
+            .map((e) => e.path)
+            .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
+            .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
+          const unique = Array.from(new Set(refs));
+          setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
         } catch {
-          setAvailableModels([activeModel]);
+          setAvailableModels(activeRef ? [activeRef] : []);
         }
       } catch {
         // Ignore errors — dropdown will just show current model once loaded
@@ -516,7 +525,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, [modelInfoVersion]);
+  }, [modelInfoVersion, agentAlias]);
 
   const sendMessage = useCallback((content: string) => {
     if (!wsRef.current?.connected) return;
@@ -556,10 +565,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     }, MODEL_SWITCH_TIMEOUT_MS);
 
     try {
-      // Determine whether 'model' or 'default_model' is the active key, then write to it.
-      const modelProp = await getProp('model');
-      const targetKey = modelProp.populated ? 'model' : 'default_model';
-      await putProp(targetKey, model);
+      // Per-agent switch: write THIS agent's own model_provider ref (multi-agent
+      // / schema V3). `model` here is a provider ref (e.g. "kilo.minimax_m3").
+      // The global `model`/`default_model` keys were removed in V3.
+      await putProp(`agents.${agentAlias}.model_provider`, model);
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
