@@ -175,6 +175,8 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub allow_background_commands: bool,
+    pub allow_shell_expansion: bool,
+    pub allow_inline_eval: bool,
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
     pub tracker: PerSenderTracker,
@@ -306,6 +308,8 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             allow_background_commands: false,
+            allow_shell_expansion: false,
+            allow_inline_eval: false,
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
             tracker: PerSenderTracker::new(),
@@ -1161,10 +1165,15 @@ impl SecurityPolicy {
         // bypassing path checks through variable indirection. The helper below
         // ignores escapes and literals inside single quotes, so `$(` or `${`
         // literals are permitted there.
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
+        //
+        // Skipped when `allow_shell_expansion` is true — the operator has
+        // determined that the agent already has equivalent capabilities
+        // (e.g. file_write + interpreter) making this guard redundant.
+        if !self.allow_shell_expansion
+            && (command.contains('`')
+                || contains_unquoted_shell_variable_expansion(command)
+                || command.contains("<(")
+                || command.contains(">("))
         {
             return false;
         }
@@ -1282,6 +1291,11 @@ impl SecurityPolicy {
                     })
             }
             "python" | "python3" => {
+                // Skipped when allow_inline_eval — the agent already has
+                // file_write + python3 so the block only wastes tokens.
+                if self.allow_inline_eval {
+                    return true;
+                }
                 // -c executes arbitrary code from argument string
                 // -m runs any installed module as a script — broad block is intentional:
                 //   -m http.server opens a local exfil vector
@@ -1295,6 +1309,9 @@ impl SecurityPolicy {
                     .any(|arg| arg.starts_with("-c") || arg.starts_with("-m"))
             }
             "node" => {
+                if self.allow_inline_eval {
+                    return true;
+                }
                 // -e/--eval evaluates argument as JavaScript
                 // -p/--print same as --eval but prints the result
                 // starts_with covers glued form: node -e'code' (one whitespace token)
@@ -1685,6 +1702,8 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             allow_background_commands: autonomy_config.allow_background_commands,
+            allow_shell_expansion: autonomy_config.allow_shell_expansion,
+            allow_inline_eval: autonomy_config.allow_inline_eval,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: PerSenderTracker::new(),
@@ -1751,6 +1770,21 @@ impl SecurityPolicy {
                 "**Forbidden paths**: {}. \
                  Avoid accessing these paths.",
                 paths.join(", ")
+            );
+        }
+
+        // Shell expansion and inline eval
+        if self.allow_shell_expansion {
+            let _ = writeln!(
+                out,
+                "**Shell expansion**: variable expansion (`$var`, `$()`), backticks, \
+                 and control flow (`for`, `while`, `if`) are permitted in shell commands."
+            );
+        }
+        if self.allow_inline_eval {
+            let _ = writeln!(
+                out,
+                "**Inline eval**: `python3 -c`, `python3 -m`, and `node -e` are permitted."
             );
         }
 
@@ -3777,6 +3811,64 @@ mod tests {
         };
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("echo `whoami`"));
+    }
+
+    #[test]
+    fn allow_shell_expansion_permits_backticks() {
+        let p = SecurityPolicy {
+            allow_shell_expansion: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("echo `whoami`"));
+        assert!(p.is_command_allowed("echo $(cat /etc/hostname)"));
+        assert!(p.is_command_allowed("echo ${HOME}"));
+    }
+
+    #[test]
+    fn allow_shell_expansion_still_checks_allowlist() {
+        let p = SecurityPolicy {
+            allow_shell_expansion: true,
+            ..SecurityPolicy::default()
+        };
+        // `rm` is high-risk and blocked even with expansion allowed
+        assert!(!p.is_command_allowed("rm -rf /"));
+    }
+
+    #[test]
+    fn allow_shell_expansion_permits_for_loops() {
+        let p = SecurityPolicy {
+            allow_shell_expansion: true,
+            allowed_commands: vec!["for".into(), "echo".into(), "do".into(), "done".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("for f in *.txt; do echo $f; done"));
+    }
+
+    #[test]
+    fn allow_inline_eval_permits_python_c() {
+        let p = SecurityPolicy {
+            allow_inline_eval: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("python3 -c 'print(1+1)'"));
+        assert!(p.is_command_allowed("python3 -m json.tool file.json"));
+    }
+
+    #[test]
+    fn allow_inline_eval_permits_node_e() {
+        let p = SecurityPolicy {
+            allow_inline_eval: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("node -e 'console.log(1)'"));
+        assert!(p.is_command_allowed("node --eval 'process.exit(0)'"));
+    }
+
+    #[test]
+    fn allow_inline_eval_default_still_blocks() {
+        let p = SecurityPolicy::default();
+        assert!(!p.is_command_allowed("python3 -c 'import os'"));
+        assert!(!p.is_command_allowed("node -e 'process.exit()'"));
     }
 
     #[test]

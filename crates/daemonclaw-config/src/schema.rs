@@ -5700,6 +5700,21 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub allow_background_commands: bool,
 
+    /// Allow shell variable expansion (`$var`, `$()`, backticks) in commands.
+    /// When false (default), these are blocked to prevent hiding arbitrary
+    /// commands inside allowed ones. Enable when the agent already has
+    /// equivalent capabilities (e.g. file_write + python3) and the expansion
+    /// blocker only wastes tokens on workarounds.
+    #[serde(default)]
+    pub allow_shell_expansion: bool,
+
+    /// Allow inline eval flags (`python3 -c`, `node -e`, etc.) in shell
+    /// commands. When false (default), these are blocked to prevent arbitrary
+    /// code execution from argument strings. Enable when the agent already
+    /// has file_write + interpreter access, making the block redundant.
+    #[serde(default)]
+    pub allow_inline_eval: bool,
+
     /// Additional environment variables allowed for shell tool subprocesses.
     ///
     /// These names are explicitly allowlisted and merged with the built-in safe
@@ -5850,6 +5865,8 @@ impl Default for AutonomyConfig {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             allow_background_commands: false,
+            allow_shell_expansion: false,
+            allow_inline_eval: false,
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
@@ -11529,6 +11546,8 @@ auto_save = true
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
                 allow_background_commands: false,
+                allow_shell_expansion: false,
+                allow_inline_eval: false,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],

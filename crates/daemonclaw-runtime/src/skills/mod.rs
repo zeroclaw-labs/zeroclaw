@@ -198,6 +198,13 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
             continue;
         }
 
+        if std::fs::read_dir(&path)
+            .map(|mut rd| rd.next().is_none())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         match audit::audit_skill_directory_with_options(
             &path,
             audit::SkillAuditOptions { allow_scripts },
