@@ -1,0 +1,7 @@
+name = "sd-webui"
+version = "0.1.0"
+description = "Generate images locally via your own Stable Diffusion WebUI (AUTOMATIC1111)"
+author = "ZeroClaw Labs"
+wasm_path = "sd_webui.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]

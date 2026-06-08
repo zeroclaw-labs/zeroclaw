@@ -1016,7 +1016,7 @@ impl Agent {
         .await
     }
 
-    /// Like [`from_config_with_session_cwd_and_mcp_backchannel`] but also
+    /// Like [`Self::from_config_with_session_cwd_and_mcp_backchannel`] but also
     /// injects the TUI's captured shell environment so that tools like
     /// `ShellTool` inherit the user's real `PATH`, `SSH_AUTH_SOCK`, etc.
     /// rather than the daemon's stripped-down process environment.
