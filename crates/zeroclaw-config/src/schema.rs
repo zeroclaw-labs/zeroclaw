@@ -10671,6 +10671,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub irc: HashMap<String, IrcConfig>,
+    /// Twitch chat channel instances (`[channels.twitch.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub twitch: HashMap<String, TwitchConfig>,
     /// Lark channel instances (`[channels.lark.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10868,6 +10872,12 @@ impl ChannelsConfig {
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
+                kind: "twitch",
+                name: "Twitch",
+                desc: "Twitch chat (IRC)",
+                configured: !self.twitch.is_empty(),
+            },
+            ChannelInfo {
                 kind: "irc",
                 name: "IRC",
                 desc: "IRC over TLS",
@@ -10999,6 +11009,7 @@ impl ChannelsConfig {
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
             || self.irc.values().any(|c| c.enabled)
+            || self.twitch.values().any(|c| c.enabled)
             || self.lark.values().any(|c| c.enabled)
             || self.line.values().any(|c| c.enabled)
             || self.dingtalk.values().any(|c| c.enabled)
@@ -11046,6 +11057,7 @@ impl Default for ChannelsConfig {
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -12411,6 +12423,50 @@ impl ChannelConfig for IrcConfig {
     }
     fn desc() -> &'static str {
         "IRC over TLS"
+    }
+}
+
+/// Twitch chat channel configuration. A thin adapter over IRC
+/// (`irc.chat.twitch.tv:6697` over TLS); see the `twitch` channel module.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.twitch"]
+pub struct TwitchConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Twitch login name of the bot account (case-insensitive — lowercased
+    /// before send).
+    #[tab(Connection)]
+    pub bot_username: String,
+    /// Twitch OAuth user-access token. The `oauth:` prefix is added
+    /// automatically if missing, so both `"oauth:abcdef"` and `"abcdef"`
+    /// work. Mint via <https://twitchapps.com/tmi/> or the Twitch CLI.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub oauth_token: String,
+    /// Twitch channels to join. Each entry receives a `#` prefix if missing
+    /// and is lowercased before send (Twitch channel names are
+    /// case-insensitive). E.g. `["mychannel", "#anotherchannel"]`.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// When true, only respond to messages that mention the bot's login
+    /// name. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_only: bool,
+}
+
+impl ChannelConfig for TwitchConfig {
+    fn name() -> &'static str {
+        "Twitch"
+    }
+    fn desc() -> &'static str {
+        "Twitch chat (IRC)"
     }
 }
 
@@ -17895,6 +17951,7 @@ auto_save = true
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
                 irc: HashMap::new(),
+                twitch: HashMap::new(),
                 lark: HashMap::new(),
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
@@ -19351,6 +19408,7 @@ allowed_users = ["@u:matrix.org"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -19791,6 +19849,7 @@ allowed_numbers = ["+1", "+2"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),

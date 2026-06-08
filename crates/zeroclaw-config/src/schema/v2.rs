@@ -95,6 +95,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "email",
     "gmail_push",
     "irc",
+    "twitch",
     "lark",
     "line",
     "dingtalk",
