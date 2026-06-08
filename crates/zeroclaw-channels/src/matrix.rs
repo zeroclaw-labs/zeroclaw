@@ -3719,6 +3719,9 @@ impl Channel for MatrixChannel {
     }
 
     async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        if !self.ack_reactions {
+            return Ok(());
+        }
         let client = self.ensure_client().await?;
         let event_id: OwnedEventId = message_id.parse()?;
         outbound::unreact(&self.outbox(client), channel_id, &event_id, emoji).await
@@ -4059,6 +4062,39 @@ mod tests {
                 &["!ok:server".to_string()],
                 "!nope:server"
             ));
+        }
+    }
+
+    mod ack_reactions {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::MatrixConfig;
+
+        use super::super::MatrixChannel;
+
+        #[tokio::test]
+        async fn matrix_remove_reaction_noops_before_parsing_when_ack_disabled() {
+            let config = MatrixConfig {
+                homeserver: "https://matrix.example.com".to_string(),
+                access_token: Some("token".to_string()),
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            channel
+                .remove_reaction("bad-room", "bad-event", "✅")
+                .await
+                .expect("ack-disabled reaction removal should be a no-op");
         }
     }
 
@@ -4588,7 +4624,8 @@ mod tests {
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
-                default_target: None,
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             }
         }
 

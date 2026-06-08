@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --standard | --full | --help]
 :: ============================================================================
 
-set "VERSION=0.6.2"
+set "VERSION=0.8.0-beta-2"
 set "RUST_MIN_VERSION=1.87"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
@@ -185,6 +185,9 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo   %GREEN%OK%RESET% Binary installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
+if exist "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" (
+    echo   %GREEN%OK%RESET% TUI installed to %USERPROFILE%\.zeroclaw\bin\zerocode.exe
+)
 goto verify
 
 :: ---- Minimal build ----
@@ -241,11 +244,21 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo   %GREEN%OK%RESET% Build succeeded.
 
+echo   Command: cargo build --release --locked -p zerocode --target %TARGET%
+cargo build --release --locked -p zerocode --target %TARGET%
+if %ERRORLEVEL% NEQ 0 (
+    echo   %YELLOW%WARNING: zerocode TUI build failed; continuing with zeroclaw only.%RESET%
+)
+
 :: Copy binary to a convenient location
 echo.
 echo %BOLD%[4/5] Installing binary...%RESET%
 mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
 copy /Y "target\%TARGET%\release\zeroclaw.exe" "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" >nul
+if exist "target\%TARGET%\release\zerocode.exe" (
+    copy /Y "target\%TARGET%\release\zerocode.exe" "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" >nul
+    echo   %GREEN%OK%RESET% TUI installed to %USERPROFILE%\.zeroclaw\bin\zerocode.exe
+)
 set "BIN_PATH=%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe"
 for /f %%S in ('powershell -NoProfile -Command "[math]::Round(((Get-Item -LiteralPath ''%BIN_PATH%'').Length / 1MB), 2)"') do (
     set "BINARY_MB=%%S"
@@ -295,12 +308,13 @@ echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
 if /I "%MODE%"=="minimal" (
-echo     2. Minimal build excludes onboarding ^(zeroclaw onboard is unavailable^)
+echo     2. Minimal build excludes quickstart ^(zeroclaw quickstart is unavailable^)
 echo     3. Configure model providers manually in %%USERPROFILE%%\.zeroclaw\config.toml
 echo     4. Use reduced CLI path: zeroclaw agent --message "Hello"
 ) else (
-echo     2. Run: zeroclaw onboard
+echo     2. Run: zeroclaw quickstart
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
+echo     4. Launch the TUI: zerocode
 )
 echo.
 echo   Alternative install via Scoop:

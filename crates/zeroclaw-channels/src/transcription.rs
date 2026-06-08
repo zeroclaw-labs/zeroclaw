@@ -715,6 +715,7 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 /// `transcribe()` calls. there is no global default-provider concept.
 pub struct TranscriptionManager {
     transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
+    max_audio_bytes: Option<usize>,
     /// Resolved alias for the agent that owns this manager. Empty when
     /// the agent has no transcription preference (opt-out).
     agent_transcription_provider: String,
@@ -726,6 +727,10 @@ impl TranscriptionManager {
     /// manager to a specific agent should call
     /// `with_agent_transcription_provider` to set it.
     pub fn new(config: &TranscriptionConfig) -> Result<Self> {
+        if matches!(config.max_audio_bytes, Some(0)) {
+            bail!("transcription.max_audio_bytes must be greater than zero");
+        }
+
         let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
             HashMap::new();
 
@@ -785,6 +790,7 @@ impl TranscriptionManager {
 
         Ok(Self {
             transcription_providers,
+            max_audio_bytes: config.max_audio_bytes,
             agent_transcription_provider: String::new(),
         })
     }
@@ -838,9 +844,24 @@ impl TranscriptionManager {
             ))
         })?;
 
+        self.enforce_global_audio_limit(audio_data)?;
+
         use ::zeroclaw_log::Instrument;
         let span = ::zeroclaw_log::attribution_span!(p.as_ref());
         p.transcribe(audio_data, file_name).instrument(span).await
+    }
+
+    fn enforce_global_audio_limit(&self, audio_data: &[u8]) -> Result<()> {
+        if let Some(max_audio_bytes) = self.max_audio_bytes
+            && audio_data.len() > max_audio_bytes
+        {
+            bail!(
+                "Audio file too large ({} bytes, global max {})",
+                audio_data.len(),
+                max_audio_bytes
+            );
+        }
+        Ok(())
     }
 
     /// List registered transcription_provider names.
@@ -939,6 +960,62 @@ impl ::zeroclaw_api::attribution::Attributable for LocalWhisperProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct StaticTranscriptionProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TranscriptionProvider for StaticTranscriptionProvider {
+        fn name(&self) -> &str {
+            "static"
+        }
+
+        async fn transcribe(&self, _audio_data: &[u8], _file_name: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("under cap".to_string())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StaticTranscriptionProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                    ::zeroclaw_api::attribution::TranscriptionProviderKind::Groq,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "static"
+        }
+    }
+
+    fn manager_with_static_provider(
+        max_audio_bytes: Option<usize>,
+    ) -> (TranscriptionManager, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
+            HashMap::new();
+        transcription_providers.insert(
+            "static".to_string(),
+            Box::new(StaticTranscriptionProvider {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        (
+            TranscriptionManager {
+                transcription_providers,
+                max_audio_bytes,
+                agent_transcription_provider: String::new(),
+            },
+            calls,
+        )
+    }
 
     // Tests for the deleted `transcribe_audio` free function were removed
     // alongside the function in #6273. Equivalent coverage lives on
@@ -1114,6 +1191,66 @@ mod tests {
             .unwrap()
             .with_agent_transcription_provider("openai");
         assert_eq!(manager.agent_transcription_provider, "openai");
+    }
+
+    #[test]
+    fn manager_rejects_zero_global_max_audio_bytes() {
+        let config = TranscriptionConfig {
+            max_audio_bytes: Some(0),
+            ..TranscriptionConfig::default()
+        };
+
+        let err = match TranscriptionManager::new(&config) {
+            Ok(_) => panic!("expected zero max_audio_bytes to fail manager construction"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("transcription.max_audio_bytes must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_global_max_audio_bytes_rejects_over_limit_before_provider_dispatch() {
+        let (manager, calls) = manager_with_static_provider(Some(3));
+        let err = manager
+            .transcribe_with_provider(&[0u8; 4], "voice.ogg", "static")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Audio file too large"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("global max 3"), "got: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn manager_global_max_audio_bytes_allows_exact_limit() {
+        let (manager, calls) = manager_with_static_provider(Some(4));
+        let result = manager
+            .transcribe_with_provider(&[0u8; 4], "voice.ogg", "static")
+            .await
+            .unwrap();
+        assert_eq!(result, "under cap");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_transcribe_enforces_global_max_audio_bytes() {
+        let (manager, calls) = manager_with_static_provider(Some(2));
+        let manager = manager.with_agent_transcription_provider("static");
+        let err = manager
+            .transcribe(&[0u8; 3], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Audio file too large"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("global max 2"), "got: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

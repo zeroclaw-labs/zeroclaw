@@ -487,7 +487,7 @@ impl SseTransport {
         let sse_url = self.sse_url.clone();
         let server_name = self.server_name.clone();
 
-        self.reader_task = Some(tokio::spawn(async move {
+        self.reader_task = Some(zeroclaw_spawn::spawn!(async move {
             let stream = resp
                 .bytes_stream()
                 .map(|item| item.map_err(std::io::Error::other));

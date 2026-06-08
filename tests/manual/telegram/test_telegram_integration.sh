@@ -187,10 +187,10 @@ if [ -f "$CONFIG_PATH" ]; then
             warn "User allowlist not set"
         fi
     else
-        warn "Telegram not configured - run 'zeroclaw onboard' first"
+        warn "Telegram not configured - run 'zeroclaw config set channels.telegram.default.bot-token <token>' first"
     fi
 else
-    warn "No config file found - run 'zeroclaw onboard' first"
+    warn "No config file found - run 'zeroclaw quickstart' first"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

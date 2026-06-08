@@ -612,7 +612,10 @@ async fn turn_bails_out_at_max_iterations() {
     let model_provider = Box::new(ScriptedModelProvider::new(responses));
 
     let config = AliasedAgentConfig {
-        max_tool_iterations: max_iters,
+        resolved: zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: max_iters,
+            ..Default::default()
+        },
         ..AliasedAgentConfig::default()
     };
 
@@ -755,7 +758,10 @@ async fn history_trims_after_max_messages() {
 
     let model_provider = Box::new(ScriptedModelProvider::new(responses));
     let config = AliasedAgentConfig {
-        max_history_messages: max_history,
+        resolved: zeroclaw_config::schema::ResolvedRuntime {
+            max_history_messages: max_history,
+            ..Default::default()
+        },
         ..AliasedAgentConfig::default()
     };
 

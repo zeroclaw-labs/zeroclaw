@@ -269,13 +269,85 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
     Ok(())
 }
 
-/// High-level: arbitrary versioned TOML → fully validated V3 `Config`.
-/// Runs migration if needed, then deserializes into the current `Config` type.
+/// Versioned TOML → validated V3 `Config`, strict: any defect errors.
+/// Used by repair tooling (`zeroclaw config migrate`, `model_routing_config`)
+/// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
+    let final_value = migrate_value(input)?;
+    final_value
+        .try_into()
+        .context("migrated config failed to deserialize as current schema")
+}
+
+/// Daemon load path: versioned TOML → usable `Config`, never failing.
+/// Thin wrapper over [`migrate_to_current_salvaged`] that drops the report.
+pub fn migrate_to_current_resilient(input: &str) -> Config {
+    migrate_to_current_salvaged(input).config
+}
+
+/// Top-level keys whose silent loss could *weaken* security posture: dropping
+/// a malformed one to its `Default` may grant a broader posture than intended.
+/// Salvage still drops them (so the daemon boots) but logs ERROR and reports
+/// them in [`ResilientLoad::dropped_security`] for exposure gating.
+pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
+
+/// Sentinel `dropped_security` entry used when the *whole* config is replaced
+/// by `Config::default()` (unparseable TOML, unsupported future schema, broken
+/// migration chain, or a root that cannot be salvaged section-by-section). In
+/// that case every security-critical section is lost at once, so the posture is
+/// degraded and the serving gate must refuse to start without an explicit
+/// operator override — exactly as it does for a single dropped section.
+pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
+
+/// Result of a resilient (never-failing) config load.
+#[derive(Debug, Clone, Default)]
+pub struct ResilientLoad {
+    /// Loaded config: every section that parsed, `Default` for any dropped.
+    pub config: Config,
+    /// Non-security paths dropped during salvage (logged WARN).
+    pub dropped: Vec<String>,
+    /// [`SECURITY_CRITICAL_KEYS`] sections dropped to `Default` (logged ERROR).
+    /// Non-empty means the running posture may be weaker than intended.
+    pub dropped_security: Vec<String>,
+}
+
+/// Daemon load path with a salvage report. Degrades instead of failing:
+/// strict deserialize first; else drop each invalid channel alias, channel
+/// type, and top-level section (substituting `Default`); else fall back to
+/// `Config::default()`. Security-critical drops log ERROR and surface in
+/// `dropped_security`. `Config::validate()` is intentionally not run.
+pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
+    let value = match migrate_value(input) {
+        Ok(value) => value,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{err:#}") })),
+                "config could not be parsed or migrated; starting on defaults so it \
+                 can be repaired (gateway /api/config, `zeroclaw config migrate`)"
+            );
+            return ResilientLoad {
+                config: Config::default(),
+                dropped: Vec::new(),
+                // Whole-config loss degrades the security posture: every
+                // security-critical section is gone, so mark it so the serving
+                // gate refuses to start without an explicit override.
+                dropped_security: vec![WHOLE_CONFIG_SENTINEL.to_string()],
+            };
+        }
+    };
+    deserialize_resilient(value)
+}
+
+/// Parse + migrate to the current schema version as a `toml::Value`, without
+/// the final typed deserialize. Shared by the strict and resilient entries.
+fn migrate_value(input: &str) -> Result<toml::Value> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
-    let final_value = if from == CURRENT_SCHEMA_VERSION {
-        value
+    if from == CURRENT_SCHEMA_VERSION {
+        Ok(value)
     } else if from > CURRENT_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             ERROR,
@@ -289,13 +361,238 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
         );
         anyhow::bail!(
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
-        );
+        )
     } else {
-        run_chain(value, from)?
+        run_chain(value, from)
+    }
+}
+
+/// Deserialize a migrated `toml::Value` into `Config`, never failing.
+/// Strict first; on failure prune broken channel aliases, channel types, then
+/// top-level sections (each → `Default`), so only the broken blocks are lost.
+fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
+    if let Ok(config) = value.clone().try_into::<Config>() {
+        return ResilientLoad {
+            config,
+            dropped: Vec::new(),
+            dropped_security: Vec::new(),
+        };
+    }
+
+    let mut salvaged = value;
+    let mut dropped: Vec<String> = Vec::new();
+    prune_bad_channel_aliases(&mut salvaged, &mut dropped);
+    prune_bad_channel_types(&mut salvaged, &mut dropped);
+    prune_bad_top_level_sections(&mut salvaged, &mut dropped);
+
+    let mut whole_config_lost = false;
+    let config = salvaged.try_into::<Config>().unwrap_or_else(|err| {
+        // Nothing in the root table is individually salvageable (e.g. a
+        // non-table root). Boot on defaults so repair surfaces are reachable.
+        whole_config_lost = true;
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "error": format!("{err:#}") })),
+            "config could not be salvaged section-by-section; starting on defaults \
+             so it can be repaired"
+        );
+        Config::default()
+    });
+
+    let mut dropped_security: Vec<String> = Vec::new();
+    let mut dropped_plain: Vec<String> = Vec::new();
+    // A whole-config default loses every security-critical section at once, so
+    // mark it degraded even though no individual section was named in `dropped`.
+    if whole_config_lost {
+        dropped_security.push(WHOLE_CONFIG_SENTINEL.to_string());
+    }
+    for path in dropped {
+        if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) {
+            dropped_security.push(path);
+        } else {
+            dropped_plain.push(path);
+        }
+    }
+
+    for path in &dropped_plain {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "dropped_config": path })),
+            &format!(
+                "config section `{path}` is invalid and was skipped so the daemon can \
+                 start; fix the block and reload to re-enable it"
+            )
+        );
+    }
+    for path in &dropped_security {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "dropped_security_config": path })),
+            &format!(
+                "SECURITY-CRITICAL config section `{path}` is invalid and was reset to \
+                 its default so the daemon can boot; the running posture may be WEAKER \
+                 than intended — repair `{path}` and reload before trusting this instance. \
+                 Run `zeroclaw config migrate` to see the precise parse error, or fix it \
+                 via the gateway config editor at `/api/config`"
+            )
+        );
+    }
+
+    ResilientLoad {
+        config,
+        dropped: dropped_plain,
+        dropped_security,
+    }
+}
+
+/// Drop top-level `[section]`s that block deserialization (each → `Default`).
+/// Two probes: drop a single key if its removal validates the whole config;
+/// else drop every key that fails to deserialize in isolation (catches
+/// multiple independent offenders the joint probe can't). Appends to `dropped`.
+fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    if value.as_table().is_none() {
+        return;
+    }
+    if value.clone().try_into::<Config>().is_ok() {
+        return;
+    }
+
+    let keys: Vec<String> = value
+        .as_table()
+        .expect("root is a table")
+        // toml::Value tables preserve insertion order, so drops are reported
+        // in TOML declaration order — predictable for operators reading logs.
+        .keys()
+        .cloned()
+        .collect();
+    for key in &keys {
+        let root = value.as_table_mut().expect("root is a table");
+        let Some(removed) = root.remove(key) else {
+            continue;
+        };
+        if value.clone().try_into::<Config>().is_ok() {
+            dropped.push(key.clone());
+            return;
+        }
+        value
+            .as_table_mut()
+            .expect("root is a table")
+            .insert(key.clone(), removed);
+    }
+
+    for key in keys {
+        let still_present = value.as_table().and_then(|root| root.get(&key)).cloned();
+        let Some(section) = still_present else {
+            continue;
+        };
+        if top_level_section_is_invalid(&key, &section) {
+            value.as_table_mut().expect("root is a table").remove(&key);
+            dropped.push(key);
+        }
+    }
+}
+
+/// True when top-level `[<key>]`, wrapped alone, fails to deserialize.
+fn top_level_section_is_invalid(key: &str, section: &toml::Value) -> bool {
+    let mut root = toml::value::Table::new();
+    root.insert(key.to_string(), section.clone());
+    toml::Value::Table(root).try_into::<Config>().is_err()
+}
+
+/// Drop each `[channels.<type>.<alias>]` that fails to deserialize, checked in
+/// isolation so valid siblings survive. Appends `channels.<type>.<alias>`.
+fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(channels) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("channels"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
     };
-    final_value
-        .try_into()
-        .context("migrated config failed to deserialize as current schema")
+
+    for (chan_type, aliases) in channels.iter_mut() {
+        let Some(alias_table) = aliases.as_table_mut() else {
+            continue;
+        };
+        let invalid: Vec<String> = alias_table
+            .iter()
+            .filter(|(_, v)| channel_alias_is_invalid(chan_type, v))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for alias in invalid {
+            alias_table.remove(&alias);
+            dropped.push(format!("channels.{chan_type}.{alias}"));
+        }
+    }
+}
+
+/// Drop each `[channels.<type>]` block still blocking the load after alias
+/// pruning (e.g. a scalar where a table is required). Drops only the offending
+/// type, never the whole `[channels]` section. Appends `channels.<type>`.
+fn prune_bad_channel_types(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(channel_types) = value
+        .as_table()
+        .and_then(|root| root.get("channels"))
+        .and_then(toml::Value::as_table)
+        .map(|chans| chans.keys().cloned().collect::<Vec<_>>())
+    else {
+        return;
+    };
+
+    for chan_type in channel_types {
+        if channels_section_is_valid(value) {
+            return;
+        }
+        let Some(removed) = value
+            .as_table_mut()
+            .and_then(|root| root.get_mut("channels"))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|chans| chans.remove(&chan_type))
+        else {
+            continue;
+        };
+        if channels_section_is_valid(value) {
+            dropped.push(format!("channels.{chan_type}"));
+        } else {
+            value
+                .as_table_mut()
+                .and_then(|root| root.get_mut("channels"))
+                .and_then(toml::Value::as_table_mut)
+                .expect("channels is a table")
+                .insert(chan_type, removed);
+        }
+    }
+}
+
+/// True when `value`'s `[channels]` section deserializes cleanly in isolation.
+fn channels_section_is_valid(value: &toml::Value) -> bool {
+    let Some(channels) = value
+        .as_table()
+        .and_then(|root| root.get("channels"))
+        .cloned()
+    else {
+        return true;
+    };
+    let mut root = toml::value::Table::new();
+    root.insert("channels".to_string(), channels);
+    toml::Value::Table(root).try_into::<Config>().is_ok()
+}
+
+/// True when `[channels.<type>.<alias>]`, wrapped alone, fails to deserialize.
+fn channel_alias_is_invalid(chan_type: &str, alias_value: &toml::Value) -> bool {
+    let mut inner = toml::value::Table::new();
+    inner.insert("probe".to_string(), alias_value.clone());
+    let mut type_table = toml::value::Table::new();
+    type_table.insert(chan_type.to_string(), toml::Value::Table(inner));
+    let mut channels = toml::value::Table::new();
+    channels.insert("channels".to_string(), toml::Value::Table(type_table));
+    toml::Value::Table(channels).try_into::<Config>().is_err()
 }
 
 /// File-API wrapper: read disk config, migrate, write `<file>.backup`
@@ -694,8 +991,267 @@ mod tests {
         assert!(detect_version(&v).is_err());
     }
 
-    // ── migrate_file_in_place atomic-write semantics ──
+    // ── resilient daemon load: starts no matter what, so config can be repaired ──
 
+    #[test]
+    fn broken_channel_alias_is_dropped_not_fatal() {
+        // Email alias missing required `imap_host` must not abort the load.
+        let raw = r#"
+schema_version = 3
+
+[channels.email.fakeemail]
+enabled = true
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+"#;
+        let cfg = migrate_to_current_resilient(raw);
+        assert!(
+            !cfg.channels.email.contains_key("fakeemail"),
+            "invalid alias must be pruned"
+        );
+    }
+
+    #[test]
+    fn valid_alias_survives_broken_sibling() {
+        let raw = r#"
+schema_version = 3
+
+[channels.email.broken]
+enabled = true
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+
+[channels.email.good]
+enabled = true
+imap_host = "imap.example.com"
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+"#;
+        let cfg = migrate_to_current_resilient(raw);
+        assert!(
+            cfg.channels.email.contains_key("good"),
+            "valid sibling must be kept"
+        );
+        assert!(
+            !cfg.channels.email.contains_key("broken"),
+            "invalid sibling must be pruned"
+        );
+    }
+
+    #[test]
+    fn broken_non_channel_section_falls_back_to_default() {
+        // A type mismatch outside the channel maps must NOT abort the daemon:
+        // the section is dropped to its default so the operator can repair it.
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = "not-a-bool"
+"#;
+        let cfg = migrate_to_current_resilient(raw);
+        // `[heartbeat]` reverted to its serde default; load did not panic.
+        assert!(!cfg.heartbeat.enabled);
+        assert_eq!(cfg.heartbeat.interval_minutes, 30);
+    }
+
+    #[test]
+    fn unparseable_config_falls_back_to_defaults() {
+        // Not even valid TOML — the daemon still boots on defaults so the
+        // operator can reach a repair surface and overwrite the file.
+        let cfg = migrate_to_current_resilient("this is not valid TOML {{{");
+        assert_eq!(cfg.schema_version, Config::default().schema_version);
+    }
+
+    #[test]
+    fn future_schema_version_falls_back_to_defaults() {
+        // A schema newer than this binary can't be migrated, but the daemon
+        // must still start rather than refuse to boot.
+        let raw = format!("schema_version = {}\n", CURRENT_SCHEMA_VERSION + 100);
+        let cfg = migrate_to_current_resilient(&raw);
+        assert_eq!(cfg.schema_version, Config::default().schema_version);
+    }
+
+    #[test]
+    fn unparseable_config_marks_whole_config_degraded() {
+        // Whole-config loss loses every security-critical section at once, so it
+        // must mark the posture degraded — otherwise the serving gate has no
+        // signal and boots a defaulted security posture silently.
+        let load = migrate_to_current_salvaged("this is not valid TOML {{{");
+        assert!(
+            load.dropped_security
+                .iter()
+                .any(|p| p == WHOLE_CONFIG_SENTINEL),
+            "unparseable config must degrade security posture, got {:?}",
+            load.dropped_security
+        );
+    }
+
+    #[test]
+    fn future_schema_version_marks_whole_config_degraded() {
+        let raw = format!("schema_version = {}\n", CURRENT_SCHEMA_VERSION + 100);
+        let load = migrate_to_current_salvaged(&raw);
+        assert!(
+            load.dropped_security
+                .iter()
+                .any(|p| p == WHOLE_CONFIG_SENTINEL),
+            "unsupported future schema must degrade security posture, got {:?}",
+            load.dropped_security
+        );
+    }
+
+    #[test]
+    fn unsalvageable_root_marks_whole_config_degraded() {
+        // A root that is not a table cannot be salvaged section-by-section; the
+        // final deserialize fallback defaults the whole config and must mark it.
+        let raw = "schema_version = 3\nthis_is_a_bare_top_level = \"value\"\n[\n";
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            !load.dropped_security.is_empty(),
+            "an unsalvageable root must degrade security posture, got {:?}",
+            load.dropped_security
+        );
+    }
+
+    #[test]
+    fn strict_path_still_errors_for_tooling() {
+        // `migrate_to_current` stays strict — repair tooling needs the error.
+        let raw = r#"
+schema_version = 3
+
+[channels.email.fakeemail]
+enabled = true
+smtp_host = "smtp.example.com"
+username = "u"
+password = "p"
+from_address = "a@example.com"
+"#;
+        assert!(
+            migrate_to_current(raw).is_err(),
+            "strict path must surface the defect for repair tooling"
+        );
+    }
+
+    #[test]
+    fn broken_security_section_is_reported_as_degraded() {
+        let raw = r#"
+schema_version = 3
+
+[security]
+audit = "should-be-a-table-not-a-string"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped_security.iter().any(|p| p == "security"),
+            "malformed [security] must be reported as a security-critical drop"
+        );
+        assert!(
+            load.dropped.is_empty(),
+            "security drop must not also appear in the plain dropped list"
+        );
+    }
+
+    #[test]
+    fn broken_non_security_section_is_plain_drop_not_security() {
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = "not-a-bool"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|p| p == "heartbeat"),
+            "malformed [heartbeat] must be a plain drop"
+        );
+        assert!(
+            load.dropped_security.is_empty(),
+            "a non-security section must never be flagged security-critical"
+        );
+    }
+
+    #[test]
+    fn broken_channel_type_block_is_dropped_not_fatal() {
+        let raw = r#"
+schema_version = 3
+
+[channels]
+email = "oops-this-should-be-a-table"
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|p| p == "channels.email"),
+            "the broken whole-type block must be dropped, got {:?}",
+            load.dropped
+        );
+        assert!(
+            load.config.channels.telegram.contains_key("main"),
+            "valid sibling channel type must survive a broken-type drop"
+        );
+    }
+
+    #[test]
+    fn multiple_independent_bad_sections_all_dropped() {
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = "not-a-bool"
+
+[backup]
+enabled = "also-not-a-bool"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|p| p == "heartbeat"),
+            "first offender must be dropped, got {:?}",
+            load.dropped
+        );
+        assert!(
+            load.dropped.iter().any(|p| p == "backup"),
+            "second offender must be dropped, got {:?}",
+            load.dropped
+        );
+    }
+
+    #[test]
+    fn multiple_bad_sections_one_security_critical() {
+        let raw = r#"
+schema_version = 3
+
+[security]
+audit = "should-be-a-table-not-a-string"
+
+[heartbeat]
+enabled = "not-a-bool"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped_security.iter().any(|p| p == "security"),
+            "malformed [security] must be classified security-critical, got {:?}",
+            load.dropped_security
+        );
+        assert!(
+            load.dropped.iter().any(|p| p == "heartbeat"),
+            "malformed [heartbeat] must be a plain drop, got {:?}",
+            load.dropped
+        );
+        assert!(
+            !load.dropped.iter().any(|p| p == "security"),
+            "security drop must not also appear in the plain dropped list"
+        );
+    }
+
+    // ── migrate_file_in_place atomic-write semantics ──
     fn setup_temp_config_dir() -> tempfile::TempDir {
         tempfile::TempDir::new().expect("temp dir")
     }

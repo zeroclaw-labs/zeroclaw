@@ -4,27 +4,29 @@ use zeroclaw_macros::Configurable;
 
 use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, AstraiModelProviderConfig, AtomicChatModelProviderConfig,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
-    BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FireworksModelProviderConfig,
-    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
+    AtomicChatModelProviderConfig, AvianModelProviderConfig, AzureModelProviderConfig,
+    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
+    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
+    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    ModelProviderConfig, MoonshotModelProviderConfig, NebiusModelProviderConfig,
+    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
+    KiloCliModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, ModelProviderConfig,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NebiusModelProviderConfig,
     NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
     OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
     OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
     PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
     RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
     SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -153,9 +155,17 @@ define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
+/// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
+/// guard only bounds chains that loop; a long acyclic chain would otherwise
+/// recurse one stack frame per alias at config-load and build time, turning a
+/// pathological config into a startup stack overflow. Both the validation walk
+/// and the runtime build walk stop descending past this depth and prune the
+/// rest of the branch.
+pub const MAX_FALLBACK_DEPTH: usize = 3;
+
 /// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this
+/// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
 /// macro so adding a new model_provider type is a one-line addition here, not a
 /// shotgun edit across multiple helpers.
 ///
@@ -229,6 +239,13 @@ macro_rules! for_each_model_provider_slot {
             (osaurus, "osaurus", OsaurusModelProviderConfig),
             (litellm, "litellm", LitellmModelProviderConfig),
             (lepton, "lepton", LeptonModelProviderConfig),
+            (morph, "morph", MorphModelProviderConfig),
+            (github_models, "github_models", GithubModelsModelProviderConfig),
+            (upstage, "upstage", UpstageModelProviderConfig),
+            (featherless, "featherless", FeatherlessModelProviderConfig),
+            (arcee, "arcee", ArceeModelProviderConfig),
+            (lambda_ai, "lambda_ai", LambdaAiModelProviderConfig),
+            (inception, "inception", InceptionModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
             (opencode, "opencode", OpencodeModelProviderConfig),            (kilocli, "kilocli", KiloCliModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
@@ -339,6 +356,40 @@ impl ModelProviders {
             };
         }
         for_each_model_provider_slot!(emit_get)
+    }
+
+    /// Resolve a name that is either a bare `<alias>` or a `<kind>.<alias>` pair
+    /// to its `(kind, alias, &config)`. A bare alias is matched across every
+    /// family; ambiguity (same alias under multiple kinds) returns `None` so the
+    /// caller can ask the user to qualify it. Registry-driven via
+    /// `for_each_model_provider_slot!`.
+    pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
+        if let Some((kind, alias)) = name.split_once('.') {
+            macro_rules! emit_dotted {
+                ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                    match kind {
+                        $( $type_str => self.$field.get(alias).map(|c| ($type_str, alias.to_string(), &c.base)), )+
+                        _ => None,
+                    }
+                };
+            }
+            return for_each_model_provider_slot!(emit_dotted);
+        }
+        let mut hit: Option<(&'static str, String, &ModelProviderConfig)> = None;
+        macro_rules! emit_bare {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                $(
+                    if let Some(c) = self.$field.get(name) {
+                        if hit.is_some() {
+                            return None; // ambiguous across kinds
+                        }
+                        hit = Some(($type_str, name.to_string(), &c.base));
+                    }
+                )+
+            };
+        }
+        for_each_model_provider_slot!(emit_bare);
+        hit
     }
 
     /// Get-or-create the shared base config for a `<provider_type>.<alias>`

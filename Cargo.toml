@@ -1,32 +1,33 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.8.0-beta-1"
+version = "0.8.0-beta-2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-1" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-1" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-1", default-features = false }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-1" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-1" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-1" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-1", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-1" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-1", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.8.0-beta-1" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-1" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-1" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-1" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-1" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-1" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-2" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-2" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-2", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-2" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.0-beta-2" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-2" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-2" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-2", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-2" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-2", default-features = false }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-2" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-2" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-2" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-2" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-2" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
+directories = "6.0"
 
 [package]
 name = "zeroclawlabs"
@@ -73,6 +74,7 @@ path = "src/lib.rs"
 [dependencies]
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, features = ["clap"] }
 zeroclaw-log.workspace = true
@@ -81,7 +83,6 @@ zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
-zeroclaw-tui = { workspace = true, optional = true }
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }
 zeroclaw-hardware = { workspace = true, optional = true }
@@ -203,10 +204,10 @@ tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 regex = "1.10"
 hostname = { version = "0.4.2", optional = true }
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rustls-pki-types = { version = "1.14.0", optional = true }
-tokio-rustls = { version = "0.26.4", optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
@@ -242,7 +243,6 @@ default = [
     "default-channels",
     "acp-bridge",
     "gateway",
-    "tui-onboarding",
     "observability-prometheus",
     "schema-export",
 ]
@@ -274,7 +274,7 @@ channels-full = [
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
-    "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt",
+    "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
@@ -286,7 +286,6 @@ gateway = [
     "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
     "dep:mime_guess",
 ]
-tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
@@ -301,6 +300,7 @@ channel-slack = ["zeroclaw-channels/channel-slack"]
 channel-signal = ["zeroclaw-channels/channel-signal"]
 channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
 channel-irc = ["zeroclaw-channels/channel-irc"]
+channel-twitch = ["zeroclaw-channels/channel-twitch"]
 channel-imessage = ["zeroclaw-channels/channel-imessage"]
 channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
 channel-qq = ["zeroclaw-channels/channel-qq"]
@@ -337,6 +337,10 @@ observability-prometheus = [
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
+# Forwards `zeroclaw-hardware/dev-sim`: extends the serial allow-list with
+# `/tmp/zc-sim-*` for hardware-free simulation. Off by default; opt-in for the
+# simulator and demo.
+dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]

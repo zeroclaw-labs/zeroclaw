@@ -1,6 +1,6 @@
 //! Property helpers used by the `Configurable` derive macro and the `zeroclaw config` CLI.
 
-use crate::traits::{PropFieldInfo, PropKind};
+use crate::traits::{ConfigTab, CredentialSurfaceClass, PropFieldInfo, PropKind};
 
 /// For a `#[nested] HashMap<String, T>` field, parse a `get_prop`/`set_prop`
 /// path of the form `<my_prefix>.<field_name>.<hm_key>.<inner_suffix>` and
@@ -137,6 +137,9 @@ pub fn make_prop_field(
     enum_variants: Option<fn() -> Vec<String>>,
     description: &'static str,
     derived_from_secret: bool,
+    credential_class: Option<CredentialSurfaceClass>,
+    tab: ConfigTab,
+    display_secret_terminals: &[&str],
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -144,10 +147,14 @@ pub fn make_prop_field(
             Some(toml::Value::Array(arr)) if !arr.is_empty() => {
                 format!("[{}]", vec!["****"; arr.len()].join(", "))
             }
-            _ => "<unset>".to_string(),
+            _ => crate::traits::UNSET_DISPLAY.to_string(),
         }
     } else {
-        toml_value_to_display(table.and_then(|t| t.get(serde_name)))
+        toml_value_to_display_for_kind(
+            table.and_then(|t| t.get(serde_name)),
+            kind,
+            display_secret_terminals,
+        )
     };
     PropFieldInfo {
         name: name.to_string(),
@@ -159,6 +166,8 @@ pub fn make_prop_field(
         enum_variants,
         description,
         derived_from_secret,
+        credential_class,
+        tab,
     }
 }
 
@@ -168,14 +177,18 @@ pub fn serde_get_prop<T: serde::Serialize>(
     prefix: &str,
     name: &str,
     is_secret: bool,
+    kind: PropKind,
+    display_secret_terminals: &[&str],
 ) -> anyhow::Result<String> {
     if is_secret {
         return Ok("**** (encrypted)".to_string());
     }
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let table = toml::Value::try_from(target)?;
-    Ok(toml_value_to_display(
+    Ok(toml_value_to_display_for_kind(
         table.as_table().and_then(|t| t.get(&serde_name)),
+        kind,
+        display_secret_terminals,
     ))
 }
 
@@ -190,7 +203,9 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
 ) -> anyhow::Result<()> {
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let mut table: toml::Table = toml::from_str(&toml::to_string(target)?)?;
-    if value_str.is_empty() && is_option {
+    if (value_str.is_empty() || value_str == crate::traits::UNSET_DISPLAY || value_str == "****")
+        && is_option
+    {
         table.remove(&serde_name);
     } else {
         table.insert(serde_name, parse_prop_value(value_str, kind)?);
@@ -201,10 +216,126 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
 
 fn toml_value_to_display(value: Option<&toml::Value>) -> String {
     match value {
-        None => "<unset>".to_string(),
+        None => crate::traits::UNSET_DISPLAY.to_string(),
         Some(toml::Value::String(s)) => s.clone(),
         Some(v) => v.to_string(),
     }
+}
+
+fn toml_value_to_display_for_kind(
+    value: Option<&toml::Value>,
+    kind: PropKind,
+    display_secret_terminals: &[&str],
+) -> String {
+    match kind {
+        PropKind::Object | PropKind::ObjectArray => match value {
+            None => crate::traits::UNSET_DISPLAY.to_string(),
+            Some(toml::Value::String(s)) => s.clone(),
+            Some(v) => {
+                let mut redacted = v.clone();
+                redact_toml_display_secrets(&mut redacted, display_secret_terminals);
+                redacted.to_string()
+            }
+        },
+        _ => toml_value_to_display(value),
+    }
+}
+
+pub fn object_array_json_display_value(
+    value: &impl serde::Serialize,
+    display_secret_terminals: &[&str],
+) -> String {
+    match serde_json::to_value(value) {
+        Ok(mut value) => {
+            redact_json_display_secrets(&mut value, display_secret_terminals);
+            serde_json::to_string(&value).unwrap_or_else(|_| "[]".to_string())
+        }
+        Err(_) => "[]".to_string(),
+    }
+}
+
+fn redact_json_display_secrets(value: &mut serde_json::Value, display_secret_terminals: &[&str]) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_display_secrets(item, display_secret_terminals);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map.iter_mut() {
+                if display_key_is_secret_terminal(key, display_secret_terminals) {
+                    mask_json_value(nested);
+                } else {
+                    redact_json_display_secrets(nested, display_secret_terminals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_toml_display_secrets(value: &mut toml::Value, display_secret_terminals: &[&str]) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                redact_toml_display_secrets(item, display_secret_terminals);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (key, nested) in table.iter_mut() {
+                if display_key_is_secret_terminal(key, display_secret_terminals) {
+                    mask_toml_value(nested);
+                } else {
+                    redact_toml_display_secrets(nested, display_secret_terminals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mask_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                mask_json_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values_mut() {
+                mask_json_value(nested);
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => *value = serde_json::Value::String("****".to_string()),
+    }
+}
+
+fn mask_toml_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                mask_toml_value(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, nested) in table.iter_mut() {
+                mask_toml_value(nested);
+            }
+        }
+        _ => *value = toml::Value::String("****".to_string()),
+    }
+}
+
+fn display_key_is_secret_terminal(key: &str, display_secret_terminals: &[&str]) -> bool {
+    let normalized = normalize_display_key(key);
+    display_secret_terminals
+        .iter()
+        .any(|terminal| normalize_display_key(terminal) == normalized)
+}
+
+fn normalize_display_key(key: &str) -> String {
+    key.replace('-', "_").to_ascii_lowercase()
 }
 
 fn prop_name_to_serde_field(prefix: &str, name: &str) -> anyhow::Result<String> {
@@ -271,14 +402,20 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
             {
                 return Ok(toml::Value::Array(
-                    arr.into_iter().map(toml::Value::String).collect(),
+                    arr.into_iter()
+                        .filter(|s| !s.is_empty() && s != crate::traits::UNSET_DISPLAY)
+                        .map(toml::Value::String)
+                        .collect(),
                 ));
             }
             // Fall back to comma-separated input.
             let items = value_str
                 .split(',')
                 .map(|s| toml::Value::String(s.trim().to_string()))
-                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                .filter(|v| {
+                    v.as_str()
+                        .is_some_and(|s| !s.is_empty() && s != crate::traits::UNSET_DISPLAY)
+                })
                 .collect();
             Ok(toml::Value::Array(items))
         }
@@ -416,6 +553,53 @@ pub fn validate_alias_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve a CLI-typed config path to its canonical form.
+///
+/// Field segments derived from the schema are kebab-case; aliases are
+/// snake-only per [`validate_alias_key`]. For each known canonical
+/// path, segments are compared pairwise: equal verbatim, equal after
+/// swapping `-` → `_` when the canonical segment contains `-`, or
+/// equal after swapping `_` → `-` for the final field segment. The
+/// final-segment rule lets older CLI spelling like `api-key` resolve
+/// to schema-canonical `api_key` without rewriting map aliases such as
+/// `my_bot`. Returns `raw` unchanged when no canonical path matches.
+#[must_use]
+pub fn resolve_field_path(known_paths: &[String], raw: &str) -> String {
+    let raw_segs: Vec<&str> = raw.split('.').collect();
+    for known in known_paths {
+        let known_segs: Vec<&str> = known.split('.').collect();
+        if known_segs.len() != raw_segs.len() {
+            continue;
+        }
+        let final_index = known_segs.len().saturating_sub(1);
+        let all_match = known_segs
+            .iter()
+            .zip(raw_segs.iter())
+            .enumerate()
+            .all(|(idx, (k, r))| {
+                k == r
+                    || (k.contains('-') && k.replace('-', "_") == **r)
+                    || (idx == final_index && k.contains('_') && k.replace('_', "-") == **r)
+            });
+        if all_match {
+            return known.clone();
+        }
+    }
+    raw.to_string()
+}
+
+/// Inverse of the `Configurable` macro's internal `snake_to_kebab`.
+///
+/// Field paths emitted by `prop_fields()` are kebab-case (per the macro's
+/// snake→kebab transform of the underlying Rust idents). Surfaces that want
+/// to display the field under its serde-canonical snake_case spelling — for
+/// example `api_key` rather than `api-key` — use this to convert.
+///
+/// No-op for keys without `-`.
+pub fn kebab_to_snake(key: &str) -> String {
+    key.replace('-', "_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +664,16 @@ mod tests {
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_string_array_drops_unset_sentinel() {
+        let bare = parse_prop_value(crate::traits::UNSET_DISPLAY, PropKind::StringArray).unwrap();
+        assert_eq!(bare.as_array().unwrap().len(), 0);
+        let json = parse_prop_value(r#"["<unset>", "/real"]"#, PropKind::StringArray).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str(), Some("/real"));
     }
 
     #[test]
@@ -588,5 +782,68 @@ mod tests {
                 "expected rejection of char {ch:?} in alias key"
             );
         }
+    }
+
+    #[test]
+    fn resolve_field_path_canonicalizes_snake_field_segments() {
+        let known = vec![
+            "providers.models.anthropic.my_bot.api-key".to_string(),
+            "providers.models.anthropic.my_bot.model".to_string(),
+        ];
+        // User typed snake `api_key`; alias `my_bot` stays untouched
+        // because the canonical segment has no `-`.
+        assert_eq!(
+            resolve_field_path(&known, "providers.models.anthropic.my_bot.api_key"),
+            "providers.models.anthropic.my_bot.api-key",
+        );
+    }
+
+    #[test]
+    fn resolve_field_path_passes_through_canonical_input() {
+        let known = vec!["providers.models.anthropic.my_bot.api-key".to_string()];
+        assert_eq!(
+            resolve_field_path(&known, "providers.models.anthropic.my_bot.api-key"),
+            "providers.models.anthropic.my_bot.api-key",
+        );
+    }
+
+    #[test]
+    fn resolve_field_path_canonicalizes_kebab_final_field_segments() {
+        let known = vec!["providers.models.deepseek.default.api_key".to_string()];
+        assert_eq!(
+            resolve_field_path(&known, "providers.models.deepseek.default.api-key"),
+            "providers.models.deepseek.default.api_key",
+        );
+    }
+
+    #[test]
+    fn resolve_field_path_returns_raw_when_no_match() {
+        let known: Vec<String> = vec![];
+        assert_eq!(resolve_field_path(&known, "no.such.path"), "no.such.path");
+    }
+
+    #[test]
+    fn resolve_field_path_does_not_corrupt_snake_alias() {
+        // `my_bot` is an alias; user typed it correctly; we must not
+        // turn it into `my-bot` while resolving an api_key snake input.
+        let known = vec!["providers.models.anthropic.my_bot.api-key".to_string()];
+        let resolved = resolve_field_path(&known, "providers.models.anthropic.my_bot.api_key");
+        assert!(resolved.contains("my_bot"));
+        assert!(!resolved.contains("my-bot"));
+    }
+
+    #[test]
+    fn kebab_to_snake_converts_hyphens() {
+        assert_eq!(kebab_to_snake("api-key"), "api_key");
+        assert_eq!(kebab_to_snake("bot-token"), "bot_token");
+        assert_eq!(kebab_to_snake("allowed-users"), "allowed_users");
+        assert_eq!(kebab_to_snake("external-peers"), "external_peers");
+    }
+
+    #[test]
+    fn kebab_to_snake_noop_for_plain_keys() {
+        assert_eq!(kebab_to_snake("uri"), "uri");
+        assert_eq!(kebab_to_snake("model"), "model");
+        assert_eq!(kebab_to_snake(""), "");
     }
 }

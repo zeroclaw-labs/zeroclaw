@@ -555,6 +555,7 @@ allowed_domains = ["*"]
 max_response_size = 1000000
 timeout_secs = 30
 allow_private_hosts = false
+allowed_private_hosts = []
 
 [multimodal]
 max_images = 4

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 zeroclaw-log.workspace = true
@@ -181,6 +182,7 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
   "channel-wati",
@@ -212,6 +214,7 @@ channel-slack = []
 channel-signal = []
 channel-mattermost = []
 channel-irc = []
+channel-twitch = ["channel-irc"]
 channel-imessage = []
 channel-dingtalk = []
 channel-qq = []

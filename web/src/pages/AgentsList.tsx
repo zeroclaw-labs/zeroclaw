@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom';
 import { Bot, Plus, AlertCircle } from 'lucide-react';
 import AgentCard from '@/components/AgentCard';
 import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
-import { getOnboardStatus } from '@/lib/api';
 
 interface AgentSummariesState {
   loading: boolean;
@@ -126,22 +125,6 @@ export default function AgentsList() {
 }
 
 function EmptyState() {
-  const [buttonLabel, setButtonLabel] = useState('Start onboarding');
-
-  useEffect(() => {
-    getOnboardStatus()
-      .then((status) => {
-        if (status.reason === 'has_dispatchable_agent') {
-          setButtonLabel('Run onboarding again');
-        } else if (status.has_partial_state || status.reason === 'incomplete_agent') {
-          setButtonLabel('Continue onboarding');
-        } else {
-          setButtonLabel('Start onboarding');
-        }
-      })
-      .catch(() => setButtonLabel('Start onboarding'));
-  }, []);
-
   return (
     <div
       className="rounded-2xl border-2 border-dashed p-12 text-center"
@@ -160,14 +143,14 @@ function EmptyState() {
         No agents configured yet
       </p>
       <p className="text-sm mb-4" style={{ color: 'var(--pc-text-muted)' }}>
-        Run the onboarding wizard to add your first agent.
+        Run Quickstart to create your first agent.
       </p>
       <Link
-        to="/onboard"
+        to="/quickstart"
         className="btn-electric inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm"
       >
         <Plus className="h-4 w-4" />
-        {buttonLabel}
+        Start Quickstart
       </Link>
     </div>
   );

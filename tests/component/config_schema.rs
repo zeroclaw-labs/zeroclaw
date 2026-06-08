@@ -40,7 +40,9 @@ another_fake = 42
     );
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -415,7 +417,11 @@ fn config_empty_toml_uses_default_temperature() {
     let config = migrate("");
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -427,12 +433,10 @@ fn config_empty_toml_uses_default_temperature() {
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
     let config = migrate("default_temperature = 0.7\ndefault_provider = \"openai\"\n");
-    // Migration synthesizes [agents.default] from the V2 shape; assert
-    // its tunables match AliasedAgentConfig defaults.
-    let agent = config
+    // Migration synthesizes [agents.default] from the V2 shape.
+    config
         .agent("default")
         .expect("migration synthesized agents.default");
-    assert_eq!(agent.max_tool_iterations, 10);
     assert_eq!(config.gateway.port, 42617);
 }
 
@@ -441,7 +445,9 @@ fn config_only_temperature_parses() {
     let config = migrate("default_temperature = 1.2\ndefault_provider = \"openai\"\n");
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 1.2)
@@ -451,7 +457,7 @@ fn config_only_temperature_parses() {
     let agent = config
         .agent("default")
         .expect("migration synthesized agents.default");
-    assert_eq!(agent.max_tool_iterations, 10);
+    assert!(agent.enabled);
 }
 
 #[test]
@@ -459,7 +465,7 @@ fn config_extra_unknown_keys_ignored() {
     let config = migrate(
         r#"
 default_temperature = 0.5
-default_model_provider = "openai"
+default_provider = "openai"
 future_feature = true
 [some_future_section]
 value = 123
@@ -467,7 +473,9 @@ value = 123
     );
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -622,7 +630,11 @@ fn config_empty_parses_with_all_defaults() {
     assert!(config.channels.whatsapp.is_empty());
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
