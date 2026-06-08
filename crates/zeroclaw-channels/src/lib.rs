@@ -10,6 +10,7 @@
 pub mod allowlist;
 pub mod listing;
 pub mod orchestrator;
+pub mod paced_channel;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)

@@ -59,6 +59,12 @@ pub struct AcpSessionData {
     pub messages: Vec<ConversationMessage>,
 }
 
+pub enum AcpSessionRestore {
+    Missing,
+    Killed,
+    Restorable(AcpSessionData),
+}
+
 /// Lightweight summary for the ACP session picker. Avoids loading the full
 /// message history just to render a one-line label per session.
 pub struct AcpSessionSummary {
@@ -98,6 +104,7 @@ impl AcpSessionStore {
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
                  token_count   INTEGER NOT NULL DEFAULT 0,
+                 killed_at     TEXT,
                  created_at    TEXT NOT NULL,
                  last_activity TEXT NOT NULL
              );
@@ -139,9 +146,44 @@ impl AcpSessionStore {
         )
         .context("Failed to create ACP session schema")?;
 
+        Self::ensure_killed_at_column(&conn)
+            .context("Failed to migrate ACP session killed marker")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn ensure_killed_at_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "killed_at" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute("ALTER TABLE acp_sessions ADD COLUMN killed_at TEXT", []) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session killed marker"),
+        }
     }
 
     /// Record a new session. Returns the integer `id` assigned by SQLite.
@@ -214,6 +256,20 @@ impl AcpSessionStore {
             last_activity,
             messages,
         }))
+    }
+
+    /// Load only durable ACP rows that are allowed to become live sessions.
+    /// Killed rows keep their transcript for history/export but are terminal
+    /// for runtime restore paths.
+    pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
+        if self.is_session_killed(session_uuid)? {
+            return Ok(AcpSessionRestore::Killed);
+        }
+
+        match self.load_session(session_uuid)? {
+            Some(data) => Ok(AcpSessionRestore::Restorable(data)),
+            None => Ok(AcpSessionRestore::Missing),
+        }
     }
 
     /// List all sessions as lightweight summaries, ordered by most recent
@@ -590,6 +646,41 @@ impl AcpSessionStore {
         Ok(rows > 0)
     }
 
+    /// Persist that an admin intentionally killed this ACP session. The
+    /// transcript stays durable, but runtime rehydration must not revive it.
+    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions
+                    SET killed_at = COALESCE(killed_at, ?1),
+                        last_activity = ?1
+                  WHERE session_uuid = ?2",
+                params![now, session_uuid],
+            )
+            .context("Failed to mark ACP session killed")?;
+        Ok(rows > 0)
+    }
+
+    /// Return whether this durable ACP session has been intentionally killed.
+    /// Missing rows are not killed; callers can then use normal load handling
+    /// to distinguish SESSION_NOT_FOUND from a terminal killed session.
+    pub fn is_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT CASE WHEN killed_at IS NULL THEN 0 ELSE 1 END
+             FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get::<_, i64>(0),
+        );
+        match row {
+            Ok(killed) => Ok(killed != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e).context("Failed to query ACP session killed marker"),
+        }
+    }
+
     /// Update `last_activity` without appending messages.
     pub fn touch_session(&self, session_uuid: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -905,6 +996,49 @@ mod tests {
     fn delete_nonexistent_session_returns_false() {
         let (_tmp, store) = open_store();
         assert!(!store.delete_session("ghost").unwrap());
+    }
+
+    #[test]
+    fn mark_session_killed_persists_without_deleting_history() {
+        let (tmp, store) = open_store();
+        store
+            .create_session("sess-kill", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-kill",
+                &[ConversationMessage::Chat(ChatMessage::user("keep this"))],
+            )
+            .unwrap();
+
+        assert!(!store.is_session_killed("sess-kill").unwrap());
+        assert!(store.mark_session_killed("sess-kill").unwrap());
+        assert!(store.is_session_killed("sess-kill").unwrap());
+
+        let data = store.load_session("sess-kill").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            1,
+            "kill marker must not delete durable transcript history"
+        );
+
+        drop(store);
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        assert!(
+            reopened.is_session_killed("sess-kill").unwrap(),
+            "kill marker must survive store reopen"
+        );
+        assert!(
+            reopened.load_session("sess-kill").unwrap().is_some(),
+            "durable history remains loadable after reopen"
+        );
+    }
+
+    #[test]
+    fn mark_nonexistent_session_killed_returns_false() {
+        let (_tmp, store) = open_store();
+        assert!(!store.mark_session_killed("ghost").unwrap());
+        assert!(!store.is_session_killed("ghost").unwrap());
     }
 
     #[test]
