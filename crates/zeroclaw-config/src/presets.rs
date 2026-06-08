@@ -233,8 +233,13 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
     RuntimeProfileConfig {
         agentic: true,
         max_tool_iterations: 100,
-        max_actions_per_hour: 0, // 0 = inherit / unlimited per schema docs
-        max_cost_per_day_cents: 0,
+        // `0` is NOT "unlimited" for these budgets — the per-sender rate
+        // tracker treats a max of 0 as *exhausted* (see
+        // `PerSenderTracker::is_exhausted` / `rate_limit_zero_blocks_everything`),
+        // so an `unbounded` agent set to 0 has every action rejected. Use the
+        // type max for an effectively-unlimited budget instead.
+        max_actions_per_hour: u32::MAX,
+        max_cost_per_day_cents: u32::MAX,
         shell_timeout_secs: 600,
         max_delegation_depth: 8,
         delegation_timeout_secs: Some(900),
@@ -542,6 +547,30 @@ mod tests {
         let preset_values = (preset.values)();
         let schema_default = RuntimeProfileConfig::default();
         assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
+    }
+
+    /// Regression: the `unbounded` preset must NOT zero out the action
+    /// budget. A `max_actions_per_hour` of 0 is a hard zero budget (the
+    /// per-sender tracker treats 0 as always exhausted), so an agent on
+    /// the `unbounded` profile previously had every tool call rejected
+    /// with "max 0 actions per hour". Assert the budget is non-zero and
+    /// that a policy carrying it actually permits an action.
+    #[test]
+    fn unbounded_runtime_does_not_block_all_actions() {
+        let preset = runtime_preset("unbounded").unwrap();
+        let values = (preset.values)();
+        assert_ne!(
+            values.max_actions_per_hour, 0,
+            "unbounded must not use 0 — 0 means a hard zero action budget, not unlimited",
+        );
+        let policy = crate::policy::SecurityPolicy {
+            max_actions_per_hour: values.max_actions_per_hour,
+            ..crate::policy::SecurityPolicy::default()
+        };
+        assert!(
+            policy.record_action(),
+            "an unbounded-profile agent must be allowed to take actions",
+        );
     }
 
     /// `BuilderSubmission` and its dependent types must round-trip

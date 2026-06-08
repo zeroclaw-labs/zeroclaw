@@ -9445,7 +9445,10 @@ pub struct RuntimeProfileConfig {
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
-    /// Maximum actions allowed per hour. `0` inherits the global limit.
+    /// Maximum actions allowed per hour. `0` is a hard zero budget — the
+    /// per-sender rate tracker treats a max of 0 as always exhausted
+    /// (`PerSenderTracker::is_exhausted`), blocking every action. For an
+    /// effectively-unlimited budget use a high value (e.g. `u32::MAX`), not 0.
     /// `SecurityPolicy::ensure_no_escalation_beyond` rejects subagents
     /// that try to raise this above the parent's value.
     pub max_actions_per_hour: u32,
