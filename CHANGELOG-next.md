@@ -73,6 +73,7 @@ The multi-agent epic (#6272) is the spine of this release:
 ### Channels
 
 - **Mattermost** multi-channel polling, DM auto-discovery, and `mention_only` bypass; **Nextcloud Talk** draft-update streaming (#6048).
+- **Per-alias webhook routing** (#6312): inbound webhooks for WhatsApp, WATI, Nextcloud Talk, and Linq now route by alias — `POST /<type>/<alias>` reaches the matching channel instance instead of always resolving the first one, so multi-instance configs (e.g. `whatsapp.work` + `whatsapp.personal`) each receive their own traffic. The bare `/<type>` path still works as a **deprecated** fallback that resolves to the first configured instance and tags the response with an `X-Zeroclaw-Deprecation` header; an unknown alias now returns **404** instead of a 500. Single-instance deployments need no config change.
 - Bot self-mention injected into the per-channel system prompt (`self_addressed_mention()` in each channel's platform syntax), with the lookup fixed to resolve composite `<type>.<alias>` keys so aliased and multi-agent channels actually receive it; closure-resolver peer auth unified across all 24 channels; per-channel `self_handle` overrides; standardized inbound/outbound channel log shape.
 - Reply-calibration nudge added to both the per-channel prompt and the base system prompt (so direct CLI chat gets it too): agents had been erring toward silence and treating memory as a reason not to answer, so the prompt now skews toward replying and frames memory as supplementary context rather than a gate on whether to respond.
 

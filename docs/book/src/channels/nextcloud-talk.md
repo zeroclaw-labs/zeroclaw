@@ -4,7 +4,7 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 
 ## What this integration does
 
-- Receives inbound Talk events via `POST /nextcloud-talk` on the gateway
+- Receives inbound Talk events via `POST /nextcloud-talk/<alias>` on the gateway (bare `/nextcloud-talk` still works as a deprecated fallback)
 - Verifies webhook signatures (HMAC-SHA256) when a secret is configured
 - Sends replies back to Talk rooms via the Nextcloud OCS API
 
@@ -39,11 +39,21 @@ Full field reference: [Config](../reference/config.md).
 zeroclaw daemon
 ```
 
-Configure your Talk bot's webhook URL to point at:
+Configure your Talk bot's webhook URL to point at the alias of the
+`[channels.nextcloud_talk.<alias>]` instance that should receive it:
 
 ```
-https://<your-public-url>/nextcloud-talk
+https://<your-public-url>/nextcloud-talk/<alias>
 ```
+
+For example, `[channels.nextcloud_talk.work]` receives `POST /nextcloud-talk/work`.
+This per-alias routing (#6312) lets you run several Talk bots side by side and
+deliver each one's webhooks to the right instance.
+
+The bare `https://<your-public-url>/nextcloud-talk` path still works but is
+**deprecated**: it resolves to the first configured instance and returns an
+`X-Zeroclaw-Deprecation` response header. Single-instance deployments can keep
+using it unchanged. An unknown alias returns `404`.
 
 Local development? Configure `[tunnel]` in your config (ngrok, Cloudflare, or Tailscale) and the gateway exposes itself on startup — see [Operations → Network deployment](../ops/network-deployment.md).
 

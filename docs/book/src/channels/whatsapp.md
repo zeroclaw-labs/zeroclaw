@@ -24,6 +24,14 @@ access_token = "<meta-access-token>"
 
 The gateway must be reachable by Meta for inbound webhooks. Use `zeroclaw onboard tunnel` or your own reverse proxy to expose the webhook endpoint when developing locally.
 
+Point Meta's Callback URL at the alias of the `[channels.whatsapp.<alias>]`
+instance that should receive it — `GET`/`POST https://<your-public-url>/whatsapp/<alias>`
+(e.g. `[channels.whatsapp.work]` → `/whatsapp/work`). This per-alias routing
+(#6312) lets multiple WhatsApp numbers run side by side. The bare `/whatsapp`
+path still works but is **deprecated**: it resolves to the first configured
+instance and sets an `X-Zeroclaw-Deprecation` response header. An unknown alias
+returns `404`. Single-instance deployments need no change.
+
 ## Web mode
 
 WhatsApp Web mode links a regular WhatsApp account through the optional Web backend. It does not need a Meta Business account. It does need a ZeroClaw build with the `whatsapp-web` feature enabled and a persistent session database path.
