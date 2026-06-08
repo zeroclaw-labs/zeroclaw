@@ -20,6 +20,11 @@ zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
 rumqttc = { version = "0.25", optional = true }
+lapin = { version = "2", optional = true, default-features = false, features = [
+  "rustls",
+] }
+tokio-executor-trait = { version = "2", optional = true }
+tokio-reactor-trait = { version = "1", optional = true }
 axum = { version = "0.8", default-features = false, features = [
   "http1",
   "json",
@@ -176,6 +181,7 @@ channels-full = [
   "channel-mattermost",
   "channel-mochat",
   "channel-mqtt",
+  "channel-amqp",
   "channel-nextcloud",
   "channel-notion",
   "channel-qq",
@@ -221,6 +227,7 @@ channel-twitter = []
 channel-reddit = []
 channel-notion = []
 channel-mqtt = ["dep:rumqttc"]
+channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait"]
 channel-linq = []
 channel-wati = []
 channel-nextcloud = []

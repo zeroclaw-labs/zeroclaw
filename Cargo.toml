@@ -274,7 +274,7 @@ channels-full = [
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
-    "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt",
+    "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
@@ -308,6 +308,7 @@ channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
 channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
+channel-amqp = ["zeroclaw-channels/channel-amqp"]
 channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
 channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
