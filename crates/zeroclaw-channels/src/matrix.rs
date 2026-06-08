@@ -726,6 +726,25 @@ mod client {
         has_password && has_user_id
     }
 
+    /// Decide whether a saved session belongs to a different Matrix account
+    /// than the one this channel block is configured for. Restoring a foreign
+    /// session would run the block as the wrong bot identity. Only a fully
+    /// qualified configured `user_id` (`@local:server`) is compared against the
+    /// saved canonical MXID; a bare localpart or unset `user_id` cannot be
+    /// compared without false positives, so those never flag.
+    pub(super) fn saved_session_is_foreign(
+        config: &MatrixConfig,
+        blob: &session::SessionBlob,
+    ) -> bool {
+        let Some(want) = config.user_id.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if !want.contains(':') {
+            return false;
+        }
+        want != blob.user_id.as_str()
+    }
+
     async fn build_attempt(
         config: &MatrixConfig,
         state_dir: &Path,
@@ -740,6 +759,25 @@ mod client {
         }
 
         let saved = session::load(state_dir)?;
+
+        // A saved session that belongs to a different account would run this
+        // channel block as the wrong Matrix identity. Wipe and re-login fresh
+        // under the configured account instead of impersonating.
+        if let Some(blob) = saved.as_ref()
+            && saved_session_is_foreign(config, blob)
+        {
+            return recover_or_bail(
+                config,
+                state_dir,
+                recovery_attempts,
+                &format!(
+                    "saved session user_id ({}) does not match configured channels.matrix user_id ({}); store belongs to a different account.",
+                    blob.user_id,
+                    config.user_id.as_deref().unwrap_or_default()
+                ),
+            )
+            .await;
+        }
 
         // The saved device_id is canonical — it's what the server actually
         // assigned at login. config.device_id is only a hint for first-ever
@@ -4594,7 +4632,8 @@ mod tests {
         //! corruption-recovery decisions verifiable without touching the SDK.
 
         use super::super::client::{
-            can_password_relogin, resolve_access_token_identity, store_has_orphan_data,
+            can_password_relogin, resolve_access_token_identity, saved_session_is_foreign,
+            store_has_orphan_data,
         };
         use tempfile::TempDir;
         use wiremock::{
@@ -4649,6 +4688,47 @@ mod tests {
         fn relogin_rejects_empty_strings() {
             assert!(!can_password_relogin(&cfg(Some(""), Some("@bot:m"))));
             assert!(!can_password_relogin(&cfg(Some("pw"), Some(""))));
+        }
+
+        fn blob_for(user_id: &str) -> super::super::session::SessionBlob {
+            super::super::session::SessionBlob {
+                user_id: user_id.to_string(),
+                device_id: "DEV1".to_string(),
+                access_token: "secret".to_string(),
+                refresh_token: None,
+            }
+        }
+
+        #[test]
+        fn foreign_session_detected_when_user_ids_differ() {
+            // The collision bug: two matrix blocks shared one state dir, so the
+            // second to start restored the first account's saved session and
+            // ran as the wrong bot. With the configured user_id known, a saved
+            // session for a different account must be flagged so the build flow
+            // wipes and re-logins instead of impersonating.
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let foreign = blob_for("@bender-bending-rodriguez-zeroclaw:matrix.org");
+            assert!(saved_session_is_foreign(&cfg, &foreign));
+        }
+
+        #[test]
+        fn matching_session_not_foreign() {
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let own = blob_for("@clamps-bot:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg, &own));
+        }
+
+        #[test]
+        fn unset_or_bare_user_id_never_flags() {
+            // No configured user_id, or a bare localpart that cannot be
+            // compared against the canonical MXID, must not false-positive.
+            let any = blob_for("@whoever:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), None), &any));
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), Some("")), &any));
+            assert!(!saved_session_is_foreign(
+                &cfg(Some("pw"), Some("clamps-bot")),
+                &any
+            ));
         }
 
         #[test]
