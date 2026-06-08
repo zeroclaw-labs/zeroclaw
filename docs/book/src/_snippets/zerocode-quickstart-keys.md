@@ -8,17 +8,17 @@ Switch to the **Quickstart** pane:
 
 | Keys | Action |
 |---|---|
-| `Alt+← / Alt+B` | prev pane |
-| `Alt+→ / Alt+F` | next pane |
+| `Alt+← / Alt+b` | prev pane |
+| `Alt+→ / Alt+f` | next pane |
 
 Inside the pane:
 
 | Keys | Action |
 |---|---|
-| `K / ↑` | prev |
-| `J / ↓` | next |
+| `k / ↑` | prev |
+| `j / ↓` | next |
 | `Enter` | open |
-| `Q / Esc` | leave |
-| `C` | create agent |
+| `q / Esc` | leave |
+| `c / C` | create agent |
 
 These are the `default` preset. You can switch presets (vim, emacs, arrows_only) in the zerocode Keybindings tab, or rebind any action individually.
