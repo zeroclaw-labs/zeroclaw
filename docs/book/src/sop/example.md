@@ -28,7 +28,7 @@ Three things live under the ZeroClaw install root:
 
 | Artifact | Location | Role |
 |---|---|---|
-| config | `~/.zeroclaw/` | The agent, the AMQP + Matrix channels, and the `[sop]` block. |
+| `config.toml` | `~/.zeroclaw/config.toml` | The agent, the AMQP + Matrix channels, and the `[sop]` block. |
 | `sops/stagex-update/` | `<install>/shared/sops/stagex-update/` | The pipeline: `SOP.toml` (metadata) + `SOP.md` (the eight steps). |
 | `skills/stagex-update/` | `<install>/shared/skills/stagex-update/` | The glue that fires the SOP on a release event. |
 
