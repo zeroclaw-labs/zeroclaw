@@ -64,6 +64,80 @@
         </script>
         <!-- Start loading toc.js asap -->
         <script src="{{ resource "toc.js" }}"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
