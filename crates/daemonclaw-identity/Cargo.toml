@@ -1,0 +1,41 @@
+[package]
+name = "daemonclaw-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local Ed25519 agent identity provider for DaemonClaw. Always-on default; pairs with daemonclaw-wardtoken for issuer-backed identity."
+publish = false
+
+[dependencies]
+daemonclaw-api.workspace = true
+# Secret-store dep is intentionally deferred. The `daemonclaw-config` crate
+# is a large surface (16k+ lines) and pulling it in here would slow the
+# local-provider test loop and create a circular risk with the WardToken
+# work. We carry a minimal local SecretStore that mirrors the `enc2:` wire
+# format — same algorithm (ChaCha20-Poly1305), same prefix, same key file
+# location (`<dir>/.secret_key` mode 0600), same `encrypt/decrypt` API —
+# so swapping to the real one is a one-line change in `state.rs` when the
+# boundaries justify it.
+chacha20poly1305 = "0.10"
+# Ring is the Ed25519 implementation. One crypto stack, matches the rest of
+# the tree. The binary already pulls this in via `agent-runtime`; the dep here
+# is non-optional because the identity layer is meaningless without it.
+ring = "0.17"
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+hostname = "0.4"
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["fs", "sync", "macros", "rt"] }
+tracing = { version = "0.1", default-features = false }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+hex = "0.4"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
