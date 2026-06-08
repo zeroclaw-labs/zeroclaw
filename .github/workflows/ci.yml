@@ -230,6 +230,20 @@ jobs:
       - name: Check licenses, sources, and advisories
         run: cargo deny check
 
+  nix-eval:
+    name: Nix Module Eval
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Nix
+        run: sudo apt-get update -qq && sudo apt-get install -y nix-bin nix-setup-systemd
+      - name: Verify Nix
+        run: sudo nix --version
+      - name: Evaluate Nix module assertions
+        run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -237,7 +251,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

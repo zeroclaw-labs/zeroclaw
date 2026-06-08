@@ -83,15 +83,15 @@ impl EmailChannel {
 
     /// Pure, testable predicate that applies the email-allowlist match
     /// semantics against an already-resolved peer list.
+    ///
+    /// Domain-class email matching (`@host` / bare `host` admit a whole
+    /// domain; `user@host` is a full case-insensitive address) can't be
+    /// expressed by the `crate::allowlist::Match` modes, so the per-entry
+    /// comparison runs through `crate::allowlist::is_user_allowed_by`. `peers`
+    /// is the caller's freshly-resolved list; no allowlist state is cached.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
-        if peers.is_empty() {
-            return false; // Empty = deny all
-        }
-        if peers.iter().any(|a| a == "*") {
-            return true; // Wildcard = allow all
-        }
-        let email_lower = email.to_lowercase();
-        peers.iter().any(|allowed| {
+        crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
+            let email_lower = email.to_lowercase();
             if allowed.starts_with('@') {
                 // Domain match with @ prefix: "@example.com"
                 email_lower.ends_with(&allowed.to_lowercase())

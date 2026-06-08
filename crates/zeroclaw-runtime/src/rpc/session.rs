@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_infra::session_queue::SessionActorQueue;
+use zeroclaw_providers::ModelProvider;
 
 /// Why a session's in-flight turn cancel token was fired. Recorded at the
 /// firing site and drained at the turn-verdict site so the durable audit row
@@ -44,6 +45,8 @@ impl CancelCause {
 pub struct SessionOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
 }
@@ -98,7 +101,8 @@ impl RpcSession {
 
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
-    cancel_tokens: std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
+    cancel_generation: std::sync::atomic::AtomicU64,
     /// Records WHY each session's cancel token was fired. Populated at the
     /// firing site immediately before `token.cancel()`; drained by the
     /// turn-verdict site. Every known firing site records before firing; a
@@ -114,6 +118,7 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
+            cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
@@ -141,6 +146,11 @@ impl SessionStore {
 
     /// Apply overrides to the session and immediately mutate the agent.
     /// Returns the merged overrides for confirmation.
+    ///
+    /// Note: `model_provider` is recorded here but the live provider swap is
+    /// driven by the dispatcher via [`Self::apply_model_provider`], because
+    /// rebuilding the `ModelProvider` box needs `Config` access that the
+    /// session store deliberately does not hold.
     pub async fn set_overrides(
         &self,
         id: &str,
@@ -150,6 +160,16 @@ impl SessionStore {
         let session = sessions.get_mut(id)?;
         if let Some(ref m) = patch.model {
             session.overrides.model = Some(m.clone());
+        }
+        if let Some(ref p) = patch.model_provider {
+            session.overrides.model_provider = Some(p.clone());
+            // A provider switch without an explicit model must not carry the
+            // previous provider's model forward (e.g. switching to an Ollama
+            // alias while a Claude model override lingers). Clear it so the
+            // dispatcher resolves the new alias's configured model.
+            if patch.model.is_none() {
+                session.overrides.model = None;
+            }
         }
         if let Some(t) = patch.temperature {
             session.overrides.temperature = Some(t);
@@ -166,6 +186,28 @@ impl SessionStore {
             guard.set_temperature(overrides.temperature);
         }
         Some(overrides)
+    }
+
+    /// Swap a freshly built `ModelProvider` box (and its name) onto the
+    /// session's agent. Called by the dispatcher after it constructs the
+    /// box from config, keeping model_provider-build logic out of the store.
+    pub async fn apply_model_provider(
+        &self,
+        id: &str,
+        model_provider: Box<dyn ModelProvider>,
+        model_provider_name: String,
+    ) -> bool {
+        let agent = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(id) {
+                Some(s) => s.agent.clone(),
+                None => return false,
+            }
+        };
+        let mut guard = agent.lock().await;
+        guard.set_model_provider(model_provider);
+        guard.set_model_provider_name(model_provider_name);
+        true
     }
 
     pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {
@@ -258,7 +300,7 @@ impl SessionStore {
     }
 
     pub async fn remove(&self, id: &str) -> bool {
-        if let Some(token) = self
+        if let Some((_, token)) = self
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -332,20 +374,36 @@ impl SessionStore {
         self.sessions.lock().await.keys().cloned().collect()
     }
 
-    pub fn register_cancel_token(&self, id: &str, token: tokio_util::sync::CancellationToken) {
-        self.cancel_tokens
+    pub fn register_cancel_token(
+        &self,
+        id: &str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> u64 {
+        let generation = self
+            .cancel_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        if let Some((_, stale)) = self
+            .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), token);
+            .insert(id.to_string(), (generation, token))
+        {
+            stale.cancel();
+        }
+        generation
     }
 
-    pub fn remove_cancel_token(&self, id: &str) {
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        // A token removed at clean turn end carries no cancel; drop any stale
-        // cause so it cannot leak onto a later turn for the same session id.
+    pub fn remove_cancel_token(&self, id: &str, generation: u64) {
+        {
+            let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+            match tokens.get(id) {
+                Some((g, _)) if *g == generation => {
+                    tokens.remove(id);
+                }
+                _ => return,
+            }
+        }
         self.cancel_causes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -358,7 +416,7 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .map(|t| {
+            .map(|(_, t)| {
                 t.cancel();
                 true
             })
@@ -379,7 +437,7 @@ impl SessionStore {
     /// Returns `true` if the session existed and was removed, `false` if not found.
     /// History on disk is NOT touched — this is an in-memory eviction only.
     pub async fn kill_session(&self, id: &str) -> bool {
-        if let Some(token) = self
+        if let Some((_, token)) = self
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -547,6 +605,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_overrides_applies_model_and_temperature_live() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        let merged = store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model: Some("model-x".into()),
+                    temperature: Some(0.42),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(merged.model.as_deref(), Some("model-x"));
+        assert_eq!(merged.temperature, Some(0.42));
+
+        // The override is applied to the live agent immediately.
+        let agent = store.get_agent("s1").await.unwrap();
+        let (_, _, model_name) = agent.lock().await.attribution_fields();
+        assert_eq!(model_name, "model-x");
+    }
+
+    #[tokio::test]
+    async fn set_overrides_records_model_provider_without_rebuilding() {
+        // The store records the model_provider override but does NOT rebuild the
+        // provider box — that is the dispatcher's job (needs Config). Here we
+        // only assert the field round-trips through the merge.
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        let merged = store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model_provider: Some("anthropic.default".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(merged.model_provider.as_deref(), Some("anthropic.default"));
+    }
+
+    #[tokio::test]
+    async fn provider_switch_without_model_clears_prior_model() {
+        // Switching provider with no explicit model must drop the prior
+        // model override so the dispatcher resolves the new alias's
+        // configured model (e.g. Ollama alias must not keep a Claude model).
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model: Some("claude-opus-4-5".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        let merged = store
+            .set_overrides(
+                "s1",
+                SessionOverrides {
+                    model_provider: Some("ollama.default".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(merged.model_provider.as_deref(), Some("ollama.default"));
+        assert_eq!(
+            merged.model, None,
+            "a provider-only switch must clear the lingering model override"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_overrides_missing_session_is_none() {
+        let store = make_store(4);
+        assert!(
+            store
+                .set_overrides("ghost", SessionOverrides::default())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn remove_cleans_up() {
         let store = make_store(4);
         store
@@ -663,15 +830,48 @@ mod tests {
     async fn cancel_token_lifecycle() {
         let store = make_store(4);
         let token = tokio_util::sync::CancellationToken::new();
-        store.register_cancel_token("s1", token.clone());
+        let generation = store.register_cancel_token("s1", token.clone());
 
         assert!(!token.is_cancelled());
         assert!(store.cancel_session("s1"));
         assert!(token.is_cancelled());
 
         // Second cancel returns false (token was consumed by remove).
-        store.remove_cancel_token("s1");
+        store.remove_cancel_token("s1", generation);
         assert!(!store.cancel_session("s1"));
+    }
+
+    #[tokio::test]
+    async fn reregister_force_cancels_prior_turn() {
+        let store = make_store(4);
+        let old = tokio_util::sync::CancellationToken::new();
+        let old_gen = store.register_cancel_token("s", old.clone());
+
+        let new = tokio_util::sync::CancellationToken::new();
+        let new_gen = store.register_cancel_token("s", new.clone());
+
+        assert!(old.is_cancelled(), "re-register must kill the prior turn");
+        assert!(!new.is_cancelled());
+        assert_ne!(old_gen, new_gen);
+
+        store.remove_cancel_token("s", old_gen);
+        assert!(
+            store.cancel_session("s"),
+            "stale-generation remove must not orphan the live turn's token"
+        );
+        assert!(new.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stale_remove_is_a_noop() {
+        let store = make_store(4);
+        let token = tokio_util::sync::CancellationToken::new();
+        let generation = store.register_cancel_token("s", token.clone());
+        store.remove_cancel_token("s", generation.wrapping_sub(1));
+        assert!(
+            store.cancel_session("s"),
+            "a remove with a non-matching generation must leave the token intact"
+        );
     }
 
     #[tokio::test]

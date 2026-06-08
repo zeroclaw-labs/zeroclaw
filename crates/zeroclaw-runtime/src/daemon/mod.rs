@@ -619,6 +619,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("state")
         .join("daemon_state.json")
 }
 
@@ -1496,12 +1497,12 @@ mod tests {
     }
 
     #[test]
-    fn state_file_path_uses_config_directory() {
+    fn state_file_path_uses_config_state_directory() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
         let path = state_file_path(&config);
-        assert_eq!(path, tmp.path().join("daemon_state.json"));
+        assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
     }
 
     #[tokio::test]
@@ -1578,6 +1579,8 @@ mod tests {
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config.channels.discord.insert(
@@ -1598,6 +1601,8 @@ mod tests {
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(!has_supervised_channels(&config));
@@ -1619,6 +1624,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1659,6 +1666,8 @@ mod tests {
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1714,6 +1723,8 @@ mod tests {
                 auth_header: None,
                 secret: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
                 max_retries: None,
                 retry_base_delay_ms: None,
                 retry_max_delay_ms: None,
@@ -1793,6 +1804,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -1818,6 +1831,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.

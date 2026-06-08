@@ -139,6 +139,7 @@ pub fn make_prop_field(
     derived_from_secret: bool,
     credential_class: Option<CredentialSurfaceClass>,
     tab: ConfigTab,
+    display_secret_terminals: &[&str],
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -149,7 +150,11 @@ pub fn make_prop_field(
             _ => crate::traits::UNSET_DISPLAY.to_string(),
         }
     } else {
-        toml_value_to_display(table.and_then(|t| t.get(serde_name)))
+        toml_value_to_display_for_kind(
+            table.and_then(|t| t.get(serde_name)),
+            kind,
+            display_secret_terminals,
+        )
     };
     PropFieldInfo {
         name: name.to_string(),
@@ -172,14 +177,18 @@ pub fn serde_get_prop<T: serde::Serialize>(
     prefix: &str,
     name: &str,
     is_secret: bool,
+    kind: PropKind,
+    display_secret_terminals: &[&str],
 ) -> anyhow::Result<String> {
     if is_secret {
         return Ok("**** (encrypted)".to_string());
     }
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let table = toml::Value::try_from(target)?;
-    Ok(toml_value_to_display(
+    Ok(toml_value_to_display_for_kind(
         table.as_table().and_then(|t| t.get(&serde_name)),
+        kind,
+        display_secret_terminals,
     ))
 }
 
@@ -211,6 +220,122 @@ fn toml_value_to_display(value: Option<&toml::Value>) -> String {
         Some(toml::Value::String(s)) => s.clone(),
         Some(v) => v.to_string(),
     }
+}
+
+fn toml_value_to_display_for_kind(
+    value: Option<&toml::Value>,
+    kind: PropKind,
+    display_secret_terminals: &[&str],
+) -> String {
+    match kind {
+        PropKind::Object | PropKind::ObjectArray => match value {
+            None => crate::traits::UNSET_DISPLAY.to_string(),
+            Some(toml::Value::String(s)) => s.clone(),
+            Some(v) => {
+                let mut redacted = v.clone();
+                redact_toml_display_secrets(&mut redacted, display_secret_terminals);
+                redacted.to_string()
+            }
+        },
+        _ => toml_value_to_display(value),
+    }
+}
+
+pub fn object_array_json_display_value(
+    value: &impl serde::Serialize,
+    display_secret_terminals: &[&str],
+) -> String {
+    match serde_json::to_value(value) {
+        Ok(mut value) => {
+            redact_json_display_secrets(&mut value, display_secret_terminals);
+            serde_json::to_string(&value).unwrap_or_else(|_| "[]".to_string())
+        }
+        Err(_) => "[]".to_string(),
+    }
+}
+
+fn redact_json_display_secrets(value: &mut serde_json::Value, display_secret_terminals: &[&str]) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_display_secrets(item, display_secret_terminals);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map.iter_mut() {
+                if display_key_is_secret_terminal(key, display_secret_terminals) {
+                    mask_json_value(nested);
+                } else {
+                    redact_json_display_secrets(nested, display_secret_terminals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_toml_display_secrets(value: &mut toml::Value, display_secret_terminals: &[&str]) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                redact_toml_display_secrets(item, display_secret_terminals);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (key, nested) in table.iter_mut() {
+                if display_key_is_secret_terminal(key, display_secret_terminals) {
+                    mask_toml_value(nested);
+                } else {
+                    redact_toml_display_secrets(nested, display_secret_terminals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mask_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                mask_json_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values_mut() {
+                mask_json_value(nested);
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => *value = serde_json::Value::String("****".to_string()),
+    }
+}
+
+fn mask_toml_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                mask_toml_value(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, nested) in table.iter_mut() {
+                mask_toml_value(nested);
+            }
+        }
+        _ => *value = toml::Value::String("****".to_string()),
+    }
+}
+
+fn display_key_is_secret_terminal(key: &str, display_secret_terminals: &[&str]) -> bool {
+    let normalized = normalize_display_key(key);
+    display_secret_terminals
+        .iter()
+        .any(|terminal| normalize_display_key(terminal) == normalized)
+}
+
+fn normalize_display_key(key: &str) -> String {
+    key.replace('-', "_").to_ascii_lowercase()
 }
 
 fn prop_name_to_serde_field(prefix: &str, name: &str) -> anyhow::Result<String> {

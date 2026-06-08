@@ -4,7 +4,8 @@ use super::cron_common::{
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use serde_json::json;
+use chrono::{Duration as ChronoDuration, Utc};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -41,9 +42,20 @@ impl CronAddTool {
         Some(format!(
             "Invalid schedule: expected a JSON object with a \"kind\" field, got plain string {got}. \
              Use one of: {{\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\"}}, \
-             {{\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}}, or \
+             {{\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}}, \
+             {{\"kind\":\"after\",\"after_seconds\":600}} for one-shot relative reminders, or \
              {{\"kind\":\"every\",\"every_ms\":3600000}}"
         ))
+    }
+
+    fn deserialize_cron_add_schedule_arg(value: &Value) -> Result<CronAddScheduleArg, String> {
+        if let Some(normalized) = normalize_maybe_stringified_schedule_arg(value)?
+            && normalized.get("kind").and_then(Value::as_str) == Some("after")
+        {
+            return CronAddScheduleArg::after_from_value(&normalized);
+        }
+
+        deserialize_schedule_arg(value).map(CronAddScheduleArg::Schedule)
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
@@ -77,6 +89,71 @@ impl CronAddTool {
     }
 }
 
+fn normalize_maybe_stringified_schedule_arg(value: &Value) -> Result<Option<Value>, String> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('{') {
+                serde_json::from_str(trimmed)
+                    .map(Some)
+                    .map_err(|err| format!("Invalid schedule: {err}"))
+            } else {
+                Ok(None)
+            }
+        }
+        other => Ok(Some(other.clone())),
+    }
+}
+
+enum CronAddScheduleArg {
+    Schedule(Schedule),
+    AfterSeconds(u64),
+}
+
+impl CronAddScheduleArg {
+    fn after_from_value(value: &Value) -> Result<Self, String> {
+        let after_seconds = value
+            .get("after_seconds")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "Invalid schedule: after_seconds must be an integer > 0".to_string())?;
+        if after_seconds == 0 {
+            return Err("Invalid schedule: after_seconds must be > 0".to_string());
+        }
+
+        Ok(Self::AfterSeconds(after_seconds))
+    }
+
+    fn default_delete_after_run(&self) -> bool {
+        matches!(
+            self,
+            Self::Schedule(Schedule::At { .. }) | Self::AfterSeconds(_)
+        )
+    }
+
+    fn into_schedule(self) -> Result<Schedule, String> {
+        match self {
+            Self::Schedule(schedule) => Ok(schedule),
+            Self::AfterSeconds(after_seconds) => {
+                let after_seconds = i64::try_from(after_seconds)
+                    .map_err(|_| "Invalid schedule: after_seconds is too large")?;
+                let delay = ChronoDuration::seconds(after_seconds);
+                let at = Utc::now().checked_add_signed(delay).ok_or_else(|| {
+                    "Invalid schedule: after_seconds overflowed DateTime arithmetic".to_string()
+                })?;
+                Ok(Schedule::At { at })
+            }
+        }
+    }
+}
+
+fn schedule_error_result(error: String) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: String::new(),
+        error: Some(error),
+    }
+}
+
 #[async_trait]
 impl Tool for CronAddTool {
     fn name(&self) -> &str {
@@ -84,8 +161,11 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+        "Create a scheduled cron job (shell or agent) with cron/at/after/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
+         For relative one-shot reminders such as 'in 10 minutes' or 'after 2 hours', \
+         use schedule={\"kind\":\"after\",\"after_seconds\":...}; the runtime resolves it \
+         with the live clock when the tool executes. \
          To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ, Webhook), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          For webhook deliveries that must thread through the originating conversation, also set \
@@ -106,7 +186,7 @@ impl Tool for CronAddTool {
                 // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
                 // tool specs are sent. See src/tools/schema.rs.
                 "schedule": {
-                    "description": "When to run the job. Exactly one of three forms must be used.",
+                    "description": "When to run the job. Exactly one of four forms must be used. Prefer 'after' for relative one-shot reminders.",
                     "oneOf": [
                         {
                             "type": "object",
@@ -126,6 +206,15 @@ impl Tool for CronAddTool {
                                 "at": { "type": "string", "description": AT_DESCRIPTION }
                             },
                             "required": ["kind", "at"]
+                        },
+                        {
+                            "type": "object",
+                            "description": "One-shot relative delay in seconds. Prefer this for reminders like 'in 10 minutes' so the runtime resolves the live clock. Example: {\"kind\":\"after\",\"after_seconds\":600}",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["after"] },
+                                "after_seconds": { "type": "integer", "minimum": 1, "description": "Delay from job creation time in seconds, e.g. 600 for 10 minutes" }
+                            },
+                            "required": ["kind", "after_seconds"]
                         },
                         {
                             "type": "object",
@@ -163,7 +252,7 @@ impl Tool for CronAddTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional allowlist of tool names for agent jobs. When omitted, all tools remain available."
+                    "description": "Optional allowlist of tool names for agent jobs. When omitted, cron-launched agent runs keep non-scheduler tools available but exclude scheduler mutation tools such as cron_add, cron_update, cron_remove, cron_run, and schedule. Include those names explicitly to opt back in."
                 },
                 "delivery": {
                     "type": "object",
@@ -195,7 +284,7 @@ impl Tool for CronAddTool {
                 },
                 "delete_after_run": {
                     "type": "boolean",
-                    "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for 'at' schedules."
+                    "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for one-shot 'at' and 'after' schedules."
                 },
                 "approved": {
                     "type": "boolean",
@@ -216,7 +305,7 @@ impl Tool for CronAddTool {
             });
         }
 
-        let schedule = match args.get("schedule") {
+        let schedule_arg = match args.get("schedule") {
             Some(v @ serde_json::Value::String(raw)) => {
                 if let Some(error) = Self::plain_string_schedule_error(raw) {
                     return Ok(ToolResult {
@@ -226,7 +315,7 @@ impl Tool for CronAddTool {
                     });
                 }
 
-                match deserialize_schedule_arg(v) {
+                match Self::deserialize_cron_add_schedule_arg(v) {
                     Ok(schedule) => schedule,
                     Err(error) => {
                         return Ok(ToolResult {
@@ -237,7 +326,7 @@ impl Tool for CronAddTool {
                     }
                 }
             }
-            Some(v) => match deserialize_schedule_arg(v) {
+            Some(v) => match Self::deserialize_cron_add_schedule_arg(v) {
                 Ok(schedule) => schedule,
                 Err(error) => {
                     return Ok(ToolResult {
@@ -280,7 +369,7 @@ impl Tool for CronAddTool {
             }
         };
 
-        let default_delete_after_run = matches!(schedule, Schedule::At { .. });
+        let default_delete_after_run = schedule_arg.default_delete_after_run();
         let delete_after_run = args
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
@@ -327,6 +416,11 @@ impl Tool for CronAddTool {
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
+
+                let schedule = match schedule_arg.into_schedule() {
+                    Ok(schedule) => schedule,
+                    Err(error) => return Ok(schedule_error_result(error)),
+                };
 
                 cron::add_shell_job_with_approval(
                     &self.config,
@@ -391,6 +485,11 @@ impl Tool for CronAddTool {
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
+
+                let schedule = match schedule_arg.into_schedule() {
+                    Ok(schedule) => schedule,
+                    Err(error) => return Ok(schedule_error_result(error)),
+                };
 
                 cron::add_agent_job(
                     &self.config,
@@ -798,6 +897,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_relative_after_schedule_as_one_shot_at() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let before = chrono::Utc::now();
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "after", "after_seconds": 60 },
+                "job_type": "agent",
+                "prompt": "remind me to drink water"
+            }))
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+
+        assert!(result.success, "{:?}", result.error);
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        match jobs[0].schedule {
+            Schedule::At { at } => {
+                assert!(at >= before + chrono::Duration::seconds(60));
+                assert!(at <= after + chrono::Duration::seconds(60));
+                assert_eq!(jobs[0].next_run, at);
+            }
+            ref other => {
+                panic!("after input should persist as one-shot at schedule, got {other:?}")
+            }
+        }
+        assert!(jobs[0].delete_after_run);
+
+        let schema = tool.parameters_schema();
+        let delete_description = schema["properties"]["delete_after_run"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(delete_description.contains("'at' and 'after' schedules"));
+    }
+
+    #[tokio::test]
+    async fn accepts_stringified_relative_after_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let before = chrono::Utc::now();
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"after","after_seconds":60}"#,
+                "job_type": "agent",
+                "prompt": "remind me to drink water"
+            }))
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+
+        assert!(result.success, "{:?}", result.error);
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        match jobs[0].schedule {
+            Schedule::At { at } => {
+                assert!(at >= before + chrono::Duration::seconds(60));
+                assert!(at <= after + chrono::Duration::seconds(60));
+            }
+            ref other => panic!("after input should persist as an at schedule, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_after_schedule_with_non_positive_delay() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "after", "after_seconds": 0 },
+                "job_type": "agent",
+                "prompt": "remind me"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("after_seconds must be > 0")
+        );
+    }
+
+    #[tokio::test]
     async fn accepts_stringified_schedule_with_timezone() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -939,6 +1129,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowed_tools_schema_documents_scheduler_mutation_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let schema = tool.parameters_schema();
+        let description = schema["properties"]["allowed_tools"]["description"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(description.contains("exclude scheduler mutation tools"));
+        assert!(description.contains("cron_add"));
+        assert!(description.contains("opt back in"));
+    }
+
+    #[tokio::test]
     async fn delivery_schema_includes_matrix_channel() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -1010,6 +1216,34 @@ mod tests {
         assert!(jobs[0].delivery.best_effort);
     }
 
+    #[tokio::test]
+    async fn past_at_schedule_error_includes_clock_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": "2020-01-01T00:00:00Z" },
+                "job_type": "shell",
+                "command": "echo at"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("'at' must be in the future"));
+        assert!(error.contains("now_utc="), "{error}");
+        assert!(error.contains("now_local="), "{error}");
+        assert!(
+            error.contains("at_utc=2020-01-01T00:00:00+00:00"),
+            "{error}"
+        );
+        assert!(error.contains("at_local="), "{error}");
+        assert!(error.contains("delta_seconds="), "{error}");
+    }
+
     #[test]
     fn schedule_schema_is_oneof_with_cron_at_every_variants() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1029,11 +1263,15 @@ mod tests {
         let top_required = schema["required"].as_array().expect("top-level required");
         assert!(top_required.iter().any(|v| v == "schedule"));
 
-        // schedule is a oneOf with exactly 3 variants: cron, at, every
+        // schedule is a oneOf with four variants: cron, at, after, every
         let one_of = schema["properties"]["schedule"]["oneOf"]
             .as_array()
             .expect("schedule.oneOf must be an array");
-        assert_eq!(one_of.len(), 3, "expected cron, at, and every variants");
+        assert_eq!(
+            one_of.len(),
+            4,
+            "expected cron, at, after, and every variants"
+        );
 
         let kinds: Vec<&str> = one_of
             .iter()
@@ -1041,9 +1279,10 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"cron"), "missing cron variant");
         assert!(kinds.contains(&"at"), "missing at variant");
+        assert!(kinds.contains(&"after"), "missing after variant");
         assert!(kinds.contains(&"every"), "missing every variant");
 
-        // Each variant declares its required fields and every_ms is typed integer
+        // Each variant declares its required fields and duration fields are typed integers.
         for variant in one_of {
             let kind = variant["properties"]["kind"]["enum"][0]
                 .as_str()
@@ -1061,6 +1300,22 @@ mod tests {
             match kind {
                 "cron" => assert!(req.contains(&"expr"), "cron variant missing 'expr'"),
                 "at" => assert!(req.contains(&"at"), "at variant missing 'at'"),
+                "after" => {
+                    assert!(
+                        req.contains(&"after_seconds"),
+                        "after variant missing 'after_seconds'"
+                    );
+                    assert_eq!(
+                        variant["properties"]["after_seconds"]["type"].as_str(),
+                        Some("integer"),
+                        "after_seconds must be typed as integer"
+                    );
+                    assert_eq!(
+                        variant["properties"]["after_seconds"]["minimum"].as_i64(),
+                        Some(1),
+                        "after_seconds must declare a positive minimum"
+                    );
+                }
                 "every" => {
                     assert!(
                         req.contains(&"every_ms"),
