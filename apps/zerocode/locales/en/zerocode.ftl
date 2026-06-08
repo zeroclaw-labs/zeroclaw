@@ -319,7 +319,7 @@ zc-quickstart-status-submitting = Submitting…
 zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat will open when reconnected…
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
 zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
-zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when every selector is ✓.
+zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel

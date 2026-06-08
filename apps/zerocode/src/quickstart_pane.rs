@@ -125,8 +125,7 @@ fn apply_model_catalog_result(form: &mut FieldFormModal, models: Option<Vec<Stri
     form.model_catalog_attempts = form.model_catalog_attempts.saturating_add(1);
     match models {
         Some(models) => {
-            form.model_catalog = models;
-            apply_model_catalog_to_rows(&mut form.fields, Some(&form.model_catalog));
+            apply_model_catalog_to_rows(&mut form.fields, Some(&models));
             form.model_catalog_state = ModelCatalogState::Loaded;
         }
         None if form.model_catalog_attempts < MODEL_CATALOG_MAX_ATTEMPTS => {
@@ -385,13 +384,7 @@ struct FormState {
     /// `Fresh`.
     memory_existing_alias: String,
     channels: Vec<ChannelDraft>,
-    /// `true` once the user has opened the Channels modal and
-    /// hit Done (channels are optional, but the user has to say
-    /// "I considered this and chose 0 / N" before the selector
-    /// counts as `[✓]`).
-    channels_visited: bool,
     peer_groups: Vec<crate::wire::QuickstartPeerGroup>,
-    peer_groups_visited: bool,
     agent_name: String,
     personality_files: Vec<crate::wire::QuickstartPersonalityFile>,
 }
@@ -413,9 +406,7 @@ impl FormState {
             memory_chosen: false,
             memory_existing_alias: String::new(),
             channels: Vec::new(),
-            channels_visited: false,
             peer_groups: Vec::new(),
-            peer_groups_visited: false,
             agent_name: String::new(),
             personality_files: Vec::new(),
         }
@@ -633,12 +624,15 @@ struct FieldFormModal {
     type_key: String,
     /// User-named alias for this entry. Pre-filled with `type_key`.
     alias: String,
-    /// Live model catalog fetched for model-provider forms.
-    model_catalog: Vec<String>,
     model_catalog_state: ModelCatalogState,
     model_catalog_attempts: u8,
     fields: Vec<FieldFormRow>,
     cursor: usize,
+}
+
+struct ModelCatalogFetchResult {
+    type_key: String,
+    models: Option<Vec<String>>,
 }
 
 struct FieldFormRow {
@@ -775,6 +769,16 @@ impl FileEditorState {
         }
     }
 
+    fn scroll_lines(&mut self, delta: i32) {
+        if self.lines.is_empty() {
+            self.ensure_cursor_in_bounds();
+            return;
+        }
+        let max_row = self.lines.len().saturating_sub(1) as i32;
+        self.cursor_row = (self.cursor_row as i32 + delta).clamp(0, max_row) as usize;
+        self.clamp_cursor_col();
+    }
+
     fn ensure_cursor_in_bounds(&mut self) {
         if self.lines.is_empty() {
             self.lines.push(String::new());
@@ -826,6 +830,11 @@ pub struct QuickstartPane {
     applied_alias: Option<String>,
     busy: bool,
     active_modal: Option<Modal>,
+    /// Source of truth for an in-flight model-catalog fetch. The
+    /// fetched model list itself is not cached here; successful results
+    /// are applied into the model field descriptor so the picker has one
+    /// canonical source.
+    model_catalog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ModelCatalogFetchResult>>,
     /// Rect of the modal body painted by the most recent `draw` call.
     /// `None` when no modal is up. Used by `handle_mouse` to detect
     /// clicks inside vs. outside the modal.
@@ -858,6 +867,7 @@ impl QuickstartPane {
             applied_alias: None,
             busy: false,
             active_modal: None,
+            model_catalog_rx: None,
             modal_rect: None,
             modal_row_rects: Vec::new(),
             selector_list_rect: None,
@@ -898,7 +908,7 @@ impl QuickstartPane {
             Some(Modal::FieldForm(f)) => f
                 .fields
                 .get(f.cursor)
-                .is_some_and(|row| field_row_variants(f, row).is_none()),
+                .is_some_and(|row| field_row_variants(row).is_none()),
             Some(Modal::Agent(a)) => a.editor.is_some() || a.cursor == 0,
             _ => false,
         }
@@ -1108,18 +1118,18 @@ impl QuickstartPane {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
         };
+        if let Modal::Agent(a) = modal
+            && let Some(editor) = a.editor.as_mut()
+        {
+            editor.scroll_lines(delta);
+            return;
+        }
         let (cur, len) = match modal {
             Modal::Picker(p) => (&mut p.cursor, p.options.len()),
             Modal::FieldForm(f) => (&mut f.cursor, f.fields.len()),
             Modal::ChannelList(cl) => (&mut cl.cursor, self.modal_row_rects.len()),
             Modal::PeerGroupList(pl) => (&mut pl.cursor, self.modal_row_rects.len()),
-            Modal::Agent(a) => {
-                if let Some(editor) = a.editor.as_mut() {
-                    (&mut editor.cursor_row, editor.lines.len())
-                } else {
-                    (&mut a.cursor, self.modal_row_rects.len())
-                }
-            }
+            Modal::Agent(a) => (&mut a.cursor, self.modal_row_rects.len()),
             Modal::TextInput(_) => return,
         };
         if len == 0 {
@@ -1445,7 +1455,7 @@ impl QuickstartPane {
                     let variants = f
                         .fields
                         .get(f.cursor)
-                        .and_then(|row| field_row_variants(f, row))
+                        .and_then(field_row_variants)
                         .map(|v| v.to_vec());
                     if let (Some(row), Some(variants)) = (f.fields.get_mut(f.cursor), variants)
                         && !variants.is_empty()
@@ -1463,7 +1473,7 @@ impl QuickstartPane {
                     let variants = f
                         .fields
                         .get(f.cursor)
-                        .and_then(|row| field_row_variants(f, row))
+                        .and_then(field_row_variants)
                         .map(|v| v.to_vec());
                     if let (Some(row), Some(variants)) = (f.fields.get_mut(f.cursor), variants)
                         && !variants.is_empty()
@@ -1477,7 +1487,7 @@ impl QuickstartPane {
                     let is_enum = f
                         .fields
                         .get(f.cursor)
-                        .and_then(|row| field_row_variants(f, row))
+                        .and_then(field_row_variants)
                         .is_some();
                     if let Some(row) = f.fields.get_mut(f.cursor)
                         && !is_enum
@@ -1489,7 +1499,7 @@ impl QuickstartPane {
                     let is_enum = f
                         .fields
                         .get(f.cursor)
-                        .and_then(|row| field_row_variants(f, row))
+                        .and_then(field_row_variants)
                         .is_some();
                     if let KeyCode::Char(c) = key.code
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1535,7 +1545,6 @@ impl QuickstartPane {
                                 cursor: 0,
                             }));
                         } else if cl.cursor == drafts + 1 {
-                            self.form.channels_visited = true;
                             self.active_modal = None;
                             self.advance_after_completed(Selector::Channels);
                         }
@@ -1575,7 +1584,6 @@ impl QuickstartPane {
                                 }));
                             }
                         } else if pl.cursor == drafts + 1 {
-                            self.form.peer_groups_visited = true;
                             self.active_modal = None;
                             self.advance_after_completed(Selector::PeerGroups);
                         }
@@ -1662,7 +1670,7 @@ impl QuickstartPane {
                             }
                         }
                     }
-                    Some(QuickstartModalAction::EditCopy) if on_file => {
+                    Some(QuickstartModalAction::ClearFile) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
                         a.files.insert(filename, String::new());
                     }
@@ -1837,15 +1845,43 @@ impl QuickstartPane {
             selector: sel,
             type_key,
             alias,
-            model_catalog: Vec::new(),
             model_catalog_state,
             model_catalog_attempts: 0,
             fields: rows,
             cursor: 0,
         }));
+        self.model_catalog_rx = None;
     }
 
     pub async fn tick(&mut self) {
+        let mut clear_rx = false;
+        let mut fetched = None;
+        if let Some(rx) = self.model_catalog_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    fetched = Some(result);
+                    clear_rx = true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    clear_rx = true;
+                }
+            }
+        }
+        if clear_rx {
+            self.model_catalog_rx = None;
+        }
+        if let Some(result) = fetched
+            && let Some(Modal::FieldForm(form)) = self.active_modal.as_mut()
+            && form.type_key == result.type_key
+            && matches!(
+                form.model_catalog_state,
+                ModelCatalogState::Pending | ModelCatalogState::Retrying
+            )
+        {
+            apply_model_catalog_result(form, result.models);
+        }
+
         let pending_type = match self.active_modal.as_ref() {
             Some(Modal::FieldForm(form))
                 if matches!(
@@ -1860,26 +1896,22 @@ impl QuickstartPane {
         let Some(type_key) = pending_type else {
             return;
         };
-
-        let models = match self.rpc.catalog_models(&type_key).await {
-            Ok(res) if res.live && !res.models.is_empty() => {
-                sort_quickstart_models(&type_key, res.models)
-            }
-            _ => None,
-        };
-
-        let Some(Modal::FieldForm(form)) = self.active_modal.as_mut() else {
-            return;
-        };
-        if form.type_key != type_key
-            || !matches!(
-                form.model_catalog_state,
-                ModelCatalogState::Pending | ModelCatalogState::Retrying
-            )
-        {
+        if self.model_catalog_rx.is_some() {
             return;
         }
-        apply_model_catalog_result(form, models);
+
+        let rpc = Arc::clone(&self.rpc);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.model_catalog_rx = Some(rx);
+        tokio::spawn(async move {
+            let models = match rpc.catalog_models(&type_key).await {
+                Ok(res) if res.live && !res.models.is_empty() => {
+                    sort_quickstart_models(&type_key, res.models)
+                }
+                _ => None,
+            };
+            let _ = tx.send(ModelCatalogFetchResult { type_key, models });
+        });
     }
 
     /// Commit the active FieldFormModal into [`FormState`]. Returns
@@ -2184,24 +2216,6 @@ fn wrapped_total(lines: &[Line], width: u16) -> u16 {
     wrapped_row_heights(lines, width).iter().copied().sum()
 }
 
-fn apply_model_catalog_to_fields(
-    fields: &mut [QuickstartFieldDescriptor],
-    model_catalog: Option<&[String]>,
-) {
-    let Some(models) = model_catalog else {
-        return;
-    };
-    if models.is_empty() {
-        return;
-    }
-    for field in fields {
-        if is_model_field(field) {
-            field.kind = crate::client::QuickstartFieldKind::Enum;
-            field.enum_variants = Some(models.to_vec());
-        }
-    }
-}
-
 fn apply_model_catalog_to_rows(rows: &mut [FieldFormRow], model_catalog: Option<&[String]>) {
     let Some(models) = model_catalog else {
         return;
@@ -2225,25 +2239,30 @@ fn is_model_field(field: &QuickstartFieldDescriptor) -> bool {
 }
 
 fn sort_quickstart_models(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
-    let mut models: Vec<String> = models
+    let provider_l = provider.to_ascii_lowercase();
+    let mut ranked: Vec<(i32, String, String)> = models
         .into_iter()
-        .filter(|model| !is_non_chat_model(model))
+        .filter_map(|model| {
+            let model_l = model.to_ascii_lowercase();
+            if is_non_chat_model_lower(&model_l) {
+                None
+            } else {
+                Some((model_rank_lower(&provider_l, &model_l), model_l, model))
+            }
+        })
         .collect();
-    if models.is_empty() {
+    if ranked.is_empty() {
         return None;
     }
-    models.sort_by(|a, b| {
-        model_rank(provider, a)
-            .cmp(&model_rank(provider, b))
-            .then_with(|| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
-            .then_with(|| a.cmp(b))
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
-    Some(models)
+    Some(ranked.into_iter().map(|(_, _, model)| model).collect())
 }
 
-fn model_rank(provider: &str, model: &str) -> i32 {
-    let provider = provider.to_ascii_lowercase();
-    let model_l = model.to_ascii_lowercase();
+fn model_rank_lower(provider: &str, model_l: &str) -> i32 {
     let mut rank = 100;
 
     if provider.starts_with("openai") {
@@ -2271,9 +2290,9 @@ fn model_rank(provider: &str, model: &str) -> i32 {
     rank
 }
 
-fn is_non_chat_model(model: &str) -> bool {
+fn is_non_chat_model_lower(model: &str) -> bool {
     contains_any(
-        &model.to_ascii_lowercase(),
+        model,
         &[
             "image",
             "audio",
@@ -2293,10 +2312,9 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 fn build_field_form_rows(
     section: QuickstartFieldSection,
-    mut fields: Vec<QuickstartFieldDescriptor>,
+    fields: Vec<QuickstartFieldDescriptor>,
     model_catalog: Option<&[String]>,
 ) -> Vec<FieldFormRow> {
-    apply_model_catalog_to_fields(&mut fields, model_catalog);
     let mut rows: Vec<FieldFormRow> = fields
         .into_iter()
         .map(|mut d| {
@@ -2324,21 +2342,12 @@ fn build_field_form_rows(
             FieldFormRow { descriptor: d, buf }
         })
         .collect();
-    if matches!(section, QuickstartFieldSection::ModelProvider)
-        && let Some(models) = model_catalog
-        && let Some(first_model) = models.first()
-    {
-        for row in &mut rows {
-            if is_model_field(&row.descriptor) && row.buf.is_empty() {
-                row.buf = first_model.clone();
-            }
-        }
-    }
     // Prepend an editable alias row for ModelProvider so users can
     // choose a custom alias instead of the hardcoded "default".
     if matches!(section, QuickstartFieldSection::ModelProvider) {
         rows.insert(0, model_provider_alias_row());
     }
+    apply_model_catalog_to_rows(&mut rows, model_catalog);
     rows
 }
 
@@ -2363,17 +2372,11 @@ fn model_provider_alias_row() -> FieldFormRow {
     }
 }
 
-fn field_row_variants<'a>(form: &'a FieldFormModal, row: &'a FieldFormRow) -> Option<&'a [String]> {
+fn field_row_variants(row: &FieldFormRow) -> Option<&[String]> {
     if let Some(variants) = row.descriptor.enum_variants.as_deref()
         && !variants.is_empty()
     {
         return Some(variants);
-    }
-    if form.selector == Selector::ModelProvider
-        && is_model_field(&row.descriptor)
-        && !form.model_catalog.is_empty()
-    {
-        return Some(form.model_catalog.as_slice());
     }
     None
 }
@@ -2488,7 +2491,7 @@ fn draw_modal(
                 } else {
                     theme::body_style()
                 };
-                let is_enum = field_row_variants(f, row).is_some();
+                let is_enum = field_row_variants(row).is_some();
                 let is_model_row = is_model_field(&row.descriptor);
                 let raw_display = if row.descriptor.is_secret {
                     "•".repeat(row.buf.chars().count())
@@ -2782,7 +2785,7 @@ fn draw_modal(
                     } else {
                         theme::body_style()
                     };
-                    let content = a.files.get(filename).cloned().unwrap_or_default();
+                    let content = a.files.get(filename).map(String::as_str).unwrap_or("");
                     let status = if content.trim().is_empty() {
                         "—".to_string()
                     } else {
@@ -3018,8 +3021,6 @@ mod tests {
         let f = complete_form();
         assert!(f.channels.is_empty());
         assert!(f.peer_groups.is_empty());
-        assert!(!f.channels_visited);
-        assert!(!f.peer_groups_visited);
         assert!(!f.is_satisfied(Selector::Channels));
         assert!(!f.is_satisfied(Selector::PeerGroups));
         assert!(f.all_selectors_satisfied());
@@ -3029,8 +3030,6 @@ mod tests {
     fn optional_rows_complete_only_when_configured() {
         let mut f = complete_form();
 
-        f.channels_visited = true;
-        f.peer_groups_visited = true;
         assert!(!f.is_satisfied(Selector::Channels));
         assert!(!f.is_satisfied(Selector::PeerGroups));
 
@@ -3082,36 +3081,52 @@ mod tests {
 
     #[test]
     fn live_model_catalog_turns_model_row_into_picker() {
-        let mut fields = vec![
-            QuickstartFieldDescriptor {
-                key: "model".into(),
-                label: "model".into(),
-                help: String::new(),
-                kind: crate::client::QuickstartFieldKind::String,
-                is_secret: false,
-                enum_variants: None,
-                required: true,
-                default: None,
+        let mut rows = vec![
+            model_provider_alias_row(),
+            FieldFormRow {
+                descriptor: QuickstartFieldDescriptor {
+                    key: "model".into(),
+                    label: "model".into(),
+                    help: String::new(),
+                    kind: crate::client::QuickstartFieldKind::String,
+                    is_secret: false,
+                    enum_variants: None,
+                    required: true,
+                    default: None,
+                },
+                buf: String::new(),
             },
-            QuickstartFieldDescriptor {
-                key: "api_key".into(),
-                label: "api_key".into(),
-                help: String::new(),
-                kind: crate::client::QuickstartFieldKind::String,
-                is_secret: true,
-                enum_variants: None,
-                required: false,
-                default: None,
+            FieldFormRow {
+                descriptor: QuickstartFieldDescriptor {
+                    key: "api_key".into(),
+                    label: "api_key".into(),
+                    help: String::new(),
+                    kind: crate::client::QuickstartFieldKind::String,
+                    is_secret: true,
+                    enum_variants: None,
+                    required: false,
+                    default: None,
+                },
+                buf: String::new(),
             },
         ];
         let models = vec!["gpt-5".to_string(), "gpt-5.1".to_string()];
 
-        apply_model_catalog_to_fields(&mut fields, Some(&models));
+        apply_model_catalog_to_rows(&mut rows, Some(&models));
 
-        assert_eq!(fields[0].kind, crate::client::QuickstartFieldKind::Enum);
-        assert_eq!(fields[0].enum_variants.as_deref(), Some(models.as_slice()));
-        assert_eq!(fields[1].kind, crate::client::QuickstartFieldKind::String);
-        assert!(fields[1].enum_variants.is_none());
+        assert_eq!(
+            rows[1].descriptor.kind,
+            crate::client::QuickstartFieldKind::Enum
+        );
+        assert_eq!(
+            rows[1].descriptor.enum_variants.as_deref(),
+            Some(models.as_slice())
+        );
+        assert_eq!(
+            rows[2].descriptor.kind,
+            crate::client::QuickstartFieldKind::String
+        );
+        assert!(rows[2].descriptor.enum_variants.is_none());
     }
 
     #[test]
@@ -3162,7 +3177,6 @@ mod tests {
             selector: Selector::ModelProvider,
             type_key: "openai".into(),
             alias: "default".into(),
-            model_catalog: Vec::new(),
             model_catalog_state: ModelCatalogState::Pending,
             model_catalog_attempts: 0,
             fields: build_field_form_rows(
@@ -3195,7 +3209,6 @@ mod tests {
             selector: Selector::ModelProvider,
             type_key: "openai".into(),
             alias: "default".into(),
-            model_catalog: Vec::new(),
             model_catalog_state: ModelCatalogState::Retrying,
             model_catalog_attempts: 1,
             fields: build_field_form_rows(
@@ -3448,6 +3461,20 @@ mod tests {
         assert_eq!(editor.content(), "onetwo");
         assert_eq!(editor.cursor_row, 0);
         assert_eq!(editor.cursor_col, 3);
+    }
+
+    #[test]
+    fn file_editor_scroll_clamps_at_edges() {
+        let mut editor = FileEditorState::new("TOOLS.md".into(), "one\ntwo\nthree".into());
+
+        editor.scroll_lines(-1);
+        assert_eq!(editor.cursor_row, 0);
+
+        editor.scroll_lines(10);
+        assert_eq!(editor.cursor_row, 2);
+
+        editor.scroll_lines(1);
+        assert_eq!(editor.cursor_row, 2);
     }
 
     #[test]

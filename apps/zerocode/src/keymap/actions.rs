@@ -340,7 +340,7 @@ keyactions! {
         Save           [Chord::ctrl('s')] => "save",
         EditWithEditor [Chord::char('e'), Chord::char('E')] => "edit file",
         EditTemplate   [Chord::char('t'), Chord::char('T')] => "from template",
-        EditCopy       [Chord::char('c'), Chord::char('C')] => "copy contents",
+        ClearFile      [Chord::char('c'), Chord::char('C')] => "clear file",
         Create         [] => "create",
     }
 }

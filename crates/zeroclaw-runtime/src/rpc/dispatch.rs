@@ -263,6 +263,34 @@ fn not_yet_implemented(method: Method) -> RpcResult {
     ))
 }
 
+fn personality_template_context(
+    config: &zeroclaw_config::schema::Config,
+    req: &PersonalityTemplatesParams,
+) -> crate::agent::personality_templates::TemplateContext {
+    let agent_requested = req.agent.is_some();
+    let requested_agent = req
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let agent_alias = requested_agent.unwrap_or("default");
+    let configured_agent_exists = config.agent(agent_alias).is_some();
+
+    crate::agent::personality_templates::TemplateContext {
+        agent: requested_agent
+            .map(str::to_string)
+            .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
+            .unwrap_or_else(|| "ZeroClaw".to_string()),
+        // Existing config editors pass an agent alias, but Quickstart
+        // also asks for templates before the new agent exists. Treat an
+        // explicit agent request as a full per-agent template render so
+        // MEMORY.md is available during first-run setup; keep the no-agent
+        // fallback memoryless for generic/default callers.
+        include_memory: configured_agent_exists || agent_requested,
+        ..Default::default()
+    }
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -2663,26 +2691,8 @@ impl RpcDispatcher {
 
     fn handle_personality_templates(&self, params: &Value) -> RpcResult {
         let req: PersonalityTemplatesParams = parse_params(params)?;
-        let agent_requested = req.agent.is_some();
-        let requested_agent = req
-            .agent
-            .as_deref()
-            .filter(|agent| !agent.trim().is_empty());
-        let agent_alias = requested_agent.unwrap_or("default");
         let config = self.ctx.config.read().clone();
-        let configured_agent = config.agent(agent_alias);
-        let ctx = crate::agent::personality_templates::TemplateContext {
-            agent: configured_agent
-                .map(|_| agent_alias.trim().to_string())
-                .unwrap_or_else(|| "ZeroClaw".to_string()),
-            // Existing config editors pass an agent alias, but Quickstart
-            // also asks for templates before the new agent exists. Treat an
-            // explicit agent request as a full per-agent template render so
-            // MEMORY.md is available during first-run setup; keep the no-agent
-            // fallback memoryless for generic/default callers.
-            include_memory: configured_agent.is_some() || agent_requested,
-            ..Default::default()
-        };
+        let ctx = personality_template_context(&config, &req);
         let templates = crate::agent::personality_templates::render_preset_default(&ctx);
         let files: Vec<TemplateFileEntry> = templates
             .into_iter()
@@ -3289,6 +3299,26 @@ mod tests {
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn personality_templates_use_requested_agent_name_before_config_exists() {
+        let req = PersonalityTemplatesParams {
+            agent: Some(" bob ".to_string()),
+        };
+        let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
+
+        assert_eq!(ctx.agent, "bob");
+        assert!(ctx.include_memory);
+    }
+
+    #[test]
+    fn personality_templates_without_agent_stay_generic_and_memoryless() {
+        let req = PersonalityTemplatesParams { agent: None };
+        let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
+
+        assert_eq!(ctx.agent, "ZeroClaw");
+        assert!(!ctx.include_memory);
     }
 
     #[test]
