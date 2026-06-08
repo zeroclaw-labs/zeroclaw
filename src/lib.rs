@@ -42,7 +42,7 @@ pub mod agent;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod approval;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod auth;
+pub mod auth;
 #[cfg(feature = "agent-runtime")]
 pub mod channels;
 pub mod commands;
