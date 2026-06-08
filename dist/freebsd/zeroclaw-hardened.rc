@@ -1,0 +1,163 @@
+#!/bin/sh
+#
+# PROVIDE: zeroclaw
+# REQUIRE: NETWORKING DAEMON
+# KEYWORD: shutdown
+#
+# Hardened single-instance rc.d script for zeroclaw, for unattended and remote
+# operation. Compared to the basic zeroclaw.rc it adds:
+#   * idempotent start  — refuses to stack a second daemon(8) supervisor;
+#   * thorough stop      — TERMs then KILLs the supervisor and verifies it died;
+#   * detached supervisor std fds — so `ssh host service zeroclaw start` does
+#     not hang waiting on EOF;
+#   * status orphan check — reports supervisors not tracked by the pidfile.
+#
+# Install as /usr/local/etc/rc.d/zeroclaw (use this OR zeroclaw.rc, not both)
+# and replace @@ZEROCLAW_USER@@ with the account that owns ~/.zeroclaw (see
+# dist/freebsd/README.md).
+
+. /etc/rc.subr
+
+name="zeroclaw"
+rcvar="zeroclaw_enable"
+
+load_rc_config $name
+
+: ${zeroclaw_enable:="NO"}
+# NOTE: do NOT name this ${name}_user — rc.subr would then do its own user
+# switch and collide with daemon -u ("failed to set user environment").
+: ${zeroclaw_runas:="@@ZEROCLAW_USER@@"}
+
+rundir="/var/run/zeroclaw"
+pidfile="${rundir}/zeroclaw.pid"          # daemon -P: the SUPERVISOR pid
+child_pidfile="${rundir}/zeroclaw.child.pid"  # daemon -p: the CHILD (zeroclaw) pid
+logfile="/var/log/${name}.log"
+launcher="/usr/local/libexec/zeroclaw-run.sh"
+# daemon(8) retitles its supervisor to "daemon: <launcher>[childpid] (daemon)".
+# Bind the pgrep on the "daemon: " prefix AND the trailing "[" that opens
+# daemon's [childpid], so it matches ONLY a supervisor for THIS launcher (never
+# the zeroclaw child, never a hand-run of the launcher, never this rc shell,
+# and never a sibling launcher whose name merely starts with zeroclaw-run.sh).
+# The dots/brackets are escaped so .sh and the "[" are literal. FreeBSD pgrep
+# does NOT honor a leading "^" anchor on this retitle, so we bind on the prefix.
+launcher_pat="daemon: /usr/local/libexec/zeroclaw-run[.]sh[[]"
+
+command="/usr/sbin/daemon"
+
+start_precmd="zeroclaw_prestart"
+start_cmd="zeroclaw_start"
+stop_cmd="zeroclaw_stop"
+status_cmd="zeroclaw_status"
+
+# Echo every live daemon(8) supervisor pid for this service, one per line.
+zeroclaw_pids()
+{
+    pgrep -f "${launcher_pat}" 2>/dev/null | while IFS= read -r _pid; do
+        case "${_pid}" in
+        ''|*[!0-9]*)
+            continue
+            ;;
+        esac
+        if kill -0 "${_pid}" 2>/dev/null; then
+            printf '%s\n' "${_pid}"
+        fi
+    done
+}
+
+zeroclaw_prestart()
+{
+    # rundir is root-owned: rc.d (root) writes the daemon -P pidfile here and
+    # trusts it later; the unprivileged service user must not be able to forge
+    # control-plane pidfiles.
+    install -d -o root -g wheel -m 755 "${rundir}"
+    [ -e "${logfile}" ] || install -o root -g wheel -m 640 /dev/null "${logfile}"
+    return 0
+}
+
+zeroclaw_start()
+{
+    _pids=$(zeroclaw_pids)
+    if [ -n "${_pids}" ]; then
+        echo "${name} already running; refusing to start duplicate supervisor pid(s): $(printf '%s' "${_pids}" | tr '\n' ' ')"
+        return 0
+    fi
+    rm -f "${pidfile}" "${child_pidfile}"
+    echo "Starting ${name}."
+    # Redirect daemon's own std{in,out,err} to /dev/null: -o already routes the
+    # child's output to the logfile, and without this the supervisor inherits
+    # (and holds open) the caller's fds, so `ssh host service ... start` never
+    # gets EOF and hangs.
+    # -p records the CHILD pid so a forced stop can reap an orphaned child if the
+    # supervisor has to be KILLed (see zeroclaw_stop).
+    /usr/sbin/daemon -r -P "${pidfile}" -p "${child_pidfile}" -o "${logfile}" \
+        -u "${zeroclaw_runas}" "${launcher}" \
+        </dev/null >/dev/null 2>&1
+}
+
+zeroclaw_stop()
+{
+    _pids=$(zeroclaw_pids)
+    if [ -z "${_pids}" ]; then
+        echo "${name} not running."
+        rm -f "${pidfile}" "${child_pidfile}"
+        return 0
+    fi
+    echo "Stopping ${name} supervisor pid(s): $(printf '%s' "${_pids}" | tr '\n' ' ')"
+    for _pid in ${_pids}; do
+        kill -TERM "${_pid}" 2>/dev/null || :
+    done
+    _wait=10
+    while [ "${_wait}" -gt 0 ]; do
+        _pids=$(zeroclaw_pids)
+        [ -z "${_pids}" ] && break
+        sleep 1
+        _wait=$((_wait - 1))
+    done
+    _pids=$(zeroclaw_pids)
+    if [ -n "${_pids}" ]; then
+        # KILL the supervisor FIRST so it can no longer respawn the child, then
+        # reap the now-orphaned child. Doing it in this order avoids a race
+        # where the supervisor restarts the child between the two kills.
+        echo "Forcing ${name} supervisor pid(s): $(printf '%s' "${_pids}" | tr '\n' ' ')"
+        for _pid in ${_pids}; do
+            kill -KILL "${_pid}" 2>/dev/null || :
+        done
+        # daemon -p writes the child pid with NO trailing newline, so `read`
+        # returns nonzero at EOF even though it populated ${_child}; do not gate
+        # on its exit status.
+        if [ -f "${child_pidfile}" ]; then
+            IFS= read -r _child < "${child_pidfile}" 2>/dev/null || :
+            case "${_child}" in
+            ''|*[!0-9]*)
+                ;;
+            *)
+                if kill -0 "${_child}" 2>/dev/null; then
+                    echo "Reaping orphaned ${name} child pid: ${_child}"
+                    kill -KILL "${_child}" 2>/dev/null || :
+                fi
+                ;;
+            esac
+        fi
+        sleep 1
+    fi
+    _pids=$(zeroclaw_pids)
+    if [ -n "${_pids}" ]; then
+        echo "Failed to stop ${name} supervisor pid(s): $(printf '%s' "${_pids}" | tr '\n' ' ')" >&2
+        return 1
+    fi
+    rm -f "${pidfile}" "${child_pidfile}"
+    return 0
+}
+
+zeroclaw_status()
+{
+    _pids=$(zeroclaw_pids)
+    if [ -n "${_pids}" ]; then
+        echo "${name} is running as supervisor pid(s): $(printf '%s' "${_pids}" | tr '\n' ' ')"
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"

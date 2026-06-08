@@ -126,3 +126,15 @@ pub fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
         None
     }
 }
+
+/// Whether a canonical provider family honors the `wire_api` config field.
+///
+/// Mirrors the provider factory in `zeroclaw-providers`: only the
+/// bring-your-own-endpoint families build either a chat-completions or a
+/// responses provider from `wire_api`. Every branded vendor family has a
+/// fixed wire protocol and ignores the field. Kept in lockstep with the
+/// `FamilyProviderFactory` impls that branch on `wire_api == Responses`
+/// (`openai`, `llamacpp`, `custom`, and the generic openai-compatible path).
+pub fn family_honors_wire_api(family: &str) -> bool {
+    matches!(family, "openai" | "llamacpp" | "custom")
+}
