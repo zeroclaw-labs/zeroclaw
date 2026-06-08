@@ -12527,7 +12527,9 @@ pub struct OtpConfig {
     #[serde(default = "default_otp_cache_valid_secs")]
     pub cache_valid_secs: u64,
 
-    /// Tool/action names gated by OTP.
+    /// Tool/action names gated by OTP. Empty or malformed entries are rejected
+    /// at config load; an entry that does not match a known gated action is
+    /// accepted but logged at WARN, since it cannot be enforced.
     #[serde(default = "default_otp_gated_actions")]
     pub gated_actions: Vec<String>,
 
@@ -15242,6 +15244,21 @@ impl Config {
             {
                 anyhow::bail!(
                     "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !default_otp_gated_actions()
+                .iter()
+                .any(|known| known == normalized)
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "action": normalized,
+                            "known_actions": default_otp_gated_actions(),
+                        })),
+                    "security.otp.gated_actions entry does not match a known gated action and will not be enforced: "
                 );
             }
         }
@@ -21693,6 +21710,45 @@ require_otp_to_resume = true
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_accepts_all_default_gated_actions_without_warning() {
+        let mut config = Config::default();
+        config.security.otp.gated_actions = default_otp_gated_actions();
+
+        config
+            .validate()
+            .expect("the canonical default gated actions must validate clean");
+    }
+
+    #[test]
+    async fn security_validation_accepts_unknown_gated_action_but_does_not_bail() {
+        // An unknown but well-formed action name is a silent no-op today
+        // (OTP enforcement of gated_actions is not wired through). Config load
+        // must not fail on it — the operator's whole config would be rejected
+        // for a typo'd gate — but the runtime emits a WARN so the no-op is not
+        // silent. This asserts the warn-and-continue contract: load succeeds.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec!["kubectl_write".into()];
+
+        config
+            .validate()
+            .expect("an unknown gated action must warn, not reject the config");
+    }
+
+    #[test]
+    async fn security_validation_still_rejects_malformed_gated_action() {
+        // The unknown-name warn must not weaken the existing hard checks from
+        // the charset/empty validation: a name with invalid characters still
+        // bails rather than degrading to a warn.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec!["kubectl write".into()];
+
+        let err = config
+            .validate()
+            .expect_err("malformed gated action must still be rejected");
+        assert!(err.to_string().contains("gated_actions"));
     }
 
     // The two `validate_*_transcription_default_provider` tests were removed
