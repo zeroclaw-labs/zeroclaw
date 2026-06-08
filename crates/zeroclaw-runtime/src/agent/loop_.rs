@@ -2230,8 +2230,11 @@ pub async fn run_tool_call_loop(
             return Ok(accumulated_display_text);
         }
 
-        // Accumulate text from this iteration (tool calls present, loop continues).
-        accumulated_display_text.push_str(&display_text);
+        // Do not accumulate intermediate-turn display text into the final
+        // channel response. Native tool-call providers may emit narration or
+        // scratchpad-like text alongside tool calls; draft-capable channels
+        // can still see it live through `on_delta` below, but the final
+        // delivered response must only contain the final assistant turn.
 
         // Native tool-call model_providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
@@ -9011,9 +9014,9 @@ This is an example, not an invocation."#;
                 .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)"))),
             "tool-call progress line should still be relayed"
         );
-        assert!(
-            result.ends_with("Final answer"),
-            "accumulated result should end with final answer, got: {result}"
+        assert_eq!(
+            result, "Final answer",
+            "final delivered result should not include intermediate tool-call narration"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }

@@ -13493,46 +13493,7 @@ msgstr "WITインターフェースを公式プラグインSDKとして文書化
 
 #: src/foundations/fnd-003-governance.md
 msgid "Document the process for a Core Team member to step down or become inactive"
-msgstr "このプロセスに従うことで、コアチームメンバーの離脱または非アクティブ化をスムーズに行うことができます。"
-"このプロセスに従うことで、コアチームメンバーの離脱または非アクティブ化をスムーズに行うことができます。このプロセスに従うことで、コアチームメンバーの離脱または非アクティブ化をスムーズに行うことができます。このプロセスに従うことで、コアチームメンバーの離脱または非アクティブ化をスムーズに行うことができます。**コアチームメンバーの離脱または非アクティブ化のプロセス**\n"
-"\n"
-"コアチームメンバーが離脱するか、非アクティブになる場合、以下の手順に従ってください。\n"
-"\n"
-"### 1. 離脱または非アクティブ化の理由の明確化\n"
-"まず、離脱または非アクティブ化の理由を明確にします。これにより、チーム全体が状況を理解し、適切な対応を取ることができます。\n"
-"\n"
-"### 2. チームへの通知\n"
-"離脱または非アクティブ化の意思をチームに正式に通知します。以下の方法で通知を行うことが推奨されます：\n"
-"- **メール**: チームの共有メールアドレスまたは個別にメールを送信します。\n"
-"- **チャットツール**: SlackやDiscordなどのチャットツールでメッセージを投稿します。\n"
-"- **会議**: 必要に応じて、オンライン会議を開催し、直接説明します。\n"
-"\n"
-"### 3. 責任の引き継ぎ\n"
-"現在の役割や責任を引き継ぐための手順を確立します。これには以下が含まれます：\n"
-"- **タスクの整理**: 現在担当しているタスクやプロジェクトの進捗状況を整理します。\n"
-"- **ドキュメントの更新**: プロジェクトのドキュメントやリポジトリを更新し、新しいメンバーが引き継ぎやすいようにします。\n"
-"- **引き継ぎ会議**: 引き継ぎを受けるメンバーと会議を開き、詳細な説明を行います。\n"
-"\n"
-"### 4. アクセス権限の調整\n"
-"必要に応じて、プロジェクトやリポジトリへのアクセス権限を調整します。これには以下が含まれます：\n"
-"- **リポジトリのアクセス権限**: GitHubやGitLabなどのリポジトリからアクセス権限を削除します。\n"
-"- **ツールへのアクセス**: Slack、Jira、Confluenceなどのツールからのアクセス権限を調整します。\n"
-"\n"
-"### 5. 感謝と挨拶\n"
-"チームに対して感謝の意を表し、適切な挨拶を行います。これにより、良好な関係を維持し、将来の協力の可能性を残すことができます。\n"
-"\n"
-"### 6. 記録の更新\n"
-"プロジェクトのドキュメントやリポジトリに、メンバーの離脱または非アクティブ化に関する情報を記録します。これには以下が含まれます：\n"
-"- **メンバーリストの更新**: チームのメンバーリストから名前を削除します。\n"
-"- **履歴の記録**: 離脱または非アクティブ化の日時と理由を記録します。\n"
-"\n"
-"### 7. 後継者の選定（必要に応じて）\n"
-"必要に応じて、新しいメンバーを選定し、トレーニングやオンボーディングを行います。これにより、プロジェクトの継続性を確保します。\n"
-"\n"
-"### 8. 最終確認\n"
-"すべての手順が完了したことを確認し、チーム全体に報告します。これにより、プロジェクトの円滑な進行を確保します。\n"
-"\n"
-"このプロセスに従うことで、コアチームメンバーの離脱または非アクティブ化をスムーズに行うことができます。"
+msgstr "Core Team メンバーが退任する、または非アクティブになるプロセスを文書化する"
 
 #: src/foundations/fnd-004-engineering-infrastructure.md
 #: src/foundations/fnd-006-zero-compromise-in-practice.md
@@ -30803,49 +30764,7 @@ msgstr "次に起きたことは、それほど一般的ではありません。
 
 #: src/architecture/request-lifecycle.md
 msgid "What happens between \"user sends a message\" and \"agent replies\" — the full path, with streaming, tool calls, and security gates annotated."
-msgstr "このフローは、ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示しています。各ステップは、ユーザーとエージェント間のスムーズな対話を確保するために重要です。"
-"このフローは、ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示しています。各ステップは、ユーザーとエージェント間のスムーズな対話を確保するために重要です。このフローは、ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示しています。各ステップは、ユーザーとエージェント間のスムーズな対話を確保するために重要です。このフローは、ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示しています。各ステップは、ユーザーとエージェント間のスムーズな対話を確保するために重要です。「ユーザーがメッセージを送信」してから「エージェントが返信する」までの間の処理フローを、ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示します。\n"
-"\n"
-"1. **ユーザーがメッセージを送信**\n"
-"   - ユーザーがチャットインターフェースにメッセージを入力し、送信ボタンをクリックします。\n"
-"   - メッセージはネットワーク経由でサーバーに送信されます。\n"
-"\n"
-"2. **セキュリティゲート（入力検証）**\n"
-"   - 受信したメッセージは、まずセキュリティゲートを通過します。\n"
-"   - **入力検証**: メッセージの内容が安全かどうかを確認します。例えば、有害なコンテンツや不正なコードが含まれていないかチェックします。\n"
-"   - **フィルタリング**: 不適切なコンテンツやスパムをフィルタリングします。\n"
-"\n"
-"3. **メッセージの解析とエンティティ抽出**\n"
-"   - セキュリティゲートを通過したメッセージは、自然言語処理（NLP）エンジンによって解析されます。\n"
-"   - **エンティティ抽出**: メッセージから重要な情報（例：名前、日付、場所など）を抽出します。\n"
-"   - **意図の認識**: ユーザーの意図を特定します（例：質問、リクエスト、コマンドなど）。\n"
-"\n"
-"4. **コンテキストの管理**\n"
-"   - 現在の会話のコンテキストを管理します。\n"
-"   - **セッション管理**: 各ユーザーのセッション情報を保持し、以前のメッセージを参照します。\n"
-"   - **コンテキストの更新**: 新しいメッセージに基づいてコンテキストを更新します。\n"
-"\n"
-"5. **エージェントの処理**\n"
-"   - エージェントは、解析されたメッセージとコンテキストに基づいて処理を行います。\n"
-"   - **ツール呼び出し**: 必要に応じて外部ツールやAPIを呼び出します。\n"
-"     - **例**: データベースへのクエリ、天気予報の取得、カレンダーのチェックなど。\n"
-"   - **ストリーミング**: 結果をリアルタイムでストリーミングして返します。\n"
-"     - **ストリーミングの利点**: ユーザーは結果が完成する前に部分的な結果を受け取ることができます。\n"
-"\n"
-"6. **セキュリティゲート（出力検証）**\n"
-"   - 生成された応答は、再度セキュリティゲートを通過します。\n"
-"   - **出力検証**: 応答が安全で適切かどうかを確認します。\n"
-"   - **フィルタリング**: 不適切なコンテンツや機密情報をフィルタリングします。\n"
-"\n"
-"7. **エージェントの返信**\n"
-"   - 最終的な応答がユーザーに返されます。\n"
-"   - **ストリーミング**: 応答がストリーミング形式で返される場合、ユーザーはリアルタイムで応答を受け取ります。\n"
-"   - **完全な応答**: 応答が完全に生成されると、ユーザーに最終的な応答が表示されます。\n"
-"\n"
-"8. **ユーザーが応答を受信**\n"
-"   - ユーザーはエージェントの応答を受け取り、必要に応じて次のアクションを取ります。\n"
-"\n"
-"このフローは、ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示しています。各ステップは、ユーザーとエージェント間のスムーズな対話を確保するために重要です。"
+msgstr "「ユーザーがメッセージを送信」してから「エージェントが返信する」までに起こること — ストリーミング、ツール呼び出し、セキュリティゲートを注釈付きで示す完全な経路。"
 
 #: src/ops/observability.md
 msgid "What is `internal`?"
@@ -31055,17 +30974,7 @@ msgstr "WhatsApp など (WiFi 経由)"
 
 #: src/providers/streaming.md
 msgid "When"
-msgstr "もし特定の文脈や技術文書での使用例があれば、より正確な翻訳を提供できます。"
-"もし特定の文脈や技術文書での使用例があれば、より正確な翻訳を提供できます。もし特定の文脈や技術文書での使用例があれば、より正確な翻訳を提供できます。もし特定の文脈や技術文書での使用例があれば、より正確な翻訳を提供できます。「When」は英語で「～のとき」や「～の場合」という意味を持つ接続詞です。文脈によって適切な日本語に訳す必要があります。\n"
-"\n"
-"例:\n"
-"- **When** you click the button, the dialog will appear.  \n"
-"  → ボタンをクリックすると、ダイアログが表示されます。\n"
-"\n"
-"- **When** the process completes, a notification will be sent.  \n"
-"  → プロセスが完了すると、通知が送信されます。\n"
-"\n"
-"もし特定の文脈や技術文書での使用例があれば、より正確な翻訳を提供できます。"
+msgstr "いつ"
 
 #: src/channels/matrix.md
 msgid "When **`recover()` itself fails** (typically `MAC check for the secret storage key failed`), the channel logs the homeserver's default secret-storage key id, whether the key event has passphrase info, the whitespace-stripped input length, and the full error chain — these point at _which_ layer rejected the recovery key without leaking the value. Recovery failures are **non-fatal** (they don't trigger auto-wipe); the bot continues, the new device just won't be cross-signed."
@@ -31803,101 +31712,7 @@ msgstr "（抽出を見越して）`crates/zeroclaw-api` のルートレベル `
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)"
-msgstr "この文書は、プラグインレジストリの透明性と信頼性を確保し、ユーザーと開発者の間で共通の理解を促進することを目的としています。"
-"この文書は、プラグインレジストリの透明性と信頼性を確保し、ユーザーと開発者の間で共通の理解を促進することを目的としています。この文書は、プラグインレジストリの透明性と信頼性を確保し、ユーザーと開発者の間で共通の理解を促進することを目的としています。この文書は、プラグインレジストリの透明性と信頼性を確保し、ユーザーと開発者の間で共通の理解を促進することを目的としています。# プラグインレジストリガバナンス文書\n"
-"\n"
-"## 1. 概要\n"
-"\n"
-"この文書は、プラグインレジストリ（以下、「レジストリ」と呼ぶ）のガバナンス構造、プラグインのレビュープロセス、およびセキュリティインシデント発生時の対応手順を定義します。レジストリの透明性、信頼性、およびセキュリティを維持することを目的としています。\n"
-"\n"
-"## 2. レジストリの制御と管理\n"
-"\n"
-"### 2.1 管理主体\n"
-"レジストリは、以下の組織または委員会（以下、「ガバナンス委員会」と呼ぶ）によって管理されます。\n"
-"\n"
-"- **ガバナンス委員会**: レジストリの運用方針、セキュリティポリシー、および重要な決定を決定する主体。\n"
-"- **技術運営チーム**: 日常の運用、インフラ管理、および技術的なレビューを担当。\n"
-"\n"
-"### 2.2 権限と責任\n"
-"- **ガバナンス委員会**:\n"
-"  - レジストリのポリシー変更\n"
-"  - 重大なセキュリティインシデントへの対応決定\n"
-"  - 管理者の選任と解任\n"
-"- **技術運営チーム**:\n"
-"  - プラグインのレビュー\n"
-"  - レジストリのインフラ管理\n"
-"  - ユーザーサポート\n"
-"\n"
-"## 3. プラグインのレビュープロセス\n"
-"\n"
-"### 3.1 提出要件\n"
-"プラグインをレジストリに提出するには、以下の要件を満たす必要があります。\n"
-"\n"
-"- **ソースコードの公開**: プラグインのソースコードは、公開リポジトリにホストされていること。\n"
-"- **ドキュメント**: 使用方法、依存関係、およびセキュリティに関する情報を提供すること。\n"
-"- **テストカバレッジ**: 基本的なテストカバレッジが確保されていること。\n"
-"- **ライセンス**: 適切なオープンソースライセンスが選択されていること。\n"
-"\n"
-"### 3.2 レビュー手順\n"
-"1. **自動チェック**:\n"
-"   - コードの静的解析\n"
-"   - テストカバレッジの確認\n"
-"   - ライセンスの検証\n"
-"2. **手動レビュー**:\n"
-"   - 技術運営チームによるコードレビュー\n"
-"   - セキュリティ監査\n"
-"   - 機能性とユーザーエクスペリエンスの評価\n"
-"3. **承認**:\n"
-"   - レビューを通過したプラグインは、ガバナンス委員会の承認を経てレジストリに登録されます。\n"
-"\n"
-"## 4. 侵害されたプラグインの取り消し\n"
-"\n"
-"### 4.1 インシデントの検出\n"
-"- ユーザーからの報告\n"
-"- セキュリティチームによる監視\n"
-"- 自動検知システム\n"
-"\n"
-"### 4.2 対応手順\n"
-"1. **即時対応**:\n"
-"   - 侵害が確認されたプラグインをレジストリから即時削除または非公開にする。\n"
-"   - ユーザーへの通知を送信し、影響範囲を明記する。\n"
-"2. **調査**:\n"
-"   - セキュリティチームによる詳細な調査\n"
-"   - 侵害の原因と影響範囲の特定\n"
-"3. **報告**:\n"
-"   - 調査結果をガバナンス委員会に報告\n"
-"   - 必要に応じて、外部のセキュリティコミュニティや規制当局に報告\n"
-"\n"
-"### 4.3 再登録\n"
-"- 侵害されたプラグインの再登録は、以下の条件を満たす場合に限り許可されます。\n"
-"  - 問題の原因が特定され、修正が完了していること。\n"
-"  - 再レビューを通過していること。\n"
-"  - ガバナンス委員会の承認を得ていること。\n"
-"\n"
-"## 5. ガバナンス委員会の構成と運営\n"
-"\n"
-"### 5.1 構成\n"
-"- **メンバー**: 5〜7名の委員で構成され、技術、セキュリティ、およびコミュニティの代表者が含まれる。\n"
-"- **任期**: 各委員の任期は2年とし、再任が可能。\n"
-"\n"
-"### 5.2 運営\n"
-"- **会議**: 月1回の定例会議と、必要に応じて臨時会議を開催。\n"
-"- **決定**: 重要な決定は、委員の過半数による投票で行う。\n"
-"\n"
-"## 6. 変更と更新\n"
-"\n"
-"このガバナンス文書は、必要に応じてガバナンス委員会によって更新されます。変更は、コミュニティへの公開とフィードバックの収集を経て適用されます。\n"
-"\n"
-"## 7. お問い合わせ\n"
-"\n"
-"この文書に関する質問や提案は、以下の連絡先までお気軽にお問い合わせください。\n"
-"\n"
-"- **メール**: governance@example.com\n"
-"- **フォーラム**: [コミュニティフォーラム](https://community.example.com)\n"
-"\n"
-"---\n"
-"\n"
-"この文書は、プラグインレジストリの透明性と信頼性を確保し、ユーザーと開発者の間で共通の理解を促進することを目的としています。"
+msgstr "Plugin Registry ガバナンス文書を作成する（誰がレジストリを管理するか、プラグインをどのようにレビューするか、侵害されたプラグインをどのように取り消すか）"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the WIT interface documentation alongside the `wit/` files (generated from WIT + hand-written explanation)"
@@ -48254,3 +48069,147 @@ msgstr "🔵 チームの決定"
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "🟡 Conditional"
 msgstr "🟡 条件"
+
+#: src/SUMMARY.md
+msgid "Channels & Integrations"
+msgstr "チャンネルと連携"
+
+#: src/SUMMARY.md src/developing/index.md
+msgid "Extending & Plugins"
+msgstr "拡張とプラグイン"
+
+#: src/SUMMARY.md
+msgid "Foundations (RFCs)"
+msgstr "基盤（RFC）"
+
+#: src/SUMMARY.md
+msgid "Hardware & Boards"
+msgstr "ハードウェアとボード"
+
+#: src/SUMMARY.md src/setup/index.md
+msgid "Installation"
+msgstr "インストール"
+
+#: src/SUMMARY.md
+msgid "Operations & Deployment"
+msgstr "運用とデプロイ"
+
+#: src/SUMMARY.md
+msgid "Security & Autonomy"
+msgstr "セキュリティと自律性"
+
+#: src/SUMMARY.md
+msgid "Standard Operating Procedures"
+msgstr "標準運用手順"
+
+#: src/SUMMARY.md
+msgid "Tools & Extensibility"
+msgstr "ツールと拡張性"
+
+#: src/getting-started/index.md
+msgid "Start here if you are installing ZeroClaw for the first time or choosing the simplest path to a working agent."
+msgstr "ZeroClaw を初めてインストールする場合や、動作するエージェントへの最短ルートを選ぶ場合は、ここから始めてください。"
+
+#: src/getting-started/index.md
+msgid "[Quick start](./quick-start.md) covers installation, onboarding, and the first chat."
+msgstr "[クイックスタート](./quick-start.md) では、インストール、オンボーディング、最初のチャットを扱います。"
+
+#: src/getting-started/index.md
+msgid "[YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset."
+msgstr "[YOLO モード](./yolo.md) では、最速だが安全ではないローカル開発プリセットを説明します。"
+
+#: src/getting-started/index.md
+msgid "[Multi-model setup](./multi-model-setup.md) explains provider and route basics."
+msgstr "[マルチモデル設定](./multi-model-setup.md) では、プロバイダーとルートの基本を説明します。"
+
+#: src/getting-started/index.md
+msgid "[zerocode](./tui.md) introduces the terminal UI."
+msgstr "[zerocode](./tui.md) では、ターミナル UI を紹介します。"
+
+#: src/getting-started/index.md
+msgid "[Language and translations](./language.md) covers locale selection."
+msgstr "[言語と翻訳](./language.md) では、ロケールの選択を扱います。"
+
+#: src/setup/index.md
+msgid "Choose the installation path for your operating system or deployment target."
+msgstr "使用するオペレーティングシステムまたはデプロイ先に合わせて、インストール手順を選んでください。"
+
+#: src/setup/index.md
+msgid "[Docker and containers](./container.md)"
+msgstr "[Docker とコンテナ](./container.md)"
+
+#: src/reference/index.md
+msgid "Reference material for operators and integrators who need exact command, configuration, environment, and API details."
+msgstr "正確なコマンド、設定、環境、API の詳細が必要な運用者とインテグレーター向けのリファレンスです。"
+
+#: src/reference/index.md
+msgid "[CLI](./cli.md)"
+msgstr "[CLI](./cli.md)"
+
+#: src/reference/index.md
+msgid "[Config](./config.md)"
+msgstr "[設定](./config.md)"
+
+#: src/reference/index.md
+msgid "[Environment variables](./env-vars.md)"
+msgstr "[環境変数](./env-vars.md)"
+
+#: src/reference/index.md
+msgid "[API rustdoc](../api.md)"
+msgstr "[API rustdoc](../api.md)"
+
+#: src/reference/index.md
+msgid "[Gateway HTTP API](../gateway/api.md)"
+msgstr "[ゲートウェイ HTTP API](../gateway/api.md)"
+
+#: src/reference/index.md
+msgid "[Web dashboard](../gateway/web-dashboard.md)"
+msgstr "[Web ダッシュボード](../gateway/web-dashboard.md)"
+
+#: src/developing/index.md
+msgid "Use these pages when extending ZeroClaw or working on project tooling."
+msgstr "ZeroClaw を拡張する場合やプロジェクトのツール類に取り組む場合は、これらのページを参照してください。"
+
+#: src/developing/index.md
+msgid "[Plugin protocol](./plugin-protocol.md)"
+msgstr "[プラグインプロトコル](./plugin-protocol.md)"
+
+#: src/developing/index.md
+msgid "[Extension examples](./extension-examples.md)"
+msgstr "[拡張例](./extension-examples.md)"
+
+#: src/developing/index.md
+msgid "[Building the docs locally](./building-docs.md)"
+msgstr "[ドキュメントをローカルでビルドする](./building-docs.md)"
+
+#: src/developing/index.md
+msgid "[Building the web dashboard](./web.md)"
+msgstr "[Web ダッシュボードをビルドする](./web.md)"
+
+#: src/contributing/index.md
+msgid "Start here before opening issues, proposing architecture changes, or submitting pull requests."
+msgstr "Issue を開く、アーキテクチャ変更を提案する、またはプルリクエストを送る前に、ここから始めてください。"
+
+#: src/contributing/index.md
+msgid "[Architecture and contribution map](./architecture-map.md)"
+msgstr "[アーキテクチャとコントリビューションのマップ](./architecture-map.md)"
+
+#: src/contributing/index.md
+msgid "[Privacy and PII discipline](./privacy.md)"
+msgstr "[プライバシーと PII の規律](./privacy.md)"
+
+#: src/contributing/index.md
+msgid "[Testing](./testing.md)"
+msgstr "[テスト](./testing.md)"
+
+#: src/contributing/index.md
+msgid "[PR review protocol](./pr-review-protocol.md)"
+msgstr "[PR レビュープロトコル](./pr-review-protocol.md)"
+
+#: src/contributing/index.md
+msgid "[Multi-agent setup](./multi-agent-setup.md)"
+msgstr "[マルチエージェント設定](./multi-agent-setup.md)"
+
+#: src/contributing/index.md
+msgid "[Contributor License Agreement](./cla.md)"
+msgstr "[コントリビューターライセンス契約](./cla.md)"

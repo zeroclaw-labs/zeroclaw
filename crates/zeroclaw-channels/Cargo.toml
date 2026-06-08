@@ -182,6 +182,7 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
   "channel-wati",
@@ -213,6 +214,7 @@ channel-slack = []
 channel-signal = []
 channel-mattermost = []
 channel-irc = []
+channel-twitch = ["channel-irc"]
 channel-imessage = []
 channel-dingtalk = []
 channel-qq = []

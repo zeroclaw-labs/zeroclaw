@@ -156,7 +156,6 @@ keyactions! {
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
-        RenameSession           [Chord::ctrl('r')] => "rename session",
         DeleteSession           [] => "delete session",
         CancelTurn              [Chord::ctrl('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",
@@ -164,6 +163,13 @@ keyactions! {
         ApprovalApproveAll      [Chord::char('a')] => "approve all",
         ApprovalApproveEdit     [Chord::char('e')] => "approve + edit",
         DismissModal            [] => "dismiss",
+        PauseResumeQueue        [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "pause/resume queue",
+        QueueNavUp              [Chord::with(KeyCode::Up, KeyModifiers::ALT)] => "queue prev",
+        QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
+        QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
+        QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
+        QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",
+        QueueNarrow             [Chord::shift(KeyCode::Right)] => "narrow queue",
     }
 }
 
@@ -215,6 +221,7 @@ keyactions! {
         DetailWidenDown  [Chord::shift(KeyCode::Down)] => "widen detail down",
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
+        KillSession      [Chord::char('X')] => "kill session",
         Refresh          [Chord::char('r')] => "refresh",
         JumpStart        [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd          [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
@@ -237,9 +244,10 @@ keyactions! {
 
 keyactions! {
     pub enum QuickstartTabAction ("quickstart") {
-        Up     [Chord::key(KeyCode::Up)] => "prev",
-        Down   [Chord::key(KeyCode::Down)] => "next",
+        Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
+        Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter  [Chord::key(KeyCode::Enter)] => "open",
+        Back   [Chord::char('q'), Chord::key(KeyCode::Esc)] => "leave",
         Create [Chord::char('c'), Chord::char('C')] => "create agent",
     }
 }
@@ -247,6 +255,7 @@ keyactions! {
 keyactions! {
     pub enum InputBarAction ("input_bar") {
         Submit             [Chord::key(KeyCode::Enter)] => "send",
+        Inject             [Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",

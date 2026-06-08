@@ -621,25 +621,22 @@ impl OpenAiCompatibleModelProvider {
             .next()
             .unwrap_or(model)
             .to_ascii_lowercase();
+        // gpt-5*-chat-latest (gpt-5-chat-latest, gpt-5.1-chat-latest, ...) are
+        // OpenAI's non-reasoning chat-router models; the Chat Completions API
+        // rejects reasoning_effort for them. Treat them as a distinct family, the
+        // same way the native openai.rs provider already special-cases them.
+        let is_gpt5_chat_latest = id.starts_with("gpt-5") && id.ends_with("-chat-latest");
         let is_openai_reasoning_model = id == "o1"
             || id.starts_with("o1-")
             || id == "o3"
             || id.starts_with("o3-")
             || id == "o4"
             || id.starts_with("o4-")
-            || id.starts_with("gpt-5");
+            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
         let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
 
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
     }
-}
-
-/// Kimi K2.5/K2.6 models enforce fixed temperatures per mode (1.0 thinking,
-/// 0.6 instant) and reject any other value with HTTP 400. Omit `temperature`
-/// for kimi-k2.* models so the backend chooses the correct mode default.
-/// Substring match covers k2.5, k2.6, and future k2.x variants.
-fn compatible_model_omits_temperature(model: &str) -> bool {
-    model.contains("kimi-k2")
 }
 
 #[derive(Debug, Serialize)]
@@ -2197,11 +2194,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         // Normalize image markers (e.g. local file paths from channel
@@ -2314,11 +2306,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2400,11 +2387,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2512,11 +2494,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
@@ -2625,11 +2602,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
@@ -2778,11 +2750,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let provider = self.clone();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
@@ -2920,11 +2887,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
@@ -3928,6 +3890,16 @@ mod tests {
         assert_eq!(
             model_provider.reasoning_effort_for_model("openai/gpt-5"),
             Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5-chat-latest"),
+            None,
+            "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5.1-chat-latest"),
+            None,
+            "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
         );
         assert_eq!(
             model_provider.reasoning_effort_for_model("gpt-4-codex"),
@@ -5528,20 +5500,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compatible_model_omits_temperature_matches_kimi_k2() {
-        assert!(compatible_model_omits_temperature("kimi-k2.5"));
-        assert!(compatible_model_omits_temperature("kimi-k2.6"));
-        assert!(compatible_model_omits_temperature("kimi-k2.7"));
-        assert!(compatible_model_omits_temperature("kimi-k2"));
+    fn minimal_request(temperature: Option<f64>) -> ApiChatRequest {
+        ApiChatRequest {
+            model: "any-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            temperature,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        }
     }
 
     #[test]
-    fn compatible_model_omits_temperature_skips_other_models() {
-        assert!(!compatible_model_omits_temperature("kimi-k1"));
-        assert!(!compatible_model_omits_temperature("kimi-latest"));
-        assert!(!compatible_model_omits_temperature("gpt-4o"));
-        assert!(!compatible_model_omits_temperature("claude-sonnet-4-6"));
-        assert!(!compatible_model_omits_temperature("llama-3.1-70b"));
+    fn unset_temperature_is_omitted_from_wire() {
+        // `None` must honor the `Option<f64>` contract: no `temperature` field
+        // on the wire, regardless of model name. Generalizes the former
+        // kimi-k2-only special case (issue #7145).
+        let body = serde_json::to_value(minimal_request(None)).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "unset temperature must be omitted from the request body, got: {body}"
+        );
+    }
+
+    #[test]
+    fn explicit_temperature_is_sent_on_wire() {
+        let body = serde_json::to_value(minimal_request(Some(0.5))).unwrap();
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "explicit temperature must be sent verbatim, got: {body}"
+        );
     }
 }
