@@ -1267,7 +1267,7 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -1363,7 +1363,9 @@ impl RpcDispatcher {
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
         let cancel_cause = self.ctx.sessions.take_cancel_cause(sid);
-        self.ctx.sessions.remove_cancel_token(sid);
+        self.ctx
+            .sessions
+            .remove_cancel_token(sid, cancel_generation);
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -1601,6 +1603,33 @@ impl RpcDispatcher {
             .set_overrides(&req.session_id, req.overrides)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // A model_provider override needs a live provider-box rebuild, which
+        // requires Config — held here, not in the session store. Resolve the
+        // model from the (already-merged) model override or the configured
+        // entry, build the box, and swap it onto the session's agent.
+        if let Some(ref model_provider_ref) = merged.model_provider {
+            let built = {
+                let config = self.ctx.config.read();
+                crate::agent::agent::build_session_model_provider(
+                    &config,
+                    model_provider_ref,
+                    merged.model.as_deref(),
+                )
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
+            };
+            let (model_provider, model_provider_name, model_name) = built;
+            self.ctx
+                .sessions
+                .apply_model_provider(&req.session_id, model_provider, model_provider_name)
+                .await
+                .then_some(())
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            // Keep the agent's model name aligned with the model_provider it now holds.
+            if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+                agent.lock().await.set_model_name(model_name);
+            }
+        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
