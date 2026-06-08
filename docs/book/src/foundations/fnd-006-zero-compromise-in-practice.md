@@ -1,10 +1,9 @@
 # FND-006: Zero Compromise in Practice: Code Health, Error Discipline, and the Production Readiness Standard
 
-### Starting v0.7.0 · Type: Quality · Rev. 1
-
+> Starting v0.7.0 · Type: Quality · Rev. 1
+>
 > **Canonical reference** · Ratified by the team · Rev. 1
 > Discussion thread and full revision history: [#5653](https://github.com/zeroclaw-labs/zeroclaw/issues/5653)
-
 
 --------
 

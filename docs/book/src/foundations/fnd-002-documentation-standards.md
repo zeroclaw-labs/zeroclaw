@@ -1,9 +1,9 @@
 # FND-002: Intentional Documentation: Standards, Structure, and i18n Strategy
-### Starting v0.7.0 · Type: Documentation · Rev. 1
 
+> Starting v0.7.0 · Type: Documentation · Rev. 1
+>
 > **Canonical reference** · Ratified by the team · Rev. 1
 > Discussion thread and full revision history: [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)
-
 
 ---
 
@@ -37,7 +37,7 @@ Without an answer to that question, documentation accumulates as a pile of pages
 
 The fix is not to write more documentation. The fix is to decide, before writing anything, what type of artifact you are creating. Type determines format, audience, location, lifecycle, and who is responsible for keeping it current. Once type is established, the rest follows naturally.
 
-This RFC adopts the **EA Artifacts on a Page** framework by Svyatoslav Kotusev (https://eaonapage.com) as the classification lens for all ZeroClaw documentation. The framework is evidence-based, deliberately non-prescriptive, and maps directly onto the kinds of documents an open source infrastructure project actually needs.
+This RFC adopts the **EA Artifacts on a Page** framework by Svyatoslav Kotusev (<https://eaonapage.com>) as the classification lens for all ZeroClaw documentation. The framework is evidence-based, deliberately non-prescriptive, and maps directly onto the kinds of documents an open source infrastructure project actually needs.
 
 The core principle, borrowed from the broader development philosophy this team is adopting:
 
@@ -134,7 +134,7 @@ The case for removing all non-English content from the repository rests on four 
 
 ### 4.2 What Stays
 
-One thing worth preserving: the _structure_ of the i18n approach. The idea of making ZeroClaw accessible in multiple languages is right. Only the _location_ and _ownership model_ is wrong.
+One thing worth preserving: the *structure* of the i18n approach. The idea of making ZeroClaw accessible in multiple languages is right. Only the *location* and *ownership model* is wrong.
 
 ### 4.3 The Replacement Strategy
 
@@ -599,7 +599,7 @@ These documentation-specific standards complement the broader standards proposed
 
 ### Diátaxis Framework (Documentation Structure)
 
-**What it is:** Diátaxis (https://diataxis.fr) is a systematic framework for technical documentation that divides content into four types: tutorials, how-to guides, reference, and explanation. It is the documentation framework behind the Python documentation, Django docs, and many others. It is highly compatible with the EA Artifacts approach: they answer different questions (Diátaxis: how to structure the content of a document; EA Artifacts: what type of document is this and where does it live).
+**What it is:** Diátaxis (<https://diataxis.fr>) is a systematic framework for technical documentation that divides content into four types: tutorials, how-to guides, reference, and explanation. It is the documentation framework behind the Python documentation, Django docs, and many others. It is highly compatible with the EA Artifacts approach: they answer different questions (Diátaxis: how to structure the content of a document; EA Artifacts: what type of document is this and where does it live).
 
 **How it applies:** User-facing documentation on the Wiki should follow Diátaxis structure. Code-adjacent documentation in the repository follows EA Artifacts. The two frameworks operate at different levels and do not conflict.
 
@@ -633,7 +633,7 @@ All documentation uses CommonMark (the standardized Markdown specification) with
 
 ### Vale for Prose Linting
 
-**What it is:** Vale (https://vale.sh) is a prose linter: it checks writing style, consistency, and readability using configurable rules. It can enforce things like: always use "you" not "the user", avoid passive voice in imperative sections, use consistent terminology ("plugin" not "extension" not "module").
+**What it is:** Vale (<https://vale.sh>) is a prose linter: it checks writing style, consistency, and readability using configurable rules. It can enforce things like: always use "you" not "the user", avoid passive voice in imperative sections, use consistent terminology ("plugin" not "extension" not "module").
 
 **Why it matters:** The current documentation is inconsistent in tone, terminology, and style. Some pages say "plugin", some say "module", some say "extension". Vale makes these rules automatic and enforces them at CI time, the same way Clippy enforces code quality.
 
@@ -722,14 +722,13 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ---
 
-
 ## Appendix A: Glossary
 
 **ADR (Architecture Decision Record)**: An immutable record of a significant architectural decision: the context that prompted it, what was decided, and the consequences. ADRs do not change once accepted; superseded decisions are recorded as new ADRs.
 
-**Diátaxis**: A systematic framework for technical documentation structure that divides content into tutorials (learning), how-to guides (goal-oriented), reference (information), and explanation (understanding). See https://diataxis.fr.
+**Diátaxis**: A systematic framework for technical documentation structure that divides content into tutorials (learning), how-to guides (goal-oriented), reference (information), and explanation (understanding). See <https://diataxis.fr>.
 
-**EA Artifacts on a Page**: A classification framework for enterprise architecture documents developed by Svyatoslav Kotusev. Classifies artifacts into five families: Considerations, Landscapes, Outlines, Designs, and Standards. See https://eaonapage.com.
+**EA Artifacts on a Page**: A classification framework for enterprise architecture documents developed by Svyatoslav Kotusev. Classifies artifacts into five families: Considerations, Landscapes, Outlines, Designs, and Standards. See <https://eaonapage.com>.
 
 **Frontmatter**: YAML metadata at the top of a Markdown file, delimited by `---`. Makes documents machine-readable and queryable by tools, CI checks, and AI assistants.
 
@@ -737,18 +736,18 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Strangler Fig Pattern**: A migration strategy in which new structure is built incrementally around the old, replacing it piece by piece rather than all at once. The system remains functional throughout the migration.
 
-**Vale**: A prose linter for technical documentation. Enforces style, consistency, and readability rules at CI time, the way Clippy enforces Rust code quality. See https://vale.sh.
+**Vale**: A prose linter for technical documentation. Enforces style, consistency, and readability rules at CI time, the way Clippy enforces Rust code quality. See <https://vale.sh>.
 
 ---
 
 ## Appendix B: Further Reading
 
-- **Diátaxis documentation framework**: https://diataxis.fr: The definitive reference for structuring technical documentation by type.
-- **EA Artifacts on a Page (v2.2)**: https://eaonapage.com: The classification framework used in Section 3.
+- [Diátaxis documentation framework](<https://diataxis.fr>): The definitive reference for structuring technical documentation by type.
+- [EA Artifacts on a Page (v2.2)](<https://eaonapage.com>): The classification framework used in Section 3.
 - **"Docs for Developers"**: Jared Bhatti et al.: A practical guide to technical documentation written by engineers who have maintained large documentation systems.
-- **Vale documentation**: https://vale.sh/docs: Setup guide and configuration reference for the prose linter proposed in Section 10.
-- **Michael Nygard on ADRs**: https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions: The original post that introduced the ADR format used in Section 6.
-- **GitHub Wikis documentation**: https://docs.github.com/en/communities/documenting-your-project-with-wikis: Reference for setting up and governing the GitHub Wiki proposed in Section 5.
+- [Vale documentation](https://vale.sh/docs): Setup guide and configuration reference for the prose linter proposed in Section 10.
+- [Michael Nygard on ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): The original post that introduced the ADR format used in Section 6.
+- [GitHub Wikis documentation](https://docs.github.com/en/communities/documenting-your-project-with-wikis): Reference for setting up and governing the GitHub Wiki proposed in Section 5.
 
 ---
 

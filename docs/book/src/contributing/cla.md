@@ -1,6 +1,6 @@
 # Contributor License Agreement
 
-**Version 1.0, February 2026 · ZeroClaw Labs**
+> Version 1.0, February 2026 · ZeroClaw Labs
 
 By submitting a contribution (pull request, patch, issue with code, or any other form of code submission) to the ZeroClaw repository, you agree to the terms below. No separate signature is required for individual contributors.
 

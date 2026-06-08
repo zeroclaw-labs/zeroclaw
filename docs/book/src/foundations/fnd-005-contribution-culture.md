@@ -1,9 +1,9 @@
 # FND-005: Contribution Culture: Human Collaboration, AI Partnership, and Team Growth
-### Starting v0.7.0 · Type: Culture · Rev. 1
 
+> Starting v0.7.0 · Type: Culture · Rev. 1
+>
 > **Canonical reference** · Ratified by the team · Rev. 1
 > Discussion thread and full revision history: [#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615)
-
 
 ---
 

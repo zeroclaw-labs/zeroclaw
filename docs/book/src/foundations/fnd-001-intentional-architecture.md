@@ -1,9 +1,9 @@
 # FND-001: Intentional Architecture: ZeroClaw Microkernel Transition
-### Starting v0.7.0 · Type: Architecture · Rev. 3
 
+> Starting v0.7.0 · Type: Architecture · Rev. 3
+>
 > **Canonical reference** · Ratified by the team · Rev. 3
 > Discussion thread and full revision history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
-
 
 ---
 
@@ -16,7 +16,7 @@
 ## Table of Contents
 
 1. [A Development Philosophy: Vision First](#1-a-development-philosophy-vision-first)
-2. [The Vision: What ZeroClaw Is](#2-the-vision--what-zeroclaw-is)
+2. [The Vision: What ZeroClaw Is](#2-the-vision-what-zeroclaw-is)
 3. [Honest Assessment: Where We Are Today](#3-honest-assessment-where-we-are-today)
 4. [The Target Architecture](#4-the-target-architecture)
    - [4.4.1 Versioning Policy](#441-versioning-policy)
@@ -258,7 +258,7 @@ These are orthogonal. Conflating them creates misleading semver noise and erodes
 
 ---
 
-**Crate versioning: unified with intentional exceptions**
+##### Crate versioning: unified with intentional exceptions
 
 All application crates, the kernel, the gateway, tool plugin crates, channel plugin crates, and the CLI, use Cargo workspace package inheritance:
 
@@ -289,7 +289,7 @@ Three crate classes are intentionally excluded from workspace inheritance and ma
 
 ---
 
-**What "breaking" means for the product version**
+##### What "breaking" means for the product version
 
 Because application crates share a unified version, the team needs a product-level definition of a breaking change, distinct from a breaking change inside a single crate's internal implementation. A breaking change within a plugin crate that does not cross any of the boundaries below is **not** a product-level breaking change and does not warrant a MAJOR bump.
 
@@ -301,7 +301,7 @@ Because application crates share a unified version, the team needs a product-lev
 
 ---
 
-**Stability tiers**
+##### Stability tiers
 
 The product version answers *"what release is this?"* A stability tier answers *"how much can I rely on this component?"* Every component, kernel, gateway, plugin crate, WIT interface, carries one of three tiers. Tiers are documented in the component's `AGENTS.md` and in its plugin registry manifest.
 
@@ -315,7 +315,7 @@ Stability tiers are **promoted, never demoted** through a deliberate team decisi
 
 ---
 
-**Release automation**
+##### Release automation
 
 Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. Crates with independent versions (`zeroclaw-api`, hardware library crates) are managed separately using the same tool's per-crate configuration.
 
@@ -330,7 +330,7 @@ These are no longer the same question, and the current `[features]` section of `
 
 ---
 
-**Fate of the current compile-time feature flags**
+##### Fate of the current compile-time feature flags
 
 The 20+ feature flags in the current `Cargo.toml` fall into three buckets as the architecture matures:
 
@@ -349,7 +349,7 @@ The `ci-all` meta-feature simplifies substantially as channel and tool flags ret
 
 ---
 
-**The canonical release kernel binary**
+##### The canonical release kernel binary
 
 The binary published to GitHub Releases for each platform target is built with the following profile:
 
@@ -368,7 +368,7 @@ There is no longer a "build with everything" binary. That mental model is replac
 
 ---
 
-**Release artifact matrix**
+##### Release artifact matrix
 
 Each GitHub Release publishes the following artifacts:
 
@@ -521,9 +521,9 @@ The overall migration strategy is the **Strangler Fig Pattern**: we grow the new
 
 **Vision alignment:** None of the vision properties change for users. This is entirely internal. The value is that every future contribution now has a structural home, and new contributors can understand the codebase in parts rather than all at once.
 
-#### Deliverables
+#### Phase 1 Deliverables
 
-**D1: Extract `zeroclaw-api` crate**
+##### D1: Extract `zeroclaw-api` crate
 
 Create a new crate `crates/zeroclaw-api` containing only trait definitions and their supporting types. No implementations. No heavy dependencies. This crate should compile in under two seconds.
 
@@ -538,7 +538,7 @@ Move into this crate:
 
 Every other crate in the workspace that needs these types adds `zeroclaw-api` as a dependency. The compiler now enforces that no implementation crate can import another implementation crate without going through the API layer.
 
-**D2: Extract `zeroclaw-tool-call-parser` crate**
+##### D2: Extract `zeroclaw-tool-call-parser` crate
 
 The tool call parsing logic in `src/agent/loop_.rs` is approximately 1,400 lines of pure text transformation: it takes a string from the LLM and returns a list of structured tool calls. It has no dependency on agent state, memory, providers, or channels. It handles a dozen different LLM output formats (JSON, XML, GLM-style, MiniMax, Perl-style, markdown fences, and more).
 
@@ -566,11 +566,11 @@ pub struct ParsedToolCall {
 
 The ~300 parsing tests currently in `loop_.rs` move into this crate. `loop_.rs` shrinks by approximately 1,400 lines.
 
-**D3: Adopt OpenTelemetry as the observability standard**
+##### D3: Adopt OpenTelemetry as the observability standard
 
 Formalize what is already implemented: document that `ObserverEvent` and `ObserverMetric` are the internal event bus, and that `OtelObserver` is the canonical production backend. Add a JSON structured logging subscriber for `ZEROCLAW_LOG_FORMAT=json`. Adopt W3C Trace Context for future cross-component tracing.
 
-**D4: Write WIT interface files**
+##### D4: Write WIT interface files
 
 Before we implement WASM plugin execution, define the contracts. Create a `wit/` directory at the workspace root with interface definitions for:
 - `zeroclaw:tool/tool.wit`: the Tool plugin interface
@@ -596,9 +596,9 @@ These become the official plugin SDK. The implementation in v0.8.0 will be gener
 
 **Vision alignment:** This is where the composition model becomes real for users. A user who wants only a CLI agent downloads one binary, runs `zeroclaw onboard`, and is done: no Rust toolchain, no compilation. The `zeroclaw onboard` wizard gains the ability to download plugin components on demand.
 
-#### Deliverables
+#### Phase 2 Deliverables
 
-**D1: Formalize `zeroclaw-runtime` crate**
+##### D1: Formalize `zeroclaw-runtime` crate
 
 Extract the agent orchestration loop, CLI channel, security policy, plugin host, and IPC API into `crates/zeroclaw-runtime`, gated by the `agent-runtime` feature. This crate depends on `zeroclaw-api` and the foundation crates. It has no knowledge of Telegram, Discord, Anthropic, or any specific tool implementation.
 
@@ -620,7 +620,7 @@ pub async fn run(runtime: Runtime, registry: Registry) -> anyhow::Result<()>;
 
 The binary crate becomes a thin wiring layer that reads config and calls `run`.
 
-**D2: Complete the WASM execution bridge**
+##### D2: Complete the WASM execution bridge
 
 The `extism` dependency is incompatible with WASM Component Model (`.wit` files) and requires the `cranelift` feature of `wasmtime`, which blocks ARM32 targets from compiling. Remove Extism and replace it with direct usage of `wasmtime`. During the transition, Extism should be left as an option until the final deprecation PR.
 
@@ -628,7 +628,7 @@ Wire `wasmtime` into `zeroclaw-plugins` with optional dependencies on `cranelift
 
 A complete WASM execution bridge implementation defines the WASI host functions that WASM plugins can call (HTTP requests, memory access, logging) within the permission model already defined in `PluginPermission`. Where possible, the WASI Preview 2 APIs should be used (`wasi:io`, `wasi:http`, `wasi:filesystem`, etc) to provide a consistent standards-based API for plugins.
 
-**D3: Component registry client**
+##### D3: Component registry client
 
 Add a `zeroclaw plugin` subcommand backed by a simple registry client:
 
@@ -642,11 +642,11 @@ zeroclaw plugin update            # update all installed plugins
 
 The registry is a JSON index file served from a known URL (e.g., `https://plugins.zeroclawlabs.ai/index.json`). Each entry includes name, version, download URL, SHA-256 checksum, and the publisher's Ed25519 public key. The `PluginHost` signature verification already handles the security model.
 
-**D4: Integrate `zeroclaw onboard` with the plugin system**
+##### D4: Integrate `zeroclaw onboard` with the plugin system
 
 The onboarding wizard should ask the user which channels and integrations they want, then call `PluginRegistry::install` for each. No compilation required. The user downloads a binary, runs `zeroclaw onboard`, and has a working configured agent in under two minutes.
 
-**D5: Reduce `all_tools_with_runtime` to core tools only**
+##### D5: Reduce `all_tools_with_runtime` to core tools only
 
 The kernel includes exactly the tools a user needs for a useful agent with no plugins installed: `shell`, `file_read`, `file_write`, `file_edit`, `git_operations`, `glob_search`, `content_search`, `memory_recall`, `memory_store`, `memory_forget`, and `web_fetch`. Everything else is registered by installed plugins.
 
@@ -668,27 +668,27 @@ The kernel includes exactly the tools a user needs for a useful agent with no pl
 
 **Vision alignment:** This phase delivers the "zero external requirements" promise fully. A user on a Raspberry Pi gets a kernel binary with no web server, no React app, and no HTTP listener. A user who wants the web dashboard installs `zeroclaw-gw` separately.
 
-#### Deliverables
+#### Phase 3 Deliverables
 
-**D1: Define the kernel IPC API**
+##### D1: Define the kernel IPC API
 
 Before extracting the gateway, define the OpenAPI 3.1 spec for the local API the kernel exposes on a Unix socket or loopback port. This API is what the gateway, the Tauri app, and any future client connects to. It is the stable contract between the kernel and the outside world.
 
 Endpoints include: send a message, receive a streaming response, list active sessions, list installed plugins, get agent status, manage memory, trigger cron jobs. This is a design document first: the spec should be reviewed and agreed upon before a line of implementation is written.
 
-**D2: Implement the kernel IPC server**
+##### D2: Implement the kernel IPC server
 
 Add the IPC server to `zeroclaw-kernel` behind a feature flag (`--features ipc`). On platforms that support it, the kernel listens on a Unix socket at `~/.zeroclaw/kernel.sock`. On Windows, use a named pipe. The `zeroclaw gateway` command (the current entrypoint for the web server) becomes `zeroclaw-gw` connecting to this socket.
 
-**D3: Extract `zeroclaw-gw` as a separate binary**
+##### D3: Extract `zeroclaw-gw` as a separate binary
 
 Move `src/gateway/` to a new `crates/zeroclaw-gw/` crate with its own binary. It depends on `zeroclaw-api` and connects to the kernel via the IPC API. The embedded React application via `rust-embed` moves entirely into this crate: the kernel binary no longer contains any web assets.
 
-**D4: Migrate channel webhook handlers out of the gateway**
+##### D4: Migrate channel webhook handlers out of the gateway
 
 The WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail webhook handlers currently in `gateway/mod.rs` move to their respective channel plugins. The gateway provides a generic webhook registration API: a channel plugin, when loaded, registers its webhook path prefix and its handler function. The gateway routes incoming webhooks to the registered handler. The gateway no longer knows about WhatsApp.
 
-**D5: Formalize the Tauri sidecar relationship**
+##### D5: Formalize the Tauri sidecar relationship
 
 Update `apps/tauri/` to bundle `zeroclaw-gw` as a Tauri sidecar binary. The Tauri app becomes the "full experience" distribution: it starts the kernel and gateway automatically and opens the web UI. Users who download the Tauri app get everything working without touching a terminal.
 
@@ -708,17 +708,17 @@ Update `apps/tauri/` to bundle `zeroclaw-gw` as a Tauri sidecar binary. The Taur
 
 **Why this phase:** With the kernel stable, the gateway separate, and the plugin system working, v1.0.0 is the release where the architecture becomes the product. External developers can write and publish plugins. Users can assemble exactly the ZeroClaw they want. The binary can credibly claim the lean profile the vision promises.
 
-#### Deliverables
+#### Phase 4 Deliverables
 
-**D1: Migrate all remaining channels to plugins**
+##### D1: Migrate all remaining channels to plugins
 
 Each of the 27+ channel implementations becomes a standalone WASM plugin crate. They are published to the component registry with signed releases. The kernel binary contains zero channel implementations except the CLI.
 
-**D2: Migrate long-tail tools to plugins**
+##### D2: Migrate long-tail tools to plugins
 
 Approximately 60 of the 70+ tools move to plugin crates, grouped by domain: `zeroclaw-tools-web` (browser, search, screenshot, PDF), `zeroclaw-tools-integrations` (Jira, Notion, Google Workspace, MS365, LinkedIn), `zeroclaw-tools-hardware` (board info, GPIO), `zeroclaw-tools-cloud` (cloud ops, security ops). The kernel retains only the 10–12 core tools identified in v0.8.0.
 
-**D3: Plugin SDK and developer documentation**
+##### D3: Plugin SDK and developer documentation
 
 Publish a plugin development guide. A developer should be able to write a new tool plugin in an afternoon:
 1. Add `zeroclaw-plugin-sdk` as a dependency
@@ -728,11 +728,11 @@ Publish a plugin development guide. A developer should be able to write a new to
 
 The SDK handles the host function bindings, the manifest format, and the permissions model.
 
-**D4: Stabilize the kernel IPC API at v1.0**
+##### D4: Stabilize the kernel IPC API at v1.0
 
 The kernel IPC API gets a version prefix (`/v1/`) and a stability guarantee. Breaking changes in v1.x are not permitted to this API. This is the contract that third-party clients and the gateway depend on.
 
-**D5: Extract the versioning policy and stability tier definitions to `docs/book/src/maintainers/stability-tiers.md`**
+##### D5: Extract the versioning policy and stability tier definitions to `docs/book/src/maintainers/stability-tiers.md`
 
 The versioning policy and stability tier table defined in §4.4.1 of this RFC become a standing contributor reference document at `docs/book/src/maintainers/stability-tiers.md`. This document is the day-to-day reference contributors use when assigning a tier to a new plugin crate, and that maintainers consult when making release decisions. The RFC itself remains the historical record of *why* these decisions were made; the extracted document is *what* contributors look up.
 
@@ -828,7 +828,6 @@ A published WIT interface and plugin SDK means anyone can extend ZeroClaw withou
 
 ---
 
-
 ## Appendix A: Glossary
 
 Terms used in this document that may be unfamiliar:
@@ -859,11 +858,11 @@ These are resources the team may find valuable. They are not required reading, b
 
 - **"Release It!"**: Michael Nygard. Practical patterns for building software that stays up in production. The gateway separation and circuit-breaker patterns discussed here are drawn from this book.
 
-- **The Rust API Guidelines**: https://rust-lang.github.io/api-guidelines/: The official guide for designing idiomatic Rust libraries. Our trait interfaces should follow these conventions.
+- [The Rust API Guidelines](https://rust-lang.github.io/api-guidelines/): The official guide for designing idiomatic Rust libraries. Our trait interfaces should follow these conventions.
 
-- **The WebAssembly Component Model**: https://component-model.bytecodealliance.org/: The technical foundation for the plugin system proposed in this RFC.
+- [The WebAssembly Component Model](https://component-model.bytecodealliance.org/): The technical foundation for the plugin system proposed in this RFC.
 
-- **OpenTelemetry specification**: https://opentelemetry.io/docs/specs/: The full specification for the observability standard we are adopting.
+- [OpenTelemetry specification](https://opentelemetry.io/docs/specs/): The full specification for the observability standard we are adopting.
 
 ---
 

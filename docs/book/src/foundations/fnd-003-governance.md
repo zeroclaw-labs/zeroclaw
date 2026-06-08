@@ -1,10 +1,10 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
-Starting v0.7.0 · Type: Governance · Rev. 5
 
+> Starting v0.7.0 · Type: Governance · Rev. 5
+>
 > **Canonical reference** · Ratified by the team · Rev. 5
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
-
 
 ---
 
@@ -13,7 +13,6 @@ Starting v0.7.0 · Type: Governance · Rev. 5
 > Software projects do not fail because the code is bad. They fail because the people writing the code cannot coordinate. Features get built twice. Bugs get lost. Good ideas evaporate because nobody wrote them down. New contributors show up wanting to help and cannot find where to start. This RFC is about building the lightweight scaffolding that prevents those failures, not so the project feels organized, but so the team can move faster, with more confidence, and with less friction. Every recommendation here is chosen specifically for a small, growing, student-led open source team. Nothing here requires a project manager, a Scrum Master, or a formal committee.
 
 ---
-
 
 ## Revision History
 
@@ -179,27 +178,31 @@ XL items should almost always be broken down before they enter In Progress. If y
 
 Create four named views in the Project:
 
-**View 1: Roadmap**
+#### View 1: Roadmap
+
 - Type: Roadmap (timeline)
 - Grouped by: Milestone
 - Visible fields: Title, Type, Size, Component, Assignee
 - Purpose: Public-facing. "Here is what is coming and when." Share this link in the README and with the community. Keep it updated.
 
-**View 2: Board**
+#### View 2: Board
+
 - Type: Board (Kanban)
 - Columns: Status field values
 - Filtered to: Current milestone only
 - Visible fields: Title, Assignee, Size, Risk Tier
 - Purpose: Day-to-day work visibility. What is everyone working on right now? What is blocked?
 
-**View 3: Backlog**
+#### View 3: Backlog
+
 - Type: Table
 - Sorted by: Priority (descending), then Size (ascending)
 - Filtered to: Status = Backlog OR Defined
 - Visible fields: Title, Type, Priority, Size, Component, Milestone, Risk Tier
 - Purpose: Used during grooming sessions. What needs to be worked on next? What is sized and ready to pick up?
 
-**View 4: My Work**
+#### View 4: My Work
+
 - Type: Board
 - Filtered to: Assignee = @me
 - Purpose: Personal dashboard. Each contributor can see their own items without noise.
@@ -933,7 +936,7 @@ Terminal closure labels are operational policy, not part of the historical `stat
 
 An item is **Done** when all of the following are true:
 
-### For code changes:
+### For code changes
 
 - [ ] The PR has been reviewed and approved by the required reviewer tier (per CODEOWNERS and risk level)
 - [ ] All CI checks pass: `cargo fmt`, `cargo clippy`, `cargo test`
@@ -944,14 +947,14 @@ An item is **Done** when all of the following are true:
 - [ ] If the change is significant: a CHANGELOG.md entry is added under the correct milestone section
 - [ ] If the change requires an ADR: the ADR is written, linked, and merged before or with the implementation PR
 
-### For documentation changes:
+### For documentation changes
 
 - [ ] YAML frontmatter is present and valid
 - [ ] All internal links resolve correctly
 - [ ] If the document describes a current behavior: it is accurate against the current `master` branch
 - [ ] If the document is an ADR: it follows the Nygard format and has a `status` field
 
-### For releases:
+### For releases
 
 - [ ] All items in the milestone are in `Done` status or explicitly moved to the next milestone with a comment explaining why
 - [ ] The CHANGELOG.md entry for the release is complete
@@ -1105,11 +1108,11 @@ By v1.0.0, the governance model should be self-sustaining: the team should not n
 
 ## Appendix B: Further Reading
 
-- **GitHub Projects documentation**: https://docs.github.com/en/issues/planning-and-tracking-with-projects: Complete reference for GitHub Projects v2 features.
-- **GitHub Discussions documentation**: https://docs.github.com/en/discussions: Setup guide and governance options for GitHub Discussions.
-- **CODEOWNERS syntax reference**: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners: The full syntax for CODEOWNERS files.
-- **"Producing Open Source Software"**: Karl Fogel: The definitive book on running an open source project. Free online at https://producingoss.com. Chapters on governance, contributor management, and communication are directly applicable.
-- **"An Introduction to Open Source Governance Models"**: The Apache Software Foundation's governance documentation is a good model for how a mature open source project formalizes authority and decision-making: https://www.apache.org/foundation/governance/
+- [GitHub Projects documentation](https://docs.github.com/en/issues/planning-and-tracking-with-projects): Complete reference for GitHub Projects v2 features.
+- [GitHub Discussions documentation](https://docs.github.com/en/discussions): Setup guide and governance options for GitHub Discussions.
+- [CODEOWNERS syntax reference](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners): The full syntax for CODEOWNERS files.
+- **"Producing Open Source Software"**: Karl Fogel: The definitive book on running an open source project. Free online at [producingoss.com](https://producingoss.com). Chapters on governance, contributor management, and communication are directly applicable.
+- **"An Introduction to Open Source Governance Models"**: The Apache Software Foundation's governance documentation is a good model for how a mature open source project formalizes authority and decision-making: <https://www.apache.org/foundation/governance/>
 - **Vale prose linter**: [Vale](https://vale.sh): Referenced in the documentation RFC; integrates with the `good first issue` documentation improvement workflow.
 
 ---

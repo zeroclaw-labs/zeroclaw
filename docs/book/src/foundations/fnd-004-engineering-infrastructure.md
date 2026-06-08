@@ -1,9 +1,9 @@
 # FND-004: Engineering Infrastructure: CI/CD Pipeline and Release Automation
-### Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
 
+> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
+>
 > **Canonical reference** · Ratified by the team · Rev. 1
 > Discussion thread and full revision history: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
-
 
 ---
 
@@ -405,27 +405,27 @@ The pipeline migration follows the same Strangler Fig approach as the code migra
 
 **Why this phase:** The architectural transition is already underway. The pipeline needs to stop fighting it before it makes implementation work harder than it needs to be.
 
-#### Deliverables
+#### Phase 1 Deliverables
 
-**D1: Consolidate `checks-on-pr.yml` and `ci-run.yml` into a single workflow**
+##### D1: Consolidate `checks-on-pr.yml` and `ci-run.yml` into a single workflow
 
 Merge the two PR workflows into one. The consolidated workflow keeps the staged structure defined in §3.1. The `Quality Gate` and `CI` naming distinction disappears. There is one workflow, one set of results, one place to look.
 
 The composite gate job (`CI Required Gate`) is preserved. Branch protection continues to require only that single job. This means the internal structure of the pipeline can change without requiring branch protection rule updates.
 
-**D2: Replace `cargo audit` with `cargo deny`**
+##### D2: Replace `cargo audit` with `cargo deny`
 
 Add `deny.toml` to the repository root. Configure the `[advisories]`, `[licenses]`, and `[sources]` sections. Triage all current RUSTSEC advisories on `master`: update what can be updated, document what cannot with justification and tracking issues. The security gate passes clean on `master` before this phase is complete.
 
-**D3: Fix workspace-aware clippy invocation**
+##### D3: Fix workspace-aware clippy invocation
 
 Change `cargo clippy --all-targets -- -D warnings` to `cargo clippy --workspace --all-targets -- -D warnings` in the consolidated workflow. Remove the `rust_strict_delta_gate.sh` script: with `--workspace -D warnings` always enforced clean, the delta concept is implicit.
 
-**D4: Formalise action pinning policy**
+##### D4: Formalise action pinning policy
 
 Add a `SECURITY.md` note and a CI check that validates all `uses:` references in workflow files are SHA-pinned. Add `dependabot` configuration for GitHub Actions updates.
 
-**D5: Add daily advisory scan workflow**
+##### D5: Add daily advisory scan workflow
 
 Add `daily-audit.yml` as a scheduled workflow running `cargo deny check advisories` against `master` at 09:00 UTC. On failure, open a GitHub Issue with the advisory details using `gh issue create`.
 
@@ -445,21 +445,21 @@ Add `daily-audit.yml` as a scheduled workflow running `cargo deny check advisori
 
 **Why this phase:** By v0.8.0 the workspace will have grown further. Running the full pipeline on every PR will be increasingly expensive. Contributors to `zeroclaw-tool-call-parser` should not wait 30 minutes for a gateway rebuild.
 
-#### Deliverables
+#### Phase 2 Deliverables
 
-**D1: Changed-crate detection**
+##### D1: Changed-crate detection
 
 Add a `scripts/ci/affected_crates.sh` script that uses `cargo metadata` to build the dependency graph and returns the set of crates affected by the PR's changed files. The CI workflow uses this output to scope test execution.
 
-**D2: Per-crate test scoping**
+##### D2: Per-crate test scoping
 
 Add `--package` flags to `cargo nextest` based on the affected-crate output. Full workspace tests continue to run on `master` pushes and nightly. PRs run the affected subset.
 
-**D3: Workspace-aware cache configuration**
+##### D3: Workspace-aware cache configuration
 
 Update `Swatinem/rust-cache` configuration with explicit workspace scoping and `save-if: ${{ github.ref == 'refs/heads/master' }}` to prevent cache thrashing from concurrent PRs.
 
-**D4: Extract reusable workflow definitions**
+##### D4: Extract reusable workflow definitions
 
 Extract the build, test, and security jobs into reusable workflow files under `.github/_workflows/`. Update `ci.yml` and the new `release.yml` skeleton to call them.
 
@@ -477,21 +477,21 @@ Extract the build, test, and security jobs into reusable workflow files under `.
 
 **Why this phase:** Phase 3 of the architecture RFC extracts `zeroclaw-gw` as a separate binary. The first multi-artifact release happens here. The release pipeline must be ready before it is needed.
 
-#### Deliverables
+#### Phase 3 Deliverables
 
-**D1: Introduce `release-plz` and remove `version-sync.yml`**
+##### D1: Introduce `release-plz` and remove `version-sync.yml`
 
 Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. `zeroclaw-api` and hardware library crates are configured with independent release settings. The `version-sync.yml` workflow is retired.
 
-**D2: Build the structured release pipeline in `release.yml`**
+##### D2: Build the structured release pipeline in `release.yml`
 
 Implement the directed release graph from §5.2: `build-kernel-standard`, `build-kernel-hardware`, `build-gateway`, with downstream publish jobs. Plugin build jobs are stubbed: they succeed with no-op until Phase 4.
 
-**D3: Add SLSA Level 2 provenance**
+##### D3: Add SLSA Level 2 provenance
 
 Add `actions/attest-build-provenance` to each build job. Provenance attestations are attached to GitHub Release assets. Document verification instructions in `SECURITY.md`.
 
-**D4: Retire redundant release workflows**
+##### D4: Retire redundant release workflows
 
 Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` into the structured `release.yml` pipeline. These workflows grew independently; the structured pipeline replaces them with a single, auditable flow.
 
@@ -510,21 +510,21 @@ Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.ym
 
 **Why this phase:** v1.0.0 is when WASM plugins become publishable. The pipeline must handle plugin publishing, registry upload, and the Tauri desktop installer as first-class release artifacts.
 
-#### Deliverables
+#### Phase 4 Deliverables
 
-**D1: Activate WASM plugin build jobs**
+##### D1: Activate WASM plugin build jobs
 
 Implement `build-plugins-wasm` in the release pipeline. Each plugin crate builds to `wasm32-wasip1` in a dedicated job. Plugin manifests are generated and signed. The `publish-plugin-registry` job uploads signed WASM files to the plugin registry.
 
-**D2: Desktop installer build and publish**
+##### D2: Desktop installer build and publish
 
 Complete the Tauri build jobs for macOS, Windows, and Linux. The installer bundles the kernel and gateway binaries. Code signing credentials for macOS and Windows are documented as required repository secrets with a setup guide.
 
-**D3: Publish the CI/CD standards to `docs/book/src/maintainers/ci-and-actions.md`**
+##### D3: Publish the CI/CD standards to `docs/book/src/maintainers/ci-and-actions.md`
 
 The action pinning policy, advisory triage process, conventional commit requirements, and release pipeline structure defined in this RFC are extracted to `docs/book/src/maintainers/ci-and-actions.md` as a standing reference. This RFC remains the historical record of the decisions; the extracted document is what contributors look up day-to-day.
 
-**D4: Contributor onboarding for the pipeline**
+##### D4: Contributor onboarding for the pipeline
 
 Add a `Running CI Locally` section to the contributing documentation that shows contributors how to replicate the CI checks on their own machine before pushing:
 
@@ -576,7 +576,6 @@ The Release PR from `release-plz` is the release review checkpoint. Before anyth
 
 ---
 
-
 ## Appendix A: Glossary
 
 **SLSA (Supply-chain Levels for Software Artifacts)**: A security framework that defines levels of build integrity, from basic provenance to fully hermetic builds. Developed by Google and adopted by the OpenSSF. Level 2 is the practical target for most open-source projects: hosted build platform, version-controlled build scripts, signed provenance attached to artifacts.
@@ -597,14 +596,14 @@ The Release PR from `release-plz` is the release review checkpoint. Before anyth
 
 ## Appendix B: Further Reading
 
-- **SLSA Framework**: https://slsa.dev: The full specification and implementation guides for supply chain security levels.
+- [SLSA Framework](https://slsa.dev): The full specification and implementation guides for supply chain security levels.
 
-- **`cargo deny` documentation**: https://embarkstudios.github.io/cargo-deny/: Configuration reference for the `deny.toml` policy file, including all advisory, license, and source options.
+- [`cargo deny` documentation](https://embarkstudios.github.io/cargo-deny/): Configuration reference for the `deny.toml` policy file, including all advisory, license, and source options.
 
-- **`release-plz` documentation**: https://release-plz.eplant.org: Workspace configuration, changelog format customisation, and GitHub Actions integration guide.
+- [`release-plz` documentation](https://release-plz.eplant.org): Workspace configuration, changelog format customisation, and GitHub Actions integration guide.
 
-- **GitHub Actions security hardening**: https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions: Official guidance on SHA pinning, token permissions, and supply chain risk in Actions workflows.
+- [GitHub Actions security hardening](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions): Official guidance on SHA pinning, token permissions, and supply chain risk in Actions workflows.
 
-- **Conventional Commits specification**: https://www.conventionalcommits.org: The full specification for commit message format and its relationship to semantic versioning.
+- [Conventional Commits specification](https://www.conventionalcommits.org): The full specification for commit message format and its relationship to semantic versioning.
 
-- **OpenSSF Scorecard**: https://securityscorecards.dev: An automated tool that scores open-source projects on security practices including dependency pinning, branch protection, code review requirements, and more. Useful as a baseline assessment and ongoing health metric.
+- [OpenSSF Scorecard](https://securityscorecards.dev): An automated tool that scores open-source projects on security practices including dependency pinning, branch protection, code review requirements, and more. Useful as a baseline assessment and ongoing health metric.
