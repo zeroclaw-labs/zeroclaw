@@ -5,8 +5,9 @@
 //! `whatsapp.work` + `whatsapp.personal`) only ever delivered traffic to the
 //! first instance. This module adds path-based routing: `/<type>/{alias}`
 //! resolves to the matching instance, while the bare `/<type>` path keeps
-//! working as a deprecated fallback that resolves to the first configured
-//! instance and tags the response with [`DEPRECATION_HEADER`].
+//! working as a deprecated fallback that resolves to a single, deterministic
+//! instance (the lexicographically-first alias) and tags the response with
+//! [`DEPRECATION_HEADER`].
 //!
 //! Channel handlers store their instances (and any per-instance signing
 //! secrets) in `AppState` as `HashMap<String, _>` keyed by alias and call
@@ -27,8 +28,9 @@ pub const DEPRECATION_HEADER: &str = "x-zeroclaw-deprecation";
 pub enum Resolved<'a, T> {
     /// An explicit `<alias>` matched a configured instance.
     Alias { key: &'a str, value: &'a T },
-    /// No `<alias>` was given (bare path); resolved to the first configured
-    /// instance. Callers attach [`DEPRECATION_HEADER`] to the response.
+    /// No `<alias>` was given (bare path); resolved to the
+    /// lexicographically-first configured instance (deterministic across
+    /// process restarts). Callers attach [`DEPRECATION_HEADER`] to the response.
     Fallback { key: &'a str, value: &'a T },
     /// No matching instance — either an explicit alias that is not configured,
     /// or no instances configured at all.
@@ -65,18 +67,21 @@ impl<'a, T> Resolved<'a, T> {
 /// Resolve an optional path `<alias>` against a map of channel instances.
 ///
 /// - `Some(alias)` → exact lookup: [`Resolved::Alias`] or [`Resolved::NotFound`].
-/// - `None` (bare path) → first configured instance as [`Resolved::Fallback`],
-///   or [`Resolved::NotFound`] when nothing is configured.
+/// - `None` (bare path) → lexicographically-first configured instance as
+///   [`Resolved::Fallback`], or [`Resolved::NotFound`] when nothing is configured.
 ///
-/// Single-instance configs stay fully back-compatible: the map holds exactly one
-/// entry, so the bare-path fallback is deterministic and behaves as before.
+/// `HashMap` has no stable iteration order, so the bare-path fallback selects the
+/// lexicographically-smallest alias rather than an arbitrary one. This keeps the
+/// deprecated fallback deterministic across process restarts even for
+/// multi-instance configs. Single-instance configs are trivially stable (the map
+/// holds exactly one entry) and behave as before.
 pub fn resolve<'a, T>(map: &'a HashMap<String, T>, alias: Option<&str>) -> Resolved<'a, T> {
     match alias {
         Some(alias) => match map.get_key_value(alias) {
             Some((key, value)) => Resolved::Alias { key, value },
             None => Resolved::NotFound,
         },
-        None => match map.iter().next() {
+        None => match map.iter().min_by(|(a, _), (b, _)| a.cmp(b)) {
             Some((key, value)) => Resolved::Fallback { key, value },
             None => Resolved::NotFound,
         },
@@ -151,6 +156,21 @@ mod tests {
         assert!(resolved.is_fallback());
         let (key, _) = resolved.entry().expect("fallback entry");
         assert!(m.contains_key(key));
+    }
+
+    #[test]
+    fn multi_instance_bare_path_is_deterministic() {
+        // `HashMap` iteration order is unspecified, so the fallback must pick a
+        // stable instance — the lexicographically-first alias ("personal" < "work").
+        let m = map();
+        let (key, value) = resolve(&m, None).entry().expect("entry");
+        assert_eq!(key, "personal");
+        assert_eq!(*value, 2);
+
+        // Insertion order must not affect the result.
+        let reordered = HashMap::from([("work".to_string(), 1), ("personal".to_string(), 2)]);
+        let (key2, _) = resolve(&reordered, None).entry().expect("entry");
+        assert_eq!(key2, "personal");
     }
 
     #[test]
