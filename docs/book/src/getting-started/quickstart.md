@@ -60,7 +60,13 @@ all-defaults, no-approvals config, see [YOLO mode](./yolo.md).
 In the [zerocode](./tui.md) terminal interface, the Quickstart pane is one of
 the tabs. Drive it with the keyboard:
 
-{{#include ../_snippets/zerocode-quickstart-keys.md}}
+Switch to the **Quickstart** pane:
+
+{{#include ../_snippets/zerocode-pane-nav-keys.md}}
+
+Inside the pane:
+
+{{#include ../_snippets/zerocode-quickstart-pane-keys.md}}
 
 Mouse works too: click a tab in the mode bar to switch panes, click a step to
 select and open it, and scroll to move through the list.

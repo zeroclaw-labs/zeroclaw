@@ -17,10 +17,6 @@ path = "src/bin/fluent.rs"
 name = "web"
 path = "src/bin/web.rs"
 
-[[bin]]
-name = "keymap-doc"
-path = "src/bin/keymap_doc.rs"
-
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

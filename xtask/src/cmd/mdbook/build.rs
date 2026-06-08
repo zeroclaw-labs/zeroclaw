@@ -41,6 +41,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     );
     inject_lang_switcher_locales(&book, &entries)?;
     crate::cmd::mdbook::themes::run(root)?;
+    crate::cmd::mdbook::keymap::run(root)?;
     let mdbook = mdbook_program()?;
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     for entry in &entries {

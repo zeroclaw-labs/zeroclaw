@@ -48,6 +48,7 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     // local iteration.
     crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &entries)?;
     crate::cmd::mdbook::themes::run(&root)?;
+    crate::cmd::mdbook::keymap::run(&root)?;
 
     // Watched locale: the one passed in, or the first entry in locales.toml.
     let watch_locale = locale
