@@ -58,6 +58,9 @@ pub async fn execute_one_tool(
         tool: call_name.to_string(),
         tool_call_id: tool_call_id_owned.clone(),
         arguments: Some(full_args.clone()),
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
     let start = Instant::now();
 
@@ -78,6 +81,9 @@ pub async fn execute_one_tool(
             success: false,
             arguments: Some(full_args.clone()),
             result: Some(scrubbed_reason.clone()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         return Ok(ToolExecutionOutcome {
             output: reason,
@@ -177,6 +183,9 @@ pub async fn execute_one_tool(
                     success: true,
                     arguments: Some(full_args.clone()),
                     result: Some(output.clone()),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
                 Ok(ToolExecutionOutcome {
                     output,
@@ -195,6 +204,9 @@ pub async fn execute_one_tool(
                     success: false,
                     arguments: Some(full_args.clone()),
                     result: Some(scrubbed_reason.clone()),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
@@ -230,6 +242,9 @@ pub async fn execute_one_tool(
                 success: false,
                 arguments: Some(full_args.clone()),
                 result: Some(scrubbed_reason.clone()),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             });
             Ok(ToolExecutionOutcome {
                 output: reason,

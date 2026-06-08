@@ -4560,6 +4560,9 @@ async fn process_channel_message_body(
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
                         });
 
                         continue;

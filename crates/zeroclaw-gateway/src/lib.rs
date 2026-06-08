@@ -2533,6 +2533,9 @@ async fn handle_webhook(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
     state.observer.record_event(
@@ -2540,6 +2543,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
 
@@ -2570,6 +2576,9 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2580,8 +2589,16 @@ async fn handle_webhook(
                     model_provider: provider_label,
                     model: model_label.clone(),
                     duration,
-                    tokens_used,
+                    tokens_used: tokens_used.map(|t| {
+                        zeroclaw_api::observability_traits::TurnTokenUsage {
+                            input_tokens: t,
+                            output_tokens: 0,
+                        }
+                    }),
                     cost_usd,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -2601,6 +2618,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2619,6 +2639,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
