@@ -197,6 +197,16 @@ code span {
   padding: 1rem 0.75rem;
 }
 
+/* Suppress the brief flash ("wink") while toc.js populates the sidebar web
+   component: hide the scrollbox until it has children, then show it with no
+   transition so it appears already-rendered. */
+html.js .sidebar .sidebar-scrollbox:empty {
+  visibility: hidden;
+}
+html.js .sidebar .sidebar-scrollbox {
+  visibility: visible;
+}
+
 .chapter li.chapter-item {
   line-height: 1.5;
   margin: 0.1rem 0;
@@ -1093,3 +1103,26 @@ body,
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: 700; }
 .hljs-deletion { color: var(--pc-hl-comment) !important; }
+
+/* ---------------------------------------------------------------------------
+   Page transitions
+   Static mdBook navigation is a full document load per click, which feels
+   harsh. Fade (and lightly lift) only the content area in on each load so
+   navigation reads as smooth. The sidebar is intentionally left static so it
+   does not flicker on every navigation. Gated on `html.js` so no-JS users
+   never get stuck on an invisible page, and disabled under reduced-motion.
+   --------------------------------------------------------------------------- */
+@keyframes pc-page-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+html.js #mdbook-content main {
+  animation: pc-page-in 0.28s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.js #mdbook-content main {
+    animation: none;
+  }
+}
