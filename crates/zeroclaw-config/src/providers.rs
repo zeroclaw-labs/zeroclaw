@@ -155,6 +155,14 @@ define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
+/// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
+/// guard only bounds chains that loop; a long acyclic chain would otherwise
+/// recurse one stack frame per alias at config-load and build time, turning a
+/// pathological config into a startup stack overflow. Both the validation walk
+/// and the runtime build walk stop descending past this depth and prune the
+/// rest of the branch.
+pub const MAX_FALLBACK_DEPTH: usize = 3;
+
 /// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
 /// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
