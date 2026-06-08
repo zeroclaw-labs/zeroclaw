@@ -26,10 +26,10 @@ The platform-specific backends are implemented in `crates/zeroclaw-runtime/src/s
 The unit:
 
 - `Type=simple` with the agent process staying in the foreground
-- `User=` set to the invoking user
-- `SupplementaryGroups=gpio spi i2c` (enabled if hardware feature is compiled in)
-- `Restart=on-failure` with a 10-second backoff
-- `ExecStart=/home/$USER/.cargo/bin/zeroclaw daemon`
+- `ExecStart={cargo-bin}/zeroclaw daemon`
+- `Restart=always` with `RestartSec=3`
+- `Environment=HOME=%h` and `PassEnvironment=DISPLAY XDG_RUNTIME_DIR` so headless browser tools can create profile/cache dirs and reach the user session
+- `WantedBy=default.target`
 
 ### Manual control
 
@@ -59,22 +59,22 @@ journalctl --user -u zeroclaw --since "1h ago"
 
 </div>
 
-### System-scope (root) service
+### Starting before user login
 
-If you need ZeroClaw to start before user login (headless SBCs, VPSes), run the install command as root:
+The CLI only ever writes a user-scoped unit (`systemctl --user`), which by default starts at login and stops at logout. To keep ZeroClaw running on a headless box without an active session, enable lingering for the service user:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-sudo zeroclaw service install
-sudo systemctl enable --now zeroclaw
+sudo loginctl enable-linger $USER
+systemctl --user enable --now zeroclaw
 ```
 
 </div>
 
-When invoked with sudo/root, `zeroclaw service install` creates a system-scope unit at `/etc/systemd/system/zeroclaw.service` and provisions a dedicated `zeroclaw` service user.
+If you need a true system-scope unit (root-owned, `/etc/systemd/system/`, dedicated service account, or hardware groups via `SupplementaryGroups`), the CLI does not generate one — adapt the system-level template at [`scripts/zeroclaw.service`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/scripts/zeroclaw.service) and install it yourself. On OpenRC hosts, `sudo zeroclaw service install` does provision a dedicated `zeroclaw` user and system paths (see below).
 
 ## Linux: OpenRC
 
@@ -108,7 +108,7 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 
 </div>
 
-Logs go to `~/Library/Logs/ZeroClaw/zeroclaw.log` (stdout) and `zeroclaw.err` (stderr).
+Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead.
 
 ### Homebrew-managed
 
@@ -130,77 +130,69 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 ## Windows: Task Scheduler
 
-`zeroclaw service install` creates a scheduled task in the current user's session:
+`zeroclaw service install` creates a per-user scheduled task named **ZeroClaw Daemon**:
 
-- Trigger: at logon
-- Condition: battery, idle, and power-save conditions are **all disabled** (otherwise the task would stop unexpectedly)
-- Action: run `zeroclaw daemon` hidden
+- Trigger: at logon (`/SC ONLOGON`)
+- Run level: `LIMITED` (runs as the current user, not elevated)
+- Action: runs the install wrapper `zeroclaw-daemon.cmd`, which launches `zeroclaw daemon`
 
-Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw.
+Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 
-Logs go to `%LOCALAPPDATA%\ZeroClaw\logs\`:
-
-<div class="os-tabs-src">
-
-#### cmd
-
-```cmd
-type %LOCALAPPDATA%\ZeroClaw\logs\zeroclaw.log
-```
-
-</div>
-
-### Windows Service (system-scope)
-
-For servers or multi-user Windows installs, run `zeroclaw service install` from an Administrator prompt:
+Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`):
 
 <div class="os-tabs-src">
 
 #### cmd
 
 ```cmd
-:: Administrator cmd.exe
-zeroclaw service install
+type %USERPROFILE%\.zeroclaw\logs\daemon.stdout.log
 ```
 
 </div>
 
-Running elevated causes the installer to register a real Windows Service under `LocalSystem` instead of a user-scoped scheduled task. Control via `services.msc` or:
+### Manual control
+
+The task is driven through `zeroclaw service start|stop|status`, which wrap `schtasks /Run`, `/End`, and `/Query` against the **ZeroClaw Daemon** task. You can also manage it directly:
 
 <div class="os-tabs-src">
 
 #### cmd
 
 ```cmd
-sc query ZeroClaw
-sc start ZeroClaw
-sc stop ZeroClaw
+schtasks /Run /TN "ZeroClaw Daemon"
+schtasks /End /TN "ZeroClaw Daemon"
+schtasks /Query /TN "ZeroClaw Daemon" /FO LIST
 ```
 
 </div>
+
+The CLI installs only a per-user ONLOGON task; it does not register a `LocalSystem` Windows Service. For a true system service, wrap the binary with a third-party supervisor (e.g. NSSM) yourself.
 
 ## Config path resolution
 
-The service reads config from whichever workspace it was installed against. Order:
+The service reads config from whichever directory resolved at install time. Precedence (first match wins):
 
-1. `$ZEROCLAW_CONFIG_DIR/config.toml` if set
-2. `$ZEROCLAW_WORKSPACE/.zeroclaw/config.toml` if set
-3. `$HOMEBREW_PREFIX/var/zeroclaw/.zeroclaw/config.toml` if installed via Homebrew
-4. `~/.zeroclaw/config.toml` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\config.toml` (Windows)
+1. `$ZEROCLAW_CONFIG_DIR` (config lives directly at `$ZEROCLAW_CONFIG_DIR/config.toml`)
+2. `$ZEROCLAW_DATA_DIR`
+3. `$ZEROCLAW_WORKSPACE` (**deprecated** — prefer `ZEROCLAW_DATA_DIR`; resolves either `$ZEROCLAW_WORKSPACE/config.toml` or the legacy sibling `.zeroclaw/config.toml`)
+4. On macOS only, the Homebrew config dir (`$HOMEBREW_PREFIX/var/zeroclaw/`) when installed via Homebrew
+5. Default `~/.zeroclaw/config.toml` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\config.toml` (Windows)
 
-If your service seems to ignore config changes, check which path the daemon is reading:
+`ZEROCLAW_CONFIG_DIR` overrides everything; setting it alongside `ZEROCLAW_DATA_DIR` or `ZEROCLAW_WORKSPACE` logs a warning and ignores the others.
+
+If your service seems to ignore config changes, check which path the daemon resolved against — `zeroclaw status` reports the active config file, and the runtime logs a resolution-source line at startup:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-zeroclaw config list
+zeroclaw status
 ```
 
 </div>
 
-The first few lines of its output show the config file path it resolved against.
+The output includes the config file path it resolved against.
 
 ## Auto-update
 

@@ -30,6 +30,8 @@ docker run -d \
 
 </div>
 
+The official image already binds `[::]` with `allow_public_bind = true` and `require_pairing = false` baked into its default config, so the published port is reachable out of the box. The {{#env-var-name gateway.allow_public_bind}} override below only matters if you bind-mount your own `config.toml` (which replaces the baked one) that defaults to localhost.
+
 The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config: you still need to run quickstart before it's useful:
 
 <div class="os-tabs-src">
@@ -55,8 +57,8 @@ services:
       - "42617:42617"      # gateway
     volumes:
       - ./data:/zeroclaw-data
-    environment:
-      ZEROCLAW_ALLOW_PUBLIC_BIND: "1"   # only if the gateway must be reachable on the LAN
+    # The official image already enables public bind; only add an `environment:`
+    # block with the override above if you bind-mount a localhost-default config.
 ```
 
 After the container starts, run quickstart:
@@ -71,7 +73,7 @@ docker compose exec zeroclaw zeroclaw quickstart
 
 </div>
 
-Drop `ZEROCLAW_ALLOW_PUBLIC_BIND` if you only need local access.
+With the official image you can omit the {{#env-var-name gateway.allow_public_bind}} override entirely; it is already enabled in the baked config.
 
 ## macOS: OrbStack vs Colima
 
@@ -127,8 +129,8 @@ Image=ghcr.io/zeroclaw-labs/zeroclaw:latest
 ContainerName=zeroclaw
 PublishPort=42617:42617
 Volume=zeroclaw-data:/zeroclaw-data
-# Only if the gateway must be reachable off-localhost (LAN):
-Environment=ZEROCLAW_ALLOW_PUBLIC_BIND=1
+# The official image already binds publicly; add an `Environment=` line with the
+# allow-public-bind override only if you mount a localhost-default config.
 # Optional rolling-upgrade path — re-pull a newer image on (re)start and opt into `podman auto-update`:
 Pull=newer
 AutoUpdate=registry
@@ -161,7 +163,7 @@ Then onboard once, and manage it like any service:
 #### sh
 
 ```sh
-sudo podman exec -it zeroclaw zeroclaw onboard
+sudo podman exec -it zeroclaw zeroclaw quickstart
 systemctl status zeroclaw
 journalctl -u zeroclaw -f
 ```
@@ -192,7 +194,11 @@ docker run -d --name zeroclaw \
 
 </div>
 
-For container workloads, set `uri` on each `[providers.models.<type>.<alias>]` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The `ZEROCLAW_providers__models__<type>__<alias>__uri=...` env override can do the same at runtime without editing `config.toml`.
+For container workloads, set `uri` on each `[providers.models.<type>.<alias>]` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The generic env-override mechanism can set the same field at runtime without editing `config.toml`:
+
+{{#env-var container}}
+
+See [Providers → Container-friendly overrides](../providers/configuration.md#container-friendly-overrides) for the grammar.
 
 ## Channels that poll (Telegram, email): just work
 
@@ -205,7 +211,7 @@ Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options
 1. **Expose the gateway**: `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
 2. **Use a tunnel**: ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
 
-Configure a tunnel via `zeroclaw config set gateway.tunnel.provider=<ngrok|cloudflare>` and the related `gateway.tunnel.*` fields (see the [Config reference](../reference/config.md)); the resulting public URL is what you point your webhook senders at.
+Configure a tunnel by setting the top-level `[tunnel]` `tunnel_provider` (override env var: {{#env-var-name tunnel.tunnel_provider}}) to one of the supported providers and filling the matching `tunnel.*` block — the full provider list and per-provider fields are in the [Config reference](../reference/config.md#tunnel). The resulting public URL is what you point your webhook senders at.
 
 ## Kubernetes
 
@@ -230,9 +236,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /zeroclaw-data
-          env:
-            - name: ZEROCLAW_ALLOW_PUBLIC_BIND
-              value: "1"
+          # The official image already binds publicly; add an `env:` entry for the
+          # allow-public-bind override only if you mount a localhost-default config.
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -271,7 +276,7 @@ docker compose exec zeroclaw zeroclaw gateway get-paircode --new
 
 - **macOS hostname quirks (Docker Desktop, colima, Rancher Desktop).** `host.docker.internal` works out of the box on **Docker Desktop** for macOS. On **colima**, it is only reachable if you installed with `colima start --network-address` (otherwise the container can't see the host at all; connect via the VM's gateway IP, usually `192.168.5.2`, or tunnel through a shared network). **Rancher Desktop** behaves like Docker Desktop for recent versions but has had `host.docker.internal` resolve-failures on older releases. If provider calls fail with `connection refused` to `host.docker.internal`, verify with `docker run --rm alpine getent hosts host.docker.internal`: empty output means the hostname isn't resolvable and you need an explicit IP.
 - **Host-side services.** If a provider is Ollama on the host, `uri = "http://host.docker.internal:11434"` (under `[providers.models.ollama.<alias>]`) works on Docker Desktop. On Linux Docker you may need `--add-host=host.docker.internal:host-gateway`.
-- **Memory persistence.** The SQLite memory file sits inside `/zeroclaw-data/workspace/`. If you don't mount that volume, every restart loses conversation history.
+- **Memory persistence.** Agent memory (the SQLite `brain.db`) lives under the config directory at `/zeroclaw-data/.zeroclaw/agents/<alias>/workspace/memory/`, with shared instance databases under `/zeroclaw-data/data/`. Mounting `/zeroclaw-data` persists all of it; skip the volume and every restart loses conversation history.
 - **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default `config.toml` and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist`, outside the mount, so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
 - **No hardware passthrough by default.** GPIO / USB need explicit `--device` flags (`--device /dev/ttyUSB0`), and the container user needs matching GID for `dialout`/`gpio` groups.
 

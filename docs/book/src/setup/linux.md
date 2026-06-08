@@ -4,9 +4,11 @@ Install, update, run as a service, and uninstall, all Linux distributions.
 
 ## Install
 
-`install.sh` is the preferred path on every Linux distro. Pipe it from `curl`, or clone and run it locally, both do the same thing.
+```sh
+./install.sh
+```
 
-### Option 1: `install.sh` via curl (fastest)
+That is the whole install. Run it from a clone, or pipe it from `curl`:
 
 <div class="os-tabs-src">
 
@@ -18,46 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 </div>
 
-### Option 2: `install.sh` from a clone
+The installer detects your distribution and architecture, picks a prebuilt binary or builds from source (interactive by default; non-interactive shells take the prebuilt when available), installs to `~/.cargo/bin/zeroclaw`, and offers to run [`zeroclaw quickstart`](../getting-started/quickstart.md) for first-time setup. Pass `--help` for the full flag reference, or `--skip-quickstart` to install only.
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./install.sh
-```
-
-</div>
-
-### What the installer does
-
-1. Detects your distribution and architecture
-2. Asks whether you want a prebuilt binary or to build from source (the default is interactive, non-interactive shells default to prebuilt when available)
-3. Places the binary at `~/.cargo/bin/zeroclaw`
-4. Runs `zeroclaw quickstart` to complete first-time setup
-
-Flags:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-./install.sh --prebuilt                      # always prebuilt, skip the prompt
-./install.sh --source                        # always build from source
-./install.sh --minimal                       # foundation only, no default features
-./install.sh --source --features agent-runtime,channel-discord   # custom features
-./install.sh --skip-quickstart                  # install only; run `zeroclaw quickstart` later
-./install.sh --list-features                 # print available features and exit
-./install.sh --help                          # full flag reference
-```
-
-</div>
-
-### Option 3: Homebrew (Linuxbrew)
+### Homebrew (Linuxbrew)
 
 <div class="os-tabs-src">
 
@@ -65,7 +30,6 @@ Flags:
 
 ```sh
 brew install zeroclaw
-zeroclaw quickstart
 ```
 
 </div>
@@ -79,9 +43,10 @@ The core binary is statically linked where possible. Some features require syste
 | Feature | Package (Debian/Ubuntu) | Package (Arch) | Package (Fedora) |
 |---|---|---|---|
 | Docs translation (`cargo mdbook sync`) | `gettext` | `gettext` | `gettext` |
-| Hardware (GPIO / I2C / SPI) | `libgpiod-dev` | `libgpiod` | `libgpiod-devel` |
 | Browser tool (playwright) | `libnss3`, `libatk1.0-0`, `libcups2` (see `playwright --help`) | `nss`, `atk`, `cups` | `nss`, `atk`, `cups` |
 | Audio (TTS, voice channels) | `libasound2-dev` | `alsa-lib` | `alsa-lib-devel` |
+
+The hardware feature (GPIO / I2C / SPI on a Pi) uses the pure-Rust `rppal` driver and needs no extra system library — it talks to `/dev/gpiomem`, `/dev/spidev*`, and `/dev/i2c-*` directly. What it does need is device access: enable the SPI/I2C interfaces and put the service user in the `gpio`, `spi`, and `i2c` groups (see [SBC / Raspberry Pi](#sbc--raspberry-pi) below).
 
 Most deployments don't need any of these.
 
@@ -129,7 +94,7 @@ On a Raspberry Pi or similar SBC, build with the hardware feature:
 
 </div>
 
-The stock systemd unit includes `SupplementaryGroups=gpio spi i2c` so the service user can access hardware without running as root. Verify your user is in those groups:
+For hardware access without running as root, the service user needs the `gpio`, `spi`, and `i2c` groups. The user-level unit that `zeroclaw service install` writes does not set these — use the system-level Pi unit template at [`scripts/zeroclaw.service`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/scripts/zeroclaw.service), which includes `SupplementaryGroups=gpio spi i2c`. Either way, verify your user is in those groups:
 
 <div class="os-tabs-src">
 

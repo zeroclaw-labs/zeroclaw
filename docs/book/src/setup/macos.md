@@ -4,9 +4,11 @@ Install, update, run as a LaunchAgent, and uninstall on macOS (Intel or Apple Si
 
 ## Install
 
-`install.sh` is the preferred path; Homebrew is a reasonable alternative if you want `brew services` integration.
+```sh
+./install.sh
+```
 
-### Option 1: `install.sh` via curl (fastest)
+That is the whole install. Run it from a clone, or pipe it from `curl`:
 
 <div class="os-tabs-src">
 
@@ -18,45 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 </div>
 
-### Option 2: `install.sh` from a clone
+The installer picks a prebuilt binary or builds from source (interactive by default), installs to `~/.cargo/bin/zeroclaw`, and offers to run [`zeroclaw quickstart`](../getting-started/quickstart.md) for first-time setup. Pass `--help` for the full flag reference, or `--skip-quickstart` to install only.
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./install.sh
-```
-
-</div>
-
-### What the installer does
-
-1. Asks whether you want a prebuilt binary or to build from source
-2. Installs to `~/.cargo/bin/zeroclaw`
-3. Runs `zeroclaw quickstart` to complete first-time setup
-
-Flags:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-./install.sh --prebuilt                      # always prebuilt, skip the prompt
-./install.sh --source                        # always build from source
-./install.sh --minimal                       # foundation only, no default features
-./install.sh --source --features agent-runtime,channel-discord   # custom features
-./install.sh --skip-quickstart                  # install only; run `zeroclaw quickstart` later
-./install.sh --list-features                 # print available features and exit
-./install.sh --help                          # full flag reference
-```
-
-</div>
-
-### Option 3: Homebrew
+### Homebrew
 
 <div class="os-tabs-src">
 
@@ -64,7 +30,6 @@ Flags:
 
 ```sh
 brew install zeroclaw
-zeroclaw quickstart
 ```
 
 </div>
@@ -110,14 +75,14 @@ zeroclaw service status
 
 </div>
 
-Logs go to `~/Library/Logs/ZeroClaw/`:
+Logs go to `~/.zeroclaw/logs/` (Homebrew installs: `$HOMEBREW_PREFIX/var/zeroclaw/logs/`):
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-tail -f ~/Library/Logs/ZeroClaw/zeroclaw.log
+tail -f ~/.zeroclaw/logs/daemon.stdout.log
 ```
 
 </div>
@@ -212,11 +177,8 @@ Remove config and workspace (optional: this deletes conversation history):
 # Homebrew workspace
 rm -rf "$HOMEBREW_PREFIX/var/zeroclaw"
 
-# Default workspace
+# Default workspace (includes logs at ~/.zeroclaw/logs)
 rm -rf ~/.zeroclaw ~/.config/zeroclaw
-
-# Logs
-rm -rf ~/Library/Logs/ZeroClaw
 ```
 
 </div>

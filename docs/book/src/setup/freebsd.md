@@ -88,7 +88,7 @@ zeroclaw --version
 #### sh
 
 ```sh
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 </div>
@@ -458,7 +458,7 @@ doas podman run -d --name zeroclaw --restart=always \
     -v /var/db/zeroclaw:/zeroclaw-data \
     ghcr.io/zeroclaw-labs/zeroclaw:debian
 
-doas podman exec -it zeroclaw zeroclaw onboard
+doas podman exec -it zeroclaw zeroclaw quickstart
 ```
 
 </div>

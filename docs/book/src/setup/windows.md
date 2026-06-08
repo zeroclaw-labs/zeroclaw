@@ -2,45 +2,19 @@
 
 Install, update, run as a scheduled task / Windows Service, and uninstall on Windows 10 / 11.
 
-`setup.bat` is the Windows counterpart to `install.sh`, same job, different shell. If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
+`setup.bat` is the Windows counterpart to `install.sh`, same job, different shell.
 
 ## Install
-
-### Option 1: `setup.bat` from a release
-
-Download the latest ZeroClaw release, unzip, and run:
-
-<div class="os-tabs-src">
-
-#### cmd
 
 ```cmd
 setup.bat
 ```
 
-</div>
+That is the whole install: grab `setup.bat` from a ZeroClaw release and run it. It prompts for a build mode, then either downloads the prebuilt binary or (for source modes) installs a stable Rust toolchain via `rustup` and compiles. Either way the binary lands at `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`, and it points you at [`zeroclaw quickstart`](../getting-started/quickstart.md).
 
-Flags:
+To skip the interactive prompt, pass a build-mode flag — `--prebuilt` (download a release binary, no toolchain), `--minimal` (core only), `--standard`, or `--full`. Run `setup.bat --help` for the authoritative list of modes and the exact feature set each one compiles; that output is generated from the script itself, so it never drifts. With `--minimal`, quickstart is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`).
 
-| Flag | Behaviour |
-|---|---|
-| `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest, no Rust toolchain needed) |
-| `--minimal` | Build core only (`--no-default-features`; no channels, no hardware) |
-| `--standard` | Build with lean default channels (ACP server, webhook, email, Telegram) |
-| `--full` | Build with all channels (`channels-full`) |
-
-The script:
-
-1. Checks for `rustup`; downloads `rustup-init.exe` and installs stable toolchain if missing
-2. Builds (or downloads) the binary
-3. Installs to `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`
-4. Prints mode-specific next steps:
-   - `--prebuilt`, `--standard`, `--full`: run `zeroclaw quickstart`
-   - `--minimal`: quickstart is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`)
-
-For source builds, `setup.bat` now prints the exact `cargo build ...` command it executes and reports the installed `zeroclaw.exe` size so command shape and artifact expectations stay visible.
-
-### Option 2: Scoop
+### Scoop
 
 <div class="os-tabs-src">
 
@@ -48,12 +22,11 @@ For source builds, `setup.bat` now prints the exact `cargo build ...` command it
 
 ```cmd
 scoop install zeroclaw
-zeroclaw quickstart
 ```
 
 </div>
 
-### Option 3: From source
+### From source
 
 Requires Rust (`rustup`) and Visual Studio Build Tools:
 
@@ -65,10 +38,11 @@ Requires Rust (`rustup`) and Visual Studio Build Tools:
 git clone https://github.com/zeroclaw-labs/zeroclaw
 cd zeroclaw
 cargo install --locked --path .
-zeroclaw quickstart
 ```
 
 </div>
+
+If you're running WSL2, follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
 
 ## System dependencies
 
