@@ -36,6 +36,20 @@ brew install zeroclaw
 
 Homebrew-on-Linux installs follow Homebrew's service path convention, your workspace lives under `$HOMEBREW_PREFIX/var/zeroclaw/` instead of `~/.zeroclaw/`. See [Service management](./service.md) for why this matters.
 
+### NixOS
+
+A multi-instance NixOS module is shipped in-tree. See [NixOS](./nixos.md).
+
+### A note on `cargo binstall` and `nix run`
+
+Neither works yet. `cargo binstall zeroclaw` resolves crate metadata from
+crates.io, but ZeroClaw is not published there (`publish = false`), so there is
+nothing for it to fetch; `nix run github:zeroclaw-labs/zeroclaw` does not launch
+the agent because the flake exposes only a dev toolchain, not a runnable package
+([#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987)). `install.sh`
+already does what `binstall` would (download a prebuilt release binary), so it
+remains the supported one-liner.
+
 ## System dependencies
 
 The core binary is statically linked where possible. Some features require system libraries:
