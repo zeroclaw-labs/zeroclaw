@@ -10,6 +10,7 @@
 pub mod allowlist;
 pub mod listing;
 pub mod orchestrator;
+pub mod paced_channel;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
@@ -65,6 +66,8 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-twitch")]
+pub mod twitch;
 #[cfg(feature = "channel-twitter")]
 pub mod twitter;
 #[cfg(feature = "channel-voice-call")]
