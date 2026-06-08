@@ -6,7 +6,7 @@
 //! `[keybindings]` table, so every preset must define every rebindable
 //! action; a test enforces it. Presets start from the full default map
 //! and reassign the actions they change. Walked from `KEY_PRESETS`,
-//! mirroring `THEMES`.
+//! mirroring the theme registry walked via `theme_names`.
 
 use std::collections::HashMap;
 
