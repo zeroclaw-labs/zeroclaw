@@ -30,8 +30,7 @@ use std::sync::Arc;
 use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
-use zeroclaw_config::providers::ProvidersConfig;
-use zeroclaw_config::schema::{Config, ModelProviderConfig};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
 
 // Unique sentinel that exists ONLY in the planted Conversation entry — must
@@ -56,7 +55,7 @@ async fn spawn_mock_provider() -> (SocketAddr, CapturedBodies) {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
     });
     (addr, captured)
@@ -70,7 +69,10 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
 
     // ── Mock provider ───────────────────────────────────────────────
     let (addr, captured) = spawn_mock_provider().await;
-    let provider_name = format!("custom:http://{addr}");
+    let provider_uri = format!("http://{addr}");
+    // Canonical typed-family slot. The agent's `model_provider` references
+    // the alias by `<type>.<alias>` (here `custom.default`).
+    let provider_type = "custom";
 
     // ── Plant a chat-origin Conversation memory ────────────────────
     // Keys like "discord:guild:chan:msg-N" come from real channel handlers
@@ -83,7 +85,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     // With a session_id set, SQLite's recall filter scopes it out before
     // build_context runs — the bug manifests precisely when scoping fails.
     {
-        let mem = SqliteMemory::new(&workspace_dir).unwrap();
+        let mem = SqliteMemory::new("sqlite", &workspace_dir).unwrap();
         mem.store(
             "discord:guild:chan:msg-42",
             // Includes overlap words ("reminder", "today") so the keyword
@@ -100,23 +102,42 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     }
 
     // ── Config pointing the agent at the mock provider ─────────────
-    let mut models = HashMap::new();
-    models.insert(
-        provider_name.clone(),
-        ModelProviderConfig {
-            api_key: Some("test-key".to_string()),
-            model: Some("test-model".to_string()),
+    // V3 typed-family layout: `[model_providers.<type>.<alias>]`. The
+    // agent's `model_provider` references that path as `<type>.<alias>`.
+    // The test's `default` agent points at `custom.default` so `agent::run`
+    // resolves the mock provider through the same codepath production
+    // daemons use.
+    let mut providers = zeroclaw_config::providers::Providers::default();
+    {
+        let base = providers
+            .models
+            .ensure(provider_type, "default")
+            .expect("`custom` slot must exist on ModelProviders");
+        base.api_key = Some("test-key".to_string());
+        base.model = Some("test-model".to_string());
+        base.uri = Some(provider_uri.clone());
+    }
+    let mut agents = HashMap::new();
+    agents.insert(
+        "default".to_string(),
+        AliasedAgentConfig {
+            enabled: true,
+            model_provider: format!("{provider_type}.default").into(),
+            risk_profile: "default".to_string(),
             ..Default::default()
         },
     );
+    // PR branch requires every agent to point at a configured risk_profile;
+    // wire up a permissive entry so the agent loop reaches the LLM call we
+    // care about auditing here.
+    let mut risk_profiles = HashMap::new();
+    risk_profiles.insert("default".to_string(), RiskProfileConfig::default());
     let mut config = Config {
-        workspace_dir: workspace_dir.clone(),
+        data_dir: workspace_dir.clone(),
         config_path: tmp.path().join("config.toml"),
-        providers: ProvidersConfig {
-            fallback: Some(provider_name.clone()),
-            models,
-            ..Default::default()
-        },
+        providers,
+        agents,
+        risk_profiles,
         ..Config::default()
     };
     // No retries / no waits — fail fast if the mock has issues, and don't
@@ -139,14 +160,16 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     let prompt = "Any reminders to surface today? Pull anything relevant from memory.".to_string();
     let run_result = zeroclaw_runtime::agent::run(
         config,
+        "default",
         Some(prompt),
         None,
         None,
-        0.7,
+        Some(0.7),
         vec![],
         false,
         None,
         None,
+        zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
     )
     .await;
     let (success, output) = match run_result {

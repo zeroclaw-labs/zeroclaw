@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
@@ -11,10 +10,13 @@ const MAX_IMAGE_BYTES: u64 = 5_242_880;
 
 /// Tool to read image metadata and optionally return base64-encoded data.
 ///
-/// Since providers are currently text-only, this tool extracts what it can
+/// Since model_providers are currently text-only, this tool extracts what it can
 /// (file size, format, dimensions from header bytes) and provides base64
-/// data for future multimodal provider support.
+/// data for future multimodal model_provider support.
 pub struct ImageInfoTool {
+    // Pre-canonicalization path-allowlist enforcement lives in the
+    // PathGuardedTool wrapper. The concrete tool still resolves raw tool
+    // paths and applies the read-side post-canonicalization boundary.
     security: Arc<SecurityPolicy>,
 }
 
@@ -146,40 +148,69 @@ impl Tool for ImageInfoTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path_str = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "image_info: missing path parameter"
+            );
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         let include_base64 = args
             .get("include_base64")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let path = Path::new(path_str);
+        // Path-allowlist checks are applied by the PathGuardedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod). Successful
+        // reads consume budget through RateLimitedTool; post-wrapper
+        // canonicalize failures are charged here so missing-file probes are not
+        // free.
 
-        // Restrict reads to workspace directory to prevent arbitrary file exfiltration
-        if !self.security.is_path_allowed(path_str) {
+        let full_path = self.security.resolve_tool_path(path_str);
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = self.security.record_action();
+                let error = if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("File not found: {path_str}")
+                } else {
+                    format!("Failed to resolve file path: {e}")
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Path not allowed: {path_str} (must be within workspace)"
-                )),
+                error: Some(
+                    "Resolved image path is outside the allowed readable roots.".to_string(),
+                ),
             });
         }
 
-        if !path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("File not found: {path_str}")),
-            });
-        }
-
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
+        let metadata = tokio::fs::metadata(&resolved_path).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path_str,
+                        "error": format!("{}", e),
+                    })),
+                "image_info: failed to read file metadata"
+            );
+            anyhow::Error::msg(format!("Failed to read file metadata: {e}"))
+        })?;
 
         let file_size = metadata.len();
 
@@ -193,9 +224,19 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
+        let bytes = tokio::fs::read(&resolved_path).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path_str,
+                        "error": format!("{}", e),
+                    })),
+                "image_info: failed to read image file"
+            );
+            anyhow::Error::msg(format!("Failed to read image file: {e}"))
+        })?;
 
         let format = Self::detect_format(&bytes);
         let dimensions = Self::extract_dimensions(&bytes, format);
@@ -231,8 +272,19 @@ impl Tool for ImageInfoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
+    use std::path::{Component, Path, PathBuf};
+    use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+
+    const MINIMAL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -242,6 +294,45 @@ mod tests {
             forbidden_paths: vec![],
             ..SecurityPolicy::default()
         })
+    }
+
+    /// Security policy with `workspace_only: true` so external absolute paths
+    /// are blocked by the `PathGuardedTool` wrapper.
+    fn workspace_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn rootless_path(path: &Path) -> PathBuf {
+        let mut relative = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => panic!("test path must not contain parent components"),
+                Component::Normal(part) => relative.push(part),
+            }
+        }
+        relative
+    }
+
+    /// Wraps `ImageInfoTool` with the production `PathGuardedTool` +
+    /// `RateLimitedTool` stack, mirroring the registration in
+    /// `zeroclaw-runtime::tools::mod`.  Use this in tests that exercise
+    /// path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = workspace_security(workspace);
+        wrapped_tool_with_security(security)
+    }
+
+    fn wrapped_tool_with_security(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+            security,
+        ))
     }
 
     #[test]
@@ -427,29 +518,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_real_file() {
-        // Create a minimal valid PNG
-        let dir = std::env::temp_dir().join("zeroclaw_image_info_test");
-        let _ = tokio::fs::create_dir_all(&dir).await;
-        let png_path = dir.join("test.png");
-
-        // Minimal 1x1 red PNG (67 bytes)
-        let png_bytes: Vec<u8> = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
-            0x00, 0x00, 0x00, 0x0D, // IHDR length
-            0x49, 0x48, 0x44, 0x52, // IHDR
-            0x00, 0x00, 0x00, 0x01, // width: 1
-            0x00, 0x00, 0x00, 0x01, // height: 1
-            0x08, 0x02, 0x00, 0x00, 0x00, // bit depth, color type, etc.
-            0x90, 0x77, 0x53, 0xDE, // CRC
-            0x00, 0x00, 0x00, 0x0C, // IDAT length
-            0x49, 0x44, 0x41, 0x54, // IDAT
-            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21,
-            0xBC, 0x33, // CRC
-            0x00, 0x00, 0x00, 0x00, // IEND length
-            0x49, 0x45, 0x4E, 0x44, // IEND
-            0xAE, 0x42, 0x60, 0x82, // CRC
-        ];
-        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let png_path = dir.path().join("test.png");
+        tokio::fs::write(&png_path, MINIMAL_PNG).await.unwrap();
 
         let tool = ImageInfoTool::new(test_security());
         let result = tool
@@ -460,26 +531,178 @@ mod tests {
         assert!(result.output.contains("Format: png"));
         assert!(result.output.contains("Dimensions: 1x1"));
         assert!(!result.output.contains("data:"));
+    }
 
-        // Clean up
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+    #[tokio::test]
+    async fn wrapped_blocks_external_absolute_path() {
+        // Regression for the removed inline path check: when ImageInfoTool is
+        // composed with PathGuardedTool (as it is in production), an external
+        // absolute path must be blocked before the inner tool runs.
+        let workspace = std::env::temp_dir().join("zeroclaw_image_info_wrap");
+        let _ = std::fs::create_dir_all(&workspace);
+        let tool = wrapped_tool(workspace);
+
+        #[cfg(unix)]
+        let target = "/etc/passwd";
+        #[cfg(windows)]
+        let target = {
+            let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            format!(r"{sysroot}\System32\drivers\etc\hosts")
+        };
+
+        let result = tool.execute(json!({"path": target})).await.unwrap();
+        assert!(!result.success, "external path must be blocked");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_blocks_path_traversal() {
+        // Path-traversal under workspace_only must be blocked by the wrapper,
+        // not pass through to the inner tool.
+        let workspace = std::env::temp_dir().join("zeroclaw_image_info_trav");
+        let _ = std::fs::create_dir_all(&workspace);
+        let tool = wrapped_tool(workspace);
+
+        let result = tool
+            .execute(json!({"path": "../../../etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "path traversal must be blocked");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_normalizes_workspace_prefixed_relative_path() {
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("zeroclaw-data").join("workspace");
+        let images_dir = workspace.join("images");
+        tokio::fs::create_dir_all(&images_dir).await.unwrap();
+
+        let png_path = images_dir.join("one.png");
+        tokio::fs::write(&png_path, MINIMAL_PNG).await.unwrap();
+
+        let workspace_prefixed = rootless_path(&workspace).join("images").join("one.png");
+        let tool = wrapped_tool(workspace);
+
+        let result = tool
+            .execute(json!({"path": workspace_prefixed.to_string_lossy()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "workspace-prefixed image path should resolve through security policy, error: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("Format: png"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapped_blocks_symlink_escape_after_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("secret.png"), MINIMAL_PNG)
+            .await
+            .unwrap();
+        symlink(outside.join("secret.png"), workspace.join("link.png")).unwrap();
+
+        let tool = wrapped_tool(workspace);
+        let result = tool.execute(json!({"path": "link.png"})).await.unwrap();
+
+        assert!(!result.success, "symlink escape must be blocked");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("outside the allowed readable roots"),
+            "expected readable-roots error, got: {:?}",
+            error
+        );
+        assert!(
+            !error.contains(&outside.to_string_lossy().to_string()),
+            "policy error must not disclose resolved outside path, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_blocks_write_only_allowed_root_read() {
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let write_only = root.path().join("write-only");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&write_only).await.unwrap();
+        let png_path = write_only.join("one.png");
+        tokio::fs::write(&png_path, MINIMAL_PNG).await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots_write_only: vec![write_only],
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_tool_with_security(security);
+        let result = tool
+            .execute(json!({"path": png_path.to_string_lossy()}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "write-only root must not be readable");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside the allowed readable roots"),
+            "expected readable-roots error, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_file_probe_consumes_action_budget() {
+        let root = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: root.path().to_path_buf(),
+            workspace_only: true,
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = ImageInfoTool::new(security.clone());
+
+        assert!(!security.is_rate_limited());
+        let result = tool.execute(json!({"path": "missing.png"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(security.is_rate_limited());
     }
 
     #[tokio::test]
     async fn execute_with_base64() {
-        let dir = std::env::temp_dir().join("zeroclaw_image_info_b64");
-        let _ = tokio::fs::create_dir_all(&dir).await;
-        let png_path = dir.join("test_b64.png");
-
-        // Minimal 1x1 PNG
-        let png_bytes: Vec<u8> = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let png_path = dir.path().join("test_b64.png");
+        tokio::fs::write(&png_path, MINIMAL_PNG).await.unwrap();
 
         let tool = ImageInfoTool::new(test_security());
         let result = tool
@@ -488,7 +711,5 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("data:image/png;base64,"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

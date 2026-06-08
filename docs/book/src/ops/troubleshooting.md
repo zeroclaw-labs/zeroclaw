@@ -77,30 +77,26 @@ Persist in your shell profile.
 
 ---
 
-## Onboarding
+## Quickstart
 
-### Wizard insists on a config that doesn't exist
+### Quickstart won't overwrite an existing config
 
-If an earlier install left `~/.zeroclaw/config.toml`, re-run with `--force`:
-
-```bash
-zeroclaw onboard --force
-```
-
-Or just delete the directory and start over:
+`zeroclaw quickstart` does not have a `--force` flag — it intentionally leaves an existing `~/.zeroclaw/config.toml` alone. To run a fresh quickstart on a stale install, delete the directory and start over:
 
 ```bash
 rm -rf ~/.zeroclaw
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
-### Homebrew-installed but wizard writes to the wrong path
+Or, to edit a single stale field instead of wiping everything, use `zeroclaw config set <key>=<value>` directly.
 
-Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works). The wizard warns if it detects this — set `ZEROCLAW_WORKSPACE` to the Homebrew path before onboarding:
+### Homebrew install: config path mismatch
+
+Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works) while the default config dir is `~/.zeroclaw/`. Set `ZEROCLAW_WORKSPACE` to the Homebrew path before running quickstart so the two paths line up:
 
 ```bash
 export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 Or manually symlink once:
@@ -112,6 +108,37 @@ ln -s "$HOMEBREW_PREFIX/var/zeroclaw" ~/.zeroclaw
 ---
 
 ## Runtime
+
+### OpenAI Codex subscription auth warns about config or streaming
+
+Symptoms:
+
+- The agent's `model_provider = "openai.<alias>"` points at a Codex entry, but runs still feel misconfigured
+- Config loading warns about unknown top-level fields like `api_key` / `api_url` (those belong on the provider entry, not at the file root)
+- Agent logs `provider streaming failed, falling back to non-streaming chat`
+
+Checks (substitute `<alias>` with the configured agent alias from `[agents.<alias>]`):
+
+```bash
+zeroclaw auth status
+zeroclaw auth login --provider openai-codex --device-code
+zeroclaw agent -a <alias> -m "hello"
+```
+
+For normal subscription auth the provider entry should look like this (the surrounding agent + risk profile follow the canonical [Minimal working example](../providers/configuration.md#minimal-working-example)):
+
+```toml
+[providers.models.openai.coding]   # type = openai; alias = coding (you choose)
+model = "gpt-5-codex"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+Notes:
+
+- Subscription auth uses stored auth profiles — set `requires_openai_auth = true` on the alias and leave `api_key` unset.
+- `api_key` / `uri` on the alias entry are only needed for custom OpenAI-compatible gateways or other explicit endpoint overrides.
+- The streaming-disabled warning by itself is not an auth failure; ZeroClaw retries the request in non-streaming mode.
 
 ### Daemon starts, then immediately exits
 
@@ -129,7 +156,7 @@ Enable debug logging and catch the next failure:
 
 ```bash
 zeroclaw service stop
-RUST_LOG=zeroclaw=debug zeroclaw daemon
+RUST_LOG=debug zeroclaw daemon
 ```
 
 ### Gateway unreachable
@@ -196,10 +223,6 @@ API key invalid or expired. Regenerate at the provider's dashboard, update in `[
 
 If using OAuth (`sk-ant-oat*`), the OAuth token may have expired — OAuth-issued tokens are longer-lived but not infinite. Re-authenticate.
 
-### Fallback chain always uses the fallback, never the primary
-
-Check latency and error logs — the primary may be consistently timing out. If so, lower the retry count on the primary so it fails through faster, or fix whatever's making the primary flaky.
-
 ---
 
 ## Tools
@@ -216,7 +239,7 @@ See [Security → Autonomy levels](../security/autonomy.md).
 
 ### Tool invocations fail inside Docker sandbox
 
-- Container image isn't pulled — `docker pull zeroclawlabs/tool-runner`
+- Container image isn't pulled — run `docker pull <image>` for whatever you have configured under `[security.sandbox].image` (default: `alpine:latest`)
 - Docker daemon not reachable from the ZeroClaw user — check `docker info`
 - Tool needs a device that's not passed through — extend `allow_devices`
 
@@ -234,6 +257,12 @@ Playwright downloads Chromium (~150 MB) on first launch. Let it finish. If it ke
 zeroclaw service start
 zeroclaw service status
 ```
+
+Use `zeroclaw service logs` to tail the installed service logs. Add `--follow` to stream new entries or `--lines <count>` to change how much history is shown. If the wrapper is unavailable or you need to inspect the platform directly, use:
+
+- Linux: `journalctl --user -u zeroclaw.service -f`
+- macOS: `log stream --predicate 'process == "zeroclaw"'`
+- If you are running `zeroclaw daemon` directly in a terminal, use that foreground output instead of service log commands.
 
 If that succeeds interactively but the service dies in the background, it's almost always config or permissions — read the journal:
 

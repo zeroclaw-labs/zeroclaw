@@ -28,9 +28,6 @@ pub struct OtelObserver {
     tokens_used: Counter<u64>,
     active_sessions: Gauge<u64>,
     queue_depth: Gauge<u64>,
-    hand_runs: Counter<u64>,
-    hand_duration: Histogram<f64>,
-    hand_findings: Counter<u64>,
 }
 
 impl OtelObserver {
@@ -112,12 +109,12 @@ impl OtelObserver {
 
         let llm_calls = meter
             .u64_counter("zeroclaw.llm.calls")
-            .with_description("Total LLM provider calls")
+            .with_description("Total LLM model_provider calls")
             .build();
 
         let llm_duration = meter
             .f64_histogram("zeroclaw.llm.duration")
-            .with_description("LLM provider call duration in seconds")
+            .with_description("LLM model_provider call duration in seconds")
             .with_unit("s")
             .build();
 
@@ -168,22 +165,6 @@ impl OtelObserver {
             .with_description("Current message queue depth")
             .build();
 
-        let hand_runs = meter
-            .u64_counter("zeroclaw.hand.runs")
-            .with_description("Total hand runs")
-            .build();
-
-        let hand_duration = meter
-            .f64_histogram("zeroclaw.hand.duration")
-            .with_description("Hand run duration in seconds")
-            .with_unit("s")
-            .build();
-
-        let hand_findings = meter
-            .u64_counter("zeroclaw.hand.findings")
-            .with_description("Total findings produced by hand runs")
-            .build();
-
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
@@ -200,9 +181,6 @@ impl OtelObserver {
             tokens_used,
             active_sessions,
             queue_depth,
-            hand_runs,
-            hand_duration,
-            hand_findings,
         })
     }
 }
@@ -212,11 +190,14 @@ impl Observer for OtelObserver {
         let tracer = global::tracer("zeroclaw");
 
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+            } => {
                 self.agent_starts.add(
                     1,
                     &[
-                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("model_provider", model_provider.clone()),
                         KeyValue::new("model", model.clone()),
                     ],
                 );
@@ -227,7 +208,7 @@ impl Observer for OtelObserver {
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
-                provider,
+                model_provider,
                 model,
                 duration,
                 success,
@@ -237,7 +218,7 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
-                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model_provider", model_provider.clone()),
                     KeyValue::new("model", model.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
@@ -253,7 +234,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model_provider", model_provider.clone()),
                             KeyValue::new("model", model.clone()),
                             KeyValue::new("success", *success),
                             KeyValue::new("duration_s", secs),
@@ -267,7 +248,7 @@ impl Observer for OtelObserver {
                 span.end();
             }
             ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
@@ -284,7 +265,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model_provider", model_provider.clone()),
                             KeyValue::new("model", model.clone()),
                             KeyValue::new("duration_s", secs),
                         ]),
@@ -300,7 +281,7 @@ impl Observer for OtelObserver {
                 self.agent_duration.record(
                     secs,
                     &[
-                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("model_provider", model_provider.clone()),
                         KeyValue::new("model", model.clone()),
                     ],
                 );
@@ -309,8 +290,11 @@ impl Observer for OtelObserver {
             }
             ObserverEvent::ToolCall {
                 tool,
+                tool_call_id,
                 duration,
                 success,
+                arguments,
+                result,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -323,24 +307,51 @@ impl Observer for OtelObserver {
                     Status::error("")
                 };
 
+                // Legacy ZeroClaw-internal attrs are kept so existing
+                // dashboards keep working; OpenTelemetry gen_ai.tool.*
+                // semantic-convention attributes are added so LLM-aware
+                // backends (Langfuse, SigNoz, Phoenix) surface the tool
+                // call as a proper GenAI tool execution with the command
+                // arguments and its result visible in the trace viewer.
+                let mut span_attrs = vec![
+                    // Legacy
+                    KeyValue::new("tool.name", tool.clone()),
+                    KeyValue::new("tool.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    // gen_ai.* semantic conventions
+                    KeyValue::new("gen_ai.operation.name", "execute_tool"),
+                    KeyValue::new("gen_ai.tool.name", tool.clone()),
+                ];
+                if let Some(id) = tool_call_id {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
+                }
+                if let Some(args) = arguments {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", args.clone()));
+                    // `input.value` is a Langfuse-specific convention that
+                    // surfaces into the "Input" pane of the trace viewer.
+                    // Emitting both keeps vendor-agnostic backends happy
+                    // while Langfuse users get a proper Input/Output view.
+                    span_attrs.push(KeyValue::new("input.value", args.clone()));
+                }
+                if let Some(res) = result {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.result", res.clone()));
+                    span_attrs.push(KeyValue::new("output.value", res.clone()));
+                }
+
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("tool.call")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("tool.name", tool.clone()),
-                            KeyValue::new("tool.success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
+                        .with_attributes(span_attrs),
                 );
                 span.set_status(status);
                 span.end();
 
-                let attrs = [
+                let metric_attrs = [
                     KeyValue::new("tool", tool.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
-                self.tool_calls.add(1, &attrs);
+                self.tool_calls.add(1, &metric_attrs);
                 self.tool_duration
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
@@ -372,77 +383,6 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
-            ObserverEvent::HandStarted { .. } => {}
-            ObserverEvent::HandCompleted {
-                hand_name,
-                duration_ms,
-                findings_count,
-            } => {
-                let secs = *duration_ms as f64 / 1000.0;
-                let duration = std::time::Duration::from_millis(*duration_ms);
-                let start_time = SystemTime::now()
-                    .checked_sub(duration)
-                    .unwrap_or(SystemTime::now());
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", true),
-                            KeyValue::new("hand.findings", *findings_count as i64),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                span.set_status(Status::Ok);
-                span.end();
-
-                let attrs = [
-                    KeyValue::new("hand", hand_name.clone()),
-                    KeyValue::new("success", "true"),
-                ];
-                self.hand_runs.add(1, &attrs);
-                self.hand_duration
-                    .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
-                self.hand_findings.add(
-                    *findings_count as u64,
-                    &[KeyValue::new("hand", hand_name.clone())],
-                );
-            }
-            ObserverEvent::HandFailed {
-                hand_name,
-                error,
-                duration_ms,
-            } => {
-                let secs = *duration_ms as f64 / 1000.0;
-                let duration = std::time::Duration::from_millis(*duration_ms);
-                let start_time = SystemTime::now()
-                    .checked_sub(duration)
-                    .unwrap_or(SystemTime::now());
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", false),
-                            KeyValue::new("error.message", error.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                span.set_status(Status::error(error.clone()));
-                span.end();
-
-                let attrs = [
-                    KeyValue::new("hand", hand_name.clone()),
-                    KeyValue::new("success", "false"),
-                ];
-                self.hand_runs.add(1, &attrs);
-                self.hand_duration
-                    .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
-            }
             ObserverEvent::DeploymentStarted { .. }
             | ObserverEvent::DeploymentCompleted { .. }
             | ObserverEvent::DeploymentFailed { .. }
@@ -466,29 +406,6 @@ impl Observer for OtelObserver {
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.record(*d, &[]);
             }
-            ObserverMetric::HandRunDuration {
-                hand_name,
-                duration,
-            } => {
-                self.hand_duration.record(
-                    duration.as_secs_f64(),
-                    &[KeyValue::new("hand", hand_name.clone())],
-                );
-            }
-            ObserverMetric::HandFindingsCount { hand_name, count } => {
-                self.hand_findings
-                    .add(*count, &[KeyValue::new("hand", hand_name.clone())]);
-            }
-            ObserverMetric::HandSuccessRate { hand_name, success } => {
-                let success_str = if *success { "true" } else { "false" };
-                self.hand_runs.add(
-                    1,
-                    &[
-                        KeyValue::new("hand", hand_name.clone()),
-                        KeyValue::new("success", success_str),
-                    ],
-                );
-            }
             ObserverMetric::DeploymentLeadTime(_) | ObserverMetric::RecoveryTime(_) => {
                 // DORA metrics: OTel pass-through not yet implemented.
             }
@@ -497,10 +414,22 @@ impl Observer for OtelObserver {
 
     fn flush(&self) {
         if let Err(e) = self.tracer_provider.force_flush() {
-            tracing::warn!("OTel trace flush failed: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "OTel trace flush failed"
+            );
         }
         if let Err(e) = self.meter_provider.force_flush() {
-            tracing::warn!("OTel metric flush failed: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "OTel metric flush failed"
+            );
         }
     }
 
@@ -541,16 +470,16 @@ mod tests {
     fn records_all_events_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(250),
             success: true,
@@ -559,14 +488,14 @@ mod tests {
             output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
@@ -574,17 +503,24 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(5),
             success: false,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
@@ -593,7 +529,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
     }
@@ -615,6 +551,41 @@ mod tests {
         obs.flush();
     }
 
+    /// Regression test for upstream issue #5980 — tool spans must accept a
+    /// populated `tool_call_id`, full `arguments`, and `result` without
+    /// panicking, including payloads large enough that naive attribute
+    /// encoding could truncate them. We can't assert on exported span
+    /// attributes here because the OTLP pipeline runs asynchronously, but
+    /// verifying the recording path handles all three optional fields
+    /// exercises the new gen_ai.tool.* code paths.
+    #[test]
+    fn tool_call_with_id_args_and_result_does_not_panic() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+            tool_call_id: Some("toolu_01ABC".into()),
+            arguments: Some(r#"{"command":"ls -la /tmp"}"#.into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            tool_call_id: Some("toolu_01ABC".into()),
+            duration: Duration::from_millis(42),
+            success: true,
+            arguments: Some(r#"{"command":"ls -la /tmp"}"#.into()),
+            result: Some("total 0\ndrwxr-xr-x  2 root root 40 Apr 22 12:00 .\n".into()),
+        });
+        // Failure case — the issue author specifically wants to see *why*
+        // a tool call failed, so the result field is the error text.
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            tool_call_id: Some("toolu_02DEF".into()),
+            duration: Duration::from_millis(3),
+            success: false,
+            arguments: Some(r#"{"command":"rm -rf /"}"#.into()),
+            result: Some("Error: command denied by allowlist policy".into()),
+        });
+    }
+
     // ── §8.2 OTel export failure resilience tests ────────────
 
     #[test]
@@ -622,7 +593,7 @@ mod tests {
         let obs = test_observer();
         // Simulate an error event — should not panic even with unreachable endpoint
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "connection refused to model endpoint".into(),
         });
     }
@@ -631,7 +602,7 @@ mod tests {
     fn otel_records_llm_failure_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "missing-model".into(),
             duration: Duration::from_millis(0),
             success: false,
@@ -657,41 +628,6 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(0));
         obs.record_metric(&ObserverMetric::QueueDepth(0));
-    }
-
-    #[test]
-    fn otel_hand_events_do_not_panic() {
-        let obs = test_observer();
-        obs.record_event(&ObserverEvent::HandStarted {
-            hand_name: "review".into(),
-        });
-        obs.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 1500,
-            findings_count: 3,
-        });
-        obs.record_event(&ObserverEvent::HandFailed {
-            hand_name: "review".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-        });
-    }
-
-    #[test]
-    fn otel_hand_metrics_do_not_panic() {
-        let obs = test_observer();
-        obs.record_metric(&ObserverMetric::HandRunDuration {
-            hand_name: "review".into(),
-            duration: Duration::from_millis(1500),
-        });
-        obs.record_metric(&ObserverMetric::HandFindingsCount {
-            hand_name: "review".into(),
-            count: 5,
-        });
-        obs.record_metric(&ObserverMetric::HandSuccessRate {
-            hand_name: "review".into(),
-            success: true,
-        });
     }
 
     #[test]
@@ -723,7 +659,7 @@ mod tests {
         let obs = OtelObserver::new(Some("http://127.0.0.1:19999"), Some("test"), Some(headers))
             .expect("creation should succeed");
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "anthropic".into(),
+            model_provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(100),
             success: true,
@@ -733,8 +669,11 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(50),
             success: true,
+            arguments: None,
+            result: None,
         });
     }
 

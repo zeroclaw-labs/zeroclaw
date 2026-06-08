@@ -1,11 +1,14 @@
 //! Integration catalog — schema-driven, single-loop.
 //!
 //! Every entry comes from a schema-side source:
-//! - Channels: `ChannelsConfig::nested_option_entries()` (per-field
-//!   `#[display_name = ...]` / `#[description = ...]` attributes).
+//! - Channels: `ChannelsConfig::channels()` (each multi-instance V3
+//!   channel field surfaces as one `ChannelInfo` entry; name and desc
+//!   strings live in `channels()` itself, not in this file).
 //! - Toggle integrations: `Config::integration_descriptors()` (per-struct
-//!   `#[integration(...)]` attribute on `BrowserConfig`, `CronConfig`,
-//!   `GoogleWorkspaceConfig`).
+//!   `#[integration(...)]` attribute on `BrowserConfig` /
+//!   `GoogleWorkspaceConfig`, plus an inline descriptor for `cron` whose
+//!   `active` reflects whether any job is configured — cron is now a
+//!   `HashMap<String, CronJobDecl>` with no enable toggle struct).
 //! - AI providers: `zeroclaw_providers::list_providers()` (each
 //!   `ProviderInfo` row carries `display_name`, `description`, and a
 //!   `ProviderActivation` strategy).
@@ -21,7 +24,6 @@ use super::platform::PLATFORMS;
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
 use crate::tools::BUILTIN_TOOL_INTEGRATIONS;
 use zeroclaw_config::schema::Config;
-use zeroclaw_providers::ProviderActivation;
 
 fn bool_to_status(active: bool) -> IntegrationStatus {
     if active {
@@ -46,52 +48,45 @@ fn parse_category(label: &str) -> IntegrationCategory {
     }
 }
 
-/// Compute an AI-model integration's status from its `ProviderActivation`
-/// strategy. The registry never branches on a provider name — every
-/// per-vendor decision lives on the `ProviderInfo` row in
-/// `zeroclaw_providers::list_providers()`.
-fn evaluate_provider_activation(
+/// Compute an AI-model integration's status from typed-family slot
+/// occupancy. The registry never branches on a provider name — the
+/// canonical slot list (`for_each_model_provider_slot!`) is the single
+/// source of truth, and a slot is "active" iff at least one alias is
+/// configured under it. Regional variants and OAuth modes that used to
+/// drive richer activation predicates are now folded onto the parent
+/// typed slot, so per-row activation enums are unnecessary.
+fn evaluate_model_provider_activation(
     config: &Config,
-    info: &zeroclaw_providers::ProviderInfo,
+    info: &zeroclaw_providers::ModelProviderInfo,
 ) -> IntegrationStatus {
-    let fallback = config.providers.fallback.as_deref();
-    let active = match info.activation {
-        ProviderActivation::FallbackKey => {
-            fallback == Some(info.name) || info.aliases.iter().any(|a| fallback == Some(*a))
-        }
-        ProviderActivation::FallbackKeyWithApiKey => {
-            (fallback == Some(info.name) || info.aliases.iter().any(|a| fallback == Some(*a)))
-                && config
-                    .providers
-                    .fallback_provider()
-                    .and_then(|e| e.api_key.as_ref())
-                    .is_some()
-        }
-        ProviderActivation::ModelPrefix(prefix) => config
+    bool_to_status(
+        config
             .providers
-            .fallback_provider()
-            .and_then(|e| e.model.as_deref())
-            .is_some_and(|m| m.starts_with(prefix)),
-        ProviderActivation::FallbackKeyMatches(predicate) => fallback.is_some_and(predicate),
-    };
-    bool_to_status(active)
+            .models
+            .contains_model_provider_type(info.name),
+    )
 }
 
 /// Returns the integration catalog computed against `config`.
 ///
 /// Single-loop, schema-driven. Every per-row decision lives on the
 /// schema-side source; this function just concatenates the iterators.
+///
+/// Channel discovery walks `ChannelsConfig::channels()` which always
+/// returns all known channel types; each `ChannelInfo` carries name,
+/// desc, and a configured flag.  Multi-instance V3 channels are
+/// reported active when any alias is configured.
 pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
     let channels = config
         .channels
-        .nested_option_entries()
+        .channels()
         .into_iter()
-        .map(|e| IntegrationEntry {
-            name: e.display_name.to_string(),
-            description: e.description.to_string(),
+        .map(|info| IntegrationEntry {
+            name: info.name.to_string(),
+            description: info.desc.to_string(),
             category: IntegrationCategory::Chat,
             category_label: IntegrationCategory::Chat.label().to_string(),
-            status: bool_to_status(e.present),
+            status: bool_to_status(info.configured),
         });
 
     let toggles = config.integration_descriptors().into_iter().map(|d| {
@@ -105,13 +100,13 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
         }
     });
 
-    let providers = zeroclaw_providers::list_providers()
+    let providers = zeroclaw_providers::list_model_providers()
         .into_iter()
         .map(|info| {
-            let status = evaluate_provider_activation(config, &info);
+            let status = evaluate_model_provider_activation(config, &info);
             IntegrationEntry {
                 name: info.display_name.to_string(),
-                description: info.description.to_string(),
+                description: String::new(),
                 category: IntegrationCategory::AiModel,
                 category_label: IntegrationCategory::AiModel.label().to_string(),
                 status,
@@ -149,6 +144,7 @@ mod tests {
     use super::*;
     use zeroclaw_config::schema::Config;
     use zeroclaw_config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use zeroclaw_config::traits::ChannelConfig;
 
     #[test]
     fn registry_has_entries() {
@@ -205,41 +201,44 @@ mod tests {
 
     #[test]
     fn channel_entries_carry_per_field_metadata_from_schema() {
-        // Schema-driven contract: every Option<XConfig> on ChannelsConfig
-        // surfaces as a Chat entry whose display_name and description
-        // come from the field's `#[display_name = ...]` /
-        // `#[description = ...]` attributes — no override table here.
+        // Schema-driven contract: every channel registered through
+        // `ChannelsConfig::channels()` surfaces as a Chat entry whose
+        // display_name and description come from the channel's
+        // `ChannelConfig::name()` / `desc()` methods — no override
+        // table lives here. V3 channels are HashMap<alias, XConfig>
+        // (one entry per channel type at the registry level), so the
+        // count must equal the number of (handle, _) pairs returned.
         let config = Config::default();
         let entries = all_integrations(&config);
         let channel_count = entries
             .iter()
             .filter(|e| e.category == IntegrationCategory::Chat)
             .count();
-        let nested_count = config.channels.nested_option_entries().len();
+        let channel_infos = config.channels.channels();
         assert_eq!(
-            channel_count, nested_count,
-            "every Option<XConfig> field should produce exactly one Chat entry",
+            channel_count,
+            channel_infos.len(),
+            "every ChannelsConfig::channels() entry should produce exactly one Chat entry",
         );
-        for nested in config.channels.nested_option_entries() {
+        for info in &channel_infos {
             let entry = entries
                 .iter()
-                .find(|e| e.name == nested.display_name)
+                .find(|e| e.name == info.name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "channel field {:?} (display {:?}) missing from registry",
-                        nested.field, nested.display_name,
+                        "channel {:?} ({:?}) missing from registry",
+                        info.name, info.desc,
                     )
                 });
             assert!(
                 !entry.name.is_empty(),
-                "channel field {:?} produced empty display name",
-                nested.field
+                "channel {:?} produced empty display name",
+                info.name,
             );
             assert!(
                 !entry.description.is_empty(),
-                "channel field {:?} (display {:?}) missing #[description = ...] attribute",
-                nested.field,
-                nested.display_name,
+                "channel {:?} missing description text",
+                info.name,
             );
         }
     }
@@ -247,29 +246,26 @@ mod tests {
     #[test]
     fn telegram_active_when_configured() {
         let mut config = Config::default();
-        config.channels.telegram = Some(TelegramConfig {
-            enabled: true,
-            bot_token: "123:ABC".into(),
-            allowed_users: vec!["user".into()],
-            stream_mode: StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-            approval_timeout_secs: 120,
-        });
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "123:ABC".into(),
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
         let entries = all_integrations(&config);
-        let nested = config
-            .channels
-            .nested_option_entries()
-            .into_iter()
-            .find(|e| e.field == "telegram")
-            .expect("telegram field declared on ChannelsConfig");
-        let tg = entries
-            .iter()
-            .find(|e| e.name == nested.display_name)
-            .unwrap();
+        let display_name = <TelegramConfig as ChannelConfig>::name();
+        let tg = entries.iter().find(|e| e.name == display_name).unwrap();
         assert!(matches!(tg.status, IntegrationStatus::Active));
     }
 
@@ -277,100 +273,158 @@ mod tests {
     fn telegram_available_when_not_configured() {
         let config = Config::default();
         let entries = all_integrations(&config);
-        let nested = config
-            .channels
-            .nested_option_entries()
-            .into_iter()
-            .find(|e| e.field == "telegram")
-            .expect("telegram field declared on ChannelsConfig");
-        let tg = entries
-            .iter()
-            .find(|e| e.name == nested.display_name)
-            .unwrap();
+        let display_name = <TelegramConfig as ChannelConfig>::name();
+        let tg = entries.iter().find(|e| e.name == display_name).unwrap();
         assert!(matches!(tg.status, IntegrationStatus::Available));
     }
 
     #[test]
     fn imessage_active_when_configured() {
         let mut config = Config::default();
-        config.channels.imessage = Some(IMessageConfig {
-            enabled: true,
-            allowed_contacts: vec!["*".into()],
-        });
+        config.channels.imessage.insert(
+            "default".to_string(),
+            IMessageConfig {
+                enabled: true,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
         let entries = all_integrations(&config);
-        let nested = config
-            .channels
-            .nested_option_entries()
-            .into_iter()
-            .find(|e| e.field == "imessage")
-            .expect("imessage field declared on ChannelsConfig");
-        let im = entries
-            .iter()
-            .find(|e| e.name == nested.display_name)
-            .unwrap();
+        let display_name = <IMessageConfig as ChannelConfig>::name();
+        let im = entries.iter().find(|e| e.name == display_name).unwrap();
         assert!(matches!(im.status, IntegrationStatus::Active));
+    }
+
+    #[test]
+    fn imessage_available_when_not_configured() {
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        let display_name = <IMessageConfig as ChannelConfig>::name();
+        let im = entries.iter().find(|e| e.name == display_name).unwrap();
+        assert!(matches!(im.status, IntegrationStatus::Available));
     }
 
     #[test]
     fn matrix_active_when_configured() {
         let mut config = Config::default();
-        config.channels.matrix = Some(MatrixConfig {
-            enabled: true,
-            homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
-            user_id: None,
-            device_id: None,
-            allowed_users: vec![],
-            allowed_rooms: vec!["!r:m".into()],
-            interrupt_on_new_message: false,
-            stream_mode: zeroclaw_config::schema::StreamMode::default(),
-            draft_update_interval_ms: 1500,
-            multi_message_delay_ms: 800,
-            recovery_key: None,
-            password: None,
-            mention_only: false,
-            approval_timeout_secs: 300,
-            reply_in_thread: true,
-            ack_reactions: true,
-        });
+        config.channels.matrix.insert(
+            "default".to_string(),
+            MatrixConfig {
+                enabled: true,
+                homeserver: "https://m.org".into(),
+                access_token: Some("tok".into()),
+                user_id: None,
+                device_id: None,
+                allowed_rooms: vec!["!r:m".into()],
+                interrupt_on_new_message: false,
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
+                recovery_key: None,
+                password: None,
+                mention_only: false,
+                approval_timeout_secs: 300,
+                reply_in_thread: true,
+                ack_reactions: Some(true),
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
         let entries = all_integrations(&config);
-        let nested = config
-            .channels
-            .nested_option_entries()
-            .into_iter()
-            .find(|e| e.field == "matrix")
-            .expect("matrix field declared on ChannelsConfig");
-        let mx = entries
-            .iter()
-            .find(|e| e.name == nested.display_name)
-            .unwrap();
+        let display_name = <MatrixConfig as ChannelConfig>::name();
+        let mx = entries.iter().find(|e| e.name == display_name).unwrap();
         assert!(matches!(mx.status, IntegrationStatus::Active));
     }
 
-    #[test]
-    fn cron_active_when_enabled_via_integration_descriptor() {
-        let mut config = Config::default();
-        config.cron.enabled = true;
-        let entries = all_integrations(&config);
-        let descriptor = config.cron.integration_descriptor();
-        let cron = entries
+    /// Look up a toggle integration's status by its descriptor display
+    /// name. Each call to `Config::integration_descriptors()` is the
+    /// schema-side source of truth, so the helper resolves the entry
+    /// dynamically rather than hardcoding the display string.
+    fn toggle_status(config: &Config, field_filter: impl Fn(&str) -> bool) -> IntegrationStatus {
+        let descriptor = config
+            .integration_descriptors()
+            .into_iter()
+            .find(|d| field_filter(d.display_name))
+            .unwrap_or_else(|| panic!("expected toggle integration descriptor not present"));
+        let entries = all_integrations(config);
+        let entry = entries
             .iter()
             .find(|e| e.name == descriptor.display_name)
-            .unwrap();
-        assert!(matches!(cron.status, IntegrationStatus::Active));
+            .unwrap_or_else(|| {
+                panic!(
+                    "registry missing toggle integration entry for {:?}",
+                    descriptor.display_name,
+                )
+            });
+        entry.status
     }
 
     #[test]
-    fn browser_active_when_enabled_via_integration_descriptor() {
+    fn browser_active_in_default_config() {
+        // BrowserConfig::default() has enabled=true, so the toggle
+        // should be Active in the unconfigured registry.
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_available_when_disabled() {
         let mut config = Config::default();
-        config.browser.enabled = true;
-        let entries = all_integrations(&config);
-        let descriptor = config.browser.integration_descriptor();
-        let browser = entries
-            .iter()
-            .find(|e| e.name == descriptor.display_name)
-            .unwrap();
-        assert!(matches!(browser.status, IntegrationStatus::Active));
+        config.browser.enabled = false;
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn google_workspace_available_in_default_config() {
+        // GoogleWorkspaceConfig defaults to enabled=false.
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Google Workspace"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn google_workspace_active_when_enabled() {
+        let mut config = Config::default();
+        config.google_workspace.enabled = true;
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Google Workspace"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn cron_available_when_no_jobs_configured() {
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Cron"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn cron_active_when_any_job_configured() {
+        // Cron is HashMap<String, CronJobDecl>; the descriptor's
+        // `active` reflects `!cron.is_empty()`, so a single entry
+        // (default-constructed) flips the toggle to Active.
+        let mut config = Config::default();
+        config.cron.insert(
+            "daily-digest".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Cron"),
+            IntegrationStatus::Active
+        ));
     }
 
     #[test]
@@ -410,43 +464,44 @@ mod tests {
     }
 
     #[test]
-    fn regional_provider_aliases_activate_expected_ai_integrations() {
-        // For each multi-region family that uses
-        // `ProviderActivation::FallbackKeyMatches`, configuring a
-        // regional alias must mark the corresponding
-        // `ProviderInfo`-derived integration entry as Active. Looks the
-        // entry up by canonical name (not display_name) so display
-        // copy can change without breaking the contract.
-        let cases = [
-            ("minimax-cn", "minimax"),
-            ("glm-cn", "glm"),
-            ("moonshot-intl", "moonshot"),
-            ("qwen-intl", "qwen"),
-            ("zai-cn", "zai"),
-            ("baidu", "qianfan"),
-        ];
-        for (fallback_key, canonical) in cases {
+    fn populated_typed_slot_activates_corresponding_ai_integration() {
+        // PR-branch typed-family layout: regional variants are folded
+        // onto the parent canonical slot (e.g. minimax-cn → minimax with
+        // a typed `endpoint` enum on the alias entry). Activation is
+        // therefore "any alias under the canonical slot" — a one-call
+        // `contains_model_provider_type` check that drops the V2-era
+        // `FallbackKeyMatches` predicate scaffolding.
+        //
+        // Drives every entry of `list_model_providers()` so adding a
+        // new family later (one row in `for_each_model_provider_slot!`
+        // + one display_name row here) is automatically covered.
+        for info in zeroclaw_providers::list_model_providers() {
             let mut config = Config::default();
-            config.providers.fallback = Some(fallback_key.to_string());
+            assert!(
+                config
+                    .providers
+                    .models
+                    .ensure(info.name, "default")
+                    .is_some(),
+                "ModelProviderInfo {:?} must correspond to a typed slot \
+                 (drift: name not in `for_each_model_provider_slot!`)",
+                info.name,
+            );
             let entries = all_integrations(&config);
-            let info = zeroclaw_providers::list_providers()
-                .into_iter()
-                .find(|p| p.name == canonical)
-                .unwrap_or_else(|| {
-                    panic!("ProviderInfo for canonical name {canonical:?} must exist")
-                });
             let integration = entries
                 .iter()
                 .find(|e| e.name == info.display_name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "integration entry for {canonical:?} (display {:?}) must exist",
-                        info.display_name,
+                        "integration entry for {:?} (display {:?}) must exist",
+                        info.name, info.display_name,
                     )
                 });
             assert!(
                 matches!(integration.status, IntegrationStatus::Active),
-                "fallback {fallback_key:?} must activate {canonical:?} integration",
+                "configuring slot {:?} must activate {:?} integration",
+                info.name,
+                info.display_name,
             );
         }
     }

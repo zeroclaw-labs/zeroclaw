@@ -40,11 +40,16 @@ With the feature enabled, the agent gains these tools:
 - `peripheral_probe` — discover attached boards and sensors
 - `peripheral_flash` — flash firmware to a connected microcontroller
 
-All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Restrict device access via:
+All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Hardware tools only reach the device paths explicitly listed in `[[peripherals.boards]]` entries:
 
 ```toml
-[security.sandbox]
-allow_devices = ["/dev/gpiochip0", "/dev/i2c-1", "/dev/ttyUSB0"]
+[peripherals]
+enabled = true
+
+[[peripherals.boards]]
+board = "nucleo-f401re"
+transport = "serial"
+path = "/dev/ttyACM0"
 ```
 
 ## Running on a Raspberry Pi
@@ -72,12 +77,14 @@ Hardware tools can brick things. Real, expensive things.
 - `i2c_write` / `spi_transfer` to device addresses the agent doesn't know can damage sensors.
 - GPIO writes that conflict with external drivers (voltage fights) damage pins.
 
-For production deployments with untrusted channels exposed, disable hardware tools per channel:
+For production deployments with untrusted channels exposed, keep hardware tools off non-CLI channels via the global autonomy config (the schema has no per-channel `tools_deny` field):
 
 ```toml
-[channels.public-discord]
-tools_deny = ["gpio_write", "i2c_write", "spi_transfer", "peripheral_flash"]
+[autonomy]
+non_cli_excluded_tools = ["gpio_write", "i2c_write", "spi_transfer", "peripheral_flash"]
 ```
+
+Tools listed here are omitted from the tool specs sent to the model on every non-CLI channel (Discord, Telegram, Bluesky, etc.). The local CLI still sees them.
 
 ## Datasheets
 

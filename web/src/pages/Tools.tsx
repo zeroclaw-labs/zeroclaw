@@ -103,7 +103,7 @@ export default function Tools() {
                   >
                     <button
                       onClick={() => setExpandedTool(isExpanded ? null : tool.name)}
-                      className="w-full text-left p-4 transition-all"
+                      className="w-full text-left p-4 transition-all h-full"
                       style={{ background: 'transparent' }}
                       onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--pc-hover)'; }}
                       onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}

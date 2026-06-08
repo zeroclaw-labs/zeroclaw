@@ -8,7 +8,8 @@
 use crate::session_backend::SessionBackend;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
+pub use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Append-only JSONL session store for channel conversations.
 pub struct SessionStore {
@@ -25,17 +26,8 @@ impl SessionStore {
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
-        let safe_key: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.sessions_dir.join(format!("{safe_key}.jsonl"))
+        self.sessions_dir
+            .join(format!("{}.jsonl", sanitize_session_key(session_key)))
     }
 
     /// Load all messages for a session from its JSONL file.
@@ -191,6 +183,10 @@ impl SessionBackend for SessionStore {
                     last_activity,
                     message_count: 0,
                     key,
+                    agent_alias: None,
+                    channel_id: None,
+                    room_id: None,
+                    sender_id: None,
                 }
             })
             .collect()
@@ -206,6 +202,13 @@ impl SessionBackend for SessionStore {
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
+    }
+
+    /// Quick existence probe mirroring how `delete_session` decides whether
+    /// the session is on disk (#7126). Checking file presence is the same
+    /// O(1) `stat` that `delete_session` itself performs.
+    fn session_exists(&self, session_key: &str) -> bool {
+        self.session_path(session_key).exists()
     }
 }
 
@@ -248,13 +251,46 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
 
-        // Keys with special chars should be sanitized
         store
             .append("slack/thread:123/user", &ChatMessage::user("test"))
             .unwrap();
 
         let messages = store.load("slack/thread:123/user");
         assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn sanitize_session_key_is_idempotent() {
+        let raw = "slack_C123_1.2_user one";
+        let once = sanitize_session_key(raw);
+        let twice = sanitize_session_key(&once);
+        assert_eq!(once, "slack_C123_1_2_user_one");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn restart_simulation_matches_when_caller_pre_sanitizes() {
+        let tmp = TempDir::new().unwrap();
+        let runtime_key = sanitize_session_key("slack_C123_1.2_user one");
+
+        {
+            let store = SessionStore::new(tmp.path()).unwrap();
+            store
+                .append(&runtime_key, &ChatMessage::user("first"))
+                .unwrap();
+            store
+                .append(&runtime_key, &ChatMessage::assistant("ack"))
+                .unwrap();
+        }
+
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let listed = store.list_sessions();
+        assert_eq!(listed, vec![runtime_key.clone()]);
+
+        let msgs = store.load(&listed[0]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "first");
+        assert_eq!(msgs[1].content, "ack");
     }
 
     #[test]
@@ -460,6 +496,24 @@ mod tests {
         let deleted = backend.delete_session("trait_delete").unwrap();
         assert!(deleted);
         assert!(backend.load("trait_delete").is_empty());
+    }
+
+    // ── session_exists (#7126) ─────────────────────────────────────
+    #[test]
+    fn session_exists_tracks_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        assert!(!backend.session_exists("ghost"));
+
+        backend
+            .append("ghost", &ChatMessage::user("first"))
+            .unwrap();
+        assert!(backend.session_exists("ghost"));
+
+        backend.delete_session("ghost").unwrap();
+        assert!(!backend.session_exists("ghost"));
     }
 
     // ── get_session_metadata (trait default) tests ──────────────────

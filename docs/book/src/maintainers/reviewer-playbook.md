@@ -8,6 +8,8 @@ For the actual fetch sequence and review verdict mechanics, see [PR Review Proto
 
 Use this section to route a review before reading deeper. Each row links to the section that elaborates.
 
+Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this playbook's risk matrix for review depth.
+
 | Situation | Action | Section |
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
@@ -26,6 +28,8 @@ Use this section to route a review before reading deeper. Each row links to the 
 When uncertain, treat as higher risk.
 
 If the path-labeler's risk inference is contextually wrong, apply `risk: manual` and set the final `risk:*` label explicitly — manual freezes any future automated recalculation.
+
+Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
 ## Standard workflow
 
@@ -76,14 +80,30 @@ Vague comments create avoidable round trips. If you find yourself writing "this 
 
 The same risk-routing principle applies to issues, but the labels and signals are different.
 
+Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk:*` labels describe the actual diff under review. Reassess risk when an issue becomes a PR instead of carrying the issue label forward automatically.
+
 ### Triage labels
 
 | Label | When to use |
 |---|---|
 | `r:needs-repro` | Bug report missing a deterministic repro. Block deeper triage on this. |
 | `r:support` | Usage or help question better routed outside the bug backlog. |
-| `duplicate` / `invalid` | Non-actionable noise. Close with a polite pointer. |
-| `no-stale` | Accepted work waiting on an external blocker. Keeps the issue out of stale automation. |
+| `status:accepted` | The team has accepted the RFC or work item. Add `status:no-stale` only when the issue also needs stale protection. |
+| `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
+| `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
+| `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and active owner or steward path using the contributor-visible owner sources in the [Project board contract](./pr-workflow.md#issue-ownership-path). |
+| `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
+| `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
+
+Assignee means active work. Area steward means responsibility for the next issue-routing decision when no implementer is active. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes. Labels can identify the likely area, but labels alone are not an owner source.
+
+### Resolution labels
+
+Use resolution labels only when closing or removing an item from the active queue. They explain the terminal outcome; they do not replace `status:*` lifecycle labels on work that should stay open. The [labels guide](./labels.md#resolution-labels) is the source of truth for current resolution-label definitions and migration holdbacks.
+
+For duplicates, link the canonical target before closing or redirecting discussion. For invalid reports, explain what makes the report unactionable or where it should go instead. For work we are explicitly choosing not to pursue, use the board-level `Won't Do` / live `wontfix` path and leave a brief rationale.
+
+For replaced PRs or issue paths, use [Superseding PRs](./superseding.md) and preserve contributor attribution when relevant.
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
 
@@ -92,7 +112,7 @@ If logs or payloads in the report contain personal identifiers or sensitive data
 When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size: XS/S`) at the top of the queue.
-2. Ask overlapping PRs to consolidate; close older ones as `superseded` after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
+2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
 3. Mark dormant PRs as `stale-candidate` before stale closure window starts.
 4. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
 
@@ -119,7 +139,7 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 
 ## Weekly queue hygiene
 
-- Walk the stale queue. Apply `no-stale` only to accepted-but-blocked work.
+- Walk the stale queue. Apply `status:no-stale` only when accepted or otherwise long-lived work has a recorded reason to stay open, a visible active owner or steward path, and no other stale exclusion already applies. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 

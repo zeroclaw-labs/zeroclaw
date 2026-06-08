@@ -7,9 +7,11 @@ description = "Configuration schema, secrets, and related types for ZeroClaw."
 publish = false
 
 [dependencies]
+zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
 anyhow = "1.0"
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "derive"] }
 # OnboardUi needs dyn-compat; native AFIT isn't dyn-safe. Already built for api/channels/runtime.
 async-trait = "0.1"
 chacha20poly1305 = "0.10"
@@ -18,9 +20,11 @@ directories = "6.0"
 hex = "0.4"
 hostname = "0.4.2"
 parking_lot = "0.12"
+postgres = { version = "0.19", default-features = false, features = ["with-chrono-0_4"], optional = true }
 rand = "0.10"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -36,18 +40,18 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 rustls-pki-types = "1.14.0"
 toml = "1.0"
 toml_edit = "0.25"
-tracing = { version = "0.1", default-features = false }
 url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
-default = ["schema-export"]
+# schema-export and clap are the only defaults. All channel schema types
+# compile unconditionally; channel feature flags live in zeroclaw-channels only.
+default = ["schema-export", "clap"]
 schema-export = ["dep:schemars"]
-channel-nostr = []
-voice-wake = []
+clap = ["dep:clap"]
+memory-postgres = ["dep:postgres"]

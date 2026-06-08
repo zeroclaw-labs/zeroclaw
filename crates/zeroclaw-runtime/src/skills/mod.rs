@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,9 +13,25 @@ use std::time::{Duration, SystemTime};
 use zip::ZipArchive;
 
 pub mod audit;
+pub mod bundle;
+pub mod constants;
 pub mod creator;
+pub mod document;
+pub mod frontmatter;
 pub mod improver;
+pub mod reference;
+pub mod scaffold;
+pub mod service;
+mod suggestions;
 pub mod testing;
+
+pub use bundle::{BundleError, BundleSummary};
+pub use document::{DocumentParseError, SkillDocument};
+pub use frontmatter::SkillFrontmatter;
+pub use reference::{SkillRef, SkillRefError};
+pub use scaffold::{ScaffoldError, ScaffoldOptions};
+pub use service::{RemoveMode, ServiceError, SkillSummary, SkillsService};
+pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -53,23 +69,53 @@ pub struct Skill {
     pub location: Option<PathBuf>,
 }
 
+impl ::zeroclaw_api::attribution::Attributable for Skill {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Skill
+    }
+    fn alias(&self) -> &str {
+        &self.name
+    }
+}
+
 /// A tool defined by a skill (shell command, HTTP call, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillTool {
     pub name: String,
     pub description: String,
-    /// "shell", "http", "script"
+    /// "shell", "http", "script", "builtin", "mcp"
     pub kind: String,
-    /// The command/URL/script to execute
+    /// The command/URL/script to execute (unused for builtin/mcp kinds)
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// For `kind = "builtin"`: the name of the built-in tool to delegate to.
+    /// For `kind = "mcp"`: the prefixed MCP tool name `{server}__{tool}`
+    /// (e.g. `images__generate`).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// For `kind = "builtin"` / `kind = "mcp"`: arguments fixed by the skill
+    /// manifest. These are **locked** — they are applied on top of the
+    /// caller-supplied args and cannot be overridden by the model. This is
+    /// what scopes a delegated tool (e.g. `target = "composio"` +
+    /// `locked_args = { action_name = "TEXT_TO_PDF" }` exposes exactly one
+    /// action). Accepts the legacy key `default_args` for compatibility.
+    #[serde(default, alias = "default_args")]
+    pub locked_args: HashMap<String, String>,
 }
 
 /// Skill manifest parsed from SKILL.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillManifest {
     skill: SkillMeta,
+    /// SkillForge-emitted provenance metadata. Lives in a top-level `[forge]`
+    /// table so that `SkillMeta` (the canonical skill-identity contract) is
+    /// not coupled to the SkillForge integrator's emit format. Hand-authored
+    /// SKILL.toml files omit this; auto-integrated skills carry it. See
+    /// #6210 for the architectural rationale (FND-001 §4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forge: Option<ForgeMetadata>,
     #[serde(default)]
     tools: Vec<SkillTool>,
     #[serde(default)]
@@ -77,6 +123,7 @@ struct SkillManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkillMeta {
     name: String,
     description: String,
@@ -88,6 +135,47 @@ struct SkillMeta {
     tags: Vec<String>,
     #[serde(default)]
     prompts: Vec<String>,
+}
+
+/// Provenance metadata emitted by the SkillForge integrator (see
+/// `crates/zeroclaw-runtime/src/skillforge/integrate.rs`). Lives at the
+/// top level of SKILL.toml under `[forge]`, kept separate from
+/// `[skill]` so the canonical skill identity stays decoupled from the
+/// integrator's emit format. Strict by design: a typo here is just as
+/// bad as a typo in `[skill]` (silent misconfiguration of provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgeMetadata {
+    /// Upstream URL the skill was integrated from.
+    #[serde(default)]
+    source: Option<String>,
+    /// Upstream owner (GitHub user / org).
+    #[serde(default)]
+    owner: Option<String>,
+    /// Primary language reported by the source (or `"unknown"`).
+    #[serde(default)]
+    language: Option<String>,
+    /// `true` if the upstream repo carries a license file.
+    #[serde(default)]
+    license: Option<bool>,
+    /// Upstream star count at integration time.
+    #[serde(default)]
+    stars: Option<u64>,
+    /// Upstream `updated_at` timestamp formatted `YYYY-MM-DD`, or
+    /// `"unknown"` if the integrator could not resolve one.
+    #[serde(default)]
+    updated_at: Option<String>,
+    /// Runtime/version requirements declared by the integrator.
+    #[serde(default)]
+    requirements: BTreeMap<String, toml::Value>,
+    /// Free-form integrator metadata (e.g. `auto_integrated`,
+    /// `forge_timestamp`). **This is the intended extension point** for
+    /// future SkillForge metadata: prefer adding new keys under
+    /// `[forge.metadata.X]` over new top-level `[forge]` fields, which
+    /// would require a coordinated `ForgeMetadata` schema bump and break
+    /// strict parsing for anyone running an older runtime.
+    #[serde(default)]
+    metadata: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,6 +191,103 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
+/// Trust tier of a skill listed in the `zeroclaw-skills` registry.
+///
+/// Derived from the `tags` array in `registry.json`. `Unknown` is used as the
+/// "no recognized tier tag" fallback and is treated like `Community` for trust
+/// purposes when displaying the install banner.
+///
+/// `Featured` is intentionally kept as a distinct variant even though it
+/// renders identically to `Community` today: the registry's `Featured` tag is
+/// a separate curation signal (zeroclaw-labs hand-picked, but still authored
+/// outside zeroclaw-labs) and we expect to render it differently later — e.g.
+/// "Featured — community-curated by zeroclaw-labs but not maintained by us".
+/// Keeping the variant now avoids a churn-y enum extension once that copy
+/// lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillTier {
+    Official,
+    Community,
+    Featured,
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryIndex {
+    #[serde(default)]
+    skills: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEntry {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+fn tier_from_tags(tags: &[String]) -> SkillTier {
+    let has = |needle: &str| tags.iter().any(|t| t.eq_ignore_ascii_case(needle));
+    if has("Official") {
+        SkillTier::Official
+    } else if has("Community") {
+        SkillTier::Community
+    } else if has("Featured") {
+        SkillTier::Featured
+    } else {
+        SkillTier::Unknown
+    }
+}
+
+/// Look up a skill in `<registry_dir>/registry.json` and return its trust tier
+/// and version. Returns `(SkillTier::Unknown, None)` if the index file is
+/// missing, malformed, or does not list the skill.
+pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier, Option<String>) {
+    let path = registry_dir.join("registry.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return (SkillTier::Unknown, None);
+    };
+    let Ok(index) = serde_json::from_str::<RegistryIndex>(&data) else {
+        return (SkillTier::Unknown, None);
+    };
+    let Some(entry) = index.skills.into_iter().find(|e| e.name == name) else {
+        return (SkillTier::Unknown, None);
+    };
+    (tier_from_tags(&entry.tags), entry.version)
+}
+
+/// Build the install-time tier banner. `Official` skills get a single
+/// informational line; everything else (including `Featured` and the
+/// missing-tag fallback) gets the Community warn block.
+/// Pure: the Fluent key for a tier's install banner. Split out so tests can
+/// resolve it against the English catalogue without depending on the process
+/// locale.
+fn install_tier_banner_key(tier: SkillTier) -> &'static str {
+    match tier {
+        SkillTier::Official => "cli-skills-install-tier-official",
+        SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => {
+            "cli-skills-install-tier-community"
+        }
+    }
+}
+
+pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+    let version_label = version.unwrap_or("?");
+    let args = [("name", name), ("version", version_label)];
+    let key = install_tier_banner_key(tier);
+    let mut banner = crate::i18n::get_required_cli_string_with_args(key, &args);
+    if !banner.ends_with('\n') {
+        banner.push('\n');
+    }
+    banner
+}
+
+/// Print the install-time tier banner to stdout.
+pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) {
+    print!("{}", build_install_tier_banner(name, version, tier));
+}
+
 /// Emit a user-visible warning when a skill directory is skipped due to audit
 /// findings. When the findings mention blocked scripts and `allow_scripts` is
 /// `false`, the message includes actionable remediation guidance so users know
@@ -110,10 +295,15 @@ fn default_version() -> String {
 fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
     let scripts_blocked = summary.contains("script-like files are blocked");
     if scripts_blocked && !allow_scripts {
-        tracing::warn!(
-            "skipping skill directory {}: {summary}. \
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "skipping skill directory {}: {summary}. \
              To allow script files in skills, set `skills.allow_scripts = true` in your config.",
-            path.display(),
+                path.display().to_string()
+            )
         );
         eprintln!(
             "warning: skill '{}' was skipped because it contains script files. \
@@ -123,9 +313,14 @@ fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
                 .unwrap_or_else(|| path.display().to_string()),
         );
     } else {
-        tracing::warn!(
-            "skipping insecure skill directory {}: {summary}",
-            path.display(),
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "skipping insecure skill directory {}: {summary}",
+                path.display().to_string()
+            )
         );
     }
 }
@@ -143,19 +338,27 @@ fn warn_metadata_drift(skill_dir: &Path, toml_skill: &Skill, md_path: &Path) {
     if let Some(ref md_name) = parsed.meta.name
         && md_name != &toml_skill.name
     {
-        tracing::warn!(
-            "skill '{}': name mismatch between TOML ('{}') and SKILL.md ('{}')",
-            dir_name,
-            toml_skill.name,
-            md_name,
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "skill '{}': name mismatch between TOML ('{}') and SKILL.md ('{}')",
+                dir_name, toml_skill.name, md_name
+            )
         );
     }
     if let Some(ref md_desc) = parsed.meta.description {
         let md_desc = md_desc.trim();
         if !md_desc.is_empty() && md_desc != ">-" && md_desc != toml_skill.description.trim() {
-            tracing::warn!(
-                "skill '{}': description mismatch between TOML and SKILL.md — TOML takes precedence",
-                dir_name,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "skill '{}': description mismatch between TOML and SKILL.md — TOML takes precedence",
+                    dir_name
+                )
             );
         }
     }
@@ -182,6 +385,71 @@ pub fn load_skills_with_config(
     #[cfg(feature = "plugins-wasm")]
     skills.extend(load_plugin_skills_from_config(config));
 
+    skills
+}
+
+/// Per-agent skill discovery. Walks `[agents.<agent_alias>].skill_bundles`,
+/// resolves each bundle's directory via the shared
+/// [`zeroclaw_config::skill_bundles::resolve_directory`] helper, and unions
+/// the skills under each bundle with whatever
+/// [`load_skills_with_config`] would return for the install (workspace
+/// skills, open-skills, plugin skills). Empty `skill_bundles` falls back
+/// to the install-wide set — keeps freshly-migrated agents working until
+/// the operator assigns a bundle.
+pub fn load_skills_for_agent(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Vec<Skill> {
+    let mut skills = load_skills_with_config(workspace_dir, config);
+    let Some(agent) = config.agent(agent_alias) else {
+        return skills;
+    };
+    if agent.skill_bundles.is_empty() {
+        return skills;
+    }
+    let install_root = config.install_root_dir();
+    let allow_scripts = config.skills.allow_scripts;
+    let mut seen: std::collections::HashSet<String> =
+        skills.iter().map(|s| s.name.clone()).collect();
+    for bundle_alias in &agent.skill_bundles {
+        let bundle = match config.skill_bundles.get(bundle_alias) {
+            Some(b) => b,
+            None => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "bundle_alias": bundle_alias})), "skipping skill bundle: [skill_bundles.] is not configured");
+                continue;
+            }
+        };
+        let dir = match zeroclaw_config::skill_bundles::resolve_directory(
+            config,
+            &install_root,
+            bundle_alias,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "e": e.to_string()})), "skipping skill bundle: ");
+                continue;
+            }
+        };
+        let include: std::collections::HashSet<&str> =
+            bundle.include.iter().map(String::as_str).collect();
+        let exclude: std::collections::HashSet<&str> =
+            bundle.exclude.iter().map(String::as_str).collect();
+        for skill in load_skills_from_directory(&dir, allow_scripts) {
+            if !include.is_empty() && !include.contains(skill.name.as_str()) {
+                continue;
+            }
+            if exclude.contains(skill.name.as_str()) {
+                continue;
+            }
+            // First-write wins so workspace skills override bundle skills
+            // with the same name (legacy agents who edited a workspace
+            // copy keep their override after a bundle is assigned).
+            if seen.insert(skill.name.clone()) {
+                skills.push(skill);
+            }
+        }
+    }
     skills
 }
 
@@ -252,9 +520,14 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
                 continue;
             }
             Err(err) => {
-                tracing::warn!(
-                    "skipping unauditable skill directory {}: {err}",
-                    path.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "skipping unauditable skill directory {}: {err}",
+                        path.display().to_string()
+                    )
                 );
                 continue;
             }
@@ -274,9 +547,23 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
         };
 
         if let Some(toml_path) = toml_path {
-            if let Ok(skill) = load_skill_toml(&toml_path) {
-                warn_metadata_drift(&path, &skill, &md_path);
-                skills.push(skill);
+            match load_skill_toml(&toml_path) {
+                Ok(skill) => {
+                    warn_metadata_drift(&path, &skill, &md_path);
+                    skills.push(skill);
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "path": toml_path.display().to_string(),
+                                "error": format!("{}", e),
+                            })),
+                        "failed to load SKILL.toml — skill directory skipped"
+                    );
+                }
             }
         } else if md_path.exists()
             && let Ok(skill) = load_skill_md(&md_path, &path)
@@ -326,9 +613,14 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
                 continue;
             }
             Err(err) => {
-                tracing::warn!(
-                    "skipping unauditable open-skill directory {}: {err}",
-                    path.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "skipping unauditable open-skill directory {}: {err}",
+                        path.display().to_string()
+                    )
                 );
                 continue;
             }
@@ -347,9 +639,23 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
         };
 
         if let Some(toml_path) = toml_path {
-            if let Ok(skill) = load_skill_toml(&toml_path) {
-                warn_metadata_drift(&path, &skill, &md_path);
-                skills.push(finalize_open_skill(skill));
+            match load_skill_toml(&toml_path) {
+                Ok(skill) => {
+                    warn_metadata_drift(&path, &skill, &md_path);
+                    skills.push(finalize_open_skill(skill));
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "path": toml_path.display().to_string(),
+                                "error": format!("{}", e),
+                            })),
+                        "failed to load SKILL.toml — skill directory skipped"
+                    );
+                }
             }
         } else if md_path.exists()
             && let Ok(skill) = load_open_skill_md(&md_path)
@@ -401,17 +707,27 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
         match audit::audit_open_skill_markdown(&path, repo_dir) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure open-skill file {}: {}",
-                    path.display(),
-                    report.summary()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "skipping insecure open-skill file {}: {}",
+                        path.display().to_string(),
+                        report.summary()
+                    )
                 );
                 continue;
             }
             Err(err) => {
-                tracing::warn!(
-                    "skipping unauditable open-skill file {}: {err}",
-                    path.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "skipping unauditable open-skill file {}: {err}",
+                        path.display().to_string()
+                    )
                 );
                 continue;
             }
@@ -442,7 +758,10 @@ fn open_skills_enabled_from_sources(
             return enabled;
         }
         if !raw.trim().is_empty() {
-            tracing::warn!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
             );
         }
@@ -511,9 +830,14 @@ fn ensure_open_skills_repo(
         if pull_open_skills_repo(&repo_dir) {
             let _ = mark_open_skills_synced(&repo_dir);
         } else {
-            tracing::warn!(
-                "open-skills update failed; using local copy from {}",
-                repo_dir.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "open-skills update failed; using local copy from {}",
+                    repo_dir.display().to_string()
+                )
             );
         }
     }
@@ -525,9 +849,14 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
     if let Some(parent) = repo_dir.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
-        tracing::warn!(
-            "failed to create open-skills parent directory {}: {err}",
-            parent.display()
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "failed to create open-skills parent directory {}: {err}",
+                parent.display().to_string()
+            )
         );
         return false;
     }
@@ -539,16 +868,35 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
 
     match output {
         Ok(result) if result.status.success() => {
-            tracing::info!("initialized open-skills at {}", repo_dir.display());
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "initialized open-skills at {}",
+                    repo_dir.display().to_string()
+                )
+            );
             true
         }
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            tracing::warn!("failed to clone open-skills: {stderr}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"stderr": stderr})),
+                "failed to clone open-skills: "
+            );
             false
         }
         Err(err) => {
-            tracing::warn!("failed to run git clone for open-skills: {err}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to run git clone for open-skills"
+            );
             false
         }
     }
@@ -570,11 +918,23 @@ fn pull_open_skills_repo(repo_dir: &Path) -> bool {
         Ok(result) if result.status.success() => true,
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            tracing::warn!("failed to pull open-skills updates: {stderr}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"stderr": stderr})),
+                "failed to pull open-skills updates: "
+            );
             false
         }
         Err(err) => {
-            tracing::warn!("failed to run git pull for open-skills: {err}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to run git pull for open-skills"
+            );
             false
         }
     }
@@ -608,7 +968,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     // Merge prompts from both locations: inside the [skill] table (natural
     // location for per-skill prompts) and at the manifest root (historical
     // location). Previously, prompts placed inside [skill] were silently
-    // dropped because SkillMeta had no `prompts` field. Fixes #5721.
+    // dropped because SkillMeta had no `prompts` field.
     let mut prompts = manifest.skill.prompts;
     prompts.extend(manifest.prompts);
 
@@ -730,7 +1090,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     for line in s.lines() {
         // Collect indented continuation lines for YAML block scalars (>- or |)
         if let Some(ref key) = collecting_multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 multiline_parts.push(line.trim().to_string());
                 continue;
             }
@@ -930,18 +1293,18 @@ pub fn skills_to_prompt_with_mode(
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
                 .collect();
 
             if !registered.is_empty() {
                 let _ = writeln!(
                     prompt,
-                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}__{{}}) instead of using shell.\">"
                 );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
@@ -949,7 +1312,7 @@ pub fn skills_to_prompt_with_mode(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}.{}", skill.name, tool.name),
+                        &format!("{}__{}", skill.name, tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
@@ -980,21 +1343,90 @@ pub fn skills_to_prompt_with_mode(
 /// Convert skill tools into callable `Tool` trait objects.
 ///
 /// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
-/// (for `shell`/`script` kinds) or `SkillHttpTool` (for `http` kind),
-/// enabling them to appear as first-class callable tool specs rather than
-/// only as XML in the system prompt.
+/// (for `shell`/`script` kinds), `SkillHttpTool` (for `http` kind), or
+/// `SkillBuiltinTool` (for `builtin` kind), enabling them to appear as
+/// first-class callable tool specs rather than only as XML in the system
+/// prompt.
+///
+/// The `builtin` kind requires the unfiltered tool registry. Use
+/// [`skills_to_tools_with_context`] to register that kind.
 pub fn skills_to_tools(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
+) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    skills_to_tools_with_context(skills, security, &[])
+}
+
+/// Convert skill tools into callable `Tool` trait objects with full context.
+///
+/// `unfiltered_registry` provides the pre-policy tool list for `builtin`
+/// delegation.
+/// Resolve a skill elevation tool (`kind = "builtin"` or `kind = "mcp"`).
+///
+/// Both kinds delegate to a tool resolved by name from `resolution_registry`
+/// (built-in tools + MCP tool wrappers). The only difference is `kind_label`,
+/// used for diagnostics. Returns `None` (after a WARN) when the `target` is
+/// missing or not resolvable, so a misconfigured manifest is skipped, never
+/// fatal.
+fn resolve_elevated_tool(
+    skill_name: &str,
+    tool: &SkillTool,
+    kind_label: &str,
+    resolution_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+) -> Option<Box<dyn zeroclaw_api::tool::Tool>> {
+    let Some(target_name) = tool.target.as_deref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!(
+                "Skill tool {}.{} has kind='{}' but no 'target' field, skipping",
+                skill_name, tool.name, kind_label
+            )
+        );
+        return None;
+    };
+    match resolution_registry.iter().find(|t| t.name() == target_name) {
+        Some(target) => Some(Box::new(crate::skills::skill_tool::SkillBuiltinTool::new(
+            skill_name,
+            tool,
+            std::sync::Arc::clone(target),
+            tool.locked_args.clone(),
+        ))),
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Skill tool {}.{} targets {} '{}' which was not found in the \
+                     resolution registry (for MCP, use the prefixed name \
+                     '{{server}}__{{tool}}' and ensure the server is connected), skipping",
+                    skill_name, tool.name, kind_label, target_name
+                )
+            );
+            None
+        }
+    }
+}
+
+pub fn skills_to_tools_with_context(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    tools.push(Box::new(crate::skills::skill_tool::SkillShellTool::new(
+                    let inner = crate::skills::skill_tool::SkillShellTool::new(
                         &skill.name,
                         tool,
+                        security.clone(),
+                    );
+                    tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
+                        inner,
                         security.clone(),
                     )));
                 }
@@ -1004,12 +1436,29 @@ pub fn skills_to_tools(
                         tool,
                     )));
                 }
+                "builtin" => {
+                    if let Some(t) =
+                        resolve_elevated_tool(&skill.name, tool, "builtin", unfiltered_registry)
+                    {
+                        tools.push(t);
+                    }
+                }
+                "mcp" => {
+                    if let Some(t) =
+                        resolve_elevated_tool(&skill.name, tool, "MCP", unfiltered_registry)
+                    {
+                        tools.push(t);
+                    }
+                }
                 other => {
-                    tracing::warn!(
-                        "Unknown skill tool kind '{}' for {}.{}, skipping",
-                        other,
-                        skill.name,
-                        tool.name
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "Unknown skill tool kind '{}' for {}.{}, skipping",
+                            other, skill.name, tool.name
+                        )
                     );
                 }
             }
@@ -1140,8 +1589,16 @@ fn clawhub_skill_dir_name(source: &str) -> Result<String> {
         });
     }
 
-    let parsed = parse_clawhub_url(source)
-        .ok_or_else(|| anyhow::anyhow!("invalid clawhub URL: {source}"))?;
+    let parsed = parse_clawhub_url(source).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"source": source})),
+            "skill install rejected: invalid clawhub URL"
+        );
+        anyhow::Error::msg(format!("invalid clawhub URL: {source}"))
+    })?;
 
     let path = parsed
         .path_segments()
@@ -1258,14 +1715,14 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
     let git_dir = skill_path.join(".git");
     if git_dir.exists() {
         std::fs::remove_dir_all(&git_dir)
-            .with_context(|| format!("failed to remove {}", git_dir.display()))?;
+            .with_context(|| format!("failed to remove {}", git_dir.display().to_string()))?;
     }
     Ok(())
 }
 
 fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     let src_meta = std::fs::symlink_metadata(src)
-        .with_context(|| format!("failed to read metadata for {}", src.display()))?;
+        .with_context(|| format!("failed to read metadata for {}", src.display().to_string()))?;
     if src_meta.file_type().is_symlink() {
         anyhow::bail!(
             "Refusing to copy symlinked skill source path: {}",
@@ -1273,17 +1730,28 @@ fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
         );
     }
     if !src_meta.is_dir() {
-        anyhow::bail!("Skill source must be a directory: {}", src.display());
+        anyhow::bail!(
+            "Skill source must be a directory: {}",
+            src.display().to_string()
+        );
     }
 
-    std::fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create destination {}", dest.display()))?;
+    std::fs::create_dir_all(dest).with_context(|| {
+        format!(
+            "failed to create destination {}",
+            dest.display().to_string()
+        )
+    })?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&src_path)
-            .with_context(|| format!("failed to read metadata for {}", src_path.display()))?;
+        let metadata = std::fs::symlink_metadata(&src_path).with_context(|| {
+            format!(
+                "failed to read metadata for {}",
+                src_path.display().to_string()
+            )
+        })?;
 
         if metadata.file_type().is_symlink() {
             anyhow::bail!(
@@ -1298,7 +1766,7 @@ fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
             std::fs::copy(&src_path, &dest_path).with_context(|| {
                 format!(
                     "failed to copy skill file from {} to {}",
-                    src_path.display(),
+                    src_path.display().to_string(),
                     dest_path.display()
                 )
             })?;
@@ -1328,7 +1796,10 @@ pub fn install_local_skill_source(
         .context("Source path must include a directory name")?;
     let dest = skills_path.join(name);
     if dest.exists() {
-        anyhow::bail!("Destination skill already exists: {}", dest.display());
+        anyhow::bail!(
+            "Destination skill already exists: {}",
+            dest.display().to_string()
+        );
     }
 
     if let Err(err) = copy_dir_recursive_secure(&source_path, &dest) {
@@ -1371,7 +1842,7 @@ pub fn install_git_skill_source(
     }
 }
 
-pub fn install_clawhub_skill_source(
+pub async fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
@@ -1387,13 +1858,14 @@ pub fn install_clawhub_skill_source(
         );
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
     let resp = client
         .get(&download_url)
         .send()
+        .await
         .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1403,7 +1875,7 @@ pub fn install_clawhub_skill_source(
         anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
     }
 
-    let bytes = resp.bytes()?.to_vec();
+    let bytes = resp.bytes().await?.to_vec();
     if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
         anyhow::bail!(
             "ClawhHub zip rejected: too large ({} bytes > {})",
@@ -1441,8 +1913,12 @@ pub fn install_clawhub_skill_source(
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut out_file = std::fs::File::create(&out_path)
-            .with_context(|| format!("failed to create extracted file: {}", out_path.display()))?;
+        let mut out_file = std::fs::File::create(&out_path).with_context(|| {
+            format!(
+                "failed to create extracted file: {}",
+                out_path.display().to_string()
+            )
+        })?;
         std::io::copy(&mut entry, &mut out_file)?;
     }
 
@@ -1490,8 +1966,12 @@ pub fn is_registry_source(source: &str) -> bool {
 
 fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
     if let Some(parent) = registry_dir.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create registry parent: {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create registry parent: {}",
+                parent.display().to_string()
+            )
+        })?;
     }
 
     let output = Command::new("git")
@@ -1505,7 +1985,14 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
         anyhow::bail!("failed to clone skills registry: {stderr}");
     }
 
-    tracing::info!("cloned skills registry to {}", registry_dir.display());
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "cloned skills registry to {}",
+            registry_dir.display().to_string()
+        )
+    );
     mark_skills_registry_synced(registry_dir)?;
     Ok(())
 }
@@ -1525,11 +2012,23 @@ fn pull_skills_registry(registry_dir: &Path) -> bool {
         Ok(result) if result.status.success() => true,
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            tracing::warn!("failed to pull skills registry updates: {stderr}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"stderr": stderr})),
+                "failed to pull skills registry updates: "
+            );
             false
         }
         Err(err) => {
-            tracing::warn!("failed to run git pull for skills registry: {err}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to run git pull for skills registry"
+            );
             false
         }
     }
@@ -1567,9 +2066,14 @@ fn ensure_skills_registry(workspace_dir: &Path, registry_url: Option<&str>) -> R
         if pull_skills_registry(&registry_dir) {
             let _ = mark_skills_registry_synced(&registry_dir);
         } else {
-            tracing::warn!(
-                "skills registry update failed; using local copy from {}",
-                registry_dir.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "skills registry update failed; using local copy from {}",
+                    registry_dir.display().to_string()
+                )
             );
         }
     }
@@ -1597,6 +2101,7 @@ pub fn install_registry_skill_source(
     allow_scripts: bool,
     workspace_dir: &Path,
     registry_url: Option<&str>,
+    suppress_tier_banner: bool,
 ) -> Result<(PathBuf, usize)> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
@@ -1612,9 +2117,17 @@ pub fn install_registry_skill_source(
         );
     }
 
+    if !suppress_tier_banner {
+        let (tier, version) = lookup_registry_skill_tier(&registry_dir, source);
+        print_install_tier_banner(source, version.as_deref(), tier);
+    }
+
     install_local_skill_source(
         skill_dir.to_str().with_context(|| {
-            format!("registry path is not valid UTF-8: {}", skill_dir.display())
+            format!(
+                "registry path is not valid UTF-8: {}",
+                skill_dir.display().to_string()
+            )
         })?,
         skills_path,
         allow_scripts,
@@ -1653,7 +2166,13 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
     ) {
         Ok(host) => host,
         Err(err) => {
-            tracing::warn!("failed to discover plugin skills: {err}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to discover plugin skills"
+            );
             return Vec::new();
         }
     };
@@ -1692,6 +2211,33 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. The parser must not truncate the description at it.
+        let frontmatter = "name: x\ndescription: >-\n  para one\n\n  para two\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        let desc = meta.description.expect("description should be parsed");
+        assert!(
+            desc.contains("para one"),
+            "first paragraph missing: {desc:?}"
+        );
+        assert!(
+            desc.contains("para two"),
+            "second paragraph after blank line was truncated: {desc:?}"
+        );
+        assert_eq!(meta.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_simple_frontmatter_block_scalar_stops_at_next_key() {
+        // A real, non-indented next key must still terminate the block scalar.
+        let frontmatter = "description: >-\n  hello\n  world\nversion: 1.2.3\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        assert_eq!(meta.description.as_deref(), Some("hello world"));
+        assert_eq!(meta.version.as_deref(), Some("1.2.3"));
+    }
 
     #[test]
     fn test_is_registry_source_accepts_bare_names() {
@@ -1742,6 +2288,139 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_official() {
+        assert_eq!(
+            tier_from_tags(&["Official".into(), "Featured".into()]),
+            SkillTier::Official
+        );
+        // Case-insensitive match.
+        assert_eq!(tier_from_tags(&["official".into()]), SkillTier::Official);
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_community() {
+        assert_eq!(tier_from_tags(&["Community".into()]), SkillTier::Community);
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_featured_only() {
+        assert_eq!(tier_from_tags(&["Featured".into()]), SkillTier::Featured);
+    }
+
+    #[test]
+    fn tier_from_tags_falls_back_to_unknown_when_no_tier_tag() {
+        assert_eq!(tier_from_tags(&[]), SkillTier::Unknown);
+        assert_eq!(
+            tier_from_tags(&["productivity".into(), "automation".into()]),
+            SkillTier::Unknown
+        );
+    }
+
+    /// Resolve a tier banner against the English catalogue only — locale- and
+    /// filesystem-independent, mirroring build_install_tier_banner's assembly.
+    fn english_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+        let version_label = version.unwrap_or("?");
+        let args = [("name", name), ("version", version_label)];
+        let mut banner =
+            crate::i18n::get_english_cli_string_with_args(install_tier_banner_key(tier), &args);
+        if !banner.ends_with('\n') {
+            banner.push('\n');
+        }
+        banner
+    }
+
+    #[test]
+    fn build_install_tier_banner_official_is_single_line() {
+        let banner = english_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
+        assert!(banner.contains("Official (zeroclaw-labs maintained)"));
+        assert!(banner.contains("Installing auto-coder v0.3.0"));
+        assert!(!banner.contains("not audited"));
+        // One trailing newline, no warn block.
+        assert_eq!(banner.lines().count(), 1);
+    }
+
+    #[test]
+    fn build_install_tier_banner_community_warns() {
+        let banner = english_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+        assert!(banner.contains("zeroclaw skills audit discord-moderator"));
+    }
+
+    #[test]
+    fn build_install_tier_banner_featured_uses_community_warning() {
+        let banner = english_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+    }
+
+    #[test]
+    fn build_install_tier_banner_unknown_falls_back_to_community() {
+        let banner = english_tier_banner("legacy", None, SkillTier::Unknown);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+        // Missing version is rendered as `v?` rather than panicking.
+        assert!(banner.contains("v?"));
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_resolves_from_registry_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let json = r#"{
+            "version": 1,
+            "skills": [
+                { "name": "auto-coder", "version": "0.3.0", "tags": ["Official", "Featured"] },
+                { "name": "discord-moderator", "version": "0.1.2", "tags": ["Community"] },
+                { "name": "hand-picked", "version": "1.0.0", "tags": ["Featured"] },
+                { "name": "untagged", "version": "0.0.1", "tags": ["productivity"] }
+            ]
+        }"#;
+        std::fs::write(tmp.path().join("registry.json"), json).unwrap();
+
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "auto-coder"),
+            (SkillTier::Official, Some("0.3.0".to_string()))
+        );
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "discord-moderator"),
+            (SkillTier::Community, Some("0.1.2".to_string()))
+        );
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "hand-picked"),
+            (SkillTier::Featured, Some("1.0.0".to_string()))
+        );
+        // Skill present but no tier tag → Unknown (treated as Community by the banner).
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "untagged"),
+            (SkillTier::Unknown, Some("0.0.1".to_string()))
+        );
+        // Skill not in registry.json at all → Unknown with no version.
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "missing"),
+            (SkillTier::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_handles_missing_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "anything"),
+            (SkillTier::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_handles_malformed_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("registry.json"), "{ not json").unwrap();
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "anything"),
+            (SkillTier::Unknown, None)
+        );
     }
 }
 
@@ -1816,6 +2495,316 @@ prompts = ["from-skill-section"]
         assert_eq!(
             skill.prompts,
             vec!["from-skill-section".to_string(), "from-root".to_string(),]
+        );
+    }
+}
+
+#[cfg(test)]
+mod skill_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_skill_manifest() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("valid manifest should parse");
+        assert_eq!(manifest.skill.name, "x");
+        assert_eq!(manifest.skill.description, "y");
+        assert_eq!(manifest.skill.version, "0.1.0");
+        assert!(manifest.tools.is_empty());
+        assert!(manifest.prompts.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_skill_block() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+descriptin = "oops"
+"#;
+        let err = toml::from_str::<SkillManifest>(toml_str)
+            .expect_err("unknown field in [skill] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("descriptin"),
+            "error should mention the unknown field 'descriptin'; got: {msg}"
+        );
+    }
+
+    /// Positive control covering the new field × strictness intersection:
+    /// after the rebase onto master (which added `prompts: Vec<String>`
+    /// to `SkillMeta` per #5972), the field must continue to parse cleanly
+    /// under `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn accepts_prompts_in_skill_block_with_strictness() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+prompts = ["one", "two"]
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str)
+            .expect("manifest with prompts in [skill] should parse under deny_unknown_fields");
+        assert_eq!(
+            manifest.skill.prompts,
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    /// Hand-authored skills that don't carry SkillForge provenance must parse
+    /// without error — `forge` is `Option<ForgeMetadata>` with `default`.
+    #[test]
+    fn parses_skill_without_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "hand-authored"
+description = "no forge block"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("manifest without [forge] should parse cleanly");
+        assert!(
+            manifest.forge.is_none(),
+            "forge should be None when [forge] is absent"
+        );
+        assert_eq!(manifest.skill.name, "hand-authored");
+    }
+
+    /// Happy path: a SkillForge-emitted manifest with a fully populated
+    /// `[forge]` table, including the nested `[forge.requirements]` and
+    /// `[forge.metadata]` sub-tables.
+    #[test]
+    fn parses_skill_with_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "auto-integrated"
+description = "from skillforge"
+
+[forge]
+source = "https://github.com/user/auto-integrated"
+owner = "user"
+language = "Rust"
+license = true
+stars = 42
+updated_at = "2026-04-30"
+
+[forge.requirements]
+runtime = "zeroclaw >= 0.1"
+
+[forge.metadata]
+auto_integrated = true
+forge_timestamp = "2026-04-30T12:00:00Z"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("manifest with [forge] block should parse cleanly");
+        let forge = manifest
+            .forge
+            .expect("forge should be Some when [forge] is present");
+        assert_eq!(
+            forge.source.as_deref(),
+            Some("https://github.com/user/auto-integrated")
+        );
+        assert_eq!(forge.owner.as_deref(), Some("user"));
+        assert_eq!(forge.language.as_deref(), Some("Rust"));
+        assert_eq!(forge.license, Some(true));
+        assert_eq!(forge.stars, Some(42));
+        assert_eq!(forge.updated_at.as_deref(), Some("2026-04-30"));
+        assert_eq!(
+            forge.requirements.get("runtime").and_then(|v| v.as_str()),
+            Some("zeroclaw >= 0.1"),
+        );
+        assert_eq!(
+            forge
+                .metadata
+                .get("auto_integrated")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    /// `ForgeMetadata` carries `#[serde(deny_unknown_fields)]` — a typo at
+    /// the `[forge]` level (e.g. `licence` next to `license`) must surface
+    /// loudly the same way a typo in `[skill]` does.
+    #[test]
+    fn rejects_unknown_field_in_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+
+[forge]
+source = "https://github.com/user/x"
+licence = true
+"#;
+        let err = toml::from_str::<SkillManifest>(toml_str)
+            .expect_err("unknown field in [forge] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("licence"),
+            "error should mention the unknown field 'licence'; got: {msg}"
+        );
+    }
+
+    /// Round-trip guard: the SkillForge integrator must emit `[forge]` keys
+    /// at the top level (sibling to `[skill]`), not inside `[skill]`. If a
+    /// future refactor moves these back, this test fails because the parsed
+    /// manifest's `forge` field would be `None` (and `SkillMeta` would
+    /// reject the unknown keys via `deny_unknown_fields`).
+    #[test]
+    fn integrate_round_trip_emits_top_level_forge() {
+        use crate::skillforge::scout::{ScoutResult, ScoutSource};
+        use chrono::Utc;
+        let candidate = ScoutResult {
+            name: "round-trip".into(),
+            url: "https://github.com/user/round-trip".into(),
+            description: "round-trip test".into(),
+            stars: 7,
+            language: Some("Rust".into()),
+            updated_at: Some(Utc::now()),
+            source: ScoutSource::GitHub,
+            owner: "user".into(),
+            has_license: true,
+        };
+
+        // Generate the TOML the integrator would write and parse it back.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let integrator = crate::skillforge::integrate::Integrator::new(
+            tmp.path().to_string_lossy().into_owned(),
+        );
+        let skill_dir = integrator.integrate(&candidate).unwrap();
+        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
+
+        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
+            panic!(
+                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
+                 got error: {e}\n--- toml ---\n{toml_str}"
+            )
+        });
+        let forge = manifest
+            .forge
+            .expect("integrator must emit a [forge] table");
+        assert_eq!(forge.owner.as_deref(), Some("user"));
+        assert_eq!(forge.stars, Some(7));
+        assert_eq!(forge.license, Some(true));
+        assert!(
+            forge
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("round-trip")),
+            "forge.source should carry the upstream URL"
+        );
+        // Crucial guard: none of the provenance keys leaked into [skill].
+        // A failure here means generate_toml regressed and is putting forge
+        // keys back inside `[skill]` — `deny_unknown_fields` on `SkillMeta`
+        // would have caught that already as a parse error, but assert
+        // explicitly so the failure is unambiguous in CI output.
+        assert_eq!(manifest.skill.name, "round-trip");
+        assert_eq!(manifest.skill.description, "round-trip test");
+    }
+
+    /// Behavioral assertion for the swallow-site fix: a SKILL.toml whose
+    /// `[skill]` block has a typo causes `load_skill_toml` to return `Err`,
+    /// and `load_skills_from_directory` skips it without panicking and
+    /// without including it in the loaded set. The accompanying
+    /// `tracing::warn!` call (with structured `path` and `err` fields) is
+    /// verified by source inspection — the codebase does not currently
+    /// pull in a `tracing-subscriber` test harness, and adding one purely
+    /// for this assertion would violate the AGENTS.md anti-pattern of
+    /// adding dependencies for minor convenience.
+    #[test]
+    fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Bad skill: typo in [skill] — rejected by deny_unknown_fields.
+        let bad_dir = skills_dir.join("bad-skill");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "bad"
+description = "has a typo"
+descriptin = "oops"
+"#,
+        )
+        .unwrap();
+
+        // Good skill: parses cleanly — must still load.
+        let good_dir = skills_dir.join("good-skill");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "good"
+description = "fine"
+"#,
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory(&skills_dir, false);
+        // The bad skill is skipped (not panicked-on). The good skill loads.
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"good"),
+            "good skill must load; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad"),
+            "bad skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+
+    /// Behavioral assertion for the open-skills swallow-site fix.
+    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    #[test]
+    fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("open-skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let bad_dir = skills_dir.join("bad-open-skill");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "bad-open"
+description = "has a typo"
+autor = "oops"
+"#,
+        )
+        .unwrap();
+
+        let good_dir = skills_dir.join("good-open-skill");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "good-open"
+description = "fine"
+"#,
+        )
+        .unwrap();
+
+        let skills = load_open_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"good-open"),
+            "good open-skill must load; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad-open"),
+            "bad open-skill must be skipped, not silently accepted; got: {names:?}"
         );
     }
 }

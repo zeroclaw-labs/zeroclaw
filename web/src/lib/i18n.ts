@@ -72,6 +72,16 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
 
+    // Supervised-mode tool approval (#6522)
+    'agent.approval_title': '需要授权工具调用',
+    'agent.approval_tool': '工具',
+    'agent.approval_arguments': '参数',
+    'agent.approval_timeout_in': '超时自动拒绝',
+    'agent.approval_approve': '批准',
+    'agent.approval_deny': '拒绝',
+    'agent.approval_always': '始终批准',
+    'agent.approval_always_hint': '本会话内自动批准此工具',
+
     // Tools
     'tools.title': '可用工具',
     'tools.name': '名称',
@@ -103,6 +113,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.command_required': '命令',
     'cron.schedule': '计划',
     'cron.schedule_required': '计划',
+    'cron.timezone': '时区',
+    'cron.runtime_local_timezone': '运行时本地',
     'cron.next_run': '下次执行',
     'cron.last_run': '上次执行',
     'cron.last_status': '上次状态',
@@ -392,8 +404,9 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agents',
     'nav.tools': 'Tools',
-    'nav.cron': 'Scheduled Jobs',
+    'nav.cron': 'Automations',
     'nav.integrations': 'Integrations',
     'nav.memory': 'Memory',
     'nav.config': 'Config',
@@ -401,7 +414,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logs',
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
-    'nav.onboard': 'Onboard',
+    'nav.quickstart': 'Quickstart',
 
     // Dashboard
     'dashboard.title': 'Dashboard',
@@ -418,6 +431,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.overview': 'Overview',
     'dashboard.system_info': 'System Information',
     'dashboard.quick_actions': 'Quick Actions',
+    'dashboard.add_memory': 'Add memory',
 
     // Agent / Chat
     'agent.title': 'Agent Chat',
@@ -458,6 +472,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
     'agent.running': 'Running…',
+    // Supervised-mode tool approval (#6522)
+    'agent.approval_title': 'Tool approval required',
+    'agent.approval_tool': 'Tool',
+    'agent.approval_arguments': 'Arguments',
+    'agent.approval_timeout_in': 'Auto-deny in',
+    'agent.approval_approve': 'Approve',
+    'agent.approval_deny': 'Deny',
+    'agent.approval_always': 'Always approve',
+    'agent.approval_always_hint': 'Approve this tool automatically for the rest of this session',
     'agent.stop': 'Stop',
 
     // Tools
@@ -477,8 +500,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.load_error': 'Failed to load tools',
 
     // Cron
-    'cron.title': 'Scheduled Jobs',
-    'cron.scheduled_tasks': 'Scheduled Tasks',
+    'cron.title': 'Automations',
+    'cron.scheduled_tasks': 'Automations',
     'cron.add': 'Add Job',
     'cron.add_job': 'Add Job',
     'cron.add_modal_title': 'Add Cron Job',
@@ -491,6 +514,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.command_required': 'Command',
     'cron.schedule': 'Schedule',
     'cron.schedule_required': 'Schedule',
+    'cron.timezone': 'Timezone',
+    'cron.runtime_local_timezone': 'Runtime local',
     'cron.next_run': 'Next Run',
     'cron.last_run': 'Last Run',
     'cron.last_status': 'Last Status',
@@ -653,6 +678,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_code': 'Pairing Code',
     'auth.pair_button': 'Pair',
     'auth.logout': 'Logout',
+    'auth.logout_confirm': 'Log out of ZeroClaw?',
     'auth.pairing_success': 'Pairing successful!',
     'auth.pairing_failed': 'Pairing failed. Please try again.',
     'auth.enter_code': 'Enter your pairing code to connect to the agent.',
@@ -730,6 +756,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.tab_overview': 'Overview',
     'dashboard.tab_sessions': 'Sessions',
     'dashboard.tab_channels': 'Channels',
+    'dashboard.tab_memories': 'Memories',
+    'dashboard.tab_health': 'Health',
+    'dashboard.tab_cost': 'Cost',
     'dashboard.sessions_title': 'Active Sessions',
     'dashboard.no_sessions': 'No active sessions',
     'dashboard.session_id': 'Session ID',

@@ -12,6 +12,48 @@ static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
+/// The canonical locale registry, embedded from repo-root `locales.toml` at
+/// compile time. Parsed once into a `'static` list so callers (e.g. the RPC
+/// `locales/list` handler) get a long-lived reference with no runtime file I/O.
+static AVAILABLE_LOCALES: OnceLock<Vec<LocaleOption>> = OnceLock::new();
+
+const LOCALES_TOML: &str = include_str!("../../../locales.toml");
+
+/// One selectable locale: its `code` (e.g. `ja`) and display `label`
+/// (e.g. `日本語`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleOption {
+    pub code: String,
+    pub label: String,
+}
+
+/// Locales the build knows about, from the embedded `locales.toml`. Cheap:
+/// parsed once, then returns a borrow of the cached `'static` vector.
+pub fn available_locales() -> &'static [LocaleOption] {
+    AVAILABLE_LOCALES
+        .get_or_init(|| {
+            let table: toml::Value =
+                toml::from_str(LOCALES_TOML).expect("embedded locales.toml is valid TOML");
+            table
+                .get("locale")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let code = e.get("code").and_then(|v| v.as_str())?;
+                            let label = e.get("label").and_then(|v| v.as_str())?;
+                            Some(LocaleOption {
+                                code: code.to_string(),
+                                label: label.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
 struct CliFtlSources {
     locale: String,
     disk: Option<String>,
@@ -62,10 +104,26 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
+/// Resolve a CLI string against the embedded English catalogue only, ignoring
+/// the process locale and the filesystem. Used by tests that assert the
+/// canonical English wording without depending on the host's configured
+/// locale (the global `LOCALE` OnceLock would otherwise make them flaky).
+#[cfg(test)]
+pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    let english = CliFtlSources {
+        locale: "en".to_string(),
+        disk: None,
+        builtin: None,
+    };
+    format_cli_string_with_args(&english, key, args).unwrap_or_else(|| missing_cli_string(key))
+}
+
 fn missing_cli_string(key: &str) -> String {
-    tracing::warn!(
-        error_key = "i18n.missing_cli_string",
-        key,
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"error_key": "i18n.missing_cli_string", "key": key})),
         "missing CLI Fluent string"
     );
     format!("{{{key}}}")
@@ -188,12 +246,29 @@ fn format_ftl_message(
 }
 
 fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
-    let workspace_path =
-        workspace_dir_from_config().map(|d| d.join("locales").join(locale).join(filename));
-    let search_paths = [workspace_path];
+    load_ftl_with_reader(locale, filename, |p| std::fs::read_to_string(p).ok())
+}
+
+/// Path-resolution + read wiring for locale FTL, with an injectable reader so
+/// tests can verify which path is consulted without touching the real
+/// filesystem. Production passes `std::fs::read_to_string`.
+fn load_ftl_with_reader(
+    locale: &str,
+    filename: &str,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<String> {
+    let path = zeroclaw_config::schema::ftl_locale_dir(locale)
+        .ok()
+        .map(|d| d.join(filename));
+    let search_paths = [path];
     for path in search_paths.into_iter().flatten() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            tracing::debug!(path = %path.display(), "loaded locale FTL from disk");
+        if let Some(content) = read(&path) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": path.display().to_string()})),
+                "loaded locale FTL from disk"
+            );
             return Some(content);
         }
     }
@@ -206,11 +281,27 @@ pub fn detect_locale() -> String {
 }
 
 fn read_config_table() -> Option<toml::Table> {
-    let base = directories::BaseDirs::new()?;
-    let candidates = [
-        base.home_dir().join(".zeroclaw/config.toml"),
-        base.config_dir().join("zeroclaw/config.toml"),
-    ];
+    // An explicit config dir is authoritative: when set, locale detection and
+    // FTL loading resolve only against it and never fall back to the home
+    // config. This keeps the lookup hermetic — tests (and sandboxed runs) point
+    // it at a known dir without the host's real ~/.zeroclaw/config.toml leaking
+    // in. Without this, locale detection reads the developer's own config and
+    // is non-deterministic across machines.
+    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let path = std::path::PathBuf::from(trimmed).join("config.toml");
+            return std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| c.parse().ok());
+        }
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(base.home_dir().join(".zeroclaw/config.toml"));
+        candidates.push(base.config_dir().join("zeroclaw/config.toml"));
+    }
     for path in &candidates {
         if let Ok(contents) = std::fs::read_to_string(path) {
             return contents.parse().ok();
@@ -220,27 +311,19 @@ fn read_config_table() -> Option<toml::Table> {
 }
 
 fn locale_from_config() -> Option<String> {
-    let table = read_config_table()?;
+    locale_from_table(read_config_table())
+}
+
+/// Pure: extract a normalized locale from an already-parsed config table.
+/// Split out from `locale_from_config` so it is testable without filesystem or
+/// environment access — no test may touch the real FS to verify locale logic.
+fn locale_from_table(table: Option<toml::Table>) -> Option<String> {
+    let table = table?;
     let locale = table.get("locale")?.as_str()?.trim().to_string();
     if locale.is_empty() {
         return None;
     }
     Some(normalize_locale(&locale))
-}
-
-fn workspace_dir_from_config() -> Option<std::path::PathBuf> {
-    if let Some(dir) = read_config_table()
-        .as_ref()
-        .and_then(|t| t.get("workspace_dir"))
-        .and_then(|v| v.as_str())
-    {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    Some(
-        directories::BaseDirs::new()?
-            .home_dir()
-            .join(".zeroclaw/workspace"),
-    )
 }
 
 /// Normalize "zh_CN.UTF-8" → "zh-CN".
@@ -413,6 +496,106 @@ mod tests {
     }
 
     #[test]
+    fn skills_install_cli_strings_format_from_fluent() {
+        type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let en_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["Installing skill from", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  Resolving", "example-skill", "skills registry"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "3 files scanned"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  Security audit completed successfully"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "Official"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "Community submission",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+        let zh_cn_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["正在安装技能来源", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  正在从技能注册表解析", "example-skill"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "已扫描 3 个文件"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  安全审计已成功完成"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "官方"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "社区提交",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+
+        for (source, locale, cases) in [
+            (include_str!("../locales/en/cli.ftl"), "en", en_cases),
+            (
+                include_str!("../locales/zh-CN/cli.ftl"),
+                "zh-CN",
+                zh_cn_cases,
+            ),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in *expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn normalize_locale_strips_encoding() {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");
@@ -421,7 +604,38 @@ mod tests {
 
     #[test]
     fn detect_locale_defaults_to_en_without_config() {
-        // Locale is config-only. Without a config.toml present, must return "en".
-        assert_eq!(detect_locale(), "en");
+        // Locale is config-only. read_config_table() is pure parsing over a
+        // string; verify the fallback contract without touching the real
+        // filesystem or env. An absent/locale-less table must yield "en".
+        assert_eq!(locale_from_table(None), None);
+        let no_locale: toml::Table = "model = \"x\"".parse().unwrap();
+        assert_eq!(locale_from_table(Some(no_locale)), None);
+        let empty_locale: toml::Table = "locale = \"\"".parse().unwrap();
+        assert_eq!(locale_from_table(Some(empty_locale)), None);
+        // detect_locale layers the "en" fallback over locale_from_table.
+        assert_eq!(
+            locale_from_table(None).unwrap_or_else(|| "en".to_string()),
+            "en"
+        );
+    }
+
+    #[test]
+    fn load_ftl_from_disk_reads_config_dir_data_ftl() {
+        // Verify the loader resolves a locale's FTL path and returns the
+        // reader's content — using an in-memory reader so no real filesystem
+        // or environment is touched. The path must carry the locale and
+        // filename so a fetched catalogue at <dir>/.../<locale>/<file> is found.
+        let seen = std::cell::RefCell::new(Vec::<std::path::PathBuf>::new());
+        let loaded = load_ftl_with_reader("xx", "cli.ftl", |p| {
+            seen.borrow_mut().push(p.to_path_buf());
+            Some("cli-probe = hit\n".to_string())
+        });
+        assert_eq!(loaded.as_deref(), Some("cli-probe = hit\n"));
+
+        let paths = seen.borrow();
+        assert!(!paths.is_empty(), "reader must be consulted with a path");
+        let p = paths[0].to_string_lossy();
+        assert!(p.contains("xx"), "path must carry the locale: {p}");
+        assert!(p.ends_with("cli.ftl"), "path must target the file: {p}");
     }
 }

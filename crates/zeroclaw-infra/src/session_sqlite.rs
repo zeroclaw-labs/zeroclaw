@@ -4,19 +4,19 @@
 //! Provides full-text search via FTS5 and automatic TTL-based cleanup.
 //! Designed as the default backend, replacing JSONL for new installations.
 
-use crate::session_backend::{SessionBackend, SessionMetadata, SessionQuery, SessionState};
+use crate::session_backend::{
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
-use zeroclaw_api::provider::ChatMessage;
+use std::path::Path;
+use zeroclaw_api::model_provider::ChatMessage;
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 impl SqliteSessionBackend {
@@ -108,9 +108,76 @@ impl SqliteSessionBackend {
             );
         }
 
+        // Migration: add agent_alias column for per-agent attribution
+        let has_agent_alias: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'agent_alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_agent_alias {
+            let _ = conn.execute(
+                "ALTER TABLE session_metadata ADD COLUMN agent_alias TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_metadata_agent_alias \
+                 ON session_metadata(agent_alias)",
+                [],
+            );
+        }
+
+        // Migration: structured routing columns. Each session metadata row
+        // gets the channel ref (`<type>.<alias>` like `discord.clamps`),
+        // the platform-side room/thread id, and the inbound sender id so
+        // dashboard filters and audit queries don't have to re-parse the
+        // `session_key` composition that orchestrator::conversation_history_key
+        // builds.  All three are nullable for backfill compatibility.
+        for (column, ddl) in [
+            (
+                "channel_id",
+                "ALTER TABLE session_metadata ADD COLUMN channel_id TEXT",
+            ),
+            (
+                "room_id",
+                "ALTER TABLE session_metadata ADD COLUMN room_id TEXT",
+            ),
+            (
+                "sender_id",
+                "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
+            ),
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
+                     WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if !present {
+                let _ = conn.execute(ddl, []);
+            }
+        }
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_channel_id \
+             ON session_metadata(channel_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_room_id \
+             ON session_metadata(room_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id \
+             ON session_metadata(sender_id)",
+            [],
+        );
+
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path,
         })
     }
 
@@ -182,6 +249,39 @@ impl SessionBackend for SqliteSessionBackend {
             Ok(ChatMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    fn load_with_timestamps(
+        &self,
+        session_key: &str,
+    ) -> Vec<crate::session_backend::TimestampedMessage> {
+        use crate::session_backend::TimestampedMessage;
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map(params![session_key], |row| {
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let created_at_raw: Option<String> = row.get(2).ok();
+            let created_at = created_at_raw
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            Ok(TimestampedMessage {
+                message: ChatMessage { role, content },
+                created_at,
             })
         }) {
             Ok(r) => r,
@@ -303,7 +403,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -316,6 +416,10 @@ impl SessionBackend for SqliteSessionBackend {
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
             let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -331,6 +435,10 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
             })
         }) {
             Ok(r) => r,
@@ -422,6 +530,21 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    /// Cheap existence probe used by the gateway to skip cancelled-append
+    /// writes against a session the user just deleted (#7126). Mirrors the
+    /// row that `delete_session` wipes — once the metadata row is gone the
+    /// session is considered deleted, even if a stray DELETE on the
+    /// `sessions` table might still race ahead.
+    fn session_exists(&self, session_key: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
+            params![session_key],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };
@@ -446,7 +569,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -455,6 +578,10 @@ impl SessionBackend for SqliteSessionBackend {
                 let activity_str: String = row.get(2)?;
                 let count: i64 = row.get(3)?;
                 let name: Option<String> = row.get(4)?;
+                let agent_alias: Option<String> = row.get(5)?;
+                let channel_id: Option<String> = row.get(6)?;
+                let room_id: Option<String> = row.get(7)?;
+                let sender_id: Option<String> = row.get(8)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -470,6 +597,10 @@ impl SessionBackend for SqliteSessionBackend {
                     created_at: created,
                     last_activity: activity,
                     message_count: count as usize,
+                    agent_alias,
+                    channel_id,
+                    room_id,
+                    sender_id,
                 })
             },
         )
@@ -529,7 +660,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -542,6 +673,10 @@ impl SessionBackend for SqliteSessionBackend {
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
             let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -555,6 +690,10 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
             })
         }) {
             Ok(r) => r,
@@ -569,7 +708,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -584,6 +723,10 @@ impl SessionBackend for SqliteSessionBackend {
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
             let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -597,6 +740,10 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
             })
         }) {
             Ok(r) => r,
@@ -642,13 +789,17 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
                         let activity_str: String = row.get(1)?;
                         let count: i64 = row.get(2)?;
                         let name: Option<String> = row.get(3)?;
+                        let agent_alias: Option<String> = row.get(4)?;
+                        let channel_id: Option<String> = row.get(5)?;
+                        let room_id: Option<String> = row.get(6)?;
+                        let sender_id: Option<String> = row.get(7)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -660,12 +811,79 @@ impl SessionBackend for SqliteSessionBackend {
                                 .unwrap_or_else(|_| Utc::now()),
                             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                             message_count: count as usize,
+                            agent_alias,
+                            channel_id,
+                            room_id,
+                            sender_id,
                         })
                     },
                 )
                 .ok()
             })
             .collect()
+    }
+
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let alias_val = if agent_alias.is_empty() {
+            None
+        } else {
+            Some(agent_alias)
+        };
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
+            params![session_key, now, now, alias_val],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
+    }
+
+    fn set_session_context(
+        &self,
+        session_key: &str,
+        context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        fn normalize(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|s| !s.is_empty())
+        }
+        let channel_id = normalize(context.channel_id);
+        let room_id = normalize(context.room_id);
+        let sender_id = normalize(context.sender_id);
+        let now = Utc::now().to_rfc3339();
+        // Insert a metadata stub row when missing so the per-platform
+        // fields land even before the first message append fires the
+        // upsert path. The COALESCE clauses preserve any field a prior
+        // append/set already stamped — channel-side updates only fill in
+        // gaps, they don't overwrite earlier routing context.
+        conn.execute(
+            "INSERT INTO session_metadata
+                (session_key, created_at, last_activity, message_count, channel_id, room_id, sender_id)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+             ON CONFLICT(session_key) DO UPDATE SET
+                channel_id = COALESCE(excluded.channel_id, session_metadata.channel_id),
+                room_id    = COALESCE(excluded.room_id,    session_metadata.room_id),
+                sender_id  = COALESCE(excluded.sender_id,  session_metadata.sender_id)",
+            params![session_key, now, now, channel_id, room_id, sender_id],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
     }
 }
 
@@ -914,6 +1132,25 @@ mod tests {
         assert!(!backend.delete_session("nonexistent").unwrap());
     }
 
+    /// #7126: `session_exists` must reflect the same row that
+    /// `delete_session` wipes, so the gateway's cancelled-append guard
+    /// stops resurrecting just-deleted sessions.
+    #[test]
+    fn session_exists_tracks_metadata_row() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        assert!(!backend.session_exists("ghost"));
+
+        backend
+            .append("ghost", &ChatMessage::user("first"))
+            .unwrap();
+        assert!(backend.session_exists("ghost"));
+
+        assert!(backend.delete_session("ghost").unwrap());
+        assert!(!backend.session_exists("ghost"));
+    }
+
     #[test]
     fn migrate_from_jsonl_imports_and_renames() {
         let tmp = TempDir::new().unwrap();
@@ -1143,6 +1380,101 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert!(backend.get_session_metadata("nonexistent").is_none());
+    }
+
+    #[test]
+    fn agent_alias_roundtrips_through_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_agent_alias("s1", "scout").unwrap();
+
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.agent_alias.as_deref(), Some("scout"));
+
+        let listed = backend.list_sessions_with_metadata();
+        let row = listed.iter().find(|m| m.key == "s1").unwrap();
+        assert_eq!(row.agent_alias.as_deref(), Some("scout"));
+
+        // Standalone getter also works.
+        let alias = backend.get_session_agent_alias("s1").unwrap();
+        assert_eq!(alias.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn agent_alias_set_before_any_append_upserts_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // No prior append — metadata row does not exist yet. UPSERT
+        // path must still record the alias so the WS handshake can
+        // attribute the session before the first user message lands.
+        backend.set_session_agent_alias("s1", "scout").unwrap();
+
+        let alias = backend.get_session_agent_alias("s1").unwrap();
+        assert_eq!(alias.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn session_context_roundtrips_channel_room_sender() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_context(
+                "s1",
+                SessionContext {
+                    channel_id: Some("discord.clamps"),
+                    room_id: Some("1234567890"),
+                    sender_id: Some("@user:matrix"),
+                },
+            )
+            .unwrap();
+
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.channel_id.as_deref(), Some("discord.clamps"));
+        assert_eq!(meta.room_id.as_deref(), Some("1234567890"));
+        assert_eq!(meta.sender_id.as_deref(), Some("@user:matrix"));
+
+        // Second call with partial context must NOT clear the columns
+        // already filled in — set_session_context is additive.
+        backend
+            .set_session_context(
+                "s1",
+                SessionContext {
+                    channel_id: None,
+                    room_id: Some("1234567890"),
+                    sender_id: None,
+                },
+            )
+            .unwrap();
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.channel_id.as_deref(), Some("discord.clamps"));
+        assert_eq!(meta.sender_id.as_deref(), Some("@user:matrix"));
+    }
+
+    #[test]
+    fn session_context_creates_metadata_row_before_first_append() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .set_session_context(
+                "s1",
+                SessionContext {
+                    channel_id: Some("telegram.production"),
+                    room_id: None,
+                    sender_id: Some("@alice"),
+                },
+            )
+            .unwrap();
+
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.channel_id.as_deref(), Some("telegram.production"));
+        assert_eq!(meta.sender_id.as_deref(), Some("@alice"));
+        assert!(meta.room_id.is_none());
     }
 
     #[test]

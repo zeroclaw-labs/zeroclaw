@@ -14,17 +14,29 @@ jobs:
   web:
     name: Build Web Dashboard
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          node-version: 22
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Build web dashboard
-        run: cd web && npm ci && npm run build
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        # `cargo web build` is the xtask wrapper that:
+        # 1. renders the gateway's OpenAPI 3.1 spec in-process,
+        # 2. runs `npx openapi-typescript` to produce
+        #    `web/src/lib/api-generated.ts` (gitignored — never
+        #    committed since #4f60f4405),
+        # 3. runs `npm ci` + `npm run build` (tsc + vite).
+        # Plain `cd web && npm run build` skips step 1+2 and tsc
+        # fails on the missing import.
+        run: cargo web build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: web-dist
           path: web/dist/
@@ -40,6 +52,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            # Native Linux smoke-check build intentionally uses default linker.
+            # CI gate (`ci.yml`) uses clang+mold for throughput optimization.
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
@@ -49,20 +65,32 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
+          - os: ubuntu-latest
+            target: arm-unknown-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            ndk: true
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: runner.os != 'Windows'
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: web-dist
           path: web/dist/
@@ -73,10 +101,57 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Setup Android NDK
+        if: matrix.ndk
+        shell: bash
+        run: |
+          case "$(uname -m)" in
+            x86_64) NDK_HOST="linux-x86_64" ;;
+            aarch64) NDK_HOST="linux-aarch64" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          NDK_PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST"
+          if [ ! -d "$NDK_PREBUILT" ]; then
+            echo "Android NDK prebuilt directory not found: $NDK_PREBUILT" >&2
+            exit 1
+          fi
+          echo "$NDK_PREBUILT/bin" >> "$GITHUB_PATH"
+
       - name: Build release
         shell: bash
         run: |
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
+          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+            # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556).
+            # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+            # which segfaults on ARMv6 devices (e.g., Raspberry Pi Zero W).
+            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
+          fi
+          FEATURES="channel-matrix,channel-lark"
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            cargo build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
+          fi
+          if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
+            cargo build --release --locked -p zerocode --target ${{ matrix.target }}
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zeroclaw-manual-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.target != 'aarch64-linux-android'
+        with:
+          name: zerocode-manual-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zerocode.exe' || 'zerocode' }}
+          if-no-files-found: error
+          retention-days: 1

@@ -64,6 +64,17 @@ impl Sandbox for BubblewrapSandbox {
             "--unshare-all",
             "--die-with-parent",
         ]);
+        // Conditionally bind dynamic-loader library directories that may exist
+        // on the host.  On Fedora / RHEL systems the ELF interpreter and shared
+        // libraries live in /lib64; on some older or non-merged-usr distros they
+        // live in /lib.  Without these paths inside the sandbox, any dynamically
+        // linked executable (including `cargo`) will fail to start even when its
+        // binary is reachable.
+        for lib_dir in &["/lib64", "/lib"] {
+            if std::path::Path::new(lib_dir).exists() {
+                bwrap_cmd.args(["--ro-bind", lib_dir, lib_dir]);
+            }
+        }
         bwrap_cmd.arg(&program);
         bwrap_cmd.args(&args);
 
@@ -163,6 +174,39 @@ mod tests {
             args.contains(&"/tmp".to_string()),
             "original args must be preserved"
         );
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_conditionally_binds_lib_dirs() {
+        // /lib64 and /lib must be bind-mounted (with --ro-bind src dst) when
+        // they exist on the host so that dynamically linked binaries (e.g.
+        // `cargo`) can find the ELF interpreter and shared libraries inside the
+        // sandbox.
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        for lib_dir in &["/lib64", "/lib"] {
+            if std::path::Path::new(lib_dir).exists() {
+                // Verify the triplet `--ro-bind <dir> <dir>` is present and in
+                // the correct order; a bare path without the flag would be silently
+                // ignored by bwrap and leave the sandbox broken.
+                let has_ro_bind_triplet = args
+                    .windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == *lib_dir && w[2] == *lib_dir);
+                assert!(
+                    has_ro_bind_triplet,
+                    "{lib_dir} exists on host but --ro-bind {lib_dir} {lib_dir} \
+                     is missing from bwrap args — dynamically linked binaries \
+                     will fail inside the sandbox"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Handles inbound/outbound phone calls with real-time STT/TTS streaming,
 //! call transcription logging, and approval workflows for outbound calls.
-//! Webhook endpoints receive call events from the telephony provider and
+//! Webhook endpoints receive call events from the telephony model_provider and
 //! translate them into `ChannelMessage`s for the agent loop.
 
 use std::collections::HashMap;
@@ -12,7 +12,6 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, info, warn};
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -98,14 +97,18 @@ pub struct TranscriptEntry {
 /// Voice call channel — handles telephony via Twilio, Telnyx, or Plivo.
 pub struct VoiceCallChannel {
     config: VoiceCallConfig,
+    /// The alias key under `[channels.voice_call.<alias>]` this handle is
+    /// bound to. Used for attribution.
+    alias: String,
     active_calls: Arc<Mutex<HashMap<String, CallRecord>>>,
     client: reqwest::Client,
 }
 
 impl VoiceCallChannel {
-    pub fn new(config: VoiceCallConfig) -> Self {
+    pub fn new(alias: impl Into<String>, config: VoiceCallConfig) -> Self {
         Self {
             config,
+            alias: alias.into(),
             active_calls: Arc::new(Mutex::new(HashMap::new())),
             client: reqwest::Client::new(),
         }
@@ -113,17 +116,22 @@ impl VoiceCallChannel {
 
     /// Get the provider-specific API base URL.
     fn api_base_url(&self) -> &str {
-        match self.config.provider {
+        match self.config.model_provider {
             VoiceProvider::Twilio => "https://api.twilio.com/2010-04-01",
             VoiceProvider::Telnyx => "https://api.telnyx.com/v2",
             VoiceProvider::Plivo => "https://api.plivo.com/v1",
         }
     }
 
-    /// Place an outbound call via the configured provider.
+    /// Place an outbound call via the configured model_provider.
     pub async fn place_call(&self, to_number: &str) -> Result<String> {
         if self.config.require_outbound_approval {
-            info!(to = to_number, "outbound call requires approval");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"to": to_number})),
+                "outbound call requires approval"
+            );
             return Ok(format!("PENDING_APPROVAL:{to_number}"));
         }
         self.execute_outbound_call(to_number).await
@@ -132,7 +140,7 @@ impl VoiceCallChannel {
     async fn execute_outbound_call(&self, to_number: &str) -> Result<String> {
         let webhook_url = self.webhook_url("/voice/status");
 
-        match self.config.provider {
+        match self.config.model_provider {
             VoiceProvider::Twilio => {
                 let url = format!(
                     "{}/Accounts/{}/Calls.json",
@@ -159,7 +167,12 @@ impl VoiceCallChannel {
 
                 let json: serde_json::Value = serde_json::from_str(&resp.text().await?)?;
                 let call_sid = json["sid"].as_str().unwrap_or("unknown").to_string();
-                info!(call_sid = %call_sid, to = to_number, "outbound call placed via Twilio");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"call_sid": call_sid, "to": to_number})),
+                    "outbound call placed via Twilio"
+                );
                 Ok(call_sid)
             }
             VoiceProvider::Telnyx => {
@@ -188,7 +201,12 @@ impl VoiceCallChannel {
                     .as_str()
                     .unwrap_or("unknown")
                     .to_string();
-                info!(call_id = %call_id, to = to_number, "outbound call placed via Telnyx");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"call_id": call_id, "to": to_number})),
+                    "outbound call placed via Telnyx"
+                );
                 Ok(call_id)
             }
             VoiceProvider::Plivo => {
@@ -221,7 +239,12 @@ impl VoiceCallChannel {
                     .as_str()
                     .unwrap_or("unknown")
                     .to_string();
-                info!(call_uuid = %call_uuid, to = to_number, "outbound call placed via Plivo");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"call_uuid": call_uuid, "to": to_number})),
+                    "outbound call placed via Plivo"
+                );
                 Ok(call_uuid)
             }
         }
@@ -284,9 +307,10 @@ impl VoiceCallChannel {
             calls.insert(call_id.to_string(), record);
         }
 
-        info!(
-            call_id = call_id,
-            from = from_number,
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"call_id": call_id, "from": from_number})),
             "inbound call received"
         );
 
@@ -297,14 +321,23 @@ impl VoiceCallChannel {
             reply_target: from_number.to_string(),
             content: format!("[Voice Call] Incoming call from {from_number} (call_id: {call_id})"),
             channel: "voice_call".to_string(),
+            channel_alias: None,
             timestamp: chrono::Utc::now().timestamp().unsigned_abs(),
             thread_ts: Some(call_id.to_string()),
             interruption_scope_id: Some(call_id.to_string()),
             attachments: vec![],
+            subject: None,
         };
-        tx.send(msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send call event: {e}"))?;
+        tx.send(msg).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to send call event"
+            );
+            anyhow::Error::msg(format!("Failed to send call event: {e}"))
+        })?;
         Ok(())
     }
 
@@ -322,12 +355,7 @@ impl VoiceCallChannel {
                 record.ended_at = Some(chrono::Utc::now().to_rfc3339());
             }
 
-            debug!(
-                call_id = call_id,
-                old_state = %old_state,
-                new_state = %new_state,
-                "call state transition"
-            );
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"call_id": call_id, "old_state": old_state, "new_state": new_state})), "call state transition");
         }
     }
 
@@ -354,12 +382,29 @@ impl VoiceCallChannel {
         let json = serde_json::to_string_pretty(record)?;
         std::fs::write(&path, json)?;
 
-        info!(call_id = call_id, path = %path.display(), "call transcript saved");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"call_id": call_id, "path": path.display().to_string()})
+            ),
+            "call transcript saved"
+        );
         Ok(())
     }
 }
 
 // ── Channel trait implementation ─────────────────────────────────
+
+impl ::zeroclaw_api::attribution::Attributable for VoiceCallChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::VoiceCall,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
 
 #[async_trait::async_trait]
 impl Channel for VoiceCallChannel {
@@ -374,17 +419,23 @@ impl Channel for VoiceCallChannel {
             if let Some(record) = calls.get(thread_ts)
                 && record.state == CallState::InProgress
             {
-                debug!(
-                    call_id = thread_ts,
-                    "would TTS message to active call: {}", message.content
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"call_id": thread_ts})),
+                    &format!("would TTS message to active call: {}", message.content)
                 );
                 // TTS synthesis + streaming would be handled by the
-                // telephony provider's media stream API in production.
+                // telephony model_provider's media stream API in production.
                 return Ok(());
             }
         }
 
-        debug!("voice_call send (no active call): {}", message.content);
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("voice_call send (no active call): {}", message.content)
+        );
         Ok(())
     }
 
@@ -393,7 +444,13 @@ impl Channel for VoiceCallChannel {
         let active_calls = self.active_calls.clone();
         let _tx = tx.clone();
 
-        info!(port = port, provider = %self.config.provider, "voice call webhook server starting");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"port": port, "model_provider": self.config.model_provider})
+            ),
+            "voice call webhook server starting"
+        );
 
         // The webhook server runs as an axum HTTP server on the configured port.
         // In production, this handles:
@@ -411,18 +468,34 @@ impl Channel for VoiceCallChannel {
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to bind voice webhook server: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to bind voice webhook server"
+                );
+                anyhow::Error::msg(format!("Failed to bind voice webhook server: {e}"))
+            })?;
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| anyhow::anyhow!("Voice webhook server error: {e}"))?;
+        axum::serve(listener, app).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Voice webhook server error"
+            );
+            anyhow::Error::msg(format!("Voice webhook server error: {e}"))
+        })?;
 
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
-        // Check we can reach the provider API
-        let test_url = match self.config.provider {
+        // Check we can reach the model_provider API
+        let test_url = match self.config.model_provider {
             VoiceProvider::Twilio => {
                 format!(
                     "{}/Accounts/{}.json",
@@ -446,7 +519,7 @@ impl Channel for VoiceCallChannel {
                 resp.status().is_success() || resp.status().as_u16() == 401
             }
             Err(e) => {
-                warn!(provider = %self.config.provider, "voice call health check failed: {e}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "model_provider": self.config.model_provider})), "voice call health check failed");
                 false
             }
         }
@@ -518,7 +591,7 @@ mod tests {
     fn test_config() -> VoiceCallConfig {
         VoiceCallConfig {
             enabled: true,
-            provider: VoiceProvider::Twilio,
+            model_provider: VoiceProvider::Twilio,
             account_id: "AC_TEST_ACCOUNT".into(),
             auth_token: "test_token".into(),
             from_number: "+15551234567".into(),
@@ -528,6 +601,7 @@ mod tests {
             tts_voice: None,
             max_call_duration_secs: 3600,
             webhook_base_url: Some("https://tunnel.example.com".into()),
+            excluded_tools: vec![],
         }
     }
 
@@ -548,7 +622,7 @@ mod tests {
 
     #[test]
     fn webhook_url_with_base() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         assert_eq!(
             channel.webhook_url("/voice/status"),
             "https://tunnel.example.com/voice/status"
@@ -559,7 +633,7 @@ mod tests {
     fn webhook_url_without_base() {
         let mut config = test_config();
         config.webhook_base_url = None;
-        let channel = VoiceCallChannel::new(config);
+        let channel = VoiceCallChannel::new("testbot", config);
         assert_eq!(
             channel.webhook_url("/voice/status"),
             "http://localhost:8090/voice/status"
@@ -568,13 +642,13 @@ mod tests {
 
     #[test]
     fn channel_name() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         assert_eq!(channel.name(), "voice_call");
     }
 
     #[tokio::test]
     async fn handle_inbound_call_creates_record() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         let (tx, mut rx) = mpsc::channel(10);
 
         channel
@@ -597,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_status_update_transitions_state() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         let (tx, _rx) = mpsc::channel(10);
 
         channel
@@ -625,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_transcript_entry_records_entries() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         let (tx, _rx) = mpsc::channel(10);
 
         channel
@@ -649,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_transcript_creates_file() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         let (tx, _rx) = mpsc::channel(10);
         let workspace = tempfile::tempdir().unwrap();
 
@@ -687,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_calls_lists_all() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         let (tx, _rx) = mpsc::channel(10);
 
         channel
@@ -705,7 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_call_requires_approval() {
-        let channel = VoiceCallChannel::new(test_config());
+        let channel = VoiceCallChannel::new("testbot", test_config());
         let result = channel.place_call("+15559876543").await.unwrap();
         assert!(result.starts_with("PENDING_APPROVAL:"));
     }
@@ -715,7 +789,7 @@ mod tests {
         let config = test_config();
         let json = serde_json::to_string(&config).unwrap();
         let parsed: VoiceCallConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.provider, VoiceProvider::Twilio);
+        assert_eq!(parsed.model_provider, VoiceProvider::Twilio);
         assert_eq!(parsed.from_number, "+15551234567");
         assert_eq!(parsed.webhook_port, 8090);
     }
@@ -760,7 +834,7 @@ mod tests {
     async fn transcript_logging_disabled_skips_save() {
         let mut config = test_config();
         config.transcription_logging = false;
-        let channel = VoiceCallChannel::new(config);
+        let channel = VoiceCallChannel::new("testbot", config);
         let (tx, _rx) = mpsc::channel(10);
         let workspace = tempfile::tempdir().unwrap();
 

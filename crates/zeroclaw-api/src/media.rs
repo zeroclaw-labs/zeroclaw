@@ -19,6 +19,49 @@ pub struct MediaAttachment {
 }
 
 impl MediaAttachment {
+    /// Load an attachment from a file path on disk.
+    ///
+    /// # Caller path-validation contract
+    ///
+    /// This method reads the path supplied by the caller verbatim.  **Callers
+    /// are responsible for validating or constraining `path` before calling
+    /// this function when the path originates from untrusted input** (e.g. a
+    /// user message, an HTTP request body, or any external data source).  No
+    /// sandboxing or path canonicalization is performed here.
+    ///
+    /// Read errors are propagated as `Err` rather than silently producing an
+    /// empty attachment, so the caller can decide how to handle missing or
+    /// unreadable files.
+    pub fn from_file(path: &str) -> anyhow::Result<Self> {
+        let p = std::path::Path::new(path);
+        let data = std::fs::read(p)?;
+        let file_name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let mime_type = match p.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => Some("application/pdf".to_string()),
+            Some("xlsx") => Some(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+            ),
+            Some("docx") => Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    .to_string(),
+            ),
+            Some("csv") => Some("text/csv".to_string()),
+            Some("png") => Some("image/png".to_string()),
+            Some("jpg") | Some("jpeg") => Some("image/jpeg".to_string()),
+            Some("txt") => Some("text/plain".to_string()),
+            _ => Some("application/octet-stream".to_string()),
+        };
+        Ok(Self {
+            file_name,
+            data,
+            mime_type,
+        })
+    }
+
     /// Classify this attachment into a [`MediaKind`].
     pub fn kind(&self) -> MediaKind {
         // Try MIME type first.

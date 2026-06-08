@@ -24,7 +24,7 @@ cd zeroclaw
 
 1. Asks whether you want a prebuilt binary or to build from source
 2. Installs to `~/.cargo/bin/zeroclaw`
-3. Runs `zeroclaw onboard` to complete first-time setup
+3. Runs `zeroclaw quickstart` to complete first-time setup
 
 Flags:
 
@@ -33,7 +33,7 @@ Flags:
 ./install.sh --source                        # always build from source
 ./install.sh --minimal                       # kernel only (~6.6 MB)
 ./install.sh --source --features agent-runtime,channel-discord   # custom features
-./install.sh --skip-onboard                  # install only; run `zeroclaw onboard` later
+./install.sh --skip-quickstart                  # install only; run `zeroclaw quickstart` later
 ./install.sh --list-features                 # print available features and exit
 ./install.sh --help                          # full flag reference
 ```
@@ -42,7 +42,7 @@ Flags:
 
 ```bash
 brew install zeroclaw
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 Gets you `brew services` integration. Binary lives at `$HOMEBREW_PREFIX/bin/zeroclaw`.
@@ -96,7 +96,7 @@ Full details: [Service management](./service.md).
 Re-run the installer — it detects the existing install and upgrades in place:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-onboard
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
 zeroclaw service restart
 ```
 
@@ -105,7 +105,7 @@ Or from a clone:
 ```bash
 cd /path/to/zeroclaw
 git pull
-./install.sh --skip-onboard
+./install.sh --skip-quickstart
 zeroclaw service restart
 ```
 
@@ -145,7 +145,7 @@ rm -rf ~/Library/Logs/ZeroClaw
 
 ## Gotchas
 
-- **Homebrew config path mismatch.** The wizard warns if it detects Homebrew — the `brew services` daemon reads `$HOMEBREW_PREFIX/var/zeroclaw/config.toml`, not `~/.zeroclaw/config.toml`. If your service is reading stale config, check which one the daemon sees.
+- **Homebrew config path mismatch.** The `brew services` daemon reads `$HOMEBREW_PREFIX/var/zeroclaw/config.toml`, not `~/.zeroclaw/config.toml`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_WORKSPACE` accordingly.
 - **First launch of the browser tool** downloads Chromium (~150 MB) via Playwright.
 - **Apple Silicon** and **Intel** builds are both released. The bootstrap script auto-detects. Homebrew auto-selects.
 

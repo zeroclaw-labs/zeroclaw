@@ -21,6 +21,62 @@ The control loop that delivers this is layered on purpose:
 
 Automation handles intake labels and CI gating. Final merge accountability stays with human maintainers and PR authors.
 
+## Project board contract
+
+The Project board is an automated planning board, not the authoritative PR review queue.
+
+Use the board for issue readiness, active ownership, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
+
+A draft JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as design input for future board refresh automation, not as an active GitHub Project integration yet.
+
+Do not mirror native PR review state into manual board lanes. GitHub PR state owns review decision, required checks, mergeability, conflicts, stale approvals, and merge readiness. If the board later displays derived PR routing such as `DIRTY`, `BEHIND`, or `APPROVED`, treat it as a dashboard view of GitHub state, not a separate source of truth.
+
+This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
+
+### Issue ownership path
+
+Issues need an ownership path before they can safely stay accepted, in progress, or stale-exempt for long periods. PRs have CODEOWNERS and requested reviewers; issues need an equivalent routing contract for the next triage decision.
+
+Use these meanings consistently:
+
+| Signal | Means | Does not mean |
+|---|---|---|
+| Assignee | Someone is actively implementing, investigating, or shepherding the immediate work. | Permanent area ownership or passive responsibility for every related issue. |
+| Area steward | A maintainer or documented steward surface owns the next routing decision: clarify, accept, close, defer, or identify the next implementation path. | Automatic implementation ownership. |
+| Project active owner | The board-visible person or steward source currently responsible for the next movement. | A replacement for live PR review state. |
+| Labels | Durable classification and likely area routing. | Ownership by themselves. |
+
+Area stewardship is the issue-side analogue to CODEOWNERS, but it is not implemented through CODEOWNERS. If GitHub issue fields are enabled and visible to the public on the issue page, prefer a Public issue field for `Area steward` or `Owner path`. Organization-only or private issue and Project fields do not satisfy contributor-visible ownership. Otherwise, the contributor-visible source can be a maintained steward table, a public Project field, an issue-visible maintainer comment, or a public tracker entry linked from the issue.
+
+Identifying the next implementation path does not mean the steward must personally implement the issue or guarantee staffing. It means they make the next step explicit: assign an active owner, make the issue contributor-ready, route it to a tracker or milestone, schedule it for maintainer triage, or close/defer it with a recorded rationale.
+
+Stewardship is decision ownership, not indefinite delivery ownership. A stewarded issue should not sit in an "owned" limbo; the next visible update should record one of the outcomes above or name the decision needed.
+
+Scheduling an issue for maintainer triage is valid only when the issue records what decision is needed, where that decision will be tracked, and when it will be revisited. After that triage pass, replace the triage routing with an active owner, contributor-ready scope, tracker or milestone route, blocked/deferred state, or closure rationale.
+
+For accepted or protected issues, prefer one of these visible owner sources before adding or keeping `status:no-stale`:
+
+- an assignee doing active work;
+- a Public issue field, issue comment, or body section naming the steward path;
+- a public Project active-owner or area-steward field;
+- a linked public tracker entry that names the steward or owner source.
+
+If none of those exists, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
+
+## PR lanes
+
+PR lanes are routing expectations, not another required label family. Use them to decide how much review depth, sequencing, and maintainer attention a PR needs. CODEOWNERS, native GitHub review state, CI, labels, linked issues, and explicit relationship keywords still carry the actual routing data.
+
+| Lane | Common examples | Expected movement |
+|---|---|---|
+| A: maintenance fast lane | Docs-only corrections, small tests that leave behavior unchanged, metadata/template fixes, narrow examples, CI/tooling fixes that preserve permissions and release behavior | Lightest review; fast merge once CI, template, labels, and privacy checks are clean. Usually `risk: low` and `size: XS` or `size: S`. |
+| B: narrow bug/fix lane | Small bug fixes with clear failing behavior, targeted provider/channel/tool fixes with focused validation, compatibility fixes that preserve behavior outside the reported path | Normal review by one subsystem-aware reviewer unless risk or ownership says otherwise. Merge when the linked issue is actually satisfied, validation is credible, and CI is green. |
+| C: feature slice lane | Additive feature work, new provider/channel/tool support, new config surface, scoped user-visible behavior changes | Normal review plus boundary-specific validation. Milestone fit matters, and the PR should say whether it implements, depends on, or is related to a tracker. |
+| D: architecture, migration, and high-risk lane | Runtime, gateway, security, tool-execution, workflow, broad crate migration, lifecycle, persistence, provider payload, channel behavior, permission, or release-infrastructure changes | Deep review, stronger local and CI evidence, rollback and compatibility analysis, and possible milestone sequencing or second-maintainer review. |
+| E: supersede, replacement, and overlap lane | Multiple PRs solving the same issue, newer PRs replacing older ones, contributor work carried forward from another PR, old PR made obsolete by current `master` | Coordinate before deep review. Choose one canonical path when possible, use `Supersedes #N` only when accurate, and preserve attribution when work is materially carried forward. |
+
+Do not build a separate manual PR board for these lanes unless native GitHub state and CODEOWNERS stop answering the routing question. Check native GitHub merge state before normal lane review: `DIRTY` means resolve conflicts first; `BEHIND` alone is mergeability housekeeping, not an author-facing blocker.
+
 ## Required repository settings
 
 Branch protection on `master`:
@@ -91,7 +147,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - Contract compatibility.
 - Security boundaries.
-- Error handling and fallback behavior.
+- Error handling.
 - Performance and memory regressions.
 - Whether the author can answer questions about behavior and blast radius (intent comprehension).
 
@@ -99,7 +155,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - First maintainer triage target: **within 48 hours**.
 - Blocked PRs get one actionable checklist comment, not a series of partial reviews.
-- `no-stale` reserved for accepted-but-blocked work.
+- `status:no-stale` is reserved for accepted or otherwise long-lived work with a recorded stale-exemption reason and contributor-visible active owner or steward path when the issue is not already protected by another stale exclusion. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 

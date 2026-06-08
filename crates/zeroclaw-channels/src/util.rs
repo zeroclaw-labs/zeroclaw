@@ -176,6 +176,14 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
 /// combinations) — not UUID hex (which would give only 16^6 ≈ 16.7M and
 /// would materially weaken the WhatsApp no-per-sender-check design
 /// described in the PR #6010 security note).
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
 pub(crate) fn new_approval_token() -> String {
     use rand::RngExt;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";

@@ -1,4 +1,4 @@
-import type { WsMessage } from '../types/api';
+import type { ApprovalDecision, WsMessage } from '../types/api';
 import { getToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
@@ -10,6 +10,8 @@ export type WsCloseHandler = (ev: CloseEvent) => void;
 export type WsErrorHandler = (ev: Event) => void;
 
 export interface WebSocketClientOptions {
+  /** Agent alias to bind this socket to (required by the gateway). */
+  agentAlias: string;
   /** Base URL override. Defaults to current host with ws(s) protocol. */
   baseUrl?: string;
   /** Delay in ms before attempting reconnect. Doubles on each failure up to maxReconnectDelay. */
@@ -23,14 +25,17 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
-export const SESSION_ID_STORAGE_KEY = 'zeroclaw_session_id';
+const SESSION_ID_KEY_PREFIX = 'zeroclaw_session_id';
 
-/** Return a stable session ID, persisted in localStorage across page reloads. */
-export function getOrCreateSessionId(): string {
-  let id = localStorage.getItem(SESSION_ID_STORAGE_KEY);
+/** Return a stable session ID for the given agent alias, persisted in
+ * localStorage. Each agent gets its own session so parallel conversations
+ * don't collide. */
+export function getOrCreateSessionId(agentAlias: string): string {
+  const key = `${SESSION_ID_KEY_PREFIX}.${agentAlias}`;
+  let id = localStorage.getItem(key);
   if (!id) {
     id = generateUUID();
-    localStorage.setItem(SESSION_ID_STORAGE_KEY, id);
+    localStorage.setItem(key, id);
   }
   return id;
 }
@@ -46,12 +51,14 @@ export class WebSocketClient {
   public onClose: WsCloseHandler | null = null;
   public onError: WsErrorHandler | null = null;
 
+  private readonly agentAlias: string;
   private readonly baseUrl: string;
   private readonly reconnectDelay: number;
   private readonly maxReconnectDelay: number;
   private readonly autoReconnect: boolean;
 
-  constructor(options: WebSocketClientOptions = {}) {
+  constructor(options: WebSocketClientOptions) {
+    this.agentAlias = options.agentAlias;
     let defaultBase: string;
     if (isTauri() && apiOrigin) {
       // In Tauri, derive ws URL from the gateway origin.
@@ -73,10 +80,11 @@ export class WebSocketClient {
     this.clearReconnectTimer();
 
     const token = getToken();
-    const sessionId = getOrCreateSessionId();
+    const sessionId = getOrCreateSessionId(this.agentAlias);
     const params = new URLSearchParams();
     if (token) params.set('token', token);
     params.set('session_id', sessionId);
+    params.set('agent', this.agentAlias);
     const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
 
     const protocols: string[] = ['zeroclaw.v1'];
@@ -113,6 +121,19 @@ export class WebSocketClient {
       throw new Error('WebSocket is not connected');
     }
     this.ws.send(JSON.stringify({ type: 'message', content }));
+  }
+
+  /**
+   * Reply to a supervised-mode tool `approval_request`. The backend matches
+   * the response by `request_id` and resolves the parked approval oneshot.
+   * If the socket is closed the request will auto-deny on the server side
+   * after the timeout, so we silently no-op rather than throwing.
+   */
+  sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({ type: 'approval_response', request_id: requestId, decision }),
+    );
   }
 
   /** Close the connection without auto-reconnecting. */

@@ -44,11 +44,11 @@ impl Tool for CronRunTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
 
@@ -119,45 +119,40 @@ impl Tool for CronRunTool {
             Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
-
-        if job.delivery.mode.eq_ignore_ascii_case("announce")
-            && let (Some(channel), Some(target)) =
-                (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
-            && let Err(e) =
-                cron::scheduler::deliver_announcement(&self.config, channel, target, &output).await
-        {
-            if job.delivery.best_effort {
-                tracing::warn!(
-                    job_id = %job.id,
-                    error = %e,
-                    "cron_run delivery failed (best_effort)"
-                );
-            } else {
-                tracing::warn!(job_id = %job.id, error = %e, "cron_run delivery failed");
-                success = false;
-            }
-        }
-
-        let status = if success { "ok" } else { "error" };
+        let outcome = cron::scheduler::deliver_and_classify_run_result(
+            &self.config,
+            &job,
+            success,
+            output,
+            cron::scheduler::CronDeliveryContext::ToolManual,
+        )
+        .await;
+        success = outcome.success;
 
         let _ = cron::record_run(
             &self.config,
             &job.id,
             started_at,
             finished_at,
-            status,
-            Some(&output),
+            &outcome.status,
+            Some(&outcome.output),
             duration_ms,
         );
-        let _ = cron::record_last_run(&self.config, &job.id, finished_at, success, &output);
+        let _ = cron::record_last_run_with_status(
+            &self.config,
+            &job.id,
+            finished_at,
+            &outcome.status,
+            &outcome.output,
+        );
 
         Ok(ToolResult {
             success,
             output: serde_json::to_string_pretty(&json!({
                 "job_id": job.id,
-                "status": status,
+                "status": outcome.status,
                 "duration_ms": duration_ms,
-                "output": output
+                "output": outcome.output
             }))?,
             error: if success {
                 None
@@ -175,30 +170,71 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
 
+    const TEST_AGENT: &str = "test-agent";
+
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
         Arc::new(config)
     }
 
+    fn seed_test_agent(config: &mut Config) {
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", TEST_AGENT)
+            .expect("known family");
+        config.agents.entry(TEST_AGENT.to_string()).or_insert(
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.to_string(),
+                runtime_profile: TEST_AGENT.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(
+            SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
+        )
     }
 
     #[tokio::test]
     async fn force_runs_job_and_records_history() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
+        // Build the config so we can wire the imperative job's UUID
+        // into test-agent's cron_jobs list before wrapping in Arc —
+        // otherwise execute_job_now's reverse-lookup can't find the
+        // owning agent.
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
@@ -206,6 +242,88 @@ mod tests {
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn best_effort_delivery_failure_records_degraded_history() {
+        cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            None,
+            cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo run-now",
+            Some(cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("fail-delivery".into()),
+                to: Some("123456".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            true,
+        )
+        .unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let response: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(response["status"], "degraded");
+        assert!(
+            response["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
+
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.last_status.as_deref(), Some("degraded"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
+
+        let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
     }
 
     #[tokio::test]
@@ -226,13 +344,18 @@ mod tests {
     async fn blocks_run_in_read_only_mode() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let job = cron::add_job(&config, "*/5 * * * *", "echo run-now").unwrap();
-        config.autonomy.level = AutonomyLevel::ReadOnly;
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        seed_test_agent(&mut config);
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
@@ -245,17 +368,28 @@ mod tests {
     async fn shell_run_requires_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["touch".into()];
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        seed_test_agent(&mut config);
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["touch".into()];
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        seed_test_agent(&mut config);
         let cfg = Arc::new(config);
         // Create with explicit approval so the job persists for the run test.
         let job = cron::add_shell_job_with_approval(
             &cfg,
+            TEST_AGENT,
             None,
             cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
@@ -283,15 +417,25 @@ mod tests {
     async fn blocks_run_when_rate_limited() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 0;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        seed_test_agent(&mut config);
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .level = AutonomyLevel::Full;
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .max_actions_per_hour = 0;
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        seed_test_agent(&mut config);
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();

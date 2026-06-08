@@ -22,7 +22,8 @@ Build with `--features hardware` to include Uno Q support.
 ## Prerequisites
 
 - Arduino Uno Q with WiFi configured
-- Arduino App Lab installed on your Mac (for initial setup and deployment)
+- Arduino App Lab installed on your computer (for initial board setup)
+- `arduino-app-cli` available on the Uno Q (pre-installed with the board’s Debian image, used for Bridge deployment)
 - API key for LLM (OpenRouter, etc.)
 
 ---
@@ -70,6 +71,7 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
 # Build (takes ~15–30 min on Uno Q)
+export CARGO_BUILD_JOBS=1 # build will be OOM-killed mid-link without this
 cargo build --release --features hardware
 
 # Install
@@ -100,13 +102,13 @@ If cross-compile fails, use Option A and build on the device.
 
 ## Phase 3: Configure ZeroClaw
 
-### 3.1 Run Onboard (or Create Config Manually)
+### 3.1 Run Quickstart (or Create Config Manually)
 
 ```bash
 ssh arduino@<UNO_Q_IP>
 
 # Quick config
-zeroclaw onboard --api-key YOUR_OPENROUTER_KEY --provider openrouter
+zeroclaw quickstart --api-key YOUR_OPENROUTER_KEY --model-provider openrouter
 
 # Or create config manually
 mkdir -p ~/.zeroclaw/workspace
@@ -115,7 +117,7 @@ nano ~/.zeroclaw/config.toml
 
 ### 3.2 Minimal config
 
-At minimum, set `api_key` / `default_provider` / `default_model`, plus `[channels.telegram]` with your `bot_token`. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
+At minimum, configure one `[providers.models.<type>.<alias>]` entry with `api_key` / `model`, one `[agents.<alias>]` that references it via `model_provider = "<type>.<alias>"`, and one `[channels.telegram.<alias>]` with your `bot_token`. Bind the channel to the agent via `channels = ["telegram.<alias>"]` on the agent. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
 
 ---
 
@@ -138,7 +140,7 @@ ZeroClaw includes the Bridge app and setup command.
 
 ### 5.1 Deploy Bridge App
 
-**From your Mac** (with zeroclaw repo):
+**From your computer** (with zeroclaw repo):
 ```bash
 zeroclaw peripheral setup-uno-q --host 192.168.0.48
 ```
@@ -173,11 +175,14 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
-| 6 | `cargo build --release --features hardware` |
-| 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
-| 8 | `zeroclaw config set channels.telegram.bot-token <TOKEN>` |
+| 6 | `export CARGO_BUILD_JOBS=1 && cargo build --release --features hardware` |
+| 7 | `zeroclaw quickstart --api-key KEY --model-provider openrouter` |
+| 8 | `zeroclaw config set channels.telegram.default.bot-token <token>` |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Message your Telegram bot — it responds |
+| 11 | `zeroclaw peripheral setup-uno-q` (deploys Bridge) |
+| 12 | Add `[peripherals]` block with `board = "arduino-uno-q"` to `config.toml` |
+| 13 | Restart daemon (`zeroclaw daemon …`) — GPIO commands now work |
 
 ---
 
@@ -187,4 +192,4 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 - **Telegram not responding** — Check bot_token, allowed_users, and that the Uno Q has internet (WiFi).
 - **Out of memory** — Keep features minimal (`--features hardware` for Uno Q); consider `compact_context = true`.
 - **GPIO commands ignored** — Ensure Bridge app is running (`zeroclaw peripheral setup-uno-q` deploys and starts it). Config must have `board = "arduino-uno-q"` and `transport = "bridge"`.
-- **LLM provider (GLM/Zhipu)** — Use `default_provider = "glm"` or `"zhipu"` with `GLM_API_KEY` in env or config. ZeroClaw uses the correct v4 endpoint.
+- **LLM provider (GLM/Zhipu)** — Configure `[providers.models.glm.<alias>]` with `GLM_API_KEY` in env or config (the legacy `zhipu` synonym is collapsed onto `glm`). ZeroClaw uses the correct v4 endpoint.
