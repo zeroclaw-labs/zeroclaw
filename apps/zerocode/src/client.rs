@@ -80,6 +80,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
@@ -1040,6 +1041,22 @@ impl RpcClient {
         .await
     }
 
+    /// Apply session-scoped overrides (model, model_provider, temperature) to a
+    /// live session. The daemon applies them immediately and returns the merged
+    /// set. A `model_provider` override triggers a live provider-box rebuild
+    /// daemon-side.
+    pub async fn session_configure(
+        &self,
+        session_id: &str,
+        overrides: SessionOverrides,
+    ) -> Result<SessionConfigureResult> {
+        self.call(
+            method::SESSION_CONFIGURE,
+            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+        )
+        .await
+    }
+
     pub async fn session_git_branch(&self, session_id: &str) -> Result<SessionGitBranchResult> {
         self.call(
             method::SESSION_GIT_BRANCH,
@@ -1631,6 +1648,31 @@ pub struct SessionNewResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
+
+/// Session-scoped overrides mirror of
+/// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
+/// `session/configure`; every field is optional and omitted when `None`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureResult {
+    /// Echoed by the daemon; retained to lock the wire shape even though the
+    /// TUI keys off the caller's own session id.
+    #[allow(dead_code)]
+    pub session_id: String,
+    #[serde(default)]
+    pub overrides: SessionOverrides,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
