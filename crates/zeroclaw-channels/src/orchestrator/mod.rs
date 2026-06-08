@@ -66,6 +66,8 @@ pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+#[cfg(feature = "channel-twitch")]
+pub use crate::twitch::TwitchChannel;
 #[cfg(feature = "channel-twitter")]
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
@@ -6073,6 +6075,32 @@ fn build_channel_by_id(
         "irc" => {
             anyhow::bail!("IRC channel requires the `channel-irc` feature");
         }
+        #[cfg(feature = "channel-twitch")]
+        "twitch" => {
+            let tw_cfg = config
+                .channels
+                .twitch
+                .get("default")
+                .context("Twitch channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
+            };
+            Ok(Arc::new(TwitchChannel::new(
+                tw_cfg.bot_username.clone(),
+                tw_cfg.oauth_token.clone(),
+                tw_cfg.channels.clone(),
+                tw_cfg.mention_only,
+                alias,
+                peer_resolver,
+            )))
+        }
+        #[cfg(not(feature = "channel-twitch"))]
+        "twitch" => {
+            anyhow::bail!("Twitch channel requires the `channel-twitch` feature");
+        }
         #[cfg(feature = "channel-twitter")]
         "twitter" => {
             let tw = config
@@ -7072,6 +7100,44 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "IRC channel is configured but this build was compiled without \
              `channel-irc`; skipping IRC."
+        );
+    }
+
+    #[cfg(feature = "channel-twitch")]
+    for (alias, tw) in &config.channels.twitch {
+        if !active_channel_aliases.contains(&format!("twitch.{alias}")) {
+            continue;
+        }
+        if !tw.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Twitch",
+            alias: Some(alias.clone()),
+            channel: Arc::new(TwitchChannel::new(
+                tw.bot_username.clone(),
+                tw.oauth_token.clone(),
+                tw.channels.clone(),
+                tw.mention_only,
+                alias.clone(),
+                peer_resolver,
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-twitch"))]
+    if !config.channels.twitch.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Twitch channel is configured but this build was compiled without \
+             `channel-twitch`; skipping Twitch."
         );
     }
 
