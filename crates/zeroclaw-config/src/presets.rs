@@ -123,7 +123,13 @@ fn yolo_risk() -> RiskProfileConfig {
     RiskProfileConfig {
         level: AutonomyLevel::Full,
         workspace_only: false,
-        allowed_commands: vec![],
+        // YOLO means "no command denylist" — but an EMPTY allowlist is
+        // deny-by-default (`is_command_allowed` rejects any command not
+        // matched by an entry), so `vec![]` blocks every shell command.
+        // The `*` wildcard + `block_high_risk_commands: false` is what
+        // actually grants unrestricted execution (the trusted-env path in
+        // `is_command_allowed`).
+        allowed_commands: vec!["*".to_string()],
         forbidden_paths: vec![],
         require_approval_for_medium_risk: false,
         block_high_risk_commands: false,
@@ -571,6 +577,31 @@ mod tests {
             policy.record_action(),
             "an unbounded-profile agent must be allowed to take actions",
         );
+    }
+
+    /// Regression: the `yolo` risk preset must actually permit shell
+    /// commands. `allowed_commands` is deny-by-default — an empty list
+    /// matches nothing, so a `yolo` agent (whose whole point is "no
+    /// command denylist, full autonomy") previously had every shell
+    /// command rejected with "Command not allowed by security policy".
+    /// The preset must carry the `*` wildcard so unrestricted execution
+    /// is actually granted.
+    #[test]
+    fn yolo_risk_allows_shell_commands() {
+        let preset = risk_preset("yolo").unwrap();
+        let values = (preset.values)();
+        let policy = crate::policy::SecurityPolicy {
+            autonomy: values.level,
+            allowed_commands: values.allowed_commands.clone(),
+            block_high_risk_commands: values.block_high_risk_commands,
+            ..crate::policy::SecurityPolicy::default()
+        };
+        for cmd in ["ls", "pwd", "cat README.md", "rm -rf node_modules"] {
+            assert!(
+                policy.is_command_allowed(cmd),
+                "yolo profile must allow `{cmd}` — it grants full autonomy with no denylist",
+            );
+        }
     }
 
     /// `BuilderSubmission` and its dependent types must round-trip
