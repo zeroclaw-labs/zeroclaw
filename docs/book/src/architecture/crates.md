@@ -6,16 +6,18 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ### `zeroclaw-runtime`
 
-The agent loop, security-policy enforcement, SOP engine, cron scheduler, onboarding sections, and RPC layer for zerocode. Depends on every other core and edge crate.
+The agent loop, security-policy enforcement, SOP engine, cron scheduler, SubAgent lifecycle, and RPC layer for zerocode. Depends on every other core and edge crate.
 
 Notable submodules:
 
 - `agent/`: the main request/response loop, streaming, tool-call orchestration
 - `security/`: policy types, sandbox detection, OTP, emergency stop
 - `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
-- `onboard/`: the interactive onboarding sections (`mod.rs`, plus per-shape UIs under `ui/`)
-- `memory/`: wraps `zeroclaw-memory` with runtime-level caching and consolidation schedules
+- `subagent/`: SubAgent spawning and lifecycle (see [SubAgents](./subagents.md))
+- `cron/`, `daemon/`, `heartbeat/`: scheduling and long-running process management
+- `skillforge/`, `skills/`: skill compilation and execution
 - `service/`: systemd / launchctl / Windows Service integration
+- `rpc/`: the RPC layer for zerocode
 
 ### `zeroclaw-config`
 
@@ -30,11 +32,13 @@ All user-facing config keys are documented in [Reference → Config](../referenc
 
 ### `zeroclaw-api`
 
-The kernel ABI. Defines three public traits:
+The kernel ABI. Defines the core public traits, including:
 
-- `Provider`: LLM client interface with streaming capability flags
+- `ModelProvider`: LLM client interface with streaming capability flags
 - `Channel`: inbound/outbound messaging surface
 - `Tool`: agent-callable capabilities
+- `Memory`: conversation storage and retrieval
+- `Observer`: typed metrics/observability sink
 
 The runtime depends only on these traits, not on concrete implementations. This is what makes provider/channel/tool additions a matter of implementing a trait rather than patching the core.
 
@@ -76,7 +80,7 @@ Pairing is required by default; `[gateway.allow_public_bind = true]` enables bin
 
 Callable tools the agent invokes. Not to be confused with CLI `zeroclaw` subcommands.
 
-Includes: `browser`, `http`, `pdf_extract`, `web_search`, `shell`, `file_read`, `file_write`, `hardware_probe`, and more. See [Tools → Overview](../tools/overview.md).
+Includes: `browser`, `http_request`, `pdf_read`, `web_search`, `shell`, `file_read`, `file_write`, hardware probes (`hardware_board_info`, `hardware_memory_read`), and more. See [Tools → Overview](../tools/overview.md).
 
 Each tool is registered via factory and described to the model via Fluent-localised strings.
 
@@ -113,10 +117,18 @@ The single emission surface for every log event in the workspace. Owns
 the on-disk JSONL schema (`LogEvent`), the alias-bound attribution
 registry (`ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES`), the
 `tracing-subscriber` Layer that captures every `tracing::*` call, the
-`record!` / `scope!` / `spawn!` macros, the rolling-trim writer, the
+`record!` and `scope!` macros, the rolling-trim writer, the
 paginated cursor reader behind `/api/logs`, and the bridge to the
 typed `Observer` for Prometheus / OTel consumers. See
 [`architecture/logging.md`](./logging.md).
+
+### `zeroclaw-spawn`
+
+The sanctioned wrapper around `tokio::spawn`. Provides the `spawn!`
+macro, which instruments every background task with the caller's
+current attribution span so a `record!` emitted inside the spawned
+future inherits the parent's `agent_alias` / `channel` / `session_key`.
+Call sites use `spawn!` instead of `tokio::spawn` directly.
 
 ### `zeroclaw-infra`
 
@@ -129,7 +141,7 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 
 ### `zerocode`
 
-Terminal UI. Optional, compile with `--features tui`.
+Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
 
 ### `aardvark-sys`, `robot-kit`
 
@@ -142,8 +154,7 @@ The microkernel roadmap (RFC #5574) defines a feature-flag taxonomy. The practic
 - `default`: a sensible core build
 - `ci-all`: everything on, for CI
 - `channel-<name>`: opt-in per channel (e.g. `channel-matrix`, `channel-discord`)
-- `provider-<name>`: opt-in per provider
 - `hardware`: enable hardware subsystem
-- `tui`: terminal UI
+- `gateway`, `acp-bridge`, `whatsapp-web`: opt-in capability groups
 
-Run `cargo metadata --format-version 1 | jq '.workspace_members'` or read the top-level `Cargo.toml` for the full list.
+Providers are not feature-gated; they all compile in. Channel selection is the main per-build knob. Read the top-level `Cargo.toml` `[features]` table for the full list.

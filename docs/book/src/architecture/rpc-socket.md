@@ -7,8 +7,9 @@ webhooks, the web dashboard, and remote REST consumers.
 
 ## Endpoint resolution
 
-Each `--data-dir` gets its own endpoint, so multiple daemon instances on the
-same machine do not collide.
+Each data directory gets its own endpoint, so multiple daemon instances on the
+same machine do not collide. The data dir is derived from the config dir
+(`--config-dir` / `ZEROCLAW_CONFIG_DIR`, or `ZEROCLAW_DATA_DIR`).
 
 | OS | Default endpoint |
 |---|---|
@@ -51,7 +52,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 The first RPC call must be `initialize`. The daemon rejects all other methods
 until `initialize` succeeds. Protocol version mismatch produces a structured
-error with code `-32002`.
+error with code `-32011`.
 
 ```json
 {
@@ -100,7 +101,7 @@ Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 ## Ephemeral mode
 
 `zeroclaw daemon --ephemeral` tracks connected clients and self-terminates
-when the last one disconnects (after a 30-second grace period). A reconnect
+when the last one disconnects (after a 1-second grace period). A reconnect
 during the grace period cancels the shutdown. The daemon will not exit until
 at least one client has connected.
 
@@ -136,7 +137,7 @@ In a second terminal on Unix, connect with `socat`:
 #### sh
 
 ```sh
-socat READLINE UNIX-CONNECT:~/.local/share/zeroclaw/daemon.sock
+socat READLINE UNIX-CONNECT:~/.zeroclaw/data/daemon.sock
 ```
 
 </div>

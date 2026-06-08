@@ -17,8 +17,8 @@ This page documents `spawn_subagent` end to end. `delegate` lives at `crates/zer
 
 Two spawn sites converge on `SubAgentSpawn` (`crates/zeroclaw-runtime/src/subagent/mod.rs:97`):
 
-1. **From an agent loop**: the model calls the `spawn_subagent` tool with a `prompt` string. The tool is registered like any other in the registry (`crates/zeroclaw-runtime/src/tools/mod.rs:437`).
-2. **From cron**: `JobType::Agent` jobs run through `run_agent_job` (`crates/zeroclaw-runtime/src/cron/scheduler.rs:339`) which builds the same `SubAgentContext` but flags the child as a top-level run (not a SubAgent) so it can itself spawn one level of subagent.
+1. **From an agent loop**: the model calls the `spawn_subagent` tool with a `prompt` string. The tool is registered like any other in the registry (`crates/zeroclaw-runtime/src/tools/mod.rs`, `SpawnSubagentTool::new`).
+2. **From cron**: `JobType::Agent` jobs run through `run_agent_job` (`crates/zeroclaw-runtime/src/cron/scheduler.rs`) which builds the same `SubAgentContext` but flags the child as a top-level run (not a SubAgent) so it can itself spawn one level of subagent.
 
 Both paths invoke:
 
@@ -38,7 +38,7 @@ Synchronous, in-process, single tokio runtime. Nothing crosses the process bound
    - **Depth-1 cap.** If the calling run was itself a SubAgent (`AgentRunOverrides.is_subagent == true`), refuse with `"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"`. SubAgents cannot recurse.
    - **`risk_profile.allowed_tools` gate.** If the parent's `[risk_profiles.<alias>].allowed_tools` does not list `spawn_subagent`, or `excluded_tools` lists it, refuse with a message naming the parent alias.
 3. The tool calls `SubAgentSpawn::for_agent` + `build`. Failures (unknown parent alias, escalating override) surface as `ToolResult { success: false, error: "subagent spawn failed: ..." }`.
-4. The tool constructs `AgentRunOverrides { security, memory: None, is_subagent: true }` and awaits `crate::agent::run` (`crates/zeroclaw-runtime/src/agent/loop_.rs:2295`) inside a tracing scope keyed `subagent-<uuid>`. The parent's `tool` execution **blocks** until the child returns.
+4. The tool constructs `AgentRunOverrides { security, memory: None, is_subagent: true }` and awaits `crate::agent::run` (`crates/zeroclaw-runtime/src/agent/loop_.rs`, `pub async fn run`) inside a tracing scope keyed `subagent-<uuid>`. The parent's `tool` execution **blocks** until the child returns.
 5. The child agent loop runs to completion. Its tool registry is built fresh, with `is_subagent_caller: true` flowing into its own `SpawnSubagentTool` so any attempt to recurse is rejected at the same depth-1 gate.
 6. The child returns `Result<String>`. The parent's `spawn_subagent` tool wraps it:
    - Success: `ToolResult { success: true, output: <child's final response>, error: None }`. Empty output is replaced with the literal `"subagent completed without output"`.
@@ -61,7 +61,7 @@ A SubAgent inherits the parent's permissions verbatim unless the spawn site supp
 
 Inheritance axis by axis:
 
-1. **`SecurityPolicy`**: inherited by `Arc<SecurityPolicy>` cloning. Override path (`SubAgentOverrides::policy = Some(policy)`) runs `SecurityPolicy::ensure_no_escalation_beyond` (`crates/zeroclaw-config/src/policy.rs:2051`) and rejects any field that adds privilege the parent doesn't have. Validated axes include autonomy level, allowed_roots (rw + ro + write-only), allowed_commands, workspace_only, forbidden_paths in the parent ⊆ child direction, shell_env_passthrough, `max_actions_per_hour`, `max_cost_per_day_cents`, `shell_timeout_secs`, `block_high_risk_commands`, and `require_approval_for_medium_risk`. Rejections chain a precise `EscalationViolation` so diagnostics name the offending field.
+1. **`SecurityPolicy`**: inherited by `Arc<SecurityPolicy>` cloning. Override path (`SubAgentOverrides::policy = Some(policy)`) runs `SecurityPolicy::ensure_no_escalation_beyond` (`crates/zeroclaw-config/src/policy.rs`) and rejects any field that adds privilege the parent doesn't have. Validated axes include autonomy level, allowed_roots (rw + ro + write-only), allowed_commands, workspace_only, forbidden_paths in the parent ⊆ child direction, shell_env_passthrough, `max_actions_per_hour`, `max_cost_per_day_cents`, `shell_timeout_secs`, `block_high_risk_commands`, and `require_approval_for_medium_risk`. Rejections chain a precise `EscalationViolation` so diagnostics name the offending field.
 2. **Action / cost budgets**: `PerSenderTracker` is shared between parent and child by `Arc` clone. Inherit-verbatim path: the child holds the same `Arc<SecurityPolicy>` so writes to `record_action()` / `record_cost()` hit the same bucket. Override path: `SubAgentSpawn::build` copies the parent's `tracker` field into the narrowed child policy explicitly. **A SubAgent cannot bypass `max_actions_per_hour` or `max_cost_per_day_cents` by spawning**, the limit is shared.
 3. **Tool registry**: the child's registry is built fresh by `tools::all_tools_with_runtime` under the inherited policy. The registry then passes through `apply_policy_tool_filter` (`crates/zeroclaw-runtime/src/agent/loop_.rs`), which drops any tool whose name fails either gate:
    - The policy's `allowed_tools` / `excluded_tools` (sourced from the parent's `risk_profile`).
