@@ -949,3 +949,11 @@ body,
 .content h4[id] {
   scroll-margin-top: 5rem;
 }
+
+/* Keep the left sidebar to SUMMARY chapters only. mdBook's toc.js injects an
+   `.on-this-page` block of in-page headings under the active chapter; that
+   duplicates the right-hand "On this page" panel and breaks the numbered
+   sidebar. Suppress the injected block in the nav. */
+#mdbook-sidebar .on-this-page {
+  display: none !important;
+}
