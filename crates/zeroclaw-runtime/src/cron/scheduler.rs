@@ -1,4 +1,7 @@
-use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
+use crate::cron::store::{
+    RunCompletionAction, discard_startup_overdue_jobs, persist_run_completion_state,
+    persist_run_result,
+};
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
     next_run_for_schedule, sync_declarative_jobs,
@@ -129,6 +132,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let scheduler_started_at = Utc::now();
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
@@ -189,11 +193,26 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     if config.scheduler.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &event_tx).await;
     } else {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Scheduler startup: catch-up disabled by config"
-        );
+        match discard_startup_overdue_jobs(&config, scheduler_started_at) {
+            Ok(0) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Scheduler startup: catch-up disabled by config; no overdue jobs to discard"
+            ),
+            Ok(discarded) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "count": discarded })),
+                "Scheduler startup: discarded overdue jobs because catch-up is disabled"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Scheduler startup: failed to discard overdue jobs while catch-up is disabled"
+            ),
+        }
     }
 
     loop {
