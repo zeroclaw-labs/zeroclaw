@@ -23,6 +23,7 @@ mod attachment;
 mod chat;
 mod client;
 mod clipboard;
+mod color_depth;
 mod config;
 mod config_manager;
 mod dashboard;

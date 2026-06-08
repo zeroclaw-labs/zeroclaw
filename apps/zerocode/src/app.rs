@@ -14,6 +14,7 @@ use ratatui::{
 use crate::acp;
 use crate::chat;
 use crate::client::{ConnectionState, RpcClient};
+use crate::config;
 use crate::config_manager;
 use crate::dashboard;
 use crate::keymap::{GlobalAction, ModalAction};
@@ -50,7 +51,7 @@ const MODES: [Mode; 6] = [
 
 // ── Mode enum ────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Dashboard,
     Config,
@@ -122,6 +123,13 @@ pub async fn run(
     owns_ephemeral: bool,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    // Per-agent theme overrides live in a process-global registry (theme.rs),
+    // mirroring how the global theme works: the Config pane writes there on
+    // assign/clear so changes apply live, and the draw loop reads it each frame
+    // to tint the Code/Chat pane for the focused agent. Seed it once from config
+    // here; an unknown override name resolves to the terminal theme rather than
+    // aborting.
+    theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut show_help = false;
     let mut reload_confirm = false;
     let mut quit_confirm = false;
@@ -212,6 +220,23 @@ pub async fn run(
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+
+        // Per-agent theme override: while the Code or Chat pane is focused on
+        // an agent with a configured override, swap that palette in for the
+        // whole frame (backdrop, pane, bars) so the pane reads cohesively, then
+        // restore the base theme after drawing. The base theme is whatever the
+        // global currently holds, so live theme changes from the Config pane
+        // still take effect for non-overridden panes.
+        let base_theme = theme::active_raw();
+        let frame_theme = match mode {
+            Mode::Acp => acp_pane.selected_agent().and_then(theme::agent_override),
+            Mode::Chat => chat_pane.selected_agent().and_then(theme::agent_override),
+            _ => None,
+        };
+        if let Some(t) = frame_theme {
+            theme::set_active(t);
+        }
+
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
@@ -223,13 +248,30 @@ pub async fn run(
                     frame.area(),
                 );
             }
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
+            // The info bar appears as a dedicated row between the content and
+            // the status bar, only while the active pane has a message to show.
+            let info_message = match mode {
+                Mode::Chat => chat_pane.info_message().cloned(),
+                _ => None,
+            };
+            let has_info = info_message.is_some();
+            let constraints: Vec<Constraint> = if has_info {
+                vec![
+                    Constraint::Length(1), // mode bar
+                    Constraint::Min(0),    // content
+                    Constraint::Length(1), // info bar
+                    Constraint::Length(1), // status bar
+                ]
+            } else {
+                vec![
                     Constraint::Length(1), // mode bar
                     Constraint::Min(0),    // content
                     Constraint::Length(1), // status bar
-                ])
+                ]
+            };
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
                 .split(frame.area());
 
             bar_area = chunks[0];
@@ -245,6 +287,18 @@ pub async fn run(
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
             }
 
+            let status_idx = if has_info {
+                // Render the info bar in its own row above the status bar.
+                let info_area = chunks[2];
+                let bar = crate::widgets::InfoBar::new(info_message.as_ref());
+                if let Some(widget) = bar.widget(info_area.width as usize) {
+                    frame.render_widget(widget, info_area);
+                }
+                3
+            } else {
+                2
+            };
+
             let (ctx_input, ctx_max) = match mode {
                 Mode::Chat => chat_pane.ctx_tokens(),
                 Mode::Acp => acp_pane.ctx_tokens(),
@@ -252,7 +306,7 @@ pub async fn run(
             };
             draw_status_bar(
                 frame,
-                chunks[2],
+                chunks[status_idx],
                 &conn_state,
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
@@ -261,24 +315,27 @@ pub async fn run(
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
+                use crate::keymap::RebindableActions;
+                let chord_keys = |chords: Vec<crate::keymap::Chord>| -> Vec<String> {
+                    chords.iter().map(crate::keymap::Chord::display).collect()
+                };
                 let mut node = HelpNode::entries(vec![
                     HelpEntry::new(
-                        vec![
-                            Box::leak(
-                                crate::keymap::GlobalAction::PaneNavLeft.default_chords()[0]
-                                    .display()
-                                    .into_boxed_str(),
-                            ),
-                            Box::leak(
-                                crate::keymap::GlobalAction::PaneNavRight.default_chords()[0]
-                                    .display()
-                                    .into_boxed_str(),
-                            ),
-                        ],
+                        [
+                            chord_keys(crate::keymap::GlobalAction::PaneNavLeft.resolved()),
+                            chord_keys(crate::keymap::GlobalAction::PaneNavRight.resolved()),
+                        ]
+                        .concat(),
                         crate::i18n::t("zc-app-help-cycle-mode"),
                     ),
-                    HelpEntry::key("Ctrl+R", crate::i18n::t("zc-app-help-reload")),
-                    HelpEntry::key("Ctrl+C", crate::i18n::t("zc-app-help-quit")),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::ReloadDaemon.resolved()),
+                        crate::i18n::t("zc-app-help-reload"),
+                    ),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
+                        crate::i18n::t("zc-app-help-quit"),
+                    ),
                     HelpEntry::spacer(),
                 ]);
                 let pane_node = match mode {
@@ -304,10 +361,20 @@ pub async fn run(
             }
         })?;
 
+        // Restore the base palette so the override never leaks into the next
+        // frame, a different pane, or live theme changes from the Config pane.
+        if frame_theme.is_some() {
+            theme::set_active(base_theme);
+        }
+
         // In-loop recovery. The draw above already rendered the cached
         // panes and the Disconnected status, and the input poll below keeps
         // the UI responsive (quit always works), so reconnection happens
-        // here without ever leaving the event loop.
+        // here without ever leaving the event loop. This runs every
+        // iteration, not just when the input poll times out: a steady stream
+        // of events (mouse scroll, resize, focus) would otherwise keep
+        // `event::poll` returning true and the grace timer would never start,
+        // leaving the UI frozen on the red "Disconnected" status bar.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
             // Owned ephemeral daemon: respawn exactly once. After that single
             // respawn we set `needs_intervention` to stop auto-respawning and
@@ -611,6 +678,27 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Resolve every `[theme.agent_override.<alias>]` entry into a ready palette,
+/// keyed by agent alias. Loads the local zerocode config; an unreadable config
+/// or an override naming an unknown theme is skipped silently (never written to
+/// stderr — that would corrupt the alternate-screen TUI). The base theme
+/// remains in effect for any agent not present in the returned map; a bad
+/// override surfaces in the Config pane's own validation, not here.
+fn resolve_agent_overrides(
+    config_dir: &std::path::Path,
+) -> std::collections::HashMap<String, theme::Theme> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(cfg) = config::ensure_and_load(config_dir) else {
+        return out;
+    };
+    for alias in cfg.agent_override_aliases() {
+        if let Ok(Some(t)) = cfg.resolve_agent_theme(alias) {
+            out.insert(alias.to_string(), t);
+        }
+    }
+    out
 }
 
 // ── Mode bar ─────────────────────────────────────────────────────
