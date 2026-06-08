@@ -2,6 +2,7 @@ pub mod agents;
 pub mod bus;
 pub mod collective;
 pub mod dream;
+pub mod hook;
 pub mod metacognition;
 pub mod narrative;
 pub mod neuromodulation;
