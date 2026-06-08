@@ -11,17 +11,20 @@ This site is the documentation. Everything under **Reference → CLI** and **Ref
 ## Where to start
 
 - New to ZeroClaw? → [Quickstart](./getting-started/quickstart.md)
+- Prefer a terminal UI? → [zerocode](./zerocode/overview.md)
 - Just want it running fast without safety prompts? → [YOLO mode](./getting-started/yolo.md)
+- Controlling what the agent is allowed to do? → [Security & Autonomy](./security/overview.md)
 - Installing on a specific platform? → [Linux](./setup/linux.md) · [macOS](./setup/macos.md) · [Windows](./setup/windows.md) · [Docker](./setup/container.md)
 - Understanding the architecture? → [Architecture overview](./architecture/overview.md)
 - Wiring up a chat platform? → [Channels](./channels/overview.md)
 - Pointing it at an LLM? → [Model Providers](./providers/overview.md)
 - Adding capabilities? → [Tools](./tools/overview.md)
+- Talking to hardware or boards? → [Hardware](./hardware/index.md)
 - Running it in production? → [Operations](./ops/overview.md)
 - Writing a workflow? → [SOP](./sop/index.md)
-- Building on top of it? → [Developing](./developing/plugin-protocol.md)
-- Looking up a flag or config key? → [Reference](./reference/cli.md) · [API rustdoc](./api.md)
-- Want to contribute? → [Contributing](./contributing/how-to.md)
+- Building on top of it? → [Developing](./developing/index.md)
+- Looking up a flag or config key? → [Reference](./reference/index.md) · [API rustdoc](./api.md)
+- Want to contribute? → [Contributing](./contributing/index.md)
 
 ## Source
 
