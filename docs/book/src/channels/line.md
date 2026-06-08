@@ -2,6 +2,12 @@
 
 ZeroClaw supports LINE via the Messaging API, receiving messages through an embedded webhook server and replying via the Reply API (with Push API fallback when the reply token has expired).
 
+## Who can talk to the agent
+
+{{#peer-group line}}
+
+LINE layers `dm_policy` and `group_policy` on top of the peer set — see [Access Policies](#6-access-policies) below. When a policy is set to `allowlist`, the peer set is the allowlist.
+
 ## Prerequisites
 
 1. A [LINE Developers Console](https://developers.line.biz) account.
@@ -23,7 +29,7 @@ ZeroClaw supports LINE via the Messaging API, receiving messages through an embe
 
 ## 2. Configure ZeroClaw
 
-Configure the LINE channel under `[channels.line]` with at minimum `channel_access_token` and `channel_secret`. See the [Config reference](../reference/config.md) for the full field index, defaults, and the `dm_policy` / `group_policy` enums (whose user-facing semantics are also covered in §6 below).
+Configure the LINE channel under `[channels.line.<alias>]` with at minimum `channel_access_token` and `channel_secret`. See the [config reference](../reference/config.md#channels) for the full field index, defaults, and the `dm_policy` / `group_policy` enums (whose user-facing semantics are also covered in §6 below).
 
 ### Using environment variables instead of config file
 
@@ -82,18 +88,6 @@ Copy the `https://` URL ngrok provides (e.g. `https://abc123.ngrok.io`).
 #### sh
 
 ```sh
-./target/release/zeroclaw --config zeroclaw.toml
-```
-
-</div>
-
-Or via daemon mode:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
 zeroclaw daemon
 ```
 
@@ -115,7 +109,7 @@ LINE: webhook server listening on http://0.0.0.0:8443/line/webhook
 |---|---|
 | `pairing` (default) | The bot ignores all DMs until the user sends `/bind <code>`. A pairing code is displayed in the ZeroClaw log at startup. |
 | `open` | The bot responds to every DM immediately. |
-| `allowlist` | The bot responds only to LINE user IDs listed in `allowed_users`. |
+| `allowlist` | The bot responds only to LINE user IDs in the agent's peer set (see [Who can talk to the agent](#who-can-talk-to-the-agent)). |
 
 **Pairing workflow:**
 

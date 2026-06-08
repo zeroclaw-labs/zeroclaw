@@ -2,18 +2,17 @@
 
 REST v4 polling client. Self-hosted, on-prem, or sovereign-cloud Mattermost servers all work the same way: the bot polls the channels it can read every 3 seconds for new posts, and reply posts go out via `POST /api/v4/posts`.
 
+## Who can talk to the agent
+
+{{#peer-group mattermost}}
+
+To allowlist a specific human, copy their user ID from **System Console → User
+Management** — Mattermost matches the user **UUID**, not a username, and does
+not resolve usernames at message-receive time.
+
 ## Quickstart
 
-Minimum config for a multi-channel, DM-aware bot:
-
-```toml
-[channels.mattermost.work]
-enabled = true
-url = "https://mattermost.example.com"
-bot_token = "..."
-```
-
-That alone gives you:
+Configure a Mattermost channel (`url` plus a `bot_token` secret — see [Authentication](#authentication)) through one of the surfaces below. That alone gives you:
 
 1. Auto-discovery of every channel the bot can read across every team it belongs to.
 2. DM and group-DM channels auto-discovered and polled alongside team channels.
@@ -24,24 +23,9 @@ To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
 
 ## Configuration
 
-```toml
-[channels.mattermost.<alias>]
-enabled            = true                            # gate; required
-url                = "https://mattermost.example.com" # required
-bot_token          = "..."                            # secret; OR login_id+password
-# login_id         = ""                               # alternative auth path; only when bot_token is unset
-# password         = ""                               # secret; pairs with login_id
+`bot_token` and `password` are secrets:
 
-channel_ids        = []                               # [] or ["*"] = auto-discover
-team_ids           = []                               # [] = all teams
-discover_dms       = true                             # include type=D and type=G
-thread_replies     = true                             # thread on the user's post
-mention_only       = false                            # filter ambient-channel chatter
-interrupt_on_new_message = false                      # cancel in-flight on new sender post
-
-proxy_url          = ""                               # optional per-channel proxy
-excluded_tools     = []                               # tools hidden from this channel
-```
+{{#secret-config channels.mattermost.<alias>.bot_token}}
 
 Field reference:
 
@@ -112,10 +96,6 @@ When `[transcription]` is configured and an inbound post has an audio attachment
 4. Add `[channels.mattermost.<alias>]` to your config.toml referencing the token.
 5. Bind the channel to an agent in `[agents.<alias>]` via `channels = ["mattermost.<alias>"]`.
 
-## Identity and peer groups
-
-Inbound `ChannelMessage.sender` is the Mattermost user UUID (`user_id` from the post payload). Peer-group authorization matches against that UUID. If you want to allowlist a specific human, copy their user ID from **System Console → User Management** and add it to `[peer_groups.<group>].external_peers`. The bot does not currently resolve usernames at message-receive time; that's an orthogonal concern shared with Discord and other UUID-based channels.
-
 ## Operational notes
 
 1. Poll cadence is 3 seconds per channel. N discovered channels = N HTTP calls every 3 seconds against the Mattermost server. Self-hosted defaults handle this easily; if you're on a shared cloud tenant with tight rate limits, consider scoping with `channel_ids` or `team_ids`.
@@ -125,5 +105,5 @@ Inbound `ChannelMessage.sender` is the Mattermost user UUID (`user_id` from the 
 ## See also
 
 - [Channels overview](./overview.md)
-- [Security: peer groups](../security/overview.md)
+- [Peer Groups](./peer-groups.md)
 - [Reference: config schema](../reference/config.md)

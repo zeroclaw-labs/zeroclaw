@@ -2,6 +2,10 @@
 
 Run ZeroClaw in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 
+## Who can talk to the agent
+
+{{#peer-group matrix}}
+
 Common failure mode this guide targets:
 
 > "Matrix is configured correctly, checks pass, but the bot does not respond."
@@ -10,7 +14,7 @@ Common failure mode this guide targets:
 
 If Matrix appears connected but there's no reply, validate these first:
 
-1. Sender is allowed by `allowed_users` (for testing: `["*"]`).
+1. Sender is in the agent's peer set (for testing: `external_peers = ["*"]`).
 2. Bot account has joined the exact target room.
 3. Token belongs to the same bot account (`whoami` check, see §5C).
 4. Encrypted room has usable device identity (`device_id`) and key sharing.
@@ -23,56 +27,29 @@ Before testing message flow:
 1. The bot account is joined to the target room.
 2. The access token belongs to the same bot account.
 3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Each entry is either a canonical room ID (`!room:server`) or an alias (`#alias:server`); ZeroClaw resolves aliases.
-4. `allowed_users` allows the sender (`["*"]` for open testing).
+4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing — see §6).
 5. For E2EE rooms, the bot device has received encryption keys for the room.
 
 ## 2. Configuration
 
-All config management goes through `zeroclaw config`. Do not hand-edit `~/.zeroclaw/config.toml`.
+Matrix is configured as a `[channels.matrix.<alias>]` block. Set it through any of these surfaces:
 
-Easiest: set each Matrix field with `zeroclaw config set` (see below). For the fastest one-shot bring-up, the most ergonomic path is to set the required fields back-to-back:
+{{#config-where channels}}
 
-<div class="os-tabs-src">
+{{#secret-config channels.matrix.<alias>.access_token}}
 
-#### sh
+The same applies to `password` and `recovery_key`.
 
-```sh
-zeroclaw config set channels.matrix.homeserver https://matrix.example.com
-zeroclaw config set channels.matrix.access-token   # prompts, input masked
-zeroclaw config set channels.matrix.allowed-users '["*"]'
-```
+`homeserver` and `access_token` are required; `user_id` and `device_id` are strongly recommended for E2EE; `allowed_rooms` optionally restricts which rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to-the-agent). Full field index: [config reference](../reference/config.md#channels).
 
-</div>
+> **Don't have an `access_token` yet?** See §3 below: it walks through the Matrix password-login API call that mints a token plus a stable `device_id` in one shot. If you only need to look up `device_id` for a token you already have, see §5H.
 
-Or set individual fields directly:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-zeroclaw config set channels.matrix.homeserver https://matrix.example.com
-zeroclaw config set channels.matrix.access-token           # prompts, input masked
-zeroclaw config set channels.matrix.user-id @bot:matrix.example.com
-zeroclaw config set channels.matrix.device-id ABCDEF1234
-zeroclaw config set channels.matrix.allowed-users '["*"]'   # open for testing
-zeroclaw config set channels.matrix.allowed-rooms '["!room:matrix.example.com"]'  # empty list = allow all joined rooms
-zeroclaw config set channels.matrix.ack-reactions true       # default: true (👀 → ✅)
-zeroclaw config set channels.matrix.reply-in-thread true     # default: true
-```
-
-</div>
-
-Required: `homeserver`, `access-token`, `allowed-users`. Strongly recommended for E2EE: `user-id` and `device-id`. `allowed-rooms` is optional; leave empty to allow every room the bot has joined, or list explicit IDs/aliases to restrict. For the full field index, see the [Config reference](../reference/config.md).
-
-> **Don't have an `access-token` yet?** See §3 below: it walks through the Matrix password-login API call that mints a token plus a stable `device_id` in one shot. If you only need to look up `device_id` for a token you already have, see §5H.
-
-### About `user-id` and `device-id`
+### About `user_id` and `device_id`
 
 - ZeroClaw attempts to read identity from Matrix `/_matrix/client/v3/account/whoami`.
-- If `whoami` doesn't return `device_id`, set `device-id` manually: critical for E2EE session restore.
+- If `whoami` doesn't return `device_id`, set `device_id` manually: critical for E2EE session restore.
 
-## 3. Obtaining `access-token` and `device-id`
+## 3. Obtaining `access_token` and `device_id`
 
 Brand-new bot accounts need a Matrix access token before ZeroClaw can connect. Element doesn't expose the token directly, so the canonical path is a one-shot password-login API call that returns both the access token and a stable device ID together.
 
@@ -102,27 +79,13 @@ Response:
 
 ### Step 2: Apply both values to ZeroClaw
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-zeroclaw config set channels.matrix.access-token    # paste the access_token (input is masked)
-zeroclaw config set channels.matrix.device-id NEWDEVICE
-zeroclaw config set channels.matrix.user-id @bot:example.com
-```
-
-</div>
-
-Restart for the new values to take effect: `zeroclaw service restart`.
-
-Each of the three `zeroclaw config set` calls above can be re-run any time to update an individual field.
+Put `access_token`, `device_id`, and `user_id` from the response into your `[channels.matrix.<alias>]` block (see [§2](#2-configuration) for where to set them), then restart: `zeroclaw service restart`.
 
 ### Notes
 
 - **Keep a copy of the token** when you first paste it. Secrets are encrypted at rest and `zeroclaw config get` will print `[masked]` for the token field; you can't retrieve it later. Stash it in a scratch note if you'll need it for the curl validation snippets in §5C.
 - **Reuse the same `device_id` on every restart**: changing it forces a new server-side device registration, which breaks key sharing and verification in encrypted rooms. The auto-recovery path in §8 handles the rare cases where wiping is genuinely the right call.
-- **Rotating the access token later** without re-running the wizard: run `zeroclaw config set channels.matrix.access-token` (prompts, input masked), then `zeroclaw service restart`.
+- **Rotating the access token later** without re-running the wizard: update the `access_token` field in your config (see [§2](#2-configuration)), then `zeroclaw service restart`.
 - **Token shows as expired or invalid** at startup: mint a new one with the same curl, repeat Step 2.
 
 ## 4. Quick validation
@@ -141,42 +104,30 @@ Work through in order.
 - Confirm the bot account has joined the room.
 - If using an alias (`#...`), verify it resolves to the expected canonical room.
 
-### B. Sender allowlist
+### B. Sender allowlist (peer groups)
 
-- If `allowed_users = []`, all inbound messages are denied.
-- For diagnosis, temporarily open it: run `zeroclaw config set channels.matrix.allowed-users '["*"]'`, then `zeroclaw service restart`.
-- Tighten to explicit user IDs once the flow works.
+The sender must be in the agent's peer set — see [Who can talk to the agent](#who-can-talk-to-the-agent) at the top of this page. For diagnosis, temporarily set `external_peers = ["*"]` and restart the daemon.
 
 ### C. Token and identity
 
-> **About `$MATRIX_TOKEN` in the snippets below.** Secrets in ZeroClaw are encrypted at rest and intentionally **not** retrievable via `zeroclaw config get`: it prints `[masked]` for any secret field. You have two options:
->
-> 1. **Get a fresh token** by re-running the password-login curl from §3 Step 1. Export the `access_token` it returns. Good for validation and recovery paths, doesn't affect what's in your config.
-> 2. **Keep a copy** of the token when you first paste it into `zeroclaw config set channels.matrix.access-token`. A one-time side-effect: write it to a scratch note if you want to run these curl checks later.
->
-> The non-secret fields *are* retrievable:
->
-> ```sh
-> MATRIX_HOMESERVER=$(zeroclaw config get channels.matrix.homeserver)
-> MATRIX_USER=$(zeroclaw config get channels.matrix.user-id)
-> ```
+Secrets are encrypted at rest and not retrievable — `zeroclaw config get` prints `[masked]` for any secret field. To run the checks below, use the access token you minted in §3 (or mint a fresh one) and your own homeserver URL.
 
-With `MATRIX_TOKEN` set, validate the token server-side:
+Validate the token server-side:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
-  "$MATRIX_HOMESERVER/_matrix/client/v3/account/whoami"
+curl -sS -H "Authorization: Bearer <access_token>" \
+  "https://your.homeserver/_matrix/client/v3/account/whoami"
 ```
 
 </div>
 
 - Returned `user_id` must match the bot account.
 - If `device_id` is missing from the response, set it manually (see §5H).
-- Rotate the access token: `zeroclaw config set channels.matrix.access-token` (prompts, masked), then `zeroclaw service restart`.
+- Rotate the access token: update the `access_token` field in your config (see [§2](#2-configuration)), then `zeroclaw service restart`.
 
 ### D. E2EE-specific checks
 
@@ -184,7 +135,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 - If keys haven't been shared to this device, encrypted events cannot be decrypted.
 - Verify device trust and key sharing from a trusted Matrix session.
 - `matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found`: key backup recovery isn't enabled on this device yet. Non-fatal for message flow; still worth completing (see §5I).
-- If recipients see bot messages as "unverified", verify/sign the bot device from a trusted Matrix session and keep `device-id` stable across restarts.
+- If recipients see bot messages as "unverified", verify/sign the bot device from a trusted Matrix session and keep `device_id` stable across restarts.
 
 ### E. Log levels
 
@@ -223,7 +174,7 @@ ZeroClaw needs a stable `device_id` for E2EE session restore. Without it, a new 
 #### sh
 
 ```sh
-curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
+curl -sS -H "Authorization: Bearer <access_token>" \
   "https://your.homeserver/_matrix/client/v3/account/whoami"
 ```
 
@@ -242,19 +193,7 @@ If `device_id` is missing, the token was created without a device login (e.g. vi
 1. Log in as the bot account in Element.
 2. Settings → Sessions.
 3. Copy the Device ID for the active session.
-4. Apply:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-zeroclaw config set channels.matrix.device-id ABCDEF1234
-```
-
-</div>
-
-Then `zeroclaw service restart`. Keep `device-id` stable: changing it forces a new device registration, which breaks existing key sharing and verification.
+4. Set `device_id` in your config (see [§2](#2-configuration)), then `zeroclaw service restart`. Keep `device_id` stable: changing it forces a new device registration, which breaks existing key sharing and verification.
 
 ### H (continued). Crypto-store deletion recovery
 
@@ -306,18 +245,7 @@ A fresh login creates a new device with a new `device_id`, sidestepping the OTK 
 
    </div>
 
-4. Apply the new credentials:
-
-   <div class="os-tabs-src">
-
-   #### sh
-
-   ```sh
-   zeroclaw config set channels.matrix.access-token <new_token>
-   zeroclaw config set channels.matrix.device-id <new_device_id>
-   ```
-
-   </div>
+4. Apply the new credentials: set `access_token` (secret — see [§2](#2-configuration)) and `device_id` in your config.
 
 5. Restart:
 
@@ -356,15 +284,7 @@ A recovery key lets ZeroClaw automatically restore room keys and cross-signing s
 
 Apply the recovery key to ZeroClaw:
 
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-zeroclaw config set channels.matrix.recovery-key    # input masked
-```
-
-</div>
+{{#secret-config channels.matrix.<alias>.recovery_key}}
 
 Then `zeroclaw service restart`. The recovery key is encrypted at rest immediately.
 
@@ -425,35 +345,35 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 ## 7. Operational notes
 
 - Keep Matrix tokens out of logs and screenshots.
-- Start with permissive `allowed_users`, tighten to explicit user IDs once verified.
+- Start with permissive `external_peers = ["*"]`, tighten to explicit user IDs once verified.
 - Prefer canonical room IDs in production to avoid alias drift.
-- **Threading:** when `channels.matrix.reply-in-thread` is `true` (default), every bot reply lives in a thread rooted at the user's message. Top-level user messages open a fresh thread; existing threads are continued. The main room timeline only carries the user-initiated messages.
+- **Threading:** when `channels.matrix.reply_in_thread` is `true` (default), every bot reply lives in a thread rooted at the user's message. Top-level user messages open a fresh thread; existing threads are continued. The main room timeline only carries the user-initiated messages.
 - **Thread root context:** the first inbound message ZeroClaw sees in any given thread is prefixed with `[Thread root from @sender]: <root body>` so the agent has the conversation that triggered the reply. Threads the bot itself started skip the preamble. Tracking is in-memory only; after a daemon restart, the next message in each active thread re-injects the preamble exactly once.
-- **Inline-reply media:** `channels.matrix.mention-only = true` makes the bot ignore naked media uploads (no text body to mention against). When the user inline-replies to such a dropped event with a question (`@bot can you see this?`), ZeroClaw walks the reply's `m.relates_to.m.in_reply_to.event_id`, fetches the parent event, and pulls its media into the current message: the agent's vision pipeline sees the image even though the original upload was filtered out.
+- **Inline-reply media:** `channels.matrix.mention_only = true` makes the bot ignore naked media uploads (no text body to mention against). When the user inline-replies to such a dropped event with a question (`@bot can you see this?`), ZeroClaw walks the reply's `m.relates_to.m.in_reply_to.event_id`, fetches the parent event, and pulls its media into the current message: the agent's vision pipeline sees the image even though the original upload was filtered out.
 - **Attachments thread alongside text:** `room.send_attachment` calls carry an `AttachmentConfig::reply(...)` with `EnforceThread::Threaded` when a thread anchor is present, so PDFs / images / voice notes land inside the bot's thread instead of the main timeline.
 - **Outbound media markers:** the agent emits `[image:url|path]`, `[file:url|path]`, `[voice:url|path]`, `[video:...]`, `[audio:...]` (and uppercase / `[document:...]` aliases) inside its reply text; ZeroClaw fetches the bytes (HTTP for `http(s)://`, local read otherwise) and uploads as the appropriate Matrix message event. **Missing or unreadable targets are non-fatal:** the channel logs a warning, drops just that marker, and appends a `(note: I couldn't deliver the file at <path>.)` line so the operator sees what was attempted instead of a silently-dropped reply.
-- **Voice messages** (MSC3245): inbound `m.audio` events carrying the `org.matrix.msc3245.voice` field are saved to `{workspace_dir}/matrix_files/` and run through `[transcription]` so the agent gets both the transcript text and the source path. Outbound voice notes use the `[voice:<url|path>]` marker; ZeroClaw uploads as `m.audio` with the voice flag + zero-waveform set so Element renders the bubble as a voice note. Default transcription provider is Groq's hosted Whisper API: set `transcription.default-provider = "local_whisper"` and `transcription.local-whisper.url` for fully on-device transcription.
-- **Acknowledgement reactions:** controlled by `channels.matrix.ack-reactions` (default `true`). When on, the bot reacts with 👀 while processing and ✅ when done. Set to `false` to keep rooms reaction-free.
-- **Streaming modes** (`channels.matrix.stream-mode`):
+- **Voice messages** (MSC3245): inbound `m.audio` events carrying the `org.matrix.msc3245.voice` field are saved to `{workspace_dir}/matrix_files/` and run through the agent's configured transcription provider so the agent gets both the transcript text and the source path. Outbound voice notes use the `[voice:<url|path>]` marker; ZeroClaw uploads as `m.audio` with the voice flag + zero-waveform set so Element renders the bubble as a voice note. See [Model Providers](../providers/overview.md) for transcription provider setup.
+- **Acknowledgement reactions:** controlled by `channels.matrix.ack_reactions` (default `true`). When on, the bot reacts with 👀 while processing and ✅ when done. Set to `false` to keep rooms reaction-free.
+- **Streaming modes** (`channels.matrix.stream_mode`):
     - `off` (default): reply posts as a single message once the agent finishes.
-    - `partial`: initial draft posted immediately, edited in place every `draft-update-interval-ms` as the agent generates output. Tool-execution status is shown by the same edit pipeline.
+    - `partial`: initial draft posted immediately, edited in place every `draft_update_interval_ms` as the agent generates output. Tool-execution status is shown by the same edit pipeline.
     - `multi_message`: no initial draft. Each `\n\n`-bounded paragraph posts as its own threaded message, separated by `multi-message-delay-ms`. Code-fence-aware: blank lines inside ```fenced``` blocks aren't treated as paragraph breaks.
-- **Persistent sessions:** on first successful login, ZeroClaw writes `~/.zeroclaw/state/matrix/session.json` (user_id + device_id + access_token + optional refresh_token). Subsequent restarts call `restore_session()` from that blob: no re-login. The matrix-rust-sdk SQLite crypto store lives alongside it at `~/.zeroclaw/state/matrix/store/`. **Once `session.json` exists, rotating `access-token` in config has no effect until the file is deleted**: the saved token wins. Delete `session.json` to force a re-login from config values.
-- **Cross-signing:** when `recovery-key` matches what is sealed in your account's server-side secret storage, ZeroClaw runs `recovery().recover(key)` on every startup, the SDK imports your existing master / self-signing / user-signing keys, and the freshly registered device is automatically signed. **No bootstrap, no UIA, no key rotation.** If your account doesn't yet have cross-signing set up, generate the recovery key in Element (Settings → Security & Privacy → Secure Backup) before configuring `recovery-key`.
+- **Persistent sessions:** on first successful login, ZeroClaw writes `~/.zeroclaw/state/matrix/session.json` (user_id + device_id + access_token + optional refresh_token). Subsequent restarts call `restore_session()` from that blob: no re-login. The matrix-rust-sdk SQLite crypto store lives alongside it at `~/.zeroclaw/state/matrix/store/`. **Once `session.json` exists, rotating `access_token` in config has no effect until the file is deleted**: the saved token wins. Delete `session.json` to force a re-login from config values.
+- **Cross-signing:** when `recovery_key` matches what is sealed in your account's server-side secret storage, ZeroClaw runs `recovery().recover(key)` on every startup, the SDK imports your existing master / self-signing / user-signing keys, and the freshly registered device is automatically signed. **No bootstrap, no UIA, no key rotation.** If your account doesn't yet have cross-signing set up, generate the recovery key in Element (Settings → Security & Privacy → Secure Backup) before configuring `recovery_key`.
 - **Cron delivery:** `delivery.to` should be a plain room id (`!abc:server`) or alias (`#room:server`). Older configs that wrote `<sender>||<room>` are tolerated: ZeroClaw extracts the last `!`/`#`-prefixed segment and warns about the malformed value.
 
 ## 8. Auto-recovery from corrupted local state
 
-The matrix-rust-sdk default SQLite store is single-device and assumes the local view stays in sync with the homeserver. Two failure modes break that assumption irrecoverably; ZeroClaw detects each at startup and (when `password` + `user-id` are both configured) auto-wipes `~/.zeroclaw/state/matrix/` and re-authenticates so a fresh device is created server-side.
+The matrix-rust-sdk default SQLite store is single-device and assumes the local view stays in sync with the homeserver. Two failure modes break that assumption irrecoverably; ZeroClaw detects each at startup and (when `password` + `user_id` are both configured) auto-wipes `~/.zeroclaw/state/matrix/` and re-authenticates so a fresh device is created server-side.
 
 - **Orphan crypto state.** A `store/` directory exists but `session.json` doesn't (manual cleanup, interrupted prior install, etc.). Logging in fresh on top of orphaned crypto state reproduces `Duplicate one-time keys` / `SigningKeyChanged` conflicts that don't self-heal.
 - **`StateStoreDataKey::OneTimeKeyAlreadyUploaded` flag set.** The SDK persists this key into the state store the first time it sees a duplicate-OTK upload (per the SDK's own comment: "we forgot about some of our one-time keys. This will lead to UTDs."). It survives restarts; the only fix is wipe and re-register.
 
-**`device-id` drift is detected but tolerated, not wiped.** If `channels.matrix.device-id` differs from the device id stored in `session.json`, the channel logs a warning and honors the saved id (which is the value the homeserver actually assigned at login). Wiping on drift would create a recovery loop because auto-recovery itself generates a new id, leaving config and session permanently out of sync.
+**`device_id` drift is detected but tolerated, not wiped.** If `channels.matrix.device_id` differs from the device id stored in `session.json`, the channel logs a warning and honors the saved id (which is the value the homeserver actually assigned at login). Wiping on drift would create a recovery loop because auto-recovery itself generates a new id, leaving config and session permanently out of sync.
 
 When **`recover()` itself fails** (typically `MAC check for the secret storage key failed`), the channel logs the homeserver's default secret-storage key id, whether the key event has passphrase info, the whitespace-stripped input length, and the full error chain: these point at *which* layer rejected the recovery key without leaking the value. Recovery failures are **non-fatal** (they don't trigger auto-wipe); the bot continues, the new device just won't be cross-signed.
 
-If `password` + `user-id` aren't configured, auto-recovery can't run: the channel bails with an actionable error pointing at the two choices: configure them, or `rm -rf ~/.zeroclaw/state/matrix/` manually.
+If `password` + `user_id` aren't configured, auto-recovery can't run: the channel bails with an actionable error pointing at the two choices: configure them, or `rm -rf ~/.zeroclaw/state/matrix/` manually.
 
 ## See also
 

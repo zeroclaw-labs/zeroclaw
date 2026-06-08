@@ -33,7 +33,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Signal | `channel-signal` | [Signal](./signal.md) |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
-| Discord, Slack, Telegram, iMessage, WeCom Bot Webhook, WeCom AI Bot Long Connection, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| Discord, Slack, Telegram, iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
@@ -81,36 +81,22 @@ See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
 ## Configuration
 
-Modern channel instances are configured under `[channels.<type>.<alias>]`, with `default` as the common first alias:
+Modern channel instances are configured under `[channels.<type>.<alias>]`, with `default` as the common first alias. Set them through any config surface:
 
-```toml
-[channels.discord.default]
-enabled = true
-bot_token = "..."
-allowed_users = ["123456789012345678"]
-reply_to_mentions_only = false
+{{#config-where channels}}
 
-[agents.assistant]
-enabled = true
-channels = ["discord.default"]
-```
-
-The `channels` entry binds the channel alias to the agent that should answer it. Some older per-channel guides still show legacy flat examples; prefer the alias shape above for new config. Channel-specific options live under the same block. Common keys across channels:
+Secrets (bot tokens, API keys, passwords) are stored encrypted — set them through the gateway, zerocode, or `zeroclaw config set` (masked), never in plain `config.toml`. The `channels` entry on an agent binds a channel alias to that agent. Field names differ per channel; `zeroclaw config schema` is the authoritative list. Fields that recur across many channels:
 
 | Key | What it does |
 |---|---|
 | `enabled` | On/off without removing the section |
-| `allowed_users` | Whitelist: empty means allow all |
-| `allowed_destinations` | Restrict which rooms/channels/threads the bot answers in |
-| `reply_to_mentions_only` | Ignore messages that don't @-mention the bot |
-| `provider` | Override default model for this channel |
+| `mention_only` | Ignore messages that don't @-mention the bot (chat platforms) |
+| `proxy_url` | Per-channel proxy (http/https/socks5/socks5h); overrides global `[proxy]` |
+| `excluded_tools` | Tools withheld from the model when answering on this channel |
 | `draft_update_interval_ms` | Streaming edit cadence (default 500 ms) |
+| `approval_timeout_secs` | Seconds to wait for operator approval on `always_ask` tools before auto-denying |
 
-## Pairing
-
-Most channels require **pairing**: a one-time handshake that binds an incoming message source to the agent's policy. Each channel's setup guide (linked from the matrix above) walks through that channel's pairing flow; `zeroclaw channel bind-telegram` handles Telegram-specific identities. Without pairing, the channel rejects everything.
-
-The rationale: an agent with a public Telegram bot token and no pairing is a publicly-accessible shell. Pairing is the gate.
+Inbound senders are gated through [peer groups](./peer-groups.md), not a per-channel field.
 
 ## Streaming capability
 

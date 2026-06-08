@@ -2,6 +2,10 @@
 
 Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, federated, and E2E-capable: another sovereign-communication option alongside [Matrix](./matrix.md) and [Mattermost](./mattermost.md).
 
+## Who can talk to the agent
+
+{{#peer-group nextcloud}}
+
 ## What this integration does
 
 - Receives inbound Talk events via `POST /nextcloud-talk` on the gateway
@@ -18,20 +22,13 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 
 ## Configuration
 
-```toml
-[channels.nextcloud_talk]
-enabled = true
-base_url = "https://cloud.example.com"
-app_token = "..."                              # OCS API bearer token (bot app token)
-webhook_secret = "..."                         # shared secret for HMAC-SHA256 webhook verification
-bot_name = "zeroclaw-bot"                      # display name; filters out the bot's own posts
-allowed_users = ["*"]                          # actor IDs; "*" = allow all (use for first-time test only)
-proxy_url = ""                                 # optional per-channel proxy override
-```
+The channel is read from the `default` alias. Set it through any config surface:
 
-Environment override: `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` takes precedence over the config value. Useful for rotating secrets without editing the config.
+{{#config-where channels}}
 
-Full field reference: [Config](../reference/config.md).
+`webhook_secret` can also be supplied at runtime via the generic env override `ZEROCLAW_channels__nextcloud_talk__default__webhook_secret`, useful for rotating it without editing the config.
+
+Full field reference: [config reference](../reference/config.md#channels).
 
 ## Gateway endpoint
 
@@ -80,16 +77,16 @@ Without a secret, no verification: don't expose this endpoint publicly in that m
 
 ## Quick validation
 
-1. Set `allowed_users = ["*"]` for first-time testing
+1. Set `external_peers = ["*"]` in the peer group for first-time testing
 2. Send a test message in the configured Talk room
 3. Confirm ZeroClaw receives and replies in the same room
-4. Tighten `allowed_users` to explicit actor IDs (e.g. `["alice", "bob"]`)
+4. Tighten the peer group to explicit actor IDs (e.g. `["alice", "bob"]`)
 
 ## Troubleshooting
 
-- **`404 Nextcloud Talk not configured`**: `[channels.nextcloud_talk]` section missing or `enabled = false`
+- **`404 Nextcloud Talk not configured`**: `[channels.nextcloud_talk.default]` section missing or `enabled = false`
 - **`401 Invalid signature`**: secret mismatch, wrong random header, or body-signing bug. Check the raw body is being signed (not the parsed JSON)
-- **No reply, webhook `200`**: event was filtered. Check logs for "actorType = bots" or "user not in allowed_users"
+- **No reply, webhook `200`**: event was filtered. Check logs for "actorType = bots" or a sender not in the peer set
 - **Replies delivered but look wrong**: check thread context; Talk replies are currently root-level only
 
 ## Streaming
