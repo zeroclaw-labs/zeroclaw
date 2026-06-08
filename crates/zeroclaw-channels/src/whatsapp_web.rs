@@ -388,12 +388,7 @@ impl WhatsAppWebChannel {
     /// because LIDs couldn't receive messages directly. Now the library
     /// expects LID format when the recipient is LID-addressed.
     #[cfg(feature = "whatsapp-web")]
-    fn compute_reply_target(
-        chat_jid: &str,
-        _is_lid: bool,
-        _is_group: bool,
-        _mapped_phone: Option<&str>,
-    ) -> String {
+    fn compute_reply_target(chat_jid: &str) -> String {
         // Pass through unchanged - library handles LID resolution internally
         chat_jid.to_string()
     }
@@ -1296,12 +1291,7 @@ impl Channel for WhatsAppWebChannel {
                                     .cloned();
 
                                 let is_group = info.source.is_group;
-                                let mut reply_target = Self::compute_reply_target(
-                                    &chat,
-                                    info.source.chat.is_lid(),
-                                    is_group,
-                                    mapped_phone.as_deref(),
-                                );
+                                let mut reply_target = Self::compute_reply_target(&chat);
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
@@ -2083,14 +2073,7 @@ mod tests {
     fn compute_reply_target_preserves_lid_dm() {
         // LID DM → preserved as-is (library handles LID resolution internally)
         let chat_jid = "76188559093817@lid";
-        let is_lid = true;
-        let is_group = false;
-        let result = WhatsAppWebChannel::compute_reply_target(
-            chat_jid,
-            is_lid,
-            is_group,
-            Some("15551234567"),
-        );
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid);
         assert_eq!(
             result, chat_jid,
             "LID DM must be preserved - library handles LID addressing natively"
@@ -2123,14 +2106,7 @@ mod tests {
     fn compute_reply_target_preserves_pn_dm() {
         // PN DM → preserved as-is
         let chat_jid = "15551234567@s.whatsapp.net";
-        let is_lid = false;
-        let is_group = false;
-        let result = WhatsAppWebChannel::compute_reply_target(
-            chat_jid,
-            is_lid,
-            is_group,
-            Some("15551234567"),
-        );
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid);
         assert_eq!(result, chat_jid, "PN DM must preserve original chat JID");
     }
 
@@ -2149,14 +2125,7 @@ mod tests {
     fn compute_reply_target_preserves_group() {
         // Group chat → preserved as-is
         let chat_jid = "120363012345678901@g.us";
-        let is_lid = false;
-        let is_group = true;
-        let result = WhatsAppWebChannel::compute_reply_target(
-            chat_jid,
-            is_lid,
-            is_group,
-            Some("15551234567"),
-        );
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid);
         assert_eq!(
             result, chat_jid,
             "Group chat must preserve original chat JID"
