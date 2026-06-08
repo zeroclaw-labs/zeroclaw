@@ -12,9 +12,10 @@ use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
-/// Reserve space for continuation markers added by send_text_chunks:
-/// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
-const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
+const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
+const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
+const TELEGRAM_FENCE_REOPEN: &str = "```\n";
+const TELEGRAM_FENCE_CLOSE: &str = "```";
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
 
 /// Metadata for an incoming document or photo attachment.
@@ -85,7 +86,8 @@ fn truncate_telegram_command_description(raw: &str) -> String {
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
-/// The effective per-chunk limit is reduced to leave room for continuation markers.
+/// The split budget includes continuation markers and synthetic code fences
+/// exactly as `send_text_chunks` will send them.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
@@ -93,50 +95,198 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut remaining = message;
-    let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
+    let mut in_code_block = false;
 
     while !remaining.is_empty() {
-        // If the remainder fits within the full limit, take it all (last chunk
-        // or single chunk — continuation overhead is at most 14 chars).
-        if remaining.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-            chunks.push(remaining.to_string());
+        let has_previous = !chunks.is_empty();
+
+        if telegram_chunk_send_len(remaining, in_code_block, has_previous, false)
+            <= TELEGRAM_MAX_MESSAGE_LENGTH
+        {
+            let chunk = build_telegram_chunk(remaining, in_code_block, false);
+            chunks.push(chunk);
             break;
         }
 
-        // Find the byte offset for the Nth character boundary.
-        let hard_split = remaining
-            .char_indices()
-            .nth(chunk_limit)
-            .map_or(remaining.len(), |(idx, _)| idx);
+        let max_take = max_nonfinal_telegram_raw_chars(remaining, in_code_block, has_previous);
+        let hard_split = byte_index_after_chars(remaining, max_take);
+        let chunk_end = preferred_telegram_split_end(
+            remaining,
+            hard_split,
+            max_take,
+            in_code_block,
+            has_previous,
+        );
 
-        let chunk_end = if hard_split == remaining.len() {
-            hard_split
-        } else {
-            // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..hard_split];
-
-            // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the start
-                if search_area[..pos].chars().count() >= chunk_limit / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(hard_split) + 1
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at character boundary
-                hard_split
-            }
-        };
-
-        chunks.push(remaining[..chunk_end].to_string());
+        let raw_chunk = &remaining[..chunk_end];
+        let starts_in_code_block = in_code_block;
+        in_code_block = code_block_state_after(raw_chunk, in_code_block);
+        chunks.push(build_telegram_chunk(raw_chunk, starts_in_code_block, true));
         remaining = &remaining[chunk_end..];
     }
 
     chunks
+}
+
+fn build_telegram_chunk(raw_chunk: &str, starts_in_code_block: bool, has_next: bool) -> String {
+    let reopen_prefix = if starts_in_code_block {
+        TELEGRAM_FENCE_REOPEN
+    } else {
+        ""
+    };
+    let ends_in_code_block = code_block_state_after(raw_chunk, starts_in_code_block);
+    let needs_synthetic_close = has_next && ends_in_code_block;
+    let mut chunk = String::with_capacity(
+        reopen_prefix.len()
+            + raw_chunk.len()
+            + if needs_synthetic_close {
+                "\n```".len()
+            } else {
+                0
+            },
+    );
+    chunk.push_str(reopen_prefix);
+    chunk.push_str(raw_chunk);
+    if needs_synthetic_close {
+        if !chunk.ends_with('\n') {
+            chunk.push('\n');
+        }
+        chunk.push_str(TELEGRAM_FENCE_CLOSE);
+    }
+    chunk
+}
+
+fn format_telegram_text_chunk(chunk: &str, index: usize, total: usize) -> String {
+    if total <= 1 {
+        return chunk.to_string();
+    }
+
+    if index == 0 {
+        format!("{chunk}{TELEGRAM_CONTINUES_SUFFIX}")
+    } else if index == total - 1 {
+        format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}")
+    } else {
+        format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}{TELEGRAM_CONTINUES_SUFFIX}")
+    }
+}
+
+fn telegram_chunk_marker_len(has_previous: bool, has_next: bool) -> usize {
+    let prefix_len = if has_previous {
+        TELEGRAM_CONTINUED_PREFIX.chars().count()
+    } else {
+        0
+    };
+    let suffix_len = if has_next {
+        TELEGRAM_CONTINUES_SUFFIX.chars().count()
+    } else {
+        0
+    };
+    prefix_len + suffix_len
+}
+
+fn telegram_chunk_body_len(raw_chunk: &str, starts_in_code_block: bool, has_next: bool) -> usize {
+    let reopen_len = if starts_in_code_block {
+        TELEGRAM_FENCE_REOPEN.chars().count()
+    } else {
+        0
+    };
+    let raw_len = raw_chunk.chars().count();
+    let ends_in_code_block = code_block_state_after(raw_chunk, starts_in_code_block);
+    let synthetic_close_len = if has_next && ends_in_code_block {
+        TELEGRAM_FENCE_CLOSE.chars().count() + usize::from(!raw_chunk.ends_with('\n'))
+    } else {
+        0
+    };
+
+    reopen_len + raw_len + synthetic_close_len
+}
+
+fn telegram_chunk_send_len(
+    raw_chunk: &str,
+    starts_in_code_block: bool,
+    has_previous: bool,
+    has_next: bool,
+) -> usize {
+    telegram_chunk_marker_len(has_previous, has_next)
+        + telegram_chunk_body_len(raw_chunk, starts_in_code_block, has_next)
+}
+
+fn max_nonfinal_telegram_raw_chars(
+    remaining: &str,
+    starts_in_code_block: bool,
+    has_previous: bool,
+) -> usize {
+    let remaining_chars = remaining.chars().count();
+    let marker_len = telegram_chunk_marker_len(has_previous, true);
+    let reopen_len = if starts_in_code_block {
+        TELEGRAM_FENCE_REOPEN.chars().count()
+    } else {
+        0
+    };
+    let upper = remaining_chars
+        .saturating_sub(1)
+        .min(TELEGRAM_MAX_MESSAGE_LENGTH - marker_len - reopen_len);
+
+    for take in (1..=upper).rev() {
+        let end = byte_index_after_chars(remaining, take);
+        if telegram_chunk_send_len(&remaining[..end], starts_in_code_block, has_previous, true)
+            <= TELEGRAM_MAX_MESSAGE_LENGTH
+        {
+            return take;
+        }
+    }
+
+    1
+}
+
+fn byte_index_after_chars(s: &str, char_count: usize) -> usize {
+    if char_count == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_count)
+        .map_or(s.len(), |(idx, _)| idx)
+}
+
+fn preferred_telegram_split_end(
+    remaining: &str,
+    hard_split: usize,
+    max_take: usize,
+    starts_in_code_block: bool,
+    has_previous: bool,
+) -> usize {
+    let search_area = &remaining[..hard_split];
+    let candidate_fits = |end: usize| {
+        end > 0
+            && end < remaining.len()
+            && telegram_chunk_send_len(&remaining[..end], starts_in_code_block, has_previous, true)
+                <= TELEGRAM_MAX_MESSAGE_LENGTH
+    };
+
+    if let Some(pos) = search_area.rfind('\n') {
+        let end = pos + '\n'.len_utf8();
+        if search_area[..pos].chars().count() >= max_take / 2 && candidate_fits(end) {
+            return end;
+        }
+    }
+
+    if let Some(pos) = search_area.rfind(' ') {
+        let end = pos + ' '.len_utf8();
+        if candidate_fits(end) {
+            return end;
+        }
+    }
+
+    hard_split
+}
+
+fn code_block_state_after(text: &str, mut in_code_block: bool) -> bool {
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+    }
+    in_code_block
 }
 
 fn pick_uniform_index(len: usize) -> usize {
@@ -2297,17 +2447,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
-            let text = if chunks.len() > 1 {
-                if index == 0 {
-                    format!("{chunk}\n\n(continues...)")
-                } else if index == chunks.len() - 1 {
-                    format!("(continued)\n\n{chunk}")
-                } else {
-                    format!("(continued)\n\n{chunk}\n\n(continues...)")
-                }
-            } else {
-                chunk.to_string()
-            };
+            let text = format_telegram_text_chunk(chunk, index, chunks.len());
 
             let mut markdown_body = serde_json::json!({
                 "chat_id": chat_id,
@@ -4933,6 +5073,46 @@ mod tests {
     }
 
     #[test]
+    fn telegram_split_counts_final_continued_marker_in_send_length() {
+        let msg = "a".repeat(8142);
+        let chunks = split_message_for_telegram(&msg);
+        assert!(chunks.len() >= 2);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let text = format_telegram_text_chunk(chunk, index, chunks.len());
+            assert!(
+                text.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "final sent chunk {index} must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                text.chars().count()
+            );
+        }
+
+        let final_text =
+            format_telegram_text_chunk(chunks.last().unwrap(), chunks.len() - 1, chunks.len());
+        assert!(final_text.starts_with(TELEGRAM_CONTINUED_PREFIX));
+    }
+
+    #[test]
+    fn telegram_split_counts_middle_continuation_markers_in_send_length() {
+        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH * 3);
+        let chunks = split_message_for_telegram(&msg);
+        assert!(chunks.len() >= 3);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let text = format_telegram_text_chunk(chunk, index, chunks.len());
+            assert!(
+                text.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "sent chunk {index} must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                text.chars().count()
+            );
+        }
+
+        let middle = format_telegram_text_chunk(&chunks[1], 1, chunks.len());
+        assert!(middle.starts_with(TELEGRAM_CONTINUED_PREFIX));
+        assert!(middle.ends_with(TELEGRAM_CONTINUES_SUFFIX));
+    }
+
+    #[test]
     fn telegram_split_at_word_boundary() {
         let msg = format!(
             "{} more text here",
@@ -5605,6 +5785,82 @@ mod tests {
                 part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
                 "each part must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
                 part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_split_long_fenced_code_block_balances_each_chunk() {
+        let mut msg = String::new();
+        msg.push_str("Intro\n\n```rust\n");
+        for i in 0..700 {
+            let _ = writeln!(msg, "fn generated_{i}() {{ println!(\"line {i:03}\"); }}");
+        }
+        msg.push_str("```\n\nOutro");
+
+        let parts = split_message_for_telegram(&msg);
+        assert!(parts.len() >= 2, "long fenced code block should split");
+        for part in &parts {
+            assert!(
+                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "balanced chunk must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+            assert_eq!(
+                part.matches("```").count() % 2,
+                0,
+                "each chunk should have balanced markdown fences"
+            );
+
+            let html = TelegramChannel::markdown_to_telegram_html(part);
+            assert_eq!(
+                html.matches("<pre><code>").count(),
+                html.matches("</code></pre>").count(),
+                "rendered Telegram HTML should have balanced code blocks"
+            );
+        }
+
+        assert!(
+            parts.iter().skip(1).any(|part| part.starts_with("```\n")),
+            "continuation inside a code block should reopen a fence"
+        );
+        assert!(
+            parts
+                .iter()
+                .take(parts.len() - 1)
+                .any(|part| part.ends_with("\n```") || part.ends_with("```")),
+            "split chunks inside a code block should close the fence"
+        );
+    }
+
+    #[test]
+    fn telegram_split_fenced_code_send_text_stays_within_limit_and_balanced() {
+        let mut msg = String::new();
+        msg.push_str("```rust\n");
+        msg.push_str(&"a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 120));
+        msg.push_str("\n```\n");
+
+        let parts = split_message_for_telegram(&msg);
+        assert!(parts.len() >= 2);
+
+        for (index, part) in parts.iter().enumerate() {
+            let text = format_telegram_text_chunk(part, index, parts.len());
+            assert!(
+                text.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "sent fenced chunk {index} must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                text.chars().count()
+            );
+            assert_eq!(
+                text.matches("```").count() % 2,
+                0,
+                "sent fenced chunk {index} should have balanced markdown fences"
+            );
+
+            let html = TelegramChannel::markdown_to_telegram_html(&text);
+            assert_eq!(
+                html.matches("<pre><code>").count(),
+                html.matches("</code></pre>").count(),
+                "sent fenced chunk {index} should render balanced Telegram HTML"
             );
         }
     }
