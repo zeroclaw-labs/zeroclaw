@@ -1254,11 +1254,10 @@ mod client {
     /// length (whitespace-stripped, not the value), and the full error
     /// debug chain (the SDK's `Display` masks fallback errors).
     async fn run_recovery(client: &Client, key: &str) {
+        use matrix_sdk::encryption::recovery::RecoveryState;
+
         let recovery = client.encryption().recovery();
-        if matches!(
-            recovery.state(),
-            matrix_sdk::encryption::recovery::RecoveryState::Enabled
-        ) {
+        if matches!(recovery.state(), RecoveryState::Enabled) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -1269,6 +1268,18 @@ mod client {
 
         let stripped_len = key.chars().filter(|c| !c.is_whitespace()).count();
         diagnose_secret_storage(client, stripped_len).await;
+
+        // No secret storage exists server-side: this account never had Secure
+        // Backup set up. The previous behavior only logged "set it up in
+        // Element first" and left the account with no key backup, spamming
+        // "no backup key was found" forever and risking unrecoverable room
+        // keys if the local store is wiped. Bootstrap it automatically,
+        // seeding secret storage with the operator's configured recovery_key
+        // so that same value unlocks it on future starts.
+        if matches!(recovery.state(), RecoveryState::Disabled) {
+            bootstrap_recovery(&recovery, key).await;
+            return;
+        }
 
         match recovery.recover(key).await {
             Ok(()) => {
@@ -1284,6 +1295,39 @@ mod client {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"e": e.to_string()})),
                 "matrix: E2EE recovery failed: ; full error chain = . If the input length above is unexpected (base58 keys are typically ~58 chars, passphrases vary), the wrong value may be in channels.matrix.recovery-key."
+            ),
+        }
+    }
+
+    /// Create Secure Backup + secret storage for an account that has none.
+    /// Seeds secret storage with the operator's configured `recovery_key` as
+    /// the passphrase, so the same configured value unlocks it on later
+    /// starts. The SDK also returns a freshly generated base58 recovery key;
+    /// it is logged so an operator who prefers the generated key over a
+    /// passphrase can persist it into `channels.matrix.recovery-key`.
+    async fn bootstrap_recovery(
+        recovery: &matrix_sdk::encryption::recovery::Recovery,
+        passphrase: &str,
+    ) {
+        let enable = recovery.enable().wait_for_backups_to_upload();
+        let enable = if passphrase.is_empty() {
+            enable
+        } else {
+            enable.with_passphrase(passphrase)
+        };
+        match enable.await {
+            Ok(generated_key) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"generated_recovery_key": generated_key})),
+                "matrix: Secure Backup bootstrapped (created secret storage + key backup). Keep the generated_recovery_key safe; it (or the configured passphrase) unlocks backup on future starts."
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "matrix: failed to bootstrap Secure Backup; key backup remains unconfigured for this account"
             ),
         }
     }
