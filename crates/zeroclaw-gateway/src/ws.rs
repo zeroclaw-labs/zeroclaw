@@ -823,21 +823,20 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
-    let provider_label = {
-        let cfg = state.config.read();
-        cfg.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    // Attribute telemetry, broadcasts, and cost to THIS agent's actual model
+    // (resolved per-turn), not the global default model or the first configured
+    // provider. Previously `provider_label` took the first `providers.models`
+    // entry and the model came from `model_label` (the global default), so every
+    // gateway_ws_turn / agent_start / cost record mislabelled the model.
+    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
+    let provider_label = turn_provider.clone();
+    let model_label = turn_model.clone();
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "model_provider": provider_label,
-        "model": state.model,
+        "model": model_label,
     }));
 
     // Set session state to running
@@ -870,7 +869,6 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let turn_fut = async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
@@ -1175,7 +1173,7 @@ async fn process_chat_message(
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
             "model_provider": provider_label,
-            "model": state.model,
+            "model": model_label,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1186,7 +1184,7 @@ async fn process_chat_message(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model_provider": provider_label,
-                    "model": state.model,
+                    "model": model_label,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1249,7 +1247,7 @@ async fn process_chat_message(
             let cost_usd = record_turn_cost(
                 state,
                 &provider_label,
-                &state.model,
+                &model_label,
                 total_input_tokens,
                 total_output_tokens,
                 None,
@@ -1262,7 +1260,7 @@ async fn process_chat_message(
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
                 "cost_usd": cost_usd,
-                "model": state.model,
+                "model": model_label,
                 "provider": provider_label,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
@@ -1276,7 +1274,7 @@ async fn process_chat_message(
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "model_provider": provider_label,
-                "model": state.model,
+                "model": model_label,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1288,7 +1286,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": state.model,
+                        "model": model_label,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
@@ -1354,7 +1352,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": state.model,
+                        "model": model_label,
                         "session_key": session_key,
                         "error": sanitized,
                         "error_code": error_code,
