@@ -52,26 +52,18 @@ zeroclaw quickstart
 ```
 
 You answer one prompt per step in the terminal. The built-in `cli` channel
-works immediately, so Channels and Peer groups can be skipped.
-
-**Skip the prompts** by passing the required steps as flags:
-
-```bash
-zeroclaw quickstart --model-provider ollama --model qwen3.6:35b-a3b
-```
-
-Add `--api-key <key>` for hosted providers and `--agent <alias>` to name the
-agent. For an all-defaults, no-approvals config, see [YOLO mode](./yolo.md).
+works immediately, so Channels and Peer groups can be skipped. For an
+all-defaults, no-approvals config, see [YOLO mode](./yolo.md).
 
 ## zerocode
 
-In the [zerocode](./tui.md) terminal interface, switch to the **Quickstart**
-pane with **Alt+→ / Alt+←** (or **Alt+f / Alt+b**) to cycle panes. Then:
+In the [zerocode](./tui.md) terminal interface, the Quickstart pane is one of
+the tabs. Drive it with the keyboard:
 
-- **j / k** (or ↑ / ↓): move between steps
-- **Enter**: open the focused step and fill it in
-- **c**: create the agent once every required step is satisfied
-- **q / Esc**: leave the pane
+{{#include ../_snippets/zerocode-quickstart-keys.md}}
+
+Mouse works too: click a tab in the mode bar to switch panes, click a step to
+select and open it, and scroll to move through the list.
 
 Each step opens a modal that mirrors the checklist above, with a "Use existing"
 option that lists the matching aliases already in your config.

@@ -12782,6 +12782,7 @@ dependencies = [
  "zeroclaw-config",
  "zeroclaw-gateway",
  "zeroclaw-providers",
+ "zerocode",
 ]
 
 [[package]]
