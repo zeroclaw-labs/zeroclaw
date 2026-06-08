@@ -46,16 +46,20 @@ impl Tool for GlobSearchTool {
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "pattern"})),
+                    "glob_search: missing pattern parameter"
+                );
+                anyhow::Error::msg("Missing 'pattern' parameter")
+            })?;
 
-        // Rate limit check (fast path)
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         // Security: reject absolute paths unless under an explicit allowed root.
         if (pattern.starts_with('/') || pattern.starts_with('\\'))
@@ -74,15 +78,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
-            });
-        }
-
-        // Record action to consume rate limit budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -132,8 +127,8 @@ impl Tool for GlobSearchTool {
                 Err(_) => continue, // skip broken symlinks / unresolvable paths
             };
 
-            if !self.security.is_resolved_path_allowed(&resolved) {
-                continue; // silently filter symlink escapes
+            if !self.security.is_resolved_path_readable(&resolved) {
+                continue;
             }
 
             // Only include files, not directories
@@ -360,21 +355,9 @@ mod tests {
         assert!(result.output.contains("file.txt"));
     }
 
-    #[tokio::test]
-    async fn glob_search_rate_limited() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("file.txt"), "").unwrap();
-
-        let tool = GlobSearchTool::new(test_security_with(
-            dir.path().to_path_buf(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
-        let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Rate limit"));
-    }
+    // Rate-limit behavior is covered by RateLimitedTool's own tests in
+    // zeroclaw-tools::wrappers; this tool delegates the concern to the wrapper
+    // at registration time.
 
     #[tokio::test]
     async fn glob_search_results_sorted() {
@@ -423,6 +406,40 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Invalid glob pattern")
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_search_filters_symlink_into_write_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let sibling = TempDir::new().unwrap();
+        std::fs::write(sibling.path().join("secret.txt"), "secret").unwrap();
+
+        let symlink_path = workspace.path().join("siblings");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(sibling.path(), &symlink_path).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_write_only: vec![sibling.path().to_path_buf()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GlobSearchTool::new(security);
+
+        let result = tool
+            .execute(json!({"pattern": "siblings/*"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("secret.txt"),
+            "write-only root must not surface through glob_search even via a workspace symlink; got: {}",
+            result.output
         );
     }
 }

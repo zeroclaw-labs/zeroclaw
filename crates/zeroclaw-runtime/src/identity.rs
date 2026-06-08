@@ -14,7 +14,7 @@ use zeroclaw_config::schema::IdentityConfig;
 /// AIEOS v1.1 identity structure.
 ///
 /// This follows the AIEOS schema for defining AI agent identity, personality,
-/// and behavior. See https://aieos.org for the full specification.
+/// and behavior. See <https://aieos.org> for the full specification.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AieosIdentity {
     /// Core identity: names, bio, origin, residence
@@ -174,11 +174,19 @@ pub fn load_aieos_identity(
             workspace_dir.join(path)
         };
 
-        let content = std::fs::read_to_string(&full_path)
-            .with_context(|| format!("Failed to read AIEOS file: {}", full_path.display()))?;
+        let content = std::fs::read_to_string(&full_path).with_context(|| {
+            format!(
+                "Failed to read AIEOS file: {}",
+                full_path.display().to_string()
+            )
+        })?;
 
-        let identity = parse_aieos_identity(&content)
-            .with_context(|| format!("Failed to parse AIEOS JSON from: {}", full_path.display()))?;
+        let identity = parse_aieos_identity(&content).with_context(|| {
+            format!(
+                "Failed to parse AIEOS JSON from: {}",
+                full_path.display().to_string()
+            )
+        })?;
 
         return Ok(Some(identity));
     }

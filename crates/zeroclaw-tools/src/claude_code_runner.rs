@@ -42,7 +42,7 @@ pub struct ClaudeCodeHookEvent {
 pub struct ClaudeCodeRunnerTool {
     security: Arc<SecurityPolicy>,
     config: ClaudeCodeRunnerConfig,
-    /// Base URL of the ZeroClaw gateway (e.g. "http://localhost:3000").
+    /// Base URL of the ZeroClaw gateway (e.g. `"http://localhost:3000"`).
     gateway_url: String,
 }
 
@@ -105,14 +105,8 @@ impl Tool for ClaudeCodeRunnerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         // Enforce act policy
         if let Err(error) = self
@@ -127,10 +121,16 @@ impl Tool for ClaudeCodeRunnerTool {
         }
 
         // Extract prompt (required)
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "claude_code_runner: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
 
         // Validate working directory
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
@@ -182,15 +182,6 @@ impl Tool for ClaudeCodeRunnerTool {
             .get("slack_channel")
             .and_then(|v| v.as_str())
             .map(String::from);
-
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Generate a unique session ID
         let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -291,14 +282,16 @@ impl Tool for ClaudeCodeRunnerTool {
         // Schedule session TTL cleanup
         let ttl = self.config.session_ttl;
         let cleanup_session = session_name.clone();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &cleanup_session])
                 .output()
                 .await;
-            tracing::info!(
-                session = cleanup_session,
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"session": cleanup_session})),
                 "Claude Code runner session TTL expired, cleaned up"
             );
         });

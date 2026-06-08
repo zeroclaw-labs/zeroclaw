@@ -44,10 +44,17 @@ impl Tool for SopListTool {
         let filter = args.get("filter").and_then(|v| v.as_str()).unwrap_or("");
         let filter_lower = filter.to_lowercase();
 
-        let engine = self
-            .engine
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+        let engine = self.engine.lock().map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP engine lock poisoned"
+            );
+
+            anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+        })?;
         let sops = engine.sops();
 
         if sops.is_empty() {

@@ -99,25 +99,53 @@ impl LinkedInClient {
                     "LINKEDIN_CLIENT_ID" => client_id = Some(value),
                     "LINKEDIN_CLIENT_SECRET" => client_secret = Some(value),
                     "LINKEDIN_ACCESS_TOKEN" => access_token = Some(value),
-                    "LINKEDIN_REFRESH_TOKEN" => {
-                        if !value.is_empty() {
-                            refresh_token = Some(value);
-                        }
-                    }
+                    "LINKEDIN_REFRESH_TOKEN" if !value.is_empty() => refresh_token = Some(value),
                     "LINKEDIN_PERSON_ID" => person_id = Some(value),
                     _ => {}
                 }
             }
         }
 
-        let client_id =
-            client_id.ok_or_else(|| anyhow::anyhow!("LINKEDIN_CLIENT_ID not found in .env"))?;
-        let client_secret = client_secret
-            .ok_or_else(|| anyhow::anyhow!("LINKEDIN_CLIENT_SECRET not found in .env"))?;
-        let access_token = access_token
-            .ok_or_else(|| anyhow::anyhow!("LINKEDIN_ACCESS_TOKEN not found in .env"))?;
-        let person_id =
-            person_id.ok_or_else(|| anyhow::anyhow!("LINKEDIN_PERSON_ID not found in .env"))?;
+        let client_id = client_id.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "LINKEDIN_CLIENT_ID"})),
+                "linkedin_client: LINKEDIN_CLIENT_ID missing from .env"
+            );
+            anyhow::Error::msg("LINKEDIN_CLIENT_ID not found in .env")
+        })?;
+        let client_secret = client_secret.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "LINKEDIN_CLIENT_SECRET"})),
+                "linkedin_client: LINKEDIN_CLIENT_SECRET missing from .env"
+            );
+            anyhow::Error::msg("LINKEDIN_CLIENT_SECRET not found in .env")
+        })?;
+        let access_token = access_token.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "LINKEDIN_ACCESS_TOKEN"})),
+                "linkedin_client: LINKEDIN_ACCESS_TOKEN missing from .env"
+            );
+            anyhow::Error::msg("LINKEDIN_ACCESS_TOKEN not found in .env")
+        })?;
+        let person_id = person_id.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "LINKEDIN_PERSON_ID"})),
+                "linkedin_client: LINKEDIN_PERSON_ID missing from .env"
+            );
+            anyhow::Error::msg("LINKEDIN_PERSON_ID not found in .env")
+        })?;
 
         Ok(LinkedInCredentials {
             client_id,
@@ -510,7 +538,15 @@ impl LinkedInClient {
             .refresh_token
             .as_deref()
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("No refresh token available"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "linkedin_client: no refresh token available"
+                );
+                anyhow::Error::msg("No refresh token available")
+            })?;
 
         let client = Self::client();
         let response = client
@@ -540,7 +576,16 @@ impl LinkedInClient {
             .get("access_token")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("Token refresh response missing access_token field"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"field": "access_token"})),
+                    "linkedin_client: token refresh response missing access_token"
+                );
+                anyhow::Error::msg("Token refresh response missing access_token field")
+            })?;
 
         Ok(new_token)
     }
@@ -584,13 +629,31 @@ impl LinkedInClient {
         let upload_url = register_json
             .pointer("/value/uploadUrl")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing uploadUrl in register response"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "uploadUrl"})),
+                    "linkedin_client: register response missing uploadUrl"
+                );
+                anyhow::Error::msg("Missing uploadUrl in register response")
+            })?
             .to_string();
 
         let image_urn = register_json
             .pointer("/value/image")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing image URN in register response"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "image_urn"})),
+                    "linkedin_client: register response missing image URN"
+                );
+                anyhow::Error::msg("Missing image URN in register response")
+            })?
             .to_string();
 
         // Step 2: Upload binary
@@ -761,7 +824,7 @@ impl LinkedInClient {
 
 /// Multi-provider image generator with SVG fallback card.
 ///
-/// Tries AI providers in configured priority order. If all fail (missing keys,
+/// Tries AI model_providers in configured priority order. If all fail (missing keys,
 /// API errors, exhausted credits), falls back to generating a branded SVG card.
 pub struct ImageGenerator {
     config: LinkedInImageConfig,
@@ -787,7 +850,7 @@ impl ImageGenerator {
             .as_secs();
         let base_name = format!("post_{timestamp}");
 
-        // Try each configured provider in order
+        // Try each configured model_provider in order
         for provider_name in &self.config.providers {
             let result = match provider_name.as_str() {
                 "stability" => self.try_stability(prompt, &image_dir, &base_name).await,
@@ -795,32 +858,46 @@ impl ImageGenerator {
                 "dalle" => self.try_dalle(prompt, &image_dir, &base_name).await,
                 "flux" => self.try_flux(prompt, &image_dir, &base_name).await,
                 other => {
-                    tracing::warn!("Unknown image provider '{other}', skipping");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"other": other})),
+                        "Unknown image model_provider '', skipping"
+                    );
                     continue;
                 }
             };
 
             match result {
                 Ok(path) => {
-                    tracing::info!("Image generated via {provider_name}: {}", path.display());
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("Image generated via {provider_name}: {}", path.display())
+                    );
                     return Ok(path);
                 }
                 Err(e) => {
-                    tracing::warn!("Image provider '{provider_name}' failed: {e}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "provider_name": provider_name})), "Image model_provider '' failed");
                 }
             }
         }
 
-        // All AI providers failed — try SVG fallback
+        // All AI model_providers failed — try SVG fallback
         if self.config.fallback_card {
             let svg_path = image_dir.join(format!("{base_name}.svg"));
             let svg_content = Self::generate_fallback_card(prompt, &self.config.card_accent_color);
             tokio::fs::write(&svg_path, &svg_content).await?;
-            tracing::info!("Fallback SVG card generated: {}", svg_path.display());
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("Fallback SVG card generated: {}", svg_path.display())
+            );
             return Ok(svg_path);
         }
 
-        anyhow::bail!("All image generation providers failed and fallback_card is disabled")
+        anyhow::bail!("All image generation model_providers failed and fallback_card is disabled")
     }
 
     /// Read an env var value from the workspace .env file (same format as LinkedInClient).
@@ -903,7 +980,16 @@ impl ImageGenerator {
         let b64 = json
             .pointer("/artifacts/0/base64")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image data in Stability response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"image_provider": "stability"})),
+                    "linkedin_client: Stability response missing image data"
+                );
+                anyhow::Error::msg("No image data in Stability response")
+            })?;
 
         let bytes = base64_decode(b64)?;
         let path = output_dir.join(format!("{base_name}_stability.png"));
@@ -957,7 +1043,16 @@ impl ImageGenerator {
         let b64 = json
             .pointer("/predictions/0/bytesBase64Encoded")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image data in Imagen response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"image_provider": "imagen"})),
+                    "linkedin_client: Imagen response missing image data"
+                );
+                anyhow::Error::msg("No image data in Imagen response")
+            })?;
 
         let bytes = base64_decode(b64)?;
         let path = output_dir.join(format!("{base_name}_imagen.png"));
@@ -1006,7 +1101,16 @@ impl ImageGenerator {
         let b64 = json
             .pointer("/data/0/b64_json")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image data in DALL-E response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"image_provider": "dalle"})),
+                    "linkedin_client: DALL-E response missing image data"
+                );
+                anyhow::Error::msg("No image data in DALL-E response")
+            })?;
 
         let bytes = base64_decode(b64)?;
         let path = output_dir.join(format!("{base_name}_dalle.png"));
@@ -1053,7 +1157,16 @@ impl ImageGenerator {
         let image_url = json
             .pointer("/images/0/url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image URL in Flux response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"image_provider": "flux"})),
+                    "linkedin_client: Flux response missing image URL"
+                );
+                anyhow::Error::msg("No image URL in Flux response")
+            })?;
 
         // Download the image from the returned URL
         let img_resp = client.get(image_url).send().await?;
@@ -1608,7 +1721,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LinkedInImageConfig {
             enabled: true,
-            providers: vec![], // no AI providers — force fallback
+            providers: vec![], // no AI model_providers — force fallback
             fallback_card: true,
             card_accent_color: "#0A66C2".into(),
             temp_dir: "images".into(),
@@ -1642,7 +1755,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("All image generation providers failed")
+                .contains("All image generation model_providers failed")
         );
     }
 

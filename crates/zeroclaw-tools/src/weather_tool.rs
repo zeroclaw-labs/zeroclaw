@@ -178,8 +178,16 @@ impl WeatherTool {
             );
         }
 
-        let parsed: WttrResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Failed to parse wttr.in response: {e}"))?;
+        let parsed: WttrResponse = serde_json::from_str(&body).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "weather_tool: failed to parse wttr.in response"
+            );
+            anyhow::Error::msg(format!("Failed to parse wttr.in response: {e}"))
+        })?;
 
         Ok(parsed)
     }

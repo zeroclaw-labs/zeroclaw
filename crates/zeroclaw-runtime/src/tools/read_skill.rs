@@ -8,6 +8,7 @@ pub struct ReadSkillTool {
     workspace_dir: PathBuf,
     open_skills_enabled: bool,
     open_skills_dir: Option<String>,
+    allow_scripts: bool,
 }
 
 impl ReadSkillTool {
@@ -15,11 +16,13 @@ impl ReadSkillTool {
         workspace_dir: PathBuf,
         open_skills_enabled: bool,
         open_skills_dir: Option<String>,
+        allow_scripts: bool,
     ) -> Self {
         Self {
             workspace_dir,
             open_skills_enabled,
             open_skills_dir,
+            allow_scripts,
         }
     }
 }
@@ -53,12 +56,23 @@ impl Tool for ReadSkillTool {
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "name"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing 'name' parameter")
+            })?;
 
         let skills = crate::skills::load_skills_with_open_skills_settings(
             &self.workspace_dir,
             self.open_skills_enabled,
             self.open_skills_dir.as_deref(),
+            self.allow_scripts,
         );
 
         let Some(skill) = skills
@@ -118,7 +132,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_tool(tmp: &TempDir) -> ReadSkillTool {
-        ReadSkillTool::new(tmp.path().join("workspace"), false, None)
+        ReadSkillTool::new(tmp.path().join("workspace"), false, None, false)
     }
 
     #[tokio::test]
@@ -183,5 +197,36 @@ description = "Ship safely"
             result.error.as_deref(),
             Some("Unknown skill 'calendar'. Available skills: weather")
         );
+    }
+
+    #[tokio::test]
+    async fn script_skill_is_returned_when_allow_scripts_true() {
+        // Regression pin for #5697: a skill directory containing a script
+        // file (.sh) must be returned by read_skill when the tool was
+        // constructed with allow_scripts=true. Prior to the fix,
+        // ReadSkillTool forwarded a hardcoded None to
+        // load_skills_with_open_skills_settings, which unwrap_or(false)
+        // resolved to false, silently blocking the skill.
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("workspace/skills/setup");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Setup\n\nRuns ./configure and logs.\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("configure.sh"), "#!/bin/sh\necho ok\n").unwrap();
+
+        // Construct with allow_scripts=true. Pre-fix this resolved to false
+        // inside the loader and the skill was skipped.
+        let tool = ReadSkillTool::new(tmp.path().join("workspace"), false, None, true);
+        let result = tool.execute(json!({ "name": "setup" })).await.unwrap();
+
+        assert!(
+            result.success,
+            "script-bearing skill must be returned when allow_scripts=true; got error={:?}",
+            result.error
+        );
+        assert!(result.output.contains("# Setup"));
     }
 }

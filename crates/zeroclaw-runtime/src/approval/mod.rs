@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
-use zeroclaw_config::schema::AutonomyConfig;
+use zeroclaw_config::schema::RiskProfileConfig;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -21,7 +21,7 @@ pub struct ApprovalRequest {
 }
 
 /// The user's response to an approval request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalResponse {
     /// Execute this one call.
@@ -30,6 +30,35 @@ pub enum ApprovalResponse {
     No,
     /// Execute and add tool to session-scoped allowlist.
     Always,
+    /// Skip execution; return this as the tool result instead.
+    #[serde(rename = "replace_with")]
+    ReplaceWith(String),
+}
+
+/// Maximum length of an operator-supplied `DenyWithEdit` / `ReplaceWith`
+/// replacement, in bytes. The replacement is operator-authored but still
+/// untrusted input that becomes a tool result fed back to the model — cap it
+/// so a runaway paste can't blow up the context window.
+pub const MAX_REPLACEMENT_LEN: usize = 64 * 1024;
+
+/// Sanitize an operator-supplied tool-result replacement before it is fed back
+/// to the model: drop control characters (except `\n`, `\r`, `\t`) that could
+/// corrupt rendering or smuggle terminal escapes, and truncate to
+/// [`MAX_REPLACEMENT_LEN`] on a char boundary.
+#[must_use]
+pub fn sanitize_tool_replacement(replacement: &str) -> String {
+    let cleaned: String = replacement
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect();
+    if cleaned.len() <= MAX_REPLACEMENT_LEN {
+        return cleaned;
+    }
+    let mut end = MAX_REPLACEMENT_LEN;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    cleaned[..end].to_string()
 }
 
 /// A single audit log entry for an approval decision.
@@ -40,6 +69,13 @@ pub struct ApprovalLogEntry {
     pub arguments_summary: String,
     pub decision: ApprovalResponse,
     pub channel: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRequirement {
+    Prompt,
+    Approved,
+    NotRequired,
 }
 
 // ── ApprovalManager ──────────────────────────────────────────────
@@ -56,6 +92,8 @@ pub struct ApprovalLogEntry {
 ///   because there is no interactive operator to approve them. `auto_approve`
 ///   policy is still enforced, and `always_ask` / supervised-default tools are
 ///   denied rather than silently allowed.
+/// - **Non-interactive back-channel** (ACP/WS): tools needing approval are sent
+///   through a client approval channel instead of trusting tool arguments.
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
     auto_approve: HashSet<String>,
@@ -66,6 +104,9 @@ pub struct ApprovalManager {
     /// When `true`, tools that would require interactive approval are
     /// auto-denied instead. Used for channel-driven (non-CLI) runs.
     non_interactive: bool,
+    /// When `true`, shell calls in non-interactive mode still enter the outer
+    /// approval flow because a real client approval channel exists.
+    non_interactive_shell_requires_approval: bool,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -73,13 +114,14 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
-    /// Create an interactive (CLI) approval manager from autonomy config.
-    pub fn from_config(config: &AutonomyConfig) -> Self {
+    /// Create an interactive (CLI) approval manager from a risk profile.
+    pub fn from_risk_profile(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: config.auto_approve.iter().cloned().collect(),
-            always_ask: config.always_ask.iter().cloned().collect(),
-            autonomy_level: config.level,
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
             non_interactive: false,
+            non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -90,12 +132,31 @@ impl ApprovalManager {
     /// Enforces the same `auto_approve` / `always_ask` / supervised policies
     /// as the CLI manager, but tools that would require interactive approval
     /// are auto-denied instead of prompting (since there is no operator).
-    pub fn for_non_interactive(config: &AutonomyConfig) -> Self {
+    pub fn for_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: config.auto_approve.iter().cloned().collect(),
-            always_ask: config.always_ask.iter().cloned().collect(),
-            autonomy_level: config.level,
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
             non_interactive: true,
+            non_interactive_shell_requires_approval: false,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create a non-interactive manager for direct agents with a human
+    /// approval back-channel, such as ACP and the web dashboard WebSocket.
+    /// Reads from the same per-agent risk profile as
+    /// [`Self::for_non_interactive`]; the only difference is that shell
+    /// invocations route through the operator-driven backchannel rather
+    /// than auto-denying.
+    pub fn for_non_interactive_backchannel(risk_profile: &RiskProfileConfig) -> Self {
+        Self {
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
+            non_interactive: true,
+            non_interactive_shell_requires_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -111,19 +172,23 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
+        self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
+    }
+
+    pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
-            return false;
+            return ApprovalRequirement::Approved;
         }
 
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
-            return false;
+            return ApprovalRequirement::NotRequired;
         }
 
         // always_ask overrides everything.
         if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
-            return true;
+            return ApprovalRequirement::Prompt;
         }
 
         // Channel-driven shell execution is still guarded by the shell tool's
@@ -131,23 +196,26 @@ impl ApprovalManager {
         // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
         // non-interactive channels without silently allowing medium/high-risk
         // commands.
-        if self.non_interactive && tool_name == "shell" {
-            return false;
+        if self.non_interactive
+            && tool_name == "shell"
+            && !self.non_interactive_shell_requires_approval
+        {
+            return ApprovalRequirement::NotRequired;
         }
 
         // auto_approve skips the prompt.
         if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
-            return false;
+            return ApprovalRequirement::Approved;
         }
 
         // Session allowlist (from prior "Always" responses).
         let allowlist = self.session_allowlist.lock();
         if allowlist.contains(tool_name) {
-            return false;
+            return ApprovalRequirement::Approved;
         }
 
         // Default: supervised mode requires approval.
-        true
+        ApprovalRequirement::Prompt
     }
 
     /// Record an approval decision and update session state.
@@ -155,11 +223,11 @@ impl ApprovalManager {
         &self,
         tool_name: &str,
         args: &serde_json::Value,
-        decision: ApprovalResponse,
+        decision: &ApprovalResponse,
         channel: &str,
     ) {
         // If "Always", add to session allowlist.
-        if decision == ApprovalResponse::Always {
+        if *decision == ApprovalResponse::Always {
             let mut allowlist = self.session_allowlist.lock();
             allowlist.insert(tool_name.to_string());
         }
@@ -170,7 +238,7 @@ impl ApprovalManager {
             timestamp: Utc::now().to_rfc3339(),
             tool_name: tool_name.to_string(),
             arguments_summary: summary,
-            decision,
+            decision: decision.clone(),
             channel: channel.to_string(),
         };
         let mut log = self.audit_log.lock();
@@ -220,23 +288,53 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     }
 }
 
-/// Produce a short human-readable summary of tool arguments.
+/// Produce a short human-readable summary of tool arguments. Argument keys
+/// whose names suggest a credential get their value replaced with
+/// `[redacted]` before truncation, so summaries that cross security
+/// boundaries (e.g. the gateway WebSocket `approval_request` frame) cannot
+/// leak secret-bearing fields. Operators MUST treat the summary as
+/// best-effort: a tool that names its credential field something other than
+/// the patterns below still surfaces. The tool author's typed config and
+/// `#[secret]` annotations are the long-term truth source.
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let val = match v {
+            let mut parts: Vec<String> = Vec::with_capacity(map.len());
+
+            // Prioritize "path" (used by file_write/file_edit etc.) so approval
+            // popups and audit logs always surface the target file first.
+            if let Some(v) = map.get("path") {
+                let val = if looks_like_secret_key("path") {
+                    "[redacted]".to_string()
+                } else {
+                    match v {
                         serde_json::Value::String(s) => truncate_for_summary(s, 80),
                         other => {
                             let s = other.to_string();
                             truncate_for_summary(&s, 80)
                         }
-                    };
-                    format!("{k}: {val}")
-                })
-                .collect();
+                    }
+                };
+                parts.push(format!("path: {val}"));
+            }
+
+            for (k, v) in map.iter() {
+                if k == "path" {
+                    continue;
+                }
+                let val = if looks_like_secret_key(k) {
+                    "[redacted]".to_string()
+                } else {
+                    match v {
+                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        other => {
+                            let s = other.to_string();
+                            truncate_for_summary(&s, 80)
+                        }
+                    }
+                };
+                parts.push(format!("{k}: {val}"));
+            }
             parts.join(", ")
         }
         other => {
@@ -244,6 +342,31 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
             truncate_for_summary(&s, 120)
         }
     }
+}
+
+/// Heuristic for argument keys that should have their value redacted in
+/// human-readable summaries. Matches anywhere in the (lowercased) key:
+/// covers `api_key`, `api-key`, `apiKey`, `oauth_token`, `secret`,
+/// `password`, `auth_token`, `bearer`, `client_secret`, `private_key`, etc.
+fn looks_like_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "auth",
+        "bearer",
+        "private_key",
+        "private-key",
+        "privatekey",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn truncate_for_summary(input: &str, max_chars: usize) -> String {
@@ -261,21 +384,37 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::AutonomyConfig;
+    use zeroclaw_config::schema::RiskProfileConfig;
 
-    fn supervised_config() -> AutonomyConfig {
-        AutonomyConfig {
+    #[test]
+    fn sanitize_replacement_strips_control_chars_keeps_whitespace() {
+        let dirty = "ok\u{0007}line\nnext\ttab\u{001b}[31m";
+        let clean = sanitize_tool_replacement(dirty);
+        assert_eq!(clean, "okline\nnext\ttab[31m");
+    }
+
+    #[test]
+    fn sanitize_replacement_truncates_on_char_boundary() {
+        let big = "é".repeat(MAX_REPLACEMENT_LEN); // 2 bytes each
+        let clean = sanitize_tool_replacement(&big);
+        assert!(clean.len() <= MAX_REPLACEMENT_LEN);
+        // Truncation must land on a char boundary (no panic, valid UTF-8).
+        assert!(clean.chars().all(|c| c == 'é'));
+    }
+
+    fn supervised_config() -> RiskProfileConfig {
+        RiskProfileConfig {
             level: AutonomyLevel::Supervised,
             auto_approve: vec!["file_read".into(), "memory_recall".into()],
             always_ask: vec!["shell".into()],
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         }
     }
 
-    fn full_config() -> AutonomyConfig {
-        AutonomyConfig {
+    fn full_config() -> RiskProfileConfig {
+        RiskProfileConfig {
             level: AutonomyLevel::Full,
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         }
     }
 
@@ -283,27 +422,27 @@ mod tests {
 
     #[test]
     fn auto_approve_tools_skip_prompt() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(!mgr.needs_approval("file_read"));
         assert!(!mgr.needs_approval("memory_recall"));
     }
 
     #[test]
     fn always_ask_tools_always_prompt() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(mgr.needs_approval("shell"));
     }
 
     #[test]
     fn unknown_tool_needs_approval_in_supervised() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
         assert!(mgr.needs_approval("http_request"));
     }
 
     #[test]
     fn full_autonomy_never_prompts() {
-        let mgr = ApprovalManager::from_config(&full_config());
+        let mgr = ApprovalManager::from_risk_profile(&full_config());
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
@@ -311,11 +450,11 @@ mod tests {
 
     #[test]
     fn readonly_never_prompts() {
-        let config = AutonomyConfig {
+        let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         };
-        let mgr = ApprovalManager::from_config(&config);
+        let mgr = ApprovalManager::from_risk_profile(&config);
         assert!(!mgr.needs_approval("shell"));
     }
 
@@ -323,13 +462,13 @@ mod tests {
 
     #[test]
     fn always_response_adds_to_session_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
 
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "test.txt"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "cli",
         );
 
@@ -339,13 +478,13 @@ mod tests {
 
     #[test]
     fn always_ask_overrides_session_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
 
         // Even after "Always" for shell, it should still prompt.
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "cli",
         );
 
@@ -355,11 +494,11 @@ mod tests {
 
     #[test]
     fn yes_response_does_not_add_to_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "file_write",
             &serde_json::json!({}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "cli",
         );
         assert!(mgr.needs_approval("file_write"));
@@ -369,18 +508,18 @@ mod tests {
 
     #[test]
     fn audit_log_records_decisions() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
 
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "rm -rf ./build/"}),
-            ApprovalResponse::No,
+            &ApprovalResponse::No,
             "cli",
         );
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "out.txt", "content": "hello"}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "cli",
         );
 
@@ -394,11 +533,11 @@ mod tests {
 
     #[test]
     fn audit_log_contains_timestamp_and_channel() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "telegram",
         );
 
@@ -416,6 +555,19 @@ mod tests {
         let summary = summarize_args(&args);
         assert!(summary.contains("command: ls -la"));
         assert!(summary.contains("cwd: /tmp"));
+    }
+
+    #[test]
+    pub fn summarize_args_puts_path_first_for_file_tools() {
+        let args = serde_json::json!({
+            "path": "src/main.rs",
+            "old_string": "foo",
+            "new_string": "bar"
+        });
+        let summary = summarize_args(&args);
+        assert!(summary.starts_with("path: src/main.rs"));
+        assert!(summary.contains("old_string: foo"));
+        assert!(summary.contains("new_string: bar"));
     }
 
     #[test]
@@ -453,7 +605,7 @@ mod tests {
 
     #[test]
     fn interactive_manager_reports_interactive() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(!mgr.is_non_interactive());
     }
 
@@ -467,8 +619,15 @@ mod tests {
 
     #[test]
     fn non_interactive_shell_skips_outer_approval_by_default() {
-        let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
+        let mgr = ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
         assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn non_interactive_backchannel_shell_requires_outer_approval() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
+        assert!(mgr.is_non_interactive());
+        assert!(mgr.needs_approval("shell"));
     }
 
     #[test]
@@ -499,9 +658,9 @@ mod tests {
 
     #[test]
     fn non_interactive_readonly_never_needs_approval() {
-        let config = AutonomyConfig {
+        let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         };
         let mgr = ApprovalManager::for_non_interactive(&config);
         // ReadOnly blocks execution elsewhere; approval manager does not prompt.
@@ -518,7 +677,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "test.txt"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "telegram",
         );
 
@@ -532,7 +691,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "telegram",
         );
 
@@ -548,6 +707,10 @@ mod tests {
         assert_eq!(json, "\"always\"");
         let parsed: ApprovalResponse = serde_json::from_str("\"no\"").unwrap();
         assert_eq!(parsed, ApprovalResponse::No);
+        let json =
+            serde_json::to_string(&ApprovalResponse::ReplaceWith("foo".to_string())).unwrap();
+        let parsed: ApprovalResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ApprovalResponse::ReplaceWith("foo".to_string()));
     }
 
     // ── ApprovalRequest ──────────────────────────────────────
@@ -567,7 +730,7 @@ mod tests {
 
     #[test]
     fn non_interactive_allows_default_auto_approve_tools() {
-        let config = AutonomyConfig::default();
+        let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
 
         for tool in &config.auto_approve {
@@ -580,7 +743,7 @@ mod tests {
 
     #[test]
     fn non_interactive_denies_unknown_tools() {
-        let config = AutonomyConfig::default();
+        let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
         assert!(
             mgr.needs_approval("some_unknown_tool"),
@@ -590,7 +753,7 @@ mod tests {
 
     #[test]
     fn non_interactive_weather_is_auto_approved() {
-        let config = AutonomyConfig::default();
+        let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
         assert!(
             !mgr.needs_approval("weather"),
@@ -600,9 +763,9 @@ mod tests {
 
     #[test]
     fn always_ask_overrides_auto_approve() {
-        let config = AutonomyConfig {
+        let config = RiskProfileConfig {
             always_ask: vec!["weather".into()],
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         };
         let mgr = ApprovalManager::for_non_interactive(&config);
         assert!(
@@ -620,6 +783,9 @@ mod tests {
             ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
             ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
             ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
         };
         assert_eq!(mapped, ApprovalResponse::Yes);
     }
@@ -631,6 +797,9 @@ mod tests {
             ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
             ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
             ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
         };
         assert_eq!(mapped, ApprovalResponse::Always);
     }
@@ -642,8 +811,34 @@ mod tests {
             ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
             ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
             ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
         };
         assert_eq!(mapped, ApprovalResponse::No);
+    }
+
+    #[test]
+    fn channel_deny_with_edit_maps_to_replace_with() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let mapped = match (ChannelApprovalResponse::DenyWithEdit {
+            replacement: "x".to_string(),
+        }) {
+            ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
+            ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
+            ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
+        };
+        assert!(matches!(mapped, ApprovalResponse::ReplaceWith(s) if s == "x"));
+    }
+
+    #[test]
+    fn replace_with_is_not_yes_or_no() {
+        let r = ApprovalResponse::ReplaceWith("new text".to_string());
+        assert_ne!(r, ApprovalResponse::Yes);
+        assert_ne!(r, ApprovalResponse::No);
     }
 
     #[test]
@@ -652,6 +847,7 @@ mod tests {
         let req = ChannelApprovalRequest {
             tool_name: "shell".into(),
             arguments_summary: "command: ls -la".into(),
+            raw_arguments: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ChannelApprovalRequest = serde_json::from_str(&json).unwrap();
@@ -670,5 +866,63 @@ mod tests {
         assert_eq!(parsed, ChannelApprovalResponse::AlwaysApprove);
         let parsed: ChannelApprovalResponse = serde_json::from_str("\"deny\"").unwrap();
         assert_eq!(parsed, ChannelApprovalResponse::Deny);
+    }
+
+    // ── summarize_args secret-key redaction ────────────────────
+
+    #[test]
+    fn summarize_args_redacts_known_secret_key_names() {
+        let args = serde_json::json!({
+            "endpoint": "https://api.example.com",
+            "api_key": "sk-very-secret-key-value",
+            "oauth_token": "oauth-secret",
+            "client_secret": "client-secret",
+            "password": "hunter2",
+            "private_key": "-----BEGIN PRIVATE KEY-----abc",
+            "bearer_token": "bearer-thing",
+        });
+        let summary = summarize_args(&args);
+        for needle in [
+            "sk-very-secret-key-value",
+            "oauth-secret",
+            "client-secret",
+            "hunter2",
+            "-----BEGIN PRIVATE KEY-----",
+            "bearer-thing",
+        ] {
+            assert!(
+                !summary.contains(needle),
+                "summary leaked secret value {needle:?}: {summary}"
+            );
+        }
+        assert!(summary.contains("endpoint:"));
+        assert!(summary.contains("api.example.com"));
+    }
+
+    #[test]
+    fn summarize_args_keeps_non_secret_values() {
+        let args = serde_json::json!({
+            "path": "/tmp/file.txt",
+            "limit": 42,
+        });
+        let summary = summarize_args(&args);
+        assert!(summary.contains("/tmp/file.txt"));
+        assert!(summary.contains("42"));
+    }
+
+    #[test]
+    fn summarize_args_redaction_is_case_insensitive_and_substring_aware() {
+        let args = serde_json::json!({
+            "X-API-Key": "hdrsecret",
+            "DBPassword": "dbpw",
+            "AuthHeader": "auth-thing",
+        });
+        let summary = summarize_args(&args);
+        for leaked in ["hdrsecret", "dbpw", "auth-thing"] {
+            assert!(
+                !summary.contains(leaked),
+                "redaction missed {leaked:?}: {summary}"
+            );
+        }
     }
 }

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::path::Path;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 /// Result of a single diagnostic check.
 pub struct CheckResult {
@@ -35,13 +36,13 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     results.push(check_config(config));
 
     // 2. Workspace directory is writable
-    results.push(check_workspace(&config.workspace_dir).await);
+    results.push(check_workspace(&config.data_dir).await);
 
     // 3. SQLite memory backend opens
-    results.push(check_sqlite(&config.workspace_dir));
+    results.push(check_sqlite(&config.data_dir));
 
-    // 4. Provider registry has entries
-    results.push(check_provider_registry());
+    // 4. ModelProvider registry has entries
+    results.push(check_model_provider_registry());
 
     // 5. Tool registry has entries
     results.push(check_tool_registry(config));
@@ -54,6 +55,9 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
 
     // 8. Version sanity
     results.push(check_version());
+
+    // 9. gateway.web_dist_dir is a literal path (no shell-style expansion)
+    results.push(check_web_dist_dir(config));
 
     Ok(results)
 }
@@ -69,6 +73,7 @@ pub async fn run_full(config: &crate::config::Config) -> Result<Vec<CheckResult>
     results.push(check_memory_roundtrip(config).await);
 
     // 11. WebSocket handshake
+    #[cfg(feature = "gateway")]
     results.push(check_websocket_handshake(config).await);
 
     Ok(results)
@@ -91,9 +96,24 @@ pub fn print_results(results: &[CheckResult]) {
     }
     println!();
     if failed == 0 {
-        println!("  \x1b[32mAll {total} checks passed.\x1b[0m");
+        println!(
+            "  \x1b[32m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-all-passed",
+                &[("total", &total.to_string())]
+            )
+        );
     } else {
-        println!("  \x1b[31m{failed}/{total} checks failed.\x1b[0m");
+        println!(
+            "  \x1b[31m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-some-failed",
+                &[
+                    ("failed", &failed.to_string()),
+                    ("total", &total.to_string())
+                ],
+            )
+        );
     }
     println!();
 }
@@ -150,34 +170,55 @@ fn check_sqlite(workspace_dir: &Path) -> CheckResult {
     }
 }
 
-fn check_provider_registry() -> CheckResult {
-    let providers = crate::providers::list_providers();
-    if providers.is_empty() {
-        CheckResult::fail("providers", "no providers registered")
+fn check_model_provider_registry() -> CheckResult {
+    let model_providers = crate::providers::list_model_providers();
+    if model_providers.is_empty() {
+        CheckResult::fail("model_providers", "no model providers registered")
     } else {
         CheckResult::pass(
-            "providers",
-            format!("{} providers available", providers.len()),
+            "model_providers",
+            format!("{} model providers available", model_providers.len()),
         )
     }
 }
 
 fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
-    let security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-    let tools = crate::tools::default_tools(security);
-    if tools.is_empty() {
-        CheckResult::fail("tools", "no tools registered")
-    } else {
-        CheckResult::pass("tools", format!("{} core tools available", tools.len()))
+    // Probe one tool registry per enabled agent. V3 has no global default —
+    // tools are bound to a specific agent's risk profile.
+    let enabled_agents: Vec<&String> = config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias)
+        .collect();
+    if enabled_agents.is_empty() {
+        return CheckResult::fail("tools", "no enabled agents configured");
     }
+    let mut total_tools = 0usize;
+    for alias in &enabled_agents {
+        let security = match crate::security::SecurityPolicy::for_agent(config, alias) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => return CheckResult::fail("tools", format!("agent {alias}: {e}")),
+        };
+        let tools = crate::tools::default_tools(security);
+        if tools.is_empty() {
+            return CheckResult::fail("tools", format!("agent {alias}: no tools registered"));
+        }
+        total_tools = tools.len();
+    }
+    CheckResult::pass(
+        "tools",
+        format!(
+            "{} enabled agent(s); {} core tools per registry",
+            enabled_agents.len(),
+            total_tools
+        ),
+    )
 }
 
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
-    let channels = config.channels.channels();
-    let configured = channels.iter().filter(|(_, c)| *c).count();
+    let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
+    let configured = channels.iter().filter(|e| e.configured).count();
     CheckResult::pass(
         "channels",
         format!(
@@ -189,12 +230,33 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
 }
 
 fn check_security_policy(config: &crate::config::Config) -> CheckResult {
-    let _policy =
-        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    CheckResult::pass(
-        "security",
-        format!("autonomy level: {:?}", config.autonomy.level),
-    )
+    // Probe the security policy of every enabled agent. V3 binds policy
+    // to risk_profile per agent; there is no global "active" policy.
+    let enabled_agents: Vec<&String> = config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias)
+        .collect();
+    if enabled_agents.is_empty() {
+        return CheckResult::fail("security", "no enabled agents configured");
+    }
+    let mut summaries = Vec::new();
+    for alias in &enabled_agents {
+        let Some(profile) = config.risk_profile_for_agent(alias) else {
+            return CheckResult::fail(
+                "security",
+                format!(
+                    "agents.{alias}.risk_profile does not name a configured risk_profiles entry"
+                ),
+            );
+        };
+        if let Err(e) = crate::security::SecurityPolicy::for_agent(config, alias) {
+            return CheckResult::fail("security", format!("agent {alias}: {e}"));
+        }
+        summaries.push(format!("{alias}={:?}", profile.level));
+    }
+    CheckResult::pass("security", summaries.join(", "))
 }
 
 fn check_version() -> CheckResult {
@@ -202,37 +264,126 @@ fn check_version() -> CheckResult {
     CheckResult::pass("version", format!("v{version}"))
 }
 
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw self-test`
+/// time instead of at runtime.
+///
+/// User-facing strings (check name + detail) go through Fluent
+/// (`cli-self-test-web-dist-dir-*` keys) per AGENTS.md § Localization —
+/// no bare Rust literals for CLI output. The check `name` field is
+/// `&'static str`, so we resolve the Fluent string once into a leaked
+/// static at first call. Reason phrases are Fluent keys too
+/// (`cli-web-dist-dir-reason-{tilde,dollar}`).
+fn check_web_dist_dir(config: &crate::config::Config) -> CheckResult {
+    let name = web_dist_dir_check_name();
+    match config.gateway.web_dist_dir.as_deref() {
+        None => CheckResult::pass(
+            name,
+            zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-self-test-web-dist-dir-pass-unset",
+            ),
+        ),
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
+            None => CheckResult::pass(
+                name,
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-self-test-web-dist-dir-pass-literal",
+                    &[("path", value)],
+                ),
+            ),
+            Some(reason_key) => {
+                let reason = zeroclaw_runtime::i18n::get_required_cli_string(reason_key);
+                CheckResult::fail(
+                    name,
+                    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-self-test-web-dist-dir-fail-expansion",
+                        &[("path", value), ("reason", reason.as_str())],
+                    ),
+                )
+            }
+        },
+    }
+}
+
+/// Resolve the localized check name once and cache it as a `&'static str`
+/// (CheckResult::name is `&'static str` to stay copyable across the table
+/// renderer). Falls back to the bare identifier if the Fluent string is
+/// missing (mirrors the `missing_cli_string` warn-log behavior).
+fn web_dist_dir_check_name() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<&'static str> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let resolved =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        Box::leak(resolved.into_boxed_str())
+    })
+}
+
+/// Return the Fluent reason key when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("cli-web-dist-dir-reason-tilde")
+    } else if value.contains('$') {
+        Some("cli-web-dist-dir-reason-dollar")
+    } else {
+        None
+    }
+}
+
+/// Resolve a wildcard bind address (`0.0.0.0`, `[::]`) to a concrete
+/// loopback target so the probe can actually connect — and report the
+/// configured value alongside so the user isn't confused about why the
+/// output says `127.0.0.1` when their `config.toml` says `0.0.0.0`
+///. Returns `(probe_host, display_host)` where `display_host`
+/// is `Some(_)` only when a rewrite happened.
+fn resolve_probe_host(configured: &str) -> (&str, Option<&str>) {
+    match configured {
+        "0.0.0.0" => ("127.0.0.1", Some("0.0.0.0")),
+        // Normalise both shapes to bracketed form for the display URL so the
+        // unbracketed `::` doesn't yield `http://:::42617` (three colons,
+        // invalid URL). The probe target stays `[::1]`.
+        "[::]" | "::" => ("[::1]", Some("[::]")),
+        other => (other, None),
+    }
+}
+
+fn format_probe_url(scheme: &str, configured_host: &str, port: u16, path: &str) -> String {
+    let (probe_host, display_host) = resolve_probe_host(configured_host);
+    let probed = format!("{scheme}://{probe_host}:{port}{path}");
+    match display_host {
+        Some(cfg) => {
+            format!("{scheme}://{cfg}:{port}{path} (probed via {scheme}://{probe_host}:{port})")
+        }
+        None => probed,
+    }
+}
+
 async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
     let port = config.gateway.port;
-    let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        &config.gateway.host
-    };
-    let url = format!("http://{host}:{port}/health");
+    let (probe_host, _) = resolve_probe_host(&config.gateway.host);
+    let probe_url = format!("http://{probe_host}:{port}/health");
+    let display_url = format_probe_url("http", &config.gateway.host, port, "/health");
     match reqwest::Client::new()
-        .get(&url)
+        .get(&probe_url)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            CheckResult::pass("gateway", format!("health OK at {url}"))
+            CheckResult::pass("gateway", format!("health OK at {display_url}"))
         }
         Ok(resp) => CheckResult::fail("gateway", format!("health returned {}", resp.status())),
-        Err(e) => CheckResult::fail("gateway", format!("not reachable at {url}: {e}")),
+        Err(e) => CheckResult::fail("gateway", format!("not reachable at {display_url}: {e}")),
     }
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(
-        &config.memory,
-        &config.workspace_dir,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
-    ) {
+    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };
@@ -268,17 +419,170 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
     }
 }
 
+#[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
     let port = config.gateway.port;
-    let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        &config.gateway.host
-    };
-    let url = format!("ws://{host}:{port}/ws/chat");
+    let (probe_host, _) = resolve_probe_host(&config.gateway.host);
+    let probe_url = format!("ws://{probe_host}:{port}/ws/chat");
+    let display_url = format_probe_url("ws", &config.gateway.host, port, "/ws/chat");
 
-    match tokio_tungstenite::connect_async(&url).await {
-        Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {url}")),
-        Err(e) => CheckResult::fail("websocket", format!("handshake failed at {url}: {e}")),
+    match tokio_tungstenite::connect_async(&probe_url).await {
+        Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {display_url}")),
+        Err(e) => CheckResult::fail(
+            "websocket",
+            format!("handshake failed at {display_url}: {e}"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+
+    #[test]
+    fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
+        // Issue #6079: `~/web-dist` is read verbatim and silently fails.
+        // #6961 Round 3: predicate now returns Fluent key, not bare phrase.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_with_env_var_resolves_to_dollar_reason_key() {
+        // Issue #6079: `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("/srv/$USER/dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        // Absolute and relative literal paths must NOT be flagged.
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_fail_for_tilde() {
+        // #6961 Round 3: the failure detail goes through Fluent
+        // (cli-self-test-web-dist-dir-fail-expansion) — assert the
+        // resolved English string contains the inlined path + reason.
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(!result.passed, "tilde path must fail the check");
+
+        let expected_reason =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-fail-expansion",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+        assert_eq!(result.detail, expected_detail);
+
+        let expected_name =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        assert_eq!(result.name, expected_name.as_str());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_for_literal() {
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-pass-literal",
+            &[("path", "/srv/zeroclaw/web-dist")],
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_when_unset() {
+        let config = crate::config::Config::default();
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string(
+            "cli-self-test-web-dist-dir-pass-unset",
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv4_wildcard() {
+        assert_eq!(
+            resolve_probe_host("0.0.0.0"),
+            ("127.0.0.1", Some("0.0.0.0"))
+        );
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv6_wildcard_bracketed() {
+        assert_eq!(resolve_probe_host("[::]"), ("[::1]", Some("[::]")));
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv6_wildcard_unbracketed_normalises_to_brackets() {
+        // Regression: previously returned `Some("::")`, which `format_probe_url`
+        // would render as `http://:::42617/...` (three colons, invalid URL).
+        assert_eq!(resolve_probe_host("::"), ("[::1]", Some("[::]")));
+    }
+
+    #[test]
+    fn resolve_probe_host_concrete_host_passthrough() {
+        assert_eq!(resolve_probe_host("127.0.0.1"), ("127.0.0.1", None));
+        assert_eq!(
+            resolve_probe_host("example.internal"),
+            ("example.internal", None)
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv4_wildcard_shows_both() {
+        assert_eq!(
+            format_probe_url("http", "0.0.0.0", 42617, "/health"),
+            "http://0.0.0.0:42617/health (probed via http://127.0.0.1:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv6_wildcard_unbracketed_shows_valid_url() {
+        // Regression: was `http://:::42617/health`, now `http://[::]:42617/health`.
+        assert_eq!(
+            format_probe_url("http", "::", 42617, "/health"),
+            "http://[::]:42617/health (probed via http://[::1]:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv6_wildcard_bracketed_shows_valid_url() {
+        assert_eq!(
+            format_probe_url("http", "[::]", 42617, "/health"),
+            "http://[::]:42617/health (probed via http://[::1]:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_concrete_host_no_probe_suffix() {
+        assert_eq!(
+            format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
+            "ws://127.0.0.1:42617/ws/chat"
+        );
     }
 }

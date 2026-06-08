@@ -31,7 +31,7 @@ mod tests {
     #[test]
     fn factory_empty_string_returns_none() {
         let cfg = TunnelConfig {
-            provider: String::new(),
+            tunnel_provider: String::new(),
             ..TunnelConfig::default()
         };
         let t = create_tunnel(&cfg).unwrap();
@@ -41,16 +41,16 @@ mod tests {
     #[test]
     fn factory_unknown_provider_errors() {
         let cfg = TunnelConfig {
-            provider: "wireguard".into(),
+            tunnel_provider: "wireguard".into(),
             ..TunnelConfig::default()
         };
-        assert_tunnel_err(&cfg, "Unknown tunnel provider");
+        assert_tunnel_err(&cfg, "Unknown tunnel_provider");
     }
 
     #[test]
     fn factory_cloudflare_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "cloudflare".into(),
+            tunnel_provider: "cloudflare".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.cloudflare]");
@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn factory_cloudflare_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "cloudflare".into(),
+            tunnel_provider: "cloudflare".into(),
             cloudflare: Some(CloudflareTunnelConfig {
                 token: "test-token".into(),
             }),
@@ -73,7 +73,7 @@ mod tests {
     #[test]
     fn factory_tailscale_defaults_ok() {
         let cfg = TunnelConfig {
-            provider: "tailscale".into(),
+            tunnel_provider: "tailscale".into(),
             ..TunnelConfig::default()
         };
         let t = create_tunnel(&cfg).unwrap();
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn factory_ngrok_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "ngrok".into(),
+            tunnel_provider: "ngrok".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.ngrok]");
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn factory_ngrok_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "ngrok".into(),
+            tunnel_provider: "ngrok".into(),
             ngrok: Some(NgrokTunnelConfig {
                 auth_token: "tok".into(),
                 domain: None,
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn factory_custom_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "custom".into(),
+            tunnel_provider: "custom".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.custom]");
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn factory_custom_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "custom".into(),
+            tunnel_provider: "custom".into(),
             custom: Some(CustomTunnelConfig {
                 start_command: "echo tunnel".into(),
                 health_url: None,
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn factory_pinggy_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "pinggy".into(),
+            tunnel_provider: "pinggy".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.pinggy]");
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn factory_pinggy_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "pinggy".into(),
+            tunnel_provider: "pinggy".into(),
             pinggy: Some(PinggyTunnelConfig {
                 token: Some("tok".into()),
                 region: None,
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn factory_openvpn_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "openvpn".into(),
+            tunnel_provider: "openvpn".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.openvpn]");
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn factory_openvpn_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "openvpn".into(),
+            tunnel_provider: "openvpn".into(),
             openvpn: Some(OpenVpnTunnelConfig {
                 config_file: "client.ovpn".into(),
                 auth_file: None,
@@ -272,8 +272,17 @@ mod tests {
     async fn kill_shared_terminates_and_clears_child() {
         let proc = new_shared_process();
 
-        let child = Command::new("sleep")
-            .arg("30")
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.args(["30"]);
+            c
+        };
+
+        let child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

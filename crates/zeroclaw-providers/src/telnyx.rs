@@ -1,7 +1,7 @@
-//! Telnyx AI inference provider.
+//! Telnyx AI inference model_provider.
 //!
 //! Telnyx provides AI inference through an OpenAI-compatible API at
-//! https://api.telnyx.com/v2/ai with access to 53+ models including
+//! <https://api.telnyx.com/v2/ai> with access to 53+ models including
 //! GPT-4o, Claude, Llama, Mistral, and more.
 //!
 //! # Configuration
@@ -9,16 +9,19 @@
 //! Set the `TELNYX_API_KEY` environment variable or configure in `config.toml`:
 //!
 //! ```toml
-//! default_provider = "telnyx"
+//! default_model_provider = "telnyx"
 //! default_model = "openai/gpt-4o"
 //! ```
 
-use crate::traits::{ChatMessage, Provider};
+use crate::traits::{ChatMessage, ModelProvider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 
-/// Telnyx AI inference provider.
+/// Telnyx Inference Engine public endpoint.
+pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
+
+/// Telnyx AI inference model_provider.
 ///
 /// Uses the OpenAI-compatible chat completions API at `/v2/ai/chat/completions`.
 /// Supports 53+ models including OpenAI, Anthropic (via API), Meta Llama,
@@ -27,31 +30,27 @@ use serde::Deserialize;
 /// # Example
 ///
 /// ```rust,ignore
-/// use zeroclaw::providers::telnyx::TelnyxProvider;
-/// use zeroclaw::providers::Provider;
+/// use zeroclaw::providers::telnyx::TelnyxModelProvider;
+/// use zeroclaw::providers::ModelProvider;
 ///
-/// let provider = TelnyxProvider::new(Some("your-api-key"));
-/// let response = provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
+/// let model_provider = TelnyxModelProvider::new("test", Some("your-api-key"));
+/// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
 /// ```
-pub struct TelnyxProvider {
+pub struct TelnyxModelProvider {
+    /// `[model_providers.telnyx.<alias>]` config-key alias.
+    alias: String,
     /// Telnyx API key
     api_key: Option<String>,
     /// HTTP client for API requests
     client: Client,
 }
 
-impl TelnyxProvider {
-    /// Telnyx AI API base URL
-    const BASE_URL: &'static str = "https://api.telnyx.com/v2/ai";
-
-    /// Create a new Telnyx AI provider.
-    ///
-    /// The API key can be provided directly or will be resolved from:
-    /// 1. `TELNYX_API_KEY` environment variable
-    /// 2. `ZEROCLAW_API_KEY` environment variable (fallback)
-    pub fn new(api_key: Option<&str>) -> Self {
+impl TelnyxModelProvider {
+    /// Create a new Telnyx AI model_provider.
+    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
         let resolved_key = resolve_telnyx_api_key(api_key);
         Self {
+            alias: alias.to_string(),
             api_key: resolved_key,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
@@ -60,11 +59,10 @@ impl TelnyxProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
-
-    /// Create a provider with a custom base URL (for testing or proxies).
-    pub fn with_base_url(api_key: Option<&str>, _base_url: &str) -> Self {
+    /// Create a model_provider with a custom base URL (for testing or proxies).
+    pub fn with_base_url(alias: &str, api_key: Option<&str>, _base_url: &str) -> Self {
         // Note: custom base URL support for testing
-        Self::new(api_key)
+        Self::new(alias, api_key)
     }
 
     /// List available models from Telnyx AI.
@@ -72,12 +70,19 @@ impl TelnyxProvider {
     /// Returns a list of model IDs that can be used with the chat API.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Telnyx API key not set. Set TELNYX_API_KEY environment variable.")
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "api_key"})),
+                "telnyx: API key not configured"
+            );
+            anyhow::Error::msg("Telnyx API key not set. Set TELNYX_API_KEY environment variable.")
         })?;
 
         let response = self
             .client
-            .get(format!("{}/models", Self::BASE_URL))
+            .get(format!("{}/models", BASE_URL))
             .header("Authorization", format!("Bearer {}", api_key))
             .send()
             .await?;
@@ -93,35 +98,15 @@ impl TelnyxProvider {
 
     /// Build the chat completions URL
     fn chat_url(&self) -> String {
-        format!("{}/chat/completions", Self::BASE_URL)
+        format!("{}/chat/completions", BASE_URL)
     }
 }
 
-/// Resolve Telnyx API key from parameter or environment.
 fn resolve_telnyx_api_key(api_key: Option<&str>) -> Option<String> {
-    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
-        return Some(key.to_string());
-    }
-
-    // Try Telnyx-specific env var first
-    if let Ok(key) = std::env::var("TELNYX_API_KEY") {
-        let key = key.trim();
-        if !key.is_empty() {
-            return Some(key.to_string());
-        }
-    }
-
-    // Fall back to generic env vars
-    for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
-        if let Ok(key) = std::env::var(env_var) {
-            let key = key.trim();
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
-        }
-    }
-
-    None
+    api_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(ToString::to_string)
 }
 
 /// Response from the /models endpoint
@@ -140,7 +125,8 @@ struct ModelInfo {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -166,17 +152,29 @@ struct ResponseMessage {
 }
 
 #[async_trait]
-impl Provider for TelnyxProvider {
+impl ModelProvider for TelnyxModelProvider {
+    // ── ModelProvider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw onboard`."
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "api_key"})),
+                "telnyx: API key not configured"
+            );
+            anyhow::Error::msg(
+                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw quickstart --model-provider telnyx --api-key <key>`.",
             )
         })?;
 
@@ -223,18 +221,33 @@ impl Provider for TelnyxProvider {
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from Telnyx"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "telnyx: empty choices in response"
+                );
+                anyhow::Error::msg("No response from Telnyx")
+            })
     }
 
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw onboard`."
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "api_key"})),
+                "telnyx: API key not configured"
+            );
+            anyhow::Error::msg(
+                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw quickstart --model-provider telnyx --api-key <key>`.",
             )
         })?;
 
@@ -275,16 +288,20 @@ impl Provider for TelnyxProvider {
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from Telnyx"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "telnyx: empty choices in response"
+                );
+                anyhow::Error::msg("No response from Telnyx")
+            })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
         // Pre-warm the connection pool
-        let _ = self
-            .client
-            .get(format!("{}/models", Self::BASE_URL))
-            .send()
-            .await;
+        let _ = self.client.get(format!("{}/models", BASE_URL)).send().await;
         Ok(())
     }
 }
@@ -309,19 +326,32 @@ pub mod models {
     pub const MISTRAL_SMALL: &str = "mistralai/mistral-small";
 }
 
+impl ::zeroclaw_api::attribution::Attributable for TelnyxModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Telnyx,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn creates_provider_with_key() {
-        let provider = TelnyxProvider::new(Some("test-key"));
-        assert!(provider.api_key.is_some());
+        let model_provider = TelnyxModelProvider::new("test", Some("test-key"));
+        assert!(model_provider.api_key.is_some());
     }
 
     #[test]
     fn creates_provider_without_key() {
-        let _provider = TelnyxProvider::new(None);
+        let _provider = TelnyxModelProvider::new("test", None);
         // Will be None if env vars not set
     }
 
@@ -373,7 +403,7 @@ mod tests {
                     content: "Hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
 
         let json = serde_json::to_string(&req).unwrap();

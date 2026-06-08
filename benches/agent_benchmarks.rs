@@ -7,7 +7,7 @@
 //!
 //! Run: `cargo bench`
 //!
-//! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 7)
+//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -19,7 +19,7 @@ use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
+use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
 use zeroclaw::tools::{Tool, ToolResult};
 
 use anyhow::Result;
@@ -29,11 +29,11 @@ use async_trait::async_trait;
 // Mock infrastructure (mirrors test mocks, kept local for benchmark isolation)
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct BenchProvider {
+struct BenchModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
 }
 
-impl BenchProvider {
+impl BenchModelProvider {
     fn text_only(text: &str) -> Self {
         Self {
             responses: Mutex::new(vec![ChatResponse {
@@ -54,6 +54,7 @@ impl BenchProvider {
                         id: "tc1".into(),
                         name: "noop".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -69,14 +70,27 @@ impl BenchProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for BenchModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "BenchModelProvider"
+    }
+}
+
 #[async_trait]
-impl Provider for BenchProvider {
+impl ModelProvider for BenchModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         Ok("fallback".into())
     }
@@ -85,7 +99,7 @@ impl Provider for BenchProvider {
         &self,
         _request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
@@ -101,6 +115,8 @@ impl Provider for BenchProvider {
 }
 
 struct NoopTool;
+
+zeroclaw_api::mock_tool_attribution!(NoopTool);
 
 #[async_trait]
 impl Tool for NoopTool {
@@ -204,11 +220,13 @@ fn bench_native_parsing(c: &mut Criterion) {
                 id: "tc1".into(),
                 name: "search".into(),
                 arguments: r#"{"query": "zeroclaw"}"#.into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "read_file".into(),
                 arguments: r#"{"path": "src/main.rs"}"#.into(),
+                extra_content: None,
             },
         ],
         usage: None,
@@ -285,9 +303,9 @@ fn bench_agent_turn(c: &mut Criterion) {
     c.bench_function("agent_turn_text_only", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let provider = Box::new(BenchProvider::text_only("benchmark response"));
+                let model_provider = Box::new(BenchModelProvider::text_only("benchmark response"));
                 let mut agent = Agent::builder()
-                    .provider(provider)
+                    .model_provider(model_provider)
                     .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
                     .memory(make_memory())
                     .observer(make_observer())
@@ -303,9 +321,9 @@ fn bench_agent_turn(c: &mut Criterion) {
     c.bench_function("agent_turn_with_tool_call", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let provider = Box::new(BenchProvider::with_tool_then_text());
+                let model_provider = Box::new(BenchModelProvider::with_tool_then_text());
                 let mut agent = Agent::builder()
-                    .provider(provider)
+                    .model_provider(model_provider)
                     .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
                     .memory(make_memory())
                     .observer(make_observer())

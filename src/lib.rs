@@ -58,8 +58,6 @@ pub(crate) mod doctor;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 #[cfg(feature = "agent-runtime")]
-pub mod hands;
-#[cfg(feature = "agent-runtime")]
 pub(crate) mod hardware;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod health;
@@ -76,8 +74,6 @@ pub(crate) mod multimodal;
 pub mod nodes;
 #[cfg(feature = "agent-runtime")]
 pub mod observability;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod onboard;
 #[cfg(feature = "agent-runtime")]
 pub mod peripherals;
 #[cfg(feature = "agent-runtime")]
@@ -99,8 +95,6 @@ pub mod sop;
 pub mod tools;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod trust;
-#[cfg(feature = "tui-onboarding")]
-pub mod tui;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod tunnel;
 #[cfg(feature = "agent-runtime")]
@@ -115,6 +109,7 @@ pub use config::Config;
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GatewayCommands {
     /// Start the gateway server (default if no subcommand specified)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Start the gateway server (webhooks, websockets).
 
@@ -136,8 +131,14 @@ Examples:
         /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
     /// Restart the gateway server
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Restart the gateway server.
 
@@ -156,8 +157,14 @@ Examples:
         /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
     /// Show or generate the pairing code without restarting
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Show or generate the gateway pairing code.
 
@@ -165,15 +172,43 @@ Displays the pairing code for connecting new clients without \
 restarting the gateway. Requires the gateway to be running.
 
 With --new, generates a fresh pairing code even if the gateway \
-was previously paired (useful for adding additional clients).
+was previously paired (useful for adding additional clients). This \
+does NOT revoke existing tokens.
+
+With --rotate, revokes ALL paired bearer tokens, clears the device \
+registry, and issues a fresh code. Use this after a suspected token \
+leak when you do not know which token was compromised; every client \
+must re-pair.
+
+With --rotate-device <id>, revokes just that device's bearer token \
+and issues a fresh code for re-pairing that one device.
 
 Examples:
-  zeroclaw gateway get-paircode       # show current pairing code
-  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+  zeroclaw gateway get-paircode               # show current pairing code
+  zeroclaw gateway get-paircode --new         # add another client (no revocation)
+  zeroclaw gateway get-paircode --rotate      # revoke ALL tokens, then issue a code
+  zeroclaw gateway get-paircode --rotate-device dash-1  # revoke one device's token
+  zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
     GetPaircode {
-        /// Generate a new pairing code (even if already paired)
+        /// Generate a new pairing code for adding a client (does not revoke existing tokens)
         #[arg(long)]
         new: bool,
+
+        /// Revoke ALL paired tokens and clear the device registry, then issue a new code
+        #[arg(long, conflicts_with_all = ["new", "rotate_device"])]
+        rotate: bool,
+
+        /// Revoke a single device's bearer token by id, then issue a new code
+        #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
+        rotate_device: Option<String>,
+
+        /// Port of the running gateway to query; defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running gateway to query; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -213,6 +248,7 @@ pub enum ChannelCommands {
     /// Run health checks for configured channels (handled in main.rs for async)
     Doctor,
     /// Add a new channel configuration
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a new channel configuration.
 
@@ -236,6 +272,7 @@ Examples:
         name: String,
     },
     /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Bind a Telegram identity into the allowlist.
 
@@ -251,6 +288,7 @@ Examples:
         identity: String,
     },
     /// Send a message to a configured channel
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Send a one-off message to a configured channel.
 
@@ -282,6 +320,61 @@ Examples:
 pub enum SkillCommands {
     /// List all installed skills
     List,
+    /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Scaffold a new skill under a skill bundle. Writes <bundle.directory>/<name>/SKILL.md \
+plus the canonical optional subdirs (scripts/, references/, assets/). \
+Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
+
+Examples:
+  zeroclaw skills add code-review --bundle official --description \"Review PRs.\"
+  zeroclaw skills add ops-runbook --description \"Triage prod incidents.\" --edit")]
+    Add {
+        /// Skill name (lowercase + hyphens only)
+        name: String,
+        /// Target bundle alias. Optional when exactly one bundle is configured.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// What the skill does and when to use it (frontmatter `description`).
+        /// Required; prompted on TTY when missing.
+        #[arg(long)]
+        description: Option<String>,
+        /// SPDX license identifier (e.g. MIT).
+        #[arg(long)]
+        license: Option<String>,
+        /// Skill author handle.
+        #[arg(long)]
+        author: Option<String>,
+        /// SemVer version (defaults to 0.1.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Skill category for registry grouping.
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip scaffolding scripts/, references/, assets/.
+        #[arg(long)]
+        no_scaffold: bool,
+        /// Open SKILL.md in $EDITOR after scaffold.
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Open a skill's SKILL.md (or a sibling file) in $EDITOR
+    Edit {
+        /// Skill name
+        name: String,
+        /// Target bundle alias. Optional when name is unique across bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Edit a sibling file instead of SKILL.md (e.g. scripts/runner.sh).
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Manage skill bundles (the named directories skills live in)
+    Bundle {
+        #[command(subcommand)]
+        bundle_command: SkillBundleCommands,
+    },
     /// Audit a skill source directory or installed skill name
     Audit {
         /// Skill path or installed skill name
@@ -291,6 +384,10 @@ pub enum SkillCommands {
     Install {
         /// Source URL or local path
         source: String,
+        /// Suppress only the install-time tier banner; other install
+        /// progress output (resolving, installed, audited) is unaffected.
+        #[arg(long)]
+        no_tier_banner: bool,
     },
     /// Remove an installed skill
     Remove {
@@ -304,6 +401,32 @@ pub enum SkillCommands {
         /// Show verbose output
         #[arg(long)]
         verbose: bool,
+    },
+}
+
+/// Skill bundle subcommands (`zeroclaw skills bundle <op>`)
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillBundleCommands {
+    /// List configured skill bundles and their resolved directories
+    List,
+    /// Add a new skill bundle. Directory defaults to shared/skills/<alias>/.
+    Add {
+        /// Bundle alias (lowercase + hyphens; same convention as agents/channels)
+        alias: String,
+        /// Override directory (relative to install root or absolute).
+        /// Must resolve inside `<install>/shared/`.
+        #[arg(long)]
+        directory: Option<String>,
+    },
+    /// Remove a configured skill bundle
+    Remove {
+        /// Bundle alias
+        alias: String,
+    },
+    /// Show metadata + skill list for a bundle
+    Show {
+        /// Bundle alias
+        alias: String,
     },
 }
 
@@ -328,12 +451,13 @@ pub enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a new recurring scheduled task.
 
 Uses standard 5-field cron syntax: 'min hour day month weekday'. \
-Times are evaluated in UTC by default; use --tz with an IANA \
-timezone name to override.
+When --tz is omitted, cron schedules use the runtime local timezone. \
+For user-facing schedules, pass --tz with an explicit IANA timezone.
 
 Examples:
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
@@ -342,61 +466,75 @@ Examples:
     Add {
         /// Cron expression
         expression: String,
+        /// Configured agent alias the cron job runs as. Required —
+        /// there is no default agent.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
         /// Optional IANA timezone (e.g. America/Los_Angeles)
         #[arg(long)]
         tz: Option<String>,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
-    /// Add a one-shot scheduled task at an RFC3339 timestamp
+    /// Add a one-shot scheduled task at an RFC3339 timestamp with explicit Z or offset
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-Add a one-shot task that fires at a specific UTC timestamp.
+Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
-The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).
+The timestamp must include an explicit Z or numeric offset \
+(e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
 
 Examples:
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift 2025-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
-        /// One-shot timestamp in RFC3339 format
+        /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a fixed-interval scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a task that repeats at a fixed interval.
 
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  zeroclaw cron add-every 60000 'Ping heartbeat'     # every minute
-  zeroclaw cron add-every 3600000 'Hourly report'    # every hour")]
+  zeroclaw cron add-every --agent triage 60000 'Ping heartbeat'
+  zeroclaw cron add-every --agent triage 3600000 'Hourly report'")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a one-shot task that fires after a delay from now.
 
@@ -404,19 +542,21 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
-  zeroclaw cron once 2h 'Follow up on deployment'
-  zeroclaw cron once 1d 'Daily check'")]
+  zeroclaw cron once --agent ops-bot 30m 'Run backup in 30 minutes'
+  zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
     Once {
         /// Delay duration
         delay: String,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Remove a scheduled task
@@ -425,18 +565,23 @@ Examples:
         id: String,
     },
     /// Update a scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Update one or more fields of an existing scheduled task.
 
 Only the fields you specify are changed; others remain unchanged.
 
 Examples:
-  zeroclaw cron update <task-id> --expression '0 8 * * *'
-  zeroclaw cron update <task-id> --tz Europe/London --name 'Morning check'
-  zeroclaw cron update <task-id> --command 'Updated message'")]
+  zeroclaw cron update TASK_ID --expression '0 8 * * *'
+  zeroclaw cron update TASK_ID --tz Europe/London --name 'Morning check'
+  zeroclaw cron update TASK_ID --command 'Updated message'")]
     Update {
         /// Task ID
         id: String,
+        /// Configured agent alias whose risk profile gates the new
+        /// shell command (when --command is provided). Required.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
         /// New cron expression
         #[arg(long)]
         expression: Option<String>,
@@ -502,6 +647,13 @@ pub enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// Rebuild backend indexes: FTS tables + any missing embedding vectors.
+    ///
+    /// Run after `zeroclaw migrate openclaw` or other bulk writes that
+    /// land rows with `embedding = NULL`. Safe to re-run; only touches
+    /// entries whose vector is missing. No-op for backends without a
+    /// vector index.
+    Reindex,
 }
 
 /// Integration subcommands
@@ -518,6 +670,7 @@ pub enum IntegrationCommands {
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HardwareCommands {
     /// Enumerate USB devices (VID/PID) and show known boards
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Enumerate USB devices and show known boards.
 
@@ -528,6 +681,7 @@ Examples:
   zeroclaw hardware discover")]
     Discover,
     /// Introspect a device by path (e.g. /dev/ttyACM0)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Introspect a device by its serial or device path.
 
@@ -542,6 +696,7 @@ Examples:
         path: String,
     },
     /// Get chip info via USB (probe-rs over ST-Link). No firmware needed on target.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Get chip info via USB using probe-rs over ST-Link.
 
@@ -564,6 +719,7 @@ pub enum PeripheralCommands {
     /// List configured peripherals
     List,
     /// Add a peripheral (board path, e.g. nucleo-f401re /dev/ttyACM0)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Add a peripheral by board type and transport path.
 
@@ -584,6 +740,7 @@ Examples:
         path: String,
     },
     /// Flash ZeroClaw firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Flash ZeroClaw firmware to an Arduino board.
 

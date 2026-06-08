@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
@@ -26,7 +26,6 @@ export default function Canvas() {
   const [showHistory, setShowHistory] = useState(false);
   const [canvasList, setCanvasList] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   // Build WebSocket URL for canvas
   const getWsUrl = useCallback((id: string) => {
@@ -92,36 +91,81 @@ export default function Canvas() {
     return () => clearInterval(interval);
   }, []);
 
-  // Render content into the iframe
-  useEffect(() => {
-    if (!iframeRef.current || !currentFrame) return;
-    if (currentFrame.content_type === 'eval') return; // eval frames are special
+  // Build srcdoc HTML for the iframe — avoids needing allow-same-origin to
+  // access contentDocument.  Content types that don't need scripts get a
+  // restrictive CSP meta tag; only the explicit `html` content type can
+  // execute scripts inside the opaque-origin sandbox.  Every other content
+  // type — including `eval` and any unrecognised type — renders an inert
+  // no-script document, so a previous frame's srcdoc can never remain
+  // visible or active across a content_type transition.
+  const srcdoc = useMemo(() => {
+    if (!currentFrame) return undefined;
 
-    const iframe = iframeRef.current;
-    const doc = iframe.contentDocument;
-    if (!doc) return;
+    const cs = getComputedStyle(document.documentElement);
+    const bgBase = cs.getPropertyValue('--pc-bg-base').trim() || '#1e1e24';
+    const textPrimary = cs.getPropertyValue('--pc-text-primary').trim() || '#d4d4d8';
+    const textSecondary = cs.getPropertyValue('--pc-text-secondary').trim() || '#a1a1aa';
+    const fontMono = cs.getPropertyValue('--pc-font-mono').trim() || 'monospace';
+    const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
 
-    let html = currentFrame.content;
-    if (currentFrame.content_type === 'svg') {
-      html = `<!DOCTYPE html><html><head><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#1a1a2e;}</style></head><body>${currentFrame.content}</body></html>`;
-    } else if (currentFrame.content_type === 'markdown') {
-      // Simple markdown-to-HTML: render as preformatted text with basic styling
-      const escaped = currentFrame.content
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:system-ui,sans-serif;color:#e0e0e0;background:#1a1a2e;line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
-    } else if (currentFrame.content_type === 'text') {
-      const escaped = currentFrame.content
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:monospace;color:#e0e0e0;background:#1a1a2e;white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+    // CSP that blocks all scripts — used for non-interactive content types
+    // and for the inert placeholder.  object-src 'none' is required
+    // separately because in the absence of a default-src directive,
+    // object-src would otherwise fall back to * and allow <object>,
+    // <embed>, and <applet> to load external content from these frames.
+    const noScriptCsp =
+      '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'; object-src \'none\'">';
+
+    // Inert placeholder document.  Used for `eval` (where iframe rendering
+    // is intentionally a no-op and execution happens out of band) and as
+    // the deny-by-default fallback for any unrecognised content_type.
+    // Replacing the previous srcdoc with this guarantees that stale frame
+    // content cannot retain capability across a transition.
+    const inertDoc =
+      `<!DOCTYPE html><html><head>${noScriptCsp}</head><body style="margin:0;background:${bgBase};"></body></html>`;
+
+    if (currentFrame.content_type === 'eval') {
+      return inertDoc;
     }
 
-    doc.open();
-    doc.write(html);
-    doc.close();
+    if (currentFrame.content_type === 'svg') {
+      // Strip <script> tags and event-handler attributes from SVG to prevent XSS.
+      // Run the matched-pair strip first; then strip any remaining <script ...>
+      // opener so the void-element / unclosed form (`<script src="..."/>` or
+      // `<script src="...">` with no closing tag) does not survive. The \b
+      // word boundary keeps the patterns from matching tag names that merely
+      // start with "script" (e.g. <scriptlet>, should one ever exist).
+      const sanitized = currentFrame.content
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+        .replace(/<script\b[^>]*\/?>/gi, '')
+        .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+      return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${sanitized}</body></html>`;
+    }
+
+    if (currentFrame.content_type === 'markdown') {
+      const escaped = currentFrame.content
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
+    }
+
+    if (currentFrame.content_type === 'text') {
+      const escaped = currentFrame.content
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+    }
+
+    if (currentFrame.content_type === 'html') {
+      // Scripts allowed but still sandboxed (no same-origin).
+      return currentFrame.content;
+    }
+
+    // Unrecognised content_type — render inert rather than defaulting to
+    // scriptable HTML.  Future content types must be added explicitly above.
+    return inertDoc;
   }, [currentFrame]);
 
   const handleSwitchCanvas = () => {
@@ -248,15 +292,15 @@ export default function Canvas() {
         {/* Canvas viewer */}
         <div
           className="flex-1 rounded-lg border overflow-hidden"
-          style={{ borderColor: 'var(--pc-border)', background: '#1a1a2e' }}
+          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-base)' }}
         >
           {currentFrame ? (
             <iframe
-              ref={iframeRef}
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts"
+              srcDoc={srcdoc}
               className="w-full h-full border-0"
               title={`Canvas: ${canvasId}`}
-              style={{ background: '#1a1a2e' }}
+              style={{ background: 'var(--pc-bg-base)' }}
             />
           ) : (
             <div className="flex items-center justify-center h-full">

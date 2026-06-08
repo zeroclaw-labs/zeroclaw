@@ -16,6 +16,7 @@ export default defineConfig(({ command }) => ({
   },
   build: {
     outDir: "dist",
+    target: ["chrome111", "edge111", "firefox113", "safari16.2"],
   },
   server: {
     proxy: {

@@ -7,7 +7,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
-use tracing::{info, warn};
 use zeroclaw_config::schema::HeartbeatConfig;
 
 // ── Structured task types ────────────────────────────────────────
@@ -195,12 +194,20 @@ impl HeartbeatEngine {
     /// Start the heartbeat loop (runs until cancelled)
     pub async fn run(&self) -> Result<()> {
         if !self.config.enabled {
-            info!("Heartbeat disabled");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Heartbeat disabled"
+            );
             return Ok(());
         }
 
         let interval_mins = self.config.interval_minutes.max(1);
-        info!("💓 Heartbeat started: every {} minutes", interval_mins);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("💓 Heartbeat started: every {} minutes", interval_mins)
+        );
 
         let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
@@ -211,11 +218,23 @@ impl HeartbeatEngine {
             match self.tick().await {
                 Ok(tasks) => {
                     if tasks > 0 {
-                        info!("💓 Heartbeat: processed {} tasks", tasks);
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!("💓 Heartbeat: processed {} tasks", tasks)
+                        );
                     }
                 }
                 Err(e) => {
-                    warn!("💓 Heartbeat error: {}", e);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("💓 Heartbeat error: {}", e)
+                    );
                     self.observer.record_event(&ObserverEvent::Error {
                         component: "heartbeat".into(),
                         message: e.to_string(),
@@ -249,7 +268,7 @@ impl HeartbeatEngine {
             .filter(HeartbeatTask::is_runnable)
             .collect();
         // Sort by priority descending (High > Medium > Low)
-        tasks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.priority));
         Ok(tasks)
     }
 
@@ -325,14 +344,18 @@ impl HeartbeatEngine {
 
     /// Build the Phase 1 LLM decision prompt for two-phase heartbeat.
     pub fn build_decision_prompt(tasks: &[HeartbeatTask]) -> String {
-        let mut prompt = String::from(
+        let now = chrono::Utc::now();
+        let mut prompt = format!(
             "You are a heartbeat scheduler. Review the following periodic tasks and decide \
              whether any should be executed right now.\n\n\
+             Current time: {} UTC ({})\n\n\
              Consider:\n\
              - Task priority (high tasks are more urgent)\n\
              - Whether the task is time-sensitive or can wait\n\
              - Whether running the task now would provide value\n\n\
              Tasks:\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%A"),
         );
 
         for (i, task) in tasks.iter().enumerate() {
@@ -585,6 +608,10 @@ mod tests {
         assert!(prompt.contains("2. [medium] Review calendar"));
         assert!(prompt.contains("skip"));
         assert!(prompt.contains("run:"));
+        assert!(
+            prompt.contains("Current time:"),
+            "prompt must include current datetime for time-sensitive decisions"
+        );
     }
 
     #[test]

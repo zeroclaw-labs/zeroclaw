@@ -6,7 +6,7 @@
 //! Startup sequence (called via [`ToolRegistry::load`]):
 //! 1. Register built-in hardware tools (`gpio_read`, `gpio_write`).
 //! 2. Scan `~/.zeroclaw/tools/` for user plugin manifests.
-//! 3. Build a [`SubprocessTool`] for each valid manifest and register it.
+//! 3. Build a `SubprocessTool` for each valid manifest and register it.
 //! 4. Print the startup log summarising loaded tools and connected devices.
 //!
 //! Dispatch flow (called per LLM tool-call):

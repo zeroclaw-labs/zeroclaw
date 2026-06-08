@@ -1,13 +1,13 @@
 //! Lightweight LLM task tool for structured JSON-only sub-calls.
 //!
-//! Runs a single prompt through an LLM provider with no tool access and
+//! Runs a single prompt through an LLM model_provider with no tool access and
 //! optionally validates the response against a caller-supplied JSON Schema.
 //! Ideal for structured data extraction in workflows.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::provider::Provider;
+use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -17,30 +17,31 @@ use zeroclaw_config::policy::ToolOperation;
 /// this is a pure text-in, text-out (or JSON-out) call.
 pub struct LlmTaskTool {
     security: Arc<SecurityPolicy>,
-    /// Default provider name from root config (e.g. "openrouter").
-    default_provider: String,
+    /// Default model_provider name from root config (e.g. "openrouter").
+    default_model_provider: String,
     /// Default model from root config.
     default_model: String,
-    /// Default temperature from root config.
-    default_temperature: f64,
-    /// API key for provider authentication.
+    /// Default temperature from root config. `None` means no temperature
+    /// is sent on the wire; provider applies its own default.
+    default_temperature: Option<f64>,
+    /// API key for model_provider authentication.
     api_key: Option<String>,
-    /// Provider runtime options inherited from root config.
-    provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+    /// ModelProvider runtime options inherited from root config.
+    provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
 }
 
 impl LlmTaskTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
-        default_provider: String,
+        default_model_provider: String,
         default_model: String,
-        default_temperature: f64,
+        default_temperature: Option<f64>,
         api_key: Option<String>,
-        provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     ) -> Self {
         Self {
             security,
-            default_provider,
+            default_model_provider,
             default_model,
             default_temperature,
             api_key,
@@ -124,7 +125,7 @@ impl Tool for LlmTaskTool {
         let temperature = args
             .get("temperature")
             .and_then(|v| v.as_f64())
-            .unwrap_or(self.default_temperature);
+            .or(self.default_temperature);
 
         // Build the effective prompt, adding JSON schema instructions when needed
         let effective_prompt = if let Some(schema_obj) = schema {
@@ -141,25 +142,28 @@ impl Tool for LlmTaskTool {
             prompt.to_string()
         };
 
-        // Create provider
+        // Create model_provider
         let api_key_ref = self.api_key.as_deref();
-        let provider: Box<dyn Provider> = match zeroclaw_providers::create_provider_with_options(
-            &self.default_provider,
-            api_key_ref,
-            &self.provider_runtime_options,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to create provider: {e}")),
-                });
-            }
-        };
+        let model_provider: Box<dyn ModelProvider> =
+            match zeroclaw_providers::create_model_provider_with_options(
+                &self.default_model_provider,
+                api_key_ref,
+                &self.provider_runtime_options,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to create model_provider: {e}")),
+                    });
+                }
+            };
 
-        // Make the LLM call (no tools, no agent loop)
-        let response = match provider
+        // Make the LLM call (no tools, no agent loop). `temperature` is
+        // already Option<f64>; pass straight through. None omits the field
+        // on the wire so the provider applies its own default.
+        let response = match model_provider
             .simple_chat(&effective_prompt, model, temperature)
             .await
         {
@@ -416,9 +420,9 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         assert_eq!(tool.name(), "llm_task");
@@ -442,9 +446,9 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         let result = tool.execute(json!({})).await.unwrap();
@@ -458,9 +462,9 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         let result = tool.execute(json!({"prompt": "  "})).await.unwrap();
@@ -474,9 +478,9 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             "nonexistent_provider_xyz".to_string(),
             "test-model".to_string(),
-            0.7,
+            Some(0.7),
             None,
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         let result = tool
@@ -484,6 +488,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("provider"));
+        assert!(result.error.as_deref().unwrap().contains("model_provider"));
     }
 }

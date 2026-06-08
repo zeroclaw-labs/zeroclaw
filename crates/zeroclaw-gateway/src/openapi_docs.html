@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZeroClaw Gateway API</title>
+    <link rel="icon" href="data:," />
+    <style>
+      body { margin: 0; font-family: system-ui, sans-serif; }
+      .offline-note {
+        max-width: 760px;
+        margin: 4rem auto;
+        padding: 2rem;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        background: #fafafa;
+        font-size: 14px;
+        line-height: 1.6;
+        display: none;
+      }
+      body.offline .offline-note { display: block; }
+      body.offline .scalar-fallback { display: none; }
+      code { background: #eee; padding: 2px 6px; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <noscript>
+      <p>This page renders the gateway's OpenAPI spec via Scalar. JavaScript is required.</p>
+      <p>Raw spec: <a href="/api/openapi.json">/api/openapi.json</a></p>
+    </noscript>
+
+    <div class="offline-note">
+      <h2>Offline mode</h2>
+      <p>
+        The Scalar bundle could not be loaded from
+        <code>cdn.jsdelivr.net</code>. The OpenAPI spec is still reachable at
+        <a href="/api/openapi.json"><code>/api/openapi.json</code></a> — point
+        any compatible viewer at it (Insomnia, Postman, Swagger UI, etc.).
+      </p>
+      <p>
+        For an offline-friendly explorer mounted alongside the dashboard,
+        install <code>@scalar/api-reference</code> in <code>web/</code> and
+        serve it locally.
+      </p>
+    </div>
+
+    <div class="scalar-fallback">
+      <script
+        id="api-reference"
+        data-url="/api/openapi.json"
+        data-configuration='{"theme": "default", "showSidebar": true, "hideClientButton": false, "authentication": {"preferredSecurityScheme": "bearerAuth"}}'
+      ></script>
+      <script
+        src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"
+        onerror="document.body.classList.add('offline')"
+      ></script>
+    </div>
+  </body>
+</html>

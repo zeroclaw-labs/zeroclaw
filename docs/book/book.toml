@@ -1,0 +1,36 @@
+[book]
+title = "ZeroClaw Docs"
+description = "Documentation for the ZeroClaw personal AI assistant."
+authors = ["ZeroClaw Labs"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "default-dark"
+preferred-dark-theme = "default-dark"
+git-repository-url = "https://github.com/zeroclaw-labs/zeroclaw"
+edit-url-template = "https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/{path}"
+site-url = "/"
+additional-js = [
+  "theme/version-selector.js",
+  "theme/lang-switcher.js",
+  "theme/pc-enhance.js",
+  "mermaid.min.js",
+  "mermaid-init.js",
+]
+additional-css = ["theme/pc-themes.css", "theme/custom.css"]
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+
+[output.html.fold]
+enable = true
+level = 0
+
+[preprocessor.gettext]
+after = ["links"]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

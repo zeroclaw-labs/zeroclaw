@@ -1,0 +1,951 @@
+/* @import must precede all style rules per the CSS spec, so the font import
+   leads the file — placed lower it is silently dropped and the docs fall back
+   to system fonts. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ============================================================================
+   ZeroClaw docs reskin — Tier A (CSS-only)
+   Ports the web dashboard's --pc-* design system onto mdBook's `ayu` theme.
+   Tokens are copied from web/src/contexts/themes.json (default-dark /
+   default-light) and web/src/index.css. Keep them in sync by hand if the
+   dashboard palette changes — this is a deliberate, documented copy, not a
+   second source of truth for the app itself.
+   ============================================================================ */
+
+/* ---------------------------------------------------------------------------
+   1. Design tokens
+   --------------------------------------------------------------------------- */
+:root {
+  /* Dashboard palette — default-dark */
+  --pc-bg-base: #1e1e24;
+  --pc-bg-surface: #232329;
+  --pc-bg-elevated: #27272a;
+  --pc-bg-input: #1a1a20;
+  --pc-bg-code: #1a1a20;
+  --pc-bg-sidebar: #1b1b21;
+
+  --pc-border: rgba(255, 255, 255, 0.08);
+  --pc-border-strong: rgba(255, 255, 255, 0.12);
+
+  --pc-text-primary: #d4d4d8;
+  --pc-text-secondary: #a1a1aa;
+  --pc-text-muted: #71717a;
+  --pc-text-faint: #52525b;
+
+  --pc-accent: #22d3ee;
+  --pc-accent-light: #67e8f9;
+  --pc-accent-dim: rgba(34, 211, 238, 0.3);
+  --pc-accent-glow: rgba(34, 211, 238, 0.1);
+  --pc-accent-rgb: 34, 211, 238;
+
+  --pc-hover: rgba(255, 255, 255, 0.05);
+  --pc-hover-strong: rgba(255, 255, 255, 0.08);
+  --pc-separator: rgba(255, 255, 255, 0.05);
+
+  --pc-scrollbar-thumb: #52525b;
+  --pc-scrollbar-track: #232329;
+  --pc-scrollbar-thumb-hover: #71717a;
+
+  /* Status colors (fixed across schemes, from dashboard) */
+  --pc-status-success: #00e68a;
+  --pc-status-warning: #ffaa00;
+  --pc-status-error: #ff4466;
+  --pc-status-info: #0080ff;
+
+  /* Fonts (loaded via the @import at the top of this file) */
+  --pc-font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --pc-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+
+  --pc-radius: 0.75rem;
+  --pc-radius-lg: 1rem;
+}
+
+/* ---------------------------------------------------------------------------
+   2. Bridge our --pc-* tokens onto mdBook's own theme variables.
+   Scoped to :root so it applies for every theme class (the GENERATED
+   pc-themes.css redefines --pc-* per html.<id>, and these var() refs follow).
+   --------------------------------------------------------------------------- */
+:root {
+  --bg: var(--pc-bg-base);
+  --fg: var(--pc-text-primary);
+
+  --sidebar-bg: var(--pc-bg-sidebar);
+  --sidebar-fg: var(--pc-text-secondary);
+  --sidebar-non-existant: var(--pc-text-faint);
+  --sidebar-active: var(--pc-accent);
+  --sidebar-spacer: var(--pc-separator);
+
+  --scrollbar: var(--pc-scrollbar-thumb);
+
+  --icons: var(--pc-text-muted);
+  --icons-hover: var(--pc-accent);
+
+  --links: var(--pc-accent-light);
+
+  --inline-code-color: var(--pc-accent-light);
+
+  --theme-popup-bg: var(--pc-bg-elevated);
+  --theme-popup-border: var(--pc-border-strong);
+  --theme-hover: var(--pc-hover-strong);
+
+  --quote-bg: var(--pc-bg-surface);
+  --quote-border: var(--pc-accent-dim);
+
+  --table-border-color: var(--pc-border);
+  --table-header-bg: var(--pc-bg-elevated);
+  --table-alternate-bg: var(--pc-bg-surface);
+
+  --searchbar-border-color: var(--pc-border-strong);
+  --searchbar-bg: var(--pc-bg-input);
+  --searchbar-fg: var(--pc-text-primary);
+  --searchbar-shadow-color: var(--pc-accent-dim);
+  --searchresults-header-fg: var(--pc-text-muted);
+  --searchresults-border-color: var(--pc-border);
+  --searchresults-li-bg: var(--pc-bg-elevated);
+  --search-mark-bg: var(--pc-accent-dim);
+}
+
+/* ---------------------------------------------------------------------------
+   3. Fonts
+   --------------------------------------------------------------------------- */
+html,
+body,
+.content {
+  font-family: var(--pc-font-ui);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code,
+kbd,
+pre,
+.hljs,
+code span {
+  /* mdBook's ayu highlight.js theme sets font-family on these inline; override it. */
+  font-family: var(--pc-font-mono) !important;
+}
+
+.content h1,
+.content h2,
+.content h3,
+.content h4 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-top: 1em;
+  margin-bottom: 0.4em;
+  line-height: 1.25;
+}
+
+.content h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-top: 0;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--pc-border);
+}
+
+.content h2 {
+  margin-top: 0.8em;
+}
+
+.content h3 {
+  margin-top: 0.7em;
+}
+
+/* Collapse the top margin when a heading directly follows another heading */
+.content h1 + h2,
+.content h2 + h3,
+.content h3 + h4 {
+  margin-top: 0.3em;
+}
+
+/* ---------------------------------------------------------------------------
+   4. Page chrome — menu bar
+   --------------------------------------------------------------------------- */
+.menu-bar {
+  background: var(--pc-bg-sidebar);
+  border-bottom: 1px solid var(--pc-border);
+  backdrop-filter: blur(16px);
+}
+
+.menu-bar i,
+.menu-bar .icon-button {
+  color: var(--pc-text-muted);
+  transition: color 0.2s ease;
+}
+
+.menu-bar .icon-button:hover,
+.menu-bar i:hover {
+  color: var(--pc-accent);
+}
+
+.menu-title {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--pc-text-primary);
+}
+
+/* ---------------------------------------------------------------------------
+   5. Sidebar
+   --------------------------------------------------------------------------- */
+.sidebar {
+  background: var(--pc-bg-sidebar);
+  border-right: 1px solid var(--pc-border);
+}
+
+.sidebar .sidebar-scrollbox {
+  padding: 1rem 0.75rem;
+}
+
+.chapter li.chapter-item {
+  line-height: 1.5;
+  margin: 0.1rem 0;
+}
+
+.chapter li a {
+  border-radius: 0.5rem;
+  padding: 0.32rem 0.6rem;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+
+.chapter li a:hover {
+  background: var(--pc-hover);
+  color: var(--pc-text-primary);
+}
+
+.chapter li a.active {
+  background: var(--pc-accent-glow);
+  color: var(--pc-accent);
+  font-weight: 600;
+}
+
+/* Foldable section parent rows (label-only chapters from SUMMARY.md).
+   The label is a bare <span> inside .chapter-link-wrapper, with a sibling
+   a.chapter-fold-toggle. pc-enhance.js makes the whole row clickable. */
+.chapter li.chapter-item > .chapter-link-wrapper:has(> a.chapter-fold-toggle) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  border-radius: 0.5rem;
+  padding: 0.32rem 0.6rem;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+
+/* The label text span (first child span, not a link) — matches the look of a
+   regular sidebar link (.chapter li a) so sections read at the same weight
+   and size as Introduction / Philosophy. */
+.chapter li.chapter-item > .chapter-link-wrapper:has(> a.chapter-fold-toggle) > span {
+  color: var(--pc-text-secondary);
+  font-weight: 400;
+  flex: 1;
+}
+
+.chapter li.chapter-item > .chapter-link-wrapper.pc-foldable-row:hover {
+  background: var(--pc-hover);
+}
+.chapter li.chapter-item > .chapter-link-wrapper.pc-foldable-row:hover > span {
+  color: var(--pc-accent);
+}
+
+/* Section numbers match the muted prefix on regular links */
+.chapter li.chapter-item > .chapter-link-wrapper:has(> a.chapter-fold-toggle) > span > strong {
+  font-weight: 400;
+  margin-right: 0.15rem;
+}
+
+/* Fold toggle arrow — larger hit area, accent on hover, rotates when open */
+.chapter-fold-toggle {
+  color: var(--pc-text-muted);
+  padding: 0.15rem 0.3rem;
+  border-radius: 0.35rem;
+  flex-shrink: 0;
+  transition: transform 0.2s ease, color 0.18s ease;
+}
+.pc-foldable-row:hover .chapter-fold-toggle {
+  color: var(--pc-accent);
+}
+li.chapter-item.expanded > .chapter-link-wrapper > .chapter-fold-toggle {
+  transform: rotate(90deg);
+}
+
+/* Nested child list: indent + accent guide line */
+.chapter ol.section {
+  margin-left: 0.55rem;
+  padding-left: 0.55rem;
+  border-left: 1px solid var(--pc-border);
+}
+
+.sidebar-resize-handle {
+  background: transparent;
+}
+
+/* ---------------------------------------------------------------------------
+   6. Links
+   --------------------------------------------------------------------------- */
+.content a,
+.content a:visited {
+  color: var(--pc-accent-light);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.18s ease;
+}
+
+.content a:hover {
+  border-bottom-color: var(--pc-accent-dim);
+}
+
+/* ---------------------------------------------------------------------------
+   7. Inline code + code blocks
+   --------------------------------------------------------------------------- */
+.content code {
+  background: var(--pc-accent-glow);
+  color: var(--pc-accent-light);
+  padding: 0.12em 0.4em;
+  border-radius: 0.4em;
+  font-size: 0.88em;
+}
+
+.content pre {
+  /* mdBook's ayu theme sets a fixed code background; override to our token. */
+  background: var(--pc-bg-code) !important;
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  padding: 1rem 1.1rem;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  position: relative;
+}
+
+.content pre > code {
+  background: transparent;
+  color: var(--pc-text-primary);
+  padding: 0;
+  border-radius: 0;
+  font-size: 0.86em;
+  line-height: 1.6;
+}
+
+/* Code-fence language badge — top-right of any fenced block */
+pre:has(> code[class*="language-"]) {
+  position: relative;
+}
+pre:has(> code[class*="language-"])::before {
+  position: absolute;
+  top: 0.4em;
+  right: 0.6em;
+  font-size: 0.68em;
+  font-family: var(--pc-font-mono);
+  color: var(--pc-text-muted);
+  opacity: 0.6;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+}
+pre:has(> code.language-toml)::before       { content: "toml"; }
+pre:has(> code.language-rust)::before       { content: "rust"; }
+pre:has(> code.language-bash)::before        { content: "bash"; }
+pre:has(> code.language-sh)::before          { content: "sh"; }
+pre:has(> code.language-shell)::before       { content: "shell"; }
+pre:has(> code.language-json)::before        { content: "json"; }
+pre:has(> code.language-yaml)::before        { content: "yaml"; }
+pre:has(> code.language-yml)::before         { content: "yml"; }
+pre:has(> code.language-text)::before        { content: "text"; }
+pre:has(> code.language-markdown)::before    { content: "md"; }
+pre:has(> code.language-md)::before          { content: "md"; }
+pre:has(> code.language-html)::before        { content: "html"; }
+pre:has(> code.language-css)::before         { content: "css"; }
+pre:has(> code.language-javascript)::before  { content: "js"; }
+pre:has(> code.language-js)::before          { content: "js"; }
+pre:has(> code.language-ts)::before          { content: "ts"; }
+pre:has(> code.language-typescript)::before  { content: "ts"; }
+pre:has(> code.language-python)::before      { content: "py"; }
+pre:has(> code.language-py)::before          { content: "py"; }
+pre:has(> code.language-go)::before          { content: "go"; }
+pre:has(> code.language-ini)::before         { content: "ini"; }
+pre:has(> code.language-diff)::before        { content: "diff"; }
+pre:has(> code.language-console)::before     { content: "console"; }
+pre:has(> code.language-dockerfile)::before  { content: "dockerfile"; }
+pre:has(> code.language-mermaid)::before     { content: ""; }
+
+/* Copy button — match dashboard icon-button feel */
+pre > .buttons {
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+pre:hover > .buttons {
+  opacity: 1;
+}
+pre > .buttons .clip-button {
+  color: var(--pc-text-muted);
+}
+pre > .buttons .clip-button:hover {
+  color: var(--pc-accent);
+}
+
+/* ---------------------------------------------------------------------------
+   8. Tables — full width, no-wrap reference columns, dashboard styling
+   --------------------------------------------------------------------------- */
+.content table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  overflow: hidden;
+  margin: 1.2rem 0;
+  line-height: 1.5;
+}
+
+.content table thead {
+  background: var(--pc-bg-elevated);
+}
+
+.content table thead th {
+  color: var(--pc-text-primary);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  border: none;
+  border-bottom: 1px solid var(--pc-border-strong);
+  padding: 0.5rem 0.9rem;
+  vertical-align: middle;
+}
+
+.content table td {
+  border: none;
+  border-bottom: 1px solid var(--pc-separator);
+  padding: 0.5rem 0.9rem;
+  background: transparent;
+  vertical-align: middle;
+}
+
+.content table tbody tr {
+  /* mdBook applies an alternating-row background; override so rows stay flat. */
+  background: transparent !important;
+  transition: background 0.15s ease;
+}
+
+.content table tbody tr:hover {
+  /* Same specificity battle as above — force our hover token over the zebra rule. */
+  background: var(--pc-hover) !important;
+}
+
+.content table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Keep Key/Type/Default reference columns from wrapping; Description flexes */
+.content table td:nth-child(1),
+.content table td:nth-child(2),
+.content table td:nth-child(3) {
+  white-space: nowrap;
+}
+
+/* Inline code in table cells: trim vertical padding so rows stay compact
+   (size matches body inline code — no shrinking) */
+.content table code {
+  padding: 0.05em 0.35em;
+  line-height: 1.3;
+}
+
+/* ---------------------------------------------------------------------------
+   9. Blockquotes / admonitions
+   --------------------------------------------------------------------------- */
+.content blockquote {
+  background: var(--pc-bg-surface);
+  border: 1px solid var(--pc-border);
+  border-left: 3px solid var(--pc-accent);
+  border-radius: var(--pc-radius);
+  padding: 0.8rem 1.1rem;
+  color: var(--pc-text-secondary);
+  margin: 1.2rem 0;
+}
+
+.content blockquote p:first-child { margin-top: 0; }
+.content blockquote p:last-child { margin-bottom: 0; }
+
+/* Heuristic admonition coloring via leading emoji is impractical in pure CSS;
+   instead, give a subtle accent-glow background to the whole quote. */
+
+/* ---------------------------------------------------------------------------
+   10. Horizontal rules
+   --------------------------------------------------------------------------- */
+.content hr {
+  border: none;
+  border-top: 1px solid var(--pc-border);
+  margin: 2rem 0;
+}
+
+/* ---------------------------------------------------------------------------
+   11. Scrollbars (match dashboard thin scrollbars)
+   --------------------------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--pc-scrollbar-thumb) transparent;
+}
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--pc-scrollbar-thumb);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pc-scrollbar-thumb-hover);
+}
+
+/* ---------------------------------------------------------------------------
+   12. Search
+   --------------------------------------------------------------------------- */
+#searchbar {
+  background: var(--pc-bg-input);
+  border: 1px solid var(--pc-border-strong);
+  border-radius: var(--pc-radius);
+  color: var(--pc-text-primary);
+  padding: 0.6rem 0.9rem;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+#searchbar:focus {
+  outline: none;
+  border-color: var(--pc-accent-dim);
+  box-shadow: 0 0 0 3px var(--pc-accent-glow);
+}
+.searchresults-outer {
+  border-bottom: 1px solid var(--pc-border);
+}
+.searchresults-header {
+  color: var(--pc-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.72rem;
+}
+mark {
+  background: var(--pc-accent-dim);
+  color: var(--pc-text-primary);
+  border-radius: 0.25em;
+  padding: 0 0.15em;
+}
+
+/* ---------------------------------------------------------------------------
+   13. Theme picker popup (the paint-roller menu)
+   --------------------------------------------------------------------------- */
+.theme-popup {
+  background: var(--pc-bg-elevated);
+  border: 1px solid var(--pc-border-strong);
+  border-radius: var(--pc-radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  padding: 0.3rem;
+}
+.theme-popup .theme {
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.7rem 0.4rem 1.4rem;
+}
+.theme-popup .theme:hover {
+  background: var(--pc-hover-strong);
+  color: var(--pc-accent);
+}
+.theme-popup .theme.theme-selected,
+.theme-popup li.theme-selected > .theme {
+  color: var(--pc-accent);
+  font-weight: 600;
+}
+/* mdBook draws the selected check with margin-inline-start:-14px; ensure the
+   left padding leaves room so it is not clipped against the popup edge. */
+.theme-popup .theme-selected::before {
+  margin-inline-start: -1rem;
+  width: 1rem;
+  color: var(--pc-accent);
+}
+
+/* ---------------------------------------------------------------------------
+   14. Buttons (next/prev nav)
+   --------------------------------------------------------------------------- */
+.nav-chapters {
+  color: var(--pc-text-muted);
+  font-size: 2em;
+  transition: color 0.2s ease;
+}
+.nav-chapters:hover {
+  color: var(--pc-accent);
+}
+
+.mobile-nav-chapters {
+  background: var(--pc-bg-elevated);
+  color: var(--pc-text-secondary);
+  border: 1px solid var(--pc-border);
+  border-radius: 0.6rem;
+  font-size: 1.6rem;
+  width: auto;
+  padding: 0.5rem 1.1rem;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+.mobile-nav-chapters:hover {
+  background: var(--pc-hover-strong);
+  color: var(--pc-accent);
+  border-color: var(--pc-accent-dim);
+}
+
+/* ---------------------------------------------------------------------------
+   15. Content rhythm + readability
+   --------------------------------------------------------------------------- */
+.content {
+  line-height: 1.7;
+}
+
+.content p,
+.content li {
+  color: var(--pc-text-primary);
+}
+
+.content strong {
+  color: var(--pc-text-primary);
+  font-weight: 600;
+}
+
+/* Keyboard keys */
+.content kbd {
+  background: var(--pc-bg-elevated);
+  border: 1px solid var(--pc-border-strong);
+  border-bottom-width: 2px;
+  border-radius: 0.4em;
+  padding: 0.1em 0.45em;
+  font-size: 0.82em;
+  color: var(--pc-text-secondary);
+}
+
+/* Images get a subtle card frame */
+.content img {
+  border-radius: var(--pc-radius);
+  max-width: 100%;
+}
+
+/* Footnote / definition niceties */
+.content sup a {
+  border-bottom: none;
+}
+
+/* Smooth the whole-page color transitions when switching themes */
+html,
+body,
+.sidebar,
+.menu-bar,
+.content pre,
+.content table,
+.content blockquote {
+  transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
+}
+
+/* ============================================================================
+   TIER B — layout, hero, right-hand TOC, theme switcher, progress bar.
+   Per-theme token mapping now lives in the GENERATED pc-themes.css; this file
+   carries component styling that consumes those tokens.
+   ============================================================================ */
+
+/* ---------------------------------------------------------------------------
+   B1. Reading progress bar
+   --------------------------------------------------------------------------- */
+#pc-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 2px;
+  width: 0;
+  background: linear-gradient(90deg, var(--pc-accent), var(--pc-accent-light));
+  box-shadow: 0 0 8px var(--pc-accent-dim);
+  z-index: 9999;
+  transition: width 0.08s linear;
+}
+
+/* ---------------------------------------------------------------------------
+   B2. Right-hand "On this page" TOC
+   The content column already centers via mdBook's max-width; we pin the TOC
+   to the right gutter on wide viewports.
+   --------------------------------------------------------------------------- */
+.pc-page-toc {
+  position: fixed;
+  top: 6rem;
+  right: 1.5rem;
+  width: 15rem;
+  max-height: calc(100vh - 8rem);
+  overflow-y: auto;
+  font-size: 0.82rem;
+  padding-left: 0.9rem;
+  border-left: 1px solid var(--pc-border);
+  display: none;
+  z-index: 5;
+}
+
+@media (min-width: 1500px) {
+  .pc-page-toc { display: block; }
+}
+
+.pc-toc-title {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--pc-text-faint);
+  margin-bottom: 0.6rem;
+}
+
+.pc-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pc-toc-item { margin: 0.1rem 0; }
+.pc-toc-item.pc-toc-h3 { padding-left: 0.85rem; }
+
+.pc-toc-list a {
+  display: block;
+  color: var(--pc-text-muted);
+  text-decoration: none;
+  border: none;
+  padding: 0.2rem 0.4rem;
+  border-radius: 0.4rem;
+  border-left: 2px solid transparent;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  line-height: 1.35;
+}
+
+.pc-toc-list a:hover {
+  color: var(--pc-text-primary);
+  background: var(--pc-hover);
+}
+
+.pc-toc-list a.pc-toc-active {
+  color: var(--pc-accent);
+  border-left-color: var(--pc-accent);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+   B3. Hero landing banner
+   --------------------------------------------------------------------------- */
+.pc-hero {
+  position: relative;
+  margin: 0 0 2.5rem;
+  padding: 3.5rem 2.5rem 3rem;
+  border: 1px solid var(--pc-border);
+  border-radius: 1.5rem;
+  background:
+    radial-gradient(120% 120% at 0% 0%, var(--pc-accent-glow), transparent 55%),
+    var(--pc-bg-surface);
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.pc-hero-glow {
+  position: absolute;
+  inset: -40% -10% auto auto;
+  width: 60%;
+  height: 200%;
+  background: radial-gradient(circle, var(--pc-accent-glow), transparent 60%);
+  filter: blur(40px);
+  z-index: -1;
+  pointer-events: none;
+  animation: pc-float 8s ease-in-out infinite;
+}
+
+@keyframes pc-float {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50% { transform: translateY(-12px) scale(1.04); }
+}
+
+.pc-hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--pc-accent);
+  background: var(--pc-accent-glow);
+  border: 1px solid var(--pc-accent-dim);
+  padding: 0.25rem 0.7rem;
+  border-radius: 9999px;
+  margin-bottom: 1.1rem;
+}
+
+.pc-hero-title {
+  font-size: 2.6rem;
+  line-height: 1.1;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 0 0 0.6rem;
+  /* mdBook gives h1 a bottom border + padding; strip them so the gradient hero title sits flush. */
+  border: none !important;
+  padding: 0 !important;
+  background: linear-gradient(135deg, var(--pc-text-primary), var(--pc-accent-light));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.pc-hero-sub {
+  font-size: 1.1rem;
+  color: var(--pc-text-secondary);
+  max-width: 36rem;
+  margin: 0 0 1.6rem;
+}
+
+.pc-hero-actions {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.pc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.6rem 1.3rem;
+  border-radius: 0.8rem;
+  font-weight: 600;
+  font-size: 0.92rem;
+  /* mdBook underlines .content links; the hero CTA buttons must not be underlined. */
+  text-decoration: none !important;
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+}
+
+/* Quick start = GitHub button with background and text colours swapped. */
+.content a.pc-btn-primary {
+  background: var(--pc-text-secondary);
+  color: var(--pc-bg-elevated);
+  border-color: var(--pc-text-secondary);
+}
+.pc-btn-primary:hover {
+  opacity: 0.88;
+}
+
+.content a.pc-btn-secondary {
+  background: var(--pc-bg-elevated);
+  color: var(--pc-text-secondary);
+  border-color: var(--pc-border-strong);
+}
+.content a.pc-btn-secondary:hover {
+  color: var(--pc-text-primary);
+  border-color: var(--pc-accent-dim);
+}
+
+/* ---------------------------------------------------------------------------
+   B4. Theme switcher — swatches + grouping + scrollable popup
+   --------------------------------------------------------------------------- */
+#mdbook-theme-list {
+  max-height: 70vh;
+  overflow-y: auto;
+  min-width: 13rem;
+  padding: 0.4rem;
+}
+
+.pc-theme-group {
+  list-style: none;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--pc-text-muted);
+  padding: 0.6rem 0.7rem 0.3rem;
+  pointer-events: none;
+}
+
+.pc-theme-item > button.theme {
+  /* mdBook's theme-list buttons default to display:block; force flex for the swatch + label row. */
+  display: flex !important;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  text-align: left;
+}
+
+.pc-theme-swatch {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 0.3rem;
+  overflow: hidden;
+  flex-shrink: 0;
+  border: 1px solid var(--pc-border-strong);
+  background: var(--s0);
+}
+.pc-theme-swatch::before,
+.pc-theme-swatch::after {
+  content: '';
+}
+.pc-theme-swatch {
+  background-image:
+    linear-gradient(var(--s1), var(--s1)),
+    linear-gradient(var(--s2), var(--s2)),
+    linear-gradient(var(--s3), var(--s3));
+  background-repeat: no-repeat;
+  background-size: 50% 50%;
+  background-position: top left, top right, bottom left;
+}
+
+.pc-theme-name {
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   B5. Glass cards — opt-in via blockquotes already styled; add a heavier
+   "feature card" look when an mdBook ```admonish``` or > [!NOTE] pattern is
+   present. Pure-CSS detection of GitHub alert syntax:
+   --------------------------------------------------------------------------- */
+.content blockquote {
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+}
+
+/* GitHub-style alerts: > [!NOTE] etc. mdBook renders the marker as the first
+   line; we can at least tint by the leading strong text if present. */
+.content blockquote p:first-child strong:only-child {
+  color: var(--pc-accent);
+}
+
+/* ---------------------------------------------------------------------------
+   B6. Table horizontal-scroll wrapper (added by pc-enhance.js)
+   --------------------------------------------------------------------------- */
+.pc-table-wrap {
+  overflow-x: auto;
+  margin: 1.2rem 0;
+  border-radius: var(--pc-radius);
+}
+.pc-table-wrap > table {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   B7. Polish — selection, sidebar scrollbar, focus
+   --------------------------------------------------------------------------- */
+::selection {
+  background: var(--pc-accent-dim);
+  color: var(--pc-text-primary);
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+  background: var(--pc-scrollbar-thumb);
+}
+
+/* Give the content a touch more breathing room and a max measure */
+.content main {
+  padding-bottom: 4rem;
+}
+
+/* Anchor offset so headings aren't hidden under the sticky menu bar */
+.content h1[id],
+.content h2[id],
+.content h3[id],
+.content h4[id] {
+  scroll-margin-top: 5rem;
+}

@@ -17,6 +17,8 @@ pub mod capabilities_tool;
 #[cfg(feature = "hardware")]
 pub mod nucleo_flash;
 #[cfg(feature = "hardware")]
+pub mod smartroom;
+#[cfg(feature = "hardware")]
 pub mod uno_q_bridge;
 #[cfg(feature = "hardware")]
 pub mod uno_q_setup;
@@ -58,7 +60,12 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
         {
             tools.push(Box::new(uno_q_bridge::UnoQGpioReadTool));
             tools.push(Box::new(uno_q_bridge::UnoQGpioWriteTool));
-            tracing::info!(board = %board.board, "Uno Q Bridge GPIO tools added");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"board": board.board})),
+                "Uno Q Bridge GPIO tools added"
+            );
             continue;
         }
 
@@ -70,10 +77,20 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
             match rpi::RpiGpioPeripheral::connect_from_config(board).await {
                 Ok(peripheral) => {
                     tools.extend(peripheral.tools());
-                    tracing::info!(board = %board.board, "RPi GPIO peripheral connected");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"board": board.board})),
+                        "RPi GPIO peripheral connected"
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to connect RPi GPIO {}: {}", board.board, e);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("Failed to connect RPi GPIO {}: {}", board.board, e)
+                    );
                 }
             }
             continue;
@@ -84,7 +101,12 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
             continue;
         }
         if board.path.is_none() {
-            tracing::warn!("Skipping serial board {}: no path", board.board);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("Skipping serial board {}: no path", board.board)
+            );
             continue;
         }
 
@@ -92,7 +114,12 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
             Ok(peripheral) => {
                 let mut p = peripheral;
                 if p.connect().await.is_err() {
-                    tracing::warn!("Peripheral {} connect warning (continuing)", p.name());
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("Peripheral {} connect warning (continuing)", p.name())
+                    );
                 }
                 serial_transports.push((board.board.clone(), p.transport()));
                 tools.extend(p.tools());
@@ -102,12 +129,43 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
                     tools.push(Box::new(arduino_upload::ArduinoUploadTool::new(
                         path.clone(),
                     )));
-                    tracing::info!("Arduino upload tool added (port: {})", path);
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("Arduino upload tool added (port: {})", path)
+                    );
                 }
-                tracing::info!(board = %board.board, "Serial peripheral connected");
+
+                // Smart-room named device tools (ESP32 / ESP32 simulator).
+                // Lets the model use device names instead of guessing pin numbers.
+                if board.board == "esp32" || board.board == "esp32-sim" {
+                    let transport = p.transport();
+                    tools.push(Box::new(smartroom::SetDeviceTool {
+                        transport: transport.clone(),
+                    }));
+                    tools.push(Box::new(smartroom::ReadDeviceTool { transport }));
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"board": board.board})),
+                        "Smart-room device tools added (set_device, read_device)"
+                    );
+                }
+
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"board": board.board})),
+                    "Serial peripheral connected"
+                );
             }
             Err(e) => {
-                tracing::warn!("Failed to connect {}: {}", board.board, e);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("Failed to connect {}: {}", board.board, e)
+                );
             }
         }
     }

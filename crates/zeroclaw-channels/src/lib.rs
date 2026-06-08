@@ -1,9 +1,21 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::useless_format,
+    clippy::explicit_auto_deref
+)]
+#![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
+
+pub mod allowlist;
+pub mod listing;
 pub mod orchestrator;
+pub mod paced_channel;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
+#[cfg(feature = "channel-acp-server")]
+pub mod acp_channel;
 pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
@@ -18,8 +30,6 @@ pub mod clawdtalk;
 pub mod dingtalk;
 #[cfg(feature = "channel-discord")]
 pub mod discord;
-#[cfg(feature = "channel-discord")]
-pub mod discord_history;
 #[cfg(feature = "channel-email")]
 pub mod email_channel;
 #[cfg(feature = "channel-email")]
@@ -66,9 +76,13 @@ pub mod voice_wake;
 pub mod wati;
 #[cfg(feature = "channel-webhook")]
 pub mod webhook;
+#[cfg(feature = "channel-wechat")]
+pub mod wechat;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
-#[cfg(feature = "channel-whatsapp-cloud")]
+#[cfg(feature = "channel-wecom-ws")]
+pub mod wecom_ws;
+#[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;

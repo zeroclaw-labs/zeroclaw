@@ -246,7 +246,7 @@ pub struct Fulfillment {
 
 // ── Credential chain layers (serialized form) ────────────────────────
 
-/// Parsed representation of an L1 SD-JWT (credential provider → user).
+/// Parsed representation of an L1 SD-JWT (credential model_provider → user).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Layer1 {
     pub iss: String,
