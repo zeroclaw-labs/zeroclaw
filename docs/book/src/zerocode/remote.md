@@ -20,7 +20,7 @@ Connect zerocode on your workstation to a daemon running on another machine
 
    </div>
 
-2. **Enable WSS.** Set the `wss` config through the [Config](./config.md) pane (or the gateway / `zeroclaw config set`). Use absolute paths — the config does not expand `~`.
+2. **Enable WSS.** Set the `wss` config through the [Config](./config.md) pane (or the gateway / `zeroclaw config set`). Use absolute paths; the config does not expand `~`.
 
 3. **Open the firewall port:**
 

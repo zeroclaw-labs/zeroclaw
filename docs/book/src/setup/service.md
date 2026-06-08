@@ -31,7 +31,7 @@ The unit:
 - `Environment=HOME=%h` and `PassEnvironment=DISPLAY XDG_RUNTIME_DIR` so headless browser tools can create profile/cache dirs and reach the user session
 - `WantedBy=default.target`
 
-### Manual control
+### Manual control (systemd)
 
 <div class="os-tabs-src">
 
@@ -74,7 +74,7 @@ systemctl --user enable --now zeroclaw
 
 </div>
 
-If you need a true system-scope unit (root-owned, `/etc/systemd/system/`, dedicated service account, or hardware groups via `SupplementaryGroups`), the CLI does not generate one — adapt the system-level template at [`scripts/zeroclaw.service`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/scripts/zeroclaw.service) and install it yourself. On OpenRC hosts, `sudo zeroclaw service install` does provision a dedicated `zeroclaw` user and system paths (see below).
+If you need a true system-scope unit (root-owned, `/etc/systemd/system/`, dedicated service account, or hardware groups via `SupplementaryGroups`), the CLI does not generate one; adapt the system-level template at [`scripts/zeroclaw.service`](https://github.com/zeroclaw-labs/zeroclaw/blob/master/scripts/zeroclaw.service) and install it yourself. On OpenRC hosts, `sudo zeroclaw service install` does provision a dedicated `zeroclaw` user and system paths (see below).
 
 ## Linux: OpenRC
 
@@ -150,7 +150,7 @@ type %USERPROFILE%\.zeroclaw\logs\daemon.stdout.log
 
 </div>
 
-### Manual control
+### Manual control (Task Scheduler)
 
 The task is driven through `zeroclaw service start|stop|status`, which wrap `schtasks /Run`, `/End`, and `/Query` against the **ZeroClaw Daemon** task. You can also manage it directly:
 
@@ -174,13 +174,13 @@ The service reads config from whichever directory resolved at install time. Prec
 
 1. `$ZEROCLAW_CONFIG_DIR` (config lives directly under `$ZEROCLAW_CONFIG_DIR`)
 2. `$ZEROCLAW_DATA_DIR`
-3. `$ZEROCLAW_WORKSPACE` (**deprecated** — prefer `ZEROCLAW_DATA_DIR`; resolves either `$ZEROCLAW_WORKSPACE` or the legacy sibling `.zeroclaw/`)
+3. `$ZEROCLAW_WORKSPACE` (**deprecated**, prefer `ZEROCLAW_DATA_DIR`; resolves either `$ZEROCLAW_WORKSPACE` or the legacy sibling `.zeroclaw/`)
 4. On macOS only, the Homebrew config dir (`$HOMEBREW_PREFIX/var/zeroclaw/`) when installed via Homebrew
 5. Default `~/.zeroclaw/` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\` (Windows)
 
 `ZEROCLAW_CONFIG_DIR` overrides everything; setting it alongside `ZEROCLAW_DATA_DIR` or `ZEROCLAW_WORKSPACE` logs a warning and ignores the others.
 
-If your service seems to ignore config changes, check which path the daemon resolved against — `zeroclaw status` reports the active config file, and the runtime logs a resolution-source line at startup:
+If your service seems to ignore config changes, check which path the daemon resolved against, `zeroclaw status` reports the active config file, and the runtime logs a resolution-source line at startup:
 
 <div class="os-tabs-src">
 

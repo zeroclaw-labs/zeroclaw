@@ -65,7 +65,7 @@ scoop install zeroclaw
 cargo install --locked --path .
 ```
 
-On WSL2, follow the Linux path — `install.sh` runs unchanged. See
+On WSL2, follow the Linux path; `install.sh` runs unchanged. See
 [Setup → Windows](../setup/windows.md) for the full walkthrough.
 <!-- ANCHOR_END: windows -->
 

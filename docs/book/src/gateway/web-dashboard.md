@@ -146,7 +146,7 @@ e.g. `gateway.request_timeout_secs` becomes
 
 ### Don't use `~` or `$HOME`
 
-A literal tilde is **not** expanded by the gateway — use an absolute path for `gateway.web_dist_dir`. Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded; pre-expand them in the env var if you set the value that way:
+A literal tilde is **not** expanded by the gateway; use an absolute path for `gateway.web_dist_dir`. Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded; pre-expand them in the env var if you set the value that way:
 
 {{#env-var web_dist_home}}
 

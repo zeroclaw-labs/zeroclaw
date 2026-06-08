@@ -12,7 +12,7 @@ setup.bat
 
 That is the whole install: grab `setup.bat` from a ZeroClaw release and run it. It prompts for a build mode, then either downloads the prebuilt binary or (for source modes) installs a stable Rust toolchain via `rustup` and compiles. Either way the binary lands at `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`, and it points you at [`zeroclaw quickstart`](../getting-started/quickstart.md).
 
-To skip the interactive prompt, pass a build-mode flag — `--prebuilt` (download a release binary, no toolchain), `--minimal` (core only), `--standard`, or `--full`. Run `setup.bat --help` for the authoritative list of modes and the exact feature set each one compiles; that output is generated from the script itself, so it never drifts. With `--minimal`, quickstart is unavailable; configure ZeroClaw manually with `zeroclaw config set` and use the reduced CLI path (`zeroclaw agent ...`).
+To skip the interactive prompt, pass a build-mode flag: `--prebuilt` (download a release binary, no toolchain), `--minimal` (core only), `--standard`, or `--full`. Run `setup.bat --help` for the authoritative list of modes and the exact feature set each one compiles; that output is generated from the script itself, so it never drifts. With `--minimal`, quickstart is unavailable; configure ZeroClaw manually with `zeroclaw config set` and use the reduced CLI path (`zeroclaw agent ...`).
 
 ### Scoop
 
@@ -108,7 +108,7 @@ zeroclaw service restart
 
 </div>
 
-### Scoop
+### Scoop update
 
 <div class="os-tabs-src">
 
@@ -121,7 +121,7 @@ zeroclaw service restart
 
 </div>
 
-### From source
+### From source update
 
 <div class="os-tabs-src">
 

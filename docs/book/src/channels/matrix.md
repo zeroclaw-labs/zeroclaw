@@ -27,7 +27,7 @@ Before testing message flow:
 1. The bot account is joined to the target room.
 2. The access token belongs to the same bot account.
 3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Each entry is either a canonical room ID (`!room:server`) or an alias (`#alias:server`); ZeroClaw resolves aliases.
-4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing — see §6).
+4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing, see §6).
 5. For E2EE rooms, the bot device has received encryption keys for the room.
 
 ## 2. Configuration
@@ -106,11 +106,11 @@ Work through in order.
 
 ### B. Sender allowlist (peer groups)
 
-The sender must be in the agent's peer set — see [Who can talk to the agent](#who-can-talk-to-the-agent) at the top of this page. For diagnosis, temporarily set `external_peers = ["*"]` and restart the daemon.
+The sender must be in the agent's peer set, see [Who can talk to the agent](#who-can-talk-to-the-agent) at the top of this page. For diagnosis, temporarily set `external_peers = ["*"]` and restart the daemon.
 
 ### C. Token and identity
 
-Secrets are encrypted at rest and not retrievable — `zeroclaw config get` prints `[masked]` for any secret field. To run the checks below, use the access token you minted in §3 (or mint a fresh one) and your own homeserver URL.
+Secrets are encrypted at rest and not retrievable: `zeroclaw config get` prints `[masked]` for any secret field. To run the checks below, use the access token you minted in §3 (or mint a fresh one) and your own homeserver URL.
 
 Validate the token server-side:
 
@@ -245,7 +245,7 @@ A fresh login creates a new device with a new `device_id`, sidestepping the OTK 
 
    </div>
 
-4. Apply the new credentials: set `access_token` (secret — see [§2](#2-configuration)) and `device_id` in your config.
+4. Apply the new credentials: set `access_token` (secret, see [§2](#2-configuration)) and `device_id` in your config.
 
 5. Restart:
 

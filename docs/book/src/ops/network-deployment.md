@@ -68,7 +68,7 @@ The gateway stays bound to `127.0.0.1`, the proxy does the listening.
 ### Install
 
 Clone and run the installer. With no flags it drops into an interactive picker
-where you choose the build type and which features to compile in — including the
+where you choose the build type and which features to compile in, including the
 hardware features for GPIO/I2C/SPI. On the Pi it also uses the Pi-tuned cargo
 profiles; see [Raspberry Pi setup](../hardware/raspberry-pi-setup.md) for swap
 setup and the per-model build matrix.
@@ -99,7 +99,7 @@ The stock service unit already adds the user to the `gpio`, `spi`, `i2c` groups.
 
 ### Checklist
 
-- [ ] Install the binary (`./install.sh` — pick your features in the picker)
+- [ ] Install the binary (`./install.sh`, pick your features in the picker)
 - [ ] Run `zeroclaw quickstart`
 - [ ] Configure your channels. Telegram needs no port; webhooks need a tunnel
 - [ ] Install the service: `zeroclaw service install && zeroclaw service start`

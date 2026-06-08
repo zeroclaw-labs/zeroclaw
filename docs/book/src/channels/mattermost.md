@@ -7,12 +7,12 @@ REST v4 polling client. Self-hosted, on-prem, or sovereign-cloud Mattermost serv
 {{#peer-group mattermost}}
 
 To allowlist a specific human, copy their user ID from **System Console → User
-Management** — Mattermost matches the user **UUID**, not a username, and does
+Management**. Mattermost matches the user **UUID**, not a username, and does
 not resolve usernames at message-receive time.
 
 ## Quickstart
 
-Configure a Mattermost channel (`url` plus a `bot_token` secret — see [Authentication](#authentication)) through one of the surfaces below. That alone gives you:
+Configure a Mattermost channel (`url` plus a `bot_token` secret, see [Authentication](#authentication)) through one of the surfaces below. That alone gives you:
 
 1. Auto-discovery of every channel the bot can read across every team it belongs to.
 2. DM and group-DM channels auto-discovered and polled alongside team channels.

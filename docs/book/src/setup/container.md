@@ -211,7 +211,7 @@ Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options
 1. **Expose the gateway**: `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
 2. **Use a tunnel**: ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
 
-Configure a tunnel by setting the top-level `[tunnel]` `tunnel_provider` (override env var: {{#env-var-name tunnel.tunnel_provider}}) to one of the supported providers and filling the matching `tunnel.*` block — the full provider list and per-provider fields are in the [Config reference](../reference/config.md#tunnel). The resulting public URL is what you point your webhook senders at.
+Configure a tunnel by setting the top-level `[tunnel]` `tunnel_provider` (override env var: {{#env-var-name tunnel.tunnel_provider}}) to one of the supported providers and filling the matching `tunnel.*` block; the full provider list and per-provider fields are in the [Config reference](../reference/config.md#tunnel). The resulting public URL is what you point your webhook senders at.
 
 ## Kubernetes
 

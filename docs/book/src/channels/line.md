@@ -6,7 +6,7 @@ ZeroClaw supports LINE via the Messaging API, receiving messages through an embe
 
 {{#peer-group line}}
 
-LINE layers `dm_policy` and `group_policy` on top of the peer set — see [Access Policies](#6-access-policies) below. When a policy is set to `allowlist`, the peer set is the allowlist.
+LINE layers `dm_policy` and `group_policy` on top of the peer set, see [Access Policies](#6-access-policies) below. When a policy is set to `allowlist`, the peer set is the allowlist.
 
 ## Prerequisites
 

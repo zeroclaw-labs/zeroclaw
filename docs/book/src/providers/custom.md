@@ -10,7 +10,7 @@ Three ways to add a provider ZeroClaw doesn't ship with:
 
 If the service speaks OpenAI chat-completions, this is a config-only change. The `custom` slot requires `uri` (the family's endpoint enum has no default); reference it from an agent's `model_provider`.
 
-This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use — `custom` is the catch-all for endpoints not represented by a vendor slot.
+This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
 ## First-class local-inference servers
 

@@ -85,7 +85,7 @@ Modern channel instances are configured under `[channels.<type>.<alias>]`, with 
 
 {{#config-where channels}}
 
-Secrets (bot tokens, API keys, passwords) are stored encrypted — set them through the gateway, zerocode, or `zeroclaw config set` (masked), never in plaintext. The `channels` entry on an agent binds a channel alias to that agent. Field names differ per channel; `zeroclaw config schema` is the authoritative list. Fields that recur across many channels:
+Secrets (bot tokens, API keys, passwords) are stored encrypted; set them through the gateway, zerocode, or `zeroclaw config set` (masked), never in plaintext. The `channels` entry on an agent binds a channel alias to that agent. Field names differ per channel; `zeroclaw config schema` is the authoritative list. Fields that recur across many channels:
 
 | Key | What it does |
 |---|---|

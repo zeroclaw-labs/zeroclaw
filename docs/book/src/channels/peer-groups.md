@@ -21,7 +21,7 @@ A `[peer_groups.<name>]` block carries:
 | Field | Meaning |
 |---|---|
 | `channel` | A channel type (`"telegram"`, applies to every alias of that type) or a dotted alias (`"telegram.work"`, scopes to that one instance). |
-| `agents` | Member agents by alias. Two agents are peers only when both appear in the same group — membership is mutual. |
+| `agents` | Member agents by alias. Two agents are peers only when both appear in the same group; membership is mutual. |
 | `external_peers` | Non-agent members by the channel's native username/ID. `["*"]` accepts anyone; empty accepts no one. |
 | `ignore` | Per-group blocklist; subtracts from the resolved peer set. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |

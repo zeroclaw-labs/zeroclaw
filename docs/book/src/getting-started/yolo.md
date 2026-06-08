@@ -20,7 +20,7 @@
 
 ## Enabling it
 
-Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good intent-naming choice) and point your agent at it. If multiple agents share the host, give the YOLO-bound one its own profile and keep your other agents on a stricter profile (e.g. `hardened`) — risk profiles are per-profile, so a YOLO agent and a hardened agent can coexist in the same config.
+Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good intent-naming choice) and point your agent at it. If multiple agents share the host, give the YOLO-bound one its own profile and keep your other agents on a stricter profile (e.g. `hardened`); risk profiles are per-profile, so a YOLO agent and a hardened agent can coexist in the same config.
 
 ## What you lose
 

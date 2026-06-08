@@ -21,7 +21,7 @@ Multi-model configuration is useful for:
 
 Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<alias>]`. If the model goes down, the agent goes down; the operator routes affected channels to a different agent. See [Routing](../providers/routing.md) for the full pattern.
 
-To run multiple models, run multiple agents — each binding to one model provider. Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels` list on the agent that should pick it up; `Config::validate()` makes sure references resolve at startup.
+To run multiple models, run multiple agents, each binding to one model provider. Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels` list on the agent that should pick it up; `Config::validate()` makes sure references resolve at startup.
 
 ## Cross-vendor reliability: use OpenRouter
 
@@ -33,7 +33,7 @@ For transient errors (network blip, 503, timeout) against the *same* provider, Z
 
 ## API key rotation
 
-For providers that frequently encounter rate limits, supply additional API keys on the provider entry that ZeroClaw rotates through on `429` responses. The primary `api_key` is always tried first; extras are rotated on rate-limit errors. All keys must belong to the same provider account class — this is rate-limit smoothing, not multi-tenant key juggling.
+For providers that frequently encounter rate limits, supply additional API keys on the provider entry that ZeroClaw rotates through on `429` responses. The primary `api_key` is always tried first; extras are rotated on rate-limit errors. All keys must belong to the same provider account class; this is rate-limit smoothing, not multi-tenant key juggling.
 
 ## Local development with hosted alternative
 

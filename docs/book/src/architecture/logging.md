@@ -17,7 +17,7 @@ Every log event carries two completely separate channels of structured data. Con
 | **Answers** | *Who* did it and *under what context* | *What* specifically happened |
 | **Examples** | `channel`, `agent_alias`, `model_provider`, `tool`, `session_key`, `cron_job_id` | `bytes_received`, `tokens_used`, `status_code`, error payloads |
 | **Source** | **Spans.** Opened at entry points, walked by the layer. | **The call site.** `Event::with_attrs(json!({...}))`. |
-| **Appears at the call site?** | **Never.** Not a `record!` argument. | Yes — that's the only place it can come from. |
+| **Appears at the call site?** | **Never.** Not a `record!` argument. | Yes, that's the only place it can come from. |
 
 The rule that falls out of this: **if a value identifies who or what scope an event belongs to, it comes from a span and must never appear at the call site.** Attribution flows in automatically from `attribution_span!` / `scope!` wrappers opened higher up the stack; the layer walks the span scope leaf→root when an event fires and merges every contribution into the event's `zeroclaw.*` block. The call site that fires `record!` names none of it.
 
@@ -25,13 +25,13 @@ Because attribution is the load-bearing half of this split and the half that tri
 
 ## Attribution: it all comes from spans
 
-**Attribution is never a call-site argument.** Read that again. Channel composite, agent_alias, model_provider, tool, session_key, cron_job_id — none of these are ever typed into a `record!` call. They flow in through tracing spans opened at entry points and walked by the layer when an event fires. If you find yourself wanting to pass `agent_alias` or `tool` to `record!`, stop: the value is already in scope through a span, or it should be, and the fix is to open or fix the span, not to thread the value into the call site.
+**Attribution is never a call-site argument.** Read that again. Channel composite, agent_alias, model_provider, tool, session_key, cron_job_id: none of these are ever typed into a `record!` call. They flow in through tracing spans opened at entry points and walked by the layer when an event fires. If you find yourself wanting to pass `agent_alias` or `tool` to `record!`, stop: the value is already in scope through a span, or it should be, and the fix is to open or fix the span, not to thread the value into the call site.
 
 The mechanism, end to end:
 
 1. A "thing" (channel, provider, agent, tool, cron job, memory backend, …) implements `Attributable` once, next to its struct.
 2. Its entry point wraps work in `attribution_span!(self)`, which opens a tracing span carrying that thing's role and alias.
-3. Every `record!` fired anywhere inside that span — directly or nested arbitrarily deep — inherits the attribution automatically.
+3. Every `record!` fired anywhere inside that span, directly or nested arbitrarily deep, inherits the attribution automatically.
 4. When the event fires, the layer walks the span scope **leaf→root**, merges every `Attributable`'s contribution, and writes the merged `zeroclaw.*` block. The call site named none of it.
 
 This is the whole point of the design: per-thing logging code is zero. You impl the trait once and wrap the entry point once; every emission underneath is attributed for free.
@@ -73,9 +73,9 @@ pub enum Role {
 
 `ChannelKind`, `ToolKind`, `CronKind`, `MemoryKind`, and the four `ProviderKind` sub-enums (`ModelProviderKind`, `TtsProviderKind`, `TranscriptionProviderKind`, `TunnelProviderKind`) are all closed. The variant's snake_case form via `strum::IntoStaticStr` is the canonical `<type>` portion of the `<type>.<alias>` composite. Adding a new implementation: extend the relevant `Kind` enum, that's it.
 
-### Opening a span — do this at every entry point
+### Opening a span, do this at every entry point
 
-Wrap an entry-point's work with `attribution_span!(thing)`. The macro returns a `Span` carrying the thing's role and alias as structured fields. `.instrument(span)` the future (or `let _g = span.entered()` in sync code). **A spawned task that does not re-establish the span loses attribution** — every `tokio::spawn` body that emits must carry the same `attribution_span!` / `scope!` the parent used, or its emissions land un-attributed.
+Wrap an entry-point's work with `attribution_span!(thing)`. The macro returns a `Span` carrying the thing's role and alias as structured fields. `.instrument(span)` the future (or `let _g = span.entered()` in sync code). **A spawned task that does not re-establish the span loses attribution**: every `tokio::spawn` body that emits must carry the same `attribution_span!` / `scope!` the parent used, or its emissions land un-attributed.
 
 ```rust
 use zeroclaw_log::Instrument;
@@ -90,9 +90,9 @@ async move {
 
 The layer walks the span scope leaf→root when an event fires, merges every `Attributable`'s contribution into the event's `zeroclaw.*` attribution block, and emits the composite (`channel = "telegram.clamps"`, `channel_type = "telegram"`, `channel_alias = "clamps"`) without the call site naming any of those keys.
 
-### The `scope!` macro — non-role context
+### The `scope!` macro, non-role context
 
-`attribution_span!` is for role-bearing `Attributable` things. For per-scope identifiers that aren't tied to one — sender id, message id, turn id, request id — use `scope!`:
+`attribution_span!` is for role-bearing `Attributable` things. For per-scope identifiers that aren't tied to one (sender id, message id, turn id, request id), use `scope!`:
 
 ```rust
 zeroclaw_log::scope!(
@@ -106,9 +106,9 @@ zeroclaw_log::scope!(
 
 ## The `record!` macro and its call-site contract
 
-The `tracing` crate is `zeroclaw-log`'s implementation detail: the `record!` / `scope!` / `attribution_span!` macros expand to `zeroclaw_log::__private::tracing` so a call site never names a tracing type. The log-event macros themselves — `tracing::{trace,debug,info,warn,error}`, `log::*`, `std::dbg`, plus bare `anyhow::anyhow!` — are **hard-banned workspace-wide** as `disallowed-macros` in `clippy.toml`. With `-D warnings` in CI, any direct `tracing::info!` etc. **fails the build**, with a clippy message naming `::zeroclaw_log::record!` as the replacement. This is not a convention; it is enforced.
+The `tracing` crate is `zeroclaw-log`'s implementation detail: the `record!` / `scope!` / `attribution_span!` macros expand to `zeroclaw_log::__private::tracing` so a call site never names a tracing type. The log-event macros themselves (`tracing::{trace,debug,info,warn,error}`, `log::*`, `std::dbg`, plus bare `anyhow::anyhow!`) are **hard-banned workspace-wide** as `disallowed-macros` in `clippy.toml`. With `-D warnings` in CI, any direct `tracing::info!` etc. **fails the build**, with a clippy message naming `::zeroclaw_log::record!` as the replacement. This is not a convention; it is enforced.
 
-The only exemptions are the few files inside `crates/zeroclaw-log/` that bootstrap the pipeline and carry a local `#![allow(clippy::disallowed_macros)]`. A handful of crates (`zeroclaw-api`, `zeroclaw-spawn`, `zeroclaw-providers`, `zeroclaw-hardware`, `zeroclaw-log`) still list `tracing` / `tracing-subscriber` in `Cargo.toml`, but only for span and subscriber plumbing — not for emitting log macros. The dependency being present does not license calling the banned macros. (`tokio::spawn` is banned the same way via `disallowed-methods`; use `::zeroclaw_spawn::spawn!` so spawned tasks inherit the caller's attribution span.)
+The only exemptions are the few files inside `crates/zeroclaw-log/` that bootstrap the pipeline and carry a local `#![allow(clippy::disallowed_macros)]`. A handful of crates (`zeroclaw-api`, `zeroclaw-spawn`, `zeroclaw-providers`, `zeroclaw-hardware`, `zeroclaw-log`) still list `tracing` / `tracing-subscriber` in `Cargo.toml`, but only for span and subscriber plumbing, not for emitting log macros. The dependency being present does not license calling the banned macros. (`tokio::spawn` is banned the same way via `disallowed-methods`; use `::zeroclaw_spawn::spawn!` so spawned tasks inherit the caller's attribution span.)
 
 The macro is locked-shape: it takes a level, a single `Event` expression, and a message literal.
 

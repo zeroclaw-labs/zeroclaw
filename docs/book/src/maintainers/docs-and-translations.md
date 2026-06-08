@@ -24,7 +24,7 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 App strings live in `crates/zeroclaw-runtime/locales/`. English is the source of truth and is embedded at compile time.
 
 > **Runtime loading caveat (verify before relying on this).** Only `en` and `zh-CN` are wired into the runtime as built-ins: `crates/zeroclaw-runtime/src/i18n.rs` embeds `en` via `include_str!`, and `builtin_cli_ftl_source()` returns the embedded `zh-CN` catalogue for `zh-CN` and `None` for every other locale. A disk-override path exists: `load_ftl_from_disk` resolves `zeroclaw_config::schema::ftl_locale_dir(locale)`, i.e. `<config-dir>/data/ftl/<locale>/cli.ftl` (the same location `zeroclaw locales fetch` populates). **So a freshly filled `ja/cli.ftl` is generated and committed, but is not loaded at runtime** unless either the locale is added to `builtin_cli_ftl_source()` or the filled `cli.ftl` is placed under `<config-dir>/data/ftl/ja/`. Confirm the current state in `i18n.rs` and `zeroclaw_config::schema::ftl_locale_dir` rather than trusting this note.
-
+>
 > The `apps/zerocode` TUI maintains an independent Fluent catalogue (`apps/zerocode/locales/`), see [zerocode strings](#zerocode-strings-fluent-independent) below. `cargo fluent` walks **both** catalogue roots (runtime + zerocode), so every subcommand below covers both by default.
 
 <div class="os-tabs-src">

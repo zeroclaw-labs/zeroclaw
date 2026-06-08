@@ -16,9 +16,9 @@ See [Configuration](./configuration.md) for the full schema and [Catalog](./cata
 
 ## Per-agent dispatch: there are no global defaults
 
-A provider entry on its own does nothing. To use it, an agent references it by `model_provider` (along with a `risk_profile` and optional `runtime_profile`). `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match. `Config::validate()` fails loud at startup if any reference doesn't resolve. Every callsite picks a configured alias or opts out — there is no global "default provider" or "default model" knob.
+A provider entry on its own does nothing. To use it, an agent references it by `model_provider` (along with a `risk_profile` and optional `runtime_profile`). `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match. `Config::validate()` fails loud at startup if any reference doesn't resolve. Every callsite picks a configured alias or opts out; there is no global "default provider" or "default model" knob.
 
-For multi-agent deployments, give each agent its own `model_provider`. Channels that ingest messages bind to one agent at a time via the agent's `channels` list — see [Channels](../channels/overview.md) for the full picture.
+For multi-agent deployments, give each agent its own `model_provider`. Channels that ingest messages bind to one agent at a time via the agent's `channels` list; see [Channels](../channels/overview.md) for the full picture.
 
 ## Per-agent voice (TTS) and transcription
 

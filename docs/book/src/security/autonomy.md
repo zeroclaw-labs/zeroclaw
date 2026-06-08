@@ -46,7 +46,7 @@ This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-e
 
 ## Command allow list
 
-For the shell tool specifically: if `allowed_commands` is non-empty, it's strict — any command not listed is blocked. The shell-policy validator handles destructive-pattern detection on top of the allowlist.
+For the shell tool specifically: if `allowed_commands` is non-empty, it's strict: any command not listed is blocked. The shell-policy validator handles destructive-pattern detection on top of the allowlist.
 
 ## Path rules
 
