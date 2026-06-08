@@ -88,7 +88,7 @@ impl InitiativeEngine {
 
         let trigger_reason = trigger.description().to_string();
 
-        let recent_memories = memory.recall("*", 5, None).await.unwrap_or_default();
+        let recent_memories = memory.recall("*", 5, None, None, None).await.unwrap_or_default();
         let memory_context = recent_memories
             .iter()
             .map(|m| format!("- {}", m.content))
@@ -116,7 +116,7 @@ impl InitiativeEngine {
                 Some(&system),
                 "Generate an initiative message",
                 model,
-                state.effective_temperature(0.7),
+                Some(state.effective_temperature(0.7)),
             )
             .await?;
 

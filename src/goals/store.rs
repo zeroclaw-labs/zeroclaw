@@ -263,7 +263,7 @@ fn map_goal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Goal> {
 }
 
 fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = config.workspace_dir.join("goals").join("goals.db");
+    let db_path = config.shared_workspace_dir().join("goals").join("goals.db");
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create goals directory: {}", parent.display()))?;
@@ -320,11 +320,10 @@ mod tests {
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(config.shared_workspace_dir()).unwrap();
         config
     }
 

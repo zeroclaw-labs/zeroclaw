@@ -15,11 +15,26 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
-use super::store::{Approval, Command};
-use crate::gateway::AppState;
+use super::store::{Approval, Command, ControlStore};
+use zeroclaw_runtime::security::PairingGuard;
 
-fn check_auth(headers: &HeaderMap, state: &AppState) -> Option<(StatusCode, Json<Value>)> {
+/// Axum state for the fork-only control plane.
+///
+/// The V3 crate split removed `control_store` / `control_events_tx` from the
+/// gateway `AppState` (the gateway crate cannot depend on the binary-local
+/// `ControlStore`). This dedicated state decouples the control handlers from
+/// `AppState` so they compile independently; it is wired up only when the
+/// control plane is mounted.
+#[derive(Clone)]
+pub struct ControlState {
+    pub pairing: Arc<PairingGuard>,
+    pub control_store: Option<Arc<ControlStore>>,
+    pub control_events_tx: Option<broadcast::Sender<String>>,
+}
+
+fn check_auth(headers: &HeaderMap, state: &ControlState) -> Option<(StatusCode, Json<Value>)> {
     if !state.pairing.require_pairing() {
         return None;
     }
@@ -37,7 +52,7 @@ fn check_auth(headers: &HeaderMap, state: &AppState) -> Option<(StatusCode, Json
     None
 }
 
-pub async fn handle_bots_list(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handle_bots_list(State(state): State<ControlState>) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -59,7 +74,7 @@ pub async fn handle_bots_list(State(state): State<AppState>) -> impl IntoRespons
 pub async fn handle_bot_detail(
     headers: HeaderMap,
     Path(bot_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
 ) -> impl IntoResponse {
     if let Some(err) = check_auth(&headers, &state) {
         return err;
@@ -95,7 +110,7 @@ pub async fn handle_bot_detail(
 pub async fn handle_bot_delete(
     headers: HeaderMap,
     Path(bot_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
 ) -> impl IntoResponse {
     if let Some(err) = check_auth(&headers, &state) {
         return err;
@@ -126,7 +141,7 @@ pub async fn handle_bot_delete(
 }
 
 pub async fn handle_heartbeat(
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
@@ -213,7 +228,7 @@ pub async fn handle_heartbeat(
 
 pub async fn handle_command_create(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(err) = check_auth(&headers, &state) {
@@ -318,7 +333,7 @@ pub async fn handle_command_create(
 }
 
 pub async fn handle_command_ack(
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
@@ -375,7 +390,7 @@ pub async fn handle_command_ack(
 
 pub async fn handle_commands_list(
     Query(params): Query<HashMap<String, String>>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
         return (
@@ -404,7 +419,7 @@ pub async fn handle_commands_list(
 pub async fn handle_approval_action(
     headers: HeaderMap,
     Path(command_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(err) = check_auth(&headers, &state) {
@@ -464,7 +479,7 @@ pub async fn handle_approval_action(
 
 pub async fn handle_approvals_list(
     Query(params): Query<HashMap<String, String>>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
         return (
@@ -491,7 +506,7 @@ pub async fn handle_approvals_list(
 
 pub async fn handle_audit_log(
     Query(params): Query<HashMap<String, String>>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
         return (
@@ -517,7 +532,7 @@ pub async fn handle_audit_log(
 
 pub async fn handle_events_list(
     Query(params): Query<HashMap<String, String>>,
-    State(state): State<AppState>,
+    State(state): State<ControlState>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
         return (
@@ -542,7 +557,7 @@ pub async fn handle_events_list(
     }
 }
 
-pub async fn handle_events_stream(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handle_events_stream(State(state): State<ControlState>) -> impl IntoResponse {
     let Some(ref tx) = state.control_events_tx else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -560,7 +575,7 @@ pub async fn handle_events_stream(State(state): State<AppState>) -> impl IntoRes
         .into_response()
 }
 
-pub async fn handle_control_metrics(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handle_control_metrics(State(state): State<ControlState>) -> impl IntoResponse {
     let Some(ref store) = state.control_store else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

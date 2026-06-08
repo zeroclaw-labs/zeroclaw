@@ -9,7 +9,7 @@
     clippy::needless_range_loop
 )]
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 

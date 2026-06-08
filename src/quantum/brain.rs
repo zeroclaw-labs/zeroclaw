@@ -1,5 +1,5 @@
 use num_complex::Complex64;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 
 use crate::consciousness::traits::{
@@ -45,12 +45,12 @@ impl QuantumBrainEngine {
         ));
     }
 
-    pub fn quantum_annealing_select(
+    pub fn quantum_annealing_select<R: rand::Rng + ?Sized>(
         &mut self,
         superposition: &mut super::traits::ProposalSuperposition,
         iterations: usize,
         initial_temp: f64,
-        rng: &mut dyn rand_core::RngCore,
+        rng: &mut R,
     ) -> Option<super::traits::QuantumProposal> {
         if superposition.proposals.is_empty() {
             return None;
@@ -127,10 +127,10 @@ impl QuantumBrain for QuantumBrainEngine {
         superposition
     }
 
-    fn decide_quantum(
+    fn decide_quantum<R: rand::Rng + ?Sized>(
         &mut self,
         superposition: &mut ProposalSuperposition,
-        rng: &mut dyn rand_core::RngCore,
+        rng: &mut R,
     ) -> Option<Proposal> {
         self.anneal();
 

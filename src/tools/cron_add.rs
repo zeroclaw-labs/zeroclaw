@@ -49,7 +49,7 @@ impl Tool for CronAddTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -128,7 +128,7 @@ impl Tool for CronAddTool {
                     });
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job(&self.config, "default", name, schedule, command)
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -177,6 +177,7 @@ impl Tool for CronAddTool {
 
                 cron::add_agent_job(
                     &self.config,
+                    "default",
                     name,
                     schedule,
                     prompt,
@@ -184,6 +185,7 @@ impl Tool for CronAddTool {
                     model,
                     delivery,
                     delete_after_run,
+                    None,
                 )
             }
         };
@@ -218,20 +220,32 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        // V3 cron validates the agent alias resolves to risk/runtime profiles.
+        config.risk_profiles.entry("default".to_string()).or_default();
+        config
+            .runtime_profiles
+            .entry("default".to_string())
+            .or_default();
+        let _ = config.providers.models.ensure("openrouter", "default");
+        config.agents.entry("default".to_string()).or_insert(
+            crate::config::schema::AliasedAgentConfig {
+                model_provider: "openrouter.default".to_string().into(),
+                risk_profile: "default".to_string(),
+                runtime_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(config.shared_workspace_dir()).unwrap();
         Arc::new(config)
     }
 
-    fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+    fn test_security(_cfg: &Config) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
     }
 
     #[tokio::test]
@@ -255,14 +269,11 @@ mod tests {
     #[tokio::test]
     async fn blocks_disallowed_shell_command() {
         let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let config = Config {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = AutonomyLevel::Supervised;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(config.shared_workspace_dir()).unwrap();
         let cfg = Arc::new(config);
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 

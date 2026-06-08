@@ -345,7 +345,10 @@ impl Observer for PrometheusObserver {
             | ObserverEvent::LlmRequest { .. }
             | ObserverEvent::DeploymentStarted { .. }
             | ObserverEvent::RecoveryCompleted { .. }
-            | ObserverEvent::ConscienceVerdict { .. } => {}
+            | ObserverEvent::ConscienceVerdict { .. }
+            | ObserverEvent::LifeTick { .. }
+            | ObserverEvent::LifeInitiative { .. }
+            | ObserverEvent::LifeDreamComplete { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,

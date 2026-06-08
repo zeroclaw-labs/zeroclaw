@@ -270,6 +270,15 @@ mod continuity;
 // no-op without x0-broken-legacy's gated sub-modules).
 #[cfg(feature = "x0-extended")]
 mod cosmic;
+// The bin re-includes these x0-broken-legacy modules so sibling modules resolve
+// in the bin crate: tools/shell.rs → crate::runtime, cosmic/workspace.rs →
+// crate::quantum. The lib declares them under the same gate.
+#[cfg(feature = "x0-broken-legacy")]
+mod consciousness;
+#[cfg(feature = "x0-broken-legacy")]
+mod quantum;
+#[cfg(feature = "x0-broken-legacy")]
+mod runtime;
 #[cfg(feature = "x0-extended")]
 mod soul;
 #[cfg(feature = "x0-extended")]

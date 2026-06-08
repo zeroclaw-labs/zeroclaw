@@ -18,7 +18,11 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
         "native" => Ok(Box::new(NativeRuntime::new())),
         "docker" => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
         #[cfg(feature = "runtime-wasm")]
-        "wasm" => Ok(Box::new(WasmRuntime::new(config.wasm.clone()))),
+        // V3 `RuntimeConfig` dropped the per-runtime `wasm` field; the WASM
+        // runtime now starts from its own defaults.
+        "wasm" => Ok(Box::new(WasmRuntime::new(
+            crate::config::WasmRuntimeConfig::default(),
+        ))),
         #[cfg(not(feature = "runtime-wasm"))]
         "wasm" => anyhow::bail!(
             "runtime.kind='wasm' requires the `runtime-wasm` feature. Rebuild with: cargo build --features runtime-wasm"

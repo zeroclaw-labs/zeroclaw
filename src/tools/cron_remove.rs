@@ -36,7 +36,7 @@ impl Tool for CronRemoveTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -77,12 +77,26 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.risk_profiles.entry("default".to_string()).or_default();
+        config
+            .runtime_profiles
+            .entry("default".to_string())
+            .or_default();
+        let _ = config.providers.models.ensure("openrouter", "default");
+        config.agents.entry("default".to_string()).or_insert(
+            crate::config::schema::AliasedAgentConfig {
+                model_provider: "openrouter.default".to_string().into(),
+                risk_profile: "default".to_string(),
+                runtime_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(config.shared_workspace_dir()).unwrap();
         Arc::new(config)
     }
 
@@ -90,7 +104,7 @@ mod tests {
     async fn removes_existing_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let job = cron::add_job(&cfg, "default", "*/5 * * * *", "echo ok").unwrap();
         let tool = CronRemoveTool::new(cfg.clone());
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();

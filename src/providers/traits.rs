@@ -1,4 +1,6 @@
 pub use zeroclaw_api::model_provider::*;
+// Legacy alias for pre-split callers using `crate::providers::traits::Provider`.
+pub use zeroclaw_api::model_provider::ModelProvider as Provider;
 
 #[cfg(test)]
 mod tests {

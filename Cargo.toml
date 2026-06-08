@@ -166,7 +166,7 @@ rand_core = "0.10"
 portable-atomic = "1"
 
 # Complex numbers (quantum module)
-num-complex = { version = "0.4", optional = true }
+num-complex = { version = "0.4", optional = true, features = ["serde"] }
 
 # Tracing (fork modules use tracing for instrumentation)
 tracing = "0.1"
@@ -373,7 +373,7 @@ x0-extended = [
 # (DelegateAgentConfig, TreasuryConfig, providers::Provider,
 # channels::traits, LifeConfig, …). Not part of x0-extended; opt in
 # only if you're actively rewriting these modules against the V3 API.
-x0-broken-legacy = ["x0-extended"]
+x0-broken-legacy = ["x0-extended", "hardware"]
 # Placeholder features for integration tests that target API surfaces not yet
 # present in the V3 schema. Defining them as empty no-ops registers the names
 # so `#![cfg(feature = "…")]` gates compile cleanly under `-D warnings`. When

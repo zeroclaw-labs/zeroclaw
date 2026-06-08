@@ -1,5 +1,5 @@
 use num_complex::Complex64;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::FRAC_1_SQRT_2;
 

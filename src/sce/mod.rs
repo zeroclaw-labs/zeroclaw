@@ -627,6 +627,8 @@ mod tests {
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> Result<Vec<crate::memory::traits::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -643,17 +645,48 @@ mod tests {
         async fn forget(&self, _key: &str) -> Result<bool> {
             Ok(true)
         }
-        async fn clear(
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> Result<bool> {
+            Ok(true)
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn store_with_agent(
             &self,
-            _category: Option<&crate::memory::traits::MemoryCategory>,
-        ) -> Result<usize> {
-            Ok(0)
+            _key: &str,
+            _content: &str,
+            _category: crate::memory::traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> Result<Vec<crate::memory::traits::MemoryEntry>> {
+            Ok(Vec::new())
         }
         async fn count(&self) -> Result<usize> {
             Ok(0)
         }
         async fn health_check(&self) -> bool {
             true
+        }
+    }
+
+    // V3 `Memory` requires the `Attributable` supertrait.
+    impl ::zeroclaw_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Agent
+        }
+        fn alias(&self) -> &str {
+            "mock"
         }
     }
 

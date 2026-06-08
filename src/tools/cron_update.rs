@@ -39,7 +39,7 @@ impl Tool for CronUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -112,27 +112,38 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.risk_profiles.entry("default".to_string()).or_default();
+        config
+            .runtime_profiles
+            .entry("default".to_string())
+            .or_default();
+        let _ = config.providers.models.ensure("openrouter", "default");
+        config.agents.entry("default".to_string()).or_insert(
+            crate::config::schema::AliasedAgentConfig {
+                model_provider: "openrouter.default".to_string().into(),
+                risk_profile: "default".to_string(),
+                runtime_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(config.shared_workspace_dir()).unwrap();
         Arc::new(config)
     }
 
-    fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+    fn test_security(_cfg: &Config) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
     }
 
     #[tokio::test]
     async fn updates_enabled_flag() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let job = cron::add_job(&cfg, "default", "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool
@@ -148,17 +159,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "autonomy.allowed_commands command-gating was removed in the V3 schema; \
+                this test's premise no longer exists (legacy module pending rewrite)"]
     async fn blocks_disallowed_command_updates() {
         let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let config = Config {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(config.shared_workspace_dir()).unwrap();
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let job = cron::add_job(&cfg, "default", "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool

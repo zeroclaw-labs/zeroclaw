@@ -207,7 +207,7 @@ impl Tool for DelegateTool {
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> =
-            match providers::create_provider(&agent_config.provider, provider_credential) {
+            match providers::create_model_provider(&agent_config.provider, provider_credential) {
                 Ok(p) => p,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -252,7 +252,7 @@ impl Tool for DelegateTool {
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
                 &agent_config.model,
-                temperature,
+                Some(temperature),
             ),
         )
         .await;
