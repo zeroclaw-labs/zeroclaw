@@ -58,24 +58,9 @@ When both the provider and the channel support streaming, the flow is: provider 
 
 Reasoning models (OpenAI o-series, DeepSeek-R1, Qwen-thinking variants) emit `ReasoningDelta` events separate from regular text. By default the runtime strips these from outbound streams, see `<think>…</think>` handling in `crates/zeroclaw-channels/src/orchestrator/mod.rs`. Users see the final answer, not the chain-of-thought.
 
-To surface reasoning to the user:
+To surface reasoning to the user, enable it on the alias entry. This is off by default because reasoning content is (a) often verbose and (b) sometimes reveals internal deliberation that looks confusing to an end user.
 
-```toml
-[channels.<name>]
-show_reasoning = true
-```
-
-This is off by default because reasoning content is (a) often verbose and (b) sometimes reveals internal deliberation that looks confusing to an end user.
-
-Disabling reasoning entirely on a reasoning-capable model:
-
-```toml
-[providers.models.<name>]
-think = false
-reasoning_effort = "none"
-```
-
-Both fields are top-level; the right name depends on the provider/endpoint. Setting both covers Ollama native, Ollama OpenAI-compat, and upstream APIs that honour `reasoning_effort`.
+To disable reasoning entirely on a reasoning-capable model, set the relevant reasoning field to off. Both fields are top-level; the right name depends on the provider/endpoint. Setting both covers Ollama native, Ollama OpenAI-compat, and upstream APIs that honour `reasoning_effort`.
 
 ## Tool calls mid-stream
 

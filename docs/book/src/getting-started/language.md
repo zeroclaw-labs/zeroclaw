@@ -7,15 +7,9 @@ other languages are downloaded on demand.
 ## Set your language
 
 ZeroClaw reads a top-level `locale` key from your config. Set it to a locale
-code such as `ja`, `fr`, or `zh-CN`:
-
-```toml
-# ~/.zeroclaw/config.toml
-locale = "ja"
-```
-
-If `locale` is unset, ZeroClaw uses your operating system's language and falls
-back to English when no translation is available.
+code such as `ja`, `fr`, or `zh-CN`. If `locale` is unset, ZeroClaw uses your
+operating system's language and falls back to English when no translation is
+available.
 
 ## Fetch your language files
 

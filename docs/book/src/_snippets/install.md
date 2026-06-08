@@ -1,5 +1,6 @@
 <div class="os-tabs-src">
 
+<!-- ANCHOR: linux -->
 ### Linux
 
 **One-liner (`install.sh` via curl):**
@@ -19,7 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 ```sh
 brew install zeroclaw
 ```
+<!-- ANCHOR_END: linux -->
 
+<!-- ANCHOR: macos -->
 ### macOS
 
 **One-liner (`install.sh` via curl):**
@@ -39,7 +42,9 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 ```sh
 brew install zeroclaw
 ```
+<!-- ANCHOR_END: macos -->
 
+<!-- ANCHOR: windows -->
 ### Windows
 
 **`setup.bat` (from a release):**
@@ -62,5 +67,6 @@ cargo install --locked --path .
 
 On WSL2, follow the Linux path — `install.sh` runs unchanged. See
 [Setup → Windows](../setup/windows.md) for the full walkthrough.
+<!-- ANCHOR_END: windows -->
 
 </div>

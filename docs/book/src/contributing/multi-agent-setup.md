@@ -13,45 +13,17 @@ Throughout this walkthrough the existing single agent is called `primary` (subst
 
 ## Add a second agent
 
-Add a new `[agents.<alias>]` block to `config.toml`:
+Add another agent through the gateway dashboard, zerocode, or `zeroclaw config set`. The runtime creates `<install>/agents/<alias>/workspace/` on first agent-loop entry and seeds default identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`) when they don't exist. Edit those identity files to give the agent its persona; the agent loop reads them on every start.
 
-```toml
-[agents.researcher]
-model_provider = "anthropic.home"
-risk_profile   = "hardened"
-channels       = []                          # add channel refs in the next step
-
-[agents.researcher.memory]
-backend = "sqlite"
-
-[agents.researcher.workspace]
-# `path` defaults to <install>/agents/researcher/workspace/
-```
-
-The runtime creates `<install>/agents/researcher/workspace/` on first agent-loop entry and seeds default identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`) when they don't exist. Edit those identity files to give the agent its persona; the agent loop reads them on every start.
+{{#config-where agents}}
 
 ## Bind a channel
 
-Without a channel the agent has nowhere to listen. Add one to the `channels` array on the agent's block:
-
-```toml
-[agents.researcher]
-channels = ["telegram.prod"]                 # must reference a configured [channels.telegram.prod]
-```
-
-Save and restart the daemon. The agent picks up its channel on next start.
+Without a channel the agent has nowhere to listen. Bind one via the agent's `channels` list, then restart the daemon. The agent picks up its channel on next start.
 
 ## Cross-agent file access
 
-By default, an agent can only read and write within its own workspace dir. To grant `researcher` write access to `primary`'s workspace and read access to a third `archivist` agent's:
-
-```toml
-[agents.researcher.workspace.access]
-primary   = "write"
-archivist = "read"
-```
-
-Effective behavior:
+By default, an agent can only read and write within its own workspace dir. You can grant one agent read or write access into another agent's workspace (configured via the gateway, zerocode, or `zeroclaw config set`). Effective behavior, e.g. `researcher` granted write to `primary` and read to `archivist`:
 
 - `file_read` from `researcher` can read both `<install>/agents/primary/workspace/` and `<install>/agents/archivist/workspace/`.
 - `file_write` and `file_edit` from `researcher` can write into `<install>/agents/primary/workspace/` but **not** `<install>/agents/archivist/workspace/`.
@@ -60,28 +32,13 @@ POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are
 
 ## Cross-agent memory access
 
-Same-backend only. To let `researcher` recall memories that `primary` wrote, both agents must use the same memory backend (e.g. both `sqlite`):
-
-```toml
-[agents.researcher.workspace]
-read_memory_from = ["primary"]
-```
-
-The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
+Same-backend only. To let `researcher` recall memories that `primary` wrote, both agents must use the same memory backend (e.g. both `sqlite`). The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
 
 The bound agent always sees its own rows; the allowlist is purely additive. There is no way to *hide* an agent's own rows from itself.
 
 ## Peer group on a shared channel
 
-Two agents become "peers" (each can address the other on a channel) only when **both** appear in the same `[peer_groups.<name>]` block:
-
-```toml
-[peer_groups.research]
-channel = "telegram.prod"
-agents = ["primary", "researcher"]
-external_peers = ["operator"]
-ignore = []
-```
+Two agents become "peers" (each can address the other on a channel) only when **both** appear in the same peer group. See [Peer Groups](../channels/peer-groups.md).
 
 `external_peers` lists humans or external bots the group expects on the same channel; the runtime accepts inbound from those usernames as cross-agent traffic. `ignore` is a per-group blocklist that subtracts from the resolved peer set every member sees, useful for excluding a specific bot account that's noisy.
 
@@ -94,6 +51,8 @@ The schema validator at config load enforces:
 ## Inspect the install
 
 Every configured agent lives under an `[agents.<alias>]` block in `config.toml` with its risk profile, model provider, memory backend, and channel set.
+
+{{#config-where agents}}
 
 ## Delete an agent
 

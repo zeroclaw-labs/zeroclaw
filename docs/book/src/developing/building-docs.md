@@ -93,11 +93,6 @@ Include `.po` updates only when one of these is true:
 ## Adding a new locale
 
 1. Edit `locales.toml` at the repo root, the **only** file you need to touch:
-   ```toml
-   [[locale]]
-   code = "xx"
-   label = "Language Name"
-   ```
    Everything else (`lang-switcher.js`, CI, `cargo fluent fill`, `cargo mdbook sync`) reads from this file automatically.
 
 2. Bootstrap and fill the docs translations:

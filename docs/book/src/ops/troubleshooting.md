@@ -190,14 +190,7 @@ zeroclaw agent -a <alias> -m "hello"
 
 </div>
 
-For normal subscription auth the provider entry should look like this (the surrounding agent + risk profile follow the canonical [Minimal working example](../providers/configuration.md#minimal-working-example)):
-
-```toml
-[providers.models.openai.coding]   # type = openai; alias = coding (you choose)
-model = "gpt-5-codex"
-wire_api = "responses"
-requires_openai_auth = true
-```
+For normal subscription auth, set `requires_openai_auth = true` on the provider alias and leave `api_key` unset (surrounded by the canonical agent + risk profile from the [Minimal working example](../providers/configuration.md#minimal-working-example)).
 
 Notes:
 

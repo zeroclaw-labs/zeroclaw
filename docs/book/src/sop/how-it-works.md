@@ -4,7 +4,7 @@
 
 - SOP definitions are loaded from `<workspace>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
-- SOP runs are started by event fan-in (MQTT/webhook/cron/peripheral) or by the in-agent tool `sop_execute`.
+- SOP runs are started by MQTT event fan-in or by the in-agent tool `sop_execute`. The webhook, cron, and peripheral trigger types are defined and matched but not yet wired to a live event source (see [Connectivity](./connectivity.md)).
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
 - SOP audit records are persisted in the configured Memory backend under category `sop`.
 
@@ -12,10 +12,11 @@
 
 ```mermaid
 graph LR
-    MQTT[MQTT] -->|topic match| Dispatch
-    WH[POST /sop/* or /webhook] -->|path match| Dispatch
-    CRON[Scheduler] -->|window check| Dispatch
-    GPIO[Peripheral] -->|board/signal match| Dispatch
+    MQTT[MQTT listener] -->|topic match| Dispatch
+    TOOL[sop_execute tool] -->|manual| Dispatch
+    WH[Webhook trigger] -.->|defined, unwired| Dispatch
+    CRON[Cron trigger] -.->|defined, unwired| Dispatch
+    GPIO[Peripheral trigger] -.->|defined, unwired| Dispatch
 
     Dispatch --> Engine[SOP Engine]
     Engine --> Run[SOP Run]
@@ -28,11 +29,6 @@ graph LR
 ## Getting started
 
 1. Set the SOP directory in `config.toml` (required for runtime SOP loading):
-
-   ```toml
-   [sop]
-   sops_dir = "sops"  # omitting this disables runtime SOP execution
-   ```
 
 2. Create a SOP directory, for example:
 

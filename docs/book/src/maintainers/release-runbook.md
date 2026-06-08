@@ -1,13 +1,14 @@
 # Release Runbook
 
 > **Interim manual process.** This runbook covers how to ship a stable release
-> today using `release-stable-manual.yml`. It exists only until release-plz
-> lands in v0.7.5 and replaces this entirely.
+> today using `release-stable-manual.yml`. It remains the live process until
+> release-plz lands and replaces it; that migration has not happened yet (see
+> [Where this is going](#where-this-is-going)).
 >
 > If anything in here feels heavyweight, that is intentional friction, we do
 > not yet have the automation discipline to remove it safely.
 
-Last verified: **May 2026** (v0.7.4 cycle).
+Last verified against the `0.8.0-beta` cycle.
 
 ---
 
@@ -46,14 +47,7 @@ review it for accuracy before reusing it.
 
 ## Step 2: Bump and merge the version PR
 
-Edit the workspace `Cargo.toml`:
-
-```toml
-[workspace.package]
-version = "X.Y.Z"
-```
-
-Sync all other version references:
+Bump `workspace.package.version` in the workspace `Cargo.toml`, then sync all other version references:
 
 <div class="os-tabs-src">
 

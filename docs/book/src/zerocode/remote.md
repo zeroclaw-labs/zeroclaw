@@ -20,19 +20,7 @@ Connect zerocode on your workstation to a daemon running on another machine
 
    </div>
 
-2. **Enable WSS.** On a host you can already reach with zerocode, set this in
-   the [Config](./config.md) pane's `[wss]` section. On a fresh headless host,
-   write it to `~/.zeroclaw/config.toml` directly to bootstrap the first
-   connection. The persisted result:
-
-   ```toml
-   [wss]
-   enabled = true
-   cert_path = "/home/youruser/.zeroclaw/wss.cert"
-   key_path = "/home/youruser/.zeroclaw/wss.key"
-   ```
-
-   Use absolute paths. The config does not expand `~`.
+2. **Enable WSS.** Set the `wss` config through the [Config](./config.md) pane (or the gateway / `zeroclaw config set`). Use absolute paths — the config does not expand `~`.
 
 3. **Open the firewall port:**
 

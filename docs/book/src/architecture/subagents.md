@@ -77,11 +77,6 @@ You don't call these tools yourself; the bot does, from inside its turn. As a us
 
 What CAN be made deterministic is **availability**: tools that aren't in the parent agent's registry can't be picked. That gate lives in `[risk_profiles.<alias>].allowed_tools`. If the alias listed for the parent agent's `risk_profile` doesn't include `spawn_subagent`, the model never sees it. Same for `delegate`. Restart the daemon after editing the config.
 
-```toml
-[risk_profiles.frontline]
-allowed_tools = ["shell", "file_read", "memory_recall", "spawn_subagent", "delegate"]
-```
-
 What's verifiable end-to-end:
 
 1. The literal output strings the tool returns to the model on each path (success, refusal, failure). Quoted verbatim below, sourced from `tools/spawn_subagent.rs` and `tools/delegate.rs`.

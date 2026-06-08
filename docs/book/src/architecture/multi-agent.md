@@ -48,6 +48,8 @@ The agent-loop entry binds `agent_alias` as a tracing-span field; SubAgent spawn
 
 Agents are added by editing `[agents.<alias>]` blocks in `config.toml`. The runtime creates the per-agent workspace dir under `<install>/agents/<alias>/workspace/` and seeds bootstrap identity files on first agent-loop entry. See the [setup walkthrough](../contributing/multi-agent-setup.md) for full operator guidance.
 
+{{#config-where agents}}
+
 ## Not supported today
 
 1. Cross-backend cross-agent memory access (e.g. SQLite agent reading a Postgres agent's rows).

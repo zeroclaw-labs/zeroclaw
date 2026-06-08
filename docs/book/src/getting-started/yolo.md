@@ -20,54 +20,7 @@
 
 ## Enabling it
 
-Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good intent-naming choice) and point your agent at it:
-
-```toml
-[agents.devbox]
-model_provider = "anthropic.home"
-risk_profile   = "yolo"             # references the YOLO profile below
-runtime_profile = "loose"           # high iteration cap; independent of risk_profile
-
-[risk_profiles.yolo]
-level                            = "full"
-workspace_only                   = false
-require_approval_for_medium_risk = false
-block_high_risk_commands         = false
-allowed_commands                 = []
-forbidden_paths                  = []
-sandbox_enabled                  = false
-sandbox_backend                  = "none"
-
-[runtime_profiles.loose]
-max_tool_iterations  = 100
-max_actions_per_hour = 1000
-
-[security.otp]
-enabled = false
-
-[security.estop]
-enabled = false
-
-[gateway]
-require_pairing = false
-```
-
-If multiple agents share the host, give the YOLO-bound one its own profile (the `yolo` block) and keep your other agents on a stricter profile (e.g. `hardened`): `[risk_profiles.<alias>]` is per-profile, so a YOLO agent and a hardened agent can coexist in the same config.
-
-```toml
-[agents.devbox]
-risk_profile = "yolo"               # this one runs wide-open
-
-[agents.publicbot]
-risk_profile = "hardened"           # this one stays gated
-channels     = ["telegram.home"]
-
-[risk_profiles.hardened]
-level                            = "supervised"
-workspace_only                   = true
-require_approval_for_medium_risk = true
-block_high_risk_commands         = true
-```
+Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good intent-naming choice) and point your agent at it. If multiple agents share the host, give the YOLO-bound one its own profile and keep your other agents on a stricter profile (e.g. `hardened`) — risk profiles are per-profile, so a YOLO agent and a hardened agent can coexist in the same config.
 
 ## What you lose
 

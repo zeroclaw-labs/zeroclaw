@@ -81,10 +81,5 @@ useful when you want specific vars available regardless of whether zerocode is
 connected, for example on a headless server where the daemon itself has the
 vars set.
 
-```toml
-[risk_profiles.default]
-shell_env_passthrough = ["SSH_AUTH_SOCK", "GPG_AGENT_INFO"]
-```
-
 Subagents cannot expand this list beyond what the parent policy allows: adding
 a var not present on the parent's list is rejected as a policy escalation.

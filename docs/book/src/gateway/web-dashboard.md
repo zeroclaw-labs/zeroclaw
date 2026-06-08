@@ -10,12 +10,6 @@ returns a "not available" message.
 
 ## TL;DR
 
-```toml
-# config.toml
-[gateway]
-web_dist_dir = "/absolute/path/to/zeroclaw/web/dist"   # NOTE: no ~, no $HOME
-```
-
 <div class="os-tabs-src">
 
 #### sh
@@ -161,20 +155,7 @@ e.g. `gateway.request_timeout_secs` becomes
 
 ### Don't use `~` or `$HOME`
 
-A literal tilde is **not** expanded by the gateway:
-
-```toml
-# Broken — the gateway looks for a directory literally named "~"
-web_dist_dir = "~/zeroclaw/web/dist"
-```
-
-```toml
-# Correct
-web_dist_dir = "/home/alice/zeroclaw/web/dist"
-```
-
-Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded. Pre-expand
-them in the env var if you set the value that way:
+A literal tilde is **not** expanded by the gateway — use an absolute path for `gateway.web_dist_dir`. Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded; pre-expand them in the env var if you set the value that way:
 
 <div class="os-tabs-src">
 

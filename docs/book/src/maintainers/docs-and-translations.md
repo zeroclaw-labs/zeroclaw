@@ -13,16 +13,7 @@ Local models via [Ollama](https://ollama.com) are a first-class option: no API k
 
 ## Provider configuration
 
-Ollama is the current canonical source for docs. Ensure you have [Ollama](https://ollama.com/) installed and have `qwen3.6:35-a3b` pulled. Then, in `~/.zeroclaw/config.toml` (or your established config home):
-
-```toml
-# Local via Ollama — free, runs on your machine
-[providers.models.ollama.local]
-uri   = "http://localhost:11434/v1/chat/completions"
-model = "qwen3.6:35b-a3b" # Current preferred model
-```
-
-`uri` is the full endpoint URL and is **optional**: leave it unset to use the provider family's default endpoint (resolved by the runtime provider stack). Set it only to point at a self-hosted gateway or proxy. Any configured family works (Anthropic, OpenAI, OpenRouter, Ollama, …); the translation tools build the real runtime provider, so each family's endpoint, auth header, and wire protocol are handled for you: no OpenAI-compatibility requirement.
+Ollama is the current canonical source for docs. Ensure you have [Ollama](https://ollama.com/) installed and have `qwen3.6:35-a3b` pulled, then configure an Ollama provider entry. `uri` is the full endpoint URL and is **optional**: leave it unset to use the provider family's default endpoint (resolved by the runtime provider stack). Set it only to point at a self-hosted gateway or proxy. Any configured family works (Anthropic, OpenAI, OpenRouter, Ollama, …); the translation tools build the real runtime provider, so each family's endpoint, auth header, and wire protocol are handled for you: no OpenAI-compatibility requirement.
 
 ## Building the docs locally
 
@@ -142,12 +133,6 @@ Maintainers should accept the routine English docs exception documented in [Buil
 ## Adding a new locale
 
 1. Edit `locales.toml` at the repo root, the **only** file you need to touch:
-
-   ```toml
-   [[locale]]
-   code = "<code>"
-   label = "Language Name"
-   ```
 
 2. Translate the app strings:
 

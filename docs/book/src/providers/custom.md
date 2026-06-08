@@ -8,24 +8,9 @@ Three ways to add a provider ZeroClaw doesn't ship with:
 
 ## OpenAI-compatible endpoint: use the `custom` slot
 
-If the service speaks OpenAI chat-completions, this is a config-only change:
+If the service speaks OpenAI chat-completions, this is a config-only change. The `custom` slot requires `uri` (the family's endpoint enum has no default); reference it from an agent's `model_provider`.
 
-```toml
-[providers.models.custom.gateway]
-uri     = "https://my-gateway.example.com/v1"
-model   = "my-model-id"
-api_key = "..."                          # omit if the endpoint needs no auth
-```
-
-The `custom` slot requires `uri` (the family's endpoint enum has no default). Reference it from an agent:
-
-```toml
-[agents.assistant]
-model_provider = "custom.gateway"
-risk_profile   = "hardened"
-```
-
-This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use, `custom` is the catch-all for endpoints not represented by a vendor slot.
+This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use — `custom` is the catch-all for endpoints not represented by a vendor slot.
 
 ## First-class local-inference servers
 
@@ -43,13 +28,6 @@ llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --
 
 </div>
 
-```toml
-[providers.models.llamacpp.local]
-uri   = "http://127.0.0.1:8033/v1"       # omit to use the family default http://localhost:8080/v1
-model = "ggml-org/gpt-oss-20b-GGUF"
-# api_key only required if llama-server was started with --api-key
-```
-
 **Optional fields** (apply to any compat-slot family, including `llamacpp`):
 
 | Field | Type | Default | Description |
@@ -60,15 +38,6 @@ model = "ggml-org/gpt-oss-20b-GGUF"
 | `timeout_secs` | `u64` | 120 | Request timeout for non-streaming calls. |
 
 **Controlling thinking mode** varies by model family. `think = false` sets the top-level `enable_thinking` field in the request. Some models (e.g. Qwen3) read this flag from the Jinja template via `chat_template_kwargs` instead:
-
-```toml
-[providers.models.llamacpp.qwen3]
-uri = "http://127.0.0.1:8033/v1"
-model = "Qwen/Qwen3-30B-A3B-GGUF"
-think = false
-# Qwen3 reads enable_thinking from the Jinja template, not the top-level field:
-chat_template_kwargs = { enable_thinking = false }
-```
 
 Other model families use different template variable names, check your model's chat template and set the appropriate key under `chat_template_kwargs`.
 
@@ -84,12 +53,6 @@ python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 3
 
 </div>
 
-```toml
-[providers.models.sglang.local]
-uri   = "http://localhost:30000/v1"      # family default
-model = "meta-llama/Llama-3.1-8B-Instruct"
-```
-
 ### vLLM: slot `vllm`
 
 <div class="os-tabs-src">
@@ -102,26 +65,13 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 </div>
 
-```toml
-[providers.models.vllm.local]
-uri   = "http://localhost:8000/v1"       # family default
-model = "meta-llama/Llama-3.1-8B-Instruct"
-```
-
 ### LM Studio, Osaurus, LiteLLM
 
 Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog](./catalog.md).
 
 ## Wire protocol: `wire_api = "responses"`
 
-Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit opt-in:
-
-```toml
-[providers.models.custom.vllm]
-uri      = "http://10.0.0.15:8000/v1"
-model    = "Qwen/Qwen3-30B-A3B"
-wire_api = "responses"                  # default is "chat_completions"
-```
+Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
 
 When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set `"chat_completions"`, for the default wire.
 

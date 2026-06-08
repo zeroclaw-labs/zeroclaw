@@ -260,19 +260,7 @@ These are orthogonal. Conflating them creates misleading semver noise and erodes
 
 ##### Crate versioning: unified with intentional exceptions
 
-All application crates, the kernel, the gateway, tool plugin crates, channel plugin crates, and the CLI, use Cargo workspace package inheritance:
-
-```toml
-# Cargo.toml (workspace root)
-[workspace.package]
-version = "0.8.0"
-
-# crates/zeroclaw-kernel/Cargo.toml
-[package]
-version.workspace = true
-```
-
-A single version in the root `Cargo.toml` is the authoritative product version. This is the right model because:
+All application crates, the kernel, the gateway, tool plugin crates, channel plugin crates, and the CLI use Cargo workspace package inheritance: a single version in the root `Cargo.toml` is the authoritative product version. This is the right model because:
 
 - Users, operators, and packagers deal with one version, not twelve
 - Release automation via `release-plz` is straightforward: one PR, one bump, one changelog entry

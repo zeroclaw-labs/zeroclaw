@@ -2,29 +2,15 @@
 
 Every model provider lives at `[providers.models.<type>.<alias>]` in `~/.zeroclaw/config.toml`. `<type>` is the canonical family slot (`anthropic`, `openai`, `azure`, `gemini`, `groq`, `moonshot`, ...). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
 
+{{#config-where providers}}
+
 ## Minimal working example
 
-The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against:
-
-```toml
-{{#include ../_snippets/minimal-config.toml}}
-```
-
-The aliases (`home`, `assistant`) above are example names, substitute whatever suits your install.
+The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
 
 ## Field reference: provider entry
 
-```toml
-[providers.models.<type>.<alias>]
-model = "<model-id>"        # passed to the provider as the model selector
-```
-
 Almost every family also takes:
-
-```toml
-api_key = "..."             # or use the secrets store, or a provider-specific env var
-uri     = "https://..."     # optional operator override; otherwise the family's typed endpoint enum supplies the URL
-```
 
 ## Field resolution order
 
@@ -75,15 +61,7 @@ Several providers accept OAuth or subscription-style tokens instead of raw API k
 
 ## Container-friendly overrides
 
-When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama), set `uri` to a host-reachable address:
-
-```toml
-[providers.models.ollama.local]
-uri   = "http://host.docker.internal:11434"
-model = "qwen3.6:35b-a3b"
-```
-
-The generic env-override mechanism (`ZEROCLAW_<dotted_path_with_double_underscores>=<value>`) can set the same field at runtime without editing `config.toml`:
+When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama), set `uri` to a host-reachable address. The generic env-override mechanism (`ZEROCLAW_<dotted_path_with_double_underscores>=<value>`) can set the same field at runtime without editing config:
 
 <div class="os-tabs-src">
 
@@ -101,64 +79,21 @@ The `__` is the path separator; the example above sets `providers.models.ollama.
 
 ### Ollama
 
-```toml
-[providers.models.ollama.local]
-uri              = "http://localhost:11434"
-model            = "qwen3.6:35b-a3b"
-think            = false                    # disable reasoning mode for faster output
-reasoning_effort = "none"                   # same intent, passed as a top-level field
-options          = { temperature = 0, num_ctx = 32768 }
-```
-
 ### Azure OpenAI
-
-```toml
-[providers.models.azure.work]
-resource    = "my-resource"                 # template var: https://{resource}.openai.azure.com/...
-deployment  = "gpt-4o"
-api_version = "2024-10-01-preview"
-api_key     = "..."
-```
 
 The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from environment variables.
 
 ### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
 
-Pick the region with the typed `endpoint` field on the alias entry:
-
-```toml
-[providers.models.moonshot.cn]
-api_key  = "..."
-endpoint = "cn"                             # MoonshotEndpoint::Cn -> https://api.moonshot.cn/v1
-
-[providers.models.moonshot.intl]
-api_key  = "..."
-endpoint = "intl"                           # MoonshotEndpoint::Intl -> https://api.moonshot.ai/v1
-```
-
-One type per family; region picks via the `endpoint` field on the alias entry.
+One type per family; pick the region via the typed `endpoint` field on the alias entry.
 
 ### Custom OpenAI-compatible endpoint
-
-```toml
-[providers.models.custom.gateway]
-uri     = "https://my-gateway.example.com/v1"
-model   = "my-model-id"
-api_key = "..."
-```
 
 The `custom` slot requires `uri`. See [Custom providers](./custom.md).
 
 ## Picking which provider an agent uses
 
 Agents reference a provider by dotted alias. Provider entries on their own do nothing.
-
-```toml
-[agents.assistant]
-model_provider  = "anthropic.home"   # `<type>.<alias>` into providers.models
-risk_profile    = "hardened"         # alias into risk_profiles.<alias>
-runtime_profile = "deep"             # alias into runtime_profiles.<alias>; independent of risk_profile
-```
 
 `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
@@ -169,16 +104,6 @@ For multiple agents pointing at different providers, see [Routing](./routing.md)
 When a request to a provider fails after exhausting its retries (provider down,
 key rate-limited, model unavailable), the alias can fall over to alternatives
 you declare on the alias entry. Two independent, ordered axes:
-
-```toml
-[providers.models.anthropic.prod]
-model           = "claude-sonnet-4-5"
-fallback_models = ["claude-haiku-4-5"]   # same provider, alternate models
-fallback        = ["openai.backup"]      # other aliases, each with its own key/endpoint
-
-[providers.models.openai.backup]
-model = "gpt-4.1"
-```
 
 - **`fallback_models`**: alternate model IDs tried on *this* provider, using the
   same endpoint, key, and headers. Only the model identifier changes. Use it when

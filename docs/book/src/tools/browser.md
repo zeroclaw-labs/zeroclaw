@@ -49,11 +49,13 @@ The browser tool is enabled by default with `allowed_domains = ["*"]`. Restrict 
 #### sh
 
 ```sh
-zeroclaw config set browser.allowed-domains '["example.com", "docs.example.com"]'
+zeroclaw config set browser.allowed_domains '["example.com", "docs.example.com"]'
 zeroclaw config set browser.enabled false
 ```
 
 </div>
+
+{{#config-where browser}}
 
 For the `agent_browser` backend, set `browser.headed = true` to launch the browser in headed mode for debugging or first-time login setup, or `browser.headed = false` to force headless mode. When `browser.headed` is unset, Zeroclaw preserves the inherited `AGENT_BROWSER_HEADED` environment behavior. The rust-native backend continues to use `browser.native_headless`.
 

@@ -11,14 +11,8 @@ which daemon zerocode connects to.
 
 Open the **Config** pane, switch to the **zerocode** section, and select the
 **Theme** tab. Navigate with `↑`/`k` and `↓`/`j`; press `Enter` to apply. The
-choice takes effect immediately and is written to `zerocode-config.toml`:
-
-```toml
-[theme]
-name = "tokyo_night"
-```
-
-The highlighted row previews the theme's palette inline, a strip of colour
+choice takes effect immediately and is written to `zerocode-config.toml`. The
+highlighted row previews the theme's palette inline, a strip of colour
 blocks for its canvas, title, heading, body, warn, and tool roles, so you can
 see the colours before applying.
 
@@ -54,17 +48,6 @@ the pane is shown; other panes keep the base theme. This makes it easy to tell
 at a glance which agent you are working with.
 
 Configure overrides under `[theme.agent_override.<alias>]`:
-
-```toml
-[theme]
-name = "nord_dark"
-
-[theme.agent_override.coder]
-name = "dracula"
-
-[theme.agent_override.researcher]
-name = "everforest_dark"
-```
 
 ### Setting overrides from the UI
 

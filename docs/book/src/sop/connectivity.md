@@ -5,22 +5,25 @@ This document describes how external events trigger SOP runs.
 ## Quick Paths
 
 - [MQTT Integration](#2-mqtt-integration)
-- [Webhook Integration](#3-webhook-integration)
-- [Cron Integration](#4-cron-integration)
-- [Security Defaults](#5-security-defaults)
-- [Troubleshooting](#6-troubleshooting)
+- [Other Trigger Types](#3-other-trigger-types)
+- [Security Defaults](#4-security-defaults)
+- [Troubleshooting](#5-troubleshooting)
 
 ## 1. Overview
 
-ZeroClaw routes MQTT/webhook/cron/peripheral events through a unified SOP dispatcher (`dispatch_sop_event`).
+SOP runs are driven by events delivered to the SOP engine through `dispatch_sop_event`. The engine matches each event against every loaded SOP's triggers and starts runs for those that match.
 
 Key behaviors:
 
-- **Consistent trigger matching:** one matcher path for all event sources.
+- **Consistent trigger matching:** one matcher path evaluates all trigger types.
 - **Run-start audit:** started runs are persisted via `SopAuditLogger`.
-- **Headless safety:** in non-agent-loop contexts, `ExecuteStep` actions are logged as pending (not silently executed).
+- **Headless safety:** in non-agent-loop contexts, `process_headless_results` logs `ExecuteStep` actions as pending instead of silently executing them.
+
+Of the defined trigger types, **MQTT** is the only event source wired to a live listener in the daemon. Runs can also be started directly from an agent turn with the `sop_execute` tool. The webhook, cron, and peripheral trigger types are defined and matched by the engine, but no runtime currently feeds those event sources into `dispatch_sop_event` — see [Other Trigger Types](#3-other-trigger-types).
 
 ## 2. MQTT Integration
+
+MQTT is delivered by `run_mqtt_sop_listener`, which subscribes to the broker, builds an MQTT `SopEvent` per message, and calls `dispatch_sop_event`. This path is gated by the `channel-mqtt` build feature.
 
 ### 2.1 Configuration
 
@@ -28,111 +31,33 @@ Configure broker access with `zeroclaw config set channels.mqtt.<field> <value>`
 
 ### 2.2 Trigger Definition
 
-In `SOP.toml`:
+The SOP's trigger is defined in its `SOP.toml` (see [Syntax](./syntax.md)). Topic patterns support `+` (single-level) and `#` (multi-level) wildcards. The MQTT payload is forwarded into the SOP event payload (`event.payload`) and is available to an optional trigger `condition`, then shown in step context.
 
-```toml
-[[triggers]]
-type = "mqtt"
-topic = "sensors/alert"
-condition = "$.severity >= 2"
-```
+## 3. Other Trigger Types
 
-MQTT payload is forwarded into SOP event payload (`event.payload`), then shown in step context.
+The engine defines and matches three further trigger types, but no live event source currently routes events into the dispatcher for them. The trigger syntax is accepted in `SOP.toml` and validated (see [Syntax](./syntax.md)); the matching logic is exercised by tests, but the runtime fan-in is not yet wired.
 
-## 3. Webhook Integration
+| Trigger type | Matcher | Wiring status |
+|---|---|---|
+| `webhook` | Exact match against the trigger `path` | No HTTP route delivers webhook `SopEvent`s; the gateway has no SOP endpoint. |
+| `cron` | `check_sop_cron_triggers` performs a window-based check over cached cron triggers | Defined, but no scheduler caller invokes it outside tests. |
+| `peripheral` | Exact match against `"{board}/{signal}"` | `dispatch_peripheral_signal` exists, but no peripheral listener calls it outside tests. |
 
-### 3.1 Endpoints
+Defining one of these triggers in a `SOP.toml` is valid and will not error, but the SOP will only ever start via MQTT or `sop_execute` until the corresponding event source is wired.
 
-- **`POST /sop/{*rest}`**: SOP-only endpoint. Returns `404` if no SOP matches.
-- **`POST /webhook`**: chat endpoint. SOP dispatch runs first; on no match, the request enters the normal LLM flow.
-
-Path matching is exact against configured webhook trigger path.
-
-Example:
-
-- Trigger path in SOP: `path = "/sop/deploy"`
-- Matching request: `POST /sop/deploy`
-
-### 3.2 Authorization
-
-When pairing is enabled (default), provide:
-
-1. `Authorization: Bearer <token>` (from `POST /pair`)
-2. Optional second layer: `X-Webhook-Secret: <secret>` when webhook secret is configured
-
-### 3.3 Idempotency
-
-Use:
-
-`X-Idempotency-Key: <unique-key>`
-
-Defaults:
-
-- TTL: 300s
-- Duplicate response: `200 OK` with `"status": "duplicate"`
-
-Idempotency keys are namespaced per endpoint (`/webhook` vs `/sop/*`).
-
-### 3.4 Example Request
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-curl -X POST http://127.0.0.1:42617/sop/deploy \
-  -H "Authorization: Bearer <token>" \
-  -H "X-Idempotency-Key: $(uuidgen)" \
-  -H "Content-Type: application/json" \
-  -d '{"message":"deploy-service-a"}'
-```
-
-</div>
-
-Typical response:
-
-```json
-{
-  "status": "accepted",
-  "matched_sops": ["deploy-pipeline"],
-  "source": "sop_webhook",
-  "path": "/sop/deploy"
-}
-```
-
-## 4. Cron Integration
-
-The scheduler evaluates cached cron triggers using a window-based check.
-
-- **Window-based:** events within `(last_check, now]` are not missed.
-- **At-most-once per expression per tick:** if multiple fire points are in one poll window, dispatch happens once.
-
-Trigger example:
-
-```toml
-[[triggers]]
-type = "cron"
-expression = "0 0 8 * * *"
-```
-
-Cron expressions support 5, 6, or 7 fields.
-
-## 5. Security Defaults
+## 4. Security Defaults
 
 | Feature | Mechanism |
 |---|---|
 | **MQTT transport** | `mqtts://` + `use_tls = true` for TLS transport |
-| **Webhook auth** | Pairing bearer token (default required), optional shared secret header |
-| **Rate limiting** | Per-client limits on webhook routes (`webhook_rate_limit_per_minute`, default `60`) |
-| **Idempotency** | Header-based dedup (`X-Idempotency-Key`, default TTL `300s`) |
 | **Cron validation** | Invalid cron expressions fail closed during parsing/cache build |
+| **Headless dispatch** | Headless callers log run progression instead of auto-executing `ExecuteStep` |
 
-## 6. Troubleshooting
+## 5. Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 |---|---|---|
 | **MQTT** connection errors | broker URL/TLS mismatch | Verify scheme + TLS flag pairing (`mqtt://`/`false`, `mqtts://`/`true`) |
-| **Webhook** `401 Unauthorized` | missing bearer or invalid secret | re-pair token (`POST /pair`) and verify `X-Webhook-Secret` if configured |
-| **`/sop/*` returns 404** | trigger path mismatch | ensure `SOP.toml` uses exact path (for example `/sop/deploy`) |
-| **SOP started but step not executed** | headless trigger without active agent loop | run an agent loop for `ExecuteStep`, or design run to pause on approvals |
-| **Cron not firing** | daemon not running or invalid expression | run `zeroclaw daemon`; check logs for cron parse warnings |
+| **MQTT** SOP not starting | topic pattern mismatch or failing `condition` | Verify the trigger topic/wildcards match the published topic; check the `condition` against the payload |
+| **SOP started but step not executed** | headless trigger without active agent loop | run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
+| **Webhook/cron/peripheral trigger never fires** | event source not wired into the dispatcher | use an MQTT trigger or start the run with `sop_execute` |

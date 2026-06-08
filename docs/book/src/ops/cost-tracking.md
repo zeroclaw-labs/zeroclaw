@@ -12,40 +12,9 @@ surfaces. The code lives in `crates/zeroclaw-config/src/cost/` and
 
 ## Config schema
 
-Two related sections own the surface:
-
-```toml
-[cost]
-enabled            = true
-daily_limit_usd    = 10.0
-monthly_limit_usd  = 100.0
-warn_at_percent    = 80
-allow_override     = false
-track_per_agent    = true
-
-[cost.enforcement]
-mode               = "warn"   # "warn" | "block" | "route_down"
-route_down_model   = "claude-haiku-4-5"  # used with route_down
-reserve_percent    = 10
-
-[cost.rates.providers.models.anthropic."claude-opus-4-7"]
-input_per_mtok        = 15.0
-output_per_mtok       = 75.0
-cached_input_per_mtok = 1.5
-
-[cost.rates.providers.tts.openai."tts-1-hd"]
-per_mchar = 30.0
-
-[cost.rates.providers.transcription.openai.whisper-1]
-per_minute = 0.006
-
-[cost.rates.tools.web_search]
-per_call = 0.005
-```
-
-`[cost]` covers budget enforcement and recording behavior. `[cost.rates.*]`
+Two related sections own the surface. `cost` covers budget enforcement and recording behavior. `cost.rates.*`
 is the operator-managed rate sheet; every subsection's dotted path mirrors
-the matching `[providers.*]` path with the trailing `<alias>` segment
+the matching `providers.*` path with the trailing `<alias>` segment
 replaced by the upstream resource being priced.
 
 ### Why the key is a resource id, not an alias

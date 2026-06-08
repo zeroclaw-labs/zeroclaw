@@ -23,23 +23,11 @@ By default the gateway binds to `127.0.0.1`, unreachable from other devices. Thr
 
 ### Option 1: Public bind (LAN)
 
-```toml
-[gateway]
-host = "0.0.0.0"
-port = 42617
-allow_public_bind = true     # required safety flag
-```
-
 Then any device on the LAN can reach `http://<pi-ip>:42617`. Doesn't help for internet-reachable webhooks, your router's public IP isn't forwarded to the Pi.
 
 **Safety:** `allow_public_bind = true` is required because binding to `0.0.0.0` is a significant posture change. Without it, the daemon refuses. This is deliberate.
 
 ### Option 2: Tunnel (internet-reachable)
-
-```toml
-[tunnel]
-provider = "tailscale"       # or "cloudflare", "ngrok"
-```
 
 Then restart the daemon, the tunnel is managed declaratively from config, starting alongside the gateway.
 

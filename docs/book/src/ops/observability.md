@@ -10,38 +10,6 @@ the shape of the events, and how to query them.
 
 ## Config (`[observability]`)
 
-```toml
-[observability]
-# Storage policy for the JSONL log.
-# "none"    — in-process broadcast only (no disk writes).
-# "rolling" — append + trim once `log_persistence_max_entries` is exceeded.
-# "full"    — append forever, operator manages rotation.
-log_persistence = "rolling"
-
-# Workspace-relative path (or absolute).
-log_persistence_path = "state/runtime-trace.jsonl"
-
-# Cap for "rolling".
-log_persistence_max_entries = 200
-
-# Tool input/output capture policy.
-# "off"      — only tool name + outcome + duration; no I/O bodies.
-# "redacted" — bodies are leak-scanned and truncated at `log_tool_io_truncate_bytes`.
-# "full"     — bodies are leak-scanned; no truncation.
-log_tool_io = "redacted"
-log_tool_io_truncate_bytes = 8192
-
-# Tool names whose I/O is never persisted beyond name + outcome + duration,
-# regardless of `log_tool_io`. For tools whose I/O is intrinsically sensitive.
-log_tool_io_denylist = []
-
-# OTel / Prometheus backend (independent of the JSONL log).
-backend = "none"            # "none" | "log" | "verbose" | "prometheus" | "otel"
-otel_endpoint = "http://localhost:4318"
-otel_service_name = "zeroclaw"
-# otel_headers = { Authorization = "Bearer …" }
-```
-
 Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
 `log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 8192`. A fresh
 install produces a 200-event rolling JSONL at

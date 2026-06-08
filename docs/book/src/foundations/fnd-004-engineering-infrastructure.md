@@ -213,24 +213,7 @@ A security gate that blocks on any advisory, without context, trains the team to
 - **Sources**: ensures dependencies come only from approved registries (crates.io, path, git with specific hosts)
 - **Duplicates**: warns when multiple versions of the same crate appear in the dependency tree
 
-The key capability is the `[advisories]` section of `deny.toml`, which allows explicit ignores:
-
-```toml
-[advisories]
-db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
-notice = "warn"
-
-ignore = [
-    # RUSTSEC-2024-0388: `derivative` unmaintained — pulled in transitively
-    # through matrix-sdk; no direct usage, no active exploit. Tracked in #XXXX.
-    { id = "RUSTSEC-2024-0388", reason = "Transitive dep via matrix-sdk; no direct usage" },
-]
-```
-
-This approach transforms security scanning from a binary pass/fail into a documented, auditable policy. Every ignored advisory has a written justification and a tracking issue. Reviewers can see exactly which advisories are being suppressed and why. When a suppressed advisory escalates (a new exploit is found, a fix is available), the tracking issue is the reminder.
+The key capability is the `[advisories]` section of `deny.toml`, which allows explicit, justified ignores. This approach transforms security scanning from a binary pass/fail into a documented, auditable policy. Every ignored advisory has a written justification and a tracking issue. Reviewers can see exactly which advisories are being suppressed and why. When a suppressed advisory escalates (a new exploit is found, a fix is available), the tracking issue is the reminder.
 
 ### 4.3 Advisory Triage Process
 

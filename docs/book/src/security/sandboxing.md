@@ -4,13 +4,6 @@ The runtime can wrap tool invocations in an OS-level sandbox that restricts file
 
 Sandbox settings live on a risk profile. Each agent points at a risk profile via `agents.<alias>.risk_profile`; the agent's sandbox enable/backend are read from that profile.
 
-```toml
-[risk_profiles.assistant]
-sandbox_enabled = true
-sandbox_backend = "auto"     # "auto" | "landlock" | "firejail" | "bubblewrap" | "docker" | "sandbox-exec" | "none"
-firejail_args   = []          # extra args when sandbox_backend = "firejail"
-```
-
 `sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
@@ -53,19 +46,6 @@ The sandbox passes through only the env vars listed in `[risk_profiles.<alias>].
 ### Process limits
 
 Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].timeout_secs`, etc.). Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's runtime kind is set to `docker`:
-
-```toml
-[runtime]
-kind = "docker"
-
-[runtime.docker]
-image            = "alpine:3.20"
-network          = "none"
-memory_limit_mb  = 512
-cpu_limit        = 1.0
-read_only_rootfs = true
-mount_workspace  = true
-```
 
 ## Per-backend notes
 
@@ -133,14 +113,6 @@ docker build -t zeroclaw-sandbox:local dev/sandbox/   # build the bundled toolki
 ```
 
 </div>
-
-```toml
-[runtime]
-kind = "docker"
-
-[runtime.docker]
-image = "zeroclaw-sandbox:local"
-```
 
 Pros: strong isolation, works on any OS. Cons: per-invocation container startup cost (100–500 ms). Best for production deployments where the overhead is acceptable.
 

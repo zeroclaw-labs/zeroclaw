@@ -56,18 +56,6 @@ skills and between bundles.
 
 ## Manifest format
 
-```toml
-name = "my-plugin"                    # Unique identifier (required)
-version = "0.1.0"                     # Semver version (required)
-description = "What this plugin does" # Human-readable (optional)
-author = "Your Name"                  # Author (optional)
-wasm_path = "plugin.wasm"             # Path to .wasm relative to manifest (required for non-skill capabilities; optional/ignored for skill-only)
-capabilities = ["tool"]               # What the plugin provides (required)
-permissions = ["http_client"]          # What the plugin needs (optional)
-signature = "base64url..."            # Ed25519 signature (optional)
-publisher_key = "hex..."              # Publisher public key (optional)
-```
-
 ### Capabilities
 
 | Value | Description |
@@ -194,22 +182,6 @@ variable is not set.
 ## Writing a plugin in Rust
 
 ### Dependencies
-
-```toml
-[package]
-name = "my-plugin"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-extism-pdk = "1.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-[workspace]
-```
 
 The `[workspace]` table is needed to prevent Cargo from searching for a parent
 workspace.

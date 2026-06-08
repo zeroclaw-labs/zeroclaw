@@ -93,13 +93,6 @@ Because the model sees receipts in its context, it may echo them when describing
 
 ## Configuration
 
-```toml
-[agent.tool_receipts]
-enabled = true
-show_in_response = false    # append trailing "Tool receipts:" block
-inject_system_prompt = true # instruct the model to echo receipts verbatim
-```
-
 ## Security properties
 
 - **Ephemeral key per daemon process.** Generated at `start_channels` time, held only in memory, rotated on every restart. Never persisted, never logged, never in the model's context. Compromising long-term storage gains nothing.
