@@ -1456,6 +1456,7 @@ export function patchCronJob(
     clear_tz?: boolean;
     command?: string;
     prompt?: string;
+    enabled?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(

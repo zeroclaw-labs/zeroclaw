@@ -106,7 +106,10 @@ pub struct CronAddBody {
 #[derive(Deserialize)]
 pub struct CronPatchBody {
     /// Configured agent alias whose risk profile gates the new shell
-    /// command (when `command` is being patched). Required.
+    /// command. Only consulted when `command` is being patched; optional
+    /// otherwise (e.g. a pure schedule/name change or an enable/disable
+    /// toggle), so non-command patches need not supply it.
+    #[serde(default)]
     pub agent: String,
     pub name: Option<String>,
     pub schedule: Option<String>,
@@ -114,6 +117,9 @@ pub struct CronPatchBody {
     pub clear_tz: Option<bool>,
     pub command: Option<String>,
     pub prompt: Option<String>,
+    /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
+    /// the current state unchanged.
+    pub enabled: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -603,7 +609,10 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.read().clone();
-    if config.agent(&body.agent).is_none() {
+    // The agent only gates a shell `command` change (risk profile). Skip the
+    // existence check for patches that don't touch the command — schedule, name,
+    // and enable/disable toggles don't need an agent supplied.
+    if body.command.is_some() && config.agent(&body.agent).is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!(
@@ -613,7 +622,11 @@ pub async fn handle_api_cron_patch(
         )
             .into_response();
     }
-    let agent_alias = body.agent.clone();
+    let agent_alias = if body.command.is_some() {
+        Some(body.agent.clone())
+    } else {
+        None
+    };
     let CronPatchBody {
         agent: _,
         name,
@@ -622,6 +635,7 @@ pub async fn handle_api_cron_patch(
         clear_tz,
         command,
         prompt,
+        enabled,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -684,12 +698,13 @@ pub async fn handle_api_cron_patch(
         schedule,
         command: patch_command,
         prompt: patch_prompt,
+        enabled,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
     match zeroclaw_runtime::cron::update_shell_job_with_approval(
         &config,
-        &agent_alias,
+        agent_alias.as_deref().unwrap_or(""),
         &id,
         patch,
         false,
