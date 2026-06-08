@@ -2663,14 +2663,24 @@ impl RpcDispatcher {
 
     fn handle_personality_templates(&self, params: &Value) -> RpcResult {
         let req: PersonalityTemplatesParams = parse_params(params)?;
-        let agent_alias = req.agent.as_deref().unwrap_or("default");
+        let agent_requested = req.agent.is_some();
+        let requested_agent = req
+            .agent
+            .as_deref()
+            .filter(|agent| !agent.trim().is_empty());
+        let agent_alias = requested_agent.unwrap_or("default");
         let config = self.ctx.config.read().clone();
+        let configured_agent = config.agent(agent_alias);
         let ctx = crate::agent::personality_templates::TemplateContext {
-            agent: config
-                .agent(agent_alias)
-                .map(|_| agent_alias.to_string())
+            agent: configured_agent
+                .map(|_| agent_alias.trim().to_string())
                 .unwrap_or_else(|| "ZeroClaw".to_string()),
-            include_memory: config.agent(agent_alias).is_some(),
+            // Existing config editors pass an agent alias, but Quickstart
+            // also asks for templates before the new agent exists. Treat an
+            // explicit agent request as a full per-agent template render so
+            // MEMORY.md is available during first-run setup; keep the no-agent
+            // fallback memoryless for generic/default callers.
+            include_memory: configured_agent.is_some() || agent_requested,
             ..Default::default()
         };
         let templates = crate::agent::personality_templates::render_preset_default(&ctx);
