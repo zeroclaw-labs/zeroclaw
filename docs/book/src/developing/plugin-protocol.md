@@ -146,7 +146,7 @@ On failure:
 ## Host functions
 
 Host functions are provided by the ZeroClaw runtime and callable from within
-the WASM plugin. Each is gated on a manifest permission — calling without the
+the WASM plugin. Each is gated on a manifest permission, calling without the
 required permission returns an error.
 
 ### `zc_http_request`
@@ -286,6 +286,6 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 ## Configuration
 
-Enable the plugin system via the `[plugins]` and `[plugins.security]` sections of `config.toml` — see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
+Enable the plugin system via the `[plugins]` and `[plugins.security]` sections of `config.toml`: see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
 
 The `plugins-wasm` feature flag must be enabled at compile time (included in the default `ci-all` feature set).

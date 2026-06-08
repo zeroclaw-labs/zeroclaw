@@ -35,7 +35,7 @@ max_call_duration_secs = 3600                  # default 3600 (1 hour cap)
 # webhook_base_url = ""                        # optional public base URL when behind a tunnel/proxy; omit to use the localhost fallback
 ```
 
-Traditional carrier voice — the agent picks up, transcribes the caller, replies with TTS. Higher latency than ClawdTalk but works with any regular phone number and doesn't require SIP trunk provisioning. Outbound calls hit `from_number` and require operator approval when `require_outbound_approval` is on.
+Traditional carrier voice: the agent picks up, transcribes the caller, replies with TTS. Higher latency than ClawdTalk but works with any regular phone number and doesn't require SIP trunk provisioning. Outbound calls hit `from_number` and require operator approval when `require_outbound_approval` is on.
 
 ## Voice Wake (local wake-word)
 
@@ -53,13 +53,13 @@ Runs locally, listens on the mic, triggers agent interaction when it hears the w
 - Desktop "hotword → ask" workflows
 - Always-listening home-automation agents
 
-The agent doesn't send audio anywhere — wake detection is local. Only post-wake speech is captured and (separately) transcribed before reaching the LLM.
+The agent doesn't send audio anywhere; wake detection is local. Only post-wake speech is captured and (separately) transcribed before reaching the LLM.
 
 > **Build flag:** Voice Wake is gated by the `voice-wake` cargo feature on `zeroclaw-channels`. Build with `--features voice-wake` to include it.
 
 ## TTS (outbound speech synthesis)
 
-TTS lives at the top level under `[tts]`, not under `[channels.*]` — it's an output service that channels can call into, rather than its own inbound channel.
+TTS lives at the top level under `[tts]`, not under `[channels.*]`: it's an output service that channels can call into, rather than its own inbound channel.
 
 ```toml
 [tts]
@@ -111,7 +111,7 @@ ClawdTalk shortcuts several of these by keeping the audio stream live; regular `
 
 ## STT
 
-Speech-to-text is configured separately from the voice channels — see the `[transcription]` config in the [Config reference](../reference/config.md). Voice channels invoke whichever transcription provider is active when they need to turn audio into text.
+Speech-to-text is configured separately from the voice channels; see the `[transcription]` config in the [Config reference](../reference/config.md). Voice channels invoke whichever transcription provider is active when they need to turn audio into text.
 
 ## Hardware notes
 

@@ -2,11 +2,11 @@
 
 Install, update, run as a scheduled task / Windows Service, and uninstall on Windows 10 / 11.
 
-`setup.bat` is the Windows counterpart to `install.sh` — same job, different shell. If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
+`setup.bat` is the Windows counterpart to `install.sh`, same job, different shell. If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
 
 ## Install
 
-### Option 1 — `setup.bat` from a release
+### Option 1: `setup.bat` from a release
 
 Download the latest ZeroClaw release, unzip, and run:
 
@@ -18,7 +18,7 @@ Flags:
 
 | Flag | Behaviour |
 |---|---|
-| `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest — no Rust toolchain needed) |
+| `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest, no Rust toolchain needed) |
 | `--minimal` | Build core only (`--no-default-features`; no channels, no hardware) |
 | `--standard` | Build with lean default channels (ACP server, webhook, email, Telegram) |
 | `--full` | Build with all channels (`channels-full`) |
@@ -34,14 +34,14 @@ The script:
 
 For source builds, `setup.bat` now prints the exact `cargo build ...` command it executes and reports the installed `zeroclaw.exe` size so command shape and artifact expectations stay visible.
 
-### Option 2 — Scoop
+### Option 2: Scoop
 
 ```cmd
 scoop install zeroclaw
 zeroclaw quickstart
 ```
 
-### Option 3 — From source
+### Option 3: From source
 
 Requires Rust (`rustup`) and Visual Studio Build Tools:
 
@@ -59,7 +59,7 @@ Windows builds use the MSVC toolchain. You need:
 - Visual Studio Build Tools (or full Visual Studio) with the "Desktop development with C++" workload
 - Rust stable (via `rustup`)
 
-If you're using `--prebuilt` you don't need the Rust toolchain — the binary is self-contained.
+If you're using `--prebuilt` you don't need the Rust toolchain; the binary is self-contained.
 
 ## Running as a service
 
@@ -136,7 +136,7 @@ del "%USERPROFILE%\.cargo\bin\zeroclaw.exe"
 scoop uninstall zeroclaw
 ```
 
-Remove config and workspace (optional — this deletes conversation history):
+Remove config and workspace (optional, this deletes conversation history):
 
 ```cmd
 rmdir /s /q "%USERPROFILE%\.zeroclaw"

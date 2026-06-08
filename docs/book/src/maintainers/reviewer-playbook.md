@@ -27,7 +27,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 
 When uncertain, treat as higher risk.
 
-If the path-labeler's risk inference is contextually wrong, apply `risk: manual` and set the final `risk:*` label explicitly — manual freezes any future automated recalculation.
+If the path-labeler's risk inference is contextually wrong, apply `risk: manual` and set the final `risk:*` label explicitly: manual freezes any future automated recalculation.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -38,12 +38,12 @@ Labels are maintainer metadata. If the correct label is obvious and you have per
 For every new PR, before reading any code:
 
 1. Confirm the PR template is complete: summary, validation evidence, security & privacy, compatibility, rollback (for medium/high).
-2. Confirm labels are present and plausible — `size:*`, `risk:*`, scope labels, contributor tier where applicable.
+2. Confirm labels are present and plausible: `size:*`, `risk:*`, scope labels, contributor tier where applicable.
 3. Confirm `CI Required Gate` signal status.
 4. Confirm scope is one concern. Mixed-feature mega-PRs go back for a split unless the mix is explicitly justified.
 5. Confirm privacy / data-hygiene rules. See [Privacy](../contributing/privacy.md) for the full rulebook.
 
-If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake — the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
+If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake: the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
 
 ### Fast-lane checklist (every PR)
 
@@ -51,7 +51,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Validation commands are present and the results are coherent.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
-- Rollback path is concrete — "revert" is not concrete.
+- Rollback path is concrete; "revert" is not concrete.
 - Compatibility and migration impact is clear.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
 - Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Extension examples](../developing/extension-examples.md)).
@@ -120,10 +120,10 @@ When review demand exceeds capacity:
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label** — add `risk: manual`, then set the intended `risk:*` label.
-2. **Incorrect auto-close on issue triage** — reopen, remove the route label, leave one clarifying comment.
-3. **Label spam or noise** — keep one canonical maintainer comment, remove redundant route labels.
-4. **Ambiguous PR scope** — request a split before deep review; don't try to review across two concerns at once.
+1. **Incorrect risk label**: add `risk: manual`, then set the intended `risk:*` label.
+2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
+3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
+4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.
 
 ## Handoff
 
@@ -143,4 +143,4 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 
-The goal is a queue where every open PR is either being actively reviewed, blocked on the author, or blocked on something external — never just sitting because nobody got to it.
+The goal is a queue where every open PR is either being actively reviewed, blocked on the author, or blocked on something external, never just sitting because nobody got to it.

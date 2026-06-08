@@ -43,7 +43,7 @@ flowchart TB
 |---|---|
 | `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding sections, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
-| `zeroclaw-api` | Public traits — `Provider`, `Channel`, `Tool`. The kernel ABI |
+| `zeroclaw-api` | Public traits: `Provider`, `Channel`, `Tool`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
@@ -57,7 +57,7 @@ flowchart TB
 | `zerocode` | Terminal UI |
 | `aardvark-sys`, `robot-kit` | Specialised hardware support |
 
-The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further — the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.
+The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further: the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.
 
 ## Request lifecycle (short)
 
@@ -90,15 +90,15 @@ Full detail: [Request lifecycle](./request-lifecycle.md).
 
 Three trait-based extension points live in `zeroclaw-api`:
 
-- **`Provider`** — implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
-- **`Channel`** — implement for a new messaging platform. Inbound and outbound are separate hooks.
-- **`Tool`** — implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+- **`Provider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
+- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks.
+- **`Tool`**: implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
 
 All three are registered at startup via factory functions; the kernel doesn't know the concrete types. Compile-time feature flags decide which implementations ship in a given binary.
 
 ## Where to read next
 
-- [Crates](./crates.md) — per-crate deep dive
-- [Request lifecycle](./request-lifecycle.md) — streaming, tool calls, approvals
+- [Crates](./crates.md): per-crate deep dive
+- [Request lifecycle](./request-lifecycle.md): streaming, tool calls, approvals
 - [Model Providers → Overview](../providers/overview.md)
 - [Security → Overview](../security/overview.md)

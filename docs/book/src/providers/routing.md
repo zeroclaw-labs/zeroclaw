@@ -4,8 +4,8 @@ Routing happens at the **agent layer**. Each agent points at exactly one provide
 
 Two layers of decisions:
 
-1. **Per-call backend selection** — "use the cheap model unless this prompt looks like reasoning." Each routing target is its own `[agents.<alias>]` entry with its own `model_provider`. Channels are routed to whichever agent should handle their traffic.
-2. **Provider reliability** — vendor-redundancy lives behind a single first-class provider. Configure OpenRouter (or an equivalent) as one provider and let it handle vendor fan-out at its endpoint.
+1. **Per-call backend selection**: "use the cheap model unless this prompt looks like reasoning." Each routing target is its own `[agents.<alias>]` entry with its own `model_provider`. Channels are routed to whichever agent should handle their traffic.
+2. **Provider reliability**: vendor-redundancy lives behind a single first-class provider. Configure OpenRouter (or an equivalent) as one provider and let it handle vendor fan-out at its endpoint.
 
 ## Per-agent dispatch
 
@@ -110,6 +110,6 @@ For production deployments, wire the log output to Loki / Grafana. See [Operatio
 
 ## See also
 
-- [Overview](./overview.md) — provider model and per-agent dispatch
-- [Configuration](./configuration.md) — full `[providers.*]` schema
-- [Provider catalog](./catalog.md) — every canonical slot
+- [Overview](./overview.md): provider model and per-agent dispatch
+- [Configuration](./configuration.md): full `[providers.*]` schema
+- [Provider catalog](./catalog.md): every canonical slot

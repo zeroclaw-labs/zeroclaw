@@ -1,6 +1,6 @@
 # Logging architecture
 
-ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace — agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors — flows through it. The macro feeds a single `LogCaptureLayer` that materializes structured `LogEvent` records and routes them to three sinks at once:
+ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace, agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors, flows through it. The macro feeds a single `LogCaptureLayer` that materializes structured `LogEvent` records and routes them to three sinks at once:
 
 1. The terminal (via the `tracing-subscriber` fmt layer that `zeroclaw-log` installs internally) so operators see colored, alias-prefixed lines on stderr.
 2. The persisted JSONL log at `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"` or `"full"`).
@@ -19,7 +19,7 @@ record!(INFO, Event::new(module_path!(), Action::Start), "starting step");
 record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), "tool failed");
 ```
 
-`module_path!()` is the canonical source of the event name — it's the Rust module path of the call site (e.g. `zeroclaw_channels::telegram`), so events are searchable, jump-to-source-able, and impossible to typo. The same convention is used at every `record!` site in the workspace.
+`module_path!()` is the canonical source of the event name: it's the Rust module path of the call site (e.g. `zeroclaw_channels::telegram`), so events are searchable, jump-to-source-able, and impossible to typo. The same convention is used at every `record!` site in the workspace.
 
 The macro injects `file!()` and `line!()` automatically. The `LogCaptureLayer` attaches them to the event's `attributes` map as `_file` and `_line` so operators jump to source from a log viewer.
 
@@ -29,7 +29,7 @@ Every `record!` call is a single line of code that says **what happened**, not *
 
 - The single positional argument after the level is an `Event` expression.
 - The next argument is a string literal for the human-readable message.
-- That is everything. Channel, agent_alias, provider, tool, session_key, cron_job_id, model — none of those are call-site arguments. They flow in from spans (see [Attribution](#attribution)).
+- That is everything. Channel, agent_alias, provider, tool, session_key, cron_job_id, model: none of those are call-site arguments. They flow in from spans (see [Attribution](#attribution)).
 
 The shape is enforced by the `Event` struct: unknown fields are a compile error.
 
@@ -42,13 +42,13 @@ The shape is enforced by the `Event` struct: unknown fields are a compile error.
 - External-system identifiers: a remote API's `request_id`, an upstream trace header.
 - Derived state captured at this instant: in-flight count, retry-after seconds.
 
-**Attrs are NOT for** anything that comes from the surrounding scope — channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Those belong in a wrapping `attribution_span!` or `scope!`.
+**Attrs are NOT for** anything that comes from the surrounding scope: channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Those belong in a wrapping `attribution_span!` or `scope!`.
 
 The serde rule: pass the **raw value**, never `format!("{}", v)` or `format!("{:?}", v)`. `serde_json::json!` serializes strings as strings, numbers as numbers, `Vec<T>` as arrays, `Option<T>` as null-or-value. Wrap with `.to_string()` only when the type doesn't `impl Serialize` (e.g. `anyhow::Error`, `reqwest::Error`, `std::io::Error`, `Path::Display`, `StatusCode`).
 
 ### Placeholder rule
 
-Rust string-literal placeholders like `"raw error body: {body}"` are forbidden inside `record!` messages. Rust 2021's implicit format-string capture does not flow through `record!` — every `{var}` becomes a literal substring with no substitution. The conversion rule:
+Rust string-literal placeholders like `"raw error body: {body}"` are forbidden inside `record!` messages. Rust 2021's implicit format-string capture does not flow through `record!`: every `{var}` becomes a literal substring with no substitution. The conversion rule:
 
 ```rust
 // BAD — {body} is a literal, never interpolated
@@ -60,11 +60,11 @@ record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::js
 
 ## `Event`, `Action`, `EventOutcome`, `EventCategory`
 
-All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding a value is the only point of change — call sites do not invent strings.
+All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding a value is the only point of change: call sites do not invent strings.
 
-- `Action` — closed verb set, snake-cased on disk via `strum::IntoStaticStr`: `Start`, `Complete`, `Fail`, `Cancel`, `Skip`, `Timeout`, `Retry`, `Inbound`, `Outbound`, `Send`, `Receive`, `Connect`, `Disconnect`, `Reconnect`, `Spawn`, `Kill`, `Tick`, `Trigger`, `Schedule`, `Approve`, `Reject`, `Defer`, `Read`, `Write`, `Delete`, `List`, `Query`, `Invoke`, `Dispatch`, `Resolve`, `Register`, `Unregister`, `Load`, `Save`, `Migrate`, `Validate`, `Note`.
-- `EventOutcome` — `Success`, `Failure`, `Unknown` (the default — terminal outcome correlated to the matching Start via `trace_id`).
-- `EventCategory` — `Agent`, `Channel`, `Cron`, `Memory`, `Tool`, `Provider`, `Session`, `System`, `Internal`. Derived from the innermost role span unless overridden via `Event::with_category(...)`.
+- `Action`: closed verb set, snake-cased on disk via `strum::IntoStaticStr`: `Start`, `Complete`, `Fail`, `Cancel`, `Skip`, `Timeout`, `Retry`, `Inbound`, `Outbound`, `Send`, `Receive`, `Connect`, `Disconnect`, `Reconnect`, `Spawn`, `Kill`, `Tick`, `Trigger`, `Schedule`, `Approve`, `Reject`, `Defer`, `Read`, `Write`, `Delete`, `List`, `Query`, `Invoke`, `Dispatch`, `Resolve`, `Register`, `Unregister`, `Load`, `Save`, `Migrate`, `Validate`, `Note`.
+- `EventOutcome`: `Success`, `Failure`, `Unknown` (the default, terminal outcome correlated to the matching Start via `trace_id`).
+- `EventCategory`: `Agent`, `Channel`, `Cron`, `Memory`, `Tool`, `Provider`, `Session`, `System`, `Internal`. Derived from the innermost role span unless overridden via `Event::with_category(...)`.
 
 ## Attribution
 
@@ -125,7 +125,7 @@ The layer walks the span scope leaf→root when an event fires, merges every `At
 
 ### The `scope!` macro
 
-For per-scope identifiers that aren't tied to a role-bearing `Attributable` thing — sender id, message id, turn id, request id — use `scope!`:
+For per-scope identifiers that aren't tied to a role-bearing `Attributable` thing, sender id, message id, turn id, request id, use `scope!`:
 
 ```rust
 zeroclaw_log::scope!(
@@ -192,7 +192,7 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 
 ## `LogConfig` vs `ObservabilityConfig`
 
-`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`) — `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree.
+`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree.
 
 ## Subscriber installation
 
@@ -211,7 +211,7 @@ That single call sets up the agent-alias-prefixed terminal formatter + the `LogC
 - **New cron schedule shape**: add to `CronKind`.
 - **New model / TTS / transcription / tunnel provider**: add to the relevant `*ProviderKind` sub-enum under `ProviderKind`.
 - **New memory backend**: add to `MemoryKind`.
-- **New `Role` family altogether** (PeerGroup / Skill / Mcp gain sub-types): nest with its own `Kind` on the fly — the pattern is uniform.
+- **New `Role` family altogether** (PeerGroup / Skill / Mcp gain sub-types): nest with its own `Kind` on the fly: the pattern is uniform.
 
 Then add `impl Attributable for X` next to the new struct (`fn role() -> Role::Family(Kind::Variant)`, `fn alias() -> &str { &self.alias }`) and wrap its entry point with `attribution_span!(self)`. The layer picks up everything else automatically.
 

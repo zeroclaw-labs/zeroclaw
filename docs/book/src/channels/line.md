@@ -1,6 +1,6 @@
 # LINE
 
-ZeroClaw supports LINE via the Messaging API — receiving messages through an embedded webhook server and replying via the Reply API (with Push API fallback when the reply token has expired).
+ZeroClaw supports LINE via the Messaging API, receiving messages through an embedded webhook server and replying via the Reply API (with Push API fallback when the reply token has expired).
 
 ## Prerequisites
 
@@ -16,8 +16,8 @@ ZeroClaw supports LINE via the Messaging API — receiving messages through an e
 2. Create a **Provider** (or use an existing one).
 3. Create a new **Messaging API** channel under that Provider.
 4. From the channel settings, collect two values:
-   - **Channel Access Token** — Messaging API tab → **Issue** a long-lived token.
-   - **Channel Secret** — Basic settings tab.
+   - **Channel Access Token**: Messaging API tab → **Issue** a long-lived token.
+   - **Channel Secret**: Basic settings tab.
 
 ---
 
@@ -59,7 +59,7 @@ Copy the `https://` URL ngrok provides (e.g. `https://abc123.ngrok.io`).
 1. Go to your channel → **Messaging API** tab → **Webhook settings**.
 2. Set **Webhook URL** to `https://your-domain.com/line/webhook`.
 3. Toggle **Use webhook** to on.
-4. Click **Verify** — LINE will send a test request. ZeroClaw must be running for verification to succeed.
+4. Click **Verify**, LINE will send a test request. ZeroClaw must be running for verification to succeed.
 
 ---
 
@@ -85,7 +85,7 @@ LINE: webhook server listening on http://0.0.0.0:8443/line/webhook
 
 ## 6. Access Policies
 
-### DM (1:1 chat) — `dm_policy`
+### DM (1:1 chat): `dm_policy`
 
 | Value | Behaviour |
 |---|---|
@@ -99,7 +99,7 @@ LINE: webhook server listening on http://0.0.0.0:8443/line/webhook
 2. The user opens a LINE DM with the bot and sends `/bind <code>`.
 3. ZeroClaw confirms the pairing; subsequent DMs are accepted.
 
-### Group / multi-person chat — `group_policy`
+### Group / multi-person chat: `group_policy`
 
 | Value | Behaviour |
 |---|---|
@@ -111,7 +111,7 @@ LINE: webhook server listening on http://0.0.0.0:8443/line/webhook
 
 ## 7. Audio / Voice Message Transcription (optional)
 
-When transcription is enabled (via the global `[transcription]` config — see [Config reference](../reference/config.md)), LINE `audio` message events are automatically downloaded from the LINE Content API and transcribed before being passed to the model.
+When transcription is enabled (via the global `[transcription]` config, see [Config reference](../reference/config.md)), LINE `audio` message events are automatically downloaded from the LINE Content API and transcribed before being passed to the model.
 
 The maximum accepted audio size is 25 MB. Larger files are silently skipped with a log warning.
 
@@ -124,7 +124,7 @@ The maximum accepted audio size is 25 MB. Larger files are silently skipped with
 | LINE Verify fails | ZeroClaw not running, or port not reachable | Confirm the process is up and the port is accessible from the internet |
 | Bot does not reply to DMs | `dm_policy = pairing` and user has not run `/bind` | User must send `/bind <code>` first, or switch to `dm_policy = open` |
 | Bot does not reply in groups | `group_policy = mention` and message has no @mention | @mention the bot, or switch to `group_policy = open` |
-| Reply arrives as a push message | Reply token expired (~30 s window) | Expected fallback behaviour — no action required |
+| Reply arrives as a push message | Reply token expired (~30 s window) | Expected fallback behaviour, no action required |
 | Audio messages ignored | `[transcription]` not configured | Add `[transcription]` block with `enabled = true` |
 
 ### Log keywords
@@ -142,5 +142,5 @@ The maximum accepted audio size is 25 MB. Larger files are silently skipped with
 
 ## See also
 
-- [Config reference](../reference/config.md) — full config field index
+- [Config reference](../reference/config.md): full config field index
 - [LINE Developers Documentation](https://developers.line.biz/en/docs/messaging-api/)

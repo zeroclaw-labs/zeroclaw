@@ -1,6 +1,6 @@
 # CI & Actions
 
-Every workflow lives in `.github/workflows/`. The sections below group them by trigger — automatic on git events, or manual via `workflow_dispatch`.
+Every workflow lives in `.github/workflows/`. The sections below group them by trigger: automatic on git events, or manual via `workflow_dispatch`.
 
 ## Automatic workflows
 
@@ -8,14 +8,14 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 
-- **fmt** — `cargo fmt --all -- --check`
-- **lint** — `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
-- **build** — matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
-- **check** — all features + no-default-features
-- **check-32bit** — `i686-unknown-linux-gnu` with no default features
-- **bench** — benchmarks compile check
-- **test** — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
-- **security** — `cargo deny check`
+- **fmt**: `cargo fmt --all -- --check`
+- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
+- **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
+- **check**: all features + no-default-features
+- **check-32bit**: `i686-unknown-linux-gnu` with no default features
+- **bench**: benchmarks compile check
+- **test**: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **security**: `cargo deny check`
 
 `fmt` runs first as the cheap serial gate. The Rust-heavy jobs fan out after formatting passes, and `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green.
 
@@ -25,7 +25,7 @@ Runs `cargo audit` nightly against the dependency tree. Opens an issue on findin
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
-Auto-applies scope and risk labels based on changed file paths. Runs silently on every PR — if a PR is missing labels, check whether the paths in `.github/labeler.yml` cover the changes.
+Auto-applies scope and risk labels based on changed file paths. Runs silently on every PR, if a PR is missing labels, check whether the paths in `.github/labeler.yml` cover the changes.
 
 ### Discord Release (`discord-release.yml`)
 
@@ -77,7 +77,7 @@ Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `
 
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
-- **Windows has no Rust cache.** `if: runner.os != 'Windows'` skips the cache step on the Windows leg — `rust-cache`'s path handling poisons on Windows. Windows always runs cold.
+- **Windows has no Rust cache.** `if: runner.os != 'Windows'` skips the cache step on the Windows leg, `rust-cache`'s path handling poisons on Windows. Windows always runs cold.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
 - **`cargo-deny` is not cached.** The `security` job installs it fresh from source on every run. A future improvement is `taiki-e/install-action`, which already caches `cargo-nextest`.
 
@@ -93,7 +93,7 @@ Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `
 
 ## Allowed actions
 
-The repository runs Actions in `selected` mode — only the actions in this allowlist may run. The allowlist must stay tight; new third-party actions need explicit maintainer approval before being added.
+The repository runs Actions in `selected` mode, only the actions in this allowlist may run. The allowlist must stay tight; new third-party actions need explicit maintainer approval before being added.
 
 | Action | Used in | Purpose |
 |---|---|---|
@@ -131,7 +131,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 
 - Keep `CI Required Gate` deterministic and small. Adding jobs to the gate needs a clear quality argument.
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
-- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned — the same quality gates run locally and in CI.
+- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned, the same quality gates run locally and in CI.
 - `docs-quality` checks are not in the required gate. Run them locally with `bash scripts/ci/docs_quality_gate.sh`.
 
 ## Emergency rollback
@@ -142,4 +142,4 @@ If the allowlist locks out a critical action mid-incident:
 2. Restore `selected` allowlist after identifying the missing entry.
 3. Record the incident and the final allowlist delta.
 
-This is the only justified path to `all` mode — and it should never outlast the incident.
+This is the only justified path to `all` mode, and it should never outlast the incident.

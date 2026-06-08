@@ -2,7 +2,7 @@
 
 The `webhook` channel is a generic inbound/outbound HTTP adapter. It runs its own embedded HTTP server on a port you choose, accepts JSON-shaped messages, hands them to the agent, and (optionally) POSTs the agent's replies to a URL you specify. Use it as the universal adapter for any system that can produce an HTTP POST.
 
-> **Not the same as the gateway's `/webhook` endpoint.** The gateway service has its own `POST /webhook` for paired clients hitting the agent over HTTP — that lives under `[gateway]` and is described in [Operations → Network deployment](../ops/network-deployment.md). This page documents the `[channels.webhook]` channel only.
+> **Not the same as the gateway's `/webhook` endpoint.** The gateway service has its own `POST /webhook` for paired clients hitting the agent over HTTP, that lives under `[gateway]` and is described in [Operations → Network deployment](../ops/network-deployment.md). This page documents the `[channels.webhook]` channel only.
 
 ## Configuration
 
@@ -33,9 +33,9 @@ Request body (JSON):
 }
 ```
 
-- `sender` — required, used as the message's sender identity.
-- `content` — required, the user message handed to the agent. Empty content returns `400`.
-- `thread_id` — optional. If set, the agent's reply targets the same thread; otherwise replies target `sender`.
+- `sender`: required, used as the message's sender identity.
+- `content`: required, the user message handed to the agent. Empty content returns `400`.
+- `thread_id`: optional. If set, the agent's reply targets the same thread; otherwise replies target `sender`.
 
 Success returns `200 OK`. Malformed JSON or empty `content` returns `400`. Backpressure (channel queue full) returns `503`.
 
@@ -49,7 +49,7 @@ X-Webhook-Signature: sha256=<hex-encoded HMAC-SHA256 of the raw body>
 
 The channel computes `HMAC-SHA256(secret, raw_body)`, hex-encodes it, and compares against the header value (the `sha256=` prefix is stripped before decode). Mismatch or missing header returns `401`.
 
-When `secret` is unset, **no verification runs** — every request is accepted. Don't expose an unsecured webhook channel to the public internet; either set `secret`, restrict access at a reverse proxy, or run the listener bound to a private network only.
+When `secret` is unset, **no verification runs**: every request is accepted. Don't expose an unsecured webhook channel to the public internet; either set `secret`, restrict access at a reverse proxy, or run the listener bound to a private network only.
 
 ## Outbound
 
@@ -68,7 +68,7 @@ Content-Type: application/json
 ```
 
 - `send_method` is `POST` (default) or `PUT`. Any other value falls back to `POST`.
-- `auth_header` is sent verbatim as the `Authorization` header value — include the scheme yourself (e.g. `Bearer xyz`, `Basic dXNlcjpwYXNz`).
+- `auth_header` is sent verbatim as the `Authorization` header value, include the scheme yourself (e.g. `Bearer xyz`, `Basic dXNlcjpwYXNz`).
 - `recipient` is omitted when empty.
 - Non-2xx responses raise an error in logs; the agent reply is considered failed.
 
@@ -78,15 +78,15 @@ When `send_url` is unset, agent replies are dropped silently (logged at `debug`)
 
 The channel binds to `0.0.0.0` directly. To expose it on the public internet:
 
-1. **Reverse proxy** — terminate TLS at nginx / Caddy / Traefik and proxy to the channel's port. See [Operations → Network deployment](../ops/network-deployment.md).
-2. **Tunnel** — configure `[tunnel]` (`ngrok`, `cloudflare`, or `tailscale`) and the daemon brings up the tunnel alongside the channel.
-3. **Local-only** — run inside a private network and have your producer hit the LAN/loopback address directly.
+1. **Reverse proxy**: terminate TLS at nginx / Caddy / Traefik and proxy to the channel's port. See [Operations → Network deployment](../ops/network-deployment.md).
+2. **Tunnel**: configure `[tunnel]` (`ngrok`, `cloudflare`, or `tailscale`) and the daemon brings up the tunnel alongside the channel.
+3. **Local-only**: run inside a private network and have your producer hit the LAN/loopback address directly.
 
 Always pair public exposure with `secret`. An unauthenticated webhook listener is an open ingress to the agent.
 
 ## Outbound sends
 
-Webhook channels can also POST/PUT *outbound* messages to a configured `send_url` — used when the agent replies through the channel rather than only receiving inbound events. Outbound delivery is configured under the singular `[channels.webhook]` prefix (a separate schema surface from the inbound `[channels.webhooks.<name>]` blocks above; reconciling that shape difference in this page is tracked separately):
+Webhook channels can also POST/PUT *outbound* messages to a configured `send_url`, used when the agent replies through the channel rather than only receiving inbound events. Outbound delivery is configured under the singular `[channels.webhook]` prefix (a separate schema surface from the inbound `[channels.webhooks.<name>]` blocks above; reconciling that shape difference in this page is tracked separately):
 
 ```toml
 [channels.webhook]
@@ -100,7 +100,7 @@ retry_base_delay_ms = 500   # exponential-backoff base; default: 500
 retry_max_delay_ms = 30000  # per-wait cap; default: 30000 (30s)
 ```
 
-Outbound sends retry transient failures — network errors, HTTP `429`, and HTTP `5xx` — with exponential backoff (±25% jitter) capped by `retry_max_delay_ms`. Non-`429` `4xx` responses fail immediately without retrying. When the server returns a `Retry-After` header on `429` or `503`, that value is honored and also clamped by `retry_max_delay_ms`. Setting `max_retries = 0` preserves the prior fire-and-forget behavior byte-for-byte.
+Outbound sends retry transient failures, network errors, HTTP `429`, and HTTP `5xx`, with exponential backoff (±25% jitter) capped by `retry_max_delay_ms`. Non-`429` `4xx` responses fail immediately without retrying. When the server returns a `Retry-After` header on `429` or `503`, that value is honored and also clamped by `retry_max_delay_ms`. Setting `max_retries = 0` preserves the prior fire-and-forget behavior byte-for-byte.
 
 ## Code
 
@@ -109,5 +109,5 @@ Outbound sends retry transient failures — network errors, HTTP `429`, and HTTP
 
 ## See also
 
-- [Operations → Network deployment](../ops/network-deployment.md) — TLS termination, tunnels, the gateway's separate `/webhook`
+- [Operations → Network deployment](../ops/network-deployment.md): TLS termination, tunnels, the gateway's separate `/webhook`
 - [Channels → Overview](./overview.md)

@@ -1,6 +1,6 @@
 # Claude Code Skills
 
-The repo ships a set of [Claude Code skills](https://docs.claude.com/en/docs/agents/skills) under `.claude/skills/` that automate the heavier parts of the maintainer workflow — PR reviews, issue triage, squash-merging, changelog generation, and more.
+The repo ships a set of [Claude Code skills](https://docs.claude.com/en/docs/agents/skills) under `.claude/skills/` that automate the heavier parts of the maintainer workflow: PR reviews, issue triage, squash-merging, changelog generation, and more.
 
 Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads them automatically when you open the repo; invoke them by describing what you want in plain language, or by explicit reference (e.g. `/squash-merge 1234`).
 
@@ -8,12 +8,12 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 
 | Skill | Use it when |
 |---|---|
-| `github-pr-review-session` | Reviewing a specific PR or working through the review queue — drafts the review body, cross-checks against source, posts via `gh` as WareWolf-MoonWall |
+| `github-pr-review-session` | Reviewing a specific PR or working through the review queue: drafts the review body, cross-checks against source, posts via `gh` as WareWolf-MoonWall |
 | `github-issue-triage` | Running a backlog sweep, closing stale/duplicate issues, applying labels, enforcing the RFC stale policy |
 | `github-issue` | Filing a structured issue (bug report or feature request) |
 | `github-pr` | Opening or updating a PR with a fully-populated template body |
 | `squash-merge` | Landing an approved PR into `master` with preserved commit history and the purple **Merged** badge |
-| `changelog-generation` | Preparing `CHANGELOG-next.md` for a release — summarises merges since the last tag |
+| `changelog-generation` | Preparing `CHANGELOG-next.md` for a release: summarises merges since the last tag |
 | `skill-creator` | Creating, editing, or benchmarking the skills themselves |
 | `zeroclaw` | Operating the running ZeroClaw instance (CLI + gateway API) |
 
@@ -29,12 +29,12 @@ The skill reads `AGENTS.md`, the reviewer playbook, and the PR's diff + commits,
 
 - **Inline comments** for every `[blocking]` / `[suggestion]` / `[question]` finding
 - **Review body** only for overall verdict and template-level issues
-- **Bare commit hashes** (never wrapped in backticks — GitHub auto-links them)
+- **Bare commit hashes** (never wrapped in backticks: GitHub auto-links them)
 - **@-prefixed usernames** in all review content
 
 Findings follow the house tier system: `[blocking]` holds the PR, `[suggestion]` is optional, `[question]` asks for clarification.
 
-The skill always shows a draft for approval before posting. Reviews are posted under the human reviewer's identity — not as a bot.
+The skill always shows a draft for approval before posting. Reviews are posted under the human reviewer's identity, not as a bot.
 
 Re-review after changes:
 
@@ -52,14 +52,14 @@ Or work through the queue:
 
 The `github-issue-triage` skill runs autonomous backlog sweeps within defined authority bounds. Modes:
 
-- **Triage pass** — label, link to related PRs, apply `needs-author-action` where applicable
-- **Stale pass** — close issues that have been idle past the policy threshold
-- **Wont-fix pass** — close issues that won't be accepted, with a brief rationale
-- **Specific issue** — handle a single issue by number
+- **Triage pass**: label, link to related PRs, apply `needs-author-action` where applicable
+- **Stale pass**: close issues that have been idle past the policy threshold
+- **Wont-fix pass**: close issues that won't be accepted, with a brief rationale
+- **Specific issue**: handle a single issue by number
 
 Label definitions live in [Labels](./labels.md). Stale procedure lives in the issue-triage skill protocol, with reviewer-side context in [Reviewer playbook → Issue triage](./reviewer-playbook.md#issue-triage). The skill escalates ambiguity to the user before acting.
 
-PRs with merge conflicts receive `needs-author-action` only — no review, no diff comment — per `feedback_conflicts_label_only`.
+PRs with merge conflicts receive `needs-author-action` only, no review, no diff comment, per `feedback_conflicts_label_only`.
 
 ## Squash-merge strategy
 
@@ -73,11 +73,11 @@ GitHub's default squash-merge:
 - Formats the body inconsistently
 - Doesn't match project conventions
 
-Direct-pushing a squash to master bypasses the PR merge mechanism — the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge association). The skill uses `gh pr merge --subject --body` to get both the badge and the correctly formatted commit.
+Direct-pushing a squash to master bypasses the PR merge mechanism: the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge association). The skill uses `gh pr merge --subject --body` to get both the badge and the correctly formatted commit.
 
 ### Format
 
-- **Subject:** `<PR title> (#<number>)` — must be conventional commits (`feat(scope): …`, `fix: …`, etc.)
+- **Subject:** `<PR title> (#<number>)`: must be conventional commits (`feat(scope): …`, `fix: …`, etc.)
 - **Body (multi-commit PR):** bulleted list of `- <short sha> <commit subject>` from the PR branch
 - **Body (single-commit PR):** full commit body, or blank if there isn't one
 
@@ -113,6 +113,6 @@ The skill always confirms the generated subject and body before calling `gh pr m
 
 ## Editing the skills
 
-Skills are plain Markdown with YAML frontmatter. Their `description` field is what Claude Code uses to decide when to trigger them — be specific and include concrete trigger phrases (`"review 1234"`, `"triage issues"`, etc.). Use `skill-creator` to edit them; it enforces the structure and helps run evals to measure trigger accuracy.
+Skills are plain Markdown with YAML frontmatter. Their `description` field is what Claude Code uses to decide when to trigger them: be specific and include concrete trigger phrases (`"review 1234"`, `"triage issues"`, etc.). Use `skill-creator` to edit them; it enforces the structure and helps run evals to measure trigger accuracy.
 
 When a skill's behaviour diverges from what the docs describe (e.g. the reviewer playbook changes), update the skill **and** any docs referencing it. The skill's `SKILL.md` is canonical for the automation; the contributing docs are canonical for the humans.

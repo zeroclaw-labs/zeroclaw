@@ -2,9 +2,9 @@
 
 Single reference for every label used on PRs and issues. Sources of truth:
 
-- `.github/labeler.yml` — path-label config consumed by `actions/labeler`
-- `.github/label-policy.json` — contributor tier thresholds
-- This page — definitions, behavior, and what's automated vs manual
+- `.github/labeler.yml`: path-label config consumed by `actions/labeler`
+- `.github/label-policy.json`: contributor tier thresholds
+- This page: definitions, behavior, and what's automated vs manual
 
 When definitions conflict, update the source file first, then sync this page.
 
@@ -173,7 +173,7 @@ Tools are grouped by logical function rather than one label per file.
 
 ## Size labels
 
-Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually** — the size automation that previously computed these was removed during CI simplification.
+Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**: the size automation that previously computed these was removed during CI simplification.
 
 | Label | Threshold |
 |---|---|
@@ -237,7 +237,7 @@ Superseding is a replacement process, not currently a live label. Use [Supersedi
 
 ## Triage labels
 
-Applied manually — the auto-response automation that used to handle these was removed during CI simplification.
+Applied manually: the auto-response automation that used to handle these was removed during CI simplification.
 
 | Label | Purpose |
 |---|---|

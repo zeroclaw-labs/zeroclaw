@@ -26,8 +26,8 @@ fn supports_streaming(&self) -> bool { true }
 fn supports_streaming_tool_events(&self) -> bool { true }
 ```
 
-- **`supports_streaming`** — true for every actively maintained provider
-- **`supports_streaming_tool_events`** — true when the provider emits `ToolCall` events during the stream rather than at the end
+- **`supports_streaming`**: true for every actively maintained provider
+- **`supports_streaming_tool_events`**: true when the provider emits `ToolCall` events during the stream rather than at the end
 
 OpenAI-compatible providers differ: some stream tool-call arg deltas chunk-by-chunk, others only emit the call once complete. The `compatible.rs` SSE parser handles both.
 
@@ -42,21 +42,21 @@ fn supports_multi_message_streaming(&self) -> bool; // split one reply into many
 
 | Channel | Draft updates | Multi-message |
 |---|:---:|:---:|
-| CLI | ✓ | — |
+| CLI | ✓ | N/A |
 | Discord | ✓ | ✓ |
 | Slack | ✓ | ✓ |
 | Telegram | ✓ | partial |
-| Matrix | ✓ | — |
-| Mattermost | ✓ | — |
-| Email | — | — |
-| SMS / voice | — | — |
+| Matrix | ✓ | N/A |
+| Mattermost | ✓ | N/A |
+| Email | N/A | N/A |
+| SMS / voice | N/A | N/A |
 | Gateway (WebSocket) | ✓ | ✓ |
 
 When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by `draft_update_interval_ms` in the channel config (default: 500 ms) to avoid rate-limiting.
 
 ## Reasoning blocks
 
-Reasoning models (OpenAI o-series, DeepSeek-R1, Qwen-thinking variants) emit `ReasoningDelta` events separate from regular text. By default the runtime strips these from outbound streams — see `<think>…</think>` handling in `crates/zeroclaw-channels/src/orchestrator/mod.rs`. Users see the final answer, not the chain-of-thought.
+Reasoning models (OpenAI o-series, DeepSeek-R1, Qwen-thinking variants) emit `ReasoningDelta` events separate from regular text. By default the runtime strips these from outbound streams, see `<think>…</think>` handling in `crates/zeroclaw-channels/src/orchestrator/mod.rs`. Users see the final answer, not the chain-of-thought.
 
 To surface reasoning to the user:
 
@@ -83,7 +83,7 @@ When a model decides to call a tool, the provider emits `ToolCall`. The runtime:
 
 1. Pauses reading from the provider's stream
 2. Flushes any buffered text to the channel
-3. Runs the tool (subject to security validation — see [Security → Overview](../security/overview.md))
+3. Runs the tool (subject to security validation, see [Security → Overview](../security/overview.md))
 4. Resumes the conversation with the tool result appended
 5. Opens a new streaming call to the provider for the next assistant turn
 
@@ -91,12 +91,12 @@ From the user's perspective: text, then a visible indicator that the agent ran a
 
 ## Non-streaming providers
 
-If a provider returns the entire response in one shot (older OpenAI-compat endpoints, legacy Gemini), the runtime synthesises a single `TextDelta` containing the full reply followed by `Final`. Channel adapters still work — they just don't see partials.
+If a provider returns the entire response in one shot (older OpenAI-compat endpoints, legacy Gemini), the runtime synthesises a single `TextDelta` containing the full reply followed by `Final`. Channel adapters still work; they just don't see partials.
 
 ## Code references
 
-- `crates/zeroclaw-api/src/model_provider.rs` — `ModelProvider` trait, `StreamEvent` enum
-- `crates/zeroclaw-providers/src/compatible.rs` — OpenAI-compat SSE parser
-- `crates/zeroclaw-providers/src/anthropic.rs` — Anthropic streaming
-- `crates/zeroclaw-providers/src/ollama.rs` — Ollama streaming
-- `crates/zeroclaw-channels/src/orchestrator/mod.rs` — channel-side stream consumption
+- `crates/zeroclaw-api/src/model_provider.rs`: `ModelProvider` trait, `StreamEvent` enum
+- `crates/zeroclaw-providers/src/compatible.rs`: OpenAI-compat SSE parser
+- `crates/zeroclaw-providers/src/anthropic.rs`: Anthropic streaming
+- `crates/zeroclaw-providers/src/ollama.rs`: Ollama streaming
+- `crates/zeroclaw-channels/src/orchestrator/mod.rs`: channel-side stream consumption

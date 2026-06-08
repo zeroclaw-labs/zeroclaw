@@ -1,4 +1,4 @@
-# FND-002: Intentional Documentation — Standards, Structure, and i18n Strategy
+# FND-002: Intentional Documentation: Standards, Structure, and i18n Strategy
 ### Starting v0.7.0 · Type: Documentation · Rev. 1
 
 > **Canonical reference** · Ratified by the team · Rev. 1
@@ -9,7 +9,7 @@
 
 > **A note to the team before you read this.**
 >
-> Documentation is not what you write after the code is done. It is a product surface in its own right — the interface between the project and every person who will ever contribute to it, use it, or build on it. A codebase with no documentation forces every new person to rediscover everything from scratch. A codebase with bad documentation is often worse, because it gives people false confidence. This RFC proposes treating documentation with the same intentionality we are applying to the architecture: Vision first, then structure, then content.
+> Documentation is not what you write after the code is done. It is a product surface in its own right, the interface between the project and every person who will ever contribute to it, use it, or build on it. A codebase with no documentation forces every new person to rediscover everything from scratch. A codebase with bad documentation is often worse, because it gives people false confidence. This RFC proposes treating documentation with the same intentionality we are applying to the architecture: Vision first, then structure, then content.
 
 ---
 
@@ -77,7 +77,7 @@ All three live in `docs/` with no structural distinction between them. The resul
 
 ### 2.3 The ADR Gap
 
-The project has exactly one Architecture Decision Record: `ADR-004-tool-shared-state-ownership.md`. It is excellent — well-structured, code-referenced, specific. But the project has made at least five or six architectural decisions of equal or greater consequence that have never been recorded:
+The project has exactly one Architecture Decision Record: `ADR-004-tool-shared-state-ownership.md`. It is excellent: well-structured, code-referenced, specific. But the project has made at least five or six architectural decisions of equal or greater consequence that have never been recorded:
 
 - The choice of Rust over TypeScript
 - The trait-driven extensibility model
@@ -89,7 +89,7 @@ Without these records, every new contributor must rediscover the reasoning throu
 
 ### 2.4 What Is Already Good
 
-The `docs-contract.md` concept — treating documentation as a governed product surface — is the right instinct. It just needs the right rules. The `AGENTS.md` at the root is excellent and sets the right precedent for AI-assisted development. ADR-004 proves the team can write high-quality architectural records.
+The `docs-contract.md` concept, treating documentation as a governed product surface, is the right instinct. It just needs the right rules. The `AGENTS.md` at the root is excellent and sets the right precedent for AI-assisted development. ADR-004 proves the team can write high-quality architectural records.
 
 ---
 
@@ -124,7 +124,7 @@ A useful test for the second question: *would this document become wrong or misl
 
 The case for removing all non-English content from the repository rests on four pillars:
 
-**1. The audience has on-demand translation.** ZeroClaw's primary users are people running an AI assistant. Every such person has access to instant, high-quality machine translation — either through the agent they are running, through their browser, or through any of dozens of free translation services. The practical benefit of shipping translations in the repository is marginal.
+**1. The audience has on-demand translation.** ZeroClaw's primary users are people running an AI assistant. Every such person has access to instant, high-quality machine translation, either through the agent they are running, through their browser, or through any of dozens of free translation services. The practical benefit of shipping translations in the repository is marginal.
 
 **2. The translations are almost certainly stale.** Machine-translated content was likely generated once and has not been kept synchronised with the English source. Stale documentation is worse than no documentation for AI-assisted development, because language models will confidently derive incorrect conclusions from outdated information.
 
@@ -146,7 +146,7 @@ One thing worth preserving: the _structure_ of the i18n approach. The idea of ma
    > **Translations:** Community-maintained translations are available in the [GitHub Wiki](https://github.com/zeroclaw-labs/zeroclaw/wiki). To contribute a translation or improve an existing one, edit the Wiki directly. All languages are welcome.
 
 5. **Create** a `Translations` page on the GitHub Wiki with a table of available languages, their completeness, and the contributors maintaining them
-6. **Optionally:** add a `zeroclaw docs --translate` CLI feature that uses the configured LLM provider to translate any doc page on demand — a natural fit for a product whose entire purpose is AI assistance
+6. **Optionally:** add a `zeroclaw docs --translate` CLI feature that uses the configured LLM provider to translate any doc page on demand, a natural fit for a product whose entire purpose is AI assistance
 
 ### 4.4 The AGENTS.md Impact
 
@@ -164,7 +164,7 @@ This is not a fuzzy rule. Apply it literally.
 
 An ADR records why a specific architectural decision was made at a specific point in time. If the code changes, the ADR still accurately describes what was decided and when. The code may have evolved away from it, but the record remains accurate. → **Repository.**
 
-A setup guide for configuring the Telegram channel describes steps a user takes against the current version of the software. If the configuration format changes, the guide becomes wrong. → **This sounds like it should be in the repo — but it shouldn't.** Setup guides should update on their own timeline, not be coupled to code commits. The right model is: the API reference (which maps directly to configuration structs) lives in the repo, and the setup guide that walks a user through using that API lives on the Wiki, updated by anyone when the steps change.
+A setup guide for configuring the Telegram channel describes steps a user takes against the current version of the software. If the configuration format changes, the guide becomes wrong. → **This sounds like it should be in the repo, but it shouldn't.** Setup guides should update on their own timeline, not be coupled to code commits. The right model is: the API reference (which maps directly to configuration structs) lives in the repo, and the setup guide that walks a user through using that API lives on the Wiki, updated by anyone when the steps change.
 
 ### 5.2 The Split in Practice
 
@@ -249,7 +249,7 @@ Home
 
 ### 6.1 The Format
 
-All Architecture Decision Records use the **Nygard format**, extended with YAML frontmatter for machine readability. ADR-004 is the existing model — this section formalizes it.
+All Architecture Decision Records use the **Nygard format**, extended with YAML frontmatter for machine readability. ADR-004 is the existing model. This section formalizes it.
 
 Every ADR has three sections and five frontmatter fields:
 
@@ -324,7 +324,7 @@ When an AI coding assistant reads a repository, it sees the code as it is now. I
 
 The root `AGENTS.md` is the project's strongest existing contribution to AI-assisted development. It tells AI coding assistants the commands to run, the architecture to respect, the risk tiers to apply, and the anti-patterns to avoid. It works because it is specific, opinionated, and short.
 
-As the workspace decomposes into crates (per the microkernel architecture RFC), each crate should have its own `AGENTS.md`. This is the mechanism by which architectural boundaries become enforceable at the AI-assistance layer — not just at compile time through crate dependencies, but at the reasoning layer before any code is written.
+As the workspace decomposes into crates (per the microkernel architecture RFC), each crate should have its own `AGENTS.md`. This is the mechanism by which architectural boundaries become enforceable at the AI-assistance layer, not just at compile time through crate dependencies, but at the reasoning layer before any code is written.
 
 ### 7.2 What Each Crate AGENTS.md Contains
 
@@ -538,7 +538,7 @@ No language variants. No duplicated READMEs. One authoritative English README th
 
 The legacy `docs/contributing/docs-contract.md` encoded an i18n parity requirement and a directory structure that this RFC supersedes. It has been removed; this section is its replacement.
 
-The replacement governs three things: artifact classification, the repo/wiki split, and ADR governance. It says nothing about i18n — locale parity is now handled by the [Maintainers → Docs & Translations](../maintainers/docs-and-translations.md) page.
+The replacement governs three things: artifact classification, the repo/wiki split, and ADR governance. It says nothing about i18n: locale parity is now handled by the [Maintainers → Docs & Translations](../maintainers/docs-and-translations.md) page.
 
 **Replacement docs-contract:**
 
@@ -599,7 +599,7 @@ These documentation-specific standards complement the broader standards proposed
 
 ### Diátaxis Framework (Documentation Structure)
 
-**What it is:** Diátaxis (https://diataxis.fr) is a systematic framework for technical documentation that divides content into four types: tutorials, how-to guides, reference, and explanation. It is the documentation framework behind the Python documentation, Django docs, and many others. It is highly compatible with the EA Artifacts approach — they answer different questions (Diátaxis: how to structure the content of a document; EA Artifacts: what type of document is this and where does it live).
+**What it is:** Diátaxis (https://diataxis.fr) is a systematic framework for technical documentation that divides content into four types: tutorials, how-to guides, reference, and explanation. It is the documentation framework behind the Python documentation, Django docs, and many others. It is highly compatible with the EA Artifacts approach: they answer different questions (Diátaxis: how to structure the content of a document; EA Artifacts: what type of document is this and where does it live).
 
 **How it applies:** User-facing documentation on the Wiki should follow Diátaxis structure. Code-adjacent documentation in the repository follows EA Artifacts. The two frameworks operate at different levels and do not conflict.
 
@@ -625,7 +625,7 @@ relates-to:
 ---
 ```
 
-A CI check should verify that all documents in `docs/` have valid frontmatter. This prevents documents from being written without first declaring their type and status — enforcing the classification discipline at the tooling level.
+A CI check should verify that all documents in `docs/` have valid frontmatter. This prevents documents from being written without first declaring their type and status, enforcing the classification discipline at the tooling level.
 
 ### CommonMark + GitHub Flavored Markdown
 
@@ -633,7 +633,7 @@ All documentation uses CommonMark (the standardized Markdown specification) with
 
 ### Vale for Prose Linting
 
-**What it is:** Vale (https://vale.sh) is a prose linter — it checks writing style, consistency, and readability using configurable rules. It can enforce things like: always use "you" not "the user", avoid passive voice in imperative sections, use consistent terminology ("plugin" not "extension" not "module").
+**What it is:** Vale (https://vale.sh) is a prose linter: it checks writing style, consistency, and readability using configurable rules. It can enforce things like: always use "you" not "the user", avoid passive voice in imperative sections, use consistent terminology ("plugin" not "extension" not "module").
 
 **Why it matters:** The current documentation is inconsistent in tone, terminology, and style. Some pages say "plugin", some say "module", some say "extension". Vale makes these rules automatic and enforces them at CI time, the same way Clippy enforces code quality.
 
@@ -645,7 +645,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ---
 
-### Phase 1 · v0.7.0 — "Clean the Root"
+### Phase 1 · v0.7.0: "Clean the Root"
 
 **Deliverables:**
 
@@ -666,7 +666,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ---
 
-### Phase 2 · v0.7.0–v0.8.0 — "Write the Missing ADRs"
+### Phase 2 · v0.7.0–v0.8.0: "Write the Missing ADRs"
 
 **Deliverables:**
 
@@ -686,7 +686,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ---
 
-### Phase 3 · v0.8.0–v0.9.0 — "The AI Layer"
+### Phase 3 · v0.8.0–v0.9.0: "The AI Layer"
 
 **Deliverables:**
 
@@ -704,7 +704,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ---
 
-### Phase 4 · v1.0.0 — "The Stable Platform"
+### Phase 4 · v1.0.0: "The Stable Platform"
 
 **Deliverables:**
 
@@ -725,30 +725,30 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ## Appendix A: Glossary
 
-**ADR (Architecture Decision Record)** — An immutable record of a significant architectural decision: the context that prompted it, what was decided, and the consequences. ADRs do not change once accepted; superseded decisions are recorded as new ADRs.
+**ADR (Architecture Decision Record)**: An immutable record of a significant architectural decision: the context that prompted it, what was decided, and the consequences. ADRs do not change once accepted; superseded decisions are recorded as new ADRs.
 
-**Diátaxis** — A systematic framework for technical documentation structure that divides content into tutorials (learning), how-to guides (goal-oriented), reference (information), and explanation (understanding). See https://diataxis.fr.
+**Diátaxis**: A systematic framework for technical documentation structure that divides content into tutorials (learning), how-to guides (goal-oriented), reference (information), and explanation (understanding). See https://diataxis.fr.
 
-**EA Artifacts on a Page** — A classification framework for enterprise architecture documents developed by Svyatoslav Kotusev. Classifies artifacts into five families: Considerations, Landscapes, Outlines, Designs, and Standards. See https://eaonapage.com.
+**EA Artifacts on a Page**: A classification framework for enterprise architecture documents developed by Svyatoslav Kotusev. Classifies artifacts into five families: Considerations, Landscapes, Outlines, Designs, and Standards. See https://eaonapage.com.
 
-**Frontmatter** — YAML metadata at the top of a Markdown file, delimited by `---`. Makes documents machine-readable and queryable by tools, CI checks, and AI assistants.
+**Frontmatter**: YAML metadata at the top of a Markdown file, delimited by `---`. Makes documents machine-readable and queryable by tools, CI checks, and AI assistants.
 
-**Nygard Format** — The ADR format introduced by Michael Nygard: three sections (Context, Decision, Consequences) that capture the essential reasoning without unnecessary ceremony.
+**Nygard Format**: The ADR format introduced by Michael Nygard: three sections (Context, Decision, Consequences) that capture the essential reasoning without unnecessary ceremony.
 
-**Strangler Fig Pattern** — A migration strategy in which new structure is built incrementally around the old, replacing it piece by piece rather than all at once. The system remains functional throughout the migration.
+**Strangler Fig Pattern**: A migration strategy in which new structure is built incrementally around the old, replacing it piece by piece rather than all at once. The system remains functional throughout the migration.
 
-**Vale** — A prose linter for technical documentation. Enforces style, consistency, and readability rules at CI time, the way Clippy enforces Rust code quality. See https://vale.sh.
+**Vale**: A prose linter for technical documentation. Enforces style, consistency, and readability rules at CI time, the way Clippy enforces Rust code quality. See https://vale.sh.
 
 ---
 
 ## Appendix B: Further Reading
 
-- **Diátaxis documentation framework** — https://diataxis.fr — The definitive reference for structuring technical documentation by type.
-- **EA Artifacts on a Page (v2.2)** — https://eaonapage.com — The classification framework used in Section 3.
-- **"Docs for Developers"** — Jared Bhatti et al. — A practical guide to technical documentation written by engineers who have maintained large documentation systems.
-- **Vale documentation** — https://vale.sh/docs — Setup guide and configuration reference for the prose linter proposed in Section 10.
-- **Michael Nygard on ADRs** — https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions — The original post that introduced the ADR format used in Section 6.
-- **GitHub Wikis documentation** — https://docs.github.com/en/communities/documenting-your-project-with-wikis — Reference for setting up and governing the GitHub Wiki proposed in Section 5.
+- **Diátaxis documentation framework**: https://diataxis.fr: The definitive reference for structuring technical documentation by type.
+- **EA Artifacts on a Page (v2.2)**: https://eaonapage.com: The classification framework used in Section 3.
+- **"Docs for Developers"**: Jared Bhatti et al.: A practical guide to technical documentation written by engineers who have maintained large documentation systems.
+- **Vale documentation**: https://vale.sh/docs: Setup guide and configuration reference for the prose linter proposed in Section 10.
+- **Michael Nygard on ADRs**: https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions: The original post that introduced the ADR format used in Section 6.
+- **GitHub Wikis documentation**: https://docs.github.com/en/communities/documenting-your-project-with-wikis: Reference for setting up and governing the GitHub Wiki proposed in Section 5.
 
 ---
 

@@ -55,7 +55,7 @@ events; only the JSONL writer is gated.
 ## On-disk format
 
 JSONL: one event per line, UTF-8, `0o600` permissions on Unix. Every
-line is `sync_data`'d after write — the line is durable before the
+line is `sync_data`'d after write, the line is durable before the
 emitting code returns.
 
 Line shape mirrors `zeroclaw_log::event::LogEvent`. Top-level keys:
@@ -92,7 +92,7 @@ Composite prefixes get three keys: `<prefix>`, `<prefix>_type`,
 match either coarse or precise.
 
 When a tracing call sets a composite-prefix field to a bare type (no
-`.`), only the `_type` slot is populated — that way a
+`.`), only the `_type` slot is populated, that way a
 `tracing::*!(model_provider = name, …)` call inside a span that
 already carries the full `<type>.<alias>` composite doesn't clobber it
 on the leaf→root merge.
@@ -111,7 +111,7 @@ Top-level filters (query params): `since_ts`, `until_ts`, `until_id`,
 `event.category = "internal"`), `limit`.
 
 Every other `?<key>=<value>` is treated as a per-attribution equality
-filter — the gateway validates the key against `is_attribution_field`
+filter, the gateway validates the key against `is_attribution_field`
 and rejects unknowns with `400`. The response includes
 `attribution_keys: string[]`, so callers don't have to guess.
 
@@ -224,7 +224,7 @@ Span fields are visible inline.
 
 On startup, if `log_persistence` is enabled and the file exists, the
 writer streams any schema-1 rows through an in-place migration to
-schema-2 before the first append. Pure streaming — bounded by a
+schema-2 before the first append. Pure streaming, bounded by a
 single line's allocation regardless of file size. The migrated file is
 atomically renamed into place. Files already at v2 are left untouched.
 
@@ -245,18 +245,18 @@ volume governor for genuine errors.
 
 ## Files of interest
 
-- `crates/zeroclaw-log/src/event.rs` — the canonical `LogEvent` shape.
-- `crates/zeroclaw-log/src/layer.rs` — the `tracing-subscriber` Layer
+- `crates/zeroclaw-log/src/event.rs`: the canonical `LogEvent` shape.
+- `crates/zeroclaw-log/src/layer.rs`: the `tracing-subscriber` Layer
   that captures every `tracing::*` call and feeds the pipeline.
-- `crates/zeroclaw-log/src/macro.rs` — `record!`, `scope!`, `spawn!`.
-- `crates/zeroclaw-log/src/writer.rs` — append + rolling trim.
-- `crates/zeroclaw-log/src/reader.rs` — `/api/logs` reader.
-- `crates/zeroclaw-log/src/config.rs` — `StoragePolicy`, `ToolIoPolicy`,
+- `crates/zeroclaw-log/src/macro.rs`: `record!`, `scope!`, `spawn!`.
+- `crates/zeroclaw-log/src/writer.rs`: append + rolling trim.
+- `crates/zeroclaw-log/src/reader.rs`: `/api/logs` reader.
+- `crates/zeroclaw-log/src/config.rs`: `StoragePolicy`, `ToolIoPolicy`,
   `ResolvedPolicy`.
-- `crates/zeroclaw-log/src/migrate.rs` — schema-1 → schema-2 streaming
+- `crates/zeroclaw-log/src/migrate.rs`: schema-1 → schema-2 streaming
   migration.
-- `crates/zeroclaw-log/src/observer_bridge.rs` — typed `Observer`
+- `crates/zeroclaw-log/src/observer_bridge.rs`: typed `Observer`
   projection for Prometheus / OTel consumers.
-- `crates/zeroclaw-gateway/src/api_logs.rs` — the HTTP adapter.
+- `crates/zeroclaw-gateway/src/api_logs.rs`: the HTTP adapter.
 
 Touch the source before you trust the prose on this page.

@@ -1,6 +1,6 @@
 # RPC Socket Transport
 
-The daemon exposes a JSON-RPC 2.0 interface over a local IPC stream — a Unix
+The daemon exposes a JSON-RPC 2.0 interface over a local IPC stream, a Unix
 domain socket on Unix and a named pipe on Windows. This is the primary
 transport for local clients like zerocode. The HTTP/WS gateway remains for
 webhooks, the web dashboard, and remote REST consumers.

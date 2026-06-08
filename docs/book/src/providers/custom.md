@@ -6,7 +6,7 @@ Three ways to add a provider ZeroClaw doesn't ship with:
 2. **Use the first-class local-server slots** (`lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm`). Thin wrappers with sensible defaults.
 3. **Implement the `ModelProvider` trait** in Rust. For anything that's not OpenAI-compatible.
 
-## OpenAI-compatible endpoint — use the `custom` slot
+## OpenAI-compatible endpoint: use the `custom` slot
 
 If the service speaks OpenAI chat-completions, this is a config-only change:
 
@@ -25,13 +25,13 @@ model_provider = "custom.gateway"
 risk_profile   = "hardened"
 ```
 
-This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use — `custom` is the catch-all for endpoints not represented by a vendor slot.
+This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use, `custom` is the catch-all for endpoints not represented by a vendor slot.
 
 ## First-class local-inference servers
 
 ZeroClaw ships canonical slots for popular local-inference stacks. They're all OpenAI-compatible under the hood but with default `uri` values pre-applied so you can usually omit `uri` entirely.
 
-### llama.cpp — slot `llamacpp`
+### llama.cpp: slot `llamacpp`
 
 ```bash
 llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
@@ -48,9 +48,9 @@ model = "ggml-org/gpt-oss-20b-GGUF"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `think` | `bool` | — | Sets `enable_thinking` at the top level of the request body. `false` signals thinking-capable models to skip chain-of-thought. |
-| `chat_template_kwargs` | table | — | Passed verbatim as `chat_template_kwargs` to the Jinja chat template. Use for model-family-specific template variables. |
-| `max_tokens` | `u32` | — | Maximum output tokens per response. |
+| `think` | `bool` | N/A | Sets `enable_thinking` at the top level of the request body. `false` signals thinking-capable models to skip chain-of-thought. |
+| `chat_template_kwargs` | table | N/A | Passed verbatim as `chat_template_kwargs` to the Jinja chat template. Use for model-family-specific template variables. |
+| `max_tokens` | `u32` | N/A | Maximum output tokens per response. |
 | `timeout_secs` | `u64` | 120 | Request timeout for non-streaming calls. |
 
 **Controlling thinking mode** varies by model family. `think = false` sets the top-level `enable_thinking` field in the request. Some models (e.g. Qwen3) read this flag from the Jinja template via `chat_template_kwargs` instead:
@@ -64,9 +64,9 @@ think = false
 chat_template_kwargs = { enable_thinking = false }
 ```
 
-Other model families use different template variable names — check your model's chat template and set the appropriate key under `chat_template_kwargs`.
+Other model families use different template variable names, check your model's chat template and set the appropriate key under `chat_template_kwargs`.
 
-### SGLang — slot `sglang`
+### SGLang: slot `sglang`
 
 ```bash
 python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
@@ -78,7 +78,7 @@ uri   = "http://localhost:30000/v1"      # family default
 model = "meta-llama/Llama-3.1-8B-Instruct"
 ```
 
-### vLLM — slot `vllm`
+### vLLM: slot `vllm`
 
 ```bash
 vllm serve meta-llama/Llama-3.1-8B-Instruct
@@ -92,9 +92,9 @@ model = "meta-llama/Llama-3.1-8B-Instruct"
 
 ### LM Studio, Osaurus, LiteLLM
 
-Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern — see the [catalog](./catalog.md).
+Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog](./catalog.md).
 
-## Wire protocol — `wire_api = "responses"`
+## Wire protocol: `wire_api = "responses"`
 
 Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit opt-in:
 
@@ -170,7 +170,7 @@ See `anthropic.rs` as a reference for a provider with a fully custom wire format
 
 ### Authentication errors
 
-- Verify the API key matches the endpoint (many vendors use key prefixes — `sk-`, `gsk_`, `sk-ant-`).
+- Verify the API key matches the endpoint (many vendors use key prefixes: `sk-`, `gsk_`, `sk-ant-`).
 - Check that `uri` includes the scheme (`http://` / `https://`) and the `/v1` path if the endpoint expects it.
 - Endpoints behind a VPN or proxy? Confirm routing from the ZeroClaw host.
 
@@ -180,18 +180,18 @@ See `anthropic.rs` as a reference for a provider with a fully custom wire format
   ```bash
   curl -sS "$URI/models" -H "Authorization: Bearer $API_KEY" | jq
   ```
-- If the endpoint doesn't implement `/models`, send a direct chat request and read the error — most endpoints return the expected model family in the error body.
+- If the endpoint doesn't implement `/models`, send a direct chat request and read the error, most endpoints return the expected model family in the error body.
 - Gateway services often expose only a subset of upstream models.
 
 ### Connection issues
 
-- `curl -I $URI` — does it respond?
+- `curl -I $URI`, does it respond?
 - Firewall, proxy, egress rules? VPS providers sometimes block outbound high ports.
 - Vendor status page if it's a hosted service.
 
 ## See also
 
-- [Overview](./overview.md) — provider model and how per-agent dispatch works
-- [Configuration](./configuration.md) — full `[providers.*]` schema, Azure typed config, regional and OAuth variants
-- [Catalog](./catalog.md) — every canonical slot with a worked TOML example
-- [Developing → Plugin protocol](../developing/plugin-protocol.md) — if a plugin works better than a first-class crate
+- [Overview](./overview.md): provider model and how per-agent dispatch works
+- [Configuration](./configuration.md): full `[providers.*]` schema, Azure typed config, regional and OAuth variants
+- [Catalog](./catalog.md): every canonical slot with a worked TOML example
+- [Developing → Plugin protocol](../developing/plugin-protocol.md): if a plugin works better than a first-class crate

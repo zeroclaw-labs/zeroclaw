@@ -6,9 +6,9 @@ Run ZeroClaw in Docker, Podman, Kubernetes, or any OCI runtime.
 
 Pushed to GitHub Container Registry (`ghcr.io`) on every stable release:
 
-- `ghcr.io/zeroclaw-labs/zeroclaw:latest` — latest stable
-- `ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5` — pinned
-- `ghcr.io/zeroclaw-labs/zeroclaw:debian` — Debian-based image (larger, broader glibc support)
+- `ghcr.io/zeroclaw-labs/`:latest`: latest stable
+- `ghcr.io/zeroclaw-labs/`:v0.7.5`: pinned
+- `ghcr.io/zeroclaw-labs/`:debian`: Debian-based image (larger, broader glibc support)
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
 
@@ -24,7 +24,7 @@ docker run -d \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
-The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config — you still need to run quickstart before it's useful:
+The image expects persistent state at `/zeroclaw-data`. On first run, it bootstraps a default config: you still need to run quickstart before it's useful:
 
 ```bash
 docker exec -it zeroclaw zeroclaw quickstart
@@ -55,9 +55,9 @@ docker compose exec zeroclaw zeroclaw quickstart
 
 Drop `ZEROCLAW_ALLOW_PUBLIC_BIND` if you only need local access.
 
-## macOS — OrbStack vs Colima
+## macOS: OrbStack vs Colima
 
-macOS has no native Linux kernel, so every option (Docker Desktop, Podman, OrbStack, Colima) runs the container inside a lightweight Linux VM. For a Mac dev box, the two mac-native VMs worth comparing are OrbStack and Colima — both run the container with the same `docker run`/Compose commands above.
+macOS has no native Linux kernel, so every option (Docker Desktop, Podman, OrbStack, Colima) runs the container inside a lightweight Linux VM. For a Mac dev box, the two mac-native VMs worth comparing are OrbStack and Colima, both run the container with the same `docker run`/Compose commands above.
 
 | | OrbStack | Colima |
 |---|---|---|
@@ -75,13 +75,13 @@ brew install colima docker docker-compose   # docker-compose = the Compose v2 pl
 colima start --cpu 4 --memory 8   # add --network-address to expose the VM IP to macOS
 ```
 
-Performance is comparable for typical dev workloads; the real differentiators are licensing (commercial vs OSS) and UX preference, not raw speed — benchmark both on your own machine if idle RAM or build throughput matters. Either way you drive the engine inside the VM with `docker`; systemd quadlets (below) are a Linux-host feature and don't apply on macOS.
+Performance is comparable for typical dev workloads; the real differentiators are licensing (commercial vs OSS) and UX preference, not raw speed; benchmark both on your own machine if idle RAM or build throughput matters. Either way you drive the engine inside the VM with `docker`; systemd quadlets (below) are a Linux-host feature and don't apply on macOS.
 
 ## Podman & systemd quadlets
 
-On a Linux server, the cleanest way to run the container long-term is a Podman **quadlet** — a declarative unit file that systemd turns into a real service. You get `systemctl` lifecycle, journald logs, auto-restart, and boot ordering with no daemon and no `--restart` hack, and the unit file is config you commit to git. This is the recommended server pattern; `docker run`/Compose are fine for a laptop.
+On a Linux server, the cleanest way to run the container long-term is a Podman **quadlet**: a declarative unit file that systemd turns into a real service. You get `systemctl` lifecycle, journald logs, auto-restart, and boot ordering with no daemon and no `--restart` hack, and the unit file is config you commit to git. This is the recommended server pattern; `docker run`/Compose are fine for a laptop.
 
-A quadlet is a `*.container` file (siblings: `.pod`, `.volume`, `.network`, `.kube`, `.build`, `.image`). Podman's systemd generator reads it on every `daemon-reload` and writes a transient `.service` — you never author the `.service` yourself.
+A quadlet is a `*.container` file (siblings: `.pod`, `.volume`, `.network`, `.kube`, `.build`, `.image`). Podman's systemd generator reads it on every `daemon-reload` and writes a transient `.service`; you never author the `.service` yourself.
 
 Rootful units live in `/etc/containers/systemd/`; rootless in `~/.config/containers/systemd/`.
 
@@ -112,7 +112,7 @@ Restart=always
 WantedBy=multi-user.target default.target
 ```
 
-Deploy (idempotent — safe to re-run; re-applying converges the running container, never duplicates it):
+Deploy (idempotent, safe to re-run; re-applying converges the running container, never duplicates it):
 
 ```bash
 sudo cp zeroclaw.container /etc/containers/systemd/
@@ -128,11 +128,11 @@ systemctl status zeroclaw
 journalctl -u zeroclaw -f
 ```
 
-There is no `systemctl enable` step for generated units — the `[Install] WantedBy=` line is what brings it up on boot.
+There is no `systemctl enable` step for generated units: the `[Install] WantedBy=` line is what brings it up on boot.
 
-- **Version pinning vs `:latest`.** Pin a tag or digest (`Image=ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5` or `...@sha256:...`) for reproducible, auditable deploys — upgrading is then a reviewable tag bump in the committed `.container` file. `Pull=newer` + `AutoUpdate=registry` instead give rolling upgrades, driven by `podman-auto-update.timer` (`sudo systemctl enable --now podman-auto-update.timer`). Pick reproducibility or currency; the deploy loop is the same either way.
+- **Version pinning vs `:latest`.** Pin a tag or digest (`Image=ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5` or `...@sha256:...`) for reproducible, auditable deploys; upgrading is then a reviewable tag bump in the committed `.container` file. `Pull=newer` + `AutoUpdate=registry` instead give rolling upgrades, driven by `podman-auto-update.timer` (`sudo systemctl enable --now podman-auto-update.timer`). Pick reproducibility or currency; the deploy loop is the same either way.
 - **Rootless variant.** Drop the file in `~/.config/containers/systemd/`, use `systemctl --user daemon-reload && systemctl --user restart zeroclaw`, and run `loginctl enable-linger $USER` so it survives logout (same lingering note as [Service & daemon](../ops/service.md)).
-- **WSL2.** Modern WSL2 runs systemd (`[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`), so this exact quadlet pattern works inside a WSL distro — no Windows-specific dialect.
+- **WSL2.** Modern WSL2 runs systemd (`[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`), so this exact quadlet pattern works inside a WSL distro: no Windows-specific dialect.
 
 ## Config inside containers
 
@@ -148,16 +148,16 @@ docker run -d --name zeroclaw \
 
 For container workloads, set `uri` on each `[providers.models.<type>.<alias>]` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The `ZEROCLAW_providers__models__<type>__<alias>__uri=...` env override can do the same at runtime without editing `config.toml`.
 
-## Channels that poll (Telegram, email) — just work
+## Channels that poll (Telegram, email): just work
 
-Outbound-initiated channels don't need any special container configuration. Telegram polling, IMAP, MQTT, Nostr relays — all pull; the container only needs egress.
+Outbound-initiated channels don't need any special container configuration. Telegram polling, IMAP, MQTT, Nostr relays: all pull; the container only needs egress.
 
-## Channels that receive webhooks — need ingress
+## Channels that receive webhooks: need ingress
 
 Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options:
 
-1. **Expose the gateway** — `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
-2. **Use a tunnel** — ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
+1. **Expose the gateway**: `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
+2. **Use a tunnel**: ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
 
 Configure a tunnel via `zeroclaw config set gateway.tunnel.provider=<ngrok|cloudflare>` and the related `gateway.tunnel.*` fields (see the [Config reference](../reference/config.md)); the resulting public URL is what you point your webhook senders at.
 
@@ -193,7 +193,7 @@ spec:
             claimName: zeroclaw-data
 ```
 
-**Scaling:** ZeroClaw is single-writer per workspace. Don't scale horizontally — run one instance per agent.
+**Scaling:** ZeroClaw is single-writer per workspace. Don't scale horizontally; run one instance per agent.
 
 ## Re-authenticating after logout
 
@@ -211,13 +211,13 @@ docker compose exec zeroclaw zeroclaw gateway get-paircode --new
 
 ## Gotchas
 
-- **macOS hostname quirks (Docker Desktop, colima, Rancher Desktop).** `host.docker.internal` works out of the box on **Docker Desktop** for macOS. On **colima**, it is only reachable if you installed with `colima start --network-address` (otherwise the container can't see the host at all — connect via the VM's gateway IP, usually `192.168.5.2`, or tunnel through a shared network). **Rancher Desktop** behaves like Docker Desktop for recent versions but has had `host.docker.internal` resolve-failures on older releases. If provider calls fail with `connection refused` to `host.docker.internal`, verify with `docker run --rm alpine getent hosts host.docker.internal` — empty output means the hostname isn't resolvable and you need an explicit IP.
+- **macOS hostname quirks (Docker Desktop, colima, Rancher Desktop).** `host.docker.internal` works out of the box on **Docker Desktop** for macOS. On **colima**, it is only reachable if you installed with `colima start --network-address` (otherwise the container can't see the host at all; connect via the VM's gateway IP, usually `192.168.5.2`, or tunnel through a shared network). **Rancher Desktop** behaves like Docker Desktop for recent versions but has had `host.docker.internal` resolve-failures on older releases. If provider calls fail with `connection refused` to `host.docker.internal`, verify with `docker run --rm alpine getent hosts host.docker.internal`: empty output means the hostname isn't resolvable and you need an explicit IP.
 - **Host-side services.** If a provider is Ollama on the host, `uri = "http://host.docker.internal:11434"` (under `[providers.models.ollama.<alias>]`) works on Docker Desktop. On Linux Docker you may need `--add-host=host.docker.internal:host-gateway`.
 - **Memory persistence.** The SQLite memory file sits inside `/zeroclaw-data/workspace/`. If you don't mount that volume, every restart loses conversation history.
-- **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default `config.toml` and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist` — outside the mount — so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
+- **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default `config.toml` and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist`, outside the mount, so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
 - **No hardware passthrough by default.** GPIO / USB need explicit `--device` flags (`--device /dev/ttyUSB0`), and the container user needs matching GID for `dialout`/`gpio` groups.
 
 ## Next
 
 - [Service management](./service.md)
-- [Operations → Network deployment](../ops/network-deployment.md) — tunnels, reverse proxies
+- [Operations → Network deployment](../ops/network-deployment.md): tunnels, reverse proxies

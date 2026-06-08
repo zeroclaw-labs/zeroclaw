@@ -1,4 +1,4 @@
-# Hardware Peripherals Design — ZeroClaw
+# Hardware Peripherals Design: ZeroClaw
 
 ZeroClaw enables microcontrollers (MCUs) and Single Board Computers (SBCs) to **dynamically interpret natural language commands**, generate hardware-specific code, and execute peripheral interactions in real-time.
 
@@ -160,7 +160,7 @@ pub trait Peripheral: Send + Sync {
 1. **Startup:** ZeroClaw loads config, sees `peripherals.boards`.
 2. **Connect:** For each board, create a `Peripheral` impl, call `connect()`.
 3. **Tools:** Collect tools from all connected peripherals; merge with default tools.
-4. **Agent loop:** Agent can call `gpio_write`, `sensor_read`, etc. — these delegate to the peripheral.
+4. **Agent loop:** Agent can call `gpio_write`, `sensor_read`, etc., these delegate to the peripheral.
 5. **Shutdown:** Call `disconnect()` on each peripheral.
 
 ### Board Support
@@ -197,7 +197,7 @@ Simple JSON over serial for boards without gRPC support:
 
 ## 8. Firmware (Separate Repo or Crate)
 
-- **zeroclaw-firmware** or **zeroclaw-peripheral** — a separate crate/workspace.
+- **zeroclaw-firmware** or **zeroclaw-peripheral**: a separate crate/workspace.
 - Targets: `thumbv7em-none-eabihf` (STM32), `armv7-unknown-linux-gnueabihf` (RPi), etc.
 - Uses `embassy` or Zephyr for STM32.
 - Implements the protocol above.
@@ -211,13 +211,13 @@ Simple JSON over serial for boards without gRPC support:
 - [x] Add `--peripheral` flag to agent
 - [x] Document in AGENTS.md
 
-### Phase 2: Host-Mediated — Hardware Discovery ✅ (Done)
+### Phase 2: Host-Mediated: Hardware Discovery ✅ (Done)
 
 - [x] `zeroclaw hardware discover`: enumerate USB devices (VID/PID)
 - [x] Board registry: map VID/PID → architecture, name (e.g. Nucleo-F401RE)
 - [x] `zeroclaw hardware introspect <path>`: memory map, peripheral list
 
-### Phase 3: Host-Mediated — Serial / J-Link
+### Phase 3: Host-Mediated: Serial / J-Link
 
 - [x] `SerialPeripheral` for STM32 over USB CDC
 - [ ] probe-rs or OpenOCD integration for flash/debug
@@ -231,18 +231,18 @@ Simple JSON over serial for boards without gRPC support:
 
 **Usage:** `zeroclaw config set peripherals.datasheet-dir docs/datasheets`. Place `.md` or `.txt` files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`). Files in `_generic/` or named `generic.md` apply to all boards. Chunks are retrieved by keyword match and injected into the user message context.
 
-### Phase 5: Edge-Native — RPi ✅ (Done)
+### Phase 5: Edge-Native: RPi ✅ (Done)
 
 - [x] ZeroClaw on Raspberry Pi (native GPIO via rppal)
 - [ ] gRPC/nanoRPC server for local peripheral access
 - [ ] Code persistence (store synthesized snippets)
 
-### Phase 6: Edge-Native — ESP32
+### Phase 6: Edge-Native: ESP32
 
-- [x] Host-mediated ESP32 (serial transport) — same JSON protocol as STM32
-- [x] `esp32` firmware crate (`firmware/esp32`) — GPIO over UART
+- [x] Host-mediated ESP32 (serial transport), same JSON protocol as STM32
+- [x] `esp32` firmware crate (`firmware/esp32`): GPIO over UART
 - [x] ESP32 in hardware registry (CH340 VID/PID)
-- [ ] ZeroClaw *on* ESP32 (WiFi + LLM, edge-native) — future
+- [ ] ZeroClaw *on* ESP32 (WiFi + LLM, edge-native), future
 - [ ] Wasm or template-based execution for LLM-generated logic
 
 **Usage:** Flash `firmware/esp32` to ESP32, add `board = "esp32"`, `transport = "serial"`, `path = "/dev/ttyUSB0"` to config.
@@ -261,27 +261,27 @@ Simple JSON over serial for boards without gRPC support:
 
 ## 11. Non-Goals (For Now)
 
-- Running full ZeroClaw *on* bare STM32 (no WiFi, limited RAM) — use Host-Mediated instead
-- Real-time guarantees — peripherals are best-effort
-- Arbitrary native code execution from LLM — prefer Wasm or templates
+- Running full ZeroClaw *on* bare STM32 (no WiFi, limited RAM), use Host-Mediated instead
+- Real-time guarantees: peripherals are best-effort
+- Arbitrary native code execution from LLM: prefer Wasm or templates
 
 ## 12. Related Documents
 
-- [adding-boards-and-tools.md](adding-boards-and-tools.md) — How to add boards and datasheets
-- [network-deployment.md](../ops/network-deployment.md) — RPi and network deployment
+- [adding-boards-and-tools.md](adding-boards-and-tools.md): How to add boards and datasheets
+- [network-deployment.md](../ops/network-deployment.md): RPi and network deployment
 
 ## 13. References
 
 - [Zephyr RTOS Rust support](https://docs.zephyrproject.org/latest/develop/languages/rust/index.html)
-- [Embassy](https://embassy.dev/) — async embedded framework
-- [rppal](https://github.com/golemparts/rppal) — Raspberry Pi GPIO in Rust
+- [Embassy](https://embassy.dev/): async embedded framework
+- [rppal](https://github.com/golemparts/rppal): Raspberry Pi GPIO in Rust
 - [STM32 Nucleo-F401RE](https://www.st.com/en/evaluation-tools/nucleo-f401re.html)
-- [tonic](https://github.com/hyperium/tonic) — gRPC for Rust
-- [probe-rs](https://probe.rs/) — ARM debug probe, flash, memory access
-- [nusb](https://github.com/nic-hartley/nusb) — USB device enumeration (VID/PID)
+- [tonic](https://github.com/hyperium/tonic): gRPC for Rust
+- [probe-rs](https://probe.rs/): ARM debug probe, flash, memory access
+- [nusb](https://github.com/nic-hartley/nusb): USB device enumeration (VID/PID)
 
 ## 14. Raw Prompt Summary
 
-> *"Boards like ESP, Raspberry Pi, or boards with WiFi can connect to an LLM (Gemini or open-source). ZeroClaw runs on the device, creates its own gRPC, spins it up, and communicates with peripherals. User asks via WhatsApp: 'move X arm' or 'turn on LED'. ZeroClaw gets accurate documentation, writes code, executes it, stores it optimally, runs it, and turns on the LED — all on the development board.*
+> *"Boards like ESP, Raspberry Pi, or boards with WiFi can connect to an LLM (Gemini or open-source). ZeroClaw runs on the device, creates its own gRPC, spins it up, and communicates with peripherals. User asks via WhatsApp: 'move X arm' or 'turn on LED'. ZeroClaw gets accurate documentation, writes code, executes it, stores it optimally, runs it, and turns on the LED, all on the development board.*
 >
 > *For STM Nucleo connected via USB/J-Link/Aardvark to my Mac: ZeroClaw from my Mac accesses the hardware, installs or writes what it wants on the device, and returns the result. Example: 'Hey ZeroClaw, what are the available/readable addresses on this USB device?' It can figure out what's connected where and suggest."*

@@ -45,10 +45,10 @@ Compiling ZeroClaw from source needs ~2 GB RAM at peak. On a 512 MB Raspberry Pi
 
 Options:
 
-1. **Use a prebuilt** — `./install.sh --prebuilt` skips the toolchain and downloads from GitHub Releases
+1. **Use a prebuilt**: `./install.sh --prebuilt` skips the toolchain and downloads from GitHub Releases
 2. **Cross-compile on a bigger machine and copy the binary**
-3. **Serialise the build** — `CARGO_BUILD_JOBS=1 cargo build --release --locked`
-4. **Add swap** (works for RAM, costs disk — check you have both)
+3. **Serialise the build**: `CARGO_BUILD_JOBS=1` cargo build --release --locked`
+4. **Add swap** (works for RAM, costs disk, check you have both)
 
 ### Build is very slow
 
@@ -81,7 +81,7 @@ Persist in your shell profile.
 
 ### Quickstart won't overwrite an existing config
 
-`zeroclaw quickstart` does not have a `--force` flag — it intentionally leaves an existing `~/.zeroclaw/config.toml` alone. To run a fresh quickstart on a stale install, delete the directory and start over:
+`zeroclaw quickstart` does not have a `--force` flag, it intentionally leaves an existing `~/.zeroclaw/config.toml` alone. To run a fresh quickstart on a stale install, delete the directory and start over:
 
 ```bash
 rm -rf ~/.zeroclaw
@@ -136,7 +136,7 @@ requires_openai_auth = true
 
 Notes:
 
-- Subscription auth uses stored auth profiles — set `requires_openai_auth = true` on the alias and leave `api_key` unset.
+- Subscription auth uses stored auth profiles: set `requires_openai_auth = true` on the alias and leave `api_key` unset.
 - `api_key` / `uri` on the alias entry are only needed for custom OpenAI-compatible gateways or other explicit endpoint overrides.
 - The streaming-disabled warning by itself is not an auth failure; ZeroClaw retries the request in non-streaming mode.
 
@@ -144,9 +144,9 @@ Notes:
 
 Check journald / the platform log (see [Logs & observability](./observability.md)) for the actual error. Common causes:
 
-- **Invalid config** — `zeroclaw config list` to print resolved values, `zeroclaw config schema` to see the expected shape
-- **Port conflict** — another process on `42617`; change `[gateway] port` or free the port
-- **Missing secrets** — encrypted secrets store can't decrypt because the key file is gone; restore from backup or re-run onboarding
+- **Invalid config**: `zeroclaw config list` to print resolved values, `zeroclaw config schema` to see the expected shape
+- **Port conflict**: another process on `42617`; change `[gateway] port` or free the port
+- **Missing secrets**: encrypted secrets store can't decrypt because the key file is gone; restore from backup or re-run onboarding
 
 ### Daemon keeps restarting
 
@@ -201,7 +201,7 @@ rm -rf ~/.zeroclaw/workspace/matrix-crypto
 
 ### IMAP polling stopped
 
-Most often an auth failure — provider rotated the password or the app-password expired. Check:
+Most often an auth failure, provider rotated the password or the app-password expired. Check:
 
 ```bash
 journalctl --user -u zeroclaw -n 200 | grep -i imap
@@ -214,14 +214,14 @@ journalctl --user -u zeroclaw -n 200 | grep -i imap
 ### "Connection timed out" to Ollama
 
 - Ollama daemon not running: `systemctl status ollama` (Linux), `brew services list` (macOS)
-- Wrong URL in config — from inside a container, `localhost:11434` doesn't reach the host; use `host.docker.internal` or the host's LAN IP
-- Firewall blocking port 11434 — rare locally, common on shared LANs
+- Wrong URL in config, from inside a container, `localhost:11434` doesn't reach the host; use `host.docker.internal` or the host's LAN IP
+- Firewall blocking port 11434, rare locally, common on shared LANs
 
 ### Anthropic / OpenAI 401
 
 API key invalid or expired. Regenerate at the provider's dashboard, update in `[providers.models.<name>] api_key`, restart the service.
 
-If using OAuth (`sk-ant-oat*`), the OAuth token may have expired — OAuth-issued tokens are longer-lived but not infinite. Re-authenticate.
+If using OAuth (`sk-ant-oat*`), the OAuth token may have expired. OAuth-issued tokens are longer-lived but not infinite. Re-authenticate.
 
 ---
 
@@ -239,9 +239,9 @@ See [Security → Autonomy levels](../security/autonomy.md).
 
 ### Tool invocations fail inside Docker sandbox
 
-- Container image isn't pulled — run `docker pull <image>` for whatever you have configured under `[security.sandbox].image` (default: `alpine:latest`)
-- Docker daemon not reachable from the ZeroClaw user — check `docker info`
-- Tool needs a device that's not passed through — extend `allow_devices`
+- Container image isn't pulled, run `docker pull <image>` for whatever you have configured under `[security.sandbox].image` (default: `alpine:latest`)
+- Docker daemon not reachable from the ZeroClaw user, check `docker info`
+- Tool needs a device that's not passed through, extend `allow_devices`
 
 ### Browser tool hangs on first use
 
@@ -264,7 +264,7 @@ Use `zeroclaw service logs` to tail the installed service logs. Add `--follow` t
 - macOS: `log stream --predicate 'process == "zeroclaw"'`
 - If you are running `zeroclaw daemon` directly in a terminal, use that foreground output instead of service log commands.
 
-If that succeeds interactively but the service dies in the background, it's almost always config or permissions — read the journal:
+If that succeeds interactively but the service dies in the background, it's almost always config or permissions, read the journal:
 
 ```bash
 journalctl --user -u zeroclaw --since "5 minutes ago"
@@ -297,7 +297,7 @@ zeroclaw channel doctor
 journalctl --user -u zeroclaw --since "1 hour ago" > zeroclaw-log.txt
 ```
 
-Sanitise `zeroclaw-log.txt` (redact channel tokens if any slipped through — they shouldn't) and attach it to the issue. See [Contributing → Communication](../contributing/communication.md) for where.
+Sanitise `zeroclaw-log.txt` (redact channel tokens if any slipped through, they shouldn't) and attach it to the issue. See [Contributing → Communication](../contributing/communication.md) for where.
 
 ## See also
 

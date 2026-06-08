@@ -1,6 +1,6 @@
 # Building the web dashboard
 
-The web dashboard at `web/` is a Vite + React + TypeScript app. Its TypeScript API client is generated from the gateway's runtime OpenAPI spec, not hand-written. Both the spec snapshot and the generated client are derived artifacts — neither is committed.
+The web dashboard at `web/` is a Vite + React + TypeScript app. Its TypeScript API client is generated from the gateway's runtime OpenAPI spec, not hand-written. Both the spec snapshot and the generated client are derived artifacts, neither is committed.
 
 ## Quickstart
 
@@ -22,7 +22,7 @@ cargo web install       # npm install in web/
 | `target/openapi.json`           | `cargo web gen-api`      | gitignored |
 | `web/dist/`                     | `cargo web build`        | gitignored |
 
-`cargo web gen-api` renders the OpenAPI spec in-process from `zeroclaw_gateway::openapi::build_spec()`, writes it to `target/openapi.json`, and feeds that file to `openapi-typescript`. The same `build_spec()` serves `/api/openapi.json` at runtime, so the spec on disk is never the source of truth — it is a transient handoff between Rust and the TS codegen.
+`cargo web gen-api` renders the OpenAPI spec in-process from `zeroclaw_gateway::openapi::build_spec()`, writes it to `target/openapi.json`, and feeds that file to `openapi-typescript`. The same `build_spec()` serves `/api/openapi.json` at runtime, so the spec on disk is never the source of truth, it is a transient handoff between Rust and the TS codegen.
 
 ## Why nothing is committed
 
@@ -37,13 +37,13 @@ Generating on demand keeps the runtime `build_spec()` as the single contract sou
 ## Editing flow
 
 1. Change a gateway handler or schema in `crates/zeroclaw-gateway/`.
-2. Run `cargo web check` — `gen-api` regenerates `api-generated.ts` from the new spec, then `tsc -b` typechecks the dashboard against it. Any consumer that relies on a now-removed field fails to compile.
+2. Run `cargo web check`: `gen-api` regenerates `api-generated.ts` from the new spec, then `tsc -b` typechecks the dashboard against it. Any consumer that relies on a now-removed field fails to compile.
 3. Update consumers in `web/src/` to match.
 4. `cargo web build` for the final bundle.
 
 ## CI and release builds
 
-CI does not run `cargo web build` — the lint/build/test jobs use a `web/dist/.gitkeep` placeholder so the gateway crate compiles without the bundle. Producing a release artifact that includes the dashboard is a separate step:
+CI does not run `cargo web build`: the lint/build/test jobs use a `web/dist/.gitkeep` placeholder so the gateway crate compiles without the bundle. Producing a release artifact that includes the dashboard is a separate step:
 
 ```bash
 cargo web build

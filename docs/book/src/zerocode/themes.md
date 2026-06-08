@@ -18,8 +18,8 @@ choice takes effect immediately and is written to `zerocode-config.toml`:
 name = "tokyo_night"
 ```
 
-The highlighted row previews the theme's palette inline — a strip of colour
-blocks for its canvas, title, heading, body, warn, and tool roles — so you can
+The highlighted row previews the theme's palette inline, a strip of colour
+blocks for its canvas, title, heading, body, warn, and tool roles, so you can
 see the colours before applying.
 
 ### Available themes
@@ -27,10 +27,10 @@ see the colours before applying.
 Two themes are authored directly in zerocode because they have no registry
 entry:
 
-- **`terminal`** — inherits your terminal's own colours. Every role is left to
+- **`terminal`**: inherits your terminal's own colours. Every role is left to
   the terminal default and the app skips painting a background, so a tuned shell
   palette shows through untouched.
-- **`icy_blue`** — the default on non-macOS platforms.
+- **`icy_blue`**: the default on non-macOS platforms.
 
 The remaining themes are generated at build time from the dashboard theme
 registry (`web/src/contexts/themes.json`), the single source of truth zerocode,
@@ -43,7 +43,7 @@ The default theme is `terminal` on macOS and `icy_blue` on every other
 platform.
 
 > If `[theme].name` (or a per-agent override below) names a theme this build
-> does not have — a typo, or a config written by a newer build — zerocode falls
+> does not have, a typo, or a config written by a newer build, zerocode falls
 > back to the `terminal` theme rather than refusing to start.
 
 ## Per-agent themes (Code & Chat panes)
@@ -76,8 +76,8 @@ none). The footer shows the keys.
   `Theme → <agent>`); pick a theme and it is assigned to that agent.
 - `d` clears the highlighted agent's override.
 
-Assignments and clears apply **live** — the Code/Chat pane re-themes on the
-next frame without restarting zerocode — and are persisted to
+Assignments and clears apply **live**: the Code/Chat pane re-themes on the
+next frame without restarting zerocode, and are persisted to
 `zerocode-config.toml`. An override naming an unknown theme falls back to the
 `terminal` theme, same as the global setting.
 
@@ -87,8 +87,8 @@ zerocode detects how much colour your terminal can render and adapts its output
 once, on first paint:
 
 - **Truecolor (24-bit)** is the default for virtually every terminal. zerocode
-  emits 24-bit colour, which modern terminals — and terminal multiplexers
-  configured for it — render directly.
+  emits 24-bit colour, which modern terminals, and terminal multiplexers
+  configured for it, render directly.
 - **xterm-256** is used for macOS Terminal.app, which lacks 24-bit colour
   (detected via `TERM_PROGRAM=Apple_Terminal`). iTerm2, kitty, WezTerm, Ghostty,
   and other truecolor terminals are unaffected.
@@ -117,8 +117,8 @@ Any unrecognised value is ignored and normal detection runs.
 
 ### tmux: colours look wrong or washed out
 
-If you run zerocode inside tmux — commonly over SSH to a Raspberry Pi or other
-remote host — and the palette renders flat or near-monochrome, the cause is
+If you run zerocode inside tmux, commonly over SSH to a Raspberry Pi or other
+remote host, and the palette renders flat or near-monochrome, the cause is
 almost always tmux not advertising truecolor (RGB) support for the outer
 terminal. zerocode emits 24-bit colour, but tmux only forwards it to your
 terminal when it knows the terminal supports RGB.

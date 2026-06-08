@@ -31,7 +31,7 @@ relays = [
 allowed_pubkeys = ["npub1..."]            # empty = deny all, "*" = allow all
 ```
 
-- **Auth:** raw private key (`nsec` bech32 or hex). Store in the encrypted secrets backend — never in a checked-in config.
+- **Auth:** raw private key (`nsec` bech32 or hex). Store in the encrypted secrets backend; never in a checked-in config.
 - **Inbound:** kind-1 (text), kind-4 (DM, NIP-04), and kind-1059 (gift-wrap, NIP-17).
 - **Outbound:** same kinds. Zap handling is experimental.
 - **Relays:** the agent connects to all listed relays; use 3–5 for reliability. If `relays` is omitted, ZeroClaw connects to a built-in set of popular public relays.
@@ -72,7 +72,7 @@ subreddit = "rust"                        # optional: filter to a single subredd
 
 Bots on public social networks attract adversarial input. Two precautions:
 
-1. **Restrict who the agent will respond to.** Use `allowed_pubkeys` (Nostr) or `allowed_users` (Twitter) to whitelist senders. Bluesky has no per-channel allowlist field — gate at the autonomy / tool layer instead. The default empty-list behaviour is **deny all** for the channels that have an allowlist field.
+1. **Restrict who the agent will respond to.** Use `allowed_pubkeys` (Nostr) or `allowed_users` (Twitter) to whitelist senders. Bluesky has no per-channel allowlist field; gate at the autonomy / tool layer instead. The default empty-list behaviour is **deny all** for the channels that have an allowlist field.
 2. **Keep autonomy level at `Supervised` or lower.** A public-facing agent in `Full` autonomy is effectively a public shell. For public-facing channels, restrict the tool surface in the global tool-policy config rather than expecting per-channel `tools_allow` (no such per-channel field exists).
 
 ## Rate limits and backoff

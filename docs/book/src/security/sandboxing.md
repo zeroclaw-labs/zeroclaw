@@ -30,15 +30,15 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 ### Filesystem
 
-- **Read access** — restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
-- **Write access** — restricted to the workspace and `/tmp`.
-- **Forbidden paths** — anything listed in `[risk_profiles.<alias>].forbidden_paths`.
+- **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
+- **Write access**: restricted to the workspace and `/tmp`.
+- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`.
 
 ### Network
 
 By default, sandboxed tools have full network egress but no inbound listening. Per-backend caveats:
 
-- Landlock does not control network — it is filesystem-only.
+- Landlock does not control network, it is filesystem-only.
 - Bubblewrap and Firejail can block network when configured.
 - Docker container network mode follows `[runtime.docker].network` when `[runtime].kind = "docker"`.
 
@@ -75,7 +75,7 @@ The Linux-native path. Zero setup, kernel-enforced, very low overhead. Requires 
 
 Limitations:
 
-- No network confinement — Landlock only controls filesystem access.
+- No network confinement: Landlock only controls filesystem access.
 - `forbidden_paths` is enforced via path-based rules, not inode-based, so a clever symlink can sometimes escape (we resolve links before handing to Landlock to mitigate this).
 
 ### Bubblewrap (`bwrap`)
@@ -118,9 +118,9 @@ Pros: strong isolation, works on any OS. Cons: per-invocation container startup 
 
 ### Seatbelt (macOS)
 
-Native macOS sandbox (`sandbox-exec`). Profiles are SBPL — ZeroClaw bundles one for tool runs. Works on macOS 10.11+.
+Native macOS sandbox (`sandbox-exec`). Profiles are SBPL: ZeroClaw bundles one for tool runs. Works on macOS 10.11+.
 
-Limitation: some CLI tools (older `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, the tool needs broader filesystem access — consider switching to Docker.
+Limitation: some CLI tools (older `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, the tool needs broader filesystem access: consider switching to Docker.
 
 ### `none`
 
@@ -128,9 +128,9 @@ No sandboxing. Tools run with the full privileges of the ZeroClaw service user. 
 
 ## Troubleshooting
 
-- **"Sandbox backend unavailable"** on startup — check `zeroclaw service status` and the journal; the auto-detect logs which backends it tried.
-- **Tools working on dev, failing in service** — the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
-- **Slow tool invocations** on the Docker runtime — first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
+- **"Sandbox backend unavailable"** on startup: check `zeroclaw service status` and the journal; the auto-detect logs which backends it tried.
+- **Tools working on dev, failing in service**: the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
+- **Slow tool invocations** on the Docker runtime: first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
 
 ## Code reference
 

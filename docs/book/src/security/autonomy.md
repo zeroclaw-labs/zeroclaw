@@ -1,6 +1,6 @@
 # Autonomy Levels
 
-Autonomy is a per-agent setting that lives on a named risk profile — `[risk_profiles.<alias>].level`. Each agent references one risk profile via `agents.<alias>.risk_profile = "<profile-alias>"`. Three settings; `supervised` is the default.
+Autonomy is a per-agent setting that lives on a named risk profile: `[risk_profiles.<alias>].level`. Each agent references one risk profile via `agents.<alias>.risk_profile = "<profile-alias>"`. Three settings; `supervised` is the default.
 
 ```toml
 [risk_profiles.assistant]   # alias = assistant (must match an agents.<alias>.risk_profile)
@@ -41,13 +41,13 @@ Risk classification:
 
 ### `full`
 
-No approval gates — all tool calls flagged low/medium/high run without asking. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` still blocks; the OS-level sandbox (`sandbox_enabled` + `sandbox_backend`) still applies.
+No approval gates; all tool calls flagged low/medium/high run without asking. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` still blocks; the OS-level sandbox (`sandbox_enabled` + `sandbox_backend`) still applies.
 
 This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-end without a human in the loop. If you need `full` + no workspace constraints + no sandboxing, see [YOLO mode](../getting-started/yolo.md).
 
 ## Per-tool overrides
 
-`auto_approve`, `always_ask`, and `excluded_tools` live as fields on the risk profile — they're flat lists of tool names, not nested tables:
+`auto_approve`, `always_ask`, and `excluded_tools` live as fields on the risk profile; they're flat lists of tool names, not nested tables:
 
 ```toml
 [risk_profiles.assistant]
@@ -68,7 +68,7 @@ For the shell tool specifically:
 allowed_commands = ["git", "cargo", "grep", "find", "ls", "cat"]
 ```
 
-If `allowed_commands` is non-empty, it's strict — any command not listed is blocked. The shell-policy validator handles destructive-pattern detection on top of the allowlist.
+If `allowed_commands` is non-empty, it's strict: any command not listed is blocked. The shell-policy validator handles destructive-pattern detection on top of the allowlist.
 
 ## Path rules
 
@@ -102,7 +102,7 @@ The shell tool runs in a minimal environment by default. To expose specific env 
 shell_env_passthrough = ["PATH", "HOME", "USER", "LANG"]
 ```
 
-Secrets (`API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` patterns) are *never* passed through automatically — list them explicitly or fetch from the secrets store inside the command.
+Secrets (`API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` patterns) are *never* passed through automatically; list them explicitly or fetch from the secrets store inside the command.
 
 ## Per-channel stricter autonomy
 
@@ -118,7 +118,7 @@ channels       = ["bluesky.home"]
 level = "readonly"
 ```
 
-Per-channel `excluded_tools` (`channels.<type>.<alias>.excluded_tools`) is the cheaper knob when you only need to hide individual tools — no second agent required.
+Per-channel `excluded_tools` (`channels.<type>.<alias>.excluded_tools`) is the cheaper knob when you only need to hide individual tools, no second agent required.
 
 ## Observability
 
@@ -131,7 +131,7 @@ WARN autonomy:approval_timeout   tool=shell command="git push" channel=telegram 
 WARN autonomy:blocked            tool=shell command="rm -rf /tmp" reason="forbidden pattern"
 ```
 
-Receipts for blocked calls are written to the [tool-receipts log](./tool-receipts.md) the same as successful calls — a denial is an event worth auditing.
+Receipts for blocked calls are written to the [tool-receipts log](./tool-receipts.md) the same as successful calls; a denial is an event worth auditing.
 
 ## Why not just a binary "safe mode"?
 

@@ -1,6 +1,6 @@
 # Crates
 
-The workspace is split into layers. Edge crates talk to the outside world; core crates orchestrate; support crates provide utilities. Each crate has its own rustdoc — see [API (rustdoc)](../api.md).
+The workspace is split into layers. Edge crates talk to the outside world; core crates orchestrate; support crates provide utilities. Each crate has its own rustdoc, see [API (rustdoc)](../api.md).
 
 ## Layer: Core
 
@@ -10,12 +10,12 @@ The agent loop, security-policy enforcement, SOP engine, cron scheduler, onboard
 
 Notable submodules:
 
-- `agent/` — the main request/response loop, streaming, tool-call orchestration
-- `security/` — policy types, sandbox detection, OTP, emergency stop
-- `sop/` — Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
-- `onboard/` — the interactive onboarding sections (`mod.rs`, plus per-shape UIs under `ui/`)
-- `memory/` — wraps `zeroclaw-memory` with runtime-level caching and consolidation schedules
-- `service/` — systemd / launchctl / Windows Service integration
+- `agent/`: the main request/response loop, streaming, tool-call orchestration
+- `security/`: policy types, sandbox detection, OTP, emergency stop
+- `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
+- `onboard/`: the interactive onboarding sections (`mod.rs`, plus per-shape UIs under `ui/`)
+- `memory/`: wraps `zeroclaw-memory` with runtime-level caching and consolidation schedules
+- `service/`: systemd / launchctl / Windows Service integration
 
 ### `zeroclaw-config`
 
@@ -32,9 +32,9 @@ All user-facing config keys are documented in [Reference → Config](../referenc
 
 The kernel ABI. Defines three public traits:
 
-- `Provider` — LLM client interface with streaming capability flags
-- `Channel` — inbound/outbound messaging surface
-- `Tool` — agent-callable capabilities
+- `Provider`: LLM client interface with streaming capability flags
+- `Channel`: inbound/outbound messaging surface
+- `Tool`: agent-callable capabilities
 
 The runtime depends only on these traits, not on concrete implementations. This is what makes provider/channel/tool additions a matter of implementing a trait rather than patching the core.
 
@@ -46,18 +46,18 @@ All LLM client implementations plus the routing and retry wrappers. See [Model P
 
 Structure:
 
-- `traits.rs` — re-exports from `zeroclaw-api` plus provider-internal helpers
-- `anthropic.rs`, `openai.rs`, `ollama.rs`, … — one file per native provider
-- `compatible.rs` — a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
-- `router.rs` — hint-based per-call model route selection
-- `reliable.rs` — same-provider retry / backoff / API-key rotation wrapper
-- `streaming.rs` — SSE parsing, token estimation, tool-call deltas
+- `traits.rs`: re-exports from `zeroclaw-api` plus provider-internal helpers
+- `anthropic.rs`, `openai.rs`, `ollama.rs`, …: one file per native provider
+- `compatible.rs`: a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
+- `router.rs`: hint-based per-call model route selection
+- `reliable.rs`: same-provider retry / backoff / API-key rotation wrapper
+- `streaming.rs`: SSE parsing, token estimation, tool-call deltas
 
 ### `zeroclaw-channels`
 
 30+ messaging integrations. See [Channels → Overview](../channels/overview.md) for the catalogue.
 
-All channels implement the `Channel` trait from `zeroclaw-api`. Each is feature-gated — a minimal build includes only the channels you compile in.
+All channels implement the `Channel` trait from `zeroclaw-api`. Each is feature-gated, a minimal build includes only the channels you compile in.
 
 The `orchestrator/` submodule handles message streaming, draft updates, multi-message splits, and the ACP server.
 
@@ -105,7 +105,7 @@ Dynamic plugin loader for out-of-process tool implementations. See [Developing �
 
 ### `zeroclaw-hardware`
 
-Hardware abstraction — GPIO, I2C, SPI, USB. Platform-gated. See [Hardware → Overview](../hardware/index.md).
+Hardware abstraction: GPIO, I2C, SPI, USB. Platform-gated. See [Hardware → Overview](../hardware/index.md).
 
 ### `zeroclaw-log`
 
@@ -121,7 +121,7 @@ typed `Observer` for Prometheus / OTel consumers. See
 ### `zeroclaw-infra`
 
 Process-level support: debouncers, watchdogs, the SQLite session
-backend. Not a tracing/metrics layer — that's `zeroclaw-log`.
+backend. Not a tracing/metrics layer, that's `zeroclaw-log`.
 
 ### `zeroclaw-macros`
 
@@ -129,7 +129,7 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 
 ### `zerocode`
 
-Terminal UI. Optional — compile with `--features tui`.
+Terminal UI. Optional, compile with `--features tui`.
 
 ### `aardvark-sys`, `robot-kit`
 
@@ -139,11 +139,11 @@ Specialised hardware support used by the `hardware` submodule. Out-of-scope unle
 
 The microkernel roadmap (RFC #5574) defines a feature-flag taxonomy. The practical upshot for a user:
 
-- `default` — a sensible core build
-- `ci-all` — everything on, for CI
-- `channel-<name>` — opt-in per channel (e.g. `channel-matrix`, `channel-discord`)
-- `provider-<name>` — opt-in per provider
-- `hardware` — enable hardware subsystem
-- `tui` — terminal UI
+- `default`: a sensible core build
+- `ci-all`: everything on, for CI
+- `channel-<name>`: opt-in per channel (e.g. `channel-matrix`, `channel-discord`)
+- `provider-<name>`: opt-in per provider
+- `hardware`: enable hardware subsystem
+- `tui`: terminal UI
 
 Run `cargo metadata --format-version 1 | jq '.workspace_members'` or read the top-level `Cargo.toml` for the full list.

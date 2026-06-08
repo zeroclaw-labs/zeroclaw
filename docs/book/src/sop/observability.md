@@ -27,10 +27,10 @@ zeroclaw sop show <name>
 
 SOP run state is queried from in-agent tools:
 
-- `sop_status` — active/finished runs and optional metrics
-- `sop_status` with `include_gate_status: true` — trust phase and gate evaluator state (when available)
-- `sop_approve` — approve waiting run step
-- `sop_advance` — submit step result and move run forward
+- `sop_status`: active/finished runs and optional metrics
+- `sop_status` with `include_gate_status: true`: trust phase and gate evaluator state (when available)
+- `sop_approve`: approve waiting run step
+- `sop_advance`: submit step result and move run forward
 
 ## 3. Metrics
 

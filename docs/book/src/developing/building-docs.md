@@ -1,6 +1,6 @@
 # Building the docs locally
 
-The docs site you're reading is published from `docs/book/`. You can build the same site on your own machine — useful for offline reading, previewing edits before opening a PR, or developing translations.
+The docs site you're reading is published from `docs/book/`. You can build the same site on your own machine, useful for offline reading, previewing edits before opening a PR, or developing translations.
 
 ## One-command quickstart
 
@@ -39,20 +39,20 @@ cargo mdbook check                       # validate .po format (run before a tra
 | `docs/book/src/reference/config.md` | (same path; **gitignored**) | `cargo run -- markdown-schema` |
 | `target/doc/` (rustdoc) | `docs/book/book/api/` | `cargo doc --no-deps --workspace` |
 
-The two `reference/*.md` files are generated from the actual `clap` derives and JSON schema in the code — never edit them by hand. Edit the `///` doc comments on the relevant Rust types instead.
+The two `reference/*.md` files are generated from the actual `clap` derives and JSON schema in the code, never edit them by hand. Edit the `///` doc comments on the relevant Rust types instead.
 
 ## How translations stay current
 
-English markdown is the only source maintained by humans. Translations are stored in `docs/book/po/<locale>.po` files, which act as a cache — not as copies of the docs.
+English markdown is the only source maintained by humans. Translations are stored in `docs/book/po/<locale>.po` files, which act as a cache, not as copies of the docs.
 
 When English source changes, `cargo mdbook sync` runs two stages:
 
 1. **Extract**: `mdbook-xgettext` regenerates `po/messages.pot` from the current English source
-2. **Merge**: `msgmerge` updates each locale's `.po` file — new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point
+2. **Merge**: `msgmerge` updates each locale's `.po` file, new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point
 
-Then the command counts fuzzy + untranslated entries. If there's a delta and `--provider` is given, the `fill-translations` tool translates only those entries. **Unchanged strings cost nothing** — the `.po` file cache means re-running against unchanged source is a no-op.
+Then the command counts fuzzy + untranslated entries. If there's a delta and `--provider` is given, the `fill-translations` tool translates only those entries. **Unchanged strings cost nothing**: the `.po` file cache means re-running against unchanged source is a no-op.
 
-Without `--provider`, `cargo mdbook sync` still runs extract + merge and reports how many strings need translation. Strings without a `msgstr` fall back to English at render time — partial translations are valid.
+Without `--provider`, `cargo mdbook sync` still runs extract + merge and reports how many strings need translation. Strings without a `msgstr` fall back to English at render time, partial translations are valid.
 
 `cargo mdbook sync` normalizes generated gettext catalogs with stable output rules (`msgcat --sort-output --no-wrap --add-location=file`). That keeps diffs focused on real source changes and avoids global line-number churn from small edits.
 
@@ -80,7 +80,7 @@ Include `.po` updates only when one of these is true:
 
 ## Adding a new locale
 
-1. Edit `locales.toml` at the repo root — the **only** file you need to touch:
+1. Edit `locales.toml` at the repo root, the **only** file you need to touch:
    ```toml
    [[locale]]
    code = "xx"
@@ -121,6 +121,6 @@ The model used is whatever is configured in `[providers.models.<name>]` in `conf
 ## Tips
 
 - **Fast iteration on prose:** `cargo mdbook serve` auto-rebuilds on save. Skip `cargo mdbook refs` unless you've changed CLI flags or config schema.
-- **Fast iteration on translations:** edit `po/<locale>.po` and reload the browser — mdbook serve detects `.po` changes and rebuilds automatically.
+- **Fast iteration on translations:** edit `po/<locale>.po` and reload the browser, mdbook serve detects `.po` changes and rebuilds automatically.
 - **Cleaning up:** `rm -rf docs/book/book target/doc` removes everything generated.
-- **Zero-cost re-runs:** `cargo mdbook sync` against unchanged English source completes in seconds — no AI calls, no cost.
+- **Zero-cost re-runs:** `cargo mdbook sync` against unchanged English source completes in seconds, no AI calls, no cost.

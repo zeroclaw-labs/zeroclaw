@@ -1,14 +1,14 @@
 # Multi-agent runtime
 
-This page documents the architecture and operator-facing surface of the multi-agent runtime. The doc is intentionally short — for the schema-level field reference, see [Config](../reference/config.md); for live setup steps, see [Multi-agent setup](../contributing/multi-agent-setup.md).
+This page documents the architecture and operator-facing surface of the multi-agent runtime. The doc is intentionally short: for the schema-level field reference, see [Config](../reference/config.md); for live setup steps, see [Multi-agent setup](../contributing/multi-agent-setup.md).
 
 ## Vocabulary
 
-- **Install dir** — the directory holding everything ZeroClaw owns on a host. Typically `~/.zeroclaw/`. Equivalent to the dir containing `config.toml`.
-- **Agent** — a configured `[agents.<alias>]` block: a join table of references (`risk_profile`, `model_provider`, `channels`), a per-agent workspace dir, and a per-agent memory backend selection. Each agent picks one memory backend at creation; that choice is immutable for the agent's lifetime.
-- **Aliased workspace** — `<install>/agents/<alias>/workspace/`. One per agent. Holds the agent's identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `BOOTSTRAP.md`, `MEMORY.md`) and any operator data the agent owns.
-- **SubAgent** — a runtime-spawned ephemeral child run that inherits its parent's identity, security policy, and memory allowlist. See [SubAgents](./subagents.md) for the full surface (lifecycle, spawn sites, the depth-1 cap, what gets returned to the parent).
-- **Peer group** — a `[peer_groups.<name>]` block declaring an opt-in cross-agent communication set on a single channel. Mutual membership: agents A and B are peers only when both appear in the same group's `agents` list.
+- **Install dir**: the directory holding everything ZeroClaw owns on a host. Typically `~/.zeroclaw/`. Equivalent to the dir containing `config.toml`.
+- **Agent**: a configured `[agents.<alias>]` block: a join table of references (`risk_profile`, `model_provider`, `channels`), a per-agent workspace dir, and a per-agent memory backend selection. Each agent picks one memory backend at creation; that choice is immutable for the agent's lifetime.
+- **Aliased workspace**: `<install>/agents/<alias>/workspace/`. One per agent. Holds the agent's identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `BOOTSTRAP.md`, `MEMORY.md`) and any operator data the agent owns.
+- **SubAgent**: a runtime-spawned ephemeral child run that inherits its parent's identity, security policy, and memory allowlist. See [SubAgents](./subagents.md) for the full surface (lifecycle, spawn sites, the depth-1 cap, what gets returned to the parent).
+- **Peer group**: a `[peer_groups.<name>]` block declaring an opt-in cross-agent communication set on a single channel. Mutual membership: agents A and B are peers only when both appear in the same group's `agents` list.
 
 ## Permissions model
 
@@ -44,7 +44,7 @@ The agent-loop entry binds `agent_alias` as a tracing-span field; SubAgent spawn
 
 ## CLI
 
-- `zeroclaw agent -a <alias>` — runs the configured agent at `[agents.<alias>]`.
+- `zeroclaw agent -a <alias>`: runs the configured agent at `[agents.<alias>]`.
 
 Agents are added by editing `[agents.<alias>]` blocks in `config.toml`. The runtime creates the per-agent workspace dir under `<install>/agents/<alias>/workspace/` and seeds bootstrap identity files on first agent-loop entry. See the [setup walkthrough](../contributing/multi-agent-setup.md) for full operator guidance.
 
@@ -53,6 +53,6 @@ Agents are added by editing `[agents.<alias>]` blocks in `config.toml`. The runt
 1. Cross-backend cross-agent memory access (e.g. SQLite agent reading a Postgres agent's rows).
 2. Agent rename (the `agents.id` UUID indirection is the rename-ready foundation, but no CLI/UI surface exists).
 3. Pre-delete archive and restore.
-4. Per-agent secret namespacing — there is a single workspace-wide `SecretStore`.
+4. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
 5. Lucid wire-format extensions for cross-agent scoping.
 6. A dedicated `zeroclaw agents` management CLI for creating/deleting/listing agents.

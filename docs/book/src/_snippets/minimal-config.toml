@@ -6,7 +6,7 @@ schema_version = 3
 [providers.models.anthropic.home]
 model = "claude-sonnet-4-6"
 temperature = 0.7            # omit this line entirely to send no temperature override
-                             # (required for claude-opus-4-7 — see below)
+                             # (required for claude-opus-4-7, see below)
 api_key = "sk-ant-..."
 
 # Agent. Section header is `[agents.<alias>]`:

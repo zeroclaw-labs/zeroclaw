@@ -4,7 +4,7 @@
 > today using `release-stable-manual.yml`. It exists only until release-plz
 > lands in v0.7.5 and replaces this entirely.
 >
-> If anything in here feels heavyweight, that is intentional friction — we do
+> If anything in here feels heavyweight, that is intentional friction, we do
 > not yet have the automation discipline to remove it safely.
 
 Last verified: **May 2026** (v0.7.4 cycle).
@@ -26,7 +26,7 @@ need to do anything for those unless a job explicitly fails.
 
 ---
 
-## Step 1 — Generate CHANGELOG-next.md
+## Step 1: Generate CHANGELOG-next.md
 
 Use the changelog-generation skill to produce `CHANGELOG-next.md`:
 
@@ -44,7 +44,7 @@ review it for accuracy before reusing it.
 
 ---
 
-## Step 2 — Bump and merge the version PR
+## Step 2: Bump and merge the version PR
 
 Edit the workspace `Cargo.toml`:
 
@@ -79,12 +79,12 @@ git show origin/master:Cargo.toml | grep '^version'
 
 ---
 
-## Step 3 — Dry-run the release workflows locally with `act`
+## Step 3: Dry-run the release workflows locally with `act`
 
 The `Release Stable` workflow is a GitHub Actions job graph that consumes
 your environment-gate approval window the moment you click **Run workflow**.
-If a workflow step is broken — a missing build artifact, a stale path, a
-codegen step that someone removed without updating CI — the failure surfaces
+If a workflow step is broken: a missing build artifact, a stale path, a
+codegen step that someone removed without updating CI, the failure surfaces
 *after* you have committed to a release window, with the version PR already
 merged and master at the new version. Recovery means landing an emergency
 fix branch, re-running CI, and shipping under time pressure on a tree that
@@ -94,9 +94,9 @@ The cheap insurance against this is to run the same job graph locally first,
 on the exact merged master commit, before opening the GitHub Actions form.
 [`act`](https://nektosact.com/) executes GitHub Actions workflows inside
 Docker containers using the same `actions/*` ecosystem GitHub does. It does
-not perfectly mirror the cloud runner — it cannot reach the artifact upload
+not perfectly mirror the cloud runner; it cannot reach the artifact upload
 runtime, GitHub-issued OIDC tokens, environment secrets, or jobs that depend
-on a real release tag — but it does run the build and test steps that
+on a real release tag, but it does run the build and test steps that
 account for nearly every release-time CI failure we have ever hit.
 
 This step is a 15–20 minute investment per release. It has caught real
@@ -120,7 +120,7 @@ real `GITHUB_TOKEN` to every workflow run:
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
    the `docker` group so you don't need `sudo`. `act` also works with
-   Podman and Colima — see the
+   Podman and Colima; see the
    [act runners documentation](https://nektosact.com/usage/runners.html).
 
 That's the whole setup. The repository's `.actrc` and
@@ -159,7 +159,7 @@ resolve arbitrary commits otherwise), threads `GITHUB_TOKEN` from your
 `gh` auth into the run via the parent process environment (the token
 value never lands in argv), and sets `--artifact-server-path` so
 `actions/upload-artifact` and `actions/download-artifact` work between
-jobs. All of that is plain `act` underneath — the script just removes
+jobs. All of that is plain `act` underneath; the script just removes
 the flag soup.
 
 ### `--all` only runs jobs on a dry-run-safe allowlist
@@ -173,7 +173,7 @@ an issue, a `tweet-release` or `discord-release` that posts to a
 webhook) could perform the real-world side effect on first try.
 
 `--all` therefore enforces a hardcoded allowlist of jobs proven safe
-to run locally — currently the artifact-only build steps in
+to run locally; currently the artifact-only build steps in
 `release-stable-manual.yml` and `cross-platform-build-manual.yml`
 (`validate`, `web`, `release-notes`, `build`, `build-desktop`).
 Everything else is skipped with a logged reason:
@@ -191,16 +191,16 @@ The allowlist is **fail-closed**: a new workflow added to the repo is
 treated as potentially mutating until a maintainer reviews it and adds
 the safe job IDs to `DRY_RUN_SAFE_JOBS` in
 `scripts/dev/act-local.sh`. This matters because `discover_jobs` walks
-every `.github/workflows/*.yml`, not just the release workflows — a
+every `.github/workflows/*.yml`, not just the release workflows, a
 denylist would silently let a future write-surface workflow through.
 
 Two escape hatches exist for the rare case where you have a reason to
 attempt a non-allowlisted job locally:
 
-- `./scripts/dev/act-local.sh release-stable-manual:publish` — the
+- `./scripts/dev/act-local.sh release-stable-manual:publish`: the
   explicit `<wf>:<job>` form runs what you ask for and prints a loud
   warning before invoking `act` if the target isn't on the allowlist.
-- `./scripts/dev/act-local.sh --all --no-allowlist` — disables the
+- `./scripts/dev/act-local.sh --all --no-allowlist`: disables the
   allowlist filter for an entire `--all` run (used only when you've
   already verified the workflow steps will not reach a mutation
   surface, e.g. on a fork with no real registry credentials and an
@@ -213,18 +213,18 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`crates-io`, `docker`, `publish`) — the
+- Environment-gated jobs (`crates-io`, `docker`, `publish`): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
-Everything else — a `tsc` error, a missing file, a Rust compile
-failure, a `cargo` lockfile mismatch — is a real defect. Do not click
+Everything else, a `tsc` error, a missing file, a Rust compile
+failure, a `cargo` lockfile mismatch, is a real defect. Do not click
 **Run workflow** on the GitHub Actions form until those are fixed via a
 standard PR off master.
 
 ---
 
-## Step 4 — Trigger the release
+## Step 4: Trigger the release
 
 Go to:
 
@@ -235,7 +235,7 @@ https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/release-stable-manua
 Click **Run workflow**. Fill in:
 
 - **Branch:** `master`
-- **Stable version to release:** `X.Y.Z` — no `v` prefix
+- **Stable version to release:** `X.Y.Z`, no `v` prefix
 
 Click **Run workflow**.
 
@@ -245,7 +245,7 @@ re-trigger. Do not try to work around it.
 
 ---
 
-## Step 5 — Approve the environment gates
+## Step 5: Approve the environment gates
 
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
@@ -259,11 +259,11 @@ Approve all three when they appear:
 | `docker` | `docker` | Pushes images to GHCR |
 
 If you miss the approval window and a job times out, re-run only the failed
-job from the workflow run page — you do not need to restart from scratch.
+job from the workflow run page; you do not need to restart from scratch.
 
 ---
 
-## Step 6 — Verify the release
+## Step 6: Verify the release
 
 Once `publish` completes, confirm:
 
@@ -276,12 +276,12 @@ Once `publish` completes, confirm:
 ```
 
 You do not need to manually verify Docker, crates.io, or distribution channels
-unless a job in the workflow run shows red. Check the workflow run summary — if
+unless a job in the workflow run shows red. Check the workflow run summary; if
 all jobs are green, you are done.
 
 ---
 
-## Step 7 — Versioned documentation deployment
+## Step 7: Versioned documentation deployment
 
 ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is pushed, the `Deploy mdBook docs to Pages` workflow automatically builds and deploys the documentation for that version.
 
@@ -323,7 +323,7 @@ If you need to raise the floor to drop support for an older version:
 
 ## If something goes wrong
 
-**validate failed — version mismatch:** The version bump PR was not merged, or
+**validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 
 **An environment gate timed out:** Re-run only the timed-out job. No need to
@@ -342,7 +342,7 @@ git push origin master
 **A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
 corresponding manually-triggerable sub-workflow. Re-run the specific one with
 `dry_run: true` first to confirm the fix, then `dry_run: false`. These are
-nice-to-have — a failed Scoop job does not invalidate the release itself.
+nice-to-have: a failed Scoop job does not invalidate the release itself.
 
 ---
 
@@ -355,10 +355,10 @@ them.
 | Workflow | Why it is dangerous |
 |---|---|
 | `release-beta-on-push.yml` | Publishes automatically on every push to master |
-| `publish-crates-auto.yml` | Auto-publishes to crates.io on any version change — irreversible |
+| `publish-crates-auto.yml` | Auto-publishes to crates.io on any version change, irreversible |
 | `version-sync.yml` | Commits directly to master as a bot, bypasses review |
-| `checks-on-pr.yml` | Duplicate CI — produces confusing conflicting status |
-| `pre-release-validate.yml` | Unused generated checklist — this runbook replaces it |
+| `checks-on-pr.yml` | Duplicate CI: produces confusing conflicting status |
+| `pre-release-validate.yml` | Unused generated checklist; this runbook replaces it |
 
 All other workflows not listed above are either frozen until v0.7.5 or
 actively maintained. See `docs/contributing/ci-map.md` for the full inventory

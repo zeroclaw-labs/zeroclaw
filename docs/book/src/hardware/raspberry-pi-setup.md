@@ -2,7 +2,7 @@
 
 This guide covers installing and running ZeroClaw on Raspberry Pi (Pi 3, Pi 4, Pi 5, Pi Zero 2 W).
 
-The README's "runs on <$10 hardware with <5 MB RAM" claim is true for the **runtime**. Build-time is a different story — Rust's compiler and linker need significantly more RAM than the resulting binary, so the on-device build path needs swap and a tuned profile to avoid OOM-kills during link.
+The README's "runs on <$10 hardware with <5 MB RAM" claim is true for the **runtime**. Build-time is a different story: Rust's compiler and linker need significantly more RAM than the resulting binary, so the on-device build path needs swap and a tuned profile to avoid OOM-kills during link.
 
 For most Pi users, the **pre-built binary is the path of least resistance**.
 
@@ -15,7 +15,7 @@ For most Pi users, the **pre-built binary is the path of least resistance**.
 | Pi 5 (4 GB) | 4 GB | ✅ | ✅ with swap + `release-fast` profile |
 | Pi 4 (8 GB) | 8 GB | ✅ | ✅ with `release-fast` profile |
 | Pi 4 (4 GB) | 4 GB | ✅ | ✅ with swap + `release-fast` profile |
-| Pi 4 (2 GB) | 2 GB | ✅ | Marginal — swap required, slow |
+| Pi 4 (2 GB) | 2 GB | ✅ | Marginal, swap required, slow |
 | Pi 3 (1 GB) | 1 GB | ✅ | ❌ Not recommended |
 | Pi Zero 2 W | 512 MB | ✅ | ❌ |
 
@@ -81,7 +81,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 ```
 
-> **Note:** earlier drafts of this guide suggested `aarch64-elf-gcc` from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc — it will not produce a working Raspberry Pi OS binary. Use the `messense/macos-cross-toolchains` tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).
+> **Note:** earlier drafts of this guide suggested `aarch64-elf-gcc` from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc. It will not produce a working Raspberry Pi OS binary. Use the `messense/macos-cross-toolchains` tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).
 
 ### From Linux x86_64
 
@@ -134,7 +134,7 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ### Step 3: Choose a build profile
 
-The default `release` profile uses `lto = "fat"` and `codegen-units = 1` — best runtime performance, worst build memory. The `release-fast` profile (`codegen-units = 8`, `lto = "thin"`) drops peak RAM by ~half, with only minor runtime impact.
+The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile (`codegen-units = 8`, `lto = "thin"`) drops peak RAM by ~half, with only minor runtime impact.
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
@@ -160,11 +160,11 @@ sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
 
 ### Building with GPIO support
 
-If you want to use Pi GPIO peripherals from skills, enable the relevant feature flag (see the `peripherals` crate). Most users don't need this for typical agent workloads — it's only relevant if you're writing skills that talk to attached hardware.
+If you want to use Pi GPIO peripherals from skills, enable the relevant feature flag (see the `peripherals` crate). Most users don't need this for typical agent workloads. It's only relevant if you're writing skills that talk to attached hardware.
 
 ## Containerized deployment (Podman recommended over Docker)
 
-**Pis are memory-constrained, and that's the operating reality this section is written against.** The 2 GB Pi 4 is the low-bar test unit for this guide — if a setup doesn't leave headroom on a 2 GB box, it's not a setup we recommend. ZeroClaw itself runs in well under 5 MB RSS at runtime, but everything you stack alongside it (channel transports, browser-control, MCP servers, an adjacent agent or two, plus the OS) competes for the same fixed pool. Memory you don't spend on container infrastructure is memory ZeroClaw and its tools get to use.
+**Pis are memory-constrained, and that's the operating reality this section is written against.** The 2 GB Pi 4 is the low-bar test unit for this guide. If a setup doesn't leave headroom on a 2 GB box, it's not a setup we recommend. ZeroClaw itself runs in well under 5 MB RSS at runtime, but everything you stack alongside it (channel transports, browser-control, MCP servers, an adjacent agent or two, plus the OS) competes for the same fixed pool. Memory you don't spend on container infrastructure is memory ZeroClaw and its tools get to use.
 
 Concrete budget on a 2 GB Pi 4 running Raspberry Pi OS Bookworm/Trixie headless:
 
@@ -177,15 +177,15 @@ Concrete budget on a 2 GB Pi 4 running Raspberry Pi OS Bookworm/Trixie headless:
 | **Available with Docker** | ~1.3-1.5 GB |
 | **Available with Podman (no daemon)** | ~1.5-1.7 GB |
 
-The Podman delta is on the order of ~150-200 MB freed up — small in absolute terms, large as a percentage of what's left over after the OS gets its share. On a 2 GB unit that's the difference between comfortably running ZeroClaw + a heavy channel transport (Matrix with media, browser-automation skills) and OOM-killing under load.
+The Podman delta is on the order of ~150-200 MB freed up, small in absolute terms, large as a percentage of what's left over after the OS gets its share. On a 2 GB unit that's the difference between comfortably running ZeroClaw + a heavy channel transport (Matrix with media, browser-automation skills) and OOM-killing under load.
 
 **Three reasons Podman is the better fit on Pi than Docker:**
 
 1. **Rootless by default → security headroom.** Podman doesn't need a root daemon; containers run as your user. On an exposed edge device that matters more than on a developer laptop.
-2. **systemd-native via Quadlets → operational simplicity.** Podman ships `.container` unit files that systemd manages directly — same lifecycle, logging, and dependency model as any other unit. No separate `docker.service` to babysit, no separate logging layer.
+2. **systemd-native via Quadlets → operational simplicity.** Podman ships `.container` unit files that systemd manages directly, same lifecycle, logging, and dependency model as any other unit. No separate `docker.service` to babysit, no separate logging layer.
 3. **No daemon RSS → memory headroom.** Skipping `dockerd`'s persistent ~150-200 MB is the single biggest knob you can turn on a 2 GB Pi without sacrificing isolation.
 
-The trade-off: Podman's rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker's daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that's worth measuring. For ZeroClaw's typical "one or two long-running agent containers" pattern, the difference is negligible — and on memory-constrained hardware, the daemon-RSS savings dominate the calculation anyway.
+The trade-off: Podman's rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker's daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that's worth measuring. For ZeroClaw's typical "one or two long-running agent containers" pattern, the difference is negligible, and on memory-constrained hardware, the daemon-RSS savings dominate the calculation anyway.
 
 ### Quick install (Raspberry Pi OS Bookworm/Trixie)
 
@@ -334,18 +334,18 @@ loginctl enable-linger $USER
 
 ### Container can't reach gateway from host
 
-ZeroClaw binds `127.0.0.1` by default — inside a container that means localhost-of-the-container. Pass `--host 0.0.0.0` (or `ZEROCLAW_BIND=0.0.0.0`) when running in Podman/Docker.
+ZeroClaw binds `127.0.0.1` by default. Inside a container that means localhost-of-the-container. Pass `--host 0.0.0.0` (or `ZEROCLAW_BIND=0.0.0.0`) when running in Podman/Docker.
 
 ## Performance tips
 
 - **Use an SSD or fast SD card.** Compilation is heavily I/O-bound; a USB 3.0 SSD on a Pi 4/5 cuts build time significantly.
 - **Run headless.** Stop the desktop environment if not needed: `sudo systemctl set-default multi-user.target`.
 - **tmpfs for build artifacts** (if you have RAM + swap headroom): `export CARGO_TARGET_DIR=/tmp/zeroclaw-target`.
-- **Check that `clk_ignore_unused` isn't set** on the kernel cmdline if you're using a custom image — that flag (occasionally seen on vendor BSPs) inhibits clock gating and increases idle power. Stock Raspberry Pi OS doesn't ship with it.
+- **Check that `clk_ignore_unused` isn't set** on the kernel cmdline if you're using a custom image: that flag (occasionally seen on vendor BSPs) inhibits clock gating and increases idle power. Stock Raspberry Pi OS doesn't ship with it.
 
 ## Related
 
-- [Linux setup](../setup/linux.md) — non-Pi-specific Linux setup, applicable here too once the binary's installed
-- [Service management](../setup/service.md) — systemd patterns, deeper than what's above
-- [Hardware → Peripherals design](./hardware-peripherals-design.md) — GPIO and the peripherals crate
-- [Hardware → Adding boards & tools](./adding-boards-and-tools.md) — extending hardware support
+- [Linux setup](../setup/linux.md): non-Pi-specific Linux setup, applicable here too once the binary's installed
+- [Service management](../setup/service.md): systemd patterns, deeper than what's above
+- [Hardware → Peripherals design](./hardware-peripherals-design.md): GPIO and the peripherals crate
+- [Hardware → Adding boards & tools](./adding-boards-and-tools.md): extending hardware support

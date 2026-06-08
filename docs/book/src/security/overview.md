@@ -1,4 +1,4 @@
-# Security — Overview
+# Security: Overview
 
 An agent that can execute shell commands, open URLs, and write files is a privileged process. ZeroClaw's security model sits on top of every tool call and every channel message, gating what the agent is actually allowed to do at runtime.
 
@@ -6,7 +6,7 @@ There are six layers. From outer to inner:
 
 ## 1. Channel pairing and access control
 
-Before a message from a channel reaches the agent, the channel's pairing and allow-list are checked. `allowed_users`, `allowed_chats`, IP allowlists for webhooks — all enforced at the channel adapter, before the runtime sees the event.
+Before a message from a channel reaches the agent, the channel's pairing and allow-list are checked. `allowed_users`, `allowed_chats`, IP allowlists for webhooks, all enforced at the channel adapter, before the runtime sees the event.
 
 Docs: each channel's page under [Channels](../channels/overview.md).
 
@@ -14,9 +14,9 @@ Docs: each channel's page under [Channels](../channels/overview.md).
 
 The coarse-grained knob. Three settings:
 
-- **ReadOnly** — the agent can observe (read files, query memory, fetch URLs it's allowed to fetch) but cannot write or execute commands.
-- **Supervised** (default) — low-risk ops run; medium-risk ask the operator; high-risk block.
-- **Full** — no approval gates; `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
+- **ReadOnly**: the agent can observe (read files, query memory, fetch URLs it's allowed to fetch) but cannot write or execute commands.
+- **Supervised** (default): low-risk ops run; medium-risk ask the operator; high-risk block.
+- **Full**: no approval gates; `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
 
 Docs: [Autonomy levels](./autonomy.md).
 
@@ -26,7 +26,7 @@ The agent operates within a configured workspace directory. `file_read`, `file_w
 
 **Per-session sandbox roots (ACP and gateway WebSocket):** When a session is opened via ACP (`session/new` with a `cwd` parameter) or via the gateway WebSocket (connect-time `cwd` parameter), that path becomes the `SecurityPolicy` workspace boundary for all file and shell tools for the lifetime of the session. The daemon's global `workspace_dir` remains the data directory for memory, identity, cron, and other persistent state. The model is: `session cwd` = project boundary the agent can touch; `workspace_dir` = where ZeroClaw stores its own files. Note: the agent's system prompt currently reflects the daemon's `workspace_dir` rather than the session `cwd`; enforcement is correct but the model's self-reported location may differ.
 
-**Important:** the `cwd` parameter changes which directory on the **ZeroClaw host** the agent is sandboxed to — it does not affect which machine tools run on. Tool use (shell commands, file reads/writes) always executes on the machine running ZeroClaw. If you connect to a remote ZeroClaw instance over the gateway WebSocket, tool calls operate on the remote machine's filesystem, not on your local machine. For localhost-only deployments this distinction does not matter, but remote setups should account for it.
+**Important:** the `cwd` parameter changes which directory on the **ZeroClaw host** the agent is sandboxed to, it does not affect which machine tools run on. Tool use (shell commands, file reads/writes) always executes on the machine running ZeroClaw. If you connect to a remote ZeroClaw instance over the gateway WebSocket, tool calls operate on the remote machine's filesystem, not on your local machine. For localhost-only deployments this distinction does not matter, but remote setups should account for it.
 
 Beyond the workspace, a `forbidden_paths` list (default: `/etc`, `/sys`, `/boot`, `~/.ssh`, …) is always blocked regardless of workspace setting.
 
@@ -34,9 +34,9 @@ Beyond the workspace, a `forbidden_paths` list (default: `/etc`, `/sys`, `/boot`
 
 For shell invocations:
 
-- `allowed_commands` — if non-empty, shell only runs commands whose basename is in this list
-- `forbidden_commands` — explicit denylist (`rm -rf /`, `shutdown`, kernel operations)
-- `validate_command_execution` — a pattern-matching pass that looks for dangerous flags, pipelines, and argument shapes
+- `allowed_commands`: if non-empty, shell only runs commands whose basename is in this list
+- `forbidden_commands`: explicit denylist (`rm -rf /`, `shutdown`, kernel operations)
+- `validate_command_execution`: a pattern-matching pass that looks for dangerous flags, pipelines, and argument shapes
 
 The validator runs *before* the command hits the shell. A blocked command surfaces as a tool error the model sees and can react to.
 
@@ -46,7 +46,7 @@ When a sandbox backend is available, tool invocations run inside it:
 
 | Platform | Default backend |
 |---|---|
-| Linux | Landlock (kernel) / Bubblewrap / Firejail / Docker — auto-detected |
+| Linux | Landlock (kernel) / Bubblewrap / Firejail / Docker, auto-detected |
 | macOS | Seatbelt (native) |
 | Windows | AppContainer (experimental) |
 | Any | Docker (if the daemon is reachable) |
@@ -57,7 +57,7 @@ Docs: [Sandboxing](./sandboxing.md).
 
 ## 6. Tool receipts
 
-Every tool invocation — whether it executed, was blocked, or required approval — produces a signed receipt in a chain. Each receipt includes the hash of the previous one, so tampering with any receipt invalidates the rest.
+Every tool invocation, whether it executed, was blocked, or required approval, produces a signed receipt in a chain. Each receipt includes the hash of the previous one, so tampering with any receipt invalidates the rest.
 
 Receipts are the source of truth for "what did the agent do yesterday". They're readable, greppable, and durable.
 
@@ -67,11 +67,11 @@ Docs: [Tool receipts](./tool-receipts.md).
 
 Beyond the six layers:
 
-- **OTP gating** — `[security.otp] gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
-- **Emergency stop** — `zeroclaw estop` halts all in-flight tool calls. With `[security.estop] enabled = true`, resuming requires an OTP.
-- **Prompt injection guard** — scans model output for known injection patterns before tool calls are validated.
-- **Leak detector** — scans outbound messages for secrets (API key patterns, private keys) and blocks sends that match.
-- **Pairing guard** — device pairing for channel auth; prevents stolen credentials from working on a new device.
+- **OTP gating**: `[security.otp]` gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
+- **Emergency stop**: `zeroclaw estop` halts all in-flight tool calls. With `[security.estop] enabled = true`, resuming requires an OTP.
+- **Prompt injection guard**: scans model output for known injection patterns before tool calls are validated.
+- **Leak detector**: scans outbound messages for secrets (API key patterns, private keys) and blocks sends that match.
+- **Pairing guard**: device pairing for channel auth; prevents stolen credentials from working on a new device.
 
 ## When things go wrong
 
@@ -94,7 +94,7 @@ Out of the box:
 - OTP: `false`
 - E-stop: `false`
 
-This is a reasonable middle ground — safe enough for a laptop, permissive enough to not frustrate. Crank it up for production (OTP, audit, restricted tools) or down to [YOLO](../getting-started/yolo.md) for a dev box.
+This is a reasonable middle ground, safe enough for a laptop, permissive enough to not frustrate. Crank it up for production (OTP, audit, restricted tools) or down to [YOLO](../getting-started/yolo.md) for a dev box.
 
 ## See also
 

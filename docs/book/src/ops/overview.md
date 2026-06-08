@@ -1,13 +1,13 @@
-# Operations — Overview
+# Operations: Overview
 
 How to run ZeroClaw in production. The surface is intentionally small: one binary, one config file, one SQLite workspace. Most "operations" is "systemd and journald".
 
 This section covers:
 
-- [Service & daemon](./service.md) — keeping the process alive
-- [Logs & observability](./observability.md) — reading what the agent did
-- [Troubleshooting](./troubleshooting.md) — when things break
-- [Network deployment](./network-deployment.md) — exposing the gateway, tunnels, reverse proxies
+- [Service & daemon](./service.md): keeping the process alive
+- [Logs & observability](./observability.md): reading what the agent did
+- [Troubleshooting](./troubleshooting.md): when things break
+- [Network deployment](./network-deployment.md): exposing the gateway, tunnels, reverse proxies
 
 ## The shape of a deployment
 
@@ -27,7 +27,7 @@ zeroclaw service (systemd / launchctl / Windows Service)
   └── platform logs                   — journald / launchctl / Event Log
 ```
 
-Everything except the binary can move — the workspace path is configurable, config paths resolve per environment (Homebrew vs. bootstrap vs. XDG), and log destinations are platform-native by default.
+Everything except the binary can move, the workspace path is configurable, config paths resolve per environment (Homebrew vs. bootstrap vs. XDG), and log destinations are platform-native by default.
 
 ## What to monitor
 
@@ -95,7 +95,7 @@ zeroclaw_tool_calls_total{tool="shell",outcome="denied"} 2
 zeroclaw_tool_calls_total{tool="file_write",outcome="success"} 89
 ```
 
-Blocks and denials are worth looking at — if the agent is repeatedly hitting the same policy block, either your policy is wrong or your agent is misbehaving.
+Blocks and denials are worth looking at, if the agent is repeatedly hitting the same policy block, either your policy is wrong or your agent is misbehaving.
 
 ## Capacity
 
@@ -105,26 +105,26 @@ A single ZeroClaw instance can handle:
 - Tool calls at whatever rate the provider and sandbox allow
 - Long-running agent loops (tool chains of 20+ calls)
 
-Scale laterally by running one instance per workspace. Don't try to run two daemons on the same workspace — SQLite's single-writer model will produce lock contention and ultimately corruption.
+Scale laterally by running one instance per workspace. Don't try to run two daemons on the same workspace: SQLite's single-writer model will produce lock contention and ultimately corruption.
 
-For multi-tenant hosting, see the proposal in #2765 (closed, historical — the architecture for in-process multi-workspace routing).
+For multi-tenant hosting, see the proposal in #2765 (closed, historical, the architecture for in-process multi-workspace routing).
 
 ## Backups
 
 What to back up:
 
-- `~/.zeroclaw/config.toml` — contains channel credentials (encrypted if using secrets store)
-- `~/.zeroclaw/workspace/*.db` — SQLite conversation memory
-- `~/.zeroclaw/secrets.key` — master key for the encrypted secrets store (if used). **Without it, the config's secrets are unrecoverable.**
-- `~/.zeroclaw/workspace/receipts/` — tool-receipts log
+- `~/.zeroclaw/config.toml`: contains channel credentials (encrypted if using secrets store)
+- `~/.zeroclaw/workspace/*.db`: SQLite conversation memory
+- `~/.zeroclaw/secrets.key`: master key for the encrypted secrets store (if used). **Without it, the config's secrets are unrecoverable.**
+- `~/.zeroclaw/workspace/receipts/`: tool-receipts log
 
 A plain `tar czf zeroclaw-$(date +%F).tar.gz ~/.zeroclaw` covers everything. Restic, borg, or Duplicacy work fine for incremental backups.
 
-**Do not back up `~/.zeroclaw/workspace/cache/`** — it's regenerable and can be large.
+**Do not back up `~/.zeroclaw/workspace/cache/`**, it's regenerable and can be large.
 
 ## Updates
 
-The service does not auto-update. Subscribe to the release feed (GitHub releases or the Discord `#releases` channel — see [Contributing → Communication](../contributing/communication.md)). Typical update cadence:
+The service does not auto-update. Subscribe to the release feed (GitHub releases or the Discord `#releases` channel: see [Contributing → Communication](../contributing/communication.md)). Typical update cadence:
 
 1. Read the release notes
 2. Back up `~/.zeroclaw/`
@@ -136,7 +136,7 @@ If the new version requires config migrations, the startup log emits a warning a
 
 ## See also
 
-- [Setup → Service management](../setup/service.md) — install/remove/logs per platform
+- [Setup → Service management](../setup/service.md): install/remove/logs per platform
 - [Logs & observability](./observability.md)
 - [Troubleshooting](./troubleshooting.md)
 - [Network deployment](./network-deployment.md)

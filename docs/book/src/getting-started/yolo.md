@@ -1,6 +1,6 @@
 # YOLO Mode
 
-**YOLO mode** disables every safety gate ZeroClaw ships with. No approval prompts, no workspace boundary, no shell policy, no command allow/denylist, no OTP, no sandbox. The agent can run any shell command, touch any file, hit any URL — immediately, without asking.
+**YOLO mode** disables every safety gate ZeroClaw ships with. No approval prompts, no workspace boundary, no shell policy, no command allow/denylist, no OTP, no sandbox. The agent can run any shell command, touch any file, hit any URL: immediately, without asking.
 
 > **This is for dev boxes, home labs, and throwaway VMs.** Do not run YOLO mode on shared infrastructure. Do not run YOLO mode on a machine with production credentials in its environment. Do not run YOLO mode if you do not understand what an autonomous agent with `rm -rf` access can do.
 
@@ -16,7 +16,7 @@
 - Your laptop with your email, your browser profile, and SSH keys to production
 - A shared server
 - A VPS with live customers on it
-- Anywhere the agent might be reached by an untrusted user through a channel — a YOLO agent with a public Telegram bot is a Telegram-accessible root shell
+- Anywhere the agent might be reached by an untrusted user through a channel: a YOLO agent with a public Telegram bot is a Telegram-accessible root shell
 
 ## Enabling it
 
@@ -52,7 +52,7 @@ enabled = false
 require_pairing = false
 ```
 
-If multiple agents share the host, give the YOLO-bound one its own profile (the `yolo` block) and keep your other agents on a stricter profile (e.g. `hardened`) — `[risk_profiles.<alias>]` is per-profile, so a YOLO agent and a hardened agent can coexist in the same config.
+If multiple agents share the host, give the YOLO-bound one its own profile (the `yolo` block) and keep your other agents on a stricter profile (e.g. `hardened`): `[risk_profiles.<alias>]` is per-profile, so a YOLO agent and a hardened agent can coexist in the same config.
 
 ```toml
 [agents.devbox]
@@ -88,16 +88,16 @@ YOLO mode doesn't lobotomise the agent:
 
 - **[Tool receipts](../security/tool-receipts.md)** still get written. You can `tail -f` the receipts log and see exactly what ran.
 - **[Audit logging](../ops/observability.md)** still works if enabled (`[security.audit] enabled = true`). Strongly recommended in YOLO.
-- **Conversation memory** still persists — there's still a record of what happened.
+- **Conversation memory** still persists: there's still a record of what happened.
 
 You're not turning off the logs, you're turning off the approval gates and path enforcement.
 
 ## Reverting
 
-Delete the YOLO settings from the risk profile, or flip `[risk_profiles.<alias>] level = "supervised"` back and restart the service. Nothing persists across config changes — each startup loads the current config fresh.
+Delete the YOLO settings from the risk profile, or flip `[risk_profiles.<alias>] level = "supervised"` back and restart the service. Nothing persists across config changes: each startup loads the current config fresh.
 
 ## See also
 
-- [Security → Autonomy levels](../security/autonomy.md) — the full gradient between YOLO and paranoid
-- [Security → Tool receipts](../security/tool-receipts.md) — the audit trail you should keep on even in YOLO
-- [Philosophy](../philosophy.md) — why this exists as an escape hatch rather than a default
+- [Security → Autonomy levels](../security/autonomy.md): the full gradient between YOLO and paranoid
+- [Security → Tool receipts](../security/tool-receipts.md): the audit trail you should keep on even in YOLO
+- [Philosophy](../philosophy.md): why this exists as an escape hatch rather than a default

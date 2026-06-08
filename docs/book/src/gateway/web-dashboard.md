@@ -46,17 +46,17 @@ contains a built `index.html`. At gateway start, the daemon:
 
 1. Reads the value from `config.toml` (or the env-var override).
 2. Verifies the directory exists AND contains `index.html` on this machine.
-3. If yes — serves the dashboard from that path.
-4. If no — logs a WARN ("path doesn't contain `index.html` on this machine;
+3. If yes, serves the dashboard from that path.
+4. If no, logs a WARN ("path doesn't contain `index.html` on this machine;
    falling back to auto-detect") and tries the auto-detect candidates below.
-5. If auto-detect also turns up nothing — the gateway runs in API-only mode
+5. If auto-detect also turns up nothing, the gateway runs in API-only mode
    and `GET /` returns a "not available" message that points back here.
 
 The value is treated as a hint, not a hard requirement. A stale path (typo,
 host-specific path copied from another machine, missing build) demotes to
 auto-detect rather than crashing every dashboard request.
 
-## Default — auto-detect order
+## Default: auto-detect order
 
 When `gateway.web_dist_dir` is unset (or set to a path with no `index.html`),
 the daemon probes these locations in order and serves from the first one that
@@ -71,7 +71,7 @@ contains `index.html`:
 | 5 | `${XDG_DATA_HOME:-~/.local/share}/zeroclaw/web/dist` | Prebuilt-binary installer (per-user) |
 
 If you're on one of those distributions and the dashboard "just works", you
-don't need to set `gateway.web_dist_dir` at all — the auto-detect found it.
+don't need to set `gateway.web_dist_dir` at all, the auto-detect found it.
 
 ## How to obtain a `web/dist`
 
@@ -118,7 +118,7 @@ The value is resolved with the standard config-layer order:
 Env-var overrides apply to the in-memory `Config` only; they are never
 written back to `config.toml`.
 
-## Schema-mirror grammar — deriving `ZEROCLAW_gateway__web_dist_dir`
+## Schema-mirror grammar: deriving `ZEROCLAW_gateway__web_dist_dir`
 
 The general operator override grammar (see
 [Environment variables](../reference/env-vars.md)) maps the dotted TOML path
@@ -135,7 +135,7 @@ Env var:    ZEROCLAW_gateway__web_dist_dir
                             (`.` → `__`)    (unchanged)
 ```
 
-The same three steps produce env-var names for every other gateway knob —
+The same three steps produce env-var names for every other gateway knob,
 e.g. `gateway.request_timeout_secs` becomes
 `ZEROCLAW_gateway__request_timeout_secs`.
 
@@ -163,19 +163,19 @@ export ZEROCLAW_gateway__web_dist_dir="$HOME/zeroclaw/web/dist"   # shell expand
 ```
 
 Companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961) adds
-the targeted "looks like an unexpanded `~` / `$VAR` —
+the targeted "looks like an unexpanded `~` / `$VAR`,
 [`shellexpand`](https://crates.io/crates/shellexpand) it before writing this
 value" check tracked in
 [issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079) to both
 `zeroclaw doctor` and `zeroclaw self-test` as a Warn-severity diagnostic.
-Neither command surfaces it on current `master` — until #6961 lands, expand
+Neither command surfaces it on current `master`, until #6961 lands, expand
 `~` / `$VAR` yourself before writing `gateway.web_dist_dir` (for example
 write `/home/alice/zeroclaw/web/dist` instead of `~/zeroclaw/web/dist`).
 
 ### Relative paths resolve against CWD, not the config file
 
 `web_dist_dir = "web/dist"` is interpreted relative to the daemon's working
-directory at start time — not relative to the location of `config.toml`. If
+directory at start time, not relative to the location of `config.toml`. If
 you ship a config to another host or invoke the daemon from a different
 directory (e.g. via systemd), the relative form will look in the wrong place.
 **Use absolute paths in `config.toml`.**
@@ -200,11 +200,11 @@ INFO Web dashboard: not available — no web/dist found. Build with
 web/dist directory.
 ```
 
-API endpoints still work — only the HTML/JS bundle is missing. Build it
+API endpoints still work, only the HTML/JS bundle is missing. Build it
 (option A/B/C above) or set the path.
 
 ## See also
 
-- [Environment variables](../reference/env-vars.md) — full schema-mirror grammar
-- [Gateway HTTP API](./api.md) — what the dashboard talks to
-- [Building the web dashboard](../developing/web.md) — `cargo web` subcommands and what gets generated
+- [Environment variables](../reference/env-vars.md): full schema-mirror grammar
+- [Gateway HTTP API](./api.md): what the dashboard talks to
+- [Building the web dashboard](../developing/web.md): `cargo web` subcommands and what gets generated

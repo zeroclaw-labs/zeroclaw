@@ -1,6 +1,6 @@
-# Channels — Overview
+# Channels: Overview
 
-A **channel** is a messaging surface the agent talks through. One ZeroClaw instance can bind multiple channels simultaneously — the same agent can answer in Discord, Telegram, email, and over the REST gateway without you running separate processes.
+A **channel** is a messaging surface the agent talks through. One ZeroClaw instance can bind multiple channels simultaneously: the same agent can answer in Discord, Telegram, email, and over the REST gateway without you running separate processes.
 
 Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one is feature-gated at compile time, so a minimal build only includes the channels you want.
 
@@ -47,7 +47,7 @@ See [Social channels](./social.md).
 | Channel | Feature flag | Notes |
 |---|---|---|
 | IMAP / SMTP | `channel-email` | Classic poll-based inbox |
-| Gmail Push | `channel-email` | Google Pub/Sub push notifications — real-time, no polling |
+| Gmail Push | `channel-email` | Google Pub/Sub push notifications: real-time, no polling |
 
 See [Email](./email.md).
 
@@ -69,7 +69,7 @@ See [Voice & telephony](./voice.md).
 | Webhook | `channel-webhook` | Inbound HTTP → agent |
 | CLI | always on | Local stdin/stdout |
 | Gateway REST/WS | always on | HTTP + WebSocket |
-| ACP (Agent Client Protocol) | `channel-acp-server` | JSON-RPC 2.0 over stdio — editor/IDE sessions |
+| ACP (Agent Client Protocol) | `channel-acp-server` | JSON-RPC 2.0 over stdio: editor/IDE sessions |
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
@@ -94,7 +94,7 @@ The `channels` entry binds the channel alias to the agent that should answer it.
 | Key | What it does |
 |---|---|
 | `enabled` | On/off without removing the section |
-| `allowed_users` | Whitelist — empty means allow all |
+| `allowed_users` | Whitelist: empty means allow all |
 | `allowed_destinations` | Restrict which rooms/channels/threads the bot answers in |
 | `reply_to_mentions_only` | Ignore messages that don't @-mention the bot |
 | `provider` | Override default model for this channel |
@@ -102,14 +102,14 @@ The `channels` entry binds the channel alias to the agent that should answer it.
 
 ## Pairing
 
-Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. Each channel's setup guide (linked from the matrix above) walks through that channel's pairing flow; `zeroclaw channel bind-telegram` handles Telegram-specific identities. Without pairing, the channel rejects everything.
+Most channels require **pairing**: a one-time handshake that binds an incoming message source to the agent's policy. Each channel's setup guide (linked from the matrix above) walks through that channel's pairing flow; `zeroclaw channel bind-telegram` handles Telegram-specific identities. Without pairing, the channel rejects everything.
 
 The rationale: an agent with a public Telegram bot token and no pairing is a publicly-accessible shell. Pairing is the gate.
 
 ## Streaming capability
 
-Channels declare what kind of streaming they support — see [Providers → Streaming](../providers/streaming.md) for the capability matrix and what `supports_draft_updates` / `supports_multi_message_streaming` mean.
+Channels declare what kind of streaming they support: see [Providers → Streaming](../providers/streaming.md) for the capability matrix and what `supports_draft_updates` / `supports_multi_message_streaming` mean.
 
 ## Adding a channel
 
-Implementing a new channel means adding a file to `crates/zeroclaw-channels/src/` that implements the `Channel` trait. The canonical reference is any existing channel of similar shape — `discord.rs` for push-based, `email_channel.rs` for polling, `webhook.rs` for HTTP-driven.
+Implementing a new channel means adding a file to `crates/zeroclaw-channels/src/` that implements the `Channel` trait. The canonical reference is any existing channel of similar shape: `discord.rs` for push-based, `email_channel.rs` for polling, `webhook.rs` for HTTP-driven.

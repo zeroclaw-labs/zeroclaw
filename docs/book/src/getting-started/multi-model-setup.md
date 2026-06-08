@@ -3,9 +3,9 @@
 A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, cost tiering, local-first with hosted backup, API key rotation, and rate-limit handling.
 
 > **Reference material** for the provider system lives in:
-> - [Model Providers → Overview](../providers/overview.md) — what providers are, configuration shape
-> - [Model Providers → Routing](../providers/routing.md) — per-agent dispatch and OpenRouter
-> - [Model Providers → Catalog](../providers/catalog.md) — every provider's config shape
+> - [Model Providers → Overview](../providers/overview.md): what providers are, configuration shape
+> - [Model Providers → Routing](../providers/routing.md): per-agent dispatch and OpenRouter
+> - [Model Providers → Catalog](../providers/catalog.md): every provider's config shape
 
 ## When to use multi-model setup
 
@@ -17,7 +17,7 @@ Multi-model configuration is useful for:
 4. **Per-team isolation**: different teams use different agents with different model_providers and credentials
 5. **Rate-limit handling**: rotate through API keys on `429` (rate limit) responses
 
-## Core idea — per-agent dispatch
+## Core idea: per-agent dispatch
 
 Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<alias>]`. If the model goes down, the agent goes down; the operator routes affected channels to a different agent. See [Routing](../providers/routing.md) for the full pattern.
 
@@ -82,9 +82,9 @@ max_tool_iterations  = 50
 max_actions_per_hour = 200
 ```
 
-Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels = [...]` list on the agent that should pick it up — `Config::validate()` makes sure references resolve at startup.
+Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels = [...]` list on the agent that should pick it up, `Config::validate()` makes sure references resolve at startup.
 
-## Cross-vendor reliability — use OpenRouter
+## Cross-vendor reliability: use OpenRouter
 
 OpenRouter is treated as a single first-class provider. It handles vendor fan-out and uptime behind one endpoint:
 
@@ -102,7 +102,7 @@ risk_profile   = "hardened"
 level = "supervised"
 ```
 
-If your goal is "one provider goes down, automatically use another", that's OpenRouter's job — not ZeroClaw's. The runtime sees one provider; OpenRouter does the cross-vendor work upstream.
+If your goal is "one provider goes down, automatically use another", that's OpenRouter's job, not ZeroClaw's. The runtime sees one provider; OpenRouter does the cross-vendor work upstream.
 
 ## Same-vendor retry
 
@@ -125,7 +125,7 @@ For providers that frequently encounter rate limits, supply additional API keys 
 api_keys = ["sk-key-2", "sk-key-3", "sk-key-4"]
 ```
 
-The primary `api_key` (configured on the provider entry) is always tried first; these extras are rotated on rate-limit errors. All keys must belong to the same provider account class — this is rate-limit smoothing, not multi-tenant key juggling.
+The primary `api_key` (configured on the provider entry) is always tried first; these extras are rotated on rate-limit errors. All keys must belong to the same provider account class, this is rate-limit smoothing, not multi-tenant key juggling.
 
 ## Local development with hosted alternative
 
@@ -176,11 +176,11 @@ max_tool_iterations  = 5
 max_actions_per_hour = 30
 ```
 
-The `dev` agent runs from the CLI (no channel binding required — `zeroclaw agent -a dev` is enough). When Ollama is down, the dev agent fails fast and surfaces the error. The prod channels are unaffected.
+The `dev` agent runs from the CLI (no channel binding required, `zeroclaw agent -a dev` is enough). When Ollama is down, the dev agent fails fast and surfaces the error. The prod channels are unaffected.
 
-## Cost tiering — heavy model when needed, fast model otherwise
+## Cost tiering: heavy model when needed, fast model otherwise
 
-Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"`, and **both agents must share the same risk profile** (delegation does not cross trust tiers). So the frontline and heavy agents below run on the *same* `trusted` risk profile — they differ in model and runtime profile (iteration budget), not in trust surface.
+Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"`, and **both agents must share the same risk profile** (delegation does not cross trust tiers). So the frontline and heavy agents below run on the *same* `trusted` risk profile, they differ in model and runtime profile (iteration budget), not in trust surface.
 
 ```toml
 [providers.models.anthropic.opus]
@@ -246,7 +246,7 @@ Retries are NOT triggered by:
 2. **Permanent auth failure**: invalid API key format
 3. **Model output errors**: the model responded but returned an error payload
 
-When all retries are exhausted on a single provider, the failure surfaces to the calling channel. There is no automatic cross-provider retry — that's the point of using OpenRouter or splitting traffic across multiple agents.
+When all retries are exhausted on a single provider, the failure surfaces to the calling channel. There is no automatic cross-provider retry, that's the point of using OpenRouter or splitting traffic across multiple agents.
 
 ## Debugging
 
@@ -270,7 +270,7 @@ zeroclaw doctor traces --contains "model_provider"
 
 1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
 2. **Use OpenRouter for cross-vendor reliability.** Cross-vendor "if Claude fails, try OpenAI" is OpenRouter's job; configure it as one provider and let its endpoint handle the fan-out.
-3. **Keep API key rotation pools homogeneous.** All keys in `[reliability] api_keys` should be from the same provider account — this is rate-limit smoothing, not multi-tenancy.
+3. **Keep API key rotation pools homogeneous.** All keys in `[reliability] api_keys` should be from the same provider account, this is rate-limit smoothing, not multi-tenancy.
 4. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
 5. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
 6. **Inject secrets via env, not inline.** `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `api_key` at startup; see [Environment variables](../reference/env-vars.md).
@@ -282,10 +282,10 @@ Each provider entry resolves credentials in this order:
 
 1. **Inline `api_key`** on the provider entry.
 2. **Secrets store** at `~/.zeroclaw/secrets`.
-3. **Generic env override** — `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
 4. **Per-vendor env var** when the family supports it (e.g. `ANTHROPIC_API_KEY` / `ANTHROPIC_OAUTH_TOKEN` for Anthropic; `OPENROUTER_API_KEY` for OpenRouter).
 
-Credentials are not shared between providers — set them per provider entry.
+Credentials are not shared between providers, set them per provider entry.
 
 ## Related Documentation
 

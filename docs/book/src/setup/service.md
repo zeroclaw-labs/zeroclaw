@@ -11,9 +11,9 @@ zeroclaw service status      # running / stopped, last exit code
 zeroclaw service uninstall   # remove it
 ```
 
-The platform-specific backends are implemented in `crates/zeroclaw-runtime/src/service/`. You don't have to think about them — but knowing what they produce helps when debugging.
+The platform-specific backends are implemented in `crates/zeroclaw-runtime/src/service/`. You don't have to think about them, but knowing what they produce helps when debugging.
 
-## Linux — systemd
+## Linux: systemd
 
 `zeroclaw service install` writes a user-scoped unit at `~/.config/systemd/user/zeroclaw.service`.
 
@@ -52,7 +52,7 @@ sudo systemctl enable --now zeroclaw
 
 When invoked with sudo/root, `zeroclaw service install` creates a system-scope unit at `/etc/systemd/system/zeroclaw.service` and provisions a dedicated `zeroclaw` service user.
 
-## Linux — OpenRC
+## Linux: OpenRC
 
 Detected automatically when `/run/openrc` exists (Alpine, some Gentoo configs).
 
@@ -62,7 +62,7 @@ rc-service zeroclaw start
 rc-update add zeroclaw default    # start on boot
 ```
 
-## macOS — LaunchAgent
+## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
 
@@ -84,9 +84,9 @@ brew services restart zeroclaw
 brew services info zeroclaw
 ```
 
-Don't mix `zeroclaw service` CLI commands with `brew services` — pick one. Both end up writing a plist; having both around confuses `launchctl`.
+Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both end up writing a plist; having both around confuses `launchctl`.
 
-## Windows — Task Scheduler
+## Windows: Task Scheduler
 
 `zeroclaw service install` creates a scheduled task in the current user's session:
 
@@ -138,7 +138,7 @@ The first few lines of its output show the config file path it resolved against.
 
 ## Auto-update
 
-The service does **not** auto-update. That's deliberate — you pick when to take new code. Subscribe to the GitHub release feed or the Discord `#releases` channel (see [Contributing → Communication](../contributing/communication.md)).
+The service does **not** auto-update. That's deliberate; you pick when to take new code. Subscribe to the GitHub release feed or the Discord `#releases` channel (see [Contributing → Communication](../contributing/communication.md)).
 
 ## See also
 

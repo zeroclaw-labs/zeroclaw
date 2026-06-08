@@ -1,18 +1,18 @@
 # Linux
 
-Install, update, run as a service, and uninstall — all Linux distributions.
+Install, update, run as a service, and uninstall, all Linux distributions.
 
 ## Install
 
-`install.sh` is the preferred path on every Linux distro. Pipe it from `curl`, or clone and run it locally — both do the same thing.
+`install.sh` is the preferred path on every Linux distro. Pipe it from `curl`, or clone and run it locally, both do the same thing.
 
-### Option 1 — `install.sh` via curl (fastest)
+### Option 1: `install.sh` via curl (fastest)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
-### Option 2 — `install.sh` from a clone
+### Option 2: `install.sh` from a clone
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
@@ -23,7 +23,7 @@ cd zeroclaw
 ### What the installer does
 
 1. Detects your distribution and architecture
-2. Asks whether you want a prebuilt binary or to build from source (the default is interactive — non-interactive shells default to prebuilt when available)
+2. Asks whether you want a prebuilt binary or to build from source (the default is interactive, non-interactive shells default to prebuilt when available)
 3. Places the binary at `~/.cargo/bin/zeroclaw`
 4. Runs `zeroclaw quickstart` to complete first-time setup
 
@@ -39,14 +39,14 @@ Flags:
 ./install.sh --help                          # full flag reference
 ```
 
-### Option 3 — Homebrew (Linuxbrew)
+### Option 3: Homebrew (Linuxbrew)
 
 ```bash
 brew install zeroclaw
 zeroclaw quickstart
 ```
 
-Homebrew-on-Linux installs follow Homebrew's service path convention — your workspace lives under `$HOMEBREW_PREFIX/var/zeroclaw/` instead of `~/.zeroclaw/`. See [Service management](./service.md) for why this matters.
+Homebrew-on-Linux installs follow Homebrew's service path convention, your workspace lives under `$HOMEBREW_PREFIX/var/zeroclaw/` instead of `~/.zeroclaw/`. See [Service management](./service.md) for why this matters.
 
 ## System dependencies
 
@@ -97,7 +97,7 @@ sudo usermod -aG gpio,spi,i2c $USER
 
 ## Update
 
-Re-run the installer — it detects the existing install and upgrades in place:
+Re-run the installer, it detects the existing install and upgrades in place:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
@@ -142,7 +142,7 @@ rm ~/.cargo/bin/zeroclaw
 brew uninstall zeroclaw
 ```
 
-Remove config and workspace (optional — this deletes conversation history):
+Remove config and workspace (optional: this deletes conversation history):
 
 ```bash
 rm -rf ~/.zeroclaw ~/.config/zeroclaw
@@ -150,6 +150,6 @@ rm -rf ~/.zeroclaw ~/.config/zeroclaw
 
 ## Next
 
-- [Service management](./service.md) — systemd unit details, logs, auto-start
-- [Quickstart](../getting-started/quickstart.md) — once installed, getting talking
-- [Operations → Overview](../ops/overview.md) — running in production
+- [Service management](./service.md): systemd unit details, logs, auto-start
+- [Quickstart](../getting-started/quickstart.md): once installed, getting talking
+- [Operations → Overview](../ops/overview.md): running in production

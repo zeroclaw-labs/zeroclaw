@@ -1,4 +1,4 @@
-# Adding Boards and Tools — ZeroClaw Hardware Guide
+# Adding Boards and Tools: ZeroClaw Hardware Guide
 
 This guide explains how to add new hardware boards and custom tools to ZeroClaw.
 
@@ -68,9 +68,9 @@ Place PDFs in the datasheet directory. They are extracted and chunked for RAG.
 
 ## Adding a New Board Type
 
-1. **Create a datasheet** — `docs/datasheets/my-board.md` with pin aliases and GPIO info.
-2. **Add to config** — `zeroclaw peripheral add my-board /dev/ttyUSB0`
-3. **Implement a peripheral** (optional) — For custom protocols, implement the `Peripheral` trait in `crates/zeroclaw-hardware/src/peripherals/` and register in `create_peripheral_tools`.
+1. **Create a datasheet**: `docs/datasheets/my-board.md` with pin aliases and GPIO info.
+2. **Add to config**: `zeroclaw peripheral add my-board /dev/ttyUSB0`
+3. **Implement a peripheral** (optional): For custom protocols, implement the `Peripheral` trait in `crates/zeroclaw-hardware/src/peripherals/` and register in `create_peripheral_tools`.
 
 See [`docs/hardware/hardware-peripherals-design.md`](../hardware/hardware-peripherals-design.md) for the full design.
 
@@ -86,6 +86,6 @@ See the [generated CLI reference](../reference/cli.md) for `zeroclaw peripheral`
 
 ## Troubleshooting
 
-- **Serial port not found** — On macOS use `/dev/cu.usbmodem*`; on Linux use `/dev/ttyACM0` or `/dev/ttyUSB0`.
-- **Build with hardware** — `cargo build --features hardware`
-- **Probe-rs for Nucleo** — `cargo build --features hardware,probe`
+- **Serial port not found**: On macOS use `/dev/cu.usbmodem*`; on Linux use `/dev/ttyACM0` or `/dev/ttyUSB0`.
+- **Build with hardware**: `cargo build --features hardware`
+- **Probe-rs for Nucleo**: `cargo build --features hardware,probe`

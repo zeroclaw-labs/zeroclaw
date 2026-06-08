@@ -1,6 +1,6 @@
 # Request Lifecycle
 
-What happens between "user sends a message" and "agent replies" — the full path, with streaming, tool calls, and security gates annotated.
+What happens between "user sends a message" and "agent replies": the full path, with streaming, tool calls, and security gates annotated.
 
 ## Inbound
 
@@ -13,9 +13,9 @@ flowchart LR
 
 A channel adapter (e.g. `discord.rs`, `telegram.rs`, `email_channel.rs`) receives platform-native events and converts them into a uniform inbound envelope. The adapter handles:
 
-- **Decoding** — platform-specific payload → canonical message format
-- **Deduplication** — prevents replaying the same message twice (restarts, retries)
-- **Pair-check** — enforces the `[channels.<name>.allowed_users]` / IAM policy before the event reaches the runtime
+- **Decoding**: platform-specific payload → canonical message format
+- **Deduplication**: prevents replaying the same message twice (restarts, retries)
+- **Pair-check**: enforces the `[channels.<name>.allowed_users]` / IAM policy before the event reaches the runtime
 
 If the channel is not paired or the user isn't allowed, the event is dropped before the runtime sees it.
 
@@ -67,7 +67,7 @@ Key properties:
 
 ## Tool receipts
 
-Every tool invocation produces a signed receipt written to the tool-receipts log. See [Tool receipts](../security/tool-receipts.md). Receipts are chained — each one includes the hash of the previous — so tampering with any receipt invalidates the rest of the log.
+Every tool invocation produces a signed receipt written to the tool-receipts log. See [Tool receipts](../security/tool-receipts.md). Receipts are chained, each one includes the hash of the previous, so tampering with any receipt invalidates the rest of the log.
 
 ## Outbound
 

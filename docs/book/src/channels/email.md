@@ -36,7 +36,7 @@ allowed_senders = ["boss@example.com", "alerts@example.com"]
 ### Gmail gotchas
 
 - **App passwords required** if 2FA is on. Regular account password is rejected.
-- **"Less secure app access" is gone** — app password is the only path.
+- **"Less secure app access" is gone**: app password is the only path.
 - Consider the Gmail Push channel below for real-time delivery instead of polling.
 
 ### Outlook / Office 365
@@ -53,7 +53,7 @@ oauth_token = "..."              # managed via `zeroclaw channel auth email`
 
 ## Gmail Push (`gmail_push`)
 
-Real-time delivery via Google Cloud Pub/Sub — no polling.
+Real-time delivery via Google Cloud Pub/Sub, no polling.
 
 ```toml
 [channels.gmail_push]
@@ -74,7 +74,7 @@ allowed_senders = ["boss@example.com"]
 5. On first run, `zeroclaw channel auth gmail-push` opens a browser for the OAuth consent
 6. The agent watches the subscription for new-mail notifications
 
-Outbound sends still go via SMTP — configure an `smtp` block in this channel the same way as the IMAP+SMTP channel.
+Outbound sends still go via SMTP: configure an `smtp` block in this channel the same way as the IMAP+SMTP channel.
 
 ---
 
@@ -110,4 +110,4 @@ Email isn't optimised for conversational latency. Expect:
 
 ## Safety
 
-Email has no auth at the protocol level beyond SMTP's envelope — anyone can claim to be anyone. Always configure `allowed_senders` (strict list of addresses) or `subject_prefix` (shared secret in the subject line) before exposing the agent to an inbox that receives public mail.
+Email has no auth at the protocol level beyond SMTP's envelope; anyone can claim to be anyone. Always configure `allowed_senders` (strict list of addresses) or `subject_prefix` (shared secret in the subject line) before exposing the agent to an inbox that receives public mail.

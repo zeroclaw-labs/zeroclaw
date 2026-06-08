@@ -1,12 +1,12 @@
 # Tool Receipts
 
-Tool receipts are cryptographic proofs that a tool actually ran. Every tool invocation — approved, blocked, or auto-approved — produces an HMAC-SHA256 digest over the call and its result. The digest is appended to the tool-result text and passed back to the model as part of the conversation.
+Tool receipts are cryptographic proofs that a tool actually ran. Every tool invocation, approved, blocked, or auto-approved, produces an HMAC-SHA256 digest over the call and its result. The digest is appended to the tool-result text and passed back to the model as part of the conversation.
 
 The practical outcome: the model cannot claim to have run a tool it didn't run, and it cannot fabricate a tool result. Both produce receipt mismatches the runtime detects.
 
 ## The threat model
 
-An LLM is a string generator. By default, nothing prevents it from narrating a tool call it never made ("I ran `git log` and the latest commit is…"), or inventing a result for a tool call ("The weather API says 72°F" — when the call timed out). For an agent with autonomy, this is more than a correctness issue — it's a deniability issue.
+An LLM is a string generator. By default, nothing prevents it from narrating a tool call it never made ("I ran `git log` and the latest commit is…"), or inventing a result for a tool call ("The weather API says 72°F", when the call timed out). For an agent with autonomy, this is more than a correctness issue: it's a deniability issue.
 
 Tool receipts close that gap with the cheapest possible construct: a symmetric MAC with an ephemeral process-lifetime key.
 
@@ -16,7 +16,7 @@ Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs: Practical 
 
 ## How it works
 
-1. At channel-server startup, a 256-bit key is generated and held in `ChannelRuntimeContext` for the lifetime of the daemon process. It's ephemeral — never written to disk, never sent to the model, never logged. A daemon restart rotates the key.
+1. At channel-server startup, a 256-bit key is generated and held in `ChannelRuntimeContext` for the lifetime of the daemon process. It's ephemeral: never written to disk, never sent to the model, never logged. A daemon restart rotates the key.
 2. After each tool invocation, the runtime computes:
    ```
    receipt = HMAC-SHA256(key, tool_name || args || result || timestamp)
@@ -27,7 +27,7 @@ Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs: Practical 
    ```
 4. The tool result (with the receipt) is fed back to the model.
 
-The model sees every receipt in its conversation history. It can echo them in text it produces to the user. But it cannot produce a *new* valid receipt — the HMAC requires the session key, which the model doesn't have.
+The model sees every receipt in its conversation history. It can echo them in text it produces to the user. But it cannot produce a *new* valid receipt: the HMAC requires the session key, which the model doesn't have.
 
 ### Receipt shape
 
@@ -42,7 +42,7 @@ The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receip
 
 | Scenario | Without receipts | With receipts |
 |---|---|---|
-| Model claims it ran a tool, didn't | Undetectable | No receipt — fabrication visible |
+| Model claims it ran a tool, didn't | Undetectable | No receipt: fabrication visible |
 | Model fabricates a result for a real call | Undetectable | HMAC mismatches on verification |
 | Model denies a call it did make | Unverifiable | Receipt in log proves it |
 | Model fabricates a plausible receipt string | Plausible | HMAC verification fails |
@@ -83,7 +83,7 @@ Tool receipts:
 
 ### In the LLM's own output
 
-Because the model sees receipts in its context, it may echo them when describing tool results. The leak detector is configured to pass `zc-receipt-*` tokens through unmodified so this echoing works. If both the runtime and the model include a receipts block, the user sees two — strip one via channel-specific formatting rules.
+Because the model sees receipts in its context, it may echo them when describing tool results. The leak detector is configured to pass `zc-receipt-*` tokens through unmodified so this echoing works. If both the runtime and the model include a receipts block, the user sees two: strip one via channel-specific formatting rules.
 
 ## Configuration
 
@@ -122,5 +122,5 @@ inject_system_prompt = true # instruct the model to echo receipts verbatim
 ## See also
 
 - [Security → Overview](./overview.md)
-- [Autonomy levels](./autonomy.md) — the policy layer that decides whether a receipt-worthy call happens
-- [Reference → Config](../reference/config.md) — generated config reference
+- [Autonomy levels](./autonomy.md): the policy layer that decides whether a receipt-worthy call happens
+- [Reference → Config](../reference/config.md): generated config reference

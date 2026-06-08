@@ -6,13 +6,13 @@ Install, update, run as a LaunchAgent, and uninstall on macOS (Intel or Apple Si
 
 `install.sh` is the preferred path; Homebrew is a reasonable alternative if you want `brew services` integration.
 
-### Option 1 — `install.sh` via curl (fastest)
+### Option 1: `install.sh` via curl (fastest)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
-### Option 2 — `install.sh` from a clone
+### Option 2: `install.sh` from a clone
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
@@ -38,7 +38,7 @@ Flags:
 ./install.sh --help                          # full flag reference
 ```
 
-### Option 3 — Homebrew
+### Option 3: Homebrew
 
 ```bash
 brew install zeroclaw
@@ -87,13 +87,13 @@ brew services start zeroclaw
 brew services info zeroclaw
 ```
 
-Both methods produce the same end state — a loaded LaunchAgent that starts on login. Pick one and stick with it.
+Both methods produce the same end state, a loaded LaunchAgent that starts on login. Pick one and stick with it.
 
 Full details: [Service management](./service.md).
 
 ## Update
 
-Re-run the installer — it detects the existing install and upgrades in place:
+Re-run the installer, it detects the existing install and upgrades in place:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
@@ -130,7 +130,7 @@ brew uninstall zeroclaw
 rm ~/.cargo/bin/zeroclaw
 ```
 
-Remove config and workspace (optional — this deletes conversation history):
+Remove config and workspace (optional: this deletes conversation history):
 
 ```bash
 # Homebrew workspace

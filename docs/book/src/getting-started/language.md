@@ -54,7 +54,7 @@ zeroclaw locales fetch ja --catalog cli,zerocode   # CLI + the TUI
 ```
 
 If a catalogue has not been translated for your language yet, `fetch` skips it
-and tells you — the catalogues that do exist are still installed.
+and tells you: the catalogues that do exist are still installed.
 
 ## Where the files live
 

@@ -1,4 +1,4 @@
-# ZeroClaw on Arduino Uno Q — Step-by-Step Guide
+# ZeroClaw on Arduino Uno Q: Step-by-Step Guide
 
 Run ZeroClaw on the Arduino Uno Q's Linux side. Telegram works over WiFi; GPIO control uses the Bridge (requires a minimal App Lab app).
 
@@ -6,7 +6,7 @@ Run ZeroClaw on the Arduino Uno Q's Linux side. Telegram works over WiFi; GPIO c
 
 ## What's Included (No Code Changes Needed)
 
-ZeroClaw includes everything needed for Arduino Uno Q. **Clone the repo and follow this guide — no patches or custom code required.**
+ZeroClaw includes everything needed for Arduino Uno Q. **Clone the repo and follow this guide, no patches or custom code required.**
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
@@ -130,7 +130,7 @@ ssh arduino@<UNO_Q_IP>
 zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
-**At this point:** Telegram chat works. Send messages to your bot — ZeroClaw responds. No GPIO yet.
+**At this point:** Telegram chat works. Send messages to your bot, ZeroClaw responds. No GPIO yet.
 
 ---
 
@@ -179,17 +179,17 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 7 | `zeroclaw quickstart --api-key KEY --model-provider openrouter` |
 | 8 | `zeroclaw config set channels.telegram.default.bot-token <token>` |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
-| 10 | Message your Telegram bot — it responds |
+| 10 | Message your Telegram bot: it responds |
 | 11 | `zeroclaw peripheral setup-uno-q` (deploys Bridge) |
 | 12 | Add `[peripherals]` block with `board = "arduino-uno-q"` to `config.toml` |
-| 13 | Restart daemon (`zeroclaw daemon …`) — GPIO commands now work |
+| 13 | Restart daemon (`zeroclaw daemon …`), GPIO commands now work |
 
 ---
 
 ## Troubleshooting
 
-- **"command not found: zeroclaw"** — Use full path: `/usr/local/bin/zeroclaw` or ensure `~/.cargo/bin` is in PATH.
-- **Telegram not responding** — Check bot_token, allowed_users, and that the Uno Q has internet (WiFi).
-- **Out of memory** — Keep features minimal (`--features hardware` for Uno Q); consider `compact_context = true`.
-- **GPIO commands ignored** — Ensure Bridge app is running (`zeroclaw peripheral setup-uno-q` deploys and starts it). Config must have `board = "arduino-uno-q"` and `transport = "bridge"`.
-- **LLM provider (GLM/Zhipu)** — Configure `[providers.models.glm.<alias>]` with `GLM_API_KEY` in env or config (the legacy `zhipu` synonym is collapsed onto `glm`). ZeroClaw uses the correct v4 endpoint.
+- **"command not found: zeroclaw"**: Use full path: `/usr/local/bin/zeroclaw` or ensure `~/.cargo/bin` is in PATH.
+- **Telegram not responding**: Check bot_token, allowed_users, and that the Uno Q has internet (WiFi).
+- **Out of memory**: Keep features minimal (`--features hardware` for Uno Q); consider `compact_context = true`.
+- **GPIO commands ignored**: Ensure Bridge app is running (`zeroclaw peripheral setup-uno-q` deploys and starts it). Config must have `board = "arduino-uno-q"` and `transport = "bridge"`.
+- **LLM provider (GLM/Zhipu)**: Configure `[providers.models.glm.<alias>]` with `GLM_API_KEY` in env or config (the legacy `zhipu` synonym is collapsed onto `glm`). ZeroClaw uses the correct v4 endpoint.

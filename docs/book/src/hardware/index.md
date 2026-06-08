@@ -1,4 +1,4 @@
-# Hardware — Overview
+# Hardware: Overview
 
 ZeroClaw's hardware subsystem lets the agent control microcontrollers, SBCs, and peripherals directly. Enable with `--features hardware`.
 
@@ -33,12 +33,12 @@ cargo build --release --features "hardware board-nucleo board-arduino"
 
 With the feature enabled, the agent gains these tools:
 
-- `gpio_read` / `gpio_write` — digital I/O
-- `i2c_read` / `i2c_write` — I2C bus access
-- `spi_transfer` — SPI transfers
-- `adc_read` — analogue reads (where supported)
-- `peripheral_probe` — discover attached boards and sensors
-- `peripheral_flash` — flash firmware to a connected microcontroller
+- `gpio_read` / `gpio_write`: digital I/O
+- `i2c_read` / `i2c_write`: I2C bus access
+- `spi_transfer`: SPI transfers
+- `adc_read`: analogue reads (where supported)
+- `peripheral_probe`: discover attached boards and sensors
+- `peripheral_flash`: flash firmware to a connected microcontroller
 
 All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Hardware tools only reach the device paths explicitly listed in `[[peripherals.boards]]` entries:
 
@@ -73,7 +73,7 @@ The stock systemd unit sets `SupplementaryGroups=gpio spi i2c`.
 
 Hardware tools can brick things. Real, expensive things.
 
-- `peripheral_flash` writes firmware — a bad image can brick the board. The tool requires operator approval at `Supervised` autonomy regardless of autonomy level; there's no way to auto-approve it.
+- `peripheral_flash` writes firmware, a bad image can brick the board. The tool requires operator approval at `Supervised` autonomy regardless of autonomy level; there's no way to auto-approve it.
 - `i2c_write` / `spi_transfer` to device addresses the agent doesn't know can damage sensors.
 - GPIO writes that conflict with external drivers (voltage fights) damage pins.
 
@@ -101,6 +101,6 @@ See [Adding boards & tools](./adding-boards-and-tools.md) for the step-by-step. 
 
 ## See also
 
-- [Peripherals design](./hardware-peripherals-design.md) — the architecture
-- [Adding boards & tools](./adding-boards-and-tools.md) — implementation guide
-- [Aardvark](./aardvark.md) — USB I2C/SPI host adapter setup
+- [Peripherals design](./hardware-peripherals-design.md): the architecture
+- [Adding boards & tools](./adding-boards-and-tools.md): implementation guide
+- [Aardvark](./aardvark.md): USB I2C/SPI host adapter setup

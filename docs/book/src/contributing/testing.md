@@ -1,6 +1,6 @@
 # Testing
 
-ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost — pick the lowest level that proves what you need to prove.
+ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost; pick the lowest level that proves what you need to prove.
 
 ## The five levels
 
@@ -16,8 +16,8 @@ Plus two non-test directories:
 
 | Directory | Purpose |
 |---|---|
-| `tests/manual/` | Human-driven test scripts (shell, Python) — run directly, not via cargo |
-| `tests/support/` | Shared mock infrastructure — not a test binary, included as `mod support;` from each level |
+| `tests/manual/` | Human-driven test scripts (shell, Python), run directly, not via cargo |
+| `tests/support/` | Shared mock infrastructure, not a test binary, included as `mod support;` from each level |
 
 ## Running tests
 
@@ -64,7 +64,7 @@ use crate::support::helpers::{build_agent, text_response, tool_response};
 
 ## JSON trace fixtures
 
-Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fixtures/traces/`. They replace inline mock setup with declarative conversation scripts — much easier to read and edit than `mockall` chains.
+Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fixtures/traces/`. They replace inline mock setup with declarative conversation scripts, much easier to read and edit than `mockall` chains.
 
 How it works:
 
@@ -108,15 +108,15 @@ Expects fields: `response_contains`, `response_not_contains`, `tools_used`, `too
 
 ## Live test conventions
 
-Live tests hit real external services and cost real money — they are `#[ignore]` by default and only run with explicit opt-in.
+Live tests hit real external services and cost real money; they are `#[ignore]` by default and only run with explicit opt-in.
 
 - Always `#[ignore]`. Never let a live test run on a normal `cargo test`.
-- Read credentials from `env::var("ZEROCLAW_TEST_*")`. Don't read from `~/.zeroclaw/config.toml` — live tests should be hermetic.
+- Read credentials from `env::var("ZEROCLAW_TEST_*")`. Don't read from `~/.zeroclaw/config.toml`; live tests should be hermetic.
 - Run with `cargo test --test live -- --ignored --nocapture`.
 
 ## Database tests are integration tests
 
-Don't mock SQLite for tests that exercise schema or SQL — integration tests must hit a real database. The mock-passes-but-prod-fails class of bug is real and we've eaten it before.
+Don't mock SQLite for tests that exercise schema or SQL; integration tests must hit a real database. The mock-passes-but-prod-fails class of bug is real and we've eaten it before.
 
 ## Manual tests
 

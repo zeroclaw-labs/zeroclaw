@@ -1,6 +1,6 @@
 # Changelog Generation
 
-The authoritative procedure for assembling `CHANGELOG-next.md` between stable releases. This page is loaded by the `changelog-generation` skill and read by maintainers running a release manually — both consume the same protocol.
+The authoritative procedure for assembling `CHANGELOG-next.md` between stable releases. This page is loaded by the `changelog-generation` skill and read by maintainers running a release manually; both consume the same protocol.
 
 The release workflows (`release-stable-manual.yml`) automatically use `CHANGELOG-next.md` as the GitHub Release body if it's at the repo root when a release fires. After the stable release ships, `CHANGELOG-next.md` is intentionally left on `master`; the next release cycle overwrites it with a fresh file. No manual cleanup is needed.
 
@@ -45,7 +45,7 @@ git log <from>..<to> --pretty=format:"%H" --no-merges > /tmp/zc-commits.txt
 
 ### Categorise
 
-Map each commit to a section by its conventional commit prefix. Commits without a recognized prefix must still be read and categorized by content — never silently drop them.
+Map each commit to a section by its conventional commit prefix. Commits without a recognized prefix must still be read and categorized by content; never silently drop them.
 
 | Prefix | Section |
 |---|---|
@@ -55,7 +55,7 @@ Map each commit to a section by its conventional commit prefix. Commits without 
 | `security:`, `fix(*security*)` | What's New → Security |
 | `docs:`, `docs(*)` | What's New → Documentation (omit trivial typo fixes) |
 | `chore:`, `ci:`, `build:` | Omit unless user-visible (new install path, dropped platform, etc.) |
-| `breaking:` or `!` suffix | Breaking Changes — always surface |
+| `breaking:` or `!` suffix | Breaking Changes: always surface |
 | No prefix | Read body; categorize by content; note in review |
 
 ### Section ordering in the output file
@@ -69,7 +69,7 @@ Map each commit to a section by its conventional commit prefix. Commits without 
 
 ## 3. Contributor resolution
 
-Do **not** use `git log --pretty=format:"%an"` alone — it misses everyone listed in `Co-Authored-By` trailers. Use the GitHub GraphQL `authors` field, which resolves direct authors and co-authors.
+Do **not** use `git log --pretty=format:"%an"` alone; it misses everyone listed in `Co-Authored-By` trailers. Use the GitHub GraphQL `authors` field, which resolves direct authors and co-authors.
 
 ### Query
 
@@ -106,7 +106,7 @@ Run via `gh`:
 gh api graphql -f query='<query>'
 ```
 
-### Filter list — exclude all of the following
+### Filter list: exclude all of the following
 
 **By login pattern:**
 
@@ -160,7 +160,7 @@ Suggested groups (add or omit freely):
 - Installation & Distribution
 - Dependencies & Security Advisories
 
-Write each entry as a sentence for a human reader — not a raw commit message. Reference PR numbers with `(#NNNN)` where available.
+Write each entry as a sentence for a human reader, not a raw commit message. Reference PR numbers with `(#NNNN)` where available.
 
 ### Bug Fixes
 
@@ -191,7 +191,7 @@ If there are no breaking changes, omit this section entirely.
 
 ### Write location
 
-Write to `CHANGELOG-next.md` at the repository root — that's the path the release workflows look for. A copy also lands at `tmp/CHANGELOG-next.md` for in-session review before committing.
+Write to `CHANGELOG-next.md` at the repository root; that's the path the release workflows look for. A copy also lands at `tmp/CHANGELOG-next.md` for in-session review before committing.
 
 ### Commit
 

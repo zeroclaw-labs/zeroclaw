@@ -1,6 +1,6 @@
 # Service & Daemon
 
-This page is the operations-side companion to [Setup → Service management](../setup/service.md) — that page covers installing and uninstalling the service. This page covers running it: tuning, resource limits, graceful restarts, and multi-workspace setups.
+This page is the operations-side companion to [Setup → Service management](../setup/service.md); that page covers installing and uninstalling the service. This page covers running it: tuning, resource limits, graceful restarts, and multi-workspace setups.
 
 ## Choosing between user and system scope
 
@@ -26,11 +26,11 @@ Restart=on-failure
 RestartSec=10s
 ```
 
-The agent exits cleanly on config errors (`exit 2`) and is not restarted — this prevents a flapping service from chewing CPU while you fix the config. For other exit codes, systemd restarts with a 10-second backoff.
+The agent exits cleanly on config errors (`exit 2`) and is not restarted; this prevents a flapping service from chewing CPU while you fix the config. For other exit codes, systemd restarts with a 10-second backoff.
 
 On macOS, the LaunchAgent plist has `KeepAlive = true` with `SuccessfulExit = false`. Same semantics as `on-failure`.
 
-On Windows, the Task Scheduler task is configured with "Restart if task fails" — retry every 10s, up to 10 times.
+On Windows, the Task Scheduler task is configured with "Restart if task fails", retry every 10s, up to 10 times.
 
 ## Graceful shutdown
 
@@ -55,17 +55,17 @@ zeroclaw service stop     # free the gateway port if the service is running
 zeroclaw daemon
 ```
 
-`zeroclaw daemon` runs in the foreground, logs to stderr, and is the same process the service runs — just without the service harness. Useful when:
+`zeroclaw daemon` runs in the foreground, logs to stderr, and is the same process the service runs, just without the service harness. Useful when:
 
 - Diagnosing startup failures that the service swallows
 - Running under `gdb` / `lldb`
 - Testing a config change before committing to it
 
-Terminate with Ctrl-C — same graceful shutdown semantics as SIGTERM.
+Terminate with Ctrl-C, same graceful shutdown semantics as SIGTERM.
 
 ## Resource limits
 
-### Linux — systemd
+### Linux: systemd
 
 Add to a drop-in:
 
@@ -87,7 +87,7 @@ systemctl --user daemon-reload
 systemctl --user restart zeroclaw
 ```
 
-### macOS — launchd
+### macOS: launchd
 
 Edit `~/Library/LaunchAgents/com.zeroclaw.daemon.plist`:
 

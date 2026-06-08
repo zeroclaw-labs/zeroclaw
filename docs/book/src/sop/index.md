@@ -4,10 +4,10 @@ SOPs are deterministic procedures executed by the `SopEngine`. They provide expl
 
 ## Quick Paths
 
-- **Connect Events:** [Connectivity & Fan-In](connectivity.md) — trigger SOPs via MQTT, webhooks, cron, or peripherals.
-- **Write SOPs:** [Syntax Reference](syntax.md) — required file layout and trigger/step syntax.
-- **Monitor:** [Observability & Audit](observability.md) — where run state and audit entries are stored.
-- **Examples:** [Cookbook](cookbook.md) — reusable SOP patterns.
+- **Connect Events:** [Connectivity & Fan-In](connectivity.md): trigger SOPs via MQTT, webhooks, cron, or peripherals.
+- **Write SOPs:** [Syntax Reference](syntax.md): required file layout and trigger/step syntax.
+- **Monitor:** [Observability & Audit](observability.md): where run state and audit entries are stored.
+- **Examples:** [Cookbook](cookbook.md): reusable SOP patterns.
 
 ## 1. Runtime Contract (Current)
 

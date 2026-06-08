@@ -6,8 +6,8 @@ Deploying ZeroClaw so it can receive inbound traffic: gateway exposure, webhook 
 
 | Mode | Needs inbound port | Notes |
 |---|:---:|---|
-| Telegram (long-poll) | No | ZeroClaw polls `api.telegram.org` — works behind NAT |
-| Matrix / Mattermost / Nextcloud Talk | No | Sync/WebSocket — outbound only |
+| Telegram (long-poll) | No | ZeroClaw polls `api.telegram.org`, works behind NAT |
+| Matrix / Mattermost / Nextcloud Talk | No | Sync/WebSocket, outbound only |
 | Discord / Slack (Socket Mode) | No | Outbound WebSocket |
 | Signal (`signal-cli-rest-api`) | No | Localhost container |
 | Nostr / IMAP / MQTT | No | All outbound |
@@ -15,13 +15,13 @@ Deploying ZeroClaw so it can receive inbound traffic: gateway exposure, webhook 
 | Gateway pairing from LAN | Yes (LAN-scope) | Bind to `0.0.0.0` or use a tunnel |
 | Discord / Slack (HTTP Events) | Yes | If you don't use Socket Mode |
 
-**Upshot:** a Telegram-only bot runs on a Pi behind a consumer router with zero port forwarding. Anything webhook-based needs a reachable URL — which is where tunnels come in.
+**Upshot:** a Telegram-only bot runs on a Pi behind a consumer router with zero port forwarding. Anything webhook-based needs a reachable URL, which is where tunnels come in.
 
 ## Binding the gateway
 
-By default the gateway binds to `127.0.0.1` — unreachable from other devices. Three options to expose it:
+By default the gateway binds to `127.0.0.1`, unreachable from other devices. Three options to expose it:
 
-### Option 1 — Public bind (LAN)
+### Option 1: Public bind (LAN)
 
 ```toml
 [gateway]
@@ -30,18 +30,18 @@ port = 42617
 allow_public_bind = true     # required safety flag
 ```
 
-Then any device on the LAN can reach `http://<pi-ip>:42617`. Doesn't help for internet-reachable webhooks — your router's public IP isn't forwarded to the Pi.
+Then any device on the LAN can reach `http://<pi-ip>:42617`. Doesn't help for internet-reachable webhooks, your router's public IP isn't forwarded to the Pi.
 
 **Safety:** `allow_public_bind = true` is required because binding to `0.0.0.0` is a significant posture change. Without it, the daemon refuses. This is deliberate.
 
-### Option 2 — Tunnel (internet-reachable)
+### Option 2: Tunnel (internet-reachable)
 
 ```toml
 [tunnel]
 provider = "tailscale"       # or "cloudflare", "ngrok"
 ```
 
-Then restart the daemon — the tunnel is managed declaratively from config, starting alongside the gateway.
+Then restart the daemon, the tunnel is managed declaratively from config, starting alongside the gateway.
 
 The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router config, no opened ports. All three supported tunnels work similarly:
 
@@ -51,7 +51,7 @@ The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router c
 | Cloudflare Tunnel | Create Cloudflare account, install `cloudflared` | Free | Custom domains |
 | ngrok | Sign up, install CLI | Free with limits | Testing, short-lived |
 
-### Option 3 — Reverse proxy
+### Option 3: Reverse proxy
 
 Run nginx / Caddy / Traefik in front of the gateway. Terminate TLS there, proxy to `localhost:42617`. Suitable for:
 
@@ -67,7 +67,7 @@ agent.example.com {
 }
 ```
 
-The gateway stays bound to `127.0.0.1` — the proxy does the listening.
+The gateway stays bound to `127.0.0.1`, the proxy does the listening.
 
 ## Raspberry Pi deployment
 
@@ -85,7 +85,7 @@ For a Pi running Raspberry Pi OS:
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --prebuilt
 ```
 
-Prefer `--prebuilt` on a Pi — compiling from source can take 30+ minutes.
+Prefer `--prebuilt` on a Pi, compiling from source can take 30+ minutes.
 
 For a Pi running Alpine:
 
@@ -106,7 +106,7 @@ Grants access to GPIO, I2C, SPI via `rppal`. The stock service unit already adds
 
 - [ ] Install the binary (prefer prebuilt on a Pi)
 - [ ] Run `zeroclaw quickstart`
-- [ ] Configure your channels — Telegram needs no port; webhooks need a tunnel
+- [ ] Configure your channels. Telegram needs no port; webhooks need a tunnel
 - [ ] Install the service: `zeroclaw service install && zeroclaw service start`
 - [ ] For LAN access: set `[gateway] host = "0.0.0.0"` + `allow_public_bind = true`
 - [ ] For webhooks: configure `[tunnel]` with a provider
@@ -121,9 +121,9 @@ sudo zeroclaw service install
 
 Creates:
 
-- `/etc/init.d/zeroclaw` — init script
-- `/etc/zeroclaw/` — config directory
-- `/var/log/zeroclaw/` — log files
+- `/etc/init.d/zeroclaw`: init script
+- `/etc/zeroclaw/`: config directory
+- `/var/log/zeroclaw/`: log files
 
 Enable and start:
 
@@ -143,12 +143,12 @@ sudo tail -f /var/log/zeroclaw/error.log
 
 - Service runs as `zeroclaw:zeroclaw` (least privilege)
 - Config path is fixed: `/etc/zeroclaw/config.toml`
-- System-wide only — no user-level OpenRC services
+- System-wide only: no user-level OpenRC services
 - All service operations need `sudo`
 
 ## Telegram polling caveat
 
-Telegram Bot API's `getUpdates` is single-poller per bot token. You cannot run two instances with the same token — the second gets `Conflict: terminated by other getUpdates request`.
+Telegram Bot API's `getUpdates` is single-poller per bot token. You cannot run two instances with the same token; the second gets `Conflict: terminated by other getUpdates request`.
 
 If you see this:
 
@@ -163,15 +163,15 @@ If you see this:
 
 A publicly-reachable webhook URL is attack surface. At minimum:
 
-- **HMAC signature verification** — `secret` configured on each webhook channel
+- **HMAC signature verification**: `secret` configured on each webhook channel
 - **Source IP allowlist** where the service has fixed egress IPs (GitHub, AWS SNS)
-- **Rate limiting** — `rate_limit_per_sec` in the webhook channel config
+- **Rate limiting**: `rate_limit_per_sec` in the webhook channel config
 
 See [Channels → Webhooks](../channels/webhook.md) for the full set of knobs.
 
 ## See also
 
-- [Setup → Container](../setup/container.md) — Docker-specific network config
-- [Setup → Service management](../setup/service.md) — platform service integration
+- [Setup → Container](../setup/container.md): Docker-specific network config
+- [Setup → Service management](../setup/service.md): platform service integration
 - [Operations → Overview](./overview.md)
 - [Security → Overview](../security/overview.md)

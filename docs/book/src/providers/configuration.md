@@ -1,18 +1,18 @@
 # Provider Configuration
 
-Every model provider lives at `[providers.models.<type>.<alias>]` in `~/.zeroclaw/config.toml`. `<type>` is the canonical family slot (`anthropic`, `openai`, `azure`, `gemini`, `groq`, `moonshot`, ...). `<alias>` is your operator-assigned instance name — pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
+Every model provider lives at `[providers.models.<type>.<alias>]` in `~/.zeroclaw/config.toml`. `<type>` is the canonical family slot (`anthropic`, `openai`, `azure`, `gemini`, `groq`, `moonshot`, ...). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
 
 ## Minimal working example
 
-The smallest config that loads clean has four section headers — a provider entry, an agent that references it, and a risk profile the agent gates against:
+The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against:
 
 ```toml
 {{#include ../_snippets/minimal-config.toml}}
 ```
 
-The aliases (`home`, `assistant`) above are example names — substitute whatever suits your install.
+The aliases (`home`, `assistant`) above are example names, substitute whatever suits your install.
 
-## Field reference — provider entry
+## Field reference: provider entry
 
 ```toml
 [providers.models.<type>.<alias>]
@@ -30,9 +30,9 @@ uri     = "https://..."     # optional operator override; otherwise the family's
 
 For every family, the URL is resolved in this order:
 
-1. **Operator override** — `uri` field on the alias entry, if set.
-2. **Family endpoint** — the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
-3. **Templated families** — Azure and Bedrock take typed inputs (`resource`, `deployment`, `api_version` for Azure; `region` for Bedrock) and substitute them into the family's URI template. Missing fields fail loud at runtime.
+1. **Operator override**: `uri` field on the alias entry, if set.
+2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
+3. **Templated families**: Azure and Bedrock take typed inputs (`resource`, `deployment`, `api_version` for Azure; `region` for Bedrock) and substitute them into the family's URI template. Missing fields fail loud at runtime.
 
 ## Family slots
 
@@ -42,7 +42,7 @@ Run `cargo doc --open -p zeroclaw-config` (or read [`crates/zeroclaw-config/src/
 |---|---|
 | `anthropic` | API key or OAuth (`sk-ant-oat-*`) |
 | `openai` | GPT, o-series; the OpenAI Codex subscription variant is `providers.models.openai.<alias>` with `wire_api = "responses"` and `requires_openai_auth = true` |
-| `azure` | Typed: `resource`, `deployment`, `api_version` — all set on the alias entry |
+| `azure` | Typed: `resource`, `deployment`, `api_version`, all set on the alias entry |
 | `gemini` | Google's API; `gemini_cli` is the CLI-shells-out variant |
 | `bedrock` | AWS-credentials chain, region template |
 | `ollama` | Local inference; `uri` defaults to `http://localhost:11434` |
@@ -52,15 +52,15 @@ Run `cargo doc --open -p zeroclaw-config` (or read [`crates/zeroclaw-config/src/
 | `lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm` | Local-server defaults (`http://localhost:<port>/v1`) |
 | `custom` | Catch-all for OpenAI-compatible endpoints not covered above; `uri` is required |
 
-There is one canonical key per vendor — no synonyms.
+There is one canonical key per vendor: no synonyms.
 
 ## Credentials
 
 Three ways to supply credentials, in resolution order:
 
 1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
-2. **Config-level secrets store** — encrypted at `~/.zeroclaw/secrets` via a local key file.
-3. **Generic env override** — `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+2. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
+3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
 `zeroclaw quickstart` writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (`$ANTHROPIC_API_KEY`, `$OPENROUTER_API_KEY`, …), the [env-vars reference](../reference/env-vars.md#bridging-ecosystem-default-env-vars) shows the one-line bash expansions that point a schema-mirror name at the existing value.
 
@@ -68,10 +68,10 @@ Three ways to supply credentials, in resolution order:
 
 Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:
 
-- **Anthropic** — `sk-ant-oat-*` OAuth tokens (from Claude Pro/Team) go in `api_key` on `[providers.models.anthropic.<alias>]`.
-- **OpenAI Codex subscription** — set `requires_openai_auth = true` and leave `api_key` unset on `[providers.models.openai.<alias>]`; the runtime reads the stored Codex login.
-- **Gemini CLI** — `[providers.models.gemini_cli.<alias>]` shells out to the `gemini` CLI; use the CLI's own auth flow.
-- **Qwen / MiniMax** — set `auth_mode = "oauth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
+- **Anthropic**: `sk-ant-oat-*` OAuth tokens (from Claude Pro/Team) go in `api_key` on `[providers.models.anthropic.<alias>]`.
+- **OpenAI Codex subscription**: set `requires_openai_auth` = true` and leave `api_key` unset on `[providers.models.openai.<alias>]`; the runtime reads the stored Codex login.
+- **Gemini CLI**: `[providers.models.gemini_cli.<alias>]` shells out to the `gemini` CLI; use the CLI's own auth flow.
+- **Qwen / MiniMax**: set `auth_mode = "oauth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
 
 ## Container-friendly overrides
 
@@ -91,7 +91,7 @@ ZEROCLAW_providers__models__ollama__home__uri=http://ollama:11434 zeroclaw agent
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
-## Per-family knobs — worked examples
+## Per-family knobs: worked examples
 
 ### Ollama
 
@@ -114,7 +114,7 @@ api_version = "2024-10-01-preview"
 api_key     = "..."
 ```
 
-The `resource`, `deployment`, and `api_version` values live in this typed config — they are not read from environment variables.
+The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from environment variables.
 
 ### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
 
@@ -174,13 +174,13 @@ fallback        = ["openai.backup"]      # other aliases, each with its own key/
 model = "gpt-4.1"
 ```
 
-- **`fallback_models`** — alternate model IDs tried on *this* provider, using the
+- **`fallback_models`**: alternate model IDs tried on *this* provider, using the
   same endpoint, key, and headers. Only the model identifier changes. Use it when
   a provider serves a backup model (a smaller or older variant) that should be
   tried before leaving the provider entirely.
-- **`fallback`** — an ordered list of *other* provider aliases (dotted
+- **`fallback`**: an ordered list of *other* provider aliases (dotted
   `<type>.<alias>` references into `[providers.models]`). Each fallback alias
-  resolves with **its own** credentials, endpoint, and model — a fallback never
+  resolves with **its own** credentials, endpoint, and model, a fallback never
   inherits the failing alias's key.
 
 ### Order of attempts
@@ -211,13 +211,13 @@ the issue is surfaced as a validation warning (`dangling_fallback_ref` /
 `fallback_cycle` / `max_fallback_depth_exceeded`) on the CLI and in the dashboard.
 A `fallback_models` entry that is blank or duplicates the alias's primary `model`
 is likewise skipped at runtime and surfaced (`empty_fallback_model` /
-`fallback_model_duplicates_primary`). A bad fallback link degrades gracefully — it
+`fallback_model_duplicates_primary`). A bad fallback link degrades gracefully, it
 never prevents the agent from running.
 
 ## See also
 
 - [Overview](./overview.md)
-- [Provider catalog](./catalog.md) — concrete config example for every family
+- [Provider catalog](./catalog.md): concrete config example for every family
 - [Streaming](./streaming.md)
 - [Routing](./routing.md)
 - [Custom providers](./custom.md)

@@ -67,7 +67,7 @@ Same-backend only. To let `researcher` recall memories that `primary` wrote, bot
 read_memory_from = ["primary"]
 ```
 
-The schema validator rejects entries that point at a sibling on a different backend — the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
+The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
 
 The bound agent always sees its own rows; the allowlist is purely additive. There is no way to *hide* an agent's own rows from itself.
 
@@ -83,7 +83,7 @@ external_peers = ["operator"]
 ignore = []
 ```
 
-`external_peers` lists humans or external bots the group expects on the same channel; the runtime accepts inbound from those usernames as cross-agent traffic. `ignore` is a per-group blocklist that subtracts from the resolved peer set every member sees — useful for excluding a specific bot account that's noisy.
+`external_peers` lists humans or external bots the group expects on the same channel; the runtime accepts inbound from those usernames as cross-agent traffic. `ignore` is a per-group blocklist that subtracts from the resolved peer set every member sees, useful for excluding a specific bot account that's noisy.
 
 The schema validator at config load enforces:
 
@@ -111,7 +111,7 @@ The schema validator will refuse to load if a `[peer_groups.<name>]` still lists
 
 ## Verify
 
-Look at the merged log stream — every line should now carry `[<alias>]` or `[system]` prefixes:
+Look at the merged log stream; every line should now carry `[<alias>]` or `[system]` prefixes:
 
 ```bash
 zeroclaw daemon 2>&1 | grep '\[researcher\]'   # researcher's lines only

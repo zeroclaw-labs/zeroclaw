@@ -30,7 +30,7 @@ A plain-language walkthrough of every piece and how they connect.
 
 ## Layer by Layer
 
-### Layer 1 — `aardvark-sys` (the USB talker)
+### Layer 1: `aardvark-sys` (the USB talker)
 
 **File:** `crates/aardvark-sys/src/lib.rs`
 
@@ -81,7 +81,7 @@ Drop(handle)
 
 ---
 
-### Layer 2 — `AardvarkTransport` (the bridge)
+### Layer 2: `AardvarkTransport` (the bridge)
 
 **File:** `crates/zeroclaw-hardware/src/aardvark.rs`
 
@@ -127,11 +127,11 @@ send(ZcCommand) → ZcResponse
   on any AardvarkError → return ZcResponse{ error: "..." }
 ```
 
-**Key design choice — lazy open:** The handle is opened fresh for every command and dropped at the end. This means no held connection, no state to clean up, and no "is it still open?" logic anywhere.
+**Key design choice: lazy open:** The handle is opened fresh for every command and dropped at the end. This means no held connection, no state to clean up, and no "is it still open?" logic anywhere.
 
 ---
 
-### Layer 3 — Tools (what the agent calls)
+### Layer 3: Tools (what the agent calls)
 
 **File:** `crates/zeroclaw-hardware/src/aardvark_tools.rs`
 
@@ -181,7 +181,7 @@ DatasheetTool.call(args)
 
 ---
 
-### Layer 4 — Device Registry (the address book)
+### Layer 4: Device Registry (the address book)
 
 **File:** `crates/zeroclaw-hardware/src/device.rs`
 
@@ -209,7 +209,7 @@ resolve_aardvark_device(args)
 
 ---
 
-### Layer 5 — `boot()` (startup wiring)
+### Layer 5: `boot()` (startup wiring)
 
 **File:** `crates/zeroclaw-hardware/src/lib.rs`
 
@@ -234,7 +234,7 @@ boot()
 
 ---
 
-### Layer 6 — Tool Registry (the loader)
+### Layer 6: Tool Registry (the loader)
 
 **File:** `crates/zeroclaw-hardware/src/tool_registry.rs`
 
@@ -252,7 +252,7 @@ ToolRegistry::load(devices)
     register: i2c_scan, i2c_read, i2c_write, spi_transfer, gpio_aardvark, datasheet
 ```
 
-This is why the `hardware_feature_registers_all_six_tools` test still passes in stub mode — `has_aardvark()` returns false, 0 extra tools load, count stays at 6.
+This is why the `hardware_feature_registers_all_six_tools` test still passes in stub mode: `has_aardvark()` returns false, 0 extra tools load, count stays at 6.
 
 ---
 
@@ -321,5 +321,5 @@ This is why the `hardware_feature_registers_all_six_tools` test still passes in 
 | SDK needed | no | yes (`vendor/aardvark.h` + `.so`) |
 
 The only code that changes when you plug in real hardware is inside
-`crates/aardvark-sys/src/lib.rs` — every other layer is already wired up
+`crates/aardvark-sys/src/lib.rs`: every other layer is already wired up
 and waiting.
