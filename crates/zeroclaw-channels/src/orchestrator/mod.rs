@@ -615,6 +615,58 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         }
     }
 
+    // Does the tag structure run to the end of the message? A *real* truncated
+    // tool call is the model getting cut off, so the unterminated structure is
+    // the last thing in the message. If natural-language prose resumes after the
+    // tags, this is an inline *example* (the model is discussing tool calls), not
+    // a truncation — so we should keep it. Bias toward keeping: a little leaked
+    // XML beats eating the user's text.
+    fn tool_structure_runs_to_end(inner: &str) -> bool {
+        let mut rest = inner.trim_start();
+        while rest.starts_with('<') {
+            match rest.find('>') {
+                Some(gt) => rest = rest[gt + 1..].trim_start(),
+                None => return true,
+            }
+        }
+        let tail = rest.trim();
+        if tail.is_empty() {
+            return true;
+        }
+        !looks_like_prose(tail)
+    }
+
+    // Heuristic: does `text` read like resumed natural-language prose (as opposed
+    // to a cut-off parameter value)? True on an internal sentence boundary
+    // (". " / "! " / "? " + a letter) or a multi-word string that ends like a
+    // sentence. Deliberately lenient so ambiguous tails are kept, not dropped.
+    fn looks_like_prose(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len().saturating_sub(1) {
+            if matches!(bytes[i], b'.' | b'!' | b'?')
+                && matches!(bytes[i + 1], b' ' | b'\n' | b'\t')
+                && text[i + 1..]
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic())
+            {
+                return true;
+            }
+        }
+        let trimmed = text.trim_end();
+        let ends_like_sentence = trimmed
+            .chars()
+            .last()
+            .is_some_and(|c| matches!(c, '.' | '!' | '?'))
+            && trimmed
+                .chars()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| c.is_alphabetic());
+        ends_like_sentence && text.trim().contains(' ')
+    }
+
     let mut kept_segments = Vec::new();
     let mut remaining = message;
 
@@ -637,6 +689,26 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         if let Some(consumed_end) = extract_first_json_end(after_open) {
             remaining = strip_leading_close_tags(&after_open[consumed_end..]);
             continue;
+        }
+
+        // Unterminated open tag with no parseable JSON body. Drop the broken
+        // tail ONLY when it looks like tool-call structure AND that structure
+        // runs to the end of the message — a real truncation where the model was
+        // cut off mid-call. If prose resumes after the structure, the model is
+        // showing an *example*, not making a call, so keep it verbatim (a little
+        // leaked XML beats eating the reply). Text merely mentioning a tag is
+        // likewise kept.
+        let inner = after_open.trim_start();
+        let inner_lower = inner.to_ascii_lowercase();
+        let looks_like_tool_structure = inner_lower.starts_with("<invoke")
+            || inner_lower.starts_with("<parameter")
+            || inner_lower.starts_with("<tool")
+            || inner_lower.starts_with("<function")
+            || inner.starts_with('{')
+            || inner.starts_with('[');
+        if looks_like_tool_structure && tool_structure_runs_to_end(inner) {
+            remaining = "";
+            break;
         }
 
         kept_segments.push(remaining[start..].to_string());
