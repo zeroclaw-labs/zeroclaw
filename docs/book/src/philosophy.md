@@ -2,13 +2,13 @@
 
 ZeroClaw is built on four opinions, in priority order.
 
-## 1. You own it
+## You own it
 
 The binary runs on your machine, your VPS, or your SBC. Your API keys live in your config file. Your conversation history lives in your database. No telemetry, no cloud tenancy, no license server. If you pull the power cord, the agent stops, and nothing else breaks.
 
 This is the foundational constraint. Every other decision below falls out of it.
 
-## 2. Security-first, with escape hatches
+## Security-first, with escape hatches
 
 Local-first doesn't mean consequence-free. An agent that can execute shell commands, call HTTP endpoints, and write files is a privileged process. The default autonomy level is `supervised`: medium-risk operations require approval, high-risk operations are blocked.
 
@@ -23,13 +23,13 @@ The runtime ships with:
 
 For developers and home-lab users who understand the trade-offs, there's [YOLO mode](./getting-started/yolo.md): one config preset that disables the guardrails. It's loud, logged, and obviously named. Not the default.
 
-## 3. Minimal: in binary size, dependencies, and surface area
+## Minimal: in binary size, dependencies, and surface area
 
 ZeroClaw is written in Rust and optimised for a small binary and fast startup. The microkernel split ([RFC #5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)) factors functionality behind feature flags so you only ship what you use: the foundation builds with `--no-default-features`, and channels, hardware, and the gateway are opt-in. A typical release build lands around 26 MiB; a minimal feature set trims it further.
 
 The same discipline applies to the agent's prompt surface. Tool descriptions are [Fluent](https://projectfluent.org/)-localised and terse. There are no hidden system prompts injecting personality. The model sees what you configure.
 
-## 4. Provider-agnostic
+## Provider-agnostic
 
 The agent's brain is pluggable. Anthropic, OpenAI, Ollama, Bedrock, Gemini, Azure, OpenRouter, and any OpenAI-compatible endpoint (Groq, Mistral, xAI, and ~20 others) work out of the box. Per-agent dispatch and hint-based model routes let you run reasoning-heavy tasks on one model and cheap chat on another.
 

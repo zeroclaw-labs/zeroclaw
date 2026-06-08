@@ -197,15 +197,6 @@ code span {
   padding: 1rem 0.75rem;
 }
 
-/* mdBook injects the active page's own `## ` / `### ` headings into the left
-   sidebar as `a.header` links beneath the current chapter. We already surface
-   those in the right-hand "On this page" panel (#pc-page-toc), so suppress the
-   duplicate, mis-indented copies that render under leaf chapters like
-   Introduction and Philosophy. Only true SUMMARY chapter links stay. */
-.sidebar .sidebar-scrollbox a.header {
-  display: none !important;
-}
-
 .chapter li.chapter-item {
   line-height: 1.5;
   margin: 0.1rem 0;
