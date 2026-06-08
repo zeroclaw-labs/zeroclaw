@@ -187,7 +187,7 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
-/// and downstream providers receive a `null` `call_id` (#5425).
+/// and downstream model_providers receive a `null` `call_id`.
 pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     if max_chars == 0 || msg_content.len() <= max_chars {
         return msg_content.to_string();
@@ -226,7 +226,7 @@ pub fn fast_trim_tool_results(
 
 /// Emergency: drop oldest non-system, non-recent messages from history.
 /// Tool groups (assistant + consecutive tool messages) are dropped
-/// atomically to preserve tool_use/tool_result pairing. See #4810.
+/// atomically to preserve tool_use/tool_result pairing.
 /// Returns number of messages dropped.
 pub fn emergency_history_trim(
     history: &mut Vec<zeroclaw_providers::ChatMessage>,
@@ -255,7 +255,7 @@ pub fn emergency_history_trim(
             dropped += 1;
         }
     }
-    dropped += remove_orphaned_tool_messages(history);
+    dropped += remove_orphaned_tool_messages(history).removed;
     dropped
 }
 
@@ -315,9 +315,15 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
 }
 
 /// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
+///
+/// Preserves: the system prompt (if any), the first user message (the framing
+/// anchor — losing it is what caused the silent-amnesia bug where models said
+/// "the first message I have is 'Continue'"), and the most recent
+/// `max_history` messages (minus one slot already taken by the anchor).
+///
+/// Drops from the middle. Emits a WARN with counts on every fire so silent
+/// amnesia is impossible to miss again.
 pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -329,11 +335,67 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
         return;
     }
 
-    let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let system_offset = usize::from(has_system);
+
+    // Find the first user message (the framing anchor). If `max_history` is
+    // too small to fit both the anchor and any recent context, fall back to
+    // the old tail-only behaviour rather than producing a degenerate window.
+    let anchor_idx = history
+        .iter()
+        .enumerate()
+        .skip(system_offset)
+        .find(|(_, m)| m.role == "user")
+        .map(|(i, _)| i);
+
+    let messages_before = history.len();
+
+    let dropped_range = match anchor_idx {
+        Some(anchor) if max_history >= 2 => {
+            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
+            let tail_keep = max_history - 1;
+            let tail_start = history.len().saturating_sub(tail_keep);
+            // Middle range to drop: (anchor + 1) .. tail_start.
+            let drop_start = anchor + 1;
+            if tail_start <= drop_start {
+                // Anchor is already inside the tail window — nothing in the
+                // middle to drop. Fall through to plain head-drop below.
+                None
+            } else {
+                Some(drop_start..tail_start)
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(range) = dropped_range {
+        history.drain(range);
+    } else {
+        // No anchor, or `max_history < 2`: original head-drop behaviour.
+        let to_remove = non_system_count - max_history;
+        history.drain(system_offset..system_offset + to_remove);
+    }
+
     remove_orphaned_tool_messages(history);
     normalize_system_messages(history);
+
+    let dropped = messages_before.saturating_sub(history.len());
+    if dropped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "messages_before": messages_before,
+                    "messages_after": history.len(),
+                    "dropped": dropped,
+                    "max_history": max_history,
+                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                })),
+            "trim_history fired: middle of conversation dropped. Raise \
+             [runtime_profiles.<name>] max_history_messages or enable \
+             compact_context to avoid silent context loss."
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,7 +438,7 @@ pub fn load_interactive_session_history(
     // dropped the assistant tool_use block but left its tool_result).
     // Without this the next API call fails with 400 "unexpected tool_use_id
     // found in tool_result blocks" and the session stays bricked until the
-    // file is deleted. See #5813.
+    // file is deleted.
     remove_orphaned_tool_messages(&mut state.history);
 
     Ok(state.history)
@@ -402,11 +464,14 @@ mod tests {
         let image = dir.path().join("generated.png");
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
 
-        let input = format!("Image generated successfully.\nFile: {}", image.display());
+        let input = format!(
+            "Image generated successfully.\nFile: {}",
+            image.display().to_string()
+        );
         let output = canonicalize_tool_result_media_markers(&input);
 
         assert!(output.contains("[IMAGE:"));
-        assert!(output.contains(&format!("[IMAGE:{}]", image.display())));
+        assert!(output.contains(&format!("[IMAGE:{}]", image.display().to_string())));
     }
 
     #[test]

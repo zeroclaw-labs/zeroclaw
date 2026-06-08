@@ -16,15 +16,29 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
                     .with_context(|| format!("Invalid IANA timezone: {tz_name}"))?;
                 let localized_from = from.with_timezone(&timezone);
                 let next_local = cron.after(&localized_from).next().ok_or_else(|| {
-                    anyhow::anyhow!("No future occurrence for expression: {expr}")
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"expr": expr})),
+                        "cron schedule: no future occurrence for expression"
+                    );
+                    anyhow::Error::msg(format!("No future occurrence for expression: {expr}"))
                 })?;
                 Ok(next_local.with_timezone(&Utc))
             } else {
                 // Default to OS local timezone so schedules match user
-                // expectations instead of always using UTC (#5220).
+                // expectations instead of always using UTC.
                 let local_from = from.with_timezone(&chrono::Local);
                 let next_local = cron.after(&local_from).next().ok_or_else(|| {
-                    anyhow::anyhow!("No future occurrence for expression: {expr}")
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"expr": expr})),
+                        "cron schedule: no future occurrence for expression"
+                    );
+                    anyhow::Error::msg(format!("No future occurrence for expression: {expr}"))
                 })?;
                 Ok(next_local.with_timezone(&Utc))
             }
@@ -36,8 +50,16 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
             }
             let ms = i64::try_from(*every_ms).context("every_ms is too large")?;
             let delta = ChronoDuration::milliseconds(ms);
-            from.checked_add_signed(delta)
-                .ok_or_else(|| anyhow::anyhow!("every_ms overflowed DateTime"))
+            from.checked_add_signed(delta).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"every_ms": *every_ms})),
+                    "cron schedule: every_ms overflowed DateTime arithmetic"
+                );
+                anyhow::Error::msg("every_ms overflowed DateTime")
+            })
         }
     }
 }
@@ -51,7 +73,15 @@ pub fn validate_schedule(schedule: &Schedule, now: DateTime<Utc>) -> Result<()> 
         }
         Schedule::At { at } => {
             if *at <= now {
-                anyhow::bail!("Invalid schedule: 'at' must be in the future");
+                anyhow::bail!(
+                    "Invalid schedule: 'at' must be in the future \
+                     (now_utc={}, now_local={}, at_utc={}, at_local={}, delta_seconds={})",
+                    now.to_rfc3339(),
+                    now.with_timezone(&chrono::Local).to_rfc3339(),
+                    at.to_rfc3339(),
+                    at.with_timezone(&chrono::Local).to_rfc3339(),
+                    (*at - now).num_seconds()
+                );
             }
             Ok(())
         }

@@ -11,7 +11,7 @@
 use crate::conflict;
 use crate::importance;
 use crate::traits::{Memory, MemoryCategory};
-use zeroclaw_api::provider::Provider;
+use zeroclaw_api::model_provider::ModelProvider;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -40,10 +40,10 @@ Do not include any text outside the JSON object."#;
 /// Phase 1: Write a history entry to the Daily memory category.
 /// Phase 2: Write a memory update to the Core category (if the LLM identified new facts).
 ///
-/// This function is designed to be called fire-and-forget via `tokio::spawn`.
+/// This function is designed to be called fire-and-forget via `zeroclaw_spawn::spawn!`.
 /// Strip channel media markers (e.g. `[IMAGE:/local/path]`, `[DOCUMENT:...]`)
 /// that contain local filesystem paths.  These must never be forwarded to
-/// upstream provider APIs — they would leak local paths and cause API errors.
+/// upstream model_provider APIs — they would leak local paths and cause API errors.
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -53,8 +53,9 @@ fn strip_media_markers(text: &str) -> String {
 }
 
 pub async fn consolidate_turn(
-    provider: &dyn Provider,
+    model_provider: &dyn ModelProvider,
     model: &str,
+    temperature: Option<f64>,
     memory: &dyn Memory,
     user_message: &str,
     assistant_response: &str,
@@ -79,15 +80,12 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    // Low temperature for consolidation — we want deterministic
-    // summarization, not creative rewrites.
-    const CONSOLIDATION_TEMPERATURE: f64 = 0.1;
-    let raw = provider
+    let raw = model_provider
         .chat_with_system(
             Some(CONSOLIDATION_SYSTEM_PROMPT),
             &truncated,
             model,
-            Some(CONSOLIDATION_TEMPERATURE),
+            temperature,
         )
         .await?;
 
@@ -124,7 +122,12 @@ pub async fn consolidate_turn(
         )
         .await
         {
-            tracing::debug!("conflict check skipped: {e}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "conflict check skipped"
+            );
         }
 
         // Store with importance metadata.

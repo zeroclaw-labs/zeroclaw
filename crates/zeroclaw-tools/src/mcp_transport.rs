@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
@@ -98,14 +98,32 @@ impl StdioTransport {
             .spawn()
             .with_context(|| format!("failed to spawn MCP server `{}`", config.name))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("no stdin on MCP server `{}`", config.name))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("no stdout on MCP server `{}`", config.name))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &config.name,
+                        "missing": "stdin",
+                    })),
+                "mcp_transport: no stdin on spawned MCP server"
+            );
+            anyhow::Error::msg(format!("no stdin on MCP server `{}`", config.name))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &config.name,
+                        "missing": "stdout",
+                    })),
+                "mcp_transport: no stdout on spawned MCP server"
+            );
+            anyhow::Error::msg(format!("no stdout on MCP server `{}`", config.name))
+        })?;
         let stdout_lines = BufReader::new(stdout).lines();
 
         Ok(Self {
@@ -129,11 +147,15 @@ impl StdioTransport {
     }
 
     async fn recv_raw(&mut self) -> Result<String> {
-        let line = self
-            .stdout_lines
-            .next_line()
-            .await?
-            .ok_or_else(|| anyhow!("MCP server closed stdout"))?;
+        let line = self.stdout_lines.next_line().await?.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mcp_transport: MCP server closed stdout"
+            );
+            anyhow::Error::msg("MCP server closed stdout")
+        })?;
         if line.len() > MAX_LINE_BYTES {
             bail!("MCP response too large: {} bytes", line.len());
         }
@@ -168,7 +190,9 @@ impl McpTransportConn for StdioTransport {
             if resp.id.is_none() {
                 // Server-sent notification (e.g. `notifications/initialized`) — skip and
                 // keep waiting for the actual response to our request.
-                tracing::debug!(
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "MCP stdio: skipping server notification while waiting for response"
                 );
                 continue;
@@ -203,7 +227,19 @@ impl HttpTransport {
         let url = config
             .url
             .as_ref()
-            .ok_or_else(|| anyhow!("URL required for HTTP transport"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "mcp_server": &config.name,
+                            "transport": "http",
+                        })),
+                    "mcp_transport: HTTP transport requires URL"
+                );
+                anyhow::Error::msg("URL required for HTTP transport")
+            })?
             .clone();
 
         let client = reqwest::Client::builder()
@@ -304,8 +340,15 @@ impl McpTransportConn for HttpTransport {
             } else {
                 read_response.await?
             };
-            return maybe_resp
-                .ok_or_else(|| anyhow!("MCP server returned no response in SSE stream"));
+            return maybe_resp.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "mcp_transport: MCP server returned no response in SSE stream"
+                );
+                anyhow::Error::msg("MCP server returned no response in SSE stream")
+            });
         }
 
         let resp_text = resp.text().await.context("failed to read HTTP response")?;
@@ -345,7 +388,19 @@ impl SseTransport {
         let sse_url = config
             .url
             .as_ref()
-            .ok_or_else(|| anyhow!("URL required for SSE transport"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "mcp_server": &config.name,
+                            "transport": "sse",
+                        })),
+                    "mcp_transport: SSE transport requires URL"
+                );
+                anyhow::Error::msg("URL required for SSE transport")
+            })?
             .clone();
 
         let client = reqwest::Client::builder()
@@ -401,7 +456,18 @@ impl SseTransport {
             return Ok(());
         }
         if !resp.status().is_success() {
-            return Err(anyhow!("MCP server returned HTTP {}", resp.status()));
+            let status = resp.status();
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"status": status.as_u16()})),
+                "mcp_transport: MCP server returned non-success HTTP"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "MCP server returned HTTP {}",
+                status
+            )));
         }
         let is_event_stream = resp
             .headers()
@@ -421,7 +487,7 @@ impl SseTransport {
         let sse_url = self.sse_url.clone();
         let server_name = self.server_name.clone();
 
-        self.reader_task = Some(tokio::spawn(async move {
+        self.reader_task = Some(zeroclaw_spawn::spawn!(async move {
             let stream = resp
                 .bytes_stream()
                 .map(|item| item.map_err(std::io::Error::other));
@@ -504,33 +570,22 @@ impl SseTransport {
 
         let derived = derive_message_url(&self.sse_url, "messages")
             .or_else(|| derive_message_url(&self.sse_url, "message"))
-            .ok_or_else(|| anyhow!("invalid SSE URL"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sse_url": &self.sse_url})),
+                    "mcp_transport: invalid SSE URL"
+                );
+                anyhow::Error::msg("invalid SSE URL")
+            })?;
         let mut guard = self.shared.lock().await;
         if guard.message_url.is_none() {
             guard.message_url = Some(derived.clone());
             guard.message_url_from_endpoint = false;
         }
         Ok((derived, false))
-    }
-
-    #[allow(dead_code)] // WIP: alternate message URL fallback
-    fn maybe_try_alternate_message_url(
-        &self,
-        current_url: &str,
-        from_endpoint: bool,
-    ) -> Option<String> {
-        if from_endpoint {
-            return None;
-        }
-        let alt = if current_url.ends_with("/messages") {
-            derive_message_url(&self.sse_url, "message")
-        } else {
-            derive_message_url(&self.sse_url, "messages")
-        }?;
-        if alt == current_url {
-            return None;
-        }
-        Some(alt)
     }
 }
 
@@ -616,10 +671,13 @@ async fn handle_sse_event(
     if let Some(tx) = tx {
         let _ = tx.send(resp);
     } else {
-        tracing::debug!(
-            "MCP SSE `{}` received response for unknown id {}",
-            server_name,
-            id
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "MCP SSE `{}` received response for unknown id {}",
+                server_name, id
+            )
         );
     }
 }
@@ -945,7 +1003,15 @@ impl McpTransportConn for SseTransport {
             bail!("MCP server returned no response");
         };
 
-        rx.await.map_err(|_| anyhow!("SSE response channel closed"))
+        rx.await.map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mcp_transport: SSE response channel closed"
+            );
+            anyhow::Error::msg("SSE response channel closed")
+        })
     }
 
     async fn close(&mut self) -> Result<()> {

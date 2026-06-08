@@ -57,7 +57,7 @@ The `github-issue-triage` skill runs autonomous backlog sweeps within defined au
 - **Wont-fix pass** — close issues that won't be accepted, with a brief rationale
 - **Specific issue** — handle a single issue by number
 
-Labels and the stale policy are defined in [Reviewer playbook → Issue triage](./reviewer-playbook.md#issue-triage). The skill escalates ambiguity to the user before acting.
+Label definitions live in [Labels](./labels.md). Stale procedure lives in the issue-triage skill protocol, with reviewer-side context in [Reviewer playbook → Issue triage](./reviewer-playbook.md#issue-triage). The skill escalates ambiguity to the user before acting.
 
 PRs with merge conflicts receive `needs-author-action` only — no review, no diff comment — per `feedback_conflicts_label_only`.
 

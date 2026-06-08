@@ -15,7 +15,7 @@ flowchart TB
     subgraph Edges["Edge crates — talk to the outside"]
         CH["zeroclaw-channels<br/>30+ messaging integrations"]
         GW["zeroclaw-gateway<br/>REST · WebSocket · dashboard"]
-        PR["zeroclaw-providers<br/>LLM clients · fallback · routing"]
+        PR["zeroclaw-providers<br/>LLM clients · retry · routing"]
         TL["zeroclaw-tools<br/>browser · HTTP · PDF · hardware"]
     end
 
@@ -41,10 +41,10 @@ flowchart TB
 
 | Crate | Role |
 |---|---|
-| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding wizard, TUI |
+| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding sections, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
 | `zeroclaw-api` | Public traits — `Provider`, `Channel`, `Tool`. The kernel ABI |
-| `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the router and fallback wrapper |
+| `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
 | `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, PDF, hardware probes) |
@@ -54,7 +54,7 @@ flowchart TB
 | `zeroclaw-hardware` | Hardware abstraction layer (GPIO, I2C, SPI, USB) |
 | `zeroclaw-infra` | Tracing, metrics, structured logging |
 | `zeroclaw-macros` | Derive macros for config, tool registration |
-| `zeroclaw-tui` | Terminal UI |
+| `zerocode` | Terminal UI |
 | `aardvark-sys`, `robot-kit` | Specialised hardware support |
 
 The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further — the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.

@@ -4,13 +4,20 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, Local};
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
+    /// Per-agent persona workspace (where SOUL.md / IDENTITY.md / USER.md /
+    /// AGENTS.md live). Separate from `workspace_dir`, which is the security
+    /// sandbox root and can be overridden per session by an IDE-supplied cwd.
+    /// Channel-driven runs typically pass the same path for both; gateway and
+    /// ACP sessions pass the agent's own dir here while letting `workspace_dir`
+    /// follow the session cwd.
+    pub agent_workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
@@ -97,7 +104,7 @@ impl PromptSection for IdentitySection {
         let mut has_aieos = false;
         if let Some(config) = ctx.identity_config
             && identity::is_aieos_configured(config)
-            && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir)
+            && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.agent_workspace_dir)
         {
             let rendered = identity::aieos_to_system_prompt(&aieos);
             if !rendered.is_empty() {
@@ -113,8 +120,7 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        // Use the personality module for structured file loading.
-        let profile = personality::load_personality(ctx.workspace_dir);
+        let profile = personality::load_personality(ctx.agent_workspace_dir);
         prompt.push_str(&profile.render());
 
         Ok(prompt)
@@ -183,7 +189,7 @@ impl PromptSection for SafetySection {
         let mut out = String::from("## Safety\n\n- Do not exfiltrate private data.\n");
 
         // Omit "ask before acting" instructions when autonomy is Full —
-        // mirrors build_system_prompt_with_mode_and_autonomy. See #3952.
+        // mirrors build_system_prompt_with_mode_and_autonomy.
         if ctx.autonomy_level != AutonomyLevel::Full {
             out.push_str(
                 "- Do not run destructive commands without asking.\n\
@@ -209,7 +215,7 @@ impl PromptSection for SafetySection {
             }
         });
 
-        // Append concrete security policy constraints when available (#2404).
+        // Append concrete security policy constraints when available.
         // This tells the LLM exactly what commands are allowed, which paths
         // are off-limits, etc. — preventing wasteful trial-and-error.
         if let Some(ref summary) = ctx.security_summary {
@@ -273,16 +279,13 @@ impl PromptSection for DateTimeSection {
         let now = Local::now();
         // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
         let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
 
         Ok(format!(
-            "## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n\
-             The following is the ABSOLUTE TRUTH regarding the current date and time. \
+            "## CRITICAL CONTEXT: CURRENT DATE\n\n\
+             The following is the ABSOLUTE TRUTH regarding the current date. \
              Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
              Date: {year:04}-{month:02}-{day:02}\n\
-             Time: {hour:02}:{minute:02}:{second:02} ({tz})\n\
-             ISO 8601: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{}",
+             UTC offset: {}",
             now.format("%:z")
         ))
     }
@@ -308,6 +311,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
+
+    zeroclaw_api::mock_tool_attribution!(TestTool);
 
     struct TestTool;
 
@@ -357,6 +362,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: &workspace,
+            agent_workspace_dir: &workspace,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -389,6 +395,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -411,6 +418,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -433,6 +441,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -471,7 +480,8 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
-                timeout_secs: None,
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: None,
@@ -479,6 +489,7 @@ mod tests {
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -497,7 +508,7 @@ mod tests {
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -515,7 +526,8 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
-                timeout_secs: None,
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
@@ -523,6 +535,7 @@ mod tests {
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
+            agent_workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -544,14 +557,15 @@ mod tests {
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
-    fn datetime_section_includes_timestamp_and_timezone() {
+    fn datetime_section_includes_date_and_offset_without_wall_clock_time() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -565,12 +579,15 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n"));
+        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE\n\n"));
+        assert!(!rendered.contains("CURRENT DATE & TIME"));
 
-        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n");
+        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE\n\n");
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains("Date:"));
-        assert!(payload.contains("Time:"));
+        assert!(payload.contains("UTC offset:"));
+        assert!(!payload.contains("Time:"));
+        assert!(!payload.contains("ISO 8601:"));
     }
 
     #[test]
@@ -588,13 +605,15 @@ mod tests {
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: std::collections::HashMap::new(),
-                timeout_secs: None,
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
+            agent_workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -630,6 +649,7 @@ mod tests {
             .to_string();
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -666,6 +686,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -694,6 +715,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -730,6 +752,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],

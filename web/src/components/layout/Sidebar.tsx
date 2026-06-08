@@ -2,9 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
-  Brain,
   Clock,
-  DollarSign,
   LayoutDashboard,
   MessageSquare,
   Monitor,
@@ -25,19 +23,17 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
-  { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
+  { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
   { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
-  { to: '/memory', icon: Brain, labelKey: 'nav.memory' },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
-  { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
 ];
 
-// The 6 onboarding sections (Workspace, Providers, Channels, Memory,
+// The 6 Quickstart sections (Workspace, Providers, Channels, Memory,
 // Hardware, Tunnel) live under /config now — they're the first group
 // inside the Config explorer's sidebar. The /setup/<section> deep-link
 // route still works for bookmarks, but no top-level nav entries point

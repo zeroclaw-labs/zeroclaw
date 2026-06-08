@@ -1,15 +1,23 @@
-import { Component, createContext, useContext, useEffect, useState, type ErrorInfo, type ReactNode } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { ThemeProvider } from './contexts/ThemeContext';
+import {
+  Component,
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  type ErrorInfo,
+  type ReactNode,
+} from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { ThemeProvider } from "./contexts/ThemeContext";
 
-import { loadLocale, saveLocale } from './contexts/ThemeContext';
-import { AuthProvider, useAuth } from './hooks/useAuth';
-import { DraftContext, useDraftStore } from './hooks/useDraft';
-import { getAdminPairCode, getOnboardStatus } from './lib/api';
-import { basePath } from './lib/basePath';
-import { setLocale, type Locale } from './lib/i18n';
-import { Router } from './router/router';
-import { AgentProvider } from './contexts/AgentContext';
+import { loadLocale, saveLocale } from "./contexts/ThemeContext";
+import { AuthProvider, useAuth } from "./hooks/useAuth";
+import { DraftContext, useDraftStore } from "./hooks/useDraft";
+import { getAdminPairCode, getQuickstartState } from "./lib/api";
+import { basePath } from "./lib/basePath";
+import { ConfigDraftProvider } from "./lib/draftStore";
+import { setLocale, type Locale } from "./lib/i18n";
+import { Router } from "./router/router";
 
 // Locale context
 interface LocaleContextType {
@@ -18,8 +26,8 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'en',
-  setAppLocale: () => { },
+  locale: "en",
+  setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -47,25 +55,56 @@ export class ErrorBoundary extends Component<
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[ZeroClaw] Render error:', error, info.componentStack);
+    console.error("[ZeroClaw] Render error:", error, info.componentStack);
+    // Stale-chunk recovery: when Vite rebuilds, the loaded index.html
+    // still references the previous chunk hashes. A dynamic import for
+    // a lazy route then 404s with "error loading dynamically imported
+    // module". Reload once so the user gets the new index.html and the
+    // current chunk hashes; the sessionStorage marker prevents reload
+    // loops if reload doesn't actually help.
+    if (
+      isChunkLoadError(error) &&
+      !sessionStorage.getItem("zeroclaw-chunk-reloaded")
+    ) {
+      sessionStorage.setItem("zeroclaw-chunk-reloaded", "1");
+      window.location.reload();
+    }
   }
 
   render() {
     if (this.state.error) {
       return (
         <div className="p-6">
-          <div className="card p-6 w-full max-w-lg" style={{ borderColor: 'var(--color-status-error-alpha-30)' }}>
-            <h2 className="text-lg font-semibold mb-2" style={{ color: 'var(--color-status-error)' }}>
+          <div
+            className="card p-6 w-full max-w-lg"
+            style={{ borderColor: "var(--color-status-error-alpha-30)" }}
+          >
+            <h2
+              className="text-lg font-semibold mb-2"
+              style={{ color: "var(--color-status-error)" }}
+            >
               Something went wrong
             </h2>
-            <p className="text-sm mb-4" style={{ color: 'var(--pc-text-muted)' }}>
+            <p
+              className="text-sm mb-4"
+              style={{ color: "var(--pc-text-muted)" }}
+            >
               A render error occurred. Check the browser console for details.
             </p>
-            <pre className="text-xs rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all font-mono" style={{ background: 'var(--pc-bg-base)', color: 'var(--color-status-error)' }}>
+            <pre
+              className="text-xs rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all font-mono"
+              style={{
+                background: "var(--pc-bg-base)",
+                color: "var(--color-status-error)",
+              }}
+            >
               {this.state.error.message}
             </pre>
             <button
-              onClick={() => this.setState({ error: null })}
+              onClick={() => {
+                sessionStorage.removeItem("zeroclaw-chunk-reloaded");
+                this.setState({ error: null });
+              }}
               className="btn-electric mt-6 px-4 py-2 text-sm font-medium"
             >
               Try again
@@ -78,10 +117,24 @@ export class ErrorBoundary extends Component<
   }
 }
 
+function isChunkLoadError(error: Error): boolean {
+  const m = error?.message ?? "";
+  return (
+    m.includes("dynamically imported module") ||
+    m.includes("Failed to fetch dynamically") ||
+    m.includes("Importing a module script failed") ||
+    error?.name === "ChunkLoadError"
+  );
+}
+
 // Pairing dialog component
-function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
-  const [code, setCode] = useState('');
-  const [error, setError] = useState('');
+function PairingDialog({
+  onPair,
+}: {
+  onPair: (code: string) => Promise<void>;
+}) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [displayCode, setDisplayCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(true);
@@ -102,47 +155,71 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
       .finally(() => {
         if (!cancelled) setCodeLoading(false);
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    setError('');
+    setError("");
     try {
       await onPair(code);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Pairing failed');
+      setError(err instanceof Error ? err.message : "Pairing failed");
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--pc-bg-base)' }}>
+    <div
+      className="min-h-screen flex items-center justify-center"
+      style={{ background: "var(--pc-bg-base)" }}
+    >
       {/* Ambient glow */}
       <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
-
         <div className="text-center mb-8">
           <img
             src={`${basePath}/_app/zeroclaw-trans.png`}
             alt="ZeroClaw"
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
-            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+            onError={(e) => {
+              e.currentTarget.style.display = "none";
+            }}
           />
-          <h1 className="text-2xl font-bold mb-2 text-gradient-blue">ZeroClaw</h1>
-          <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-            {displayCode ? 'Your pairing code — click Pair to connect' : 'Enter the pairing code from your terminal'}
+          <h1 className="text-2xl font-bold mb-2 text-gradient-blue">
+            ZeroClaw
+          </h1>
+          <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            {displayCode
+              ? "Your pairing code — click Pair to connect"
+              : "Enter the pairing code from your terminal"}
           </p>
         </div>
 
         {/* Show the pairing code if available (localhost) */}
         {!codeLoading && displayCode && (
-          <div className="mb-6 p-4 rounded-2xl text-center border" style={{ background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)' }}>
-            <div className="text-4xl font-mono font-bold tracking-[0.4em] py-2" style={{ color: 'var(--pc-text-primary)' }}>
+          <div
+            className="mb-6 p-4 rounded-2xl text-center border"
+            style={{
+              background: "var(--pc-accent-glow)",
+              borderColor: "var(--pc-accent-dim)",
+            }}
+          >
+            <div
+              className="text-4xl font-mono font-bold tracking-[0.4em] py-2"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {displayCode}
             </div>
-            <p className="text-xs mt-2" style={{ color: 'var(--pc-text-muted)' }}>Enter this code below or on another device</p>
+            <p
+              className="text-xs mt-2"
+              style={{ color: "var(--pc-text-muted)" }}
+            >
+              Enter this code below or on another device
+            </p>
           </div>
         )}
 
@@ -157,7 +234,13 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             autoFocus
           />
           {error && (
-            <p aria-live="polite" className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>
+            <p
+              aria-live="polite"
+              className="text-sm mb-4 text-center animate-fade-in"
+              style={{ color: "var(--color-status-error)" }}
+            >
+              {error}
+            </p>
           )}
           <button
             type="submit"
@@ -169,7 +252,9 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
                 <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 Pairing...
               </span>
-            ) : 'Pair'}
+            ) : (
+              "Pair"
+            )}
           </button>
         </form>
       </div>
@@ -191,16 +276,27 @@ function AppContent() {
 
   // Listen for 401 events to force logout
   useEffect(() => {
-    window.addEventListener('zeroclaw-unauthorized', logout);
-    return () => window.removeEventListener('zeroclaw-unauthorized', logout);
+    window.addEventListener("zeroclaw-unauthorized", logout);
+    return () => window.removeEventListener("zeroclaw-unauthorized", logout);
   }, [logout]);
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--pc-bg-base)' }}>
+      <div
+        className="min-h-screen flex items-center justify-center"
+        style={{ background: "var(--pc-bg-base)" }}
+      >
         <div className="flex flex-col items-center gap-4 animate-fade-in">
-          <div className="h-10 w-10 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
-          <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>Connecting...</p>
+          <div
+            className="h-10 w-10 border-2 rounded-full animate-spin"
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
+          />
+          <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            Connecting...
+          </p>
         </div>
       </div>
     );
@@ -211,29 +307,26 @@ function AppContent() {
   }
 
   return (
-    <AgentProvider>
-      <DraftContext.Provider value={draftStore}>
+    <DraftContext.Provider value={draftStore}>
+      <ConfigDraftProvider>
         <LocaleContext.Provider value={{ locale, setAppLocale }}>
           <FreshInstallRedirect />
           <Router />
         </LocaleContext.Provider>
-      </DraftContext.Provider>
-    </AgentProvider>
+      </ConfigDraftProvider>
+    </DraftContext.Provider>
   );
 }
 
-// Redirects fresh installs (no completed onboarding sections, no provider
-// configured) from the default `/` landing to `/onboard`. The daemon
-// always writes a default config.toml on init, so file existence isn't
-// the right signal — we ask the gateway via /api/onboard/status which
-// inspects the in-memory config for explicit user-driven markers
-// (`onboard_state.completed_sections`, `providers.fallback`,
-// `providers.models`).
+// Redirects fresh installs (no agents yet, Quickstart never completed)
+// from `/` to `/quickstart`. The daemon always writes a default
+// config.toml on init, so file existence isn't the right signal —
+// we ask the gateway via /api/quickstart/state which reports
+// quickstart_completed plus the live agents list.
 //
 // Fires once per session. Only redirects when the user lands at `/` —
-// manual navigation to other routes is left alone, so the user can
-// always escape into the existing config editor or chat surfaces if
-// they want.
+// manual navigation to other routes is left alone, so returning users
+// who already have agents can always reach Quickstart from the nav.
 function FreshInstallRedirect() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -242,11 +335,11 @@ function FreshInstallRedirect() {
   useEffect(() => {
     if (checked) return;
     setChecked(true);
-    if (location.pathname !== '/') return;
-    void getOnboardStatus()
-      .then((status) => {
-        if (status.needs_onboarding) {
-          navigate('/onboard', { replace: true });
+    if (location.pathname !== "/") return;
+    void getQuickstartState()
+      .then((state) => {
+        if (!state.quickstart_completed && state.agents.length === 0) {
+          navigate("/quickstart", { replace: true });
         }
       })
       .catch(() => {

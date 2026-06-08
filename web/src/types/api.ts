@@ -1,15 +1,36 @@
 export interface StatusResponse {
   version?: string;
-  provider: string | null;
+  /** Dotted `<type>.<alias>` of the first configured model provider, or null
+   *  when none is configured. "provider" alone is reserved — always qualify. */
+  model_provider: string | null;
   model: string;
   temperature: number;
   uptime_seconds: number;
+  /** RFC 3339 wall-clock of daemon start. Stable across the daemon's
+   *  lifetime so the Logs page can default `since_ts` to "since daemon
+   *  start" without a separate `/api/logs` round-trip. */
+  daemon_started_at?: string;
   gateway_port: number;
   locale: string;
   memory_backend: string;
   paired: boolean;
   channels: Record<string, boolean>;
   health: HealthSnapshot;
+  /** Self-process resource snapshot. Present on Linux; on unsupported
+   * platforms `rss_bytes = 0` and `cpu_percent = null`. */
+  process?: ProcessStats;
+}
+
+export interface ProcessStats {
+  rss_bytes: number;
+  /** Total system RAM in bytes (`/proc/meminfo`'s `MemTotal`). `0` on
+   * unsupported platforms; render the RAM tile as `rss / total * 100%`
+   * when this is non-zero. */
+  system_ram_total_bytes: number;
+  /** Average CPU% across logical cores (0..100 * num_cpus). `null` on the
+   * first sample after boot (no baseline) or on unsupported platforms. */
+  cpu_percent: number | null;
+  num_cpus: number;
 }
 
 export interface HealthSnapshot {
@@ -33,6 +54,18 @@ export interface ToolSpec {
   parameters: any;
 }
 
+export interface CronDeliveryConfig {
+  mode: string;
+  channel?: string | null;
+  to?: string | null;
+  best_effort?: boolean;
+}
+
+export type CronSchedule =
+  | { kind: "cron"; expr: string; tz?: string | null }
+  | { kind: "at"; at: string }
+  | { kind: "every"; every_ms: number };
+
 export interface CronJob {
   id: string;
   name: string | null;
@@ -40,14 +73,15 @@ export interface CronJob {
   command: string;
   prompt: string | null;
   job_type: string;
-  schedule: unknown;
+  schedule: CronSchedule;
   enabled: boolean;
-  delivery: unknown;
+  delivery: CronDeliveryConfig;
   delete_after_run: boolean;
   session_target: string | null;
   model: string | null;
   allowed_tools: string[] | null;
   source: string | null;
+  agent_alias: string;
   created_at: string;
   next_run: string;
   last_run: string | null;
@@ -69,11 +103,11 @@ export interface Integration {
   name: string;
   description: string;
   category: string;
-  status: 'Available' | 'Active';
+  status: "Available" | "Active";
 }
 
 export interface DiagResult {
-  severity: 'ok' | 'warn' | 'error';
+  severity: "ok" | "warn" | "error";
   category: string;
   message: string;
 }
@@ -86,6 +120,11 @@ export interface MemoryEntry {
   timestamp: string;
   session_id: string | null;
   score: number | null;
+  /** Alias of the agent this entry was captured for (HashMap key in
+   * `config.agents`). Populated by SQL-backed memory stores when the
+   * agent is known at write time; `null` for older entries or backends
+   * without per-agent attribution. */
+  agent_alias: string | null;
 }
 
 export interface CostSummary {
@@ -95,12 +134,28 @@ export interface CostSummary {
   total_tokens: number;
   request_count: number;
   by_model: Record<string, ModelStats>;
+  /** Per-agent rollup. Empty when `[cost].track_per_agent = false` or
+   * when no records carry an agent_alias. */
+  by_agent: Record<string, AgentCostStats>;
 }
 
 export interface ModelStats {
   model: string;
   cost_usd: number;
   total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  request_count: number;
+}
+
+export interface AgentCostStats {
+  agent_alias: string;
+  cost_usd: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
   request_count: number;
 }
 
@@ -112,21 +167,52 @@ export interface CliTool {
 }
 
 export interface Session {
+  /** Display form: `gw_` stripped for gateway sessions, full composite for
+   * channel-driven sessions. */
   session_id: string;
+  /** Full DB key. Use this when calling DELETE / messages / abort
+   * endpoints — `session_id` is for display only. */
+  session_key: string;
   created_at: string;
   last_activity: string;
   message_count: number;
   name?: string;
+  /** Alias of the agent that owned this session. `null` for legacy rows
+   * with no attribution at all (channel_id null too). */
+  agent_alias: string | null;
+  /** Owning channel as `<type>.<alias>` for channel-driven sessions
+   * (Discord, Matrix, …). `null` for gateway WebSocket sessions. */
+  channel_id: string | null;
+}
+
+export type ChannelReadinessState = 'ready' | 'missing' | 'unknown';
+
+export interface ChannelReadiness {
+  enabled: ChannelReadinessState;
+  bound_to_agent: ChannelReadinessState;
+  authenticated: ChannelReadinessState;
+  listening: ChannelReadinessState;
+  requirements: string[];
+  notes: string[];
 }
 
 export interface ChannelDetail {
+  /** Composite `<type>.<alias>` identifier (v0.8.0). */
   name: string;
+  /** Channel type as the schema emits it (kebab; e.g. `"discord"`). */
   type: string;
+  /** Per-alias HashMap key (e.g. `"loneliness"`). */
+  alias: string;
+  /** Agent whose `channels` list contains `<type>.<alias>`, or `null`
+   * when the block is orphaned. */
+  owning_agent: string | null;
   enabled: boolean;
-  status: 'active' | 'inactive' | 'error';
+  status: "active" | "inactive" | "error";
   message_count: number;
   last_message_at: string | null;
-  health: 'healthy' | 'degraded' | 'down';
+  health: "healthy" | "degraded" | "down";
+  /** Per-alias readiness breakdown (present when the gateway computes it). */
+  readiness?: ChannelReadiness;
 }
 
 export interface SSEEvent {
@@ -137,19 +223,19 @@ export interface SSEEvent {
 
 export interface WsMessage {
   type:
-    | 'message'
-    | 'chunk'
-    | 'chunk_reset'
-    | 'thinking'
-    | 'tool_call'
-    | 'tool_result'
-    | 'done'
-    | 'error'
-    | 'session_start'
-    | 'connected'
-    | 'cron_result'
-    | 'approval_request'
-    | 'aborted';
+    | "message"
+    | "chunk"
+    | "chunk_reset"
+    | "thinking"
+    | "tool_call"
+    | "tool_result"
+    | "done"
+    | "error"
+    | "session_start"
+    | "connected"
+    | "cron_result"
+    | "approval_request"
+    | "aborted";
   content?: string;
   full_response?: string;
   name?: string;
@@ -170,7 +256,7 @@ export interface WsMessage {
   timeout_secs?: number;
 }
 
-export type ApprovalDecision = 'approve' | 'deny' | 'always';
+export type ApprovalDecision = "approve" | "deny" | "always";
 
 export interface PendingApproval {
   requestId: string;
@@ -185,10 +271,20 @@ export interface PendingApproval {
 export interface SessionMessageRow {
   role: string;
   content: string;
+  /** RFC 3339 timestamp recorded when the row was persisted. `null` for
+   * backends that don't stamp per-row timestamps (JSONL / in-memory). */
+  created_at: string | null;
 }
 
 export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessageRow[];
   session_persistence: boolean;
+}
+
+export interface TuiEntry {
+  tui_id: string;
+  connected_at: string;
+  peer_label: string;
+  transport: string;
 }

@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -67,6 +68,70 @@ fn resolve_existing_session_key(backend: &dyn SessionBackend, session_id: &str) 
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOwnershipScope {
+    agent_alias: String,
+    channel_ids: BTreeSet<String>,
+}
+
+impl SessionOwnershipScope {
+    pub fn for_agent(agent_alias: impl Into<String>) -> Self {
+        Self {
+            agent_alias: agent_alias.into(),
+            channel_ids: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_channels<I, S>(agent_alias: impl Into<String>, channel_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            agent_alias: agent_alias.into(),
+            channel_ids: channel_ids.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn authorize(&self, backend: &dyn SessionBackend, session_id: &str) -> Result<String, String> {
+        let Some(session_key) = resolve_existing_session_key(backend, session_id) else {
+            return Ok(session_id.trim().to_string());
+        };
+
+        let Some(metadata) = backend.get_session_metadata(&session_key) else {
+            return Err(format!(
+                "Session '{session_id}' exists but has no ownership metadata; refusing destructive session operation from agent '{}'.",
+                self.agent_alias
+            ));
+        };
+
+        if let Some(owner) = metadata.agent_alias.as_deref() {
+            if owner == self.agent_alias {
+                return Ok(session_key);
+            }
+            return Err(format!(
+                "Session '{session_id}' is owned by agent '{owner}', not '{}'.",
+                self.agent_alias
+            ));
+        }
+
+        if let Some(channel_id) = metadata.channel_id.as_deref() {
+            if self.channel_ids.contains(channel_id) {
+                return Ok(session_key);
+            }
+            return Err(format!(
+                "Session '{session_id}' belongs to channel '{channel_id}', which is not owned by agent '{}'.",
+                self.agent_alias
+            ));
+        }
+
+        Err(format!(
+            "Session '{session_id}' has no agent or channel ownership metadata; refusing destructive session operation from agent '{}'.",
+            self.agent_alias
+        ))
+    }
 }
 
 // ── SessionsListTool ────────────────────────────────────────────────
@@ -197,7 +262,16 @@ impl Tool for SessionsHistoryTool {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "session_id"})),
+                    "sessions: missing session_id parameter"
+                );
+                anyhow::Error::msg("Missing 'session_id' parameter")
+            })?;
 
         if let Err(error) = validate_session_id(session_id) {
             return Ok(error.into_tool_result());
@@ -297,7 +371,16 @@ impl Tool for SessionsSendTool {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "session_id"})),
+                    "sessions: missing session_id parameter"
+                );
+                anyhow::Error::msg("Missing 'session_id' parameter")
+            })?;
 
         if let Err(error) = validate_session_id(session_id) {
             return Ok(error.into_tool_result());
@@ -306,7 +389,16 @@ impl Tool for SessionsSendTool {
         let message = args
             .get("message")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "message"})),
+                    "sessions: missing message parameter"
+                );
+                anyhow::Error::msg("Missing 'message' parameter")
+            })?;
 
         if message.trim().is_empty() {
             return Ok(ToolResult {
@@ -328,7 +420,7 @@ impl Tool for SessionsSendTool {
             });
         };
 
-        let chat_msg = zeroclaw_api::provider::ChatMessage::user(message);
+        let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
 
         match self.backend.append(&target_session_key, &chat_msg) {
             Ok(()) => {
@@ -428,11 +520,28 @@ impl Tool for SessionsCurrentTool {
 pub struct SessionResetTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    ownership_scope: Option<SessionOwnershipScope>,
 }
 
 impl SessionResetTool {
     pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+        Self {
+            backend,
+            security,
+            ownership_scope: None,
+        }
+    }
+
+    pub fn for_agent(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        ownership_scope: SessionOwnershipScope,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            ownership_scope: Some(ownership_scope),
+        }
     }
 }
 
@@ -474,21 +583,45 @@ impl Tool for SessionResetTool {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "session_id"})),
+                    "sessions: missing session_id parameter"
+                );
+                anyhow::Error::msg("Missing 'session_id' parameter")
+            })?;
 
         if let Err(error) = validate_session_id(session_id) {
             return Ok(error.into_tool_result());
         }
 
-        match self.backend.clear_messages(session_id) {
+        let target_session_key = match &self.ownership_scope {
+            Some(scope) => match scope.authorize(self.backend.as_ref(), session_id) {
+                Ok(key) => key,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+            },
+            None => resolve_existing_session_key(self.backend.as_ref(), session_id)
+                .unwrap_or_else(|| session_id.trim().to_string()),
+        };
+
+        match self.backend.clear_messages(&target_session_key) {
             Ok(0) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{session_id}' is already empty."),
+                output: format!("Session '{target_session_key}' is already empty."),
                 error: None,
             }),
             Ok(count) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{session_id}' reset ({count} messages cleared)."),
+                output: format!("Session '{target_session_key}' reset ({count} messages cleared)."),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -507,11 +640,28 @@ impl Tool for SessionResetTool {
 pub struct SessionDeleteTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    ownership_scope: Option<SessionOwnershipScope>,
 }
 
 impl SessionDeleteTool {
     pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+        Self {
+            backend,
+            security,
+            ownership_scope: None,
+        }
+    }
+
+    pub fn for_agent(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        ownership_scope: SessionOwnershipScope,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            ownership_scope: Some(ownership_scope),
+        }
     }
 }
 
@@ -553,24 +703,48 @@ impl Tool for SessionDeleteTool {
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "session_id"})),
+                    "sessions: missing session_id parameter"
+                );
+                anyhow::Error::msg("Missing 'session_id' parameter")
+            })?;
 
         if let Err(error) = validate_session_id(session_id) {
             return Ok(error.into_tool_result());
         }
 
-        let existed = !self.backend.load(session_id).is_empty();
+        let target_session_key = match &self.ownership_scope {
+            Some(scope) => match scope.authorize(self.backend.as_ref(), session_id) {
+                Ok(key) => key,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+            },
+            None => resolve_existing_session_key(self.backend.as_ref(), session_id)
+                .unwrap_or_else(|| session_id.trim().to_string()),
+        };
 
-        match self.backend.delete_session(session_id) {
+        let existed = !self.backend.load(&target_session_key).is_empty();
+
+        match self.backend.delete_session(&target_session_key) {
             Ok(true) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{session_id}' deleted."),
+                output: format!("Session '{target_session_key}' deleted."),
                 error: None,
             }),
             Ok(false) if !existed => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Session '{session_id}' not found (may have already been deleted)."
+                    "Session '{target_session_key}' not found (may have already been deleted)."
                 ),
                 error: None,
             }),
@@ -578,7 +752,7 @@ impl Tool for SessionDeleteTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Session '{session_id}' exists but could not be deleted \
+                    "Session '{target_session_key}' exists but could not be deleted \
                      — the storage backend may not support this operation."
                 )),
             }),
@@ -594,8 +768,12 @@ impl Tool for SessionDeleteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use tempfile::TempDir;
-    use zeroclaw_api::provider::ChatMessage;
+    use zeroclaw_api::model_provider::ChatMessage;
+    use zeroclaw_infra::session_backend::SessionMetadata;
     use zeroclaw_infra::session_store::SessionStore;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -624,6 +802,95 @@ mod tests {
             .append("discord__bob", &ChatMessage::user("Hey from Bob"))
             .unwrap();
         (tmp, Arc::new(store))
+    }
+
+    struct MetadataBackend {
+        inner: Arc<dyn SessionBackend>,
+        metadata: Mutex<HashMap<String, SessionMetadata>>,
+    }
+
+    impl MetadataBackend {
+        fn new(inner: Arc<dyn SessionBackend>, metadata: Vec<SessionMetadata>) -> Self {
+            Self {
+                inner,
+                metadata: Mutex::new(
+                    metadata
+                        .into_iter()
+                        .map(|entry| (entry.key.clone(), entry))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl SessionBackend for MetadataBackend {
+        fn load(&self, key: &str) -> Vec<ChatMessage> {
+            self.inner.load(key)
+        }
+
+        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.inner.append(key, msg)
+        }
+
+        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(key)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+
+        fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+            self.inner.clear_messages(session_key)
+        }
+
+        fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+            let deleted = self.inner.delete_session(session_key)?;
+            if deleted {
+                self.metadata.lock().unwrap().remove(session_key);
+            }
+            Ok(deleted)
+        }
+
+        fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+            self.metadata
+                .lock()
+                .unwrap()
+                .get(session_key)
+                .cloned()
+                .or_else(|| self.inner.get_session_metadata(session_key))
+        }
+
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.metadata.lock().unwrap().contains_key(session_key)
+                || self.inner.session_exists(session_key)
+        }
+    }
+
+    fn session_metadata(
+        key: &str,
+        agent_alias: Option<&str>,
+        channel_id: Option<&str>,
+        message_count: usize,
+    ) -> SessionMetadata {
+        SessionMetadata {
+            key: key.to_string(),
+            name: None,
+            created_at: Utc::now(),
+            last_activity: Utc::now(),
+            message_count,
+            agent_alias: agent_alias.map(str::to_string),
+            channel_id: channel_id.map(str::to_string),
+            room_id: None,
+            sender_id: None,
+        }
+    }
+
+    fn seeded_metadata_backend(
+        metadata: Vec<SessionMetadata>,
+    ) -> (TempDir, Arc<dyn SessionBackend>) {
+        let (tmp, inner) = seeded_backend();
+        (tmp, Arc::new(MetadataBackend::new(inner, metadata)))
     }
 
     // ── Session ID validation tests ─────────────────────────────────
@@ -1083,6 +1350,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_scoped_allows_own_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("rowan"),
+            None,
+            2,
+        )]);
+        let tool = SessionResetTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("2 messages cleared"));
+        assert!(backend.load("telegram__alice").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_scoped_denies_other_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("sable"),
+            None,
+            2,
+        )]);
+        let tool = SessionResetTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("owned by agent 'sable'"));
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reset_scoped_allows_owned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionResetTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["telegram.default"]),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(backend.load("telegram__alice").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_scoped_denies_unowned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionResetTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["discord.default"]),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not owned by agent 'rowan'"));
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reset_scoped_denies_legacy_unattributed_session() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionResetTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("no agent or channel ownership metadata")
+        );
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
     async fn reset_rejects_empty_session_id() {
         let (_tmp, backend) = test_backend();
         let tool = SessionResetTool::new(backend, test_security());
@@ -1146,6 +1532,125 @@ mod tests {
         // Bob's session should be untouched
         let bob_msgs = backend.load("discord__bob");
         assert_eq!(bob_msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_scoped_allows_own_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("rowan"),
+            None,
+            2,
+        )]);
+        let tool = SessionDeleteTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("deleted"));
+        assert!(backend.load("telegram__alice").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_scoped_denies_other_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("sable"),
+            None,
+            2,
+        )]);
+        let tool = SessionDeleteTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("owned by agent 'sable'"));
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_scoped_allows_owned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionDeleteTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["telegram.default"]),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(backend.load("telegram__alice").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_scoped_denies_unowned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionDeleteTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["discord.default"]),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not owned by agent 'rowan'"));
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_scoped_denies_legacy_unattributed_session() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionDeleteTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("no agent or channel ownership metadata")
+        );
+        assert_eq!(backend.load("telegram__alice").len(), 2);
     }
 
     #[tokio::test]

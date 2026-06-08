@@ -6,7 +6,11 @@
 /docs/book/po-extract/
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
+/docs/book/src/zerocode/zerocode-theme-list.md
 /docs/book/theme/lang-switcher.js
+/docs/book/theme/pc-themes.css
+/docs/superpowers/plans
+/docs/superpowers/specs
 .secrets
 firmware/*/target
 web/dist/*
@@ -19,6 +23,8 @@ web/dist/*
 web/src/lib/api-generated.ts
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 .DS_Store
 ._*
 .wt-pr37/
@@ -57,6 +63,9 @@ credentials.json
 # Claude Code agent worktrees (temporary isolated workspaces)
 .claude/worktrees/
 
+# Claude Code scheduled-task lock (machine-local runtime state)
+.claude/scheduled_tasks.lock
+
 # Claude Code skill session state (review handoffs, changelog drafts, review bodies)
 tmp/
 
@@ -87,3 +96,5 @@ web/src/lib/api-generated.ts
 
 # Generated OpenAPI spec (transient handoff for openapi-typescript)
 target/openapi.json
+/v[0-9]*.toml
+.worktrees/

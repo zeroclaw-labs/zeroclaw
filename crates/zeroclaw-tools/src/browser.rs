@@ -14,7 +14,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::debug;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -63,6 +62,7 @@ pub struct BrowserTool {
     allowed_domains: Vec<String>,
     session_name: Option<String>,
     backend: String,
+    headed: Option<bool>,
     #[allow(dead_code)] // read only with browser-native feature
     native_headless: bool,
     #[allow(dead_code)]
@@ -204,12 +204,13 @@ impl BrowserTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         session_name: Option<String>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::new_with_backend(
             security,
             allowed_domains,
             session_name,
             "agent_browser".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -223,23 +224,25 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
         backend: String,
+        headed: Option<bool>,
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
-            allowed_domains: normalize_domains(allowed_domains),
+            allowed_domains: normalize_allowed_domains(allowed_domains)?,
             session_name,
             backend,
+            headed,
             native_headless,
             native_webdriver_url,
             native_chrome_path,
             computer_use,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
-        }
+        })
     }
 
     /// Check if agent-browser CLI is available
@@ -298,9 +301,16 @@ impl BrowserTool {
         }
 
         let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"endpoint": endpoint})),
+                "browser: invalid computer_use endpoint URL"
+            );
+            anyhow::Error::msg(format!(
                 "Invalid browser.computer_use.endpoint: '{endpoint}'. Expected http(s) URL"
-            )
+            ))
         })?;
 
         let scheme = parsed.scheme();
@@ -308,9 +318,15 @@ impl BrowserTool {
             anyhow::bail!("browser.computer_use.endpoint must use http:// or https://");
         }
 
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("browser.computer_use.endpoint must include host"))?;
+        let host = parsed.host_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: browser.computer_use.endpoint must include host"
+            );
+            anyhow::Error::msg("browser.computer_use.endpoint must include host")
+        })?;
 
         let host_is_private = is_private_host(host);
         if !self.computer_use.allow_remote_endpoint && !host_is_private {
@@ -451,28 +467,16 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let agent_browser_bin = if cfg!(target_os = "windows") {
-            "agent-browser.cmd"
-        } else {
-            "agent-browser"
-        };
-        let mut cmd = Command::new(agent_browser_bin);
-
-        // When running as a service (systemd/OpenRC), the process may lack
-        // HOME which browsers need for profile directories.
-        if is_service_environment() {
-            ensure_browser_env(&mut cmd);
-        }
-
-        // Add session if configured
-        if let Some(ref session) = self.session_name {
-            cmd.arg("--session").arg(session);
-        }
+        let mut cmd = self.agent_browser_command();
 
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
 
-        debug!("Running: agent-browser {} --json", args.join(" "));
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Running: agent-browser {} --json", args.join(" "))
+        );
 
         let output = cmd
             .stdout(Stdio::piped())
@@ -484,7 +488,11 @@ impl BrowserTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !stderr.is_empty() {
-            debug!("agent-browser stderr: {}", stderr);
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("agent-browser stderr: {}", stderr)
+            );
         }
 
         // Parse JSON response
@@ -506,6 +514,38 @@ impl BrowserTool {
                 error: Some(stderr.trim().to_string()),
             })
         }
+    }
+
+    fn agent_browser_command(&self) -> Command {
+        let agent_browser_bin = if cfg!(target_os = "windows") {
+            "agent-browser.cmd"
+        } else {
+            "agent-browser"
+        };
+        let mut cmd = Command::new(agent_browser_bin);
+
+        match self.headed {
+            Some(true) => {
+                cmd.env("AGENT_BROWSER_HEADED", "1");
+            }
+            Some(false) => {
+                cmd.env_remove("AGENT_BROWSER_HEADED");
+            }
+            None => {}
+        }
+
+        // When running as a service (systemd/OpenRC), the process may lack
+        // HOME which browsers need for profile directories.
+        if is_service_environment() {
+            ensure_browser_env(&mut cmd);
+        }
+
+        // Add session if configured
+        if let Some(ref session) = self.session_name {
+            cmd.arg("--session").arg(session);
+        }
+
+        cmd
     }
 
     /// Execute a browser action via agent-browser CLI
@@ -722,10 +762,15 @@ impl BrowserTool {
         params: &serde_json::Map<String, Value>,
         key: &str,
     ) -> anyhow::Result<i64> {
-        params
-            .get(key)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
+        params.get(key).and_then(Value::as_i64).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: Missing or invalid '{key}' parameter"
+            );
+            anyhow::Error::msg("Missing or invalid '{key}' parameter")
+        })
     }
 
     fn validate_computer_use_action(
@@ -735,10 +780,15 @@ impl BrowserTool {
     ) -> anyhow::Result<()> {
         match action {
             "open" => {
-                let url = params
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
+                let url = params.get("url").and_then(Value::as_str).ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'url' for open action"
+                    );
+                    anyhow::Error::msg("Missing 'url' for open action")
+                })?;
                 self.validate_url(url)?;
             }
             "mouse_move" | "mouse_click" => {
@@ -769,10 +819,15 @@ impl BrowserTool {
     ) -> anyhow::Result<ToolResult> {
         let endpoint = self.computer_use_endpoint_url()?;
 
-        let mut params = args
-            .as_object()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("browser args must be a JSON object"))?;
+        let mut params = args.as_object().cloned().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: browser args must be a JSON object"
+            );
+            anyhow::Error::msg("browser args must be a JSON object")
+        })?;
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
@@ -1065,10 +1120,15 @@ impl Tool for BrowserTool {
         };
 
         // Parse action from args
-        let action_str = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+        let action_str = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: Missing 'action' parameter"
+            );
+            anyhow::Error::msg("Missing 'action' parameter")
+        })?;
 
         if !is_supported_browser_action(action_str) {
             return Ok(ToolResult {
@@ -1412,7 +1472,22 @@ mod native_backend {
                         }
                         "fill" => {
                             let fill = fill_value.ok_or_else(|| {
-                                anyhow::anyhow!("find_action='fill' requires fill_value")
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "find_action": "fill",
+                                            "missing": "fill_value",
+                                        })
+                                    ),
+                                    "browser: fill action requires fill_value"
+                                );
+                                anyhow::Error::msg("find_action='fill' requires fill_value")
                             })?;
                             let _ = element.clear().await;
                             element.send_keys(&fill).await?;
@@ -1527,7 +1602,15 @@ mod native_backend {
 
         fn active_client(&self) -> Result<&Client> {
             self.client.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("No active native browser session. Run browser action='open' first")
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: no active native browser session"
+                );
+                anyhow::Error::msg(
+                    "No active native browser session. Run browser action='open' first",
+                )
             })
         }
     }
@@ -1797,10 +1880,15 @@ mod native_backend {
 fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<BrowserAction> {
     match action_str {
         "open" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
+            let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'url' for open action"
+                );
+                anyhow::Error::msg("Missing 'url' for open action")
+            })?;
             Ok(BrowserAction::Open { url: url.into() })
         }
         "snapshot" => Ok(BrowserAction::Snapshot {
@@ -1821,7 +1909,15 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for click"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for click"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for click")
+                })?;
             Ok(BrowserAction::Click {
                 selector: selector.into(),
             })
@@ -1830,11 +1926,24 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
-            let value = args
-                .get("value")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for fill"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for fill")
+                })?;
+            let value = args.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'value' for fill"
+                );
+                anyhow::Error::msg("Missing 'value' for fill")
+            })?;
             Ok(BrowserAction::Fill {
                 selector: selector.into(),
                 value: value.into(),
@@ -1844,11 +1953,24 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
-            let text = args
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for type"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for type")
+                })?;
+            let text = args.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'text' for type"
+                );
+                anyhow::Error::msg("Missing 'text' for type")
+            })?;
             Ok(BrowserAction::Type {
                 selector: selector.into(),
                 text: text.into(),
@@ -1858,7 +1980,15 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_text"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for get_text"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for get_text")
+                })?;
             Ok(BrowserAction::GetText {
                 selector: selector.into(),
             })
@@ -1881,17 +2011,30 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             text: args.get("text").and_then(|v| v.as_str()).map(String::from),
         }),
         "press" => {
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'key' for press"))?;
+            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'key' for press"
+                );
+                anyhow::Error::msg("Missing 'key' for press")
+            })?;
             Ok(BrowserAction::Press { key: key.into() })
         }
         "hover" => {
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for hover"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for hover"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for hover")
+                })?;
             Ok(BrowserAction::Hover {
                 selector: selector.into(),
             })
@@ -1900,7 +2043,15 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let direction = args
                 .get("direction")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'direction' for scroll"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'direction' for scroll"
+                    );
+                    anyhow::Error::msg("Missing 'direction' for scroll")
+                })?;
             Ok(BrowserAction::Scroll {
                 direction: direction.into(),
                 pixels: args
@@ -1913,25 +2064,51 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for is_visible"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for is_visible"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for is_visible")
+                })?;
             Ok(BrowserAction::IsVisible {
                 selector: selector.into(),
             })
         }
         "close" => Ok(BrowserAction::Close),
         "find" => {
-            let by = args
-                .get("by")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'by' for find"))?;
-            let value = args
-                .get("value")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for find"))?;
+            let by = args.get("by").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'by' for find"
+                );
+                anyhow::Error::msg("Missing 'by' for find")
+            })?;
+            let value = args.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'value' for find"
+                );
+                anyhow::Error::msg("Missing 'value' for find")
+            })?;
             let action = args
                 .get("find_action")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'find_action' for find"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'find_action' for find"
+                    );
+                    anyhow::Error::msg("Missing 'find_action' for find")
+                })?;
             Ok(BrowserAction::Find {
                 by: by.into(),
                 value: value.into(),
@@ -2014,12 +2191,66 @@ fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
     message.contains("webdriver") && (message.contains("timed out") || message.contains("timeout"))
 }
 
-fn normalize_domains(domains: Vec<String>) -> Vec<String> {
-    domains
+fn normalize_allowed_domains(domains: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut rejected = Vec::new();
+    let mut normalized = domains
         .into_iter()
-        .map(|d| d.trim().to_lowercase())
-        .filter(|d| !d.is_empty())
-        .collect()
+        .filter_map(|d| {
+            normalize_domain(&d).or_else(|| {
+                rejected.push(d.clone());
+                None
+            })
+        })
+        .collect::<Vec<_>>();
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "Invalid browser.allowed_domains entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
+            rejected.join(", ")
+        );
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let input = raw.trim();
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
+        (true, true) => &input[1..input.len() - 1],
+        (false, false) => input,
+        _ => return None,
+    };
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string().to_lowercase());
+    }
+
+    let parsed = reqwest::Url::parse(input)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
+        .ok()?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+
+    let host = parsed.host_str()?;
+    let trimmed = host.trim();
+    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => return None,
+    };
+    let normalized = host_no_brackets
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized.to_lowercase())
 }
 
 fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
@@ -2198,14 +2429,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_domains_works() {
+    fn normalize_allowed_domains_works() {
         let domains = vec![
             "  Example.COM  ".into(),
             "docs.example.com".into(),
-            String::new(),
+            "example.com".into(),
         ];
-        let normalized = normalize_domains(domains);
-        assert_eq!(normalized, vec!["example.com", "docs.example.com"]);
+        let normalized = normalize_allowed_domains(domains).unwrap();
+        assert_eq!(normalized, vec!["docs.example.com", "example.com"]);
+    }
+
+    #[test]
+    fn normalize_allowed_domains_rejects_invalid() {
+        let err =
+            normalize_allowed_domains(vec!["".into(), "  ".into(), "user@example.com".into()])
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid browser.allowed_domains entry")
+        );
+    }
+
+    #[test]
+    fn normalize_domain_rejects_unmatched_brackets() {
+        assert!(normalize_domain("[::1").is_none());
+        assert!(normalize_domain("::1]").is_none());
+        assert!(normalize_domain("[127.0.0.1").is_none());
+        assert!(normalize_domain("127.0.0.1]").is_none());
     }
 
     #[test]
@@ -2286,7 +2536,7 @@ mod tests {
     #[test]
     fn validate_url_blocks_ipv6_ssrf() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
         assert!(
@@ -2346,10 +2596,81 @@ mod tests {
     #[test]
     fn browser_tool_default_backend_is_agent_browser() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::AgentBrowser
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_inherits_headed_env_by_default() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .map(|(_, value)| value),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_clears_headed_env_when_configured_false() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "agent_browser".into(),
+            Some(false),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        )
+        .unwrap();
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .map(|(_, value)| value),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_sets_headed_env_when_configured() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "agent_browser".into(),
+            Some(true),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        )
+        .unwrap();
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str()),
+            Some("1")
         );
     }
 
@@ -2361,11 +2682,13 @@ mod tests {
             vec!["example.com".into()],
             None,
             "auto".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
 
@@ -2377,11 +2700,13 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::ComputerUse
@@ -2396,6 +2721,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2403,7 +2729,8 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert!(tool.computer_use_endpoint_url().is_err());
     }
@@ -2416,6 +2743,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2424,7 +2752,8 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert!(tool.computer_use_endpoint_url().is_ok());
     }
@@ -2437,6 +2766,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2445,7 +2775,8 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert!(
             tool.validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
@@ -2464,14 +2795,14 @@ mod tests {
     #[test]
     fn browser_tool_name() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         assert_eq!(tool.name(), "browser");
     }
 
     #[test]
     fn browser_tool_validates_url() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
 
         // Valid
         assert!(tool.validate_url("https://example.com").is_ok());
@@ -2494,7 +2825,7 @@ mod tests {
     #[test]
     fn browser_tool_empty_allowlist_blocks() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec![], None);
+        let tool = BrowserTool::new(security, vec![], None).unwrap();
         assert!(tool.validate_url("https://example.com").is_err());
     }
 
@@ -2532,12 +2863,12 @@ mod tests {
             "broken pipe while writing webdriver command",
             "WebDriver request timed out",
         ] {
-            let err = anyhow::anyhow!(message);
+            let err = anyhow::Error::msg(message);
             assert!(is_recoverable_rust_native_error(&err), "{message}");
         }
 
         let allowlist_error =
-            anyhow::anyhow!("URL host 'localhost' is not in browser allowlist [example.com]");
+            anyhow::Error::msg("URL host 'localhost' is not in browser allowlist [example.com]");
         assert!(!is_recoverable_rust_native_error(&allowlist_error));
     }
 
@@ -2548,7 +2879,7 @@ mod tests {
             "URL host '127.0.0.1' is private and disallowed",
             "Action 'mouse_move' is unavailable for backend 'rust_native'",
         ] {
-            let err = anyhow::anyhow!(message);
+            let err = anyhow::Error::msg(message);
             assert!(!is_recoverable_rust_native_error(&err), "{message}");
         }
     }

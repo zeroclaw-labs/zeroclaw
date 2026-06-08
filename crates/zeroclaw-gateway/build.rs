@@ -19,12 +19,9 @@ fn build_web_dashboard() {
         return;
     }
 
-    // Already built — skip
-    if web_dir.join("dist/index.html").exists() {
-        return;
-    }
-
-    // Rerun if the web source changes
+    // Emit rerun-if-changed before any early return so cargo registers
+    // the dependency. Without it, source edits don't re-invoke the
+    // script and stale dist/ stays served against changed web/src.
     println!(
         "cargo:rerun-if-changed={}",
         web_dir.join("package.json").display()

@@ -1,0 +1,24 @@
+[package]
+name = "zeroclaw-spawn"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Attribution-propagating, lifecycle-logged wrapper around tokio::spawn for ZeroClaw."
+publish = false
+
+[dependencies]
+# zeroclaw-spawn IS the sanctioned interface against tokio::spawn for the
+# workspace. It sits one rung above zeroclaw-log so the spawn macro can
+# emit lifecycle records (Spawn / Complete) through the same record!
+# pipeline that every other observed call site uses. Attribution rides
+# along automatically via .in_current_span() — no behavior change versus
+# tokio::spawn, only added telemetry.
+zeroclaw-log = { workspace = true }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = ["rt", "macros", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

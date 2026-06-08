@@ -1,4 +1,4 @@
-//! Read/write endpoints for the per-workspace personality markdown files
+//! Read/write endpoints for per-agent personality markdown files
 //! (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`,
 //! `HEARTBEAT.md`, `BOOTSTRAP.md`, `MEMORY.md`).
 //!
@@ -9,12 +9,12 @@
 //! Sandbox: filenames are matched against the static `EDITABLE_PERSONALITY_FILES`
 //! allowlist re-exported from the runtime crate. The on-disk path is
 //! built from a `&'static str` taken from that allowlist plus the
-//! current `workspace_dir`, so user-supplied path components cannot
-//! escape the workspace.
+//! agent's workspace dir resolved via `Config::agent_workspace_dir`,
+//! so user-supplied path components cannot escape the workspace.
 //!
-//! The `agent` query parameter is reserved for #5890 (multi-agent
-//! workspaces). It is accepted on every endpoint and ignored today;
-//! when #5890 lands it will validate an alias and append a subdir.
+//! The `agent` query parameter is required and selects which agent's
+//! workspace the endpoint operates against. Each agent has its own
+//! `<install>/agents/<alias>/workspace/` per the multi-agent layout.
 
 use axum::{
     Json,
@@ -27,23 +27,24 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use zeroclaw_runtime::agent::personality::{EDITABLE_PERSONALITY_FILES, MAX_FILE_CHARS};
 use zeroclaw_runtime::agent::personality_templates::{TemplateContext, render_preset_default};
+use zeroclaw_runtime::rpc::types::{
+    PersonalityFileEntry, PersonalityGetResult, PersonalityListResult, PersonalityPutResult,
+    PersonalityTemplatesResult, TemplateFileEntry,
+};
 
 use super::AppState;
 use super::api::require_auth;
 
-// ── Request / response shapes ───────────────────────────────────────
+// ── HTTP-specific request/response shapes (not shared) ──────────────
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AgentQuery {
-    /// Reserved for #5890. Accepted today, has no effect.
     #[serde(default)]
     pub agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct TemplateQuery {
-    /// Preset name. Only `default` is recognised today; unknown values
-    /// fall through to the default preset rather than 400-ing.
     #[serde(default)]
     pub preset: Option<String>,
     #[serde(default)]
@@ -54,64 +55,17 @@ pub struct TemplateQuery {
     pub timezone: Option<String>,
     #[serde(default)]
     pub communication_style: Option<String>,
-    /// When `false`, MEMORY.md is omitted and AGENTS.md is rendered for
-    /// a memory-disabled workspace.
     #[serde(default)]
     pub include_memory: Option<bool>,
-    /// Reserved for #5890.
     #[serde(default)]
     pub agent: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TemplateFile {
-    pub filename: &'static str,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TemplateResponse {
-    pub preset: &'static str,
-    pub files: Vec<TemplateFile>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityIndexEntry {
-    pub filename: &'static str,
-    pub exists: bool,
-    pub size: u64,
-    pub mtime_ms: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityIndex {
-    pub files: Vec<PersonalityIndexEntry>,
-    pub max_chars: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityFileResponse {
-    pub filename: String,
-    pub content: String,
-    pub exists: bool,
-    pub truncated: bool,
-    pub mtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PersonalityPutBody {
     pub content: String,
-    /// Last `mtime_ms` the editor saw via GET. When provided and the
-    /// on-disk mtime differs, the server returns 409 with the current
-    /// content + mtime so the editor can resolve the conflict.
     #[serde(default)]
     pub expected_mtime_ms: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PersonalityPutResponse {
-    pub bytes_written: u64,
-    pub mtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,10 +97,36 @@ fn validate_filename(
         })
 }
 
-fn personality_path(workspace_dir: &Path, _agent: Option<&str>, filename: &'static str) -> PathBuf {
-    // `_agent` is reserved for #5890. Today every personality file
-    // lives at the workspace root.
+fn personality_path(workspace_dir: &Path, filename: &'static str) -> PathBuf {
     workspace_dir.join(filename)
+}
+
+/// Resolve the per-agent workspace directory for personality I/O. Returns
+/// an error response when `agent` is missing or unknown so callers can
+/// short-circuit before touching disk.
+fn resolve_agent_workspace(
+    state: &AppState,
+    agent: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let Some(alias) = agent.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing required `agent` query parameter",
+            })),
+        ));
+    };
+    let cfg = state.config.read();
+    if !cfg.agents.contains_key(alias) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "unknown agent alias",
+                "agent": alias,
+            })),
+        ));
+    }
+    Ok(cfg.agent_workspace_dir(alias))
 }
 
 fn mtime_ms_of(meta: &std::fs::Metadata) -> Option<i64> {
@@ -170,35 +150,36 @@ fn truncate_to_chars(content: &str, max: usize) -> (String, bool) {
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/personality — index of all allowlist files in the active workspace.
+/// GET /api/personality?agent=<alias> — index of all allowlist files in the
+/// named agent's workspace.
 pub async fn handle_index(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(_q): Query<AgentQuery>,
+    Query(q): Query<AgentQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let workspace_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+    let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
     };
 
-    let files: Vec<PersonalityIndexEntry> = EDITABLE_PERSONALITY_FILES
+    let files: Vec<PersonalityFileEntry> = EDITABLE_PERSONALITY_FILES
         .iter()
         .copied()
         .map(|filename| {
             let path = workspace_dir.join(filename);
             match std::fs::metadata(&path) {
-                Ok(meta) => PersonalityIndexEntry {
-                    filename,
+                Ok(meta) => PersonalityFileEntry {
+                    filename: filename.to_string(),
                     exists: meta.is_file(),
                     size: meta.len(),
                     mtime_ms: mtime_ms_of(&meta),
                 },
-                Err(_) => PersonalityIndexEntry {
-                    filename,
+                Err(_) => PersonalityFileEntry {
+                    filename: filename.to_string(),
                     exists: false,
                     size: 0,
                     mtime_ms: None,
@@ -207,7 +188,7 @@ pub async fn handle_index(
         })
         .collect();
 
-    Json(PersonalityIndex {
+    Json(PersonalityListResult {
         files,
         max_chars: MAX_FILE_CHARS,
     })
@@ -230,28 +211,28 @@ pub async fn handle_get(
         Err(e) => return e.into_response(),
     };
 
-    let workspace_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+    let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
     };
-    let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
+    let path = personality_path(&workspace_dir, allowed);
 
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
             let (content, truncated) = truncate_to_chars(&raw, MAX_FILE_CHARS);
             let mtime_ms = std::fs::metadata(&path).ok().and_then(|m| mtime_ms_of(&m));
-            Json(PersonalityFileResponse {
+            Json(PersonalityGetResult {
                 filename: allowed.to_string(),
-                content,
+                content: Some(content),
                 exists: true,
                 truncated,
                 mtime_ms,
             })
             .into_response()
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Json(PersonalityFileResponse {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Json(PersonalityGetResult {
             filename: allowed.to_string(),
-            content: String::new(),
+            content: Some(String::new()),
             exists: false,
             truncated: false,
             mtime_ms: None,
@@ -297,11 +278,11 @@ pub async fn handle_put(
             .into_response();
     }
 
-    let workspace_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+    let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
     };
-    let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
+    let path = personality_path(&workspace_dir, allowed);
 
     // Disk-drift guard: if the editor told us what mtime it saw, reject
     // the write when disk has moved since.
@@ -351,7 +332,7 @@ pub async fn handle_put(
     let bytes_written = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime_ms = meta.as_ref().and_then(mtime_ms_of);
 
-    Json(PersonalityPutResponse {
+    Json(PersonalityPutResult {
         bytes_written,
         mtime_ms,
     })
@@ -374,14 +355,23 @@ pub async fn handle_templates(
         return e.into_response();
     }
 
-    let memory_default_enabled = {
-        let cfg = state.config.lock();
-        cfg.memory.backend.as_str() != "none"
+    let (memory_default_enabled, agent_display_default) = {
+        let cfg = state.config.read();
+        let mem = cfg.memory.backend.as_str() != "none";
+        let display = q
+            .agent
+            .as_deref()
+            .map(str::to_string)
+            .filter(|alias| cfg.agents.contains_key(alias));
+        (mem, display)
     };
 
     let defaults = TemplateContext::default();
     let ctx = TemplateContext {
-        agent: q.agent_name.unwrap_or(defaults.agent),
+        agent: q
+            .agent_name
+            .or(agent_display_default)
+            .unwrap_or(defaults.agent),
         user: q.user_name.unwrap_or(defaults.user),
         timezone: q.timezone.unwrap_or(defaults.timezone),
         communication_style: q
@@ -392,11 +382,14 @@ pub async fn handle_templates(
 
     let files = render_preset_default(&ctx)
         .into_iter()
-        .map(|(filename, content)| TemplateFile { filename, content })
+        .map(|(filename, content)| TemplateFileEntry {
+            filename: filename.to_string(),
+            content,
+        })
         .collect();
 
-    Json(TemplateResponse {
-        preset: "default",
+    Json(PersonalityTemplatesResult {
+        preset: "default".to_string(),
         files,
     })
     .into_response()
@@ -428,15 +421,8 @@ mod tests {
 
     #[test]
     fn personality_path_joins_workspace_root() {
-        let p = personality_path(Path::new("/tmp/ws"), None, "SOUL.md");
+        let p = personality_path(Path::new("/tmp/ws"), "SOUL.md");
         assert_eq!(p, Path::new("/tmp/ws/SOUL.md"));
-    }
-
-    #[test]
-    fn personality_path_ignores_agent_for_now() {
-        let with_agent = personality_path(Path::new("/tmp/ws"), Some("nova"), "SOUL.md");
-        let without = personality_path(Path::new("/tmp/ws"), None, "SOUL.md");
-        assert_eq!(with_agent, without);
     }
 
     #[test]

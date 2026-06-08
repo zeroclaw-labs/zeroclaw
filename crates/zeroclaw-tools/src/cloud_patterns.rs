@@ -66,7 +66,7 @@ impl Tool for CloudPatternsTool {
                 },
                 "cloud": {
                     "type": "string",
-                    "description": "Filter patterns by cloud provider (aws, azure, gcp). Optional."
+                    "description": "Filter patterns by cloud model_provider (aws, azure, gcp). Optional."
                 }
             },
             "required": ["action"]

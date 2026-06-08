@@ -60,10 +60,16 @@ impl Tool for PdfReadTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "pdf_read: missing path parameter"
+            );
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         let max_chars = args
             .get("max_chars")
@@ -102,8 +108,7 @@ impl Tool for PdfReadTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
-            let _ = self.security.record_action();
+        if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -114,7 +119,11 @@ impl Tool for PdfReadTool {
             });
         }
 
-        tracing::debug!("Reading PDF: {}", resolved_path.display());
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Reading PDF: {}", resolved_path.display())
+        );
 
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {

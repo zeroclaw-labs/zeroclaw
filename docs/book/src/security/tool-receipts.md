@@ -10,7 +10,7 @@ An LLM is a string generator. By default, nothing prevents it from narrating a t
 
 Tool receipts close that gap with the cheapest possible construct: a symmetric MAC with an ephemeral process-lifetime key.
 
-> **What "session" means here.** The HMAC key is generated once when `start_channels` initialises the channel server and lives for the lifetime of that daemon process. Every channel, every conversation, and every delegate sub-agent inside that process verifies against the same key. Restarting the daemon rotates it; there is no per-conversation or per-channel scoping. "Session" is used elsewhere in this document as shorthand for "this daemon process."
+> **What "session" means here.** The HMAC key is generated once when `start_channels` initialises the channel server and lives for the lifetime of that daemon process. Every channel, every conversation, every `delegate` hand-off, and every spawned [SubAgent](../architecture/subagents.md) inside that process verifies against the same key. Restarting the daemon rotates it; there is no per-conversation or per-channel scoping. "Session" is used elsewhere in this document as shorthand for "this daemon process."
 
 Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs: Practical Hallucination Detection for AI Agents." [arXiv:2603.10060](https://doi.org/10.48550/arXiv.2603.10060).
 
@@ -60,7 +60,7 @@ The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receip
 ### In debug logs
 
 ```bash
-RUST_LOG=zeroclaw::agent=debug zeroclaw daemon
+RUST_LOG=zeroclaw_runtime::agent=debug zeroclaw daemon
 ```
 
 Produces:

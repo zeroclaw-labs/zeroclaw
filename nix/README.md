@@ -31,11 +31,25 @@ instance:
 
   services.zeroclaw.instances.me = {
     environmentFile = config.age.secrets.zeroclaw-bot-token.path;
+    # `settings` mirrors `~/.zeroclaw/config.toml` as a Nix attrset. The
+    # config schema (section headers, type/alias convention, required
+    # fields) is documented at
+    # https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/providers/configuration.md
     settings = {
-      default_provider = "anthropic";
-      default_model = "claude-sonnet-4-6";
+      providers.models.anthropic.home = {           # type = anthropic; alias = home (you choose)
+        model = "claude-sonnet-4-6";
+        api_key = "sk-ant-...";                     # or inject via env (see "Secrets pattern" below)
+      };
 
-      channels.telegram = {
+      agents.assistant = {                          # alias = assistant (you choose)
+        model_provider = "anthropic.home";          # <type>.<alias> reference
+        risk_profile = "assistant";
+        channels = [ "telegram.home" ];             # <type>.<alias> reference
+      };
+
+      risk_profiles.assistant = { };                # must match agents.assistant.risk_profile
+
+      channels.telegram.home = {                    # type = telegram; alias = home (you choose)
         enabled = true;
         # The unit's ExecStartPre runs `envsubst` over the rendered
         # TOML. `$BOT_TOKEN` is read from the EnvironmentFile= and
@@ -71,8 +85,10 @@ services.zeroclaw.instances = {
 
 Each instance gets its own systemd unit, state directory, and per-instance
 system user. The module asserts at evaluation time that no two instances
-share a `dataDir` or `user`, and that instance names are valid systemd unit
-component names (`[A-Za-z0-9._-]+`).
+share a `dataDir`, that no two module-created users have the same `user`, and
+that instance names are valid systemd unit component names
+(`[A-Za-z0-9._-]+`). Instances may intentionally share a user when exactly one
+instance creates it and the others set `createUser = false`.
 
 ## Option summary
 
@@ -204,6 +220,8 @@ Requires KVM on the builder.
 
 ## Status
 
-Initial drop, not yet wired into ZeroClaw's CI. The CI workflow at
-`.github/workflows/ci.yml` is Rust-only today; adding a `nix-test` job to
-exercise `nix/test.nix` is a natural follow-up.
+The required CI gate runs a low-cost Nix module eval check through
+`checks.x86_64-linux.nixos-module-eval`. That check covers assertion-level
+contract regressions without requiring KVM. The full `nix/test.nix` VM test
+remains a manual or future heavier CI check because it needs a KVM-capable
+builder.

@@ -16,7 +16,15 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(I2cScanTool, ToolKind::Plugin);
+tool_attribution!(I2cReadTool, ToolKind::Plugin);
+tool_attribution!(I2cWriteTool, ToolKind::Plugin);
+tool_attribution!(SpiTransferTool, ToolKind::Plugin);
+tool_attribution!(GpioAardvarkTool, ToolKind::Plugin);
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 

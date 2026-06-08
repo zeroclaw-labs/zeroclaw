@@ -1,15 +1,15 @@
-//! Gemini provider capabilities and contract tests.
+//! Gemini model_provider capabilities and contract tests.
 //!
-//! Validates that the Gemini provider correctly declares its capabilities
-//! through the public Provider trait, ensuring the agent loop selects the
+//! Validates that the Gemini model_provider correctly declares its capabilities
+//! through the public ModelProvider trait, ensuring the agent loop selects the
 //! right tool-calling strategy (prompt-guided, not native).
 
-use zeroclaw::providers::create_provider_with_url;
-use zeroclaw::providers::traits::Provider;
+use zeroclaw::providers::create_model_provider_with_url;
+use zeroclaw::providers::traits::ModelProvider;
 
-fn gemini_provider() -> Box<dyn Provider> {
-    create_provider_with_url("gemini", Some("test-key"), None)
-        .expect("Gemini provider should resolve with test key")
+fn gemini_model_provider() -> Box<dyn ModelProvider> {
+    create_model_provider_with_url("gemini", Some("test-key"), None)
+        .expect("Gemini model_provider should resolve with test key")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,8 +18,8 @@ fn gemini_provider() -> Box<dyn Provider> {
 
 #[test]
 fn gemini_reports_no_native_tool_calling() {
-    let provider = gemini_provider();
-    let caps = provider.capabilities();
+    let model_provider = gemini_model_provider();
+    let caps = model_provider.capabilities();
     assert!(
         !caps.native_tool_calling,
         "Gemini should use prompt-guided tool calling, not native"
@@ -28,24 +28,24 @@ fn gemini_reports_no_native_tool_calling() {
 
 #[test]
 fn gemini_reports_vision_support() {
-    let provider = gemini_provider();
-    let caps = provider.capabilities();
+    let model_provider = gemini_model_provider();
+    let caps = model_provider.capabilities();
     assert!(caps.vision, "Gemini should report vision support");
 }
 
 #[test]
 fn gemini_supports_native_tools_returns_false() {
-    let provider = gemini_provider();
+    let model_provider = gemini_model_provider();
     assert!(
-        !provider.supports_native_tools(),
+        !model_provider.supports_native_tools(),
         "supports_native_tools() must be false to trigger prompt-guided fallback in chat()"
     );
 }
 
 #[test]
 fn gemini_supports_vision_returns_true() {
-    let provider = gemini_provider();
-    assert!(provider.supports_vision());
+    let model_provider = gemini_model_provider();
+    assert!(model_provider.supports_vision());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ fn gemini_convert_tools_returns_prompt_guided() {
     use zeroclaw::providers::traits::ToolsPayload;
     use zeroclaw::tools::ToolSpec;
 
-    let provider = gemini_provider();
+    let model_provider = gemini_model_provider();
     let tools = vec![ToolSpec {
         name: "memory_store".to_string(),
         description: "Store a value in memory".to_string(),
@@ -71,7 +71,7 @@ fn gemini_convert_tools_returns_prompt_guided() {
         }),
     }];
 
-    let payload = provider.convert_tools(&tools);
+    let payload = model_provider.convert_tools(&tools);
     assert!(
         matches!(payload, ToolsPayload::PromptGuided { .. }),
         "Gemini should return PromptGuided payload since native_tool_calling is false"

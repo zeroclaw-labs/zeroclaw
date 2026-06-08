@@ -2,6 +2,70 @@
 
 Cross-tool agent instructions for any AI coding assistant working on this repository.
 
+## ABSOLUTE RULE — SINGLE SOURCE OF TRUTH (NO DRY VIOLATIONS)
+
+**No piece of state lives in two places. Ever. Anywhere in this codebase.**
+
+This is not a guideline. It is not a preference. It is not deferrable to a
+follow-up PR. If a fact already lives somewhere in this codebase, you do NOT
+copy it into a new field, struct, config block, schema entry, runtime cache,
+or anywhere else. You reference it. You resolve it from its source on demand.
+
+**Why this matters more than anything else you're tempted to ship:** every
+duplicate state breeds a drift bug whose symptoms surface months later in
+production — operator edits the canonical location, the cached copy serves
+stale data, the agent silently misbehaves. The previous incarnation of this
+codebase had channel `allowed_users` Vec fields cached inside channel handles
+while the truth lived in config TOML; reloading config didn't refresh the
+channels; an authorized user couldn't talk to the bot until daemon restart.
+Every such field is now banned by this rule.
+
+### Forcing mechanism — what happens when you violate
+
+Adding a duplicate state field is an automatic-revert-on-detect change. The
+pre-push gate runs `dev/ci.sh dry-check`. If it fires, the maintainer will
+`git reset --hard` your branch back to the prior good state, and the time you
+spent is wasted. Save yourself the burn: do not write the duplicate in the
+first place.
+
+### Pre-edit ritual — before any new struct field, channel/handle field, schema field, config entry
+
+State, in your response text, the source of truth for the new data BEFORE you
+write the field. Two valid answers:
+
+  1. **"This is the source of truth — created here."** OK to write the
+     field. State what it represents.
+  2. **"Source of truth is `<path/to/canonical>` — this would be a
+     duplicate."** Do NOT write the field. Resolve from the canonical
+     location at use-time (closure, helper, `&Config` parameter, getter
+     trait, whatever fits — never a cache).
+
+Any third answer ("we'll only refresh on restart", "snapshot is fine",
+"orchestrator passes a Vec in") is a duplicate. Refuse the edit. Find the
+canonical source and resolve from there.
+
+### Examples of patterns that ARE duplicate state (forbidden):
+
+- A channel handle struct holding `Vec<String>` of "authorized users" alongside
+  `peer_groups` in `Config`.
+- A schema enum variant list duplicated across an enum and a `const &[Variant]`
+  table that aren't generated from the same macro.
+- A `ConfigSnapshot` struct that clones live `Config` fields the runtime can
+  already reach through its `Arc<RwLock<Config>>` handle.
+- Re-emitting a model-provider's API key into a runtime struct field when the
+  runtime already has the typed alias config.
+
+### Patterns that are NOT duplicate state (allowed):
+
+- Resolver closures (`Arc<dyn Fn() -> T + Send + Sync>`) that close over
+  `Arc<RwLock<Config>>` and resolve on call.
+- `&Config` / `&AgentConfig` parameters threaded through call sites.
+- Materialized views built ON-DEMAND from canonical state (cached per-call,
+  not stored).
+- Derive macros that emit multiple surfaces from one input table (e.g.
+  enum + const list from one macro invocation — both come from the same
+  source of truth at expansion time).
+
 ## Commands
 
 ```bash
@@ -17,6 +81,13 @@ Full pre-PR validation (recommended):
 ```
 
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
+
+## Subagents
+
+Subagents (via `spawn_subagent` or cron `JobType::Agent`) inherit the parent's identity and permissions but run in isolated sessions. **Before running any shell commands or filesystem operations, subagents must explicitly set their working directory to the repository root** (the directory containing the top-level `Cargo.toml` and `AGENTS.md`). Do not assume the shell starts at repo root; always `cd` to it first (or use the equivalent in the tool's context).
+
+This guarantees consistent command behavior across parent and child runs.
+
 
 ## Project Snapshot
 
@@ -42,6 +113,7 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 |-------|------|-------|
 | `zeroclaw-api` | Experimental | Stable at v1.0.0 (formal milestone) |
 | `zeroclaw-config` | Beta | Stable at v0.8.0 |
+| `zeroclaw-log` | Beta | Unified log emission + JSONL persistence + broadcast hook |
 | `zeroclaw-providers` | Beta | — |
 | `zeroclaw-memory` | Beta | — |
 | `zeroclaw-infra` | Beta | — |
@@ -50,7 +122,7 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
 | `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
-| `zeroclaw-tui` | Experimental | TUI onboarding wizard |
+| `zerocode` | Experimental | TUI onboarding wizard |
 | `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
 | `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
 | `zeroclaw-macros` | Beta | Tightly coupled to config schema |
@@ -65,6 +137,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `src/lib.rs` — module re-exports and CLI command enum definitions
 - `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
 - `crates/zeroclaw-config/` — schema, config loading/merging
+- `crates/zeroclaw-log/` — unified log surface (record! macro, LogEvent schema, JSONL persistence, broadcast hook, Observer bridge)
 - `crates/zeroclaw-macros/` — Configurable derive macro
 - `crates/zeroclaw-providers/` — model providers and resilient wrapper
 - `crates/zeroclaw-channels/` — messaging platform integrations (30+ channels)
@@ -75,7 +148,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
 - `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
 - `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
-- `crates/zeroclaw-tui/` — TUI onboarding wizard
+- `crates/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
@@ -92,11 +165,12 @@ When uncertain, classify as higher risk.
 ## Workflow
 
 1. **Read before write** — inspect existing module, factory wiring, and adjacent tests before editing.
-2. **One concern per PR** — avoid mixed feature+refactor+infra patches.
-3. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
-4. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
-5. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
-6. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
+2. **Map non-trivial changes** — before architecture, config, security, workflow, governance, CI, or agent-assisted contribution changes, read `docs/book/src/contributing/architecture-map.md` to choose the relevant architecture and foundation docs.
+3. **One concern per PR** — avoid mixed feature+refactor+infra patches.
+4. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
+5. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
+6. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
+7. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
 
 Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
@@ -150,6 +224,7 @@ Dev-operational contracts — files consumed by AI coding skills and development
 
 ## Linked References
 
+- `@docs/book/src/contributing/architecture-map.md` — start-here map for humans and coding agents before non-trivial architecture, workflow, config, security, CI, governance, or agent-assisted contribution changes
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template

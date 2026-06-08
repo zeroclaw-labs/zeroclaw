@@ -28,26 +28,28 @@ Run `setup.bat` from the latest release, or see [Setup → Windows](../setup/win
 cargo install --locked --path . # inside a clone
 ```
 
-## Onboard
+## Quickstart
 
 ```bash
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
-The wizard asks ~9 questions. Minimum inputs:
+`zeroclaw quickstart` writes a working config with one provider and one agent in a single shot. Minimum inputs:
 
 1. An **LLM provider** (Anthropic, OpenAI, Ollama, OpenRouter, etc.) and its API key or endpoint
-2. At least **one channel** — the default `cli` channel works; add Discord, Telegram, Slack, etc. if you want to chat from those platforms
+2. An **agent alias** — defaults to a sanitized provider name
 
-Everything else has safe defaults. Total time: ~2 minutes.
+Channels are configured separately. The default `cli` channel works out of the box; to add Discord, Telegram, Slack, etc., use `zeroclaw config set channels.<name>.<field>=<value>` or follow the per-channel guide under [Channels → Overview](../channels/overview.md).
+
+Everything else has safe defaults. Total time: ~1 minute.
 
 ## Talk to it
 
 ```bash
-zeroclaw agent
+zeroclaw agent -a <alias>
 ```
 
-This drops you into an interactive session using the `cli` channel. Type, get replies. Pass `-m "one-shot message"` for a single non-interactive turn.
+`<alias>` matches your `[agents.<alias>]` config entry — required, no default. This drops you into an interactive session using the `cli` channel. Pass `-m "one-shot message"` for a single non-interactive turn.
 
 For always-on deployment, register the service:
 
@@ -58,19 +60,33 @@ zeroclaw service start
 
 Then use a chat platform channel to reach the agent from Discord, Telegram, or wherever you configured.
 
-## If the wizard's questions annoy you
+## Configure
 
-Run with defaults and skip channel setup:
+`zeroclaw onboard` covers first run. To change settings afterward, open
+zerocode and use its **Config** pane rather than editing the config file by
+hand:
 
 ```bash
-zeroclaw onboard --quick --provider ollama --model qwen3.6:35b-a3b
+zerocode
 ```
 
-Or go all the way and use [YOLO mode](./yolo.md) — one config preset that disables approvals and safety gates. For dev boxes and home labs only.
+Every setting has a typed control and an inline explanation, and most apply
+live. The docs quote the TOML each control writes so you can see the persisted
+result. See [zerocode](./zerocode/overview.md) for details.
+
+## Skip the prompts
+
+Run non-interactively by passing all required flags:
+
+```bash
+zeroclaw quickstart --model-provider ollama --model qwen3.6:35b-a3b
+```
+
+Add `--api-key <key>` for hosted providers and `--agent <alias>` to override the default agent name. Or go all the way and use [YOLO mode](./yolo.md) — one config preset that disables approvals and safety gates. For dev boxes and home labs only.
 
 ## Next
 
-- [Multi-model setup](./multi-model-setup.md) — fallback chains, routing rules
+- [Multi-model setup](./multi-model-setup.md) — multi-agent dispatch, hint-based routes
 - [Setup → Service management](../setup/service.md) — running as a daemon
 - [Channels → Overview](../channels/overview.md) — wiring up chat platforms
 - [Security → Autonomy levels](../security/autonomy.md) — what the agent is allowed to do

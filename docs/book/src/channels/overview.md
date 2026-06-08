@@ -4,6 +4,14 @@ A **channel** is a messaging surface the agent talks through. One ZeroClaw insta
 
 Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one is feature-gated at compile time, so a minimal build only includes the channels you want.
 
+The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, and Telegram. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Pre-built binaries use this lean default. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
+
+```bash
+./install.sh --source --preset full
+cargo build --features channels-full
+cargo build --no-default-features --features "agent-runtime,gateway,channel-discord"
+```
+
 ## Categories
 
 ### Chat platforms
@@ -15,8 +23,11 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Matrix | `channel-matrix` | [Matrix](./matrix.md) |
 | Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
 | LINE | `channel-line` | [LINE](./line.md) |
-| Nextcloud Talk | `channel-nextcloud-talk` | [Nextcloud Talk](./nextcloud-talk.md) |
-| Discord, Slack, Telegram, Signal, iMessage, WeCom, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
+| Signal | `channel-signal` | [Signal](./signal.md) |
+| WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
+| WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
+| Discord, Slack, Telegram, iMessage, WeCom Bot Webhook, WeCom AI Bot Long Connection, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
@@ -36,7 +47,7 @@ See [Social channels](./social.md).
 | Channel | Feature flag | Notes |
 |---|---|---|
 | IMAP / SMTP | `channel-email` | Classic poll-based inbox |
-| Gmail Push | `channel-gmail-push` | Google Pub/Sub push notifications — real-time, no polling |
+| Gmail Push | `channel-email` | Google Pub/Sub push notifications — real-time, no polling |
 
 See [Email](./email.md).
 
@@ -46,8 +57,8 @@ See [Email](./email.md).
 |---|---|---|
 | ClawdTalk | `channel-clawdtalk` | Telnyx SIP real-time voice |
 | Voice Call | `channel-voice-call` | Twilio / Telnyx / Plivo |
-| Voice Wake | `channel-voice-wake` | Local wake-word detection |
-| TTS | `channel-tts` | Outbound speech synthesis (OpenAI, ElevenLabs, Google Cloud, Edge, Piper) |
+| Voice Wake | `voice-wake` | Local wake-word detection |
+| TTS | always compiled with channel support | Outbound speech synthesis (OpenAI, ElevenLabs, Google Cloud, Edge, Piper) |
 
 See [Voice & telephony](./voice.md).
 
@@ -55,26 +66,30 @@ See [Voice & telephony](./voice.md).
 
 | Channel | Feature flag | Shape |
 |---|---|---|
-| Webhook | (always on with gateway) | Inbound HTTP → agent |
+| Webhook | `channel-webhook` | Inbound HTTP → agent |
 | CLI | always on | Local stdin/stdout |
 | Gateway REST/WS | always on | HTTP + WebSocket |
-| ACP (Agent Client Protocol) | (always on with runtime) | JSON-RPC 2.0 over stdio — editor/IDE sessions |
+| ACP (Agent Client Protocol) | `channel-acp-server` | JSON-RPC 2.0 over stdio — editor/IDE sessions |
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
 ## Configuration
 
-Every channel is configured under `[channels.<name>]`:
+Modern channel instances are configured under `[channels.<type>.<alias>]`, with `default` as the common first alias:
 
 ```toml
-[channels.discord]
+[channels.discord.default]
 enabled = true
 bot_token = "..."
 allowed_users = ["123456789012345678"]
 reply_to_mentions_only = false
+
+[agents.assistant]
+enabled = true
+channels = ["discord.default"]
 ```
 
-Channel-specific options live under the same block. Common keys across channels:
+The `channels` entry binds the channel alias to the agent that should answer it. Some older per-channel guides still show legacy flat examples; prefer the alias shape above for new config. Channel-specific options live under the same block. Common keys across channels:
 
 | Key | What it does |
 |---|---|
@@ -87,7 +102,7 @@ Channel-specific options live under the same block. Common keys across channels:
 
 ## Pairing
 
-Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. The onboarding wizard handles pairing for channels you configure during `zeroclaw onboard`; use `zeroclaw channel add` and `zeroclaw channel bind-telegram` (for Telegram specifically) to pair additional identities post-onboard. Without pairing, the channel rejects everything.
+Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. Each channel's setup guide (linked from the matrix above) walks through that channel's pairing flow; `zeroclaw channel bind-telegram` handles Telegram-specific identities. Without pairing, the channel rejects everything.
 
 The rationale: an agent with a public Telegram bot token and no pairing is a publicly-accessible shell. Pairing is the gate.
 

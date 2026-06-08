@@ -5,11 +5,16 @@ import App from './App';
 import { basePath } from './lib/basePath';
 import './index.css';
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    {/* basePath is injected by the Rust gateway at serve time for reverse-proxy prefix support. */}
-    <BrowserRouter basename={basePath || '/'}>
-      <App />
-    </BrowserRouter>
-  </React.StrictMode>
-);
+const unsupportedBrowser =
+  document.documentElement.getAttribute('data-unsupported-browser') === '1';
+
+if (!unsupportedBrowser) {
+  ReactDOM.createRoot(document.getElementById('root')!).render(
+    <React.StrictMode>
+      {/* basePath is injected by the Rust gateway at serve time for reverse-proxy prefix support. */}
+      <BrowserRouter basename={basePath || '/'}>
+        <App />
+      </BrowserRouter>
+    </React.StrictMode>
+  );
+}

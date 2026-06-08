@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[derive(Parser)]
-#[command(about = "Fill empty/fuzzy .po entries via a configured provider")]
+#[command(about = "Fill empty/fuzzy .po entries via a configured model_provider")]
 struct Args {
     #[arg(long)]
     po: PathBuf,
@@ -17,9 +17,13 @@ struct Args {
     /// Entries per API call
     #[arg(long, default_value = "50")]
     batch: usize,
-    /// Provider name from [providers.models.<name>] in config.toml
+    /// ModelProvider alias from [providers.models.<kind>.<alias>] in config.toml
     #[arg(long)]
-    provider: String,
+    model_provider: String,
+    /// Config directory holding config.toml and .secret-key (default:
+    /// ~/.zeroclaw). Mirrors `zeroclaw --config-dir`.
+    #[arg(long)]
+    config_dir: Option<String>,
     /// Path for appending full input/output on every failure (default: {po}.failures.log)
     #[arg(long)]
     log_failures: Option<PathBuf>,
@@ -59,43 +63,6 @@ fn chrono_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("epoch={secs}")
-}
-
-struct ProviderConfig {
-    base_url: String,
-    model: String,
-}
-
-fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
-    let home =
-        std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
-    let candidates = [
-        format!("{home}/.zeroclaw/config.toml"),
-        format!("{home}/.config/zeroclaw/config.toml"),
-    ];
-    let raw = candidates
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .ok_or_else(|| anyhow::anyhow!("config.toml not found (tried ~/.zeroclaw/config.toml)"))?;
-    let table: toml::Table = raw.parse()?;
-    let provider = table
-        .get("providers")
-        .and_then(|v| v.get("models"))
-        .and_then(|v| v.get(provider_name))
-        .ok_or_else(|| {
-            anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml")
-        })?;
-    let model = provider.get("model").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No model set for provider '{provider_name}' — add `model = \"...\"` to [providers.models.{provider_name}]"))?
-        .to_string();
-    Ok(ProviderConfig {
-        base_url: provider
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:11434")
-            .to_string(),
-        model,
-    })
 }
 
 /// A parsed .po entry, carrying line positions so we can rewrite in place.
@@ -367,12 +334,13 @@ fn fail(err: anyhow::Error, raw_response: impl Into<String>) -> BatchFailure {
     }
 }
 
-/// Call Ollama's native `/api/chat` endpoint with a JSON schema constraining the output.
-/// Ollama enforces the schema at generation time, so the model cannot emit anything but the
-/// exact shape we request — no wrapping characters, no JSON leaks, no prose.
+/// Translate each source string via the shared runtime provider. The provider
+/// stack handles endpoint, auth, and wire protocol per family — this tool
+/// builds no HTTP. One request per source string keeps the per-entry mapping
+/// unambiguous (the .po model is one msgid -> one msgstr).
 async fn translate_batch(
-    client: &reqwest::Client,
-    provider: &ProviderConfig,
+    provider: &dyn zeroclaw_api::model_provider::ModelProvider,
+    model: &str,
     locale: &str,
     batch: &[&str],
 ) -> BatchResult {
@@ -385,63 +353,19 @@ async fn translate_batch(
          - If the input is already in {locale}, a code literal, a URL, or a single identifier, \
            return it unchanged.\n\
          - Use established software-localization terminology in {locale} rather than literal \
-           morpheme-by-morpheme translation."
+           morpheme-by-morpheme translation.\n\
+         - Return ONLY the translated string, no quotes, no preamble, no explanation."
     );
 
-    // Send each source as its own user message; the model responds with one translation per
-    // request as plain text in `message.content`. Ollama's schema enforcement is unreliable
-    // in practice (varies by model and version), so we ask for plain text and trust the prompt.
     let mut out = Vec::with_capacity(batch.len());
     for source in batch {
-        let body = serde_json::json!({
-            "model": provider.model,
-            "messages": [
-                {"role": "system", "content": &system},
-                {"role": "user", "content": *source},
-            ],
-            "stream": false,
-            // Disable reasoning/thinking — field name differs by Ollama endpoint and version, so
-            // include every variant we've seen. Unknown fields are silently ignored.
-            "think": false,
-            "reasoning_effort": "none",
-            "options": {"temperature": 0},
-        });
-        let content = fetch_ollama_content(client, provider, &body).await?;
+        let content = provider
+            .chat_with_system(Some(&system), source, model, None)
+            .await
+            .map_err(|e| fail(e, String::new()))?;
         out.push(content.trim().to_string());
     }
     Ok(out)
-}
-
-/// POST to Ollama's native `/api/chat` and return `message.content` from the response.
-async fn fetch_ollama_content(
-    client: &reqwest::Client,
-    provider: &ProviderConfig,
-    body: &serde_json::Value,
-) -> Result<String, BatchFailure> {
-    let resp = client
-        .post(format!("{}/api/chat", provider.base_url))
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| fail(e.into(), String::new()))?;
-    let status = resp.status();
-    let raw = resp
-        .text()
-        .await
-        .map_err(|e| fail(e.into(), String::new()))?;
-    if !status.is_success() {
-        return Err(fail(anyhow::anyhow!("HTTP {status}"), raw));
-    }
-    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        fail(
-            anyhow::anyhow!("response body JSON parse: {e}"),
-            raw.clone(),
-        )
-    })?;
-    parsed["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| fail(anyhow::anyhow!("no message.content"), raw))
 }
 
 #[tokio::main]
@@ -455,7 +379,8 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--po path does not exist: {}", args.po.display());
     }
 
-    let provider = read_provider_config(&args.provider)?;
+    let (provider, model) =
+        xtask::util::build_model_provider(&args.model_provider, args.config_dir.as_deref())?;
 
     let raw = std::fs::read_to_string(&args.po)?;
     let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
@@ -531,14 +456,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "==> {} to translate, {} fuzzy accepted as-is, provider={}, model={}",
+        "==> {} to translate, {} fuzzy accepted as-is, model_provider={}, model={}",
         to_translate.len(),
         to_accept.len(),
-        args.provider,
-        provider.model,
+        args.model_provider,
+        model,
     );
 
-    let client = reqwest::Client::new();
     let total = to_translate.len();
     let total_chunks = total.div_ceil(args.batch).max(1);
 
@@ -557,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
             chunk.len()
         );
 
-        match translate_batch(&client, &provider, &args.locale, &msgids).await {
+        match translate_batch(provider.as_ref(), &model, &args.locale, &msgids).await {
             Ok(translated) => {
                 for (entry, text) in chunk.iter().zip(translated.iter()) {
                     // If msgid ends with \n, msgstr must too — gettext requires it.

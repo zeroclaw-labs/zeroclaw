@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession } from '@/lib/api';
+import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
@@ -58,9 +58,44 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
+const LOCAL_PROVIDER_NAMES: Record<string, string> = {
+  atomic_chat: 'Atomic Chat',
+  gemini_cli: 'Gemini CLI',
+  kilocli: 'KiloCLI',
+  lmstudio: 'LM Studio',
+  llamacpp: 'llama.cpp server',
+  ollama: 'Ollama',
+  opencode: 'OpenCode',
+  osaurus: 'Osaurus',
+  sglang: 'SGLang',
+  synthetic: 'Synthetic',
+  vllm: 'vLLM',
+};
 
-export function AgentProvider({ children }: { children: React.ReactNode }) {
-  const sessionIdRef = useRef(getOrCreateSessionId());
+function friendlyAgentError(message?: string): string {
+  const raw = message?.trim() || t('agent.unknown_error');
+  const localConnectFailure = raw.match(
+    /model_provider=(\w+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
+  );
+  if (localConnectFailure) {
+    const provider = localConnectFailure[1] ?? '';
+    const model = localConnectFailure[2] ?? 'the selected model';
+    const url = localConnectFailure[3] ?? 'the configured endpoint';
+    const displayProvider = LOCAL_PROVIDER_NAMES[provider] ?? provider;
+    return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
+  }
+  return raw;
+}
+
+export interface AgentProviderProps {
+  /** Configured agent alias this provider is bound to. The WebSocket
+   * connection, session ID, and chat history are all scoped to this alias. */
+  agentAlias: string;
+  children: React.ReactNode;
+}
+
+export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
+  const sessionIdRef = useRef(getOrCreateSessionId(agentAlias));
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const persisted = loadChatHistory(sessionIdRef.current);
     return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
@@ -208,7 +243,17 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'tool_call': {
-        const toolName = msg.name ?? 'unknown';
+        // Defense in depth (issue #7151): the chat WebSocket shares a broadcast
+        // bus with observability telemetry, whose `tool_call` frames have a
+        // different shape (`tool`/`duration_ms`/`success`) and carry no `name`.
+        // Such a frame would otherwise produce a permanent "unknown" tool card
+        // with a spinner that never resolves (no matching `tool_result`). The
+        // backend already filters these out, but ignore them here too so a
+        // malformed telemetry frame can never render a stuck card.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         const toolArgs = msg.args;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
@@ -238,6 +283,13 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'tool_result': {
+        // Defense in depth (issue #7151): mirrors the `tool_call` guard
+        // above. Observability `tool_result`-shaped telemetry would otherwise
+        // overwrite the most recent pending tool card with an empty output.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
@@ -256,7 +308,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
+              toolCall: { name: toolName, output: msg.output ?? '' },
               timestamp: new Date(),
             },
           ];
@@ -312,18 +364,19 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'error':
+        const friendlyMessage = friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
           {
             id: generateUUID(),
             role: 'agent',
-            content: `${t('agent.error_prefix')} ${msg.message ?? t('agent.unknown_error')}`,
+            content: `${t('agent.error_prefix')} ${friendlyMessage}`,
             timestamp: new Date(),
           },
         ]);
         if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-          setError(`${t('agent.configuration_error')}: ${msg.message}. ${t('agent.check_provider_settings')}.`);
+          setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
         } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
@@ -401,9 +454,10 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     };
   }, [handleWsMessage]);
 
-  // Global WebSocket connection — survives route changes.
+  // WebSocket bound to the configured agent. Re-keys (via the outer
+  // <AgentProvider key={alias}>) when the alias changes.
   useEffect(() => {
-    const ws = new WebSocketClient();
+    const ws = new WebSocketClient({ agentAlias });
     attachSocketCallbacks(ws);
     ws.connect();
     wsRef.current = ws;
@@ -411,7 +465,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     return () => {
       ws.disconnect();
     };
-  }, [attachSocketCallbacks]);
+  }, [attachSocketCallbacks, agentAlias]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -551,7 +605,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         oldWs.disconnect();
       }
 
-      const ws = new WebSocketClient();
+      const ws = new WebSocketClient({ agentAlias });
       attachSocketCallbacks(ws);
       ws.connect();
       wsRef.current = ws;
@@ -564,7 +618,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -572,9 +626,60 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const clearAllMessages = useCallback(() => {
+    // Optimistically wipe the rendered transcript and any in-flight streaming
+    // state. Bumping the mutation version fences off a racing hydration fetch
+    // so it can't repopulate the just-cleared view.
     localMessageMutationVersionRef.current += 1;
     setMessages([]);
-  }, []);
+    pendingContentRef.current = '';
+    pendingThinkingRef.current = '';
+    capturedThinkingRef.current = '';
+    setStreamingContent('');
+    setStreamingThinking('');
+    setTyping(false);
+    setPendingApproval(null);
+
+    const sid = sessionIdRef.current;
+
+    // The live WebSocket Agent holds the full conversation in memory for the
+    // life of the connection, and the gateway persists each turn to the
+    // session backend. Clearing only React state leaves both intact, so the
+    // next turn still carries prior context and a reload/reconnect repopulates
+    // the old transcript (issue #7126). To genuinely reset context we must:
+    //   1. delete the persisted backend session history, and
+    //   2. tear down + reconnect the socket so the gateway builds a fresh
+    //      Agent that seeds from the now-empty backend.
+    void (async () => {
+      try {
+        // Reuses the existing DELETE /api/sessions/{id} primitive
+        // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
+        // session persistence is disabled, or any transport failure, must not
+        // block the local clear or the reconnect below.
+        await deleteSession(sid);
+      } catch {
+        // Persistence disabled or request failed — proceed with the reconnect
+        // so the live in-memory context is reset regardless.
+      }
+
+      // Rebuild the socket so the backend constructs a new Agent with no seeded
+      // history. Detach the old socket's callbacks first so its onClose does
+      // not write stale connection state. If there is no socket (disconnected),
+      // the alias-bound effect will reconnect on its own — nothing to do here.
+      const oldWs = wsRef.current;
+      if (oldWs) {
+        oldWs.onOpen = null;
+        oldWs.onClose = null;
+        oldWs.onError = null;
+        oldWs.onMessage = null;
+        oldWs.disconnect();
+
+        const ws = new WebSocketClient({ agentAlias });
+        attachSocketCallbacks(ws);
+        ws.connect();
+        wsRef.current = ws;
+      }
+    })();
+  }, [agentAlias, attachSocketCallbacks]);
 
   const respondToApproval = useCallback((decision: ApprovalDecision) => {
     setPendingApproval((current) => {

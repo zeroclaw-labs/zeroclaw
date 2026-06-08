@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw::agent::agent::Agent;
 use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
-use zeroclaw::agent::memory_loader::MemoryLoader;
 use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::Memory;
 use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatResponse, Provider, ToolCall};
+use zeroclaw::providers::{ChatResponse, ModelProvider, ToolCall};
 use zeroclaw::tools::Tool;
+use zeroclaw_api::memory_traits::MemoryStrategy;
 
 /// Create an in-memory "none" backend for tests.
 pub fn make_memory() -> Arc<dyn Memory> {
@@ -48,9 +48,9 @@ pub fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
 }
 
 /// Build an agent with `NativeToolDispatcher`.
-pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
+pub fn build_agent(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -61,9 +61,9 @@ pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Ag
 }
 
 /// Build an agent with `XmlToolDispatcher`.
-pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
+pub fn build_agent_xml(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -73,22 +73,22 @@ pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -
         .unwrap()
 }
 
-/// Build an agent with optional custom `MemoryLoader`.
+/// Build an agent with optional custom `MemoryStrategy`.
 pub fn build_recording_agent(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
+    memory_strategy: Option<Arc<dyn MemoryStrategy>>,
 ) -> Agent {
     let mut builder = Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir());
 
-    if let Some(loader) = memory_loader {
-        builder = builder.memory_loader(loader);
+    if let Some(strategy) = memory_strategy {
+        builder = builder.memory_strategy(strategy);
     }
 
     builder.build().unwrap()
@@ -96,7 +96,7 @@ pub fn build_recording_agent(
 
 /// Build an agent with real `SqliteMemory` in a temporary directory.
 pub fn build_agent_with_sqlite_memory(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     temp_dir: &std::path::Path,
 ) -> Agent {
@@ -106,7 +106,7 @@ pub fn build_agent_with_sqlite_memory(
     };
     let mem = Arc::from(memory::create_memory(&cfg, temp_dir, None).unwrap());
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(mem)
         .observer(make_observer())
@@ -116,12 +116,12 @@ pub fn build_agent_with_sqlite_memory(
         .unwrap()
 }
 
-/// Mock memory loader that returns a static context string.
-pub struct StaticMemoryLoader {
+/// Mock memory strategy that returns a static context string.
+pub struct StaticMemoryStrategy {
     context: String,
 }
 
-impl StaticMemoryLoader {
+impl StaticMemoryStrategy {
     pub fn new(context: &str) -> Self {
         Self {
             context: context.to_string(),
@@ -130,13 +130,27 @@ impl StaticMemoryLoader {
 }
 
 #[async_trait]
-impl MemoryLoader for StaticMemoryLoader {
+impl MemoryStrategy for StaticMemoryStrategy {
     async fn load_context(
         &self,
-        _memory: &dyn Memory,
-        _user_message: &str,
+        _query: &str,
         _session_id: Option<&str>,
-    ) -> Result<String> {
+    ) -> anyhow::Result<String> {
         Ok(self.context.clone())
+    }
+
+    async fn consolidate_turn(
+        &self,
+        _user_message: &str,
+        _assistant_response: &str,
+        _provider: &dyn ModelProvider,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_governance(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }

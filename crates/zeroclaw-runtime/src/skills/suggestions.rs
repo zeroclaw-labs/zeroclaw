@@ -143,9 +143,12 @@ fn load_toml_skill_package_metadata(
         return None;
     };
     let Ok(manifest) = toml::from_str::<RegistrySkillManifest>(&manifest) else {
-        tracing::warn!(
-            "failed to parse cached registry skill metadata from {}",
-            manifest_path.display()
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"path": manifest_path.display().to_string()})),
+            "failed to parse cached registry skill metadata"
         );
         return None;
     };

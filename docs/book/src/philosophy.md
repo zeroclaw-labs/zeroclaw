@@ -31,7 +31,7 @@ The same discipline applies to the agent's prompt surface. Tool descriptions are
 
 ## 4. Provider-agnostic
 
-The agent's brain is pluggable. Anthropic, OpenAI, Ollama, Bedrock, Gemini, Azure, OpenRouter, and any OpenAI-compatible endpoint (Groq, Mistral, xAI, and ~20 others) work out of the box. Fallback chains and routing rules let you run reasoning-heavy tasks on one model and cheap chat on another, with automatic failover.
+The agent's brain is pluggable. Anthropic, OpenAI, Ollama, Bedrock, Gemini, Azure, OpenRouter, and any OpenAI-compatible endpoint (Groq, Mistral, xAI, and ~20 others) work out of the box. Per-agent dispatch and hint-based model routes let you run reasoning-heavy tasks on one model and cheap chat on another.
 
 This is deliberate. We have opinions about quality but not about vendors. If a better model ships tomorrow under a different banner, the config is a one-line change.
 
@@ -49,8 +49,8 @@ Substantive changes go through the RFC process — see [Contributing → RFCs](.
 Ratified foundational RFCs:
 
 - **[#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)** — Microkernel transition (v0.7.0 → v1.0.0). Crate splits, feature-flag taxonomy.
-- **[#5576]((https://github.com/zeroclaw-labs/zeroclaw/issues/5576)** — Documentation standards and knowledge architecture.
-- **[#5577]((https://github.com/zeroclaw-labs/zeroclaw/issues/5577)** — Project governance: core-team structure, two-thirds-majority voting.
-- **[#5579]((https://github.com/zeroclaw-labs/zeroclaw/issues/5579)** — Engineering infrastructure: CI pipelines, release automation.
-- **[#5615]((https://github.com/zeroclaw-labs/zeroclaw/issues/5615)** — Contribution culture: human/AI co-authorship norms.
-- **[#5653]((https://github.com/zeroclaw-labs/zeroclaw/issues/5653)** — Zero Compromise: error handling, dead-code policy, release-readiness.
+- **[#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)** — Documentation standards and knowledge architecture.
+- **[#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)** — Project governance: core-team structure, two-thirds-majority voting.
+- **[#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)** — Engineering infrastructure: CI pipelines, release automation.
+- **[#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615)** — Contribution culture: human/AI co-authorship norms.
+- **[#5653](https://github.com/zeroclaw-labs/zeroclaw/issues/5653)** — Zero Compromise: error handling, dead-code policy, release-readiness.

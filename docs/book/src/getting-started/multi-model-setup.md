@@ -1,248 +1,294 @@
-# Multi-Model Setup and Fallback Chains
+# Multi-Model Setup
 
-A walkthrough of the common patterns for using multiple model providers: cost optimisation, quality tiers, local-first with hosted fallback, API key rotation, and rate-limit resilience.
+A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, cost tiering, local-first with hosted backup, API key rotation, and rate-limit handling.
 
 > **Reference material** for the provider system lives in:
 > - [Model Providers → Overview](../providers/overview.md) — what providers are, configuration shape
-> - [Model Providers → Fallback & routing](../providers/fallback-and-routing.md) — `reliable` and `router` meta-providers
+> - [Model Providers → Routing](../providers/routing.md) — per-agent dispatch and OpenRouter
 > - [Model Providers → Catalog](../providers/catalog.md) — every provider's config shape
 
-## When to Use Multi-Model Setup
+## When to use multi-model setup
 
 Multi-model configuration is useful for:
 
-- **High reliability**: Automatically fall back to alternative providers when the primary fails
-- **Cost optimization**: Route expensive models through fallback chains for rate-limited scenarios
-- **Regional resilience**: Use geographically distributed providers to handle region-specific outages
-- **Capability flexibility**: Try different models when one lacks required features (e.g., tool calling, vision)
-- **Rate limit handling**: Rotate through API keys on `429` (rate limit) responses
-- **Development and testing**: Switch between cloud and local models without code changes
+1. **Cost tiering**: cheap model handles high-volume channels; reasoning model handles complex requests
+2. **Capability routing**: vision-capable model for image-bearing channels, reasoning model for research workflows
+3. **Local-first development**: local Ollama for development, hosted endpoint for production
+4. **Per-team isolation**: different teams use different agents with different model_providers and credentials
+5. **Rate-limit handling**: rotate through API keys on `429` (rate limit) responses
 
-## Core Concepts
+## Core idea — per-agent dispatch
 
-### Fallback Provider Chains
+Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<alias>]`. If the model goes down, the agent goes down; the operator routes affected channels to a different agent. See [Routing](../providers/routing.md) for the full pattern.
 
-When a provider experiences a transient error (timeout, connection failure, auth issue), ZeroClaw automatically attempts fallback providers in the order specified.
+To run multiple models, run multiple agents:
 
-**Example**: If your primary provider is `openai` but it's temporarily unavailable, ZeroClaw can automatically fall back to `anthropic`, then `groq`.
+```toml
+[providers.models.anthropic.haiku]
+model   = "claude-haiku-4-5-20251001"
+api_key = "sk-ant-..."
+
+[providers.models.anthropic.sonnet]
+model   = "claude-sonnet-4-6"
+api_key = "sk-ant-..."
+
+[providers.models.deepseek.reasoner]
+model   = "deepseek-reasoner"
+api_key = "sk-..."
+
+[channels.telegram.home]
+bot_token = "..."
+
+[channels.slack.engineering]
+bot_token = "..."
+
+[channels.slack.research]
+bot_token = "..."
+
+[agents.fast]
+model_provider  = "anthropic.haiku"
+risk_profile    = "hardened"
+runtime_profile = "tight"            # fewer iterations for snappy public replies
+channels        = ["telegram.home"]
+
+[agents.deep]
+model_provider  = "anthropic.sonnet"
+risk_profile    = "hardened"
+runtime_profile = "deep"             # higher iteration cap for engineering tasks
+channels        = ["slack.engineering"]
+
+[agents.reasoner]
+model_provider  = "deepseek.reasoner"
+risk_profile    = "hardened"
+runtime_profile = "deep"             # extended chains for research-style prompts
+channels        = ["slack.research"]
+
+# Shared `hardened` posture across the three public-facing agents,
+# distinct `tight` / `deep` runtime profiles per per-agent throughput
+# intent. `risk_profile` and `runtime_profile` are independent maps.
+
+[risk_profiles.hardened]
+level                            = "supervised"
+workspace_only                   = true
+require_approval_for_medium_risk = true
+block_high_risk_commands         = true
+
+[runtime_profiles.tight]
+max_tool_iterations  = 5
+max_actions_per_hour = 30
+
+[runtime_profiles.deep]
+max_tool_iterations  = 50
+max_actions_per_hour = 200
+```
+
+Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels = [...]` list on the agent that should pick it up — `Config::validate()` makes sure references resolve at startup.
+
+## Cross-vendor reliability — use OpenRouter
+
+OpenRouter is treated as a single first-class provider. It handles vendor fan-out and uptime behind one endpoint:
+
+```toml
+[providers.models.openrouter.home]
+model   = "anthropic/claude-sonnet-4-20250514"
+api_key = "sk-or-..."
+
+[agents.assistant]
+model_provider = "openrouter.home"
+risk_profile   = "hardened"
+# runtime_profile omitted — uses runtime defaults
+
+[risk_profiles.hardened]
+level = "supervised"
+```
+
+If your goal is "one provider goes down, automatically use another", that's OpenRouter's job — not ZeroClaw's. The runtime sees one provider; OpenRouter does the cross-vendor work upstream.
+
+## Same-vendor retry
+
+For transient errors (network blip, 503, timeout) against the *same* provider, ZeroClaw retries with exponential backoff. This is configurable globally:
 
 ```toml
 [reliability]
-fallback_providers = ["anthropic", "groq", "openrouter"]
+provider_retries    = 2          # retries per provider attempt before bailing
+provider_backoff_ms = 500        # initial backoff; doubles per retry
 ```
 
-When the primary provider recovers, ZeroClaw resumes using it (no sticky failover).
+Defaults are 2 retries, 500 ms initial backoff. These are inside-one-provider retries.
 
-### Model-Level Fallbacks
+## API key rotation
 
-Some models may not be available in all regions, or you might want to use a faster model when a heavy model is rate-limited.
-
-```toml
-[reliability]
-model_fallbacks = { "claude-opus-4-7" = ["claude-sonnet-4-6", "gpt-4o"] }
-```
-
-If `claude-opus-4-7` fails or is unavailable, ZeroClaw tries the fallback models in order while staying within the same provider (unless a provider-level fallback is also configured).
-
-### API Key Rotation
-
-For providers that frequently encounter rate limits, you can supply additional API keys that ZeroClaw will rotate through on `429` responses.
+For providers that frequently encounter rate limits, supply additional API keys that ZeroClaw will rotate through on `429` responses:
 
 ```toml
 [reliability]
 api_keys = ["sk-key-2", "sk-key-3", "sk-key-4"]
 ```
 
-The primary `api_key` (configured globally or per-channel) is always tried first; these extras are rotated on rate-limit errors.
+The primary `api_key` (configured on the provider entry) is always tried first; these extras are rotated on rate-limit errors. All keys must belong to the same provider account class — this is rate-limit smoothing, not multi-tenant key juggling.
 
-### Provider Retries
+## Local development with hosted alternative
 
-Each provider attempt includes configurable retries with exponential backoff before moving to the next fallback.
-
-```toml
-[reliability]
-provider_retries = 2          # Retry count per provider
-provider_backoff_ms = 500     # Initial backoff in milliseconds
-```
-
-## Configuration Structure
-
-All multi-model behavior lives under the `[reliability]` section of `config.toml`. See the [Config reference](../reference/config.md) for the full field index and defaults.
-
-## Example Configurations
-
-### Basic Fallback Chain
-
-Set up a simple fallback from your primary provider to a backup:
+Run a local-Ollama agent and a hosted-provider agent side by side; route each channel to whichever you want it to use.
 
 ```toml
-default_provider = "openai"
-default_model = "gpt-4o"
+[providers.models.ollama.local]
+uri   = "http://localhost:11434"
+model = "qwen3.6:35b-a3b"
 
-[reliability]
-fallback_providers = ["anthropic"]
+[providers.models.openrouter.home]
+model   = "anthropic/claude-haiku-4-5-20251001"
+api_key = "sk-or-..."
+
+[channels.telegram.production]
+bot_token = "..."
+
+[channels.slack.production]
+bot_token = "..."
+
+[agents.dev]
+model_provider  = "ollama.local"
+risk_profile    = "permissive"      # local dev box — looser gates
+runtime_profile = "deep"            # plenty of iterations during iteration
+
+[agents.prod]
+model_provider  = "openrouter.home"
+risk_profile    = "hardened"        # public channels — strict gates
+runtime_profile = "tight"           # production discipline — short loops, low spend
+channels        = ["telegram.production", "slack.production"]
+
+[risk_profiles.permissive]
+level          = "full"
+workspace_only = false
+
+[risk_profiles.hardened]
+level                            = "supervised"
+workspace_only                   = true
+require_approval_for_medium_risk = true
+block_high_risk_commands         = true
+
+[runtime_profiles.deep]
+max_tool_iterations  = 50
+max_actions_per_hour = 200
+
+[runtime_profiles.tight]
+max_tool_iterations  = 5
+max_actions_per_hour = 30
 ```
 
-**Behavior**: If OpenAI times out or returns an error, ZeroClaw will retry twice with exponential backoff, then attempt the same request using Anthropic.
+The `dev` agent runs from the CLI (no channel binding required — `zeroclaw agent -a dev` is enough). When Ollama is down, the dev agent fails fast and surfaces the error. The prod channels are unaffected.
 
-### High-Reliability Multi-Provider Setup
+## Cost tiering — heavy model when needed, fast model otherwise
 
-Combine provider fallbacks with model fallbacks and API key rotation:
+Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. Delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"`, and **both agents must share the same risk profile** (delegation does not cross trust tiers). So the frontline and heavy agents below run on the *same* `trusted` risk profile — they differ in model and runtime profile (iteration budget), not in trust surface.
 
 ```toml
-default_provider = "openai"
-default_model = "gpt-4o"
-api_key = "sk-openai-primary"
+[providers.models.anthropic.opus]
+model   = "claude-opus-4-7"
+api_key = "sk-ant-..."
+# (no temperature — claude-opus-4-7 rejects any temperature setting)
 
-[reliability]
-fallback_providers = ["anthropic", "groq", "openrouter"]
-api_keys = ["sk-openai-backup-1", "sk-openai-backup-2"]
+[providers.models.anthropic.haiku]
+model   = "claude-haiku-4-5-20251001"
+api_key = "sk-ant-..."
 
-[reliability.model_fallbacks]
-"gpt-4o" = ["gpt-4-turbo", "gpt-3.5-turbo"]
-"gpt-4-turbo" = ["gpt-3.5-turbo"]
+[channels.telegram.home]
+bot_token = "..."
+
+[agents.frontline]
+model_provider  = "anthropic.haiku"
+risk_profile    = "trusted"      # shared trust tier (delegation requires a match)
+runtime_profile = "tight"        # low iteration cap, fast turn-around
+channels        = ["telegram.home"]
+
+[agents.heavy]
+model_provider  = "anthropic.opus"
+risk_profile    = "trusted"      # SAME profile as frontline — required to be delegable
+runtime_profile = "deep"         # high iteration cap for chain-of-thought work
+# No channels — invoked via the delegate tool from frontline
+
+# runtime_profile references an independent alias map from risk_profile;
+# the two agents share one risk profile but differ in runtime profile.
+
+[risk_profiles.trusted]
+level                            = "supervised"
+workspace_only                   = true
+require_approval_for_medium_risk = true
+block_high_risk_commands         = true
+# allow this profile's agents to delegate to each other; without this,
+# delegation is forbidden by default.
+delegation_policy                = { mode = "allow" }
+allowed_tools                    = ["shell", "file_read", "memory_recall", "delegate"]
+
+[runtime_profiles.tight]
+max_tool_iterations  = 5
+max_actions_per_hour = 30
+
+[runtime_profiles.deep]
+max_tool_iterations  = 50
+max_actions_per_hour = 200
 ```
 
-**Behavior**:
-1. Try OpenAI `gpt-4o` with primary key (2 retries)
-2. On rate-limit, rotate to backup API keys
-3. If OpenAI still fails, fall back to Anthropic with same model request (Anthropic will select available equivalent)
-4. If Anthropic unavailable, try Groq, then OpenRouter
-5. If model not available, try fallback models in order
+The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = "heavy"`; because both agents share the `trusted` risk profile and that profile allows delegation, the heavier agent picks up the sub-task on Opus.
 
-### Local Development with Cloud Fallback
+## Error handling
 
-Use a local Ollama instance as primary, fall back to cloud provider:
+Inside-one-provider retries trigger on:
 
-```toml
-default_provider = "ollama"
-default_model = "llama2:70b"
-api_url = "http://localhost:11434"
+1. **Timeout**: provider did not respond within the configured timeout
+2. **Connection error**: network or DNS failure
+3. **Rate limit (429)**: triggers API key rotation first; if all keys exhausted, fails up to the channel
+4. **Service unavailable (503)**: temporary service issue
 
-[reliability]
-fallback_providers = ["openrouter", "groq"]
-```
+Retries are NOT triggered by:
 
-**Behavior**: If Ollama goes down or times out, automatically use OpenRouter or Groq instead without configuration changes.
+1. **Invalid request (400)**: malformed input; retrying won't help
+2. **Permanent auth failure**: invalid API key format
+3. **Model output errors**: the model responded but returned an error payload
 
-### Cost Optimization: Heavy Model with Fast Fallback
+When all retries are exhausted on a single provider, the failure surfaces to the calling channel. There is no automatic cross-provider retry — that's the point of using OpenRouter or splitting traffic across multiple agents.
 
-Use an expensive reasoning model for complex tasks, but fall back to a faster model:
+## Debugging
 
-```toml
-default_provider = "anthropic"
-default_model = "claude-opus-4-7"
-
-[reliability]
-model_fallbacks = { "claude-opus-4-7" = ["claude-sonnet-4-6"] }
-```
-
-**Behavior**: When Opus is rate-limited or slow, automatically use Sonnet (typically 2–3x faster and cheaper).
-
-## Multi-Region Setup
-
-For organizations with multi-region deployments:
-
-```toml
-# Primary US region
-default_provider = "anthropic"
-default_model = "claude-sonnet-4-6"
-
-[reliability]
-# Fall back to EU region provider if US Anthropic is down
-fallback_providers = ["bedrock"]  # AWS Bedrock in multiple regions
-provider_retries = 3
-provider_backoff_ms = 1000
-```
-
-Ensure each fallback provider has credentials in your environment:
-
-```bash
-export ANTHROPIC_API_KEY="..."
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-```
-
-## Hot Reload Behavior
-
-The `[reliability]` section is hot-reloadable. While a channel or gateway is running, updates to `config.toml` take effect on the next inbound message without requiring a restart.
-
-## Error Handling and Fallback Triggers
-
-Fallback is triggered by:
-
-- **Timeout**: Provider did not respond within the configured timeout
-- **Connection error**: Network/DNS failure
-- **Auth error**: Invalid credentials (retries only if transient auth service issues detected)
-- **Rate limit (429)**: HTTP 429; triggers API key rotation first, then provider fallback
-- **Service unavailable (503)**: Temporary service issue
-- **Model not found**: Triggers model fallback chain if configured
-
-Fallback is **not** triggered by:
-
-- **Invalid request (400)**: Malformed input; retrying won't help
-- **Permanent auth failure**: Invalid API key format
-- **Model output errors**: The model responded but returned an error
-
-## Debugging Fallback Activity
-
-Enable runtime traces to debug fallback behavior:
+Persisted logs (`"rolling"` is the default) capture retry and key-rotation behaviour:
 
 ```toml
 [observability]
-runtime_trace_mode = "rolling"
-runtime_trace_path = "state/runtime-trace.jsonl"
+log_persistence = "rolling"
+log_persistence_path = "state/runtime-trace.jsonl"
 ```
 
 Then query traces:
 
 ```bash
-# Show all fallback events
-zeroclaw doctor traces --contains "fallback"
-
-# Show provider retry details
-zeroclaw doctor traces --contains "provider"
-
-# Show rate-limit rotation
+zeroclaw doctor traces --contains "retry"
 zeroclaw doctor traces --contains "429"
+zeroclaw doctor traces --contains "model_provider"
 ```
 
-## Best Practices
+## Best practices
 
-1. **Order by reliability**: Put most reliable providers first in `fallback_providers`
-2. **Test fallback chains**: Verify fallback behavior before production use
-3. **Monitor API key rotation**: Track rate-limit events to know when rotation is active
-4. **Keep model fallbacks semantically similar**: Don't fall back from a reasoning model to a chat model without intention
-5. **Use environment variables**: Store sensitive API keys in env, not config
-6. **Document fallback intent**: Add comments in config explaining why each fallback exists
-7. **Verify multi-model credentials**: Ensure all fallback providers have valid credentials set
+1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
+2. **Use OpenRouter for cross-vendor reliability.** Cross-vendor "if Claude fails, try OpenAI" is OpenRouter's job; configure it as one provider and let its endpoint handle the fan-out.
+3. **Keep API key rotation pools homogeneous.** All keys in `[reliability] api_keys` should be from the same provider account — this is rate-limit smoothing, not multi-tenancy.
+4. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
+5. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
+6. **Inject secrets via env, not inline.** `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `api_key` at startup; see [Environment variables](../reference/env-vars.md).
+7. **Separate dev and prod agents.** Each environment gets its own `[agents.<alias>]` entry bound to its own channels.
 
-## Credential Resolution
+## Credential resolution
 
-Each fallback provider resolves credentials independently using the standard resolution order:
+Each provider entry resolves credentials in this order:
 
-1. Explicit credential from config/CLI
-2. Provider-specific environment variable
-3. Generic fallback: `ZEROCLAW_API_KEY`, then `API_KEY`
+1. **Inline `api_key`** on the provider entry.
+2. **Secrets store** at `~/.zeroclaw/secrets`.
+3. **Generic env override** — `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+4. **Per-vendor env var** when the family supports it (e.g. `ANTHROPIC_API_KEY` / `ANTHROPIC_OAUTH_TOKEN` for Anthropic; `OPENROUTER_API_KEY` for OpenRouter).
 
-**Important**: The primary provider's API key is not automatically reused by fallback providers. Set credentials for each provider separately.
-
-Example:
-
-```bash
-export OPENAI_API_KEY="sk-..."
-export ANTHROPIC_API_KEY="claude-..."
-export GROQ_API_KEY="gsk-..."
-```
-
-## Limits and Constraints
-
-- Maximum fallback providers: Limited by configuration file size (typically 100+ chains are supported)
-- Maximum model fallbacks per model: No hard limit
-- API key rotation: All keys are tried before timing out
-- Retry attempts: Configurable per provider with exponential backoff
-- Total timeout budget: Cumulative across retries and fallbacks; channel-level timeout still applies
+Credentials are not shared between providers — set them per provider entry.
 
 ## Related Documentation
 
-- [Config reference](../reference/config.md) — generated config field index
+- [Model Providers → Overview](../providers/overview.md)
+- [Model Providers → Routing](../providers/routing.md)
+- [Environment variables](../reference/env-vars.md)

@@ -12,7 +12,7 @@
 //! field's declared `PropKind` and reject shape mismatches with a
 //! `value_type_mismatch` error before the value reaches `set_prop`.
 //!
-//! Issue #6175.
+//!
 
 use crate::api_error::{ConfigApiCode, ConfigApiError};
 use crate::traits::PropKind;

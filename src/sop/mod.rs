@@ -2,21 +2,28 @@
 pub use zeroclaw_runtime::sop::*;
 
 use anyhow::Result;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.workspace_dir;
+    let workspace_dir = &config.data_dir;
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
     let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
 
     match command {
         crate::SopCommands::List => {
             if sops.is_empty() {
-                println!("No SOPs found.");
+                println!("{}", get_required_cli_string("cli-sop-none"));
                 println!();
-                println!("  Create one: mkdir -p <workspace>/sops/my-sop");
-                println!("              then add SOP.toml and SOP.md");
+                println!("{}", get_required_cli_string("cli-sop-create-hint"));
+                println!("{}", get_required_cli_string("cli-sop-create-hint-2"));
             } else {
-                println!("Loaded SOPs ({}):", sops.len());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-sop-loaded-header",
+                        &[("count", &sops.len().to_string())]
+                    )
+                );
                 println!();
                 for sop in &sops {
                     println!(
@@ -51,7 +58,7 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 if let Some(n) = &name {
                     anyhow::bail!("SOP not found: {n}");
                 }
-                println!("No SOPs found to validate.");
+                println!("{}", get_required_cli_string("cli-sop-none-to-validate"));
                 return Ok(());
             }
 
@@ -59,10 +66,19 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             for sop in &targets {
                 let warnings = validate_sop(sop);
                 if warnings.is_empty() {
-                    println!("  ✅ {} — valid", sop.name);
+                    println!(
+                        "  {}",
+                        get_required_cli_string_with_args("cli-sop-valid", &[("name", &sop.name)])
+                    );
                 } else {
                     any_warnings = true;
-                    println!("  ⚠️  {} — {} warning(s):", sop.name, warnings.len());
+                    println!(
+                        "  {}",
+                        get_required_cli_string_with_args(
+                            "cli-sop-warnings",
+                            &[("name", &sop.name), ("count", &warnings.len().to_string())],
+                        )
+                    );
                     for w in &warnings {
                         println!("       - {w}");
                     }
@@ -70,15 +86,21 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             }
             if !any_warnings {
                 println!();
-                println!("All SOPs passed validation.");
+                println!("{}", get_required_cli_string("cli-sop-all-passed"));
             }
             Ok(())
         }
         crate::SopCommands::Show { name } => {
-            let sop = sops
-                .iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| anyhow::anyhow!("SOP not found: {name}"))?;
+            let sop = sops.iter().find(|s| s.name == name).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sop": name})),
+                    "sop show: name not found in loaded SOPs"
+                );
+                anyhow::Error::msg(format!("SOP not found: {name}"))
+            })?;
 
             println!(
                 "{} v{}",
@@ -87,23 +109,59 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             );
             println!("  {}", sop.description);
             println!();
-            println!("  Priority:       {}", sop.priority);
-            println!("  Execution mode: {}", sop.execution_mode);
-            println!("  Deterministic:  {}", sop.deterministic);
-            println!("  Cooldown:       {}s", sop.cooldown_secs);
-            println!("  Max concurrent: {}", sop.max_concurrent);
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-priority",
+                    &[("value", &sop.priority.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-execution-mode",
+                    &[("value", &sop.execution_mode.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-deterministic",
+                    &[("value", &sop.deterministic.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-cooldown",
+                    &[("value", &sop.cooldown_secs.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-max-concurrent",
+                    &[("value", &sop.max_concurrent.to_string())]
+                )
+            );
             if let Some(loc) = &sop.location {
-                println!("  Location:       {}", loc.display());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-sop-location",
+                        &[("value", &loc.display().to_string())]
+                    )
+                );
             }
             println!();
-            println!("  Triggers:");
+            println!("{}", get_required_cli_string("cli-sop-triggers"));
             for trigger in &sop.triggers {
                 println!("    - {trigger}");
             }
 
             if !sop.steps.is_empty() {
                 println!();
-                println!("  Steps:");
+                println!("{}", get_required_cli_string("cli-sop-steps"));
                 for step in &sop.steps {
                     let confirm = if step.requires_confirmation {
                         " [confirmation required]"
@@ -120,7 +178,13 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                         println!("       {}", step.body);
                     }
                     if !step.suggested_tools.is_empty() {
-                        println!("       Tools: {}", step.suggested_tools.join(", "));
+                        println!(
+                            "       {}",
+                            get_required_cli_string_with_args(
+                                "cli-sop-step-tools",
+                                &[("tools", &step.suggested_tools.join(", "))]
+                            )
+                        );
                     }
                 }
             }
