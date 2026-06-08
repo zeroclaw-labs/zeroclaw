@@ -117,7 +117,7 @@
       // promote it to a data-hero-sub attribute read from the landing Markdown.
       '<p class="pc-hero-sub">Your personal AI assistant — one static binary, runs anywhere, no vendor lock-in.</p>' +
       '<div class="pc-hero-actions">' +
-      '<a class="pc-btn pc-btn-primary" href="getting-started/quick-start.html">Quick start →</a>' +
+      '<a class="pc-btn pc-btn-primary" href="getting-started/quickstart.html">Quick start →</a>' +
       '<a class="pc-btn pc-btn-secondary" href="https://github.com/zeroclaw-labs/zeroclaw">GitHub</a>' +
       '</div></div>';
     // Insert the page-derived heading as text, never as HTML, so a crafted

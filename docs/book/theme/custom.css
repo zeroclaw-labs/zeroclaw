@@ -208,6 +208,14 @@ code span {
   transition: background 0.18s ease, color 0.18s ease;
 }
 
+/* Foldable section rows double-pad their text: the wrapper adds 0.6rem and the
+   inner label <a> adds another 0.6rem. Childless rows (e.g. Introduction) have
+   only the <a> padding, so their text sat 0.6rem to the left of every section.
+   Match the wrapper offset so all top-level rows align. */
+.chapter li.chapter-item > .chapter-link-wrapper:not(:has(> a.chapter-fold-toggle)) {
+  padding-left: 0.6rem;
+}
+
 .chapter li a:hover {
   background: var(--pc-hover);
   color: var(--pc-text-primary);
