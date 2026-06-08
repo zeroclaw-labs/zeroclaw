@@ -174,11 +174,69 @@
     obs.observe(box, { childList: true, subtree: true });
   }
 
+  // ── OS tabs ────────────────────────────────────────────────────────────
+  // Authoring: wrap the divergent content in a single
+  //   <div class="os-tabs-src"> ... </div>
+  // with one H3/H4 heading per OS (Linux / macOS / Windows). Each heading and
+  // the markdown beneath it (labelled fenced blocks, prose) becomes a tab
+  // panel. This transform replaces the source div with the radio/label/panel
+  // widget, generating unique ids per instance so multiple pickers coexist.
+  let osTabsSeq = 0;
+  function installOsTabs() {
+    const sources = document.querySelectorAll('.os-tabs-src');
+    sources.forEach(function (src) {
+      const headings = Array.from(src.children).filter(function (el) {
+        return el.tagName === 'H3' || el.tagName === 'H4';
+      });
+      if (headings.length < 1) return;
+
+      const group = 'os-tabs-' + ++osTabsSeq;
+      const wrap = document.createElement('div');
+      wrap.className = 'os-tabs';
+
+      const labels = document.createElement('nav');
+      labels.className = 'os-tab-labels';
+
+      const panels = [];
+      headings.forEach(function (h, i) {
+        const id = group + '-' + i;
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = group;
+        radio.id = id;
+        if (i === 0) radio.checked = true;
+        wrap.appendChild(radio);
+
+        const label = document.createElement('label');
+        label.setAttribute('for', id);
+        label.textContent = h.textContent.replace(/\u00B6/g, '').trim();
+        labels.appendChild(label);
+
+        const panel = document.createElement('div');
+        panel.className = 'os-tab-panel';
+        let node = h.nextElementSibling;
+        while (node && node.tagName !== 'H3' && node.tagName !== 'H4') {
+          const next = node.nextElementSibling;
+          panel.appendChild(node);
+          node = next;
+        }
+        panels.push(panel);
+      });
+
+      wrap.appendChild(labels);
+      panels.forEach(function (p) {
+        wrap.appendChild(p);
+      });
+      src.replaceWith(wrap);
+    });
+  }
+
   ready(function () {
     installProgressBar();
     installHero();
     installToc();
     wrapTables();
     installFoldableRows();
+    installOsTabs();
   });
 })();

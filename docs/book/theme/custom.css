@@ -965,3 +965,57 @@ body,
 #mdbook-sidebar .on-this-page {
   display: none !important;
 }
+
+/* ── OS tabs ────────────────────────────────────────────────────────────────
+   Pure CSS tabbed widget for per-OS shell invocations. No JS, no build dep.
+   Markup order inside .os-tabs: all radios first (one checked), then a single
+   .os-tab-labels row of <label for>, then the .os-tab-panel blocks in the same
+   order as the radios. Each radio targets its panel by document order. */
+.os-tabs {
+  margin: 1rem 0;
+  border: 1px solid var(--pc-border);
+  border-radius: 0.6rem;
+  overflow: hidden;
+}
+.os-tabs > input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.os-tab-labels {
+  display: flex;
+  gap: 0.25rem;
+  background: var(--pc-hover);
+  padding: 0.3rem 0.3rem 0;
+}
+.os-tab-labels > label {
+  padding: 0.5rem 1.1rem;
+  cursor: pointer;
+  font-size: 1.6rem;
+  color: var(--pc-text-secondary);
+  border-bottom: 2px solid transparent;
+  border-radius: 0.4rem 0.4rem 0 0;
+  user-select: none;
+}
+.os-tab-labels > label:hover {
+  color: var(--pc-text-primary);
+}
+.os-tabs > .os-tab-panel {
+  display: none;
+  padding: 0 1rem;
+}
+.os-tabs > .os-tab-panel > pre {
+  margin: 1rem 0;
+}
+.os-tabs > input:nth-of-type(1):checked ~ div.os-tab-panel:nth-of-type(1),
+.os-tabs > input:nth-of-type(2):checked ~ div.os-tab-panel:nth-of-type(2),
+.os-tabs > input:nth-of-type(3):checked ~ div.os-tab-panel:nth-of-type(3) {
+  display: block;
+}
+.os-tabs > input:nth-of-type(1):checked ~ .os-tab-labels > label:nth-of-type(1),
+.os-tabs > input:nth-of-type(2):checked ~ .os-tab-labels > label:nth-of-type(2),
+.os-tabs > input:nth-of-type(3):checked ~ .os-tab-labels > label:nth-of-type(3) {
+  color: var(--pc-accent);
+  border-bottom-color: var(--pc-accent);
+  background: var(--pc-bg, transparent);
+}
