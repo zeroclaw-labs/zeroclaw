@@ -244,6 +244,23 @@ jobs:
       - name: Evaluate Nix module assertions
         run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
 
+  docs-style:
+    name: Docs Style
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Resolve base SHA
+        id: base
+        run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Docs quality gate (markdown lint + em-dash prose check)
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/ci/docs_quality_gate.sh
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -251,7 +268,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

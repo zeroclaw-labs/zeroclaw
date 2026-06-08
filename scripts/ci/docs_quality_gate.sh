@@ -51,6 +51,56 @@ if [ "${#EXISTING_FILES[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# Em-dash gate: no prose em-dashes (U+2014) in changed docs. Em-dashes inside
+# fenced code blocks and inline `code` spans (including spans that wrap across
+# lines) are allowed, since those quote literal source, CLI output, or table
+# rules. Everything else uses a comma, colon, semicolon, or period instead.
+python3 - "${EXISTING_FILES[@]}" <<'PY'
+import sys
+
+EM = "\u2014"
+files = sys.argv[1:]
+violations = []
+
+for path in files:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except (FileNotFoundError, UnicodeDecodeError):
+        continue
+
+    in_fence = False
+    in_span = False
+    for n, line in enumerate(lines, 1):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            in_span = False
+            continue
+        if in_fence:
+            continue
+        if EM not in line and "`" not in line:
+            continue
+        for ch in line:
+            if ch == "`":
+                in_span = not in_span
+            elif ch == EM and not in_span:
+                violations.append((path, n, line.rstrip()))
+                break
+
+if violations:
+    print("Em-dash (\u2014) found in prose. Use a comma, colon, semicolon, or")
+    print("period instead. Em-dashes are only allowed inside code spans/blocks.")
+    print()
+    for path, n, text in violations:
+        print(f"  {path}:{n}: {text}")
+    print()
+    print(f"Blocking prose em-dashes: {len(violations)}")
+    sys.exit(1)
+
+print("No prose em-dashes in changed docs files.")
+PY
+
 if command -v npx >/dev/null 2>&1; then
     MD_CMD=(npx --yes markdownlint-cli2@0.20.0)
 elif command -v markdownlint-cli2 >/dev/null 2>&1; then
