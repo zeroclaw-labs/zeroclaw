@@ -31,7 +31,7 @@ Flags:
 ```bash
 ./install.sh --prebuilt                      # always prebuilt, skip the prompt
 ./install.sh --source                        # always build from source
-./install.sh --minimal                       # kernel only (~6.6 MB)
+./install.sh --minimal                       # foundation only, no default features
 ./install.sh --source --features agent-runtime,channel-discord   # custom features
 ./install.sh --skip-quickstart                  # install only; run `zeroclaw quickstart` later
 ./install.sh --list-features                 # print available features and exit

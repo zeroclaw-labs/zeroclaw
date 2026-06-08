@@ -25,7 +25,7 @@ For developers and home-lab users who understand the trade-offs, there's [YOLO m
 
 ## 3. Minimal: in binary size, dependencies, and surface area
 
-ZeroClaw is written in Rust and optimised for a small binary and fast startup. A microkernel roadmap ([RFC #5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)) is actively splitting functionality behind feature flags so you only ship what you use. A release build of the core runtime fits in tens of megabytes; adding channel integrations or hardware support is opt-in.
+ZeroClaw is written in Rust and optimised for a small binary and fast startup. The microkernel split ([RFC #5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)) factors functionality behind feature flags so you only ship what you use: the foundation builds with `--no-default-features`, and channels, hardware, and the gateway are opt-in. A typical release build lands around 26 MiB; a minimal feature set trims it further.
 
 The same discipline applies to the agent's prompt surface. Tool descriptions are [Fluent](https://projectfluent.org/)-localised and terse. There are no hidden system prompts injecting personality. The model sees what you configure.
 
@@ -38,19 +38,12 @@ This is deliberate. We have opinions about quality but not about vendors. If a b
 ## What this isn't
 
 - **Not a SaaS.** There's no hosted version, no account system, no billing.
-- **Not a chat UI.** It's an agent runtime. You bring the front end: a CLI, a chat platform channel, the REST gateway, or the ACP JSON-RPC interface.
+- **Not only a chat UI.** It ships chat front-ends, the [zerocode](./zerocode/overview.md) terminal interface, the web dashboard, and chat-platform channels, but those sit on top of an agent runtime. The runtime is the product; the chat surfaces are how you reach it, alongside the CLI, the REST gateway, and the ACP JSON-RPC interface.
 - **Not a framework.** You don't build apps on top of ZeroClaw. You configure it and connect channels.
 - **Not a toy.** Production deployments run 24/7 on homelab SBCs, VPSes, and cloud VMs. The `zeroclaw service` subcommand manages systemd / launchctl / Windows Service registration out of the box.
 
 ## How decisions get made
 
-Substantive changes go through the RFC process: see [Contributing → RFCs](./contributing/rfcs.md). Accepted RFCs are canonical. Open RFCs are discussion documents; they are the primary reference for what's coming next and why.
+Substantive changes go through the RFC process: see [Contributing → RFCs](./contributing/rfcs.md). An RFC labelled `status:accepted` is ratified and binding even while its implementation is still open; the discussion thread stays the living record until the work lands.
 
-Ratified foundational RFCs:
-
-- **[#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)**: Microkernel transition (v0.7.0 → v1.0.0). Crate splits, feature-flag taxonomy.
-- **[#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)**: Documentation standards and knowledge architecture.
-- **[#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)**: Project governance: core-team structure, two-thirds-majority voting.
-- **[#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)**: Engineering infrastructure: CI pipelines, release automation.
-- **[#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615)**: Contribution culture: human/AI co-authorship norms.
-- **[#5653](https://github.com/zeroclaw-labs/zeroclaw/issues/5653)**: Zero Compromise: error handling, dead-code policy, release-readiness.
+The ratified foundational RFCs, the maturity framework this project is built on, live in the book as the [Foundations](./foundations/README.md) section, versioned alongside the code. Start there for the canonical, always-current set rather than a list duplicated here.
