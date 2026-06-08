@@ -100,4 +100,4 @@ Delete the YOLO settings from the risk profile, or flip `[risk_profiles.<alias>]
 
 - [Security → Autonomy levels](../security/autonomy.md): the full gradient between YOLO and paranoid
 - [Security → Tool receipts](../security/tool-receipts.md): the audit trail you should keep on even in YOLO
-- [Philosophy](../philosophy.md): why this exists as an escape hatch rather than a default
+- [Philosophy](../philosophy/index.md): why this exists as an escape hatch rather than a default

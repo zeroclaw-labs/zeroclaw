@@ -36,8 +36,6 @@ and code does not.
 
 ---
 
-## Reading Order
-
 Read these in order if you can. Each document builds on the ones before it, and the
 sequence tells a story. You can enter anywhere and learn something useful, but reading
 them from the beginning gives you the full arc: from the shape of the architecture, to
@@ -62,8 +60,6 @@ tools: what does it mean to write the code well?
 
 ---
 
-## How These Documents Got Here
-
 Each document in this series began as a GitHub issue, an RFC, open for discussion,
 challenge, and refinement by the whole team. The linked discussion threads above are the
 living record of that process: the questions asked, the pushback offered, and the
@@ -83,8 +79,6 @@ closed, a new discussion in the community. These documents are references, not v
 The conversation they started is meant to continue.
 
 ---
-
-## A Note to Future Contributors
 
 You may be joining this project years after these were written. The tools will have
 changed. The codebase will look different. Some of what is described here will have been

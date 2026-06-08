@@ -4,11 +4,11 @@ Personal AI assistant you own, written in Rust.
 
 ZeroClaw is an agent runtime: a single binary you configure and run. It talks to LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), reaches the world through channels (Discord, Telegram, Matrix, email, voice, webhooks, your own CLI), and acts through tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 
-Read [Philosophy](./philosophy.md) to understand the opinions that shape it.
+Read [Philosophy](./philosophy/index.md) to understand the opinions that shape it.
 
 This site is the documentation. Everything under **Reference → CLI** and **Reference → Config** is generated directly from the code at build time (via `clap` derives and the JSON schema), so it stays in sync with the binary you actually run. Everything else is hand-written user-facing material.
 
-## Where to start
+Where to start:
 
 - New to ZeroClaw? → [Quickstart](./getting-started/quickstart.md)
 - Prefer a terminal UI? → [zerocode](./zerocode/overview.md)
@@ -26,7 +26,7 @@ This site is the documentation. Everything under **Reference → CLI** and **Ref
 - Looking up a flag or config key? → [Reference](./reference/index.md) · [API rustdoc](./api.md)
 - Want to contribute? → [Contributing](./contributing/index.md)
 
-## Source
+Source:
 
 - Upstream: <https://github.com/zeroclaw-labs/zeroclaw>
 - Issues, discussions, and RFCs: [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues)

@@ -98,4 +98,4 @@ Everyone who's had a PR merged appears in the contributors list on the repo. For
 
 - [How to contribute](./how-to.md)
 - [RFC process](./rfcs.md)
-- [Philosophy](../philosophy.md): what the project is trying to be, so you know what's in scope
+- [Philosophy](../philosophy/index.md): what the project is trying to be, so you know what's in scope

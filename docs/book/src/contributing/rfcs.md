@@ -101,4 +101,4 @@ This has worked well so far. Treat AI drafts as first-class but remember the spo
 
 - [How to contribute](./how-to.md)
 - [Communication](./communication.md)
-- [Philosophy](../philosophy.md)
+- [Philosophy](../philosophy/index.md)
