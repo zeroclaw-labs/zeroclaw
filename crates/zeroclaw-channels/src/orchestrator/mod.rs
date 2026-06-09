@@ -5512,12 +5512,8 @@ fn build_channel_by_id(
                     .matrix
                     .get("default")
                     .context("Matrix channel is not configured")?;
-                let state_dir = config
-                    .config_path
-                    .parent()
-                    .map(|p| p.join("state").join("matrix"))
-                    .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
                 let alias = "default".to_string();
+                let state_dir = matrix_state_dir(&config.config_path, &alias);
                 let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
                     let alias = alias.clone();
@@ -6214,6 +6210,18 @@ pub fn register_channels_for_tools(
     names
 }
 
+/// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
+/// must own its own session/crypto store so two bots under one daemon don't
+/// restore each other's `session.json` and run as the wrong account. The
+/// alias component is what keeps them distinct.
+#[cfg(feature = "channel-matrix")]
+fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|p| p.join("state").join("matrix").join(alias))
+        .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -6501,11 +6509,7 @@ fn collect_configured_channels(
         if !mx.enabled {
             continue;
         }
-        let state_dir = config
-            .config_path
-            .parent()
-            .map(|p| p.join("state").join("matrix"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
+        let state_dir = matrix_state_dir(&config.config_path, alias);
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
@@ -16038,6 +16042,30 @@ This is an example JSON object for profile settings."#;
         .await;
         let state = classify_health_result(&result);
         assert_eq!(state, ChannelHealthState::Timeout);
+    }
+
+    #[cfg(feature = "channel-matrix")]
+    #[test]
+    fn matrix_state_dir_is_distinct_per_alias() {
+        // Regression: two [channels.matrix.<alias>] blocks previously resolved
+        // to the same <config>/state/matrix dir, so the second listener to
+        // start restored the first's session.json and ran as the wrong Matrix
+        // account. The alias component must keep them separate.
+        let config_path = std::path::Path::new("/home/u/.zeroclaw/config.toml");
+        let clamps = matrix_state_dir(config_path, "clamps");
+        let bender = matrix_state_dir(config_path, "bender");
+        assert_ne!(
+            clamps, bender,
+            "distinct matrix aliases must not share a state dir"
+        );
+        assert_eq!(
+            clamps,
+            std::path::Path::new("/home/u/.zeroclaw/state/matrix/clamps")
+        );
+        assert_eq!(
+            bender,
+            std::path::Path::new("/home/u/.zeroclaw/state/matrix/bender")
+        );
     }
 
     #[cfg(feature = "channel-mattermost")]
