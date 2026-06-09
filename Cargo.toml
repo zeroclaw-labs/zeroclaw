@@ -369,11 +369,12 @@ x0-extended = [
     "agent-runtime", "wallet", "quantum", "runtime-wasm",
     "dep:zeroclaw-conscience",
 ]
-# Legacy X0 fork modules whose imports reference pre-V3 schema items
-# (DelegateAgentConfig, TreasuryConfig, providers::Provider,
-# channels::traits, LifeConfig, …). Not part of x0-extended; opt in
-# only if you're actively rewriting these modules against the V3 API.
-x0-broken-legacy = ["x0-extended", "hardware"]
+# Legacy X0 fork modules (cosmic, quantum, consciousness, onboard wizard,
+# control plane, life, sce, turboquant, runtime/wasm). Superseded by the V3
+# multi-agent model but ported back to a compiling state and guarded by CI.
+# Kept out of x0-extended / the default build because they are heavier and
+# largely research/legacy; opt in to build or run them.
+x0-legacy = ["x0-extended", "hardware"]
 # Placeholder features for integration tests that target API surfaces not yet
 # present in the V3 schema. Defining them as empty no-ops registers the names
 # so `#![cfg(feature = "…")]` gates compile cleanly under `-D warnings`. When

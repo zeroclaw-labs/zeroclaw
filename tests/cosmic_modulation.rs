@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-broken-legacy")]
+#![cfg(feature = "x0-legacy")]
 
 use zeroclaw::cosmic::{EmotionalModulator, FreeEnergyState, GlobalVariable};
 

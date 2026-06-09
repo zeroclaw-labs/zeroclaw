@@ -113,56 +113,56 @@ pub mod cognitive;
 #[cfg(feature = "x0-extended")]
 pub mod conscience;
 // consciousness depends on cosmic::GlobalWorkspace + quantum types that
-// are themselves gated to x0-broken-legacy.
-#[cfg(feature = "x0-broken-legacy")]
+// are themselves gated to x0-legacy.
+#[cfg(feature = "x0-legacy")]
 pub mod consciousness;
 #[cfg(feature = "x0-extended")]
 pub mod continuity;
 // control depends on AppState fields (control_store, control_events_tx)
-// that don't exist in the V3 gateway. Gated behind x0-broken-legacy.
-#[cfg(feature = "x0-broken-legacy")]
+// that don't exist in the V3 gateway. Gated behind x0-legacy.
+#[cfg(feature = "x0-legacy")]
 pub mod control;
 #[cfg(feature = "x0-extended")]
 pub mod cosmic;
 // goals/store.rs references Config::workspace_dir which the V3 schema
 // removed in favour of agent_workspace_dir(alias). Gated behind
-// x0-broken-legacy until the goal store is rewritten per-agent.
-#[cfg(feature = "x0-broken-legacy")]
+// x0-legacy until the goal store is rewritten per-agent.
+#[cfg(feature = "x0-legacy")]
 pub mod goals;
 // `life` references channels::traits, LifeConfig, and providers::traits::Provider,
-// none of which survived the V3 rewrite. Gated behind x0-broken-legacy until
+// none of which survived the V3 rewrite. Gated behind x0-legacy until
 // the life loop is rebuilt against the multi-agent channel/provider trait set.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 pub mod life;
 // Onboard wizard references AutonomyConfig + HardwareConfig + the gemini
 // crate's removed canonical_china_provider_name + CronConfig; pending
 // a full rewrite against the V3 onboarding flow. Gated behind
-// x0-broken-legacy.
-#[cfg(feature = "x0-broken-legacy")]
+// x0-legacy.
+#[cfg(feature = "x0-legacy")]
 pub mod onboard;
 // `skillforge` is declared in the binary crate (main.rs); the onboard wizard
 // lives in the lib crate and needs `crate::skillforge::SkillForgeConfig`, so
 // declare the re-export shim here too under the same gate.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 pub mod skillforge;
 // quantum modules depend on rand 0.10's Rng::random API + num_complex
-// serde feature; pending a rebuild. Gated behind x0-broken-legacy.
-#[cfg(feature = "x0-broken-legacy")]
+// serde feature; pending a rebuild. Gated behind x0-legacy.
+#[cfg(feature = "x0-legacy")]
 pub mod quantum;
 // runtime/wasm.rs references WasmRuntimeConfig that doesn't exist in V3.
-// Gated behind x0-broken-legacy.
-#[cfg(feature = "x0-broken-legacy")]
+// Gated behind x0-legacy.
+#[cfg(feature = "x0-legacy")]
 pub mod runtime;
 // sce imports quantum types; gated alongside it.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 pub mod sce;
 #[cfg(feature = "x0-extended")]
 pub mod soul;
 // taskqueue/store.rs references Config::workspace_dir; gated.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 pub mod taskqueue;
 // turboquant needs rand 0.10's StdRng::random API rewrite.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 pub mod turboquant;
 #[cfg(feature = "x0-extended")]
 pub mod wallet;
