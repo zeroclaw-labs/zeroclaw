@@ -97,22 +97,9 @@ This creates `~/.zeroclaw/` with a starter config and walks you through provider
 
 ## Provider authentication
 
-API-key providers need nothing FreeBSD-specific: set the key through the gateway, zerocode, `zeroclaw config set`, or the environment and you're done.
+Provider auth is not FreeBSD-specific. API-key providers just need the key set through the gateway, zerocode, `zeroclaw config set`, or the environment. OAuth and subscription providers (e.g. an OpenAI/Codex ChatGPT subscription, Anthropic Claude Pro/Team) get their token from the vendor's own dashboard or login flow, which you then configure the same way you would an API key.
 
-For OAuth-based providers (e.g. an OpenAI/Codex ChatGPT subscription), import the credential with:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-zeroclaw auth login --model-provider openai-codex --import /path/to/auth.json
-zeroclaw auth status
-```
-
-</div>
-
-> **Auth profiles are encrypted per-host and are *not* portable.** ZeroClaw stores resolved credentials in `~/.zeroclaw/auth-profiles.json`, encrypted with the host-local key at `~/.zeroclaw/.secret_key`. **Do not copy `auth-profiles.json` between machines**: the target host's `.secret_key` won't decrypt it and every request fails with `enc2: decryption failed`. Instead, copy the *raw* upstream credential (the un-encrypted `auth.json` your provider's own login produced) and re-run `zeroclaw auth login --import` on each host so it re-encrypts locally. If you hit a stale/undecryptable profile, move it aside (`mv ~/.zeroclaw/auth-profiles.json ~/.zeroclaw/auth-profiles.json.bak`) before re-importing.
+For the full credential model (API keys, OAuth/subscription tokens, env overrides, and the secrets store), see [Provider Configuration → Credentials](../providers/configuration.md#credentials) and [OAuth and subscription auth](../providers/configuration.md#oauth-and-subscription-auth). That page is the source of truth for every platform.
 
 ## Running as a service (`rc.d`)
 

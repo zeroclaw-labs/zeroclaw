@@ -178,23 +178,21 @@ Symptoms:
 
 Checks (substitute `<alias>` with the configured agent alias from `[agents.<alias>]`):
 
+For an OpenAI Codex subscription, set `requires_openai_auth = true` on the provider alias and leave `api_key` unset; the runtime uses the stored Codex login. Get the subscription credential from the vendor's own login flow. See [Provider Configuration → OAuth and subscription auth](../providers/configuration.md#oauth-and-subscription-auth) for the full credential model. Then test:
+
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-zeroclaw auth status
-zeroclaw auth login --provider openai-codex --device-code
 zeroclaw agent -a <alias> -m "hello"
 ```
 
 </div>
 
-For normal subscription auth, set `requires_openai_auth = true` on the provider alias and leave `api_key` unset (surrounded by the canonical agent + risk profile from the [Minimal working example](../providers/configuration.md#minimal-working-example)).
-
 Notes:
 
-- Subscription auth uses stored auth profiles: set `requires_openai_auth = true` on the alias and leave `api_key` unset.
+- `requires_openai_auth = true` on the alias (with `api_key` unset) selects the subscription path; surround it with the canonical agent + risk profile from the [Minimal working example](../providers/configuration.md#minimal-working-example).
 - `api_key` / `uri` on the alias entry are only needed for custom OpenAI-compatible gateways or other explicit endpoint overrides.
 - The streaming-disabled warning by itself is not an auth failure; ZeroClaw retries the request in non-streaming mode.
 
