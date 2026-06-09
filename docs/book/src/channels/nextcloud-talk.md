@@ -22,7 +22,7 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 
 ## Configuration
 
-{{#config-fields nextcloud_talk}}
+{{#config-fields channels.nextcloud_talk}}
 
 The channel is read from the `default` alias. Set it through any config surface:
 

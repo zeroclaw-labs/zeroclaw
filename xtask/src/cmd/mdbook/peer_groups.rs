@@ -198,101 +198,17 @@ In the **Config** pane, under **{label}**.
     ))
 }
 
-/// Render a channel's full field-reference table directly from its config
-/// struct's JSON Schema, so the table can never drift from the schema. The arg
-/// is the channel key (`mattermost`, `matrix`, …), parsed into the canonical
-/// `ChannelKind` registry. New promoted channel pages map their variant here
-/// once; the schema stays the single source of truth for fields, types,
+/// Render a config section's full field-reference table directly from the
+/// `Config` JSON Schema, so the table can never drift from the schema. The arg
+/// is the dotted config path to the section (`channels.matrix`,
+/// `providers.models`, `acp`, …). Map sections insert an `<alias>` level
+/// automatically. The schema is the single source of truth for fields, types,
 /// defaults, and descriptions.
 fn render_config_fields(arg: &str) -> anyhow::Result<String> {
-    use std::str::FromStr;
-    use zeroclaw_api::attribution::ChannelKind;
-    use zeroclaw_config::schema;
-
-    let key = arg.trim();
-    // Doc pages address a channel by its config-section key (`whatsapp`,
-    // `acp`, `nextcloud_talk`), which can differ from the `ChannelKind`
-    // snake_case serialize form (`whatsapp_business`, `acp_channel`). Try the
-    // registry first, then the two page-key aliases, then match on the enum
-    // variant so there is no string-literal dispatch.
-    const WHATSAPP_PAGE_KEY: &str = "whatsapp";
-    const ACP_PAGE_KEY: &str = "acp";
-    let kind = if let Ok(k) = ChannelKind::from_str(key) {
-        k
-    } else if key == WHATSAPP_PAGE_KEY {
-        ChannelKind::WhatsappBusiness
-    } else if key == ACP_PAGE_KEY {
-        ChannelKind::AcpChannel
-    } else {
-        anyhow::bail!("config-fields: `{key}` is not a known channel key");
-    };
-
-    macro_rules! table_for {
-        ($ty:ty, $prefix:expr) => {{
-            let s = schemars::schema_for!($ty);
-            zeroclaw_config::schema_markdown::field_table(&s.to_value(), false, Some($prefix))
-        }};
-    }
-
-    let table = match kind {
-        ChannelKind::Matrix => table_for!(schema::MatrixConfig, "channels.matrix.<alias>"),
-        ChannelKind::Mattermost => {
-            table_for!(schema::MattermostConfig, "channels.mattermost.<alias>")
-        }
-        ChannelKind::Slack => table_for!(schema::SlackConfig, "channels.slack.<alias>"),
-        ChannelKind::Discord => table_for!(schema::DiscordConfig, "channels.discord.<alias>"),
-        ChannelKind::Telegram => table_for!(schema::TelegramConfig, "channels.telegram.<alias>"),
-        ChannelKind::Signal => table_for!(schema::SignalConfig, "channels.signal.<alias>"),
-        ChannelKind::Webhook => table_for!(schema::WebhookConfig, "channels.webhook.<alias>"),
-        ChannelKind::Line => table_for!(schema::LineConfig, "channels.line.<alias>"),
-        ChannelKind::Irc => table_for!(schema::IrcConfig, "channels.irc.<alias>"),
-        ChannelKind::Qq => table_for!(schema::QQConfig, "channels.qq.<alias>"),
-        ChannelKind::Nostr => table_for!(schema::NostrConfig, "channels.nostr.<alias>"),
-        ChannelKind::NextcloudTalk => {
-            table_for!(
-                schema::NextcloudTalkConfig,
-                "channels.nextcloud_talk.<alias>"
-            )
-        }
-        ChannelKind::WhatsappBusiness | ChannelKind::WhatsappWeb => {
-            table_for!(schema::WhatsAppConfig, "channels.whatsapp.<alias>")
-        }
-        ChannelKind::Email => {
-            table_for!(
-                zeroclaw_config::scattered_types::EmailConfig,
-                "channels.email.<alias>"
-            )
-        }
-        ChannelKind::GmailPush => {
-            table_for!(
-                zeroclaw_config::scattered_types::GmailPushConfig,
-                "channels.gmail_push.<alias>"
-            )
-        }
-        ChannelKind::ClawdTalk => {
-            table_for!(
-                zeroclaw_config::scattered_types::ClawdTalkConfig,
-                "channels.clawdtalk.<alias>"
-            )
-        }
-        ChannelKind::VoiceCall => {
-            table_for!(
-                zeroclaw_config::scattered_types::VoiceCallConfig,
-                "channels.voice_call.<alias>"
-            )
-        }
-        ChannelKind::VoiceWake => {
-            table_for!(schema::VoiceWakeConfig, "channels.voice_wake.<alias>")
-        }
-        ChannelKind::AcpChannel => table_for!(schema::AcpConfig, "acp"),
-        other => {
-            let name: &'static str = other.into();
-            anyhow::bail!(
-                "config-fields: channel `{name}` has no promoted page mapping yet. Add its config struct to render_config_fields in xtask/src/cmd/mdbook/peer_groups.rs."
-            )
-        }
-    };
-    Ok(table)
+    let path = arg.trim();
+    let schema = schemars::schema_for!(zeroclaw_config::schema::Config);
+    zeroclaw_config::schema_markdown::field_table_for_path(&schema.to_value(), path, false)
+        .map_err(anyhow::Error::msg)
 }
 
 /// Resolve the display label for a config section path. Prefers the curated

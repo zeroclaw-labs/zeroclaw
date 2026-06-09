@@ -12,7 +12,7 @@
 //! update the [`Role::composite_prefix`] / [`Role::attribution_field`]
 //! / [`Role::default_category`] match arms. No call-site changes.
 
-use strum_macros::{EnumString, IntoStaticStr};
+use strum_macros::IntoStaticStr;
 
 /// Trait every alias-bound "thing" implements once next to its struct.
 pub trait Attributable {
@@ -66,7 +66,7 @@ pub enum Role {
 }
 
 /// Channel implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumString)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChannelKind {
     #[strum(serialize = "acp")]

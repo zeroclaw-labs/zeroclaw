@@ -23,7 +23,7 @@ Keep the daemon bound to localhost unless you have put it behind your own authen
 
 ## Configure the channel
 
-{{#config-fields signal}}
+{{#config-fields channels.signal}}
 
 {{#config-where channels}}
 

@@ -2,6 +2,61 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
+/// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
+/// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
+/// render that section's fields via [`field_table`]. Map nodes (Rust
+/// `HashMap<String, T>`, rendered by schemars with `additionalProperties`) are
+/// transparently descended into their value type, and an `<alias>` placeholder
+/// is inserted into the displayed config prefix at each crossing so the
+/// per-field deep-links and `config set` commands carry the right path
+/// (`channels.matrix` -> `channels.matrix.<alias>`).
+///
+/// Returns an error string (as a visible HTML comment) when the path does not
+/// resolve, so a typo in a directive fails loudly in the rendered page rather
+/// than silently emitting nothing.
+pub fn field_table_for_path(
+    root: &Value,
+    path: &str,
+    include_enabled: bool,
+) -> Result<String, String> {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let mut node = resolve(root, defs);
+    let mut display_segments: Vec<String> = Vec::new();
+
+    for seg in path.split('.') {
+        // Descend a map (HashMap) before matching the next key: the segment
+        // names a concrete entry, and crossing the map adds an `<alias>` level.
+        let props = node.get("properties").and_then(Value::as_object);
+        let next = props.and_then(|p| p.get(seg)).map(|s| resolve(s, defs));
+        let Some(next) = next else {
+            return Err(format!(
+                "config-fields: path segment `{seg}` not found in `{path}`"
+            ));
+        };
+        display_segments.push(seg.to_string());
+        node = next;
+        // If this node is a map, step into its value type and record `<alias>`.
+        if let Some(add) = node.get("additionalProperties") {
+            if add.is_object() {
+                node = resolve(add, defs);
+                display_segments.push("<alias>".to_string());
+            }
+        }
+    }
+
+    if node.get("properties").and_then(Value::as_object).is_none() {
+        return Err(format!("config-fields: `{path}` has no fields to render"));
+    }
+
+    let prefix = display_segments.join(".");
+    Ok(field_table(node, include_enabled, Some(&prefix)))
+}
+
 /// Renders a single struct's fields as an interactive config table from that
 /// struct's `schema_for!` JSON value. Top-level `enabled` is skipped by default
 /// since channel pages document it separately; pass `include_enabled = true` to

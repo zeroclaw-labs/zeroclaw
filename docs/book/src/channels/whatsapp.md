@@ -40,7 +40,7 @@ The default `mode = "business"` does not apply the personal DM/group policy spli
 
 ## Configuration surfaces
 
-{{#config-fields whatsapp}}
+{{#config-fields channels.whatsapp}}
 
 {{#config-where channels}}
 

@@ -32,7 +32,7 @@ Before testing message flow:
 
 ## 2. Configuration
 
-{{#config-fields matrix}}
+{{#config-fields channels.matrix}}
 
 Matrix is configured as a `[channels.matrix.<alias>]` block. Set it through any of these surfaces:
 

@@ -29,7 +29,7 @@ To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
 
 ### Field reference
 
-{{#config-fields mattermost}}
+{{#config-fields channels.mattermost}}
 
 ## Channel discovery
 

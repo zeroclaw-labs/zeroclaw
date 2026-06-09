@@ -6,7 +6,7 @@ Real-time voice input and output. Four channels cover the matrix: inbound calls,
 
 Full-duplex SIP voice powered by Telnyx. The agent talks over a real phone call (inbound or outbound). Supports barge-in, mid-turn tool use, and regional number provisioning.
 
-{{#config-fields clawdtalk}}
+{{#config-fields channels.clawdtalk}}
 
 `api_key` (Telnyx) and `webhook_secret` are secrets:
 
@@ -18,7 +18,7 @@ Full-duplex SIP voice powered by Telnyx. The agent talks over a real phone call 
 
 Traditional carrier voice: the agent picks up, transcribes the caller, replies with TTS. Higher latency than ClawdTalk but works with any regular phone number and doesn't require SIP trunk provisioning. Outbound calls hit `from_number` and require operator approval when `require_outbound_approval` is on.
 
-{{#config-fields voice_call}}
+{{#config-fields channels.voice_call}}
 
 ## Voice Wake (local wake-word)
 
@@ -30,7 +30,7 @@ Runs locally, listens on the mic, triggers agent interaction when it hears the w
 
 The agent doesn't send audio anywhere; wake detection is local. Only post-wake speech is captured and (separately) transcribed before reaching the LLM.
 
-{{#config-fields voice_wake}}
+{{#config-fields channels.voice_wake}}
 
 > **Build flag:** Voice Wake is gated by the `voice-wake` cargo feature on `zeroclaw-channels`. Build with `--features voice-wake` to include it.
 
