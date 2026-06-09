@@ -20,7 +20,7 @@
 //! lives. Adding a family is one slot row plus one trait impl; missing the
 //! impl fails to compile when the dispatch is generated.
 //!
-//! [`for_each_model_provider_slot!`]: zeroclaw_config::providers::for_each_model_provider_slot
+//! [`for_each_model_provider_slot!`]: zeroclaw_config::for_each_model_provider_slot
 
 use crate::ModelProviderRuntimeOptions;
 use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
@@ -268,27 +268,29 @@ pub fn dispatch_family_factory(
 
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, AstraiModelProviderConfig, AtomicChatModelProviderConfig,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
-    BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FireworksModelProviderConfig,
-    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
+    AtomicChatModelProviderConfig, AvianModelProviderConfig, AzureModelProviderConfig,
+    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
+    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
+    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotEndpoint, MoonshotModelProviderConfig, NebiusModelProviderConfig,
+    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
+    KiloCliModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NebiusModelProviderConfig,
     NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
     OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
     OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
     PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
     RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
     SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -475,6 +477,43 @@ impl CompatFamilySpec for FriendliModelProviderConfig {
 impl CompatFamilySpec for LeptonModelProviderConfig {
     const DISPLAY: &'static str = "Lepton AI";
     const DEFAULT_URL: &'static str = "https://llama3-1-405b.lepton.run/api/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for MorphModelProviderConfig {
+    const DISPLAY: &'static str = "Morph";
+    const DEFAULT_URL: &'static str = "https://api.morphllm.com/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for GithubModelsModelProviderConfig {
+    const DISPLAY: &'static str = "GitHub Models";
+    const DEFAULT_URL: &'static str = "https://models.github.ai/inference";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for UpstageModelProviderConfig {
+    const DISPLAY: &'static str = "Upstage Solar";
+    // Current canonical base; the legacy `/v1/solar` path is deprecated.
+    const DEFAULT_URL: &'static str = "https://api.upstage.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for FeatherlessModelProviderConfig {
+    const DISPLAY: &'static str = "Featherless AI";
+    const DEFAULT_URL: &'static str = "https://api.featherless.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for ArceeModelProviderConfig {
+    const DISPLAY: &'static str = "Arcee AI";
+    // Arcee's OpenAI-compatible API lives at `/api/v1`, not the usual `/v1`.
+    const DEFAULT_URL: &'static str = "https://api.arcee.ai/api/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for LambdaAiModelProviderConfig {
+    const DISPLAY: &'static str = "Lambda AI";
+    const DEFAULT_URL: &'static str = "https://api.lambda.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for InceptionModelProviderConfig {
+    const DISPLAY: &'static str = "Inception Labs";
+    const DEFAULT_URL: &'static str = "https://api.inceptionlabs.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
 }
 impl CompatFamilySpec for StepfunModelProviderConfig {
