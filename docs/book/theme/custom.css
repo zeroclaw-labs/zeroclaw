@@ -1204,3 +1204,51 @@ html.js #mdbook-content main {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ── Model-provider field accordion (mdbook model-provider-fields directive) ── */
+.provider-fields {
+  margin: 1rem 0;
+}
+.provider-entry {
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  margin: 0.4rem 0;
+  overflow: hidden;
+}
+.provider-entry > summary {
+  cursor: pointer;
+  padding: 0.55rem 0.9rem;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+.provider-entry > summary::-webkit-details-marker {
+  display: none;
+}
+.provider-entry > summary::before {
+  content: "\25B8"; /* ▸ */
+  color: var(--pc-accent);
+  transition: transform 0.12s ease;
+  font-size: 0.85em;
+}
+.provider-entry[open] > summary::before {
+  transform: rotate(90deg);
+}
+.provider-entry > summary:hover {
+  background: var(--pc-hover);
+}
+.provider-entry[open] > summary {
+  background: var(--pc-hover);
+  border-bottom: 1px solid var(--pc-border);
+}
+.provider-entry .provider-endpoint {
+  color: var(--pc-text-secondary);
+  font-size: 0.9em;
+}
+.provider-entry > .cfg-fields {
+  margin: 0.6rem 0.9rem 0.9rem;
+}
+.provider-entry > .cfg-fields table {
+  margin-top: 0;
+}

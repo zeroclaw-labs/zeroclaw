@@ -56,9 +56,13 @@ Local inference via KiloCLI.
 
 ## All slots
 
-Every canonical slot, its default endpoint, and whether it runs locally, generated from the provider registry. Slots with no fixed default (`—`) need `uri` set on the alias entry (Azure, `custom`, multi-region families, CLI shims).
+Every canonical slot, its default endpoint, whether it runs locally, and its
+full config field set, generated from the provider registry and the config
+schema. Click a slot to expand its fields; click a field to see how to set it.
+Slots with no fixed default need `uri` set on the alias entry (Azure, `custom`,
+multi-region families, CLI shims).
 
-{{#model-provider-catalog-table}}
+{{#model-provider-fields}}
 
 For a worked example per family, see [Configuration](./configuration.md). If your vendor isn't listed, use the `custom` slot ([Custom providers](./custom.md)).
 
@@ -73,40 +77,17 @@ below are illustrative; confirm the current catalog in the vendor dashboard.
 **Morph**: slot `morph`. Fast apply-edits models (`morph-v3-large`, `morph-v3-fast`, or
 `auto`). Key from the [Morph dashboard](https://morphllm.com).
 
-```toml
-[providers.models.morph.apply]
-model   = "morph-v3-large"
-api_key = "..."
-```
-
 **GitHub Models**: slot `github_models` (alias `github-models`). OpenAI / Meta /
 Microsoft models behind a single GitHub Personal Access Token. Create a PAT with the
 **`models`** permission (fine-grained); a Copilot token is *not* the same credential.
-Model IDs are publisher-prefixed.
+Model IDs are publisher-prefixed (e.g. `openai/gpt-4o`).
 
-```toml
-[providers.models.github_models.home]
-model   = "openai/gpt-4o"
-api_key = "github_pat_..."
-```
-
-**Upstage**: slot `upstage`. Solar Pro / Solar Mini. Key from the
+**Upstage**: slot `upstage`. Solar Pro / Solar Mini (e.g. `solar-pro2`). Key from the
 [Upstage console](https://console.upstage.ai/api-keys).
 
-```toml
-[providers.models.upstage.home]
-model   = "solar-pro2"
-api_key = "..."
-```
-
 **Featherless**: slot `featherless`. Serverless open-weight models, addressed by their
-Hugging Face repo IDs. Key from [featherless.ai](https://featherless.ai).
-
-```toml
-[providers.models.featherless.home]
-model   = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-api_key = "..."
-```
+Hugging Face repo IDs (e.g. `meta-llama/Meta-Llama-3.1-8B-Instruct`). Key from
+[featherless.ai](https://featherless.ai).
 
 **Arcee**: slot `arcee`. Native models include `conductor`, `maestro`,
 `virtuoso-large`, `coder-large`, and `blitz`. Key from the
@@ -114,30 +95,12 @@ api_key = "..."
 `/api/v1` base path; the typed endpoint already accounts for this, so still leave
 `uri` off.
 
-```toml
-[providers.models.arcee.home]
-model   = "conductor"
-api_key = "..."
-```
-
-**Lambda AI**: slot `lambda_ai` (alias `lambda-ai`). Lambda's hosted inference. Key
-from the [Lambda Cloud](https://cloud.lambda.ai) API-keys page.
-
-```toml
-[providers.models.lambda_ai.home]
-model   = "hermes3-405b"
-api_key = "..."
-```
+**Lambda AI**: slot `lambda_ai` (alias `lambda-ai`). Lambda's hosted inference (e.g.
+`hermes3-405b`). Key from the [Lambda Cloud](https://cloud.lambda.ai) API-keys page.
 
 **Inception**: slot `inception`. The Mercury diffusion-LLM family (`mercury-coder` and
 the newer `mercury-2`). Key from the
 [Inception platform](https://platform.inceptionlabs.ai).
-
-```toml
-[providers.models.inception.home]
-model   = "mercury-coder"
-api_key = "..."
-```
 
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.

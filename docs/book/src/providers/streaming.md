@@ -4,16 +4,12 @@ Every provider in ZeroClaw that speaks a streaming API streams token-by-token. T
 
 ## What gets streamed
 
-The provider trait emits `StreamEvent` values:
-
-| Event | When |
-|---|---|
-| `TextDelta(String)` | New tokens of assistant text |
-| `ReasoningDelta(String)` | Reasoning / chain-of-thought tokens (o-series, DeepSeek-R1, Qwen-thinking) |
-| `ToolCall { name, args }` | The model has decided to call a tool |
-| `PreExecutedToolCall` | A provider-side pre-executed tool call (e.g. Gemini grounded search) |
-| `PreExecutedToolResult` | Its result |
-| `Final { usage }` | Stream complete; token-usage totals |
+The provider trait emits `StreamEvent` values as the model generates output:
+text deltas, structured tool calls, provider-side pre-executed tool calls and
+their results, token-usage reports, and a final completion marker. The
+authoritative, per-variant definitions live with the type in
+`crates/zeroclaw-api/src/model_provider.rs` (`enum StreamEvent`); reasoning
+tokens arrive as text deltas, not a separate variant.
 
 Channels consume these events via the `Channel` trait's outbound stream hook.
 
@@ -33,24 +29,20 @@ OpenAI-compatible providers differ: some stream tool-call arg deltas chunk-by-ch
 
 ## Channel-side streaming
 
-Channels advertise their own streaming capabilities:
+Channels advertise their own streaming capabilities through the `Channel` trait:
 
 ```rust
 fn supports_draft_updates(&self) -> bool;           // edit a message in place
 fn supports_multi_message_streaming(&self) -> bool; // split one reply into many messages
 ```
 
-| Channel | Draft updates | Multi-message |
-|---|:---:|:---:|
-| CLI | ✓ | N/A |
-| Discord | ✓ | ✓ |
-| Slack | ✓ | ✓ |
-| Telegram | ✓ | partial |
-| Matrix | ✓ | N/A |
-| Mattermost | ✓ | N/A |
-| Email | N/A | N/A |
-| SMS / voice | N/A | N/A |
-| Gateway (WebSocket) | ✓ | ✓ |
+A channel's capability follows from its config: a channel with the
+`stream_mode` enum (off / partial / multi_message) supports both draft updates
+and multi-message; a channel with the `stream_drafts` boolean supports draft
+updates only. This table is generated from the channel config schema, so it
+stays correct as channels gain or lose streaming support:
+
+{{#channel-streaming-matrix}}
 
 When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by `draft_update_interval_ms` in the channel config (default: 500 ms) to avoid rate-limiting.
 

@@ -123,6 +123,8 @@ fn expand_directives(
     const MARKERS: &[&str] = &[
         "{{#peer-group-example ",
         "{{#model-provider-catalog-table",
+        "{{#model-provider-fields",
+        "{{#channel-streaming-matrix",
         "{{#thread-context ",
         "{{#config-fields ",
         "{{#streaming ",
@@ -156,6 +158,11 @@ fn expand_directives(
             "{{#peer-group-example " => render_example(lookup(params, arg)?),
             "{{#env-var-table" => render_env_var_table(env_vars),
             "{{#model-provider-catalog-table" => render_model_provider_catalog_table(),
+            "{{#model-provider-fields" => render_model_provider_fields(),
+            "{{#channel-streaming-matrix" => {
+                let schema = schemars::schema_for!(zeroclaw_config::schema::Config);
+                zeroclaw_config::schema_markdown::channel_streaming_matrix(&schema.to_value())
+            }
             "{{#env-var-bridge" => render_env_var_bridge(env_vars)?,
             "{{#env-var-name " => render_env_var_name(arg)?,
             "{{#env-var " => render_env_var_block(env_vars, arg)?,
@@ -209,7 +216,7 @@ In the **Config** pane, under **{label}**.
 fn render_config_fields(arg: &str) -> anyhow::Result<String> {
     let path = arg.trim();
     let schema = schemars::schema_for!(zeroclaw_config::schema::Config);
-    zeroclaw_config::schema_markdown::field_table_for_path(&schema.to_value(), path, false)
+    zeroclaw_config::schema_markdown::field_table_for_path(&schema.to_value(), path, false, None)
         .map_err(anyhow::Error::msg)
 }
 
@@ -272,11 +279,31 @@ zeroclaw config set {path}    # prompts for masked input, stores encrypted
 /// `<alias>` placeholder and the trailing field name, slash-joining the rest:
 /// `channels.matrix.<alias>.password` -> `channels/matrix`. A bare section like
 /// `acp.foo` -> `acp`. The gateway resolves these `/config/<section>` routes.
+/// Dashboard deep-link path from a dotted config field path. The web dashboard
+/// routes `/config/<section>/<type>` where `<type>` is the map key (the segment
+/// just before `<alias>`) and `<section>` is everything before it, dot-joined.
+/// `channels.mattermost.<alias>.thread_replies` -> `channels/mattermost`;
+/// `providers.models.venice.<alias>.api_key` -> `providers.models/venice`. A
+/// bare section with no `<alias>` (e.g. `acp.default_agent`) keeps its dotted
+/// prefix and drops the field: `acp.default_agent` -> `acp`. The gateway
+/// resolves these `/config/<...>` routes.
 fn dashboard_section(field_path: &str) -> String {
-    let segs: Vec<&str> = field_path.split('.').filter(|s| *s != "<alias>").collect();
-    // Drop the trailing field name; keep the section prefix.
-    let keep = segs.len().saturating_sub(1).max(1);
-    segs[..keep].join("/")
+    let segs: Vec<&str> = field_path.split('.').collect();
+    if let Some(alias_idx) = segs.iter().position(|s| *s == "<alias>") {
+        // `<...section...>.<type>.<alias>.<field>` -> `<section>/<type>`.
+        let type_idx = alias_idx.saturating_sub(1);
+        let section = segs[..type_idx].join(".");
+        let ty = segs[type_idx];
+        if section.is_empty() {
+            ty.to_string()
+        } else {
+            format!("{section}/{ty}")
+        }
+    } else {
+        // No alias: dot-joined prefix minus the trailing field name.
+        let keep = segs.len().saturating_sub(1).max(1);
+        segs[..keep].join(".")
+    }
 }
 
 /// live in threads. Args are `key="value"` pairs:
@@ -643,6 +670,75 @@ fn render_model_provider_catalog_table() -> String {
             let local = if p.local { "✓" } else { "" };
             out.push_str(&format!("| `{}` | {} | {} |\n", p.name, url, local));
         }
+    }
+    out
+}
+
+/// Walk the canonical model-provider registry and emit one expandable entry per
+/// provider, grouped by category. Each entry's summary shows the slot, default
+/// endpoint, and local flag (all derived from `list_model_providers()` and
+/// `default_model_provider_url()`); expanding it reveals that provider's full
+/// config field accordion, rendered from the `providers.models.<slot>` schema.
+/// Nothing here is hand-listed, so it can never drift from the registry or the
+/// config schema.
+fn render_model_provider_fields() -> String {
+    use std::fmt::Write as _;
+    use zeroclaw_providers::ModelProviderCategory as C;
+    let category_title = |c: C| match c {
+        C::Primary => "Primary",
+        C::OpenAiCompatible => "OpenAI-compatible",
+        C::FastInference => "Fast inference",
+        C::ModelHosting => "Model hosting platforms",
+        C::ChineseAi => "Chinese AI",
+        C::CloudEndpoint => "Cloud AI endpoints",
+    };
+    let providers = zeroclaw_providers::list_model_providers();
+    let schema = schemars::schema_for!(zeroclaw_config::schema::Config);
+    let schema = schema.to_value();
+    // Every provider slot is a `ModelProviderConfig`; its `Default` instance is
+    // the source of truth for defaults schemars omits (`skip_serializing_if`).
+    let provider_defaults =
+        serde_json::to_value(zeroclaw_config::schema::ModelProviderConfig::default()).ok();
+
+    let mut out = String::new();
+    for category in C::all() {
+        let rows: Vec<_> = providers
+            .iter()
+            .filter(|p| p.category == *category)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n### {}\n\n", category_title(*category)));
+        out.push_str("<div class=\"provider-fields\">\n");
+        for p in rows {
+            let endpoint = zeroclaw_providers::default_model_provider_url(p.name)
+                .map(|u| format!("<code>{u}</code>"))
+                .unwrap_or_else(|| "no fixed default".to_string());
+            let local = if p.local { " · local" } else { "" };
+            let path = format!("providers.models.{}", p.name);
+            let detail = zeroclaw_config::schema_markdown::field_table_for_path(
+                &schema,
+                &path,
+                false,
+                provider_defaults.as_ref(),
+            )
+            .unwrap_or_else(|e| format!("<p>{e}</p>"));
+            let _ = write!(
+                out,
+                concat!(
+                    "<details class=\"provider-entry\">",
+                    "<summary><code>{slot}</code> <span class=\"provider-endpoint\">{endpoint}{local}</span></summary>\n\n",
+                    "{detail}\n",
+                    "</details>\n",
+                ),
+                slot = p.name,
+                endpoint = endpoint,
+                local = local,
+                detail = detail,
+            );
+        }
+        out.push_str("</div>\n");
     }
     out
 }

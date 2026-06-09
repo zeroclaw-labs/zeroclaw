@@ -28,14 +28,10 @@ llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --
 
 </div>
 
-**Optional fields** (apply to any compat-slot family, including `llamacpp`):
+**Optional fields** apply to any compat-slot family (including `llamacpp`). The
+full set, derived from the schema:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `think` | `bool` | N/A | Sets `enable_thinking` at the top level of the request body. `false` signals thinking-capable models to skip chain-of-thought. |
-| `chat_template_kwargs` | table | N/A | Passed verbatim as `chat_template_kwargs` to the Jinja chat template. Use for model-family-specific template variables. |
-| `max_tokens` | `u32` | N/A | Maximum output tokens per response. |
-| `timeout_secs` | `u64` | 120 | Request timeout for non-streaming calls. |
+{{#config-fields providers.models.custom}}
 
 **Controlling thinking mode** varies by model family. `think = false` sets the top-level `enable_thinking` field in the request. Some models (e.g. Qwen3) read this flag from the Jinja template via `chat_template_kwargs` instead:
 

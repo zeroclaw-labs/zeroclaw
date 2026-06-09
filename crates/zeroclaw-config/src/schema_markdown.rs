@@ -2,6 +2,67 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
+/// Build the channel streaming-capability table by walking the `channels`
+/// section of the `Config` schema. Capability is derived from each channel
+/// struct's fields, never hand-listed:
+///   - has `stream_mode` (the off/partial/multi_message enum) -> draft updates
+///     and multi-message streaming are both supported.
+///   - has `stream_drafts` (a partial-only boolean) -> draft updates only.
+///   - neither -> no streaming.
+///
+/// Returns a Markdown table sorted by channel key.
+pub fn channel_streaming_matrix(root: &Value) -> String {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let root = resolve(root, defs);
+    let Some(channels) = root
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("channels"))
+        .map(|c| resolve(c, defs))
+    else {
+        return String::new();
+    };
+    let Some(props) = channels.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+
+    let mut rows: Vec<(String, &'static str, &'static str)> = Vec::new();
+    for (key, schema) in props {
+        let mut node = resolve(schema, defs);
+        // Descend a map (HashMap) to the per-alias struct.
+        if let Some(add) = node.get("additionalProperties")
+            && add.is_object()
+        {
+            node = resolve(add, defs);
+        }
+        let Some(fields) = node.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        let has = |f: &str| fields.contains_key(f);
+        let (draft, multi) = if has("stream_mode") {
+            ("yes", "yes")
+        } else if has("stream_drafts") {
+            ("yes", "no")
+        } else {
+            continue; // no streaming -> omit from the table
+        };
+        rows.push((key.clone(), draft, multi));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    out.push_str("| Channel | Draft updates | Multi-message |\n|---|:---:|:---:|\n");
+    for (ch, draft, multi) in rows {
+        let cell = |v: &str| if v == "yes" { "✓" } else { "" };
+        let _ = writeln!(out, "| `{ch}` | {} | {} |", cell(draft), cell(multi));
+    }
+    out
+}
+
 /// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
 /// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
 /// render that section's fields via [`field_table`]. Map nodes (Rust
@@ -14,10 +75,29 @@ use serde_json::{Map, Value};
 /// Returns an error string (as a visible HTML comment) when the path does not
 /// resolve, so a typo in a directive fails loudly in the rendered page rather
 /// than silently emitting nothing.
+/// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
+/// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
+/// render that section's fields via [`field_table`]. Map nodes (Rust
+/// `HashMap<String, T>`, rendered by schemars with `additionalProperties`) are
+/// transparently descended into their value type, and an `<alias>` placeholder
+/// is inserted into the displayed config prefix at each crossing so the
+/// per-field deep-links and `config set` commands carry the right path
+/// (`channels.matrix` -> `channels.matrix.<alias>`).
+///
+/// `defaults` is the serialized `Default::default()` of the section struct that
+/// `path` resolves to (for a map section, the map's *value* type). It lets a
+/// field's real default (`false`, `[]`, `{}`, `null`) surface even when
+/// schemars omits the schema `default` key for `skip_serializing_if` fields.
+/// Pass `None` to fall back to schema-only defaults.
+///
+/// Returns an error string when the path does not resolve, so a typo in a
+/// directive fails loudly in the rendered page rather than silently emitting
+/// nothing.
 pub fn field_table_for_path(
     root: &Value,
     path: &str,
     include_enabled: bool,
+    defaults: Option<&Value>,
 ) -> Result<String, String> {
     let empty = Map::new();
     let defs = root
@@ -54,7 +134,7 @@ pub fn field_table_for_path(
     }
 
     let prefix = display_segments.join(".");
-    Ok(field_table(node, include_enabled, Some(&prefix)))
+    Ok(field_table(node, include_enabled, Some(&prefix), defaults))
 }
 
 /// Renders a single struct's fields as an interactive config table from that
@@ -71,7 +151,12 @@ pub fn field_table_for_path(
 /// zerocode location, and `zeroclaw config set` command. The
 /// `pc-enhance.js` `installConfigFieldRows` handler wires the toggle. When
 /// `prefix` is `None`, a plain Markdown table is emitted (no accordion).
-pub fn field_table(root: &Value, include_enabled: bool, prefix: Option<&str>) -> String {
+pub fn field_table(
+    root: &Value,
+    include_enabled: bool,
+    prefix: Option<&str>,
+    defaults: Option<&Value>,
+) -> String {
     let empty = Map::new();
     let defs = root
         .get("$defs")
@@ -89,15 +174,26 @@ pub fn field_table(root: &Value, include_enabled: bool, prefix: Option<&str>) ->
     let Some(prefix) = prefix else {
         return plain_field_table(props, &required, defs, include_enabled);
     };
-    // Dashboard deep-link path: the dotted config prefix minus the trailing
-    // `<alias>` placeholder, slash-joined. `channels.mattermost.<alias>` ->
-    // `channels/mattermost`; `acp` -> `acp`. The gateway resolves these.
-    let section = prefix
-        .split('.')
-        .filter(|seg| *seg != "<alias>")
-        .collect::<Vec<_>>()
-        .join("/");
-    let section = section.as_str();
+    // Dashboard deep-link path. The web dashboard routes `/config/<section>/
+    // <type>` where `<type>` is the map key and `<section>` is the dot-joined
+    // prefix before it. `channels.mattermost.<alias>` -> `channels/mattermost`;
+    // `providers.models.venice.<alias>` -> `providers.models/venice`; a bare
+    // `acp` section (no `<alias>`) stays `acp`.
+    let section_owned = {
+        let segs: Vec<&str> = prefix.split('.').collect();
+        if let Some(alias_idx) = segs.iter().position(|s| *s == "<alias>") {
+            let type_idx = alias_idx.saturating_sub(1);
+            let head = segs[..type_idx].join(".");
+            if head.is_empty() {
+                segs[type_idx].to_string()
+            } else {
+                format!("{head}/{}", segs[type_idx])
+            }
+        } else {
+            prefix.to_string()
+        }
+    };
+    let section = section_owned.as_str();
 
     let mut rows = String::new();
     for (key, prop_schema) in props {
@@ -111,7 +207,8 @@ pub fn field_table(root: &Value, include_enabled: bool, prefix: Option<&str>) ->
         } else {
             type_label(resolved, defs)
         };
-        let default = fmt_default(resolved);
+        let fallback = defaults.and_then(|d| d.get(key));
+        let default = fmt_default_for(resolved, fallback);
         let req = if required.contains(&key.as_str()) {
             "*"
         } else {
@@ -479,24 +576,42 @@ fn type_label(schema: &Value, defs: &Map<String, Value>) -> String {
             if schema.get("properties").is_some() {
                 "object".to_owned()
             } else {
+                // A field with no `type`/`properties` is a free-form
+                // `serde_json::Value` (TOML inline table), e.g. `provider_extra`
+                // or `chat_template_kwargs`. Prefer the explicit title if the
+                // schema carries one, else label it `table` rather than `any`.
                 schema
                     .get("title")
                     .and_then(Value::as_str)
-                    .unwrap_or("any")
+                    .unwrap_or("table")
                     .to_owned()
             }
         }
     }
 }
 
+/// Format a default value for the table. Prefers the schema's own `default`
+/// key; when absent (schemars omits it for `skip_serializing_if` fields), falls
+/// back to the field's value in the struct's `Default::default()` instance, so
+/// `false`, `[]`, `{}`, and `null` defaults still surface instead of `—`.
+fn fmt_default_for(schema: &Value, fallback: Option<&Value>) -> String {
+    let value = schema.get("default").or(fallback);
+    fmt_value(value)
+}
+
 fn fmt_default(schema: &Value) -> String {
-    match schema.get("default") {
+    fmt_value(schema.get("default"))
+}
+
+fn fmt_value(value: Option<&Value>) -> String {
+    match value {
         Some(Value::Bool(b)) => format!("`{b}`"),
         Some(Value::String(s)) if s.is_empty() => "`\"\"`".to_owned(),
         Some(Value::String(s)) => format!("`\"{s}\"`"),
         Some(Value::Number(n)) => format!("`{n}`"),
         Some(Value::Null) => "`null`".to_owned(),
         Some(Value::Array(a)) if a.is_empty() => "`[]`".to_owned(),
+        Some(Value::Object(o)) if o.is_empty() => "`{}`".to_owned(),
         Some(v) => format!("`{v}`"),
         None => "—".to_owned(),
     }

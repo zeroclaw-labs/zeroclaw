@@ -92,7 +92,10 @@ you declare on the alias entry. Two independent, ordered axes:
 
 The walk is depth-first: an alias's entire model list is exhausted before leaving
 it, then each `fallback` alias is descended in turn, applying that alias's own
-`fallback_models` and `fallback` recursively. For the example above:
+`fallback_models` and `fallback` recursively. Suppose `anthropic.prod` serves
+`claude-sonnet-4-5`, lists `claude-haiku-4-5` in its `fallback_models`, and
+names `openai.backup` (serving `gpt-4.1`) in its `fallback`. The attempt order
+is then:
 
 ```
 anthropic.prod/claude-sonnet-4-5
