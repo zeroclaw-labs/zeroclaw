@@ -17,7 +17,7 @@ struct Args {
     /// Entries per API call
     #[arg(long, default_value = "50")]
     batch: usize,
-    /// ModelProvider alias from [providers.models.<kind>.<alias>] in config.toml
+    /// ModelProvider alias from `[providers.models.<kind>.<alias>]` in config.toml
     #[arg(long)]
     model_provider: String,
     /// Config directory holding config.toml and .secret-key (default:
