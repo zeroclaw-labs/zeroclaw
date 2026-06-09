@@ -51,9 +51,9 @@ This per-alias routing (#6312) lets you run several Talk bots side by side and
 deliver each one's webhooks to the right instance.
 
 The bare `https://<your-public-url>/nextcloud-talk` path still works but is
-**deprecated**: it resolves to the first configured instance and returns an
-`X-Zeroclaw-Deprecation` response header. Single-instance deployments can keep
-using it unchanged. An unknown alias returns `404`.
+**deprecated**: it resolves to the lexicographically-first alias (deterministic
+across restarts) and returns an `X-Zeroclaw-Deprecation` response header.
+Single-instance deployments can keep using it unchanged. An unknown alias returns `404`.
 
 Local development? Configure `[tunnel]` in your config (ngrok, Cloudflare, or Tailscale) and the gateway exposes itself on startup — see [Operations → Network deployment](../ops/network-deployment.md).
 

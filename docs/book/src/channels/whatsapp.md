@@ -28,9 +28,9 @@ Point Meta's Callback URL at the alias of the `[channels.whatsapp.<alias>]`
 instance that should receive it — `GET`/`POST https://<your-public-url>/whatsapp/<alias>`
 (e.g. `[channels.whatsapp.work]` → `/whatsapp/work`). This per-alias routing
 (#6312) lets multiple WhatsApp numbers run side by side. The bare `/whatsapp`
-path still works but is **deprecated**: it resolves to the first configured
-instance and sets an `X-Zeroclaw-Deprecation` response header. An unknown alias
-returns `404`. Single-instance deployments need no change.
+path still works but is **deprecated**: it resolves to the lexicographically-first
+alias (deterministic across restarts) and sets an `X-Zeroclaw-Deprecation` response
+header. An unknown alias returns `404`. Single-instance deployments need no change.
 
 ## Web mode
 
