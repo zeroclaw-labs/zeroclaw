@@ -1129,6 +1129,19 @@ mod tests {
     }
 
     #[test]
+    fn responses_url_appends_responses_to_custom_base() {
+        let p =
+            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
+        assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_defaults_to_openai_when_base_absent() {
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        assert_eq!(p.responses_url, RESPONSES_URL);
+    }
+
+    #[test]
     fn creates_with_empty_key() {
         let p = OpenAiModelProvider::new("test", Some(""));
         assert_eq!(p.credential.as_deref(), Some(""));

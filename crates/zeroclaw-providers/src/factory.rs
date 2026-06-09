@@ -71,6 +71,19 @@ pub trait CompatFamilySpec {
     /// (e.g. Sambanova, Hyperbolic — no public catalog at all without a key).
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = None;
 
+    /// Wire protocol selector for this entry, when the family reads it from
+    /// per-alias config. Defaults to `None` so families that only speak
+    /// chat_completions need no override.
+    ///
+    /// A family whose endpoint can serve the responses wire MUST override this
+    /// to return `self.base.wire_api`; otherwise a user's
+    /// `wire_api = "responses"` is silently ignored and routed through
+    /// chat_completions. The blanket `create_provider` consults this before
+    /// building the compat client.
+    fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
+        None
+    }
+
     /// Build the base compat provider with both catalog consts applied. Use
     /// this from inside `build_compat` overrides so the catalog hooks ride
     /// along with any family-specific modifiers.
@@ -117,6 +130,15 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.wire_api(),
+            alias,
+            api_url.or(Some(Self::DEFAULT_URL)),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
         Ok(apply_compat_options(
             self.build_compat(alias, key, api_url),
             opts,
@@ -321,6 +343,10 @@ impl CompatFamilySpec for OpencodeModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://opencode.ai/zen/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("opencode");
+
+    fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
+        self.base.wire_api
+    }
 }
 impl CompatFamilySpec for DoubaoModelProviderConfig {
     const DISPLAY: &'static str = "Doubao";
@@ -1565,5 +1591,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn compat_family_factory_routes_to_responses_when_wire_api_responses() {
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+        let cfg = OpencodeModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn compat_family_factory_defaults_to_chat_completions_without_wire_api() {
+        let cfg = OpencodeModelProviderConfig::default();
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn compat_family_without_wire_api_override_ignores_responses_setting() {
+        // Scope guard: only families that override `wire_api()` opt into the
+        // responses route. A compat family that does not override it (Doubao
+        // here) must keep chat_completions even if the entry sets
+        // `wire_api = "responses"`, so this fix stays scoped per family.
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+        let cfg = DoubaoModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[tokio::test]
+    async fn compat_family_responses_posts_to_responses_path_on_configured_base() {
+        use axum::{Json, Router, extract::State, http::Uri, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_path(
+            State(capture): State<Capture>,
+            uri: Uri,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push(uri.path().to_string());
+            Json(json!({ "output": [], "output_text": "ok" }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/zen/v1/responses", post(capture_path))
+            .with_state(capture.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}/zen/v1");
+        let cfg = OpencodeModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                Some("opencode-test-credential"),
+                Some(&base_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("opencode responses provider should build");
+        let _ = provider
+            .chat_with_system(None, "hello", "big-pickle", Some(0.7))
+            .await;
+
+        server.abort();
+
+        let paths = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(paths, vec!["/zen/v1/responses".to_string()]);
     }
 }
