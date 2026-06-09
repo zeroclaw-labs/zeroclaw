@@ -36,13 +36,13 @@ Boards are configured under `peripherals` and `peripherals.boards`. See the [Con
 
 ## Adding a Datasheet (RAG)
 
-Place `.md` or `.txt` files in `docs/datasheets/` (or your `datasheet_dir`). Name files by board: `nucleo-f401re.md`, `arduino-uno.md`.
+Place `.md` or `.txt` files in `docs/datasheets/` (or your `datasheet_dir`). Name files by board: `nucleo-f401re.md`, `arduino-uno.md`. PDF datasheets are also indexed when ZeroClaw is built with the `rag-pdf` feature (this enables general PDF text extraction, not a hardware-specific capability; see [Tools](../tools/overview.md)). Either way the files are extracted, chunked, and retrieved into the agent's context for board-specific questions.
 
 ### Pin Aliases (Recommended)
 
 Add a `## Pin Aliases` section so the agent can map "red led" → pin 13:
 
-```markdown
+```text
 # My Board
 
 ## Pin Aliases
@@ -56,27 +56,11 @@ Add a `## Pin Aliases` section so the agent can map "red led" → pin 13:
 
 Or use key-value format:
 
-```markdown
+```text
 ## Pin Aliases
 red_led: 13
 builtin_led: 13
 ```
-
-### PDF Datasheets
-
-With the `rag-pdf` feature, ZeroClaw can index PDF files:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-cargo build --features hardware,rag-pdf
-```
-
-</div>
-
-Place PDFs in the datasheet directory. They are extracted and chunked for RAG.
 
 ## Adding a New Board Type
 
