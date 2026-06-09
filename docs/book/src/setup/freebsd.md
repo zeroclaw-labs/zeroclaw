@@ -109,7 +109,7 @@ Because `zeroclaw service install` has no FreeBSD backend, supervise the daemon 
 
 ### 1. Launcher script
 
-`daemon(8)` starts the child with a minimal environment, so export a full `PATH` (FreeBSD puts `git`, `python3`, etc. under `/usr/local/bin`, which is *not* on the default service `PATH`). The `rc.d` script runs this through `daemon -u <user>`, so the launcher already executes as the service account: derive `HOME` from that account's passwd entry rather than hardcoding `/home/<user>`, so accounts whose home is elsewhere (and `rc.conf` run-as overrides) keep working. Save as `/usr/local/libexec/zeroclaw-run.sh`:
+`daemon(8)` starts the child with a minimal environment, so export a full `PATH` (FreeBSD puts `git`, `python3`, etc. under `/usr/local/bin`, which is *not* on the default service `PATH`). The `rc.d` script runs this through `daemon -u <user>`, which per `daemon(8)` sets `HOME`, `USER`, and `SHELL` from that account's passwd entry before exec, so `${HOME}` is already the service account's home (accounts whose home is elsewhere, and `rc.conf` run-as overrides, just work). Save as `/usr/local/libexec/zeroclaw-run.sh`:
 
 <div class="os-tabs-src">
 
@@ -117,8 +117,7 @@ Because `zeroclaw service install` has no FreeBSD backend, supervise the daemon 
 
 ```sh
 #!/bin/sh
-: "${HOME:=$(eval echo ~)}"
-export HOME
+# daemon -u <user> has already set HOME from the account's passwd entry.
 export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/bin"
 exec /usr/local/bin/zeroclaw daemon --config-dir "${HOME}/.zeroclaw"
 ```
