@@ -15325,6 +15325,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 tool: "file_write".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             },
         );
 
