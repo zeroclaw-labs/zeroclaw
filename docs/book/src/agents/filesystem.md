@@ -5,48 +5,25 @@ the install root. The layout is organized by **scope**, not one flat tree:
 instance-wide state, cross-agent shared resources, and per-agent private data
 each get their own top-level directory.
 
-```mermaid
-flowchart TB
-    ROOT["&lt;install&gt;/"]
-
-    DATA["data/"]
-    SESS["sessions/"]
-    SESSDB["sessions.db<br/>acp-sessions.db"]
-    STATE["state/"]
-    STATEF["costs.jsonl<br/>runtime-trace.jsonl"]
-    DEV["devices.db"]
-    DMEM["memory/"]
-    DMEMF["brain.db · audit.db<br/>response_cache.db<br/>MEMORY_SNAPSHOT.md · archive/"]
-
-    SHARED["shared/"]
-    SKILLS["skills/&lt;bundle&gt;/"]
-    SKILLF["SKILL.md<br/>scripts/ · references/ · assets/"]
-
-    AGENTS["agents/"]
-    ALIAS["&lt;alias&gt;/"]
-    WS["workspace/"]
-    AMEM["memory/"]
-    AMEMF["brain.db"]
-
-    ROOT --> DATA
-    ROOT --> SHARED
-    ROOT --> AGENTS
-
-    DATA --> SESS
-    SESS --> SESSDB
-    DATA --> STATE
-    STATE --> STATEF
-    DATA --> DEV
-    DATA --> DMEM
-    DMEM --> DMEMF
-
-    SHARED --> SKILLS
-    SKILLS --> SKILLF
-
-    AGENTS --> ALIAS
-    ALIAS --> WS
-    WS --> AMEM
-    AMEM --> AMEMF
+```text
+<install>/
+├── data/                         — instance-wide state (not per-agent)
+│   ├── sessions/                 — chat session stores
+│   │   └── sessions.db, acp-sessions.db
+│   ├── state/                    — runtime state
+│   │   └── costs.jsonl, runtime-trace.jsonl
+│   ├── devices.db                — gateway pairing store
+│   └── memory/                   — shared instance memory
+│       └── brain.db, audit.db, response_cache.db,
+│           MEMORY_SNAPSHOT.md, archive/
+├── shared/                       — resources agents draw on in common
+│   └── skills/<bundle>/          — skill bundles
+│       └── SKILL.md, scripts/, references/, assets/
+└── agents/                       — per-agent private data
+    └── <alias>/
+        └── workspace/            — the agent's jailed filesystem sandbox
+            └── memory/
+                └── brain.db
 ```
 
 The three roots map to three scopes:

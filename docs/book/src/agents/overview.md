@@ -21,37 +21,20 @@ that **joins** two halves:
   a memory backend, and an identity (personality) source. This is where the
   relational graph meets a concrete directory tree.
 
-```mermaid
-flowchart LR
-    subgraph References["Config references (relational)"]
-        MP["model provider"]
-        RP["risk profile"]
-        RT["runtime profile"]
-        CH["channels"]
-        PG["peer groups"]
-        SB["skill / knowledge / MCP bundles"]
-        CR["cron jobs"]
-    end
-
-    A(["agents.&lt;alias&gt;"])
-
-    subgraph Filesystem["Filesystem components (on-disk)"]
-        WS["workspace/"]
-        MEM["memory store"]
-        ID["identity / personality"]
-    end
-
-    MP --- A
-    RP --- A
-    RT --- A
-    CH --- A
-    PG --- A
-    SB --- A
-    CR --- A
-    A --- WS
-    A --- MEM
-    A --- ID
+```text
+  Config references (relational)              Filesystem (on-disk)
+  ──────────────────────────────             ──────────────────────
+  - model provider                           - workspace/
+  - risk profile                             - memory store
+  - runtime profile          agents.<alias>  - identity / personality
+  - channels             ──▶  (the join)  ◀──
+  - peer groups
+  - skill / knowledge / MCP bundles
+  - cron jobs
 ```
+
+The agent points at the references on the left, owning none of them: many agents
+may share one or diverge freely. It owns the filesystem half on the right.
 
 Each reference is a link back to its own section, the credits: model providers
 live in [Model Providers](../providers/overview.md), the profiles in
@@ -77,29 +60,17 @@ they can **delegate** a task to one another only when the caller's risk profile
 permits delegation and both agents share the same risk profile (see
 [Running agents](./operating.md#coexistence-and-isolation)).
 
-```mermaid
-flowchart TB
-    subgraph Agents
-        R(["agents.researcher"])
-        S(["agents.support"])
-    end
-
-    PROV["openrouter.prod<br/>(shared provider)"]
-    RP1["hardened<br/>(risk profile)"]
-    RP2["permissive<br/>(risk profile)"]
-    DISCORD["discord.main"]
-    SLACK["slack.helpdesk"]
-    PEER["peer group<br/>on discord.main"]
-
-    R --- PROV
-    S --- PROV
-    R --- RP1
-    S --- RP2
-    R --- DISCORD
-    S --- SLACK
-    R -. peers .-> PEER
-    S -. peers .-> PEER
+```text
+                    agents.researcher          agents.support
+                    ─────────────────          ──────────────
+  model provider     openrouter.prod ◀───────── openrouter.prod   (same one)
+  risk profile       hardened                   permissive        (diverge)
+  channel            discord.main               slack.helpdesk    (diverge)
+  peers              └──────▶ peer group on discord.main ◀───────┘
 ```
+
+Two agents share one model provider, run under different risk profiles, answer
+on different channels, and meet only where they share a peer group.
 
 A SubAgent is the short-lived exception to coexistence: an agent can spawn an
 ephemeral SubAgent that inherits the parent's identity and security policy for a
