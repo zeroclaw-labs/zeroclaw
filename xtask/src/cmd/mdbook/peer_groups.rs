@@ -228,6 +228,23 @@ fn render_config_fields(arg: &str) -> anyhow::Result<String> {
         }
         ChannelKind::Slack => table_for!(schema::SlackConfig, "channels.slack.<alias>"),
         ChannelKind::Discord => table_for!(schema::DiscordConfig, "channels.discord.<alias>"),
+        ChannelKind::Telegram => table_for!(schema::TelegramConfig, "channels.telegram.<alias>"),
+        ChannelKind::Signal => table_for!(schema::SignalConfig, "channels.signal.<alias>"),
+        ChannelKind::Webhook => table_for!(schema::WebhookConfig, "channels.webhook.<alias>"),
+        ChannelKind::Line => table_for!(schema::LineConfig, "channels.line.<alias>"),
+        ChannelKind::Irc => table_for!(schema::IrcConfig, "channels.irc.<alias>"),
+        ChannelKind::Qq => table_for!(schema::QQConfig, "channels.qq.<alias>"),
+        ChannelKind::Nostr => table_for!(schema::NostrConfig, "channels.nostr.<alias>"),
+        ChannelKind::NextcloudTalk => {
+            table_for!(
+                schema::NextcloudTalkConfig,
+                "channels.nextcloud_talk.<alias>"
+            )
+        }
+        ChannelKind::WhatsappBusiness | ChannelKind::WhatsappWeb => {
+            table_for!(schema::WhatsAppConfig, "channels.whatsapp.<alias>")
+        }
+        ChannelKind::AcpChannel => table_for!(schema::AcpConfig, "acp"),
         other => {
             let name: &'static str = other.into();
             anyhow::bail!(
@@ -266,8 +283,9 @@ fn config_section_label(path: &str) -> anyhow::Result<String> {
 /// (masked input). The arg is the full dotted path to the secret field.
 fn render_secret_config(path: &str) -> String {
     let path = path.trim();
-    // Section = first dotted segment, for the dashboard deep-link.
-    let section = path.split('.').next().unwrap_or(path);
+    // Dashboard deep-link path: dotted prefix minus `<alias>` and the field,
+    // slash-joined (`channels.matrix.<alias>.password` -> `channels/matrix`).
+    let section = dashboard_section(path);
     format!(
         r#"> **`{path}` is a secret.** Stored encrypted, never in plain
 > `config.toml`. Set it through one of these, which encrypt on write:
@@ -292,7 +310,17 @@ zeroclaw config set {path}    # prompts for masked input, stores encrypted
     )
 }
 
-/// Shared "context management in threads" explainer for channels whose replies
+/// Dashboard deep-link section path from a dotted config field path. Drops the
+/// `<alias>` placeholder and the trailing field name, slash-joining the rest:
+/// `channels.matrix.<alias>.password` -> `channels/matrix`. A bare section like
+/// `acp.foo` -> `acp`. The gateway resolves these `/config/<section>` routes.
+fn dashboard_section(field_path: &str) -> String {
+    let segs: Vec<&str> = field_path.split('.').filter(|s| *s != "<alias>").collect();
+    // Drop the trailing field name; keep the section prefix.
+    let keep = segs.len().saturating_sub(1).max(1);
+    segs[..keep].join("/")
+}
+
 /// live in threads. Args are `key="value"` pairs:
 ///   - `channel` (required): display name, e.g. `Slack`, `Matrix`.
 ///   - `prop` (optional): the channel's thread-reply config property, e.g.
@@ -327,7 +355,7 @@ fn render_thread_context(arg: &str) -> anyhow::Result<String> {
 
     let configure = match path {
         Some(p) => {
-            let section = p.split('.').next().unwrap_or(p);
+            let section = dashboard_section(p);
             format!(
                 r#"
 

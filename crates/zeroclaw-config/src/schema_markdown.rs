@@ -34,7 +34,15 @@ pub fn field_table(root: &Value, include_enabled: bool, prefix: Option<&str>) ->
     let Some(prefix) = prefix else {
         return plain_field_table(props, &required, defs, include_enabled);
     };
-    let section = prefix.split('.').next().unwrap_or(prefix);
+    // Dashboard deep-link path: the dotted config prefix minus the trailing
+    // `<alias>` placeholder, slash-joined. `channels.mattermost.<alias>` ->
+    // `channels/mattermost`; `acp` -> `acp`. The gateway resolves these.
+    let section = prefix
+        .split('.')
+        .filter(|seg| *seg != "<alias>")
+        .collect::<Vec<_>>()
+        .join("/");
+    let section = section.as_str();
 
     let mut rows = String::new();
     for (key, prop_schema) in props {
