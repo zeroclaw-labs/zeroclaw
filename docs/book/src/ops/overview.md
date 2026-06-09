@@ -14,18 +14,7 @@ This section covers:
 
 A typical always-on ZeroClaw install is:
 
-```
-zeroclaw service (systemd / launchctl / Windows Service)
-  ├── zeroclaw daemon                 — the long-running process
-  │   ├── gateway listener (:42617)   — REST / WebSocket / webhooks
-  │   ├── channel pollers             — Telegram, IMAP, Nostr relays, etc.
-  │   ├── channel listeners           — Discord / Slack / Matrix / WebSocket
-  │   ├── cron scheduler              — scheduled SOPs and jobs
-  │   └── agent loop (per session)    — provider call + tool execution
-  ├── data dir                        — ~/.zeroclaw/data/ (memory/, sessions/, state/)
-  ├── .secret_key                     — ~/.zeroclaw/.secret_key (secrets-store master key)
-  └── platform logs                   — journald / launchctl / Event Log
-```
+{{#include ../_snippets/deployment-shape.md}}
 
 Everything except the binary can move. The data dir defaults to `~/.zeroclaw/data/` (the legacy `~/.zeroclaw/workspace/` name is still accepted); config paths resolve per environment (Homebrew vs. bootstrap vs. XDG), and log destinations are platform-native by default.
 
