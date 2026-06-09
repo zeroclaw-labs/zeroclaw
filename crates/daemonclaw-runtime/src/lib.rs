@@ -28,6 +28,7 @@ pub mod service;
 pub mod skillforge;
 pub mod skills;
 pub mod sop;
+pub mod tasks;
 pub mod tools;
 pub mod trust;
 pub mod tunnel;

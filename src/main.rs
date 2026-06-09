@@ -466,6 +466,26 @@ Examples:
         sop_command: SopCommands,
     },
 
+    /// Manage work-model tasks (create, claim, complete, abandon)
+    #[command(long_about = "\
+Manage work-model tasks.
+
+Create, inspect, claim, complete, and abandon tasks tracked in the \
+local tasks.db store. Tasks follow a state machine: \
+open \u{2192} claimed \u{2192} done|abandoned, with an optional blocked state.
+
+Examples:
+  daemonclaw task list
+  daemonclaw task create 'Deploy new firmware' --origin manual --priority 3
+  daemonclaw task show <id>
+  daemonclaw task claim <id>
+  daemonclaw task complete <id> --outcome succeeded
+  daemonclaw task abandon <id> --reason 'superseded by hotfix'")]
+    Task {
+        #[command(subcommand)]
+        task_command: TaskCommands,
+    },
+
     /// Migrate data from other agent runtimes
     Migrate {
         #[command(subcommand)]
@@ -676,6 +696,80 @@ timer. It does not load config or initialize logging."
     Plugin {
         #[command(subcommand)]
         plugin_command: PluginCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskCommands {
+    /// Create a new task
+    Create {
+        /// Task title / description
+        title: String,
+        /// Origin: manual, heartbeat, cron, channel, sop
+        #[arg(long, default_value = "manual")]
+        origin: String,
+        /// Priority 0 (lowest) to 4 (critical)
+        #[arg(long, default_value = "2")]
+        priority: u8,
+        /// Parent task ID (for subtasks)
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// Show a task by ID (prefix match supported)
+    Show {
+        /// Task ID (or unique prefix)
+        id: String,
+    },
+    /// List tasks
+    List {
+        /// Filter by state: open, claimed, blocked, done, abandoned
+        #[arg(long)]
+        state: Option<String>,
+        /// Maximum results
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Claim an open or blocked task
+    Claim {
+        /// Task ID
+        id: String,
+    },
+    /// Mark a claimed task as done
+    Complete {
+        /// Task ID
+        id: String,
+        /// Outcome: succeeded, failed, cancelled
+        #[arg(long, default_value = "succeeded")]
+        outcome: String,
+    },
+    /// Abandon a task (requires reason)
+    Abandon {
+        /// Task ID
+        id: String,
+        /// Why the task is being abandoned
+        #[arg(long)]
+        reason: String,
+    },
+    /// Block a claimed task
+    Block {
+        /// Task ID
+        id: String,
+        /// Why the task is blocked
+        #[arg(long)]
+        reason: String,
+    },
+    /// Unblock a blocked task (returns to claimed)
+    Unblock {
+        /// Task ID
+        id: String,
+    },
+    /// Show activity log for a task
+    Activity {
+        /// Task ID
+        id: String,
+        /// Maximum entries
+        #[arg(long, default_value = "50")]
+        limit: usize,
     },
 }
 
@@ -1771,6 +1865,8 @@ async fn main() -> Result<()> {
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
 
         Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+
+        Commands::Task { task_command } => handle_task_command(task_command, &config),
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -3704,6 +3800,229 @@ mod tests {
         let final_temperature =
             user_temperature.unwrap_or_else(|| stored_temperature.unwrap_or(0.7));
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
+    }
+}
+
+fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
+    use daemonclaw_runtime::tasks::{
+        TaskActor, TaskOrigin, TaskOutcome, TaskState,
+        store,
+    };
+
+    let workspace = &config.workspace_dir;
+    let actor = TaskActor {
+        channel: "cli".to_string(),
+        id: Some(std::env::var("USER").unwrap_or_else(|_| "operator".to_string())),
+    };
+
+    match cmd {
+        TaskCommands::Create {
+            title,
+            origin,
+            priority,
+            parent,
+        } => {
+            let origin = TaskOrigin::from_str(&origin)
+                .ok_or_else(|| anyhow::anyhow!("invalid origin: {origin} (expected: manual, heartbeat, cron, channel, sop)"))?;
+            let task = store::create_task(
+                workspace,
+                &title,
+                origin,
+                priority,
+                parent.as_deref(),
+                &actor,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Created task {}", task.id);
+            print_task(&task);
+            Ok(())
+        }
+        TaskCommands::Show { id } => {
+            let task = resolve_task(workspace, &id)?;
+            print_task(&task);
+            let activity = store::get_task_activity(workspace, &task.id, 20)?;
+            if !activity.is_empty() {
+                println!("\nActivity:");
+                for a in &activity {
+                    let old = a
+                        .old_state
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let who = a.actor_id.as_deref().unwrap_or("?");
+                    let reason = a
+                        .reason
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default();
+                    println!(
+                        "  {} {} -> {} by {}/{}{}",
+                        &a.timestamp[..19],
+                        old,
+                        a.new_state,
+                        a.actor_channel,
+                        who,
+                        reason,
+                    );
+                }
+            }
+            Ok(())
+        }
+        TaskCommands::List { state, limit } => {
+            let state_filter = state
+                .as_deref()
+                .map(|s| {
+                    TaskState::from_str(s).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid state: {s} (expected: open, claimed, blocked, done, abandoned)"
+                        )
+                    })
+                })
+                .transpose()?;
+            let tasks = store::list_tasks(workspace, state_filter, limit)?;
+            if tasks.is_empty() {
+                println!("No tasks found.");
+                return Ok(());
+            }
+            println!(
+                "{:<8}  {:<10}  {:<10}  {:<4}  {}",
+                "ID", "STATE", "ORIGIN", "PRI", "TITLE"
+            );
+            for t in &tasks {
+                println!(
+                    "{:<8}  {:<10}  {:<10}  {:<4}  {}",
+                    &t.id[..8],
+                    t.state,
+                    t.origin,
+                    t.priority,
+                    t.title,
+                );
+            }
+            println!("\n{} task(s)", tasks.len());
+            Ok(())
+        }
+        TaskCommands::Claim { id } => {
+            let task = resolve_task(workspace, &id)?;
+            let claimed = store::claim_task(workspace, &task.id, &actor, &task.updated_at)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Claimed task {}", &claimed.id[..8]);
+            print_task(&claimed);
+            Ok(())
+        }
+        TaskCommands::Complete { id, outcome } => {
+            let outcome = TaskOutcome::from_str(&outcome).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid outcome: {outcome} (expected: succeeded, failed, cancelled)"
+                )
+            })?;
+            let task = resolve_task(workspace, &id)?;
+            let done = store::complete_task(workspace, &task.id, &actor, outcome)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Completed task {}", &done.id[..8]);
+            print_task(&done);
+            Ok(())
+        }
+        TaskCommands::Abandon { id, reason } => {
+            let task = resolve_task(workspace, &id)?;
+            let abandoned = store::abandon_task(workspace, &task.id, &actor, &reason)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Abandoned task {}", &abandoned.id[..8]);
+            print_task(&abandoned);
+            Ok(())
+        }
+        TaskCommands::Block { id, reason } => {
+            let task = resolve_task(workspace, &id)?;
+            let blocked = store::block_task(workspace, &task.id, &actor, &reason)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Blocked task {}", &blocked.id[..8]);
+            print_task(&blocked);
+            Ok(())
+        }
+        TaskCommands::Unblock { id } => {
+            let task = resolve_task(workspace, &id)?;
+            let unblocked = store::unblock_task(workspace, &task.id, &actor)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Unblocked task {}", &unblocked.id[..8]);
+            print_task(&unblocked);
+            Ok(())
+        }
+        TaskCommands::Activity { id, limit } => {
+            let task = resolve_task(workspace, &id)?;
+            let activity = store::get_task_activity(workspace, &task.id, limit)?;
+            if activity.is_empty() {
+                println!("No activity for task {}.", &task.id[..8]);
+                return Ok(());
+            }
+            println!("Activity for task {} ({}):\n", &task.id[..8], task.title);
+            for a in &activity {
+                let old = a
+                    .old_state
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let who = a.actor_id.as_deref().unwrap_or("?");
+                let reason = a
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                println!(
+                    "  {} {} -> {} by {}/{}{}",
+                    &a.timestamp[..19],
+                    old,
+                    a.new_state,
+                    a.actor_channel,
+                    who,
+                    reason,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn resolve_task(
+    workspace: &std::path::Path,
+    id_or_prefix: &str,
+) -> Result<daemonclaw_runtime::tasks::Task> {
+    use daemonclaw_runtime::tasks::store;
+
+    match store::get_task(workspace, id_or_prefix) {
+        Ok(task) => Ok(task),
+        Err(daemonclaw_runtime::tasks::TaskError::NotFound(_)) if id_or_prefix.len() < 36 => {
+            let all = store::list_tasks(workspace, None, 500)?;
+            let matches: Vec<_> = all
+                .into_iter()
+                .filter(|t| t.id.starts_with(id_or_prefix))
+                .collect();
+            match matches.len() {
+                0 => bail!("no task matching prefix '{id_or_prefix}'"),
+                1 => Ok(matches.into_iter().next().unwrap()),
+                n => bail!("ambiguous prefix '{id_or_prefix}' matches {n} tasks"),
+            }
+        }
+        Err(e) => bail!("{e}"),
+    }
+}
+
+fn print_task(task: &daemonclaw_runtime::tasks::Task) {
+    println!("  id:       {}", task.id);
+    println!("  title:    {}", task.title);
+    println!("  state:    {}", task.state);
+    println!("  origin:   {}", task.origin);
+    println!("  priority: {}", task.priority);
+    println!("  created:  {}", task.created_at);
+    println!("  updated:  {}", task.updated_at);
+    if let Some(ch) = &task.claimed_by_channel {
+        let who = task.claimed_by_id.as_deref().unwrap_or("?");
+        println!("  claimed:  {ch}/{who}");
+    }
+    if let Some(reason) = &task.blocked_reason {
+        println!("  blocked:  {reason}");
+    }
+    if let Some(outcome) = &task.outcome {
+        println!("  outcome:  {}", outcome.as_str());
+    }
+    if let Some(parent) = &task.parent_task_id {
+        println!("  parent:   {}", &parent[..8.min(parent.len())]);
     }
 }
 
