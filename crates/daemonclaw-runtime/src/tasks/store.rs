@@ -267,6 +267,117 @@ pub fn list_tasks(
     Ok(tasks)
 }
 
+pub fn render_priority_view(workspace_dir: &Path, actor_id: Option<&str>, max_tasks: usize) -> String {
+    let path = db_path(workspace_dir);
+    if !path.exists() {
+        return "[Tasks] unavailable".to_string();
+    }
+    let conn = match connect(workspace_dir) {
+        Ok(c) => c,
+        Err(_) => return "[Tasks] unavailable".to_string(),
+    };
+
+    let sql = "SELECT id, status, priority, title, assigned_to, blockers
+               FROM tasks
+               WHERE status IN ('open', 'active', 'blocked', 'review')
+               ORDER BY priority DESC, updated_at DESC";
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return "[Tasks] unavailable".to_string(),
+    };
+
+    struct Row {
+        id: String,
+        status: String,
+        priority: i64,
+        title: String,
+        assigned_to: Option<String>,
+        blockers: String,
+    }
+
+    let rows: Vec<Row> = match stmt.query_map([], |r| {
+        Ok(Row {
+            id: r.get(0)?,
+            status: r.get(1)?,
+            priority: r.get(2)?,
+            title: r.get(3)?,
+            assigned_to: r.get(4)?,
+            blockers: r.get::<_, String>(5)?,
+        })
+    }) {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(_) => return "[Tasks] unavailable".to_string(),
+    };
+
+    let filtered: Vec<&Row> = rows
+        .iter()
+        .filter(|r| {
+            if r.status != "open" {
+                return true;
+            }
+            match (&r.assigned_to, actor_id) {
+                (None, _) => true,
+                (Some(a), Some(actor)) => a == actor,
+                (Some(_), None) => true,
+            }
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return "[Tasks] none".to_string();
+    }
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in &filtered {
+        *counts.entry(r.status.as_str()).or_default() += 1;
+    }
+
+    let mut summary_parts = Vec::new();
+    for st in &["open", "active", "blocked", "review"] {
+        if let Some(&n) = counts.get(st) {
+            summary_parts.push(format!("{n} {st}"));
+        }
+    }
+
+    let cap = max_tasks.max(1);
+    let overflow = filtered.len().saturating_sub(cap);
+    let display = &filtered[..filtered.len().min(cap)];
+
+    let mut out = format!("[Tasks] {}\n", summary_parts.join(", "));
+    for r in display {
+        let short_id = &r.id[..r.id.len().min(8)];
+        let title_display = if r.title.len() > 60 {
+            format!("{}…", &r.title[..59])
+        } else {
+            r.title.clone()
+        };
+        let blocker_mark = if r.blockers != "{}" && r.blockers != "[]" && r.blockers != "null" {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.blockers) {
+                if let Some(obj) = v.as_object() {
+                    if obj.is_empty() { String::new() } else { format!(" [blockers:{}]", obj.len()) }
+                } else if let Some(arr) = v.as_array() {
+                    if arr.is_empty() { String::new() } else { format!(" [blockers:{}]", arr.len()) }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{short_id} {:<8} P{} \"{title_display}\"{blocker_mark}\n",
+            r.status, r.priority,
+        ));
+    }
+    if overflow > 0 {
+        out.push_str(&format!("+{overflow} more\n"));
+    }
+    out.trim_end().to_string()
+}
+
 /// Claim an open task. Uses `BEGIN IMMEDIATE` + `WHERE status='open'` so
 /// exactly one of two racing claimers wins; the loser gets `ClaimConflict`.
 pub fn claim_task(
@@ -1091,5 +1202,54 @@ mod tests {
 
         let activity = get_task_activity(tmp.path(), &task.id).unwrap();
         assert!(activity.is_empty());
+    }
+
+    #[test]
+    fn priority_view_no_tasks_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let _ = connect(tmp.path()).unwrap();
+        assert_eq!(render_priority_view(tmp.path(), None, 15), "[Tasks] none");
+    }
+
+    #[test]
+    fn priority_view_mixed_statuses() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        let p = simple_params("First task");
+        create_task(tmp.path(), &p, &actor, &audit).unwrap();
+
+        let mut p2 = simple_params("Second task");
+        p2.priority = 1;
+        let t2 = create_task(tmp.path(), &p2, &actor, &audit).unwrap();
+        claim_task(tmp.path(), &t2.id, &actor, &audit).unwrap();
+
+        let view = render_priority_view(tmp.path(), None, 15);
+        assert!(view.starts_with("[Tasks] "), "view: {view}");
+        assert!(view.contains("open"), "view: {view}");
+        assert!(view.contains("active"), "view: {view}");
+        assert!(view.contains("First task"), "view: {view}");
+        assert!(view.contains("Second task"), "view: {view}");
+    }
+
+    #[test]
+    fn priority_view_cap_overflow() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        for i in 0..5 {
+            let title = format!("Task {i}");
+            let p = simple_params(&title);
+            create_task(tmp.path(), &p, &actor, &audit).unwrap();
+        }
+
+        let view = render_priority_view(tmp.path(), None, 3);
+        assert!(view.contains("+2 more"), "view: {view}");
+    }
+
+    #[test]
+    fn priority_view_nonexistent_db() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(render_priority_view(tmp.path(), None, 15), "[Tasks] unavailable");
     }
 }

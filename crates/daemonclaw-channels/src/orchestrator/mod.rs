@@ -2764,6 +2764,12 @@ async fn process_channel_message(
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
+    let task_view = daemonclaw_runtime::tasks::store::render_priority_view(
+        ctx.workspace_dir.as_ref(),
+        None,
+        15,
+    );
+    let _ = write!(system_prompt, "\n\n{task_view}");
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
 
