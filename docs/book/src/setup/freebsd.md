@@ -3,7 +3,7 @@
 ZeroClaw runs natively on FreeBSD (tested on FreeBSD 15.0-RELEASE, `amd64`). Two things differ from the Linux/macOS/Windows paths:
 
 1. **No prebuilt binary and no `install.sh` support.** FreeBSD is not a target of the bootstrap installer, so you build from source with the system Rust toolchain.
-2. **No `zeroclaw service` backend.** The `zeroclaw service install` command knows systemd, launchd, and Windows Task Scheduler, not FreeBSD `rc.d`. You install a small `rc.d` script yourself. This page gives you a complete, tested one.
+2. **No `zeroclaw service` backend.** The `zeroclaw service install` command knows systemd, OpenRC, launchd, and Windows Task Scheduler, not FreeBSD `rc.d`. You install a small `rc.d` script yourself. This page gives you a complete, tested one.
 
 Everything else, config, providers, channels, the daemon, the gateway, is identical to any other platform.
 
@@ -27,7 +27,7 @@ doas pkg install -y rust git
 
 | Package | Why |
 |---|---|
-| `rust` | Provides `cargo` and `rustc` to build the binary. The port tracks a recent stable (1.94+ at time of writing). |
+| `rust` | Provides `cargo` and `rustc` to build the binary. ZeroClaw's workspace MSRV is Rust 1.87; the FreeBSD `rust` port tracks a newer stable, so `pkg install rust` satisfies it. |
 | `git` | Cloning the repo, and required at runtime if you use any git-backed tools. |
 
 > **`doas`, not `sudo`.** FreeBSD ships `doas` as the base privilege-escalation tool; `sudo` is an optional port. The examples here use `doas`. A minimal `/usr/local/etc/doas.conf` granting the `wheel` group passwordless escalation is:
@@ -383,20 +383,21 @@ This complements the native `rc.d` daemon: you can run either, or both side by s
 
 ### 1. Prerequisites
 
-Load the Linuxulator modules and confirm they report a Linux release:
+Enable the Linux ABI and confirm it reports a Linux release:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-doas kldload linux linux64
-sysctl compat.linux.osrelease        # e.g. compat.linux.osrelease: 5.15.0
+doas sysrc linux_enable="YES"
+doas service linux start              # loads the modules and mounts /compat/linux
+sysctl compat.linux.osrelease         # e.g. compat.linux.osrelease: 5.15.0
 ```
 
 </div>
 
-To load them on boot, add `linux_enable="YES"` to `/etc/rc.conf`. Then install Podman:
+`linux_enable="YES"` in `/etc/rc.conf` also loads the ABI on boot. Then install Podman:
 
 <div class="os-tabs-src">
 
@@ -495,7 +496,7 @@ fetch -qo - http://127.0.0.1:42617/health
 
 </div>
 
-A `"status":"ok"` health payload means the gateway, daemon, and channels came up.
+A `"status":"ok"` health payload means the gateway is up; the response's `runtime` field carries the per-component health (channels, providers, and so on).
 
 ## Uninstall
 
