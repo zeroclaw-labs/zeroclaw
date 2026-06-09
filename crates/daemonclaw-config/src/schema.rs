@@ -6348,6 +6348,22 @@ pub struct ClassificationRule {
 
 // ── Heartbeat ────────────────────────────────────────────────────
 
+/// Controls whether the heartbeat automatically picks up tasks from `tasks.db`.
+///
+/// - `none`: heartbeat does not claim tasks (legacy HEARTBEAT.md path only).
+/// - `assisted`: heartbeat finds open tasks and reports them to the delivery
+///   channel for operator approval before claiming.
+/// - `full`: heartbeat autonomously claims and executes open tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum AutonomousPickup {
+    #[default]
+    None,
+    Assisted,
+    Full,
+}
+
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6412,6 +6428,10 @@ pub struct HeartbeatConfig {
     /// Default: `600` (10 minutes).
     #[serde(default = "default_heartbeat_task_timeout")]
     pub task_timeout_secs: u64,
+    /// Controls whether the heartbeat autonomously picks up tasks from
+    /// `tasks.db`. Default: `none` (legacy HEARTBEAT.md path only).
+    #[serde(default)]
+    pub autonomous_pickup: AutonomousPickup,
 }
 
 fn default_heartbeat_interval() -> u32 {
@@ -6456,6 +6476,7 @@ impl Default for HeartbeatConfig {
             max_run_history: default_heartbeat_max_run_history(),
             load_session_context: false,
             task_timeout_secs: default_heartbeat_task_timeout(),
+            autonomous_pickup: AutonomousPickup::None,
         }
     }
 }

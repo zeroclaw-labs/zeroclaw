@@ -54,6 +54,9 @@ impl_prop_kind!(
 impl HasPropKind for Vec<String> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
+impl HasPropKind for crate::schema::AutonomousPickup {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
 
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]

@@ -349,6 +349,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
     let adaptive = config.heartbeat.adaptive;
+    let autonomous_pickup = config.heartbeat.autonomous_pickup;
     let start_time = std::time::Instant::now();
 
     // ── Deadman watcher ──────────────────────────────────────────
@@ -412,6 +413,38 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         }
 
         let tick_start = std::time::Instant::now();
+
+        // ── Task-pickup path (tasks.db) ──────────────────────────
+        if autonomous_pickup != daemonclaw_config::schema::AutonomousPickup::None {
+            let (tick_had_error, has_high_priority) =
+                run_task_pickup_tick(&config, autonomous_pickup, &delivery).await;
+
+            #[allow(clippy::cast_precision_loss)]
+            let tick_elapsed = tick_start.elapsed().as_millis() as f64;
+            {
+                let mut m = metrics.lock();
+                if tick_had_error {
+                    m.record_failure(tick_elapsed);
+                } else {
+                    m.record_success(tick_elapsed);
+                }
+            }
+            if adaptive {
+                let failures = metrics.lock().consecutive_failures;
+                sleep_mins = compute_adaptive_interval(
+                    base_interval,
+                    config.heartbeat.min_interval_minutes,
+                    config.heartbeat.max_interval_minutes,
+                    failures,
+                    has_high_priority,
+                );
+            } else {
+                sleep_mins = base_interval;
+            }
+            continue;
+        }
+
+        // ── Legacy HEARTBEAT.md path ─────────────────────────────
 
         // Collect runnable tasks (active only, sorted by priority)
         let mut tasks = engine.collect_runnable_tasks().await?;
@@ -720,6 +753,244 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             sleep_mins = base_interval;
         }
     }
+}
+
+/// Run one task-pickup tick: query tasks.db for open tasks eligible for autonomous
+/// execution, claim via CAS, execute under task binding, and record results.
+///
+/// Returns `(had_error, has_high_priority)` for adaptive interval computation.
+async fn run_task_pickup_tick(
+    config: &Config,
+    pickup: daemonclaw_config::schema::AutonomousPickup,
+    delivery: &Option<(String, String)>,
+) -> (bool, bool) {
+    use crate::tasks::{self, Autonomy, TaskActor, TaskBinding, TaskStatus};
+
+    let workspace = &config.workspace_dir;
+
+    // ── Deterministic recon: find open tasks eligible for pickup ──
+    let open_tasks = match tasks::store::list_tasks(workspace, Some(TaskStatus::Open), 50) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("💓 Heartbeat task-pickup: failed to list tasks: {e}");
+            return (true, false);
+        }
+    };
+
+    let eligible: Vec<_> = open_tasks
+        .into_iter()
+        .filter(|t| match pickup {
+            daemonclaw_config::schema::AutonomousPickup::Full => t.autonomy == Autonomy::Auto,
+            daemonclaw_config::schema::AutonomousPickup::Assisted => {
+                t.autonomy == Autonomy::Auto || t.autonomy == Autonomy::Assisted
+            }
+            daemonclaw_config::schema::AutonomousPickup::None => false,
+        })
+        .collect();
+
+    if eligible.is_empty() {
+        tracing::debug!("💓 Heartbeat task-pickup: no eligible tasks");
+        return (false, false);
+    }
+
+    let has_high_priority = eligible.iter().any(|t| t.priority >= 3);
+
+    // ── Assisted mode: report and return (operator acts later) ──
+    if pickup == daemonclaw_config::schema::AutonomousPickup::Assisted {
+        let report: Vec<String> = eligible
+            .iter()
+            .take(15)
+            .map(|t| {
+                format!(
+                    "  P{} {} — {}",
+                    t.priority,
+                    &t.id[..8.min(t.id.len())],
+                    t.title
+                )
+            })
+            .collect();
+        let msg = format!(
+            "💓 Heartbeat found {} open task(s) awaiting pickup:\n{}",
+            eligible.len(),
+            report.join("\n"),
+        );
+        tracing::info!("{msg}");
+        if let Some((channel, target)) = delivery {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::cron::scheduler::deliver_announcement(config, channel, target, &msg),
+            )
+            .await;
+        }
+        return (false, has_high_priority);
+    }
+
+    // ── Full mode: claim → execute → submit ──
+    let actor = TaskActor {
+        channel: "heartbeat".to_string(),
+        id: Some("heartbeat".to_string()),
+    };
+    let audit = match crate::security::audit::AuditLogger::new(
+        config.security.audit.clone(),
+        config.workspace_dir.clone(),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("💓 Heartbeat task-pickup: failed to create audit logger: {e}");
+            return (true, has_high_priority);
+        }
+    };
+
+    let mut had_error = false;
+
+    for task in &eligible {
+        let task_start = std::time::Instant::now();
+
+        // Claim via CAS — another agent may race us
+        let claimed = match tasks::store::claim_task(workspace, &task.id, &actor, &audit) {
+            Ok(t) => t,
+            Err(tasks::TaskError::ClaimConflict { .. }) => {
+                tracing::debug!(
+                    "💓 Heartbeat: task {} claimed by another agent, skipping",
+                    &task.id[..8.min(task.id.len())]
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("💓 Heartbeat: failed to claim task {}: {e}", &task.id[..8.min(task.id.len())]);
+                had_error = true;
+                continue;
+            }
+        };
+
+        tracing::info!(
+            "💓 Heartbeat claimed task {} (P{} {})",
+            &claimed.id[..8.min(claimed.id.len())],
+            claimed.priority,
+            claimed.title,
+        );
+
+        // Build prompt from task intent + title
+        let intent = claimed.intent.as_deref().unwrap_or(&claimed.title);
+        let prompt = format!(
+            "[Heartbeat Task | P{}] {}\n\nIntent: {}",
+            claimed.priority, claimed.title, intent,
+        );
+
+        let temp = daemonclaw_config::provider_store::get_fallback_provider()
+            .as_ref()
+            .and_then(|e| e.temperature)
+            .unwrap_or(0.7);
+
+        // Execute under task binding for breadcrumb trail
+        let binding = Some(TaskBinding {
+            task_id: claimed.id.clone(),
+            actor_id: "heartbeat".to_string(),
+        });
+
+        let agent_fut = tasks::with_task_binding(binding, async {
+            crate::agent::run(
+                config.clone(),
+                Some(prompt),
+                None,
+                None,
+                temp,
+                vec![],
+                false,
+                None,
+                None,
+                daemonclaw_api::agent::TurnSource::Heartbeat,
+            )
+            .await
+        });
+
+        let result = if config.heartbeat.task_timeout_secs > 0 {
+            match tokio::time::timeout(
+                Duration::from_secs(config.heartbeat.task_timeout_secs),
+                agent_fut,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "task {} timed out ({}s)",
+                    &claimed.id[..8.min(claimed.id.len())],
+                    config.heartbeat.task_timeout_secs,
+                )),
+            }
+        } else {
+            agent_fut.await
+        };
+
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_ms = task_start.elapsed().as_millis() as i64;
+        let now = chrono::Utc::now();
+
+        match result {
+            Ok(output) => {
+                crate::health::mark_component_ok("heartbeat");
+                crate::health::touch_liveness(&config.workspace_dir);
+
+                // Record to heartbeat history
+                let _ = crate::heartbeat::store::record_run(
+                    workspace,
+                    &claimed.title,
+                    &claimed.priority.to_string(),
+                    now - chrono::Duration::milliseconds(duration_ms),
+                    now,
+                    "ok",
+                    Some(output.as_str()),
+                    duration_ms,
+                    config.heartbeat.max_run_history,
+                );
+
+                // Submit for review
+                let _ = tasks::store::submit_task(workspace, &claimed.id, &actor, &audit);
+
+                // Deliver result
+                let announcement = if output.trim().is_empty() {
+                    format!("💓 task {} completed: {}", &claimed.id[..8.min(claimed.id.len())], claimed.title)
+                } else {
+                    output
+                };
+                if let Some((channel, target)) = delivery {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        crate::cron::scheduler::deliver_announcement(
+                            config, channel, target, &announcement,
+                        ),
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                had_error = true;
+                tracing::warn!(
+                    "💓 Heartbeat: task {} failed: {e}",
+                    &claimed.id[..8.min(claimed.id.len())]
+                );
+
+                let _ = crate::heartbeat::store::record_run(
+                    workspace,
+                    &claimed.title,
+                    &claimed.priority.to_string(),
+                    now - chrono::Duration::milliseconds(duration_ms),
+                    now,
+                    "error",
+                    Some(&e.to_string()),
+                    duration_ms,
+                    config.heartbeat.max_run_history,
+                );
+
+                crate::health::mark_component_error(
+                    "heartbeat",
+                    format!("task {} failed: {e}", &claimed.id[..8.min(claimed.id.len())]),
+                );
+            }
+        }
+    }
+
+    (had_error, has_high_priority)
 }
 
 /// Resolve delivery target: explicit config > auto-detect first configured channel.

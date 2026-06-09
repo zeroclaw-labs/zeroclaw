@@ -34,13 +34,15 @@ pub enum TurnSource {
     Cli,
     /// Channel message (Telegram, Slack, etc.) from an operator.
     Channel,
-    /// Cron scheduler or daemon heartbeat — no human in the loop.
+    /// Cron scheduler — no human in the loop.
     Cron,
+    /// Heartbeat task execution — autonomous, task-bound.
+    Heartbeat,
 }
 
 impl TurnSource {
     pub fn is_automated(self) -> bool {
-        matches!(self, Self::Cron)
+        matches!(self, Self::Cron | Self::Heartbeat)
     }
 }
 
