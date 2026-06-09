@@ -12222,6 +12222,15 @@ pub struct AmqpConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub thread_id_field: String,
+    /// Acknowledgement mode. When `true` (default), deliveries are acked only
+    /// after the message is durably handed to the agent loop, giving
+    /// at-least-once semantics: a crash before hand-off redelivers the event.
+    /// Set `false` for at-most-once (broker acks on dispatch), which silently
+    /// drops in-flight events on crash and is only appropriate for
+    /// non-side-effecting, drop-on-overload consumers.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_durable_ack")]
+    pub durable_ack: bool,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -12290,6 +12299,10 @@ impl ChannelConfig for AmqpConfig {
 
 fn default_amqp_sender_label() -> String {
     "amqp".to_string()
+}
+
+fn default_amqp_durable_ack() -> bool {
+    true
 }
 
 /// IRC channel configuration.

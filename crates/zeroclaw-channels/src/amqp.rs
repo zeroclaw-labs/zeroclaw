@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use portable_atomic::{AtomicU64, Ordering};
+use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use futures_util::StreamExt;
 use lapin::{
     Connection, ConnectionProperties,
-    options::{BasicConsumeOptions, QueueBindOptions, QueueDeclareOptions},
+    options::{BasicAckOptions, BasicConsumeOptions, QueueBindOptions, QueueDeclareOptions},
     tcp::{OwnedIdentity, OwnedTLSConfig},
     types::FieldTable,
 };
@@ -31,8 +31,10 @@ pub struct AmqpChannel {
     sender_label: String,
     content_template: String,
     thread_id_field: String,
+    durable_ack: bool,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    consuming: Arc<AtomicBool>,
 }
 
 /// Construction parameters for [`AmqpChannel`].
@@ -47,6 +49,7 @@ pub struct AmqpChannelConfig {
     pub sender_label: String,
     pub content_template: String,
     pub thread_id_field: String,
+    pub durable_ack: bool,
     pub alias: String,
     pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
@@ -64,8 +67,10 @@ impl AmqpChannel {
             sender_label: cfg.sender_label,
             content_template: cfg.content_template,
             thread_id_field: cfg.thread_id_field,
+            durable_ack: cfg.durable_ack,
             alias: cfg.alias,
             peer_resolver: cfg.peer_resolver,
+            consuming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -269,7 +274,7 @@ impl Channel for AmqpChannel {
                 &bound_queue,
                 &format!("zeroclaw-{}", self.alias),
                 BasicConsumeOptions {
-                    no_ack: true,
+                    no_ack: !self.durable_ack,
                     ..BasicConsumeOptions::default()
                 },
                 FieldTable::default(),
@@ -277,6 +282,7 @@ impl Channel for AmqpChannel {
             .await?;
 
         zeroclaw_runtime::health::mark_component_ok("amqp");
+        self.consuming.store(true, Ordering::Release);
         let _peers = (self.peer_resolver)();
 
         while let Some(delivery) = consumer.next().await {
@@ -305,15 +311,21 @@ impl Channel for AmqpChannel {
             };
 
             if tx.send(channel_msg).await.is_err() {
+                self.consuming.store(false, Ordering::Release);
                 return Ok(());
+            }
+
+            if self.durable_ack {
+                delivery.acker.ack(BasicAckOptions::default()).await?;
             }
         }
 
+        self.consuming.store(false, Ordering::Release);
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
-        true
+        self.consuming.load(Ordering::Acquire)
     }
 
     fn self_handle(&self) -> Option<String> {
@@ -384,6 +396,7 @@ mod tests {
             sender_label: "anitya".into(),
             content_template: content_template.into(),
             thread_id_field: thread_id_field.into(),
+            durable_ack: true,
             alias: "stagex".into(),
             peer_resolver: Arc::new(Vec::new),
         })
@@ -392,6 +405,11 @@ mod tests {
     #[test]
     fn name_is_amqp() {
         assert_eq!(channel_with("", "").name(), "amqp");
+    }
+
+    #[tokio::test]
+    async fn health_check_false_before_consuming() {
+        assert!(!channel_with("", "").health_check().await);
     }
 
     #[test]

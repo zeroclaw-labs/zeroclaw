@@ -6948,6 +6948,7 @@ fn collect_configured_channels(
                 sender_label: amqp.sender_label.clone(),
                 content_template: amqp.content_template.clone(),
                 thread_id_field: amqp.thread_id_field.clone(),
+                durable_ack: amqp.durable_ack,
                 alias: alias.clone(),
                 peer_resolver,
             })),
