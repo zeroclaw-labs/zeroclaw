@@ -6,6 +6,13 @@ license.workspace = true
 description = "WASM plugin system for ZeroClaw — host, manifests, signatures, execution bridge."
 publish = false
 
+[features]
+default = ["plugins-wit-v0"]
+plugins-wit-v0 = []
+plugins-wasmtime = ["dep:wasmtime"]
+plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
+plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
+
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
