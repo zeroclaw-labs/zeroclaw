@@ -19,9 +19,9 @@
 
 <p align="center">
   <a href="https://docs.zeroclawlabs.ai/master/en/introduction.html">Docs</a> ·
-  <a href="https://docs.zeroclawlabs.ai/master/en/philosophy.html">Philosophy</a> ·
-  <a href="https://docs.zeroclawlabs.ai/master/en/getting-started/quick-start.html">Quick start</a> ·
-  <a href="https://docs.zeroclawlabs.ai/master/en/architecture/overview.html">Architecture</a> ·
+  <a href="docs/book/src/philosophy/index.md">Philosophy</a> ·
+  <a href="docs/book/src/getting-started/quickstart.md">Quick start</a> ·
+  <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
   <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
