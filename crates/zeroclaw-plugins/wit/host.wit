@@ -1,0 +1,23 @@
+package zeroclaw:plugins@0.8.2;
+
+/// Host functions available to WASM plugins.
+///
+/// Gated by `PluginPermission` entries declared in the plugin manifest.
+interface host {
+    /// Perform an HTTP request from the plugin.
+    ///
+    /// Requires `PluginPermission::HttpClient`.
+    ///
+    /// Returns the response body as a string on success, or an error string.
+    http-request: func(
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<string>,
+    ) -> result<string, string>;
+
+    /// Read an environment variable from the host process.
+    ///
+    /// Requires `PluginPermission::EnvRead`.
+    env-read: func(key: string) -> option<string>;
+}

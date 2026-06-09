@@ -1,0 +1,37 @@
+package zeroclaw:plugins@0.8.2;
+
+/// World exposed to WASM tool plugins.
+///
+/// A tool plugin implements the `run` export and may import host functions
+/// (e.g. `http-request`, `env-read`) and the approval types.
+world tool-plugin {
+    import approval;
+    import host;
+
+    /// Execute the tool with the given JSON-encoded arguments.
+    ///
+    /// The plugin receives the arguments, performs its work (potentially
+    /// calling imported host functions), and returns a JSON-encoded result
+    /// string or an error description.
+    export run: func(arguments: string) -> result<string, string>;
+}
+
+/// World exposed to WASM channel plugins.
+world channel-plugin {
+    import approval;
+    import host;
+
+    /// Receive a message from the channel and return a structured response.
+    export receive: func(payload: string) -> result<string, string>;
+}
+
+/// World exposed to WASM memory backend plugins.
+world memory-plugin {
+    import host;
+
+    /// Store a memory entry.
+    export store: func(key: string, value: string) -> result<_, string>;
+
+    /// Recall a memory entry.
+    export recall: func(key: string) -> result<option<string>, string>;
+}

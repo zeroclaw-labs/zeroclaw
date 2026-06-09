@@ -1,0 +1,39 @@
+package zeroclaw:plugins@0.8.2;
+
+/// Approval workflow types for WASM plugin tool calls.
+///
+/// Mirrors the Rust `ApprovalResponse` / `ChannelApprovalResponse` shapes
+/// so that plugin code and the host agree on the serialization of operator
+/// decisions.
+interface approval {
+    /// A request to approve a tool call before execution.
+    record approval-request {
+        /// Canonical tool name (e.g. `http_request`, `file_write`).
+        tool-name: string,
+        /// JSON-encoded tool arguments.
+        arguments: string,
+    }
+
+    /// The operator's response to an approval request.
+    ///
+    /// This variant covers:
+    /// - CLI approvals (`yes`, `no`, `always`).
+    /// - Channel approvals (`approve`, `deny`, `always-approve`).
+    /// - Edited replacements (`deny-with-edit` maps to the host-side
+    ///   `ReplaceWith(replacement)` outcome).
+    variant approval-response {
+        /// Execute this one call.
+        yes,
+        /// Deny this call.
+        no,
+        /// Execute and add tool to session-scoped allowlist.
+        always,
+        /// Skip execution; return the supplied string as the tool result instead.
+        replace-with(string),
+        /// Deny the call and supply an edited replacement that becomes the tool
+        /// result fed back to the model.  Hosts MUST sanitize the replacement
+        /// (control-character stripping + char-boundary truncation) before
+        /// returning it to the agent loop.
+        deny-with-edit(string),
+    }
+}
