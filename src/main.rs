@@ -3683,7 +3683,7 @@ async fn main() -> Result<()> {
                     move |host, port, config, tx, reload_tx, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         Box::pin(async move {
-                            zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
                                 port,
                                 config,
@@ -3691,7 +3691,7 @@ async fn main() -> Result<()> {
                                 reload_tx,
                                 tui_registry,
                                 Some(canvas_store),
-                            )
+                            ))
                             .await
                         })
                     },
@@ -3700,11 +3700,11 @@ async fn main() -> Result<()> {
                 registry.register_channels(Box::new(move |config, cancel| {
                     let canvas_store = canvas_store_for_channels.clone();
                     Box::pin(async move {
-                        zeroclaw_channels::orchestrator::start_channels(
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
                             config,
                             Some(canvas_store),
                             cancel,
-                        )
+                        ))
                         .await
                     })
                 }));
