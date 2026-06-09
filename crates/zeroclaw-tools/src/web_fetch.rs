@@ -510,7 +510,7 @@ fn validate_target_url_with_dns_check(
     blocked_domains: &[String],
     allowed_private_hosts: &[String],
     tool_name: &str,
-    validate_dns: impl FnOnce(&str) -> anyhow::Result<()>,
+    validate_dns: impl FnOnce(&str, &[String]) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
     let url = raw_url.trim();
 
@@ -566,7 +566,7 @@ fn validate_target_url_with_dns_check(
     }
 
     if !private_host_allowed {
-        validate_dns(&host)?;
+        validate_dns(&host, allowed_private_hosts)?;
     }
 
     Ok(url.to_string())
@@ -758,7 +758,10 @@ fn is_private_or_local_host(host: &str) -> bool {
 }
 
 #[cfg(not(test))]
-fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+fn validate_resolved_host_is_public(
+    host: &str,
+    allowed_private_hosts: &[String],
+) -> anyhow::Result<()> {
     use std::net::ToSocketAddrs;
 
     let ips = (host, 0)
@@ -779,16 +782,23 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
         .map(|addr| addr.ip())
         .collect::<Vec<_>>();
 
-    validate_resolved_ips_are_public(host, &ips)
+    validate_resolved_ips_are_public(host, &ips, allowed_private_hosts)
 }
 
 #[cfg(test)]
-fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+fn validate_resolved_host_is_public(
+    _host: &str,
+    _allowed_private_hosts: &[String],
+) -> anyhow::Result<()> {
     // DNS checks are covered by validate_resolved_ips_are_public unit tests.
     Ok(())
 }
 
-fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> anyhow::Result<()> {
+fn validate_resolved_ips_are_public(
+    host: &str,
+    ips: &[std::net::IpAddr],
+    allowed_private_hosts: &[String],
+) -> anyhow::Result<()> {
     if ips.is_empty() {
         anyhow::bail!("Failed to resolve host '{host}'");
     }
@@ -799,7 +809,14 @@ fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> any
             std::net::IpAddr::V6(v6) => is_non_global_v6(*v6),
         };
         if non_global {
-            anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+            // The resolved address is private. Before rejecting, consult
+            // the private-host allowlist. For the wildcard `"*"` entry
+            // this is the first point where we know the host genuinely
+            // resolves to a private address, so we pass `true` for
+            // host_is_private_or_local. See #7412.
+            if !host_matches_private_allowlist(host, allowed_private_hosts, true) {
+                anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+            }
         }
     }
 
@@ -1343,7 +1360,7 @@ mod tests {
     #[test]
     fn resolved_private_ip_is_rejected() {
         let ips = vec!["127.0.0.1".parse().unwrap()];
-        let err = validate_resolved_ips_are_public("example.com", &ips)
+        let err = validate_resolved_ips_are_public("example.com", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-global address"));
@@ -1355,7 +1372,7 @@ mod tests {
             "93.184.216.34".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
         ];
-        let err = validate_resolved_ips_are_public("example.com", &ips)
+        let err = validate_resolved_ips_are_public("example.com", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-global address"));
@@ -1364,7 +1381,7 @@ mod tests {
     #[test]
     fn resolved_public_ips_are_allowed() {
         let ips = vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()];
-        assert!(validate_resolved_ips_are_public("example.com", &ips).is_ok());
+        assert!(validate_resolved_ips_are_public("example.com", &ips, &[]).is_ok());
     }
 
     // ── Firecrawl config parsing ────────────────────────────────────
@@ -1774,7 +1791,7 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| {
+            |_, _| {
                 panic!("DNS public-host validation should be skipped");
             },
         );
@@ -1797,12 +1814,13 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |host| {
+            |host, allowed_private_hosts| {
                 validate_resolved_ips_are_public(
                     host,
                     &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                         192, 168, 1, 5,
                     ))],
+                    allowed_private_hosts,
                 )
             },
         )
@@ -1827,12 +1845,44 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| anyhow::Ok(()),
+            |_, _| anyhow::Ok(()),
         )
         .unwrap_err()
         .to_string();
 
         assert!(err.contains("allowed_domains"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn private_allowlist_wildcard_allows_domain_resolving_to_private_ip() {
+        // #7412: `allowed_private_hosts = ["*"]` must cover domain names
+        // whose DNS resolution yields a non-global address, not just
+        // IP-literal / localhost / .local hosts.
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://internal.example.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |host, allowed_private_hosts| {
+                validate_resolved_ips_are_public(
+                    host,
+                    &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        198, 19, 66, 3,
+                    ))],
+                    allowed_private_hosts,
+                )
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "wildcard should allow DNS-resolved private host, got: {result:?}"
+        );
     }
 
     #[test]
@@ -1847,7 +1897,7 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| anyhow::bail!("blocklist should run before DNS validation"),
+            |_, _| anyhow::bail!("blocklist should run before DNS validation"),
         )
         .unwrap_err()
         .to_string();
