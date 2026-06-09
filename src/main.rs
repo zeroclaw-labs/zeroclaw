@@ -267,17 +267,17 @@ mod conscience;
 mod continuity;
 // conscience::cosmic_bridge expects `crate::cosmic` to resolve, so the
 // bin needs the cosmic module visible too (even though it's mostly
-// no-op without x0-broken-legacy's gated sub-modules).
+// no-op without x0-legacy's gated sub-modules).
 #[cfg(feature = "x0-extended")]
 mod cosmic;
-// The bin re-includes these x0-broken-legacy modules so sibling modules resolve
+// The bin re-includes these x0-legacy modules so sibling modules resolve
 // in the bin crate: tools/shell.rs → crate::runtime, cosmic/workspace.rs →
 // crate::quantum. The lib declares them under the same gate.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 mod consciousness;
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 mod quantum;
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-legacy")]
 mod runtime;
 #[cfg(feature = "x0-extended")]
 mod soul;
@@ -1382,9 +1382,9 @@ async fn main() -> Result<()> {
     // Install the consciousness orchestrator hook so every Agent built after
     // this point ticks the perceive→debate→decide→act→reflect loop once per
     // inbound message when config.consciousness.enabled is true. Gated behind
-    // x0-broken-legacy alongside the consciousness module itself.
+    // x0-legacy alongside the consciousness module itself.
     //   src/consciousness/hook.rs (HookHandler implementation)
-    #[cfg(feature = "x0-broken-legacy")]
+    #[cfg(feature = "x0-legacy")]
     crate::consciousness::hook::register_hook_factory();
 
     let cmd = apply_i18n_to_command(Cli::command());

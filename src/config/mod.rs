@@ -10,7 +10,7 @@ pub mod traits;
 
 // Fork-only ("x0") config types live in `zeroclaw_config::x0_extensions` and are
 // not re-exported at the crate root. Surface them through `crate::config::*` so
-// the x0-broken-legacy modules (onboard wizard, life, soul, runtime/wasm,
+// the x0-legacy modules (onboard wizard, life, soul, runtime/wasm,
 // delegate tools, wallet_pay) that predate the crate split keep resolving.
 pub use zeroclaw_config::x0_extensions::{
     AutonomyConfig, CognitiveConfig, ConsciousnessConfig, CosmicBrainConfig, CronConfig,
