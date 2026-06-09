@@ -59,142 +59,6 @@ impl ModelSwitchTool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::loop_::{clear_model_switch_request, get_model_switch_state};
-
-    static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn test_config() -> Config {
-        let mut config = Config::default();
-        config.providers.models.ensure("openai", "default").unwrap();
-        config.providers.models.ensure("custom", "local").unwrap();
-        config
-    }
-
-    fn tool() -> ModelSwitchTool {
-        ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(test_config()))
-    }
-
-    fn pending_switch() -> Option<(String, String)> {
-        get_model_switch_state().lock().unwrap().clone()
-    }
-
-    #[test]
-    fn set_rejects_bare_provider_family() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "openai",
-                "model": "gpt-4o"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("dotted `<type>.<alias>`"),
-            "unexpected error: {:?}",
-            result.error
-        );
-        assert_eq!(pending_switch(), None);
-    }
-
-    #[test]
-    fn set_accepts_dotted_provider_profile_ref() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "openai.default",
-                "model": "gpt-4o"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        assert_eq!(
-            pending_switch(),
-            Some(("openai.default".to_string(), "gpt-4o".to_string()))
-        );
-
-        clear_model_switch_request();
-    }
-
-    #[test]
-    fn set_rejects_unconfigured_provider_profile_ref() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "openai.missing",
-                "model": "gpt-4o"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("configured provider profile"),
-            "unexpected error: {:?}",
-            result.error
-        );
-        assert_eq!(pending_switch(), None);
-    }
-
-    #[test]
-    fn set_accepts_configured_custom_provider_profile_ref() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "custom.local",
-                "model": "local-model"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        assert_eq!(
-            pending_switch(),
-            Some(("custom.local".to_string(), "local-model".to_string()))
-        );
-
-        clear_model_switch_request();
-    }
-
-    #[test]
-    fn list_models_accepts_dotted_provider_profile_ref() {
-        let result = tool()
-            .handle_list_models(&json!({
-                "model_provider": "openai.default"
-            }))
-            .expect("list_models should return a tool result");
-
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        let output: serde_json::Value =
-            serde_json::from_str(&result.output).expect("output should be json");
-        assert_eq!(output["model_provider"], "openai.default");
-        assert!(
-            output["models"]
-                .as_array()
-                .expect("models should be an array")
-                .iter()
-                .any(|model| model == "gpt-4o")
-        );
-    }
-}
-
 #[async_trait]
 impl Tool for ModelSwitchTool {
     fn name(&self) -> &str {
@@ -468,5 +332,141 @@ impl ModelSwitchTool {
             }))?,
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::loop_::{clear_model_switch_request, get_model_switch_state};
+
+    static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.providers.models.ensure("openai", "default").unwrap();
+        config.providers.models.ensure("custom", "local").unwrap();
+        config
+    }
+
+    fn tool() -> ModelSwitchTool {
+        ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(test_config()))
+    }
+
+    fn pending_switch() -> Option<(String, String)> {
+        get_model_switch_state().lock().unwrap().clone()
+    }
+
+    #[test]
+    fn set_rejects_bare_provider_family() {
+        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
+        clear_model_switch_request();
+
+        let result = tool()
+            .handle_set(&json!({
+                "model_provider": "openai",
+                "model": "gpt-4o"
+            }))
+            .expect("set should return a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dotted `<type>.<alias>`"),
+            "unexpected error: {:?}",
+            result.error
+        );
+        assert_eq!(pending_switch(), None);
+    }
+
+    #[test]
+    fn set_accepts_dotted_provider_profile_ref() {
+        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
+        clear_model_switch_request();
+
+        let result = tool()
+            .handle_set(&json!({
+                "model_provider": "openai.default",
+                "model": "gpt-4o"
+            }))
+            .expect("set should return a tool result");
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert_eq!(
+            pending_switch(),
+            Some(("openai.default".to_string(), "gpt-4o".to_string()))
+        );
+
+        clear_model_switch_request();
+    }
+
+    #[test]
+    fn set_rejects_unconfigured_provider_profile_ref() {
+        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
+        clear_model_switch_request();
+
+        let result = tool()
+            .handle_set(&json!({
+                "model_provider": "openai.missing",
+                "model": "gpt-4o"
+            }))
+            .expect("set should return a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("configured provider profile"),
+            "unexpected error: {:?}",
+            result.error
+        );
+        assert_eq!(pending_switch(), None);
+    }
+
+    #[test]
+    fn set_accepts_configured_custom_provider_profile_ref() {
+        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
+        clear_model_switch_request();
+
+        let result = tool()
+            .handle_set(&json!({
+                "model_provider": "custom.local",
+                "model": "local-model"
+            }))
+            .expect("set should return a tool result");
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert_eq!(
+            pending_switch(),
+            Some(("custom.local".to_string(), "local-model".to_string()))
+        );
+
+        clear_model_switch_request();
+    }
+
+    #[test]
+    fn list_models_accepts_dotted_provider_profile_ref() {
+        let result = tool()
+            .handle_list_models(&json!({
+                "model_provider": "openai.default"
+            }))
+            .expect("list_models should return a tool result");
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: serde_json::Value =
+            serde_json::from_str(&result.output).expect("output should be json");
+        assert_eq!(output["model_provider"], "openai.default");
+        assert!(
+            output["models"]
+                .as_array()
+                .expect("models should be an array")
+                .iter()
+                .any(|model| model == "gpt-4o")
+        );
     }
 }
