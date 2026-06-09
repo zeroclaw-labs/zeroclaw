@@ -708,7 +708,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_search_tool and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n\
+             - Present the final answer to the latest user message directly from the \
+               tool results, without narrating delayed/internal tool-execution bookkeeping.",
         ),
         "qq" => Some(
             "When responding on QQ:\n\
@@ -16324,6 +16329,44 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("[IMAGE:<absolute-path>]"),
             "discord block must show the absolute-path marker form"
+        );
+    }
+
+    // Regression guard for #6646: web_search_tool / web_fetch never fired via
+    // the Telegram channel because the delivery-instructions block told the
+    // model to "answer the latest user message directly" and to "use tool
+    // results silently". On a small OpenAI-compatible local model that reads as
+    // "answer from memory, do not call tools", so the agent hallucinated with
+    // zero tool activity — while the identical query worked via CLI and the web
+    // dashboard, which do not inject this Telegram-only block. The block must
+    // encourage tool use for real-time/external information and must not tell
+    // the model to answer directly *instead of* using tools.
+    #[test]
+    fn channel_delivery_instructions_for_telegram_encourage_tool_use() {
+        let block = channel_delivery_instructions("telegram")
+            .expect("telegram channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Telegram:"),
+            "telegram block must identify itself"
+        );
+        // Positive: it must actively steer the model toward its tools for
+        // real-time/external information.
+        assert!(
+            block.contains("use your tools"),
+            "telegram block must instruct the model to use its tools"
+        );
+        assert!(
+            block.contains("web_search_tool") && block.contains("web_fetch"),
+            "telegram block must name the real-time tools so the model knows to reach for them"
+        );
+        assert!(
+            block.contains("never guess or answer from memory alone"),
+            "telegram block must forbid answering from memory when a tool can verify"
+        );
+        // Negative: the exact regressed phrasing must never come back.
+        assert!(
+            !block.contains("Use tool results silently: answer the latest user message directly"),
+            "telegram block must not tell the model to answer directly instead of using tools (#6646)"
         );
     }
 
