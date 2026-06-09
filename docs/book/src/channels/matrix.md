@@ -16,8 +16,8 @@ If Matrix appears connected but there's no reply, validate these first:
 
 1. Sender is in the agent's peer set (for testing: `external_peers = ["*"]`).
 2. Bot account has joined the exact target room.
-3. Token belongs to the same bot account (`whoami` check, see §5C).
-4. Encrypted room has usable device identity (`device_id`) and key sharing.
+3. Credentials belong to the bot account (`whoami` check on the token path, see [§5C](#c-token-and-identity)).
+4. Encrypted room can be decrypted: `recovery_key` set (recommended) or keys shared to the bot device.
 5. Daemon was restarted after config changes.
 
 ## 1. Requirements
@@ -25,10 +25,10 @@ If Matrix appears connected but there's no reply, validate these first:
 Before testing message flow:
 
 1. The bot account is joined to the target room.
-2. The access token belongs to the same bot account.
+2. Credentials authenticate the bot account: either `user_id` + `password` (recommended, see [§2](#2-configuration)) or an `access_token` (token path, [§3](#3-token-path-alternative-obtaining-access_token-and-device_id)).
 3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Each entry is either a canonical room ID (`!room:server`) or an alias (`#alias:server`); ZeroClaw resolves aliases.
-4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing, see §6).
-5. For E2EE rooms, the bot device has received encryption keys for the room.
+4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing, see [§6](#b-sender-allowlist-peer-groups)).
+5. For E2EE rooms, the bot can decrypt: a `recovery_key` (recommended) restores keys automatically, or keys are shared to the bot device manually.
 
 ## 2. Configuration
 
@@ -36,24 +36,70 @@ Matrix is configured as a `[channels.matrix.<alias>]` block. Set it through any 
 
 {{#config-where channels}}
 
+### Recommended setup: password + recovery key
+
+The official, lowest-friction way to run Matrix is to let ZeroClaw log in
+fresh and manage its own device identity:
+
+- **Omit `device_id`.** Let the homeserver assign one at login. ZeroClaw
+  saves the assigned id to `session.json` and reuses it on every restart, so
+  there is no value for you to look up, copy, or keep in sync. Pinning a
+  `device_id` by hand is the single most common source of broken key sharing.
+- **Omit `access_token`.** When it is unset, ZeroClaw falls back to password
+  login. A fresh login is also what the auto-recovery path ([§8](#8-auto-recovery-from-corrupted-local-state)) uses, so the
+  bot self-heals from corrupted local state without operator action.
+- **Set `password`.** With `access_token` absent, `user_id` + `password`
+  perform the login.
+- **Set `recovery_key`.** This restores room keys from server-side backup and
+  cross-signs the freshly registered device automatically on every startup:
+  no emoji verification, no manual key sharing, no bootstrap. See [§5I](#i-recovery-key-recommended-for-e2ee) for how
+  to get it from Element.
+
+So a complete recommended block sets `homeserver`, `user_id`, `password`, and
+`recovery_key`, and leaves `access_token` and `device_id` unset.
+
+The `access_token` + `device_id` path ([§3](#3-token-path-alternative-obtaining-access_token-and-device_id)) still works and is documented in
+full for operators who must reuse a pre-existing token, but it requires you to
+keep a stable `device_id` yourself, so prefer password + recovery key unless
+you have a specific reason not to.
+
 {{#secret-config channels.matrix.<alias>.access_token}}
 
 The same applies to `password` and `recovery_key`.
 
-`homeserver` and `access_token` are required; `user_id` and `device_id` are strongly recommended for E2EE; `allowed_rooms` optionally restricts which rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to-the-agent). Full field index: [config reference](../reference/config.md#channels).
+`homeserver` is required. For the recommended setup, also set `user_id`,
+`password`, and `recovery_key`. `access_token` and `device_id` are only needed
+for the token-based path in [§3](#3-token-path-alternative-obtaining-access_token-and-device_id); `allowed_rooms` optionally restricts which
+rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to-the-agent). Full field index: [config reference](../reference/config.md#channels).
 
-> **Don't have an `access_token` yet?** See §3 below: it walks through the Matrix password-login API call that mints a token plus a stable `device_id` in one shot. If you only need to look up `device_id` for a token you already have, see §5H.
+> **Don't have a `recovery_key` yet?** See [§5I](#i-recovery-key-recommended-for-e2ee): it walks through generating one
+> in Element. Going the token route instead? See [§3](#3-token-path-alternative-obtaining-access_token-and-device_id) for the password-login API
+> call that mints an `access_token` plus a stable `device_id` in one shot. To
+> look up `device_id` for a token you already have, see [§5H](#h-finding-device_id-for-an-existing-token).
 
 ### About `user_id` and `device_id`
 
-- ZeroClaw attempts to read identity from Matrix `/_matrix/client/v3/account/whoami`.
-- If `whoami` doesn't return `device_id`, set `device_id` manually: critical for E2EE session restore.
+- For the recommended password + recovery-key setup, set `user_id` and leave
+  `device_id` unset: the homeserver assigns and ZeroClaw persists it.
+- ZeroClaw reads identity from Matrix `/_matrix/client/v3/account/whoami`.
+- Only on the `access_token` path do you set `device_id` manually: a token
+  login carries a device the server already minted, and ZeroClaw needs that
+  exact id for E2EE session restore (see [§5H](#h-finding-device_id-for-an-existing-token) to find it).
 
-## 3. Obtaining `access_token` and `device_id`
+## 3. Token path (alternative): obtaining `access_token` and `device_id`
 
-Brand-new bot accounts need a Matrix access token before ZeroClaw can connect. Element doesn't expose the token directly, so the canonical path is a one-shot password-login API call that returns both the access token and a stable device ID together.
+> [!IMPORTANT]
+> This section is for the `access_token` path only. If you followed the
+> recommended password + recovery-key setup in [§2](#2-configuration), you can skip it: you do not
+> need an access token or a hand-managed `device_id`.
 
-If your operator account already has a token (e.g. you copied it from another deployment), skip to §4. If you only need to look up the `device_id` for an existing token, see §5H Option 1 (`whoami`) or Option 2 (Element).
+Use this path when you must reuse a pre-existing token (for example one copied
+from another deployment). Element doesn't expose the token directly, so the
+canonical way to mint one is a one-shot password-login API call that returns
+both the access token and a stable device ID together. The token login carries
+a device, so on this path `device_id` is required and must stay stable.
+
+If your operator account already has a token, skip to [§4](#4-quick-validation). If you only need to look up the `device_id` for an existing token, see [§5H](#h-finding-device_id-for-an-existing-token) Option 1 (`whoami`) or Option 2 (Element).
 
 ### Step 1: Mint a token via password login
 
@@ -83,14 +129,14 @@ Put `access_token`, `device_id`, and `user_id` from the response into your `[cha
 
 ### Notes
 
-- **Keep a copy of the token** when you first paste it. Secrets are encrypted at rest and `zeroclaw config get` will print `[masked]` for the token field; you can't retrieve it later. Stash it in a scratch note if you'll need it for the curl validation snippets in §5C.
-- **Reuse the same `device_id` on every restart**: changing it forces a new server-side device registration, which breaks key sharing and verification in encrypted rooms. The auto-recovery path in §8 handles the rare cases where wiping is genuinely the right call.
+- **Keep a copy of the token** when you first paste it. Secrets are encrypted at rest and `zeroclaw config get` will print `[masked]` for the token field; you can't retrieve it later. Stash it in a scratch note if you'll need it for the curl validation snippets in [§5C](#c-token-and-identity).
+- **Reuse the same `device_id` on every restart**: changing it forces a new server-side device registration, which breaks key sharing and verification in encrypted rooms. The auto-recovery path in [§8](#8-auto-recovery-from-corrupted-local-state) handles the rare cases where wiping is genuinely the right call.
 - **Rotating the access token later** without re-running the wizard: update the `access_token` field in your config (see [§2](#2-configuration)), then `zeroclaw service restart`.
 - **Token shows as expired or invalid** at startup: mint a new one with the same curl, repeat Step 2.
 
 ## 4. Quick validation
 
-Apply the field set in §2 if you haven't yet, then restart with `zeroclaw service restart` (background) or `zeroclaw daemon` (foreground). Send a plain-text message in the configured Matrix room. Confirm:
+Apply the field set in [§2](#2-configuration) if you haven't yet, then restart with `zeroclaw service restart` (background) or `zeroclaw daemon` (foreground). Send a plain-text message in the configured Matrix room. Confirm:
 
 - ZeroClaw logs show the Matrix listener starting with no repeated sync/auth errors.
 - In an encrypted room, the bot can read and reply to encrypted messages from allowed users.
@@ -110,7 +156,7 @@ The sender must be in the agent's peer set, see [Who can talk to the agent](#who
 
 ### C. Token and identity
 
-Secrets are encrypted at rest and not retrievable: `zeroclaw config get` prints `[masked]` for any secret field. To run the checks below, use the access token you minted in §3 (or mint a fresh one) and your own homeserver URL.
+Secrets are encrypted at rest and not retrievable: `zeroclaw config get` prints `[masked]` for any secret field. To run the checks below, use the access token you minted in [§3](#3-token-path-alternative-obtaining-access_token-and-device_id) (or mint a fresh one) and your own homeserver URL.
 
 Validate the token server-side:
 
@@ -126,7 +172,7 @@ curl -sS -H "Authorization: Bearer <access_token>" \
 </div>
 
 - Returned `user_id` must match the bot account.
-- If `device_id` is missing from the response, set it manually (see §5H).
+- If `device_id` is missing from the response, set it manually (see [§5H](#h-finding-device_id-for-an-existing-token)).
 - Rotate the access token: update the `access_token` field in your config (see [§2](#2-configuration)), then `zeroclaw service restart`.
 
 ### D. E2EE-specific checks
@@ -134,7 +180,7 @@ curl -sS -H "Authorization: Bearer <access_token>" \
 - The bot device must have received room keys from trusted devices.
 - If keys haven't been shared to this device, encrypted events cannot be decrypted.
 - Verify device trust and key sharing from a trusted Matrix session.
-- `matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found`: key backup recovery isn't enabled on this device yet. Non-fatal for message flow; still worth completing (see §5I).
+- `matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found`: key backup recovery isn't enabled on this device yet. Non-fatal for message flow; still worth completing (see [§5I](#i-recovery-key-recommended-for-e2ee)).
 - If recipients see bot messages as "unverified", verify/sign the bot device from a trusted Matrix session and keep `device_id` stable across restarts.
 
 ### E. Log levels
@@ -163,9 +209,17 @@ After config changes, restart the daemon and send a new message. Old timeline hi
 
 ### H. Finding `device_id` for an existing token
 
-Use this when you already have an access token (e.g. inherited from another deployment) and need to look up its `device_id`. For brand-new bots, see §3: the password-login flow there returns both values together.
+You only need this on the `access_token` path ([§3](#3-token-path-alternative-obtaining-access_token-and-device_id)). The recommended password +
+recovery-key setup omits `device_id` entirely: the homeserver assigns one and
+ZeroClaw persists it, so there is nothing to look up. If you have switched to
+the recommended setup, skip this section.
 
-ZeroClaw needs a stable `device_id` for E2EE session restore. Without it, a new device is registered every restart, breaking key sharing and device verification.
+If you really must pin a `device_id` (because you are reusing an existing
+access token rather than logging in with a password), use this to find the one
+bound to that token. For brand-new bots on the token path, see [§3](#3-token-path-alternative-obtaining-access_token-and-device_id): the
+password-login flow there returns both values together.
+
+ZeroClaw needs a stable `device_id` for E2EE session restore on the token path. Without it, a new device is registered every restart, breaking key sharing and device verification.
 
 #### Option 1: `whoami` (easiest)
 
@@ -186,7 +240,7 @@ Response includes `device_id` if the token is bound to a device session:
 {"user_id": "@bot:example.com", "device_id": "ABCDEF1234"}
 ```
 
-If `device_id` is missing, the token was created without a device login (e.g. via the admin API). Mint a new token + device_id together via §3.
+If `device_id` is missing, the token was created without a device login (e.g. via the admin API). Mint a new token + device_id together via [§3](#3-token-path-alternative-obtaining-access_token-and-device_id).
 
 #### Option 2: From Element or another Matrix client
 
@@ -263,7 +317,7 @@ A fresh login creates a new device with a new `device_id`, sidestepping the OTK 
 
 - `Our own device might have been deleted`: harmless; old device is gone.
 - `Failed to decrypt a room event`: old messages from before the reset; unrecoverable.
-- `Matrix E2EE recovery successful`: room keys restored from server backup (only if `recovery_key` is set; see §5I).
+- `Matrix E2EE recovery successful`: room keys restored from server backup (only if `recovery_key` is set; see [§5I](#i-recovery-key-recommended-for-e2ee)).
 - New messages decrypt and work normally.
 
 **Prevention:** Don't delete the local state directory without planning a fresh login. If you need a fresh start, get new credentials first, then delete the store, then update config.
