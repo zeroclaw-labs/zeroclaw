@@ -1,0 +1,113 @@
+# Agents
+
+Agents are the star of a ZeroClaw deployment. Everything else in this book, the
+providers, the channels, the security profiles, the skills, the memory, exists
+so that an agent can use it. This section is the showcase; the rest of the docs
+are the credits.
+
+{{#include ../_snippets/concept-multi-agent.md}}
+
+## An agent is a join
+
+An agent is not a program you install. It is a named row, `[agents.<alias>]`,
+that **joins** two halves:
+
+- **Config references** (the relational side): pointers to things configured
+  elsewhere, a model provider, a risk profile, a runtime profile, channels,
+  skill / knowledge / MCP bundles, cron jobs. Each is a dotted alias. The agent
+  owns none of these; it points at them, and many agents can point at the same
+  one or diverge freely.
+- **Filesystem components** (the on-disk side): a per-agent workspace directory,
+  a memory backend, and an identity (personality) source. This is where the
+  relational graph meets a concrete directory tree.
+
+```mermaid
+flowchart LR
+    subgraph References["Config references (relational)"]
+        MP["model provider"]
+        RP["risk profile"]
+        RT["runtime profile"]
+        CH["channels"]
+        PG["peer groups"]
+        SB["skill / knowledge / MCP bundles"]
+        CR["cron jobs"]
+    end
+
+    A(["agents.&lt;alias&gt;"])
+
+    subgraph Filesystem["Filesystem components (on-disk)"]
+        WS["workspace/"]
+        MEM["memory store"]
+        ID["identity / personality"]
+    end
+
+    MP --- A
+    RP --- A
+    RT --- A
+    CH --- A
+    PG --- A
+    SB --- A
+    CR --- A
+    A --- WS
+    A --- MEM
+    A --- ID
+```
+
+Each reference is a link back to its own section, the credits: model providers
+live in [Model Providers](../providers/overview.md), the profiles in
+[Security & Autonomy](../security/autonomy.md), channels in
+[Channels](../channels/overview.md), peer groups in
+[Peer Groups](../channels/peer-groups.md), bundles in [Tools](../tools/overview.md).
+
+## Multi-agent from the jump
+
+There is no privileged "the agent." The runtime holds a map of agents keyed by
+alias; a single-agent install is just a map of size one. You do not start with
+one bot and bolt on more later, you add agents and wire each one, and they
+coexist from the first line of config.
+
+Because each agent joins its own references and its own filesystem, agents can
+share some axes and diverge on others independently. Two agents might share one
+model provider but run under different risk profiles, answer on different
+channels, and keep entirely separate memory, while being able to talk to each
+other on a channel where they share a peer group.
+
+```mermaid
+flowchart TB
+    subgraph Agents
+        R(["agents.researcher"])
+        S(["agents.support"])
+    end
+
+    PROV["openrouter.prod<br/>(shared provider)"]
+    RP1["hardened<br/>(risk profile)"]
+    RP2["permissive<br/>(risk profile)"]
+    DISCORD["discord.main"]
+    SLACK["slack.helpdesk"]
+    PEER["peer group<br/>on discord.main"]
+
+    R --- PROV
+    S --- PROV
+    R --- RP1
+    S --- RP2
+    R --- DISCORD
+    S --- SLACK
+    R -. peers .- PEER
+    S -. peers .- PEER
+```
+
+A SubAgent is the short-lived exception to coexistence: an agent can spawn an
+ephemeral SubAgent that inherits the parent's identity and security policy for a
+single task. See [SubAgents](../architecture/subagents.md).
+
+## Where to go next
+
+- [Anatomy of an agent](./anatomy.md): every field on `[agents.<alias>]`, and
+  what each reference points at.
+- [Filesystem components](./filesystem.md): the workspace, memory, and identity
+  that live on disk per agent.
+- [Running agents](./operating.md): addressing agents, coexistence, and how an
+  agent surfaces in the zerocode Code and Chat panes.
+
+For the runtime internals, the permission model, the memory model, and the
+agent loop, see [Architecture → Multi-agent runtime](../architecture/multi-agent.md).

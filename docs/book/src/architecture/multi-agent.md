@@ -1,6 +1,6 @@
 # Multi-agent runtime
 
-This page documents the architecture and operator-facing surface of the multi-agent runtime. The doc is intentionally short: for the schema-level field reference, see [Config](../reference/config.md); for live setup steps, see [Multi-agent setup](../contributing/multi-agent-setup.md).
+This page documents the architecture and operator-facing surface of the multi-agent runtime. The doc is intentionally short: for the user-facing guide to configuring and running agents, see [Agents](../agents/overview.md); for the schema-level field reference, see [Config](../reference/config.md); for live setup steps, see [Multi-agent setup](../contributing/multi-agent-setup.md).
 
 ## Vocabulary
 

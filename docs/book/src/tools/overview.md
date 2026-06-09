@@ -4,6 +4,8 @@
 
 Tools are not to be confused with `zeroclaw` CLI subcommands. CLI commands are for operators; tools are for the agent.
 
+An agent gets its tools through the skill, knowledge, and MCP bundles it references; see [Agents](../agents/overview.md) for how bundles attach to an agent.
+
 ## Built-in tools
 
 A minimal build ships with:

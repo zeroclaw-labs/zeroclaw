@@ -3,7 +3,8 @@
 A **peer group** declares who an agent accepts inbound messages from on a
 channel, and which other agents it can exchange messages with there. It is the
 inbound gate for chat channels and the routing primitive for cross-agent
-dispatch. In config it lives at `[peer_groups.<name>]`.
+dispatch. In config it lives at `[peer_groups.<name>]`. For how peer groups fit
+into an agent's wiring, see [Agents](../agents/overview.md).
 
 Inbound senders are gated against the **peer set** resolved for the bound
 agent, drawn from every `[peer_groups.<name>]` block the agent belongs to.
