@@ -32,9 +32,19 @@ Use assignees for active work. Use area stewardship for routing responsibility w
 
 ## Canonical spelling
 
-Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `tool:security`, and similar labels. The size and risk families intentionally keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`.
+Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `security:policy`, and similar labels. The size, risk, and most type families currently keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`, and `type: docs`.
 
-Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Future no-space spelling for size, risk, or type labels is also a migration question, not a casual rename. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+
+## Automation contract
+
+Live PR label automation is split by source. `pr-path-labeler.yml` runs `actions/labeler` from `.github/labeler.yml` on PR open, reopen, and every pushed update. Because that workflow uses `sync-labels: true`, labels owned by `.github/labeler.yml` are recalculated from the current PR file set: matching path labels are added, and path labels that no longer match are removed.
+
+Dependabot also seeds configured labels on its own PRs from `.github/dependabot.yml`: Cargo updates get `dependencies`; GitHub Actions and Docker updates get `ci` and `dependencies`. Those labels are initial Dependabot PR metadata, not the synchronized path-labeler contract.
+
+Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
+
+If risk or size automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk: manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
 
 ## Cleanup protocol
 
@@ -62,7 +72,7 @@ Type labels capture the high-level work class. They are separate from path label
 
 ## Path labels
 
-Applied automatically by `pr-path-labeler.yml` (the only labeling automation currently active). Globs live in `.github/labeler.yml`.
+Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.yml`; when this page and the config disagree, treat `.github/labeler.yml` as the operational source and update this page.
 
 ### Base scope labels
 
@@ -173,7 +183,7 @@ Tools are grouped by logical function rather than one label per file.
 
 ## Size labels
 
-Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**: the size automation that previously computed these was removed during CI simplification.
+Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**; the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
 
 | Label | Threshold |
 |---|---|
@@ -185,7 +195,7 @@ Based on effective changed line count, normalized for docs-only and lockfile-hea
 
 ## Risk labels
 
-For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**.
+For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**. Future risk automation should follow the [automation contract](#automation-contract).
 
 | Label | Meaning |
 |---|---|

@@ -27,7 +27,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 
 When uncertain, treat as higher risk.
 
-If the path-labeler's risk inference is contextually wrong, apply `risk: manual` and set the final `risk:*` label explicitly: manual freezes any future automated recalculation.
+Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk: manual` when a maintainer correction should not be overwritten on the next pushed update.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -120,7 +120,7 @@ When review demand exceeds capacity:
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label**: add `risk: manual`, then set the intended `risk:*` label.
+1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk: manual`.
 2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
 3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
 4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.

@@ -27,7 +27,11 @@ Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tre
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
-Auto-applies path/scope labels based on changed file paths, from `.github/labeler.yml` (`sync-labels: true`). It does not set `risk:*` or `size:*` labels; those are applied manually (see [Labels](./labels.md)). Runs silently on every PR; if a PR is missing labels, check whether the paths in `.github/labeler.yml` cover the changes.
+Auto-applies path and scope labels based on changed files. It runs on PR open, reopen, and every pushed update to the PR branch. Because `sync-labels: true` is enabled, labels defined in `.github/labeler.yml` are recalculated from the current PR file set.
+
+This workflow does not currently apply `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels. If a PR is missing a path/scope label, check whether the paths in `.github/labeler.yml` cover the changes.
+
+Dependabot has separate label configuration in `.github/dependabot.yml` for its own PRs. Cargo update PRs start with `dependencies`; GitHub Actions and Docker update PRs start with `ci` and `dependencies`.
 
 ### Validate PR title (`pr-title.yml`)
 
