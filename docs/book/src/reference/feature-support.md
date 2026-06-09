@@ -1,8 +1,8 @@
 # Feature support matrix
 
-This page is a compact map of the ZeroClaw surface and how it relates to nearby Claw-family projects. It shows what ZeroClaw supports today, what is experimental or partial, and where to read the canonical docs. It is a starting point for users choosing a setup, not a replacement for the detailed setup guides.
+This page compares ZeroClaw support against nearby Claw-family runtimes and deployment shapes. It is meant to answer "which claw supports this?" quickly, then point readers to the canonical docs for details.
 
-When a row says "planned" or "needs verification", it is not claiming current support. Follow the linked issue, RFC, or docs page before building on that area.
+The matrix is conservative. A row marked "planned" or "needs verification" is not a current support claim; follow the linked docs, issue, or foundation note before relying on it.
 
 ## Status legend
 
@@ -15,123 +15,67 @@ When a row says "planned" or "needs verification", it is not claiming current su
 | Needs verification | The project needs a current source/docs pass before making a support claim. |
 | Not planned | The project does not currently intend to support this shape. |
 
-## Project comparison
+## Runtime and deployment matrix
 
-The original feature-matrix request was also a comparison request: users need to know when to choose ZeroClaw instead of OpenClaw, PicoClaw, NanoBot, or a hosted/cloud deployment shape. This table keeps that comparison factual. It links to external project docs where the source of truth lives and avoids claiming parity that this repository has not audited.
+| Capability | ZeroClaw | OpenClaw | PicoClaw | NanoClaw-style lightweight runtime | Hosted/cloud shape | Evidence |
+|---|---|---|---|---|---|---|
+| Primary fit | Supported: user-owned Rust agent runtime for local machines, services, gateways, VPS/cloud VMs, SBCs, hardware experiments, and plugin-oriented future work. | Needs verification: legacy/source project context for users coming from the earlier TypeScript runtime; this page does not claim full parity. | Partial: related external Go runtime focused on small deployments; use PicoClaw docs for PicoClaw claims. | Needs verification: comparison category for minimal assistant runtimes, not a ZeroClaw compatibility target. | Partial: ZeroClaw can run on cloud infrastructure, but the project does not describe itself as a managed service. | [Project philosophy](../philosophy.md), [Quick start](../getting-started/quick-start.md), [FND-001](../foundations/fnd-001-intentional-architecture.md), [PicoClaw repository](https://github.com/sipeed/picoclaw), [Issue #6810](https://github.com/zeroclaw-labs/zeroclaw/issues/6810) |
+| Local CLI agent | Supported: default local install, onboarding, configuration, and run path. | Needs verification: parity audit still needed. | Needs verification: external runtime; check PicoClaw docs. | Needs verification. | Not planned: hosted-only operation is not ZeroClaw's local CLI shape. | [Quick start](../getting-started/quick-start.md) |
+| Desktop OS installs | Supported: Linux, macOS, Windows, and FreeBSD setup docs exist. | Needs verification. | Needs verification. | Needs verification. | Partial: can be installed on cloud VMs where OS support matches. | [Linux](../setup/linux.md), [macOS](../setup/macos.md), [Windows](../setup/windows.md), [FreeBSD](../setup/freebsd.md) |
+| Daemon or service mode | Supported: user/system service scopes, restart behavior, shutdown grace, and resource limits are documented. | Needs verification. | Needs verification. | Needs verification. | Supported: service mode is the normal VPS/cloud VM shape. | [Service management](../setup/service.md), [Service & daemon](../ops/service.md) |
+| Gateway and web UI | Supported: REST, WebSocket, pairing/bearer auth, runtime-generated OpenAPI docs, and dashboard serving are documented. | Needs verification. | Needs verification. | Needs verification. | Supported when the operator exposes the gateway through a reverse proxy, tunnel, or public bind. | [Gateway HTTP API](../gateway/api.md), [Web dashboard](../gateway/web-dashboard.md), [Network deployment](../ops/network-deployment.md) |
+| Container / OCI deployment | Supported: GHCR images, Compose, Kubernetes fragments, and ingress notes are documented. | Needs verification. | Needs verification. | Needs verification. | Supported: container deployment is the clearest cloud/VPS packaging path. | [Docker & containers](../setup/container.md), [Network deployment](../ops/network-deployment.md) |
+| Desktop app / Tauri | Partial: desktop build and release machinery exists, but the user-facing install/support story is not yet on the same footing as OS setup docs. | Needs verification. | Not planned by ZeroClaw docs. | Needs verification. | Not planned: this is not a managed cloud shape. | [Release runbook](../maintainers/release-runbook.md), [Issue #6810](https://github.com/zeroclaw-labs/zeroclaw/issues/6810) |
+| SBC / edge deployment | Experimental: Raspberry Pi and hardware docs exist, but hardware builds require feature flags and device permissions. | Needs verification. | Partial: related external project advertises small hardware focus; verify in PicoClaw docs. | Needs verification. | Partial: cloud deployment is documented separately from device-edge operation. | [Raspberry Pi](../hardware/raspberry-pi-setup.md), [Hardware overview](../hardware/index.md), [PicoClaw hardware list](https://github.com/sipeed/picoclaw/blob/main/docs/hardware-compatibility.md) |
+| Hardware / peripheral use | Experimental: GPIO, I2C, SPI, board-specific guides, and adapter notes exist behind hardware features. | Needs verification. | Needs verification: external project. | Needs verification. | Not planned as a managed-cloud capability; hardware access belongs to local/edge hosts. | [Hardware overview](../hardware/index.md), [STM32 Nucleo](../hardware/nucleo-setup.md), [Arduino Uno Q](../hardware/arduino-uno-q-setup.md), [Aardvark](../hardware/aardvark.md), [Android](../hardware/android-setup.md) |
+| Multi-instance / horizontal scaling | Not planned: one ZeroClaw instance owns one workspace; run separate instances for separate agents/workspaces. | Needs verification. | Needs verification. | Needs verification. | Partial: cloud operators can run separate instances, but not multiple writers against one workspace. | [Docker & containers](../setup/container.md), [Service & daemon](../ops/service.md) |
 
-| Option | Best fit | Current relationship to ZeroClaw | Evidence |
-|---|---|---|---|
-| ZeroClaw | A user-owned Rust agent runtime for local machines, services, gateways, VPS/cloud VMs, SBCs, hardware/peripheral experiments, and plugin-oriented future work. | This page documents ZeroClaw's current support surface. ZeroClaw owns the support claims below. | [Project philosophy](../philosophy.md), [Quick start](../getting-started/quick-start.md), [FND-001](../foundations/fnd-001-intentional-architecture.md) |
-| OpenClaw | Legacy/source project context for users coming from the earlier TypeScript runtime. | ZeroClaw was bootstrapped from OpenClaw code, but this page does not yet claim full feature parity. A dedicated parity audit is still needed before closing the comparison request. | [FND-001](../foundations/fnd-001-intentional-architecture.md), [Issue #6810](https://github.com/zeroclaw-labs/zeroclaw/issues/6810) |
-| PicoClaw | External Go runtime focused on very low resource use, broad architecture support, and small hardware deployments. | PicoClaw is a related external project, not a ZeroClaw compatibility target. Use PicoClaw docs for PicoClaw feature claims; use this page for ZeroClaw claims. | [PicoClaw repository](https://github.com/sipeed/picoclaw), [PicoClaw hardware list](https://github.com/sipeed/picoclaw/blob/main/docs/hardware-compatibility.md) |
-| NanoBot | External Python lightweight assistant inspired by OpenClaw, useful as another comparison point for minimal assistant runtimes. | NanoBot is related comparison context only. Current ZeroClaw docs do not define a NanoBot compatibility target. | [NanoBot repository](https://github.com/HKUDS/nanobot) |
-| Hosted or managed cloud alternatives | Users who want a managed service rather than a self-owned runtime. | ZeroClaw supports running on a VPS/cloud VM and integrating hosted model providers, but the docs do not describe ZeroClaw itself as a managed cloud service. | [Project philosophy](../philosophy.md), [Docker & containers](../setup/container.md), [Network deployment](../ops/network-deployment.md) |
+## Provider and model matrix
 
-Comparison status:
+| Capability | ZeroClaw | OpenClaw | PicoClaw | NanoClaw-style lightweight runtime | Hosted/cloud shape | Evidence |
+|---|---|---|---|---|---|---|
+| Native provider catalog | Supported: typed provider slots and current provider families are documented in the catalog. | Needs verification. | Needs verification. | Needs verification. | Supported through hosted provider accounts configured in ZeroClaw. | [Provider catalog](../providers/catalog.md), [Providers overview](../providers/overview.md) |
+| OpenAI-compatible endpoints | Supported: canonical compatible slots plus `custom` endpoints with `uri`. | Needs verification. | Needs verification. | Needs verification. | Supported when the cloud provider exposes a compatible endpoint. | [Provider catalog](../providers/catalog.md), [Custom providers](../providers/custom.md) |
+| Local model providers | Supported: local and local-server provider slots are documented. | Needs verification. | Needs verification. | Needs verification. | Partial: possible on cloud hosts with local model servers, but resource requirements are operator-owned. | [Provider catalog](../providers/catalog.md), [Providers overview](../providers/overview.md) |
+| Per-agent routing | Supported: agents reference providers by alias; routing is explicit rather than a single global default. | Needs verification. | Needs verification. | Needs verification. | Supported where the same config is deployed on a cloud/VPS host. | [Providers overview](../providers/overview.md), [Provider routing](../providers/routing.md) |
+| Streaming text and tool calls | Supported: streaming deltas and mid-stream tool calls are runtime-supported, with provider-specific variation. | Needs verification. | Needs verification. | Needs verification. | Supported when the selected hosted provider and channel support streaming. | [Streaming](../providers/streaming.md), [Provider catalog](../providers/catalog.md) |
+| Reasoning, vision, and grounded search | Partial: supported where provider/model behavior exists; coverage is not uniform across the catalog. | Needs verification. | Needs verification. | Needs verification. | Partial: depends on the hosted provider and model. | [Streaming](../providers/streaming.md), [Provider catalog](../providers/catalog.md) |
 
-- **Covered here:** ZeroClaw's current runtime, deployment, provider, channel, tool, security, hardware, and plugin support.
-- **Partially covered here:** the high-level relationship between ZeroClaw, OpenClaw, PicoClaw, NanoBot, and cloud-hosted deployment shapes.
-- **Still deferred:** a row-by-row OpenClaw-to-ZeroClaw parity audit. That should compare concrete user-facing capabilities, not only roadmap documents.
+## Channel and integration matrix
 
-## Runtime and deployment
+| Capability | ZeroClaw | OpenClaw | PicoClaw | NanoClaw-style lightweight runtime | Hosted/cloud shape | Evidence |
+|---|---|---|---|---|---|---|
+| CLI channel | Supported: local stdin/stdout operation is always available. | Needs verification. | Needs verification. | Needs verification. | Not planned as a hosted-only channel. | [Channels overview](../channels/overview.md) |
+| Gateway REST / WebSocket channel | Supported: gateway clients can drive the agent through HTTP/WebSocket. | Needs verification. | Needs verification. | Needs verification. | Supported with an exposed gateway and configured auth. | [Channels overview](../channels/overview.md), [Gateway HTTP API](../gateway/api.md) |
+| Webhooks | Supported: webhook ingress lives under the gateway. | Needs verification. | Needs verification. | Needs verification. | Supported through reverse proxy, tunnel, or explicit public bind. | [Webhooks](../channels/webhook.md), [Network deployment](../ops/network-deployment.md) |
+| Chat platforms | Partial: Matrix, Mattermost, LINE, Nextcloud Talk, Signal, WhatsApp, and other chat paths are documented, but feature depth varies by channel. | Needs verification. | Needs verification. | Needs verification. | Partial: public chat integrations usually require webhook ingress, polling, external accounts, or gateway exposure. | [Channels overview](../channels/overview.md), [Matrix](../channels/matrix.md), [Mattermost](../channels/mattermost.md), [LINE](../channels/line.md), [Nextcloud Talk](../channels/nextcloud-talk.md), [Signal](../channels/signal.md), [WhatsApp](../channels/whatsapp.md), [Other chat platforms](../channels/chat-others.md) |
+| Email, social, voice, and telephony | Partial: email and social channels are documented; voice/telephony is experimental and account/deployment sensitive. | Needs verification. | Needs verification. | Needs verification. | Partial: these integrations generally require external accounts and reachable ingress. | [Email](../channels/email.md), [Social channels](../channels/social.md), [Voice & telephony](../channels/voice.md), [Network deployment](../ops/network-deployment.md) |
+| ACP editor / IDE sessions | Supported: ACP works over stdio and daemon gateway WebSocket with persisted sessions and permission prompts. | Needs verification. | Needs verification. | Needs verification. | Partial: remote use depends on gateway transport and editor/client setup. | [ACP channel](../channels/acp.md) |
+| Channel pairing and allow lists | Supported: pairing and authorization run before public channel events reach the agent runtime. | Needs verification. | Needs verification. | Needs verification. | Supported when public ingress is configured correctly. | [Security overview](../security/overview.md), [Channels overview](../channels/overview.md) |
 
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| Local CLI agent | Supported | The default way to install, onboard, configure, and run ZeroClaw locally. | [Quick start](../getting-started/quick-start.md) |
-| Linux install | Supported | `install.sh`, prebuilt/source install, systemd service, and SBC notes are documented. | [Linux setup](../setup/linux.md), [Service management](../setup/service.md) |
-| macOS install | Supported | `install.sh`, Homebrew, LaunchAgent service, and Apple Silicon/Intel release notes are documented. | [macOS setup](../setup/macos.md), [Service management](../setup/service.md) |
-| Windows install | Supported | `setup.bat`, Scoop, source install, scheduled task, and Windows Service paths are documented. | [Windows setup](../setup/windows.md), [Service management](../setup/service.md) |
-| Docker / OCI container | Supported | Official GHCR images, Compose, Kubernetes fragments, webhook ingress, and container gotchas are documented. | [Docker & containers](../setup/container.md), [Network deployment](../ops/network-deployment.md) |
-| Daemon / service mode | Supported | User/system service scopes, restart behavior, shutdown grace, resource limits, and multi-workspace operation are documented. | [Service & daemon](../ops/service.md) |
-| Gateway REST / WebSocket API | Supported | The gateway exposes REST, WebSocket, pairing/bearer auth, runtime-generated OpenAPI docs, and config mutation endpoints. | [Gateway HTTP API](../gateway/api.md) |
-| Web dashboard | Supported | The gateway/dashboard API is supported; serving the UI requires a bundled or configured `web/dist`. | [Building the web dashboard](../developing/web.md), [Docker & containers](../setup/container.md) |
-| ACP editor / IDE sessions | Supported | ACP works over stdio and over the daemon gateway WebSocket, with persisted sessions and permission prompts. | [ACP channel](../channels/acp.md) |
-| Tauri desktop app | Partial | Desktop build/release machinery exists, but the user-facing install and support story is not yet covered like Linux/macOS/Windows setup. | [Release runbook](../maintainers/release-runbook.md), [Issue #6810](https://github.com/zeroclaw-labs/zeroclaw/issues/6810) |
-| Raspberry Pi / SBC | Experimental | Raspberry Pi is documented for gateway and hardware use, but hardware builds require feature flags and device permissions. | [Raspberry Pi](../hardware/raspberry-pi-setup.md), [Hardware overview](../hardware/index.md) |
-| Horizontal scaling | Not planned | One ZeroClaw instance owns one workspace; run separate instances for separate agents/workspaces instead of multiple writers against one workspace. | [Docker & containers](../setup/container.md), [Service & daemon](../ops/service.md) |
+## Tooling and extensibility matrix
 
-## Providers and model behavior
+| Capability | ZeroClaw | OpenClaw | PicoClaw | NanoClaw-style lightweight runtime | Hosted/cloud shape | Evidence |
+|---|---|---|---|---|---|---|
+| Built-in shell, file, HTTP, and browser tools | Supported: built-in tool families are documented, with workspace and sandbox constraints. | Needs verification. | Needs verification. | Needs verification. | Supported where host policy allows the tools. | [Tools overview](../tools/overview.md), [Browser automation](../tools/browser.md), [Security overview](../security/overview.md) |
+| Memory, SOP, and cron tools | Supported: memory tools, SOP-backed tools, and cron job tools are documented. | Needs verification. | Needs verification. | Needs verification. | Supported when storage and scheduling are configured on the deployed host. | [Tools overview](../tools/overview.md), [SOP overview](../sop/index.md), [Architecture overview](../architecture/overview.md) |
+| MCP tools | Supported: ZeroClaw can connect MCP servers and load their tools at startup. | Needs verification. | Needs verification. | Needs verification. | Supported when the deployed host can run or reach the MCP server. | [MCP](../tools/mcp.md), [Tools overview](../tools/overview.md) |
+| Agent Skills | Supported: local `SKILL.md` / `SKILL.toml`, list/audit/install/remove/test commands, compact loading, and opt-in open-skills loading are documented. | Needs verification. | Needs verification. | Needs verification. | Supported where the deployed workspace carries the skill files. | [Skills](../tools/skills.md), [Python skills](../tools/python-skills.md) |
+| Prompt-triggered skill suggestions | Partial: cached registry suggestions exist, while plugin/package discovery and composer-time suggestions remain follow-up scope. | Needs verification. | Needs verification. | Needs verification. | Partial: same runtime status as local ZeroClaw. | [Skills](../tools/skills.md) |
+| WASM and skill-only plugins | Experimental: the plugin protocol documents tool plugins and skill-only bundles; several capability surfaces remain future work. | Needs verification. | Needs verification. | Needs verification. | Planned/experimental depending on host policy and plugin capability. | [Plugin protocol](../developing/plugin-protocol.md) |
 
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| Native provider families | Supported | Typed provider slots are documented in the provider catalog, which owns the current provider list. | [Provider catalog](../providers/catalog.md) |
-| OpenAI-compatible providers | Supported | Many compatible vendors have canonical slots; unknown compatible endpoints can use the `custom` slot with `uri`. | [Provider catalog](../providers/catalog.md), [Custom providers](../providers/custom.md) |
-| Local providers | Supported | Local and local-server provider slots are documented in the provider catalog. | [Provider catalog](../providers/catalog.md) |
-| Per-agent provider selection | Supported | Providers are referenced from agents by alias; there is no global default provider. | [Providers overview](../providers/overview.md) |
-| Streaming text | Supported | Providers that speak streaming APIs emit token deltas, and channels that support drafts can surface partial updates. | [Streaming](../providers/streaming.md) |
-| Streaming tool calls | Supported | The runtime supports mid-stream tool calls, but compatible providers differ in whether they stream tool-call arguments or emit completed calls. | [Streaming](../providers/streaming.md) |
-| Reasoning / thinking output | Partial | Reasoning deltas exist for supported models and are hidden from users by default; provider-specific behavior still varies. | [Streaming](../providers/streaming.md), [Provider catalog](../providers/catalog.md) |
-| Vision | Partial | Native vision support is documented for some providers, but provider and model coverage is not uniform across the catalog. | [Provider catalog](../providers/catalog.md) |
-| Provider-side grounded search | Partial | Gemini can emit pre-executed grounded-search events; this is not a universal provider capability. | [Streaming](../providers/streaming.md) |
-| Subscription / OAuth-style provider auth | Partial | Some provider entries support OAuth or subscription tokens, but coverage is provider-specific. | [Providers overview](../providers/overview.md), [Provider catalog](../providers/catalog.md) |
+## Security and policy matrix
 
-## Channels
+| Capability | ZeroClaw | OpenClaw | PicoClaw | NanoClaw-style lightweight runtime | Hosted/cloud shape | Evidence |
+|---|---|---|---|---|---|---|
+| Autonomy levels | Supported: autonomy levels gate which tool risks can run without operator approval. | Needs verification. | Needs verification. | Needs verification. | Supported where the same runtime policy is deployed. | [Autonomy levels](../security/autonomy.md), [Security overview](../security/overview.md) |
+| Workspace and path boundaries | Supported: file and shell tools are constrained by workspace and sandbox policy. | Needs verification. | Needs verification. | Needs verification. | Supported, but cloud operators must still configure host and container boundaries. | [Security overview](../security/overview.md), [Sandboxing](../security/sandboxing.md) |
+| OS sandboxing | Partial: Linux, macOS, Windows, and Docker backends differ by platform and maturity. | Needs verification. | Needs verification. | Needs verification. | Partial: container/VM isolation is operator-owned in cloud deployments. | [Sandboxing](../security/sandboxing.md), [Docker & containers](../setup/container.md) |
+| Tool receipts and audit trail | Supported: tool invocations produce receipt records for auditability. | Needs verification. | Needs verification. | Needs verification. | Supported when runtime storage is retained. | [Tool receipts](../security/tool-receipts.md) |
+| OTP and emergency stop gates | Supported: optional gates can require one-time codes or interrupt unsafe operation. | Needs verification. | Needs verification. | Needs verification. | Supported where the deployment preserves the required operator channel. | [Security overview](../security/overview.md) |
 
-Channel rows assume a build that includes the matching feature flag; the channels overview owns the current feature list.
+## Deferred comparison work
 
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| CLI channel | Supported | Local stdin/stdout operation is always available. | [Channels overview](../channels/overview.md) |
-| Gateway REST / WebSocket channel | Supported | Gateway clients can drive the agent through HTTP/WebSocket and share the same config mutation core as the CLI. | [Channels overview](../channels/overview.md), [Gateway HTTP API](../gateway/api.md) |
-| Webhooks | Supported | Webhooks live under the gateway and can be exposed through reverse proxy, tunnel, or explicit public bind. | [Webhooks](../channels/webhook.md), [Network deployment](../ops/network-deployment.md) |
-| Matrix | Supported | Matrix has a dedicated guide. | [Matrix](../channels/matrix.md) |
-| Mattermost | Supported | Mattermost has a dedicated guide. | [Mattermost](../channels/mattermost.md) |
-| LINE | Supported | LINE has a dedicated guide. | [LINE](../channels/line.md) |
-| Nextcloud Talk | Supported | Nextcloud Talk has a dedicated guide and uses gateway ingress. | [Nextcloud Talk](../channels/nextcloud-talk.md) |
-| Other chat platforms | Partial | The other-chat guide owns the current platform list. Some use polling, some require gateway ingress, and feature depth varies by channel. | [Other chat platforms](../channels/chat-others.md) |
-| Social / broadcast channels | Supported | Public-feed integrations are documented as social/broadcast channels. | [Social channels](../channels/social.md) |
-| Email | Partial | IMAP/SMTP and Gmail Push are documented; the channel guide still needs fuller coverage of advanced outbound behavior. | [Email](../channels/email.md) |
-| Voice and telephony | Experimental | Telnyx/Twilio/Plivo voice paths and local wake-word/TTS channels are documented, but they require provider/account setup and careful deployment. | [Voice & telephony](../channels/voice.md) |
-| Channel streaming drafts | Partial | The streaming guide owns the current draft-update support matrix. | [Streaming](../providers/streaming.md) |
-| Pairing for public channels | Supported | Pairing is required for most channels to bind incoming identities to policy. | [Channels overview](../channels/overview.md) |
+This page intentionally does not claim row-by-row OpenClaw, PicoClaw, or NanoClaw-style parity. The matrix gives ZeroClaw-owned support claims and marks other runtime cells as "needs verification" unless this repository has a current source-backed basis for a narrower statement.
 
-## Tools, skills, and plugins
-
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| Shell / file / HTTP tools | Supported | Built-in tools include shell, file read/write/list, HTTP, time, memory, user asks, and human escalation. | [Tools overview](../tools/overview.md), [Security overview](../security/overview.md) |
-| Web search and HTTP/browser fetch | Supported | Web search, HTTP, browser automation, and PDF extraction are documented tool families. | [Tools overview](../tools/overview.md), [Browser automation](../tools/browser.md) |
-| Browser automation | Supported | Browser automation is documented as a built-in tool with setup notes. | [Browser automation](../tools/browser.md) |
-| Memory tools | Supported | Memory search and memory pin are built-in tools; memory storage and retrieval are part of the runtime architecture. | [Tools overview](../tools/overview.md), [Architecture overview](../architecture/overview.md) |
-| SOP tools | Supported | SOP documents and `sop_*` tools are documented when SOP is configured. | [Tools overview](../tools/overview.md), [SOP overview](../sop/index.md) |
-| Cron tools | Supported | Cron tools manage scheduled jobs. | [Tools overview](../tools/overview.md) |
-| MCP tools | Supported | ZeroClaw can connect MCP servers and load their tools at startup. | [MCP](../tools/mcp.md), [Tools overview](../tools/overview.md) |
-| Agent Skills | Supported | Local `SKILL.md` / `SKILL.toml`, list/audit/install/remove/test commands, compact loading, and opt-in open-skills loading are documented. | [Skills](../tools/skills.md) |
-| Prompt-triggered skill install suggestions | Partial | Server-side suggestions can point to cached registry metadata, but plugin/package discovery and composer-time suggestions are follow-up scope. | [Skills](../tools/skills.md) |
-| WASM tool plugins | Experimental | The plugin protocol documents WASM tool plugins and host functions, but several permission and non-tool capability surfaces are not implemented yet. | [Plugin protocol](../developing/plugin-protocol.md) |
-| Skill-only plugins | Experimental | Skill-only plugin bundles can ship agentskills.io-format skills without a WASM payload. | [Plugin protocol](../developing/plugin-protocol.md) |
-
-## Hardware and edge use
-
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| Hardware feature flag | Experimental | Hardware support must be enabled with `--features hardware` or narrower board features. | [Hardware overview](../hardware/index.md) |
-| GPIO / I2C / SPI tools | Experimental | Runtime hardware tools exist when the feature is enabled and device paths are configured. | [Hardware overview](../hardware/index.md) |
-| STM32 Nucleo | Experimental | Dedicated setup guide exists. | [STM32 Nucleo](../hardware/nucleo-setup.md) |
-| Arduino Uno Q | Experimental | Dedicated setup guide exists. | [Arduino Uno Q](../hardware/arduino-uno-q-setup.md) |
-| Raspberry Pi hardware use | Experimental | Raspberry Pi GPIO/I2C/SPI setup is documented, including service group membership. | [Raspberry Pi](../hardware/raspberry-pi-setup.md), [Hardware overview](../hardware/index.md) |
-| Aardvark I2C/SPI adapter | Experimental | Dedicated setup guide exists. | [Aardvark](../hardware/aardvark.md) |
-| Android / Termux hardware path | Experimental | Android serial-over-USB / Bluetooth notes exist, with the Play Store version called out as unsupported. | [Android](../hardware/android-setup.md) |
-
-## Security and policy
-
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| Channel pairing and allow lists | Supported | Pairing and channel authorization run before public channel events reach the agent runtime. | [Security overview](../security/overview.md), [Channels overview](../channels/overview.md) |
-| Autonomy levels | Supported | Autonomy levels gate which tool risks can run without operator approval. | [Autonomy levels](../security/autonomy.md) |
-| Workspace and path boundaries | Supported | File and shell tools are constrained by workspace and sandbox policy. | [Security overview](../security/overview.md), [Sandboxing](../security/sandboxing.md) |
-| OS sandboxing | Partial | Linux, macOS, Windows, and Docker backends differ by platform and maturity. | [Sandboxing](../security/sandboxing.md) |
-| Tool receipts | Supported | Tool invocations produce receipt records for auditability. | [Tool receipts](../security/tool-receipts.md) |
-| OTP and emergency stop gates | Supported | Optional gates can require one-time codes or interrupt unsafe operation. | [Security overview](../security/overview.md) |
-
-## Related runtimes and roadmap positioning
-
-| Area | Status | Notes | Evidence |
-|---|---|---|---|
-| OpenClaw parity / migration notes | Partial | This page now gives comparison context and links the current migration position, but a full feature-by-feature OpenClaw parity audit remains future work. | [Issue #6810](https://github.com/zeroclaw-labs/zeroclaw/issues/6810), [FND-001](../foundations/fnd-001-intentional-architecture.md) |
-| PicoClaw / NanoBot lightweight deployments | Partial | The comparison table links the external projects and explains their relationship to ZeroClaw, but ZeroClaw-owned docs should not mirror their full feature lists. | [PicoClaw repository](https://github.com/sipeed/picoclaw), [NanoBot repository](https://github.com/HKUDS/nanobot) |
-| Future plugin/channel/memory/observer capability plugins | Planned | The plugin manifest includes these capability categories, but several are explicitly marked not yet implemented. | [Plugin protocol](../developing/plugin-protocol.md) |
-
-## Keeping this page current
-
-When changing support status, update the linked evidence at the same time. If a row cannot point to docs, an issue, an RFC/FND, or source-backed reference, mark it "needs verification" instead of guessing. The linked evidence remains authoritative for exact provider, channel, tool, and setup details; this page owns the high-level support classification.
+Future updates should tighten individual cells only when they can link to canonical evidence. If a row cannot point to docs, an issue, an RFC/FND, or source-backed reference, keep it marked "needs verification" instead of guessing.
