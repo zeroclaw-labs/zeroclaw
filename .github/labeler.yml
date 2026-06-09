@@ -438,6 +438,7 @@
           - "src/tools/glob_search.rs"
           - "src/tools/content_search.rs"
           - "crates/zeroclaw-tools/src/file_edit.rs"
+          - "crates/zeroclaw-runtime/src/tools/file_read.rs"
           - "crates/zeroclaw-tools/src/file_write.rs"
           - "crates/zeroclaw-tools/src/glob_search.rs"
           - "crates/zeroclaw-tools/src/content_search.rs"
@@ -484,6 +485,8 @@
           - "src/tools/shell.rs"
           - "src/tools/node_tool.rs"
           - "src/tools/cli_discovery.rs"
+          - "crates/zeroclaw-runtime/src/tools/shell.rs"
+          - "crates/zeroclaw-gateway/src/node_tool.rs"
           - "crates/zeroclaw-tools/src/cli_discovery.rs"
 
 "tool:sop":
