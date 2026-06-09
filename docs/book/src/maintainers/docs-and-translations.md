@@ -17,7 +17,22 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 
 ## Building the docs locally
 
-{{#include ../developing/building-docs.md}}
+{{#include ../_snippets/docs-build-commands.md}}
+
+`cargo mdbook` is an alias for `cargo run -p xtask --bin mdbook --` (defined in the cargo config). For a lean contributor-facing version of this section, see [Building the docs locally](../developing/building-docs.md).
+
+### How translations stay current
+
+When English source changes, `cargo mdbook sync` runs two stages:
+
+1. **Extract**: `mdbook-xgettext` regenerates `po/messages.pot` from the current English source.
+2. **Merge**: `msgmerge` updates each locale's `.po` file, new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point.
+
+Then the command counts fuzzy + untranslated entries and, when `--model-provider` is given, fills only those. Unchanged strings cost nothing: the `.po` cache means re-running against unchanged source is a no-op. Without `--model-provider`, sync still runs extract + merge and reports the delta; strings without a `msgstr` fall back to English at render time.
+
+Sync normalizes catalogs with stable output rules (`msgcat --sort-output --no-wrap --add-location=file`), so diffs stay focused on real source changes. Unavoidable churn: header metadata (`POT-Creation-Date` etc.), reference-location updates when a string moves files, and actual source-string edits.
+
+Routine English docs PRs may defer broad `.po` churn to a focused follow-up. Include `.po` updates only when the PR is a translation-cache pass, a release-translation pass, adds a locale, or produces a small reviewable diff.
 
 ## Filling app strings (Fluent)
 
@@ -161,6 +176,29 @@ Maintainers should accept the routine English docs exception documented in [Buil
 4. The `cargo fluent fill` run in step 2 already generates `apps/zerocode/locales/<code>/zerocode.ftl` in the same pass, since `cargo fluent` walks both the runtime and zerocode catalogues. No manual zerocode step is needed; verify coverage with `cargo fluent stats`.
 
 Everything else, `lang-switcher.js`, CI deploy target list, `cargo mdbook locales` output, reads from `locales.toml` automatically.
+
+## Release translation workflow
+
+Before tagging a release, run a full translation pass locally and commit the updated `.po` files.
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+# Fast delta pass (only new or changed strings since last release)
+cargo mdbook sync --model-provider ollama
+
+# OR: quality pass — re-translate everything
+cargo mdbook sync --model-provider ollama --force
+
+cargo mdbook check   # validate before committing
+cargo mdbook stats   # review coverage
+```
+
+</div>
+
+The model used is whatever is configured under `providers.models.<name>`.
 
 ## Model quality notes
 
