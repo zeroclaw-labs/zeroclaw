@@ -70,7 +70,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut book = pair
         .get(1)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("preprocessor input missing book element"))?;
+        .ok_or_else(|| anyhow::Error::msg("preprocessor input missing book element"))?;
 
     if let Some(items) = book.get_mut("items").and_then(Value::as_array_mut) {
         for item in items.iter_mut() {
@@ -133,19 +133,16 @@ fn expand_directives(
     ];
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
-    loop {
-        let Some((start, marker)) = MARKERS
-            .iter()
-            .filter_map(|m| rest.find(m).map(|i| (i, *m)))
-            .min_by_key(|(i, _)| *i)
-        else {
-            break;
-        };
+    while let Some((start, marker)) = MARKERS
+        .iter()
+        .filter_map(|m| rest.find(m).map(|i| (i, *m)))
+        .min_by_key(|(i, _)| *i)
+    {
         out.push_str(&rest[..start]);
         let after = &rest[start + marker.len()..];
         let end = after
             .find("}}")
-            .ok_or_else(|| anyhow::anyhow!("unterminated {marker} directive"))?;
+            .ok_or_else(|| anyhow::Error::msg(format!("unterminated {marker} directive")))?;
         let arg = after[..end].trim();
         let rendered = match marker {
             "{{#config-where " => render_config_where(arg, depth)?,
@@ -169,7 +166,7 @@ fn lookup<'a>(params: &'a [PeerParams], key: &str) -> anyhow::Result<&'a PeerPar
     params
         .iter()
         .find(|p| p.key == key)
-        .ok_or_else(|| anyhow::anyhow!("unknown peer-group channel '{key}'"))
+        .ok_or_else(|| anyhow::Error::msg(format!("unknown peer-group channel '{key}'")))
 }
 
 /// Render a "where to configure this" widget for a config section path. Tabs by
@@ -302,7 +299,7 @@ fn load_params() -> anyhow::Result<Vec<PeerParams>> {
     let root = repo_root();
     let path = book_dir(&root).join("peer-groups.toml");
     let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::Error::msg(format!("reading {}: {e}", path.display())))?;
     let parsed: ParamFile = toml::from_str(&raw)?;
     validate_keys(&parsed.channel)?;
     Ok(parsed.channel)
@@ -469,7 +466,7 @@ fn load_env_var_params() -> anyhow::Result<Vec<EnvVarParams>> {
     let root = repo_root();
     let path = book_dir(&root).join("env-vars.toml");
     let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::Error::msg(format!("reading {}: {e}", path.display())))?;
     let parsed: EnvVarFile = toml::from_str(&raw)?;
     validate_env_var_paths(&parsed.var)?;
     Ok(parsed.var)
