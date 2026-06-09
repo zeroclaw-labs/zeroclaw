@@ -209,3 +209,5 @@ The browser visualizer is at http://127.0.0.1:8080.
   split PRs. It is not intended as a production template.
 - For Telegram end-to-end testing, use `run-agent-host.sh`; it builds with the
   `channel-telegram` feature and runs the channel orchestrator directly.
+- Docker-hosted Telegram support is intentionally out of scope for this slice;
+  track it as a follow-up for the demo image/channel packaging path.

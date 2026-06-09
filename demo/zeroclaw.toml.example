@@ -86,6 +86,7 @@ temperature = 0.3
 # Set TELEGRAM_BOT_TOKEN in demo/.env (get from @BotFather).
 # The host run script injects it via ZEROCLAW_channels__telegram__default__bot_token
 # at runtime so the secret does not need to live in this TOML.
+# Leave the placeholder below as-is; do not put your real bot token here.
 # For testing, receive all messages from the bot chat (adjust as needed for your setup).
 [channels_config.telegram]
 enabled = true
