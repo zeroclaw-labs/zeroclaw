@@ -185,6 +185,13 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile raises `codegen-units` to 8 for more parallelism (lighter on the linker), at a minor runtime cost. The `ci` profile goes further with `lto = "thin"` and `codegen-units = 16` for the fastest, lowest-memory link.
 
+#### Automatic low-memory LTO (install.sh)
+
+If you install via `install.sh` rather than building by hand, the script already
+applies the low-memory build heuristic for you:
+
+{{#include ../_snippets/hardware-lowmem-lto.md}}
+
 <div class="os-tabs-src">
 
 #### sh
