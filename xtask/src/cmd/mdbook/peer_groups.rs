@@ -695,12 +695,61 @@ fn render_model_provider_fields() -> String {
     let providers = zeroclaw_providers::list_model_providers();
     let schema = schemars::schema_for!(zeroclaw_config::schema::Config);
     let schema = schema.to_value();
-    // Every provider slot is a `ModelProviderConfig`; its `Default` instance is
-    // the source of truth for defaults schemars omits (`skip_serializing_if`).
     let provider_defaults =
         serde_json::to_value(zeroclaw_config::schema::ModelProviderConfig::default()).ok();
 
+    // Every provider slot flattens the same `ModelProviderConfig` base and adds
+    // a handful of slot-specific extras. Render the base once and per-provider
+    // only the extras, so the page does not repeat ~18 identical fields 70+
+    // times (which bloats both the page and the search index). The base set is
+    // the intersection of every slot's field names, derived, not hand-listed.
+    let base: std::collections::BTreeSet<String> = providers
+        .iter()
+        .map(|p| {
+            zeroclaw_config::schema_markdown::section_field_names(
+                &schema,
+                &format!("providers.models.{}", p.name),
+            )
+        })
+        .reduce(|acc, fs| acc.intersection(&fs).cloned().collect())
+        .unwrap_or_default();
+
     let mut out = String::new();
+
+    // Shared base table, rendered once. Use any slot's path; excluding the
+    // empty set keeps the full base, and the base fields are identical across
+    // slots so the choice of slot does not matter.
+    if let Some(first) = providers.first() {
+        let base_table = zeroclaw_config::schema_markdown::field_table_for_path(
+            &schema,
+            &format!("providers.models.{}", first.name),
+            false,
+            provider_defaults.as_ref(),
+        )
+        .unwrap_or_default();
+        // Trim base_table to only the shared fields by excluding everything else.
+        let extras_of_first = zeroclaw_config::schema_markdown::section_field_names(
+            &schema,
+            &format!("providers.models.{}", first.name),
+        );
+        let non_base: std::collections::BTreeSet<String> =
+            extras_of_first.difference(&base).cloned().collect();
+        let base_only = zeroclaw_config::schema_markdown::field_table_for_path_excluding(
+            &schema,
+            &format!("providers.models.{}", first.name),
+            false,
+            provider_defaults.as_ref(),
+            &non_base,
+        )
+        .unwrap_or(base_table);
+        out.push_str("### Shared fields\n\n");
+        out.push_str(
+            "Every provider slot accepts these fields. Slot-specific extras are listed per provider below.\n\n",
+        );
+        out.push_str(&base_only);
+        out.push('\n');
+    }
+
     for category in C::all() {
         let rows: Vec<_> = providers
             .iter()
@@ -717,13 +766,19 @@ fn render_model_provider_fields() -> String {
                 .unwrap_or_else(|| "no fixed default".to_string());
             let local = if p.local { " · local" } else { "" };
             let path = format!("providers.models.{}", p.name);
-            let detail = zeroclaw_config::schema_markdown::field_table_for_path(
+            let extras = zeroclaw_config::schema_markdown::field_table_for_path_excluding(
                 &schema,
                 &path,
                 false,
                 provider_defaults.as_ref(),
+                &base,
             )
-            .unwrap_or_else(|e| format!("<p>{e}</p>"));
+            .unwrap_or_default();
+            let detail = if extras.is_empty() {
+                "<p>No slot-specific fields beyond the shared fields above.</p>".to_string()
+            } else {
+                format!("<p><strong>Slot-specific fields:</strong></p>\n\n{extras}")
+            };
             let _ = write!(
                 out,
                 concat!(

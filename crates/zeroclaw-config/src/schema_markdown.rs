@@ -137,6 +137,103 @@ pub fn field_table_for_path(
     Ok(field_table(node, include_enabled, Some(&prefix), defaults))
 }
 
+/// The set of field names a section path resolves to (after descending any map
+/// to its value type). Used to compute the shared base field set across many
+/// sibling sections (e.g. every model-provider slot) so a directive can render
+/// the common fields once and only the per-section extras per entry.
+pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeSet<String> {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let mut node = resolve(root, defs);
+    for seg in path.split('.') {
+        let Some(next) = node
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get(seg))
+            .map(|s| resolve(s, defs))
+        else {
+            return Default::default();
+        };
+        node = next;
+        if let Some(add) = node.get("additionalProperties")
+            && add.is_object()
+        {
+            node = resolve(add, defs);
+        }
+    }
+    node.get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Like [`field_table_for_path`] but omits every field whose name is in
+/// `exclude`. Lets a directive render a shared base table once and then only
+/// the per-section extras, instead of repeating the common fields for every
+/// sibling section. Returns an empty string (not an error) when nothing remains
+/// after exclusion, so callers can render a "no extra fields" note.
+pub fn field_table_for_path_excluding(
+    root: &Value,
+    path: &str,
+    include_enabled: bool,
+    defaults: Option<&Value>,
+    exclude: &std::collections::BTreeSet<String>,
+) -> Result<String, String> {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let mut node = resolve(root, defs).clone();
+    let mut display_segments: Vec<String> = Vec::new();
+    {
+        let mut cur = &node as &Value;
+        for seg in path.split('.') {
+            let Some(next) = cur
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|p| p.get(seg))
+                .map(|s| resolve(s, defs).clone())
+            else {
+                return Err(format!(
+                    "model-provider-fields: path segment `{seg}` not found in `{path}`"
+                ));
+            };
+            display_segments.push(seg.to_string());
+            node = next;
+            if let Some(add) = node.get("additionalProperties").cloned()
+                && add.is_object()
+            {
+                node = resolve(&add, defs).clone();
+                display_segments.push("<alias>".to_string());
+            }
+            cur = &node;
+        }
+    }
+
+    // Strip excluded fields from the resolved node's properties.
+    if let Some(props) = node.get_mut("properties").and_then(Value::as_object_mut) {
+        props.retain(|k, _| !exclude.contains(k));
+        if props.is_empty() {
+            return Ok(String::new());
+        }
+    } else {
+        return Ok(String::new());
+    }
+
+    // Carry `$defs` into the detached node so `$ref` field types still resolve.
+    if let (Some(node_obj), Some(defs_val)) = (node.as_object_mut(), root.get("$defs")) {
+        node_obj.insert("$defs".to_string(), defs_val.clone());
+    }
+
+    let prefix = display_segments.join(".");
+    Ok(field_table(&node, include_enabled, Some(&prefix), defaults))
+}
+
 /// Renders a single struct's fields as an interactive config table from that
 /// struct's `schema_for!` JSON value. Top-level `enabled` is skipped by default
 /// since channel pages document it separately; pass `include_enabled = true` to
