@@ -883,6 +883,11 @@ impl Agent {
         self.temperature = temperature;
     }
 
+    #[cfg(test)]
+    pub fn temperature_for_test(&self) -> Option<f64> {
+        self.temperature
+    }
+
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
     }
