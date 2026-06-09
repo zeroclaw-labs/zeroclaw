@@ -2692,7 +2692,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn secret_mask_is_bounded() {
         // A short secret masks one bullet per char; a realistic-length
         // key clips at the cap and reports the hidden remainder so it

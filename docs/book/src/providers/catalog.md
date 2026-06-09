@@ -20,7 +20,7 @@ GPT-4o, GPT-5, o-series reasoning models. Reasoning tokens surfaced as `Reasonin
 
 ### OpenAI Codex: `openai` slot with `requires_openai_auth = true`
 
-OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"` to route through `POST /v1/responses` and `requires_openai_auth = true` to pull credentials from `OPENAI_API_KEY` / `~/.codex/auth.json` instead of an `api_key` field on the entry.
+OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"` to route through `POST /v1/responses` and `requires_openai_auth = true` to pull credentials from the OAuth profile imported from `~/.codex/auth.json` instead of an `api_key` field on the entry. The subscription path does not read `OPENAI_API_KEY` — that variable applies only to the metered `openai` API-key mode.
 
 ### Ollama: slot `ollama`
 
@@ -61,6 +61,86 @@ Every canonical slot, its default endpoint, and whether it runs locally, generat
 {{#model-provider-catalog-table}}
 
 For a worked example per family, see [Configuration](./configuration.md). If your vendor isn't listed, use the `custom` slot ([Custom providers](./custom.md)).
+
+### Worked examples: Morph, GitHub Models, Upstage, Featherless, Arcee, Lambda AI, Inception
+
+Each of these is a standard OpenAI-compatible slot: set `model` and `api_key`, leave
+`uri` off (the typed endpoint supplies it). None of them ship a public model index,
+so the model picker stays empty until you paste a credential — once a key is set,
+ZeroClaw lists models from the provider's live `/models` endpoint. The model IDs
+below are illustrative; confirm the current catalog in the vendor dashboard.
+
+**Morph** — slot `morph`. Fast apply-edits models (`morph-v3-large`, `morph-v3-fast`, or
+`auto`). Key from the [Morph dashboard](https://morphllm.com).
+
+```toml
+[providers.models.morph.apply]
+model   = "morph-v3-large"
+api_key = "..."
+```
+
+**GitHub Models** — slot `github_models` (alias `github-models`). OpenAI / Meta /
+Microsoft models behind a single GitHub Personal Access Token. Create a PAT with the
+**`models`** permission (fine-grained) — a Copilot token is *not* the same credential.
+Model IDs are publisher-prefixed.
+
+```toml
+[providers.models.github_models.home]
+model   = "openai/gpt-4o"
+api_key = "github_pat_..."
+```
+
+**Upstage** — slot `upstage`. Solar Pro / Solar Mini. Key from the
+[Upstage console](https://console.upstage.ai/api-keys).
+
+```toml
+[providers.models.upstage.home]
+model   = "solar-pro2"
+api_key = "..."
+```
+
+**Featherless** — slot `featherless`. Serverless open-weight models, addressed by their
+Hugging Face repo IDs. Key from [featherless.ai](https://featherless.ai).
+
+```toml
+[providers.models.featherless.home]
+model   = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+api_key = "..."
+```
+
+**Arcee** — slot `arcee`. Native models include `conductor`, `maestro`,
+`virtuoso-large`, `coder-large`, and `blitz`. Key from the
+[Arcee platform](https://www.arcee.ai). Arcee's Platform API uses the non-standard
+`/api/v1` base path; the typed endpoint already accounts for this, so still leave
+`uri` off.
+
+```toml
+[providers.models.arcee.home]
+model   = "conductor"
+api_key = "..."
+```
+
+**Lambda AI** — slot `lambda_ai` (alias `lambda-ai`). Lambda's hosted inference. Key
+from the [Lambda Cloud](https://cloud.lambda.ai) API-keys page.
+
+```toml
+[providers.models.lambda_ai.home]
+model   = "hermes3-405b"
+api_key = "..."
+```
+
+**Inception** — slot `inception`. The Mercury diffusion-LLM family (`mercury-coder` and
+the newer `mercury-2`). Key from the
+[Inception platform](https://platform.inceptionlabs.ai).
+
+```toml
+[providers.models.inception.home]
+model   = "mercury-coder"
+api_key = "..."
+```
+
+> Credentials come only from config (`api_key`) or the `--credential` override at run
+> time — these slots do **not** read a per-provider `*_API_KEY` environment variable.
 
 ---
 

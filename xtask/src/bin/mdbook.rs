@@ -40,7 +40,7 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider alias from [providers.models.<kind>.<alias>] in config.toml
+        /// Provider alias from `[providers.models.<kind>.<alias>]` in config.toml
         #[arg(long)]
         model_provider: Option<String>,
         /// Config directory holding config.toml and .secret-key (default:

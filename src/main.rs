@@ -494,7 +494,7 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to providers.models.<type>.<alias>.temperature)
+        /// Temperature (0.0 - 2.0, defaults to `providers.models.<type>.<alias>.temperature`)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -707,7 +707,7 @@ Examples:
     /// Browse the shared workspace one directory at a time
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-List children of a directory under <install>/shared/. Paths are relative \
+List children of a directory under `<install>`/shared/. Paths are relative \
 to the shared workspace root; `..` traversal that escapes the root is \
 rejected. Used by the dashboard's skill-bundle directory picker and by \
 operators who want to inspect what's installed.
@@ -943,7 +943,7 @@ Examples:
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
-repository and install them under <config-dir>/data/ftl/<locale>/, where the \
+repository and install them under `<config-dir>/data/ftl/<locale>/`, where the \
 runtime and zerocode loaders read them.
 
 Pass a single locale. By default every catalogue is fetched; restrict with \
@@ -4119,12 +4119,12 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            let model_provider = match &model_command {
-                ModelCommands::Refresh { model_provider, .. }
-                | ModelCommands::List { model_provider } => model_provider.as_deref(),
-                _ => None,
+            let (model_provider, show_names) = match &model_command {
+                ModelCommands::Refresh { model_provider, .. } => (model_provider.as_deref(), false),
+                ModelCommands::List { model_provider } => (model_provider.as_deref(), true),
+                _ => (None, false),
             };
-            doctor::run_models(&config, model_provider, false).await
+            doctor::run_models(&config, model_provider, false, show_names).await
         }
 
         Commands::Providers => {
@@ -4177,7 +4177,7 @@ async fn main() -> Result<()> {
             Some(DoctorCommands::Models {
                 model_provider,
                 use_cache,
-            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache).await,
+            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache, false).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,

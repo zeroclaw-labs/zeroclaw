@@ -143,11 +143,11 @@ profiles; the trade-off is losing the per-agent dimension everywhere.
   are not edited here, they're tied to the provider that owns the
   model, so they live one tier down.
 - `/config/providers.<category>/<type>` → **Costs** tab: rate-sheet
-  editor for that provider type. The `+ Add` input suggests upstream
-  resource ids drawn from `providers.<category>.<type>.*.model`
-  across configured aliases, so the operator can one-click a rate row
-  for every model they've actually bound. This is the only entry
-  point for editing `[cost.rates.providers.<category>.<type>.*]`.
+   editor for that provider type. The `+ Add` input suggests upstream
+   resource ids drawn from `providers.<category>.<type>.*.model`
+   across configured aliases, so the operator can one-click a rate row
+   for every model they've actually bound. This is the only entry
+   point for editing `[cost.rates.providers.<category>.<type>.*]`.
 
 ### Dashboard
 

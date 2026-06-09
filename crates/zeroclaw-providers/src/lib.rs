@@ -9,7 +9,7 @@
 //!
 //! Each model_provider call goes through the [`ReliableModelProvider`] wrapper, which adds
 //! automatic retry with exponential backoff and API-key rotation on rate limits.
-//! Model routing across multiple model_providers is available via [`create_routed_model_provider`].
+//! Model routing across multiple model_providers is available via [`create_routed_model_provider_with_options`].
 //!
 //! # Extension
 //!
@@ -1083,6 +1083,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "ai21-labs" => "ai21",
         "friendliai" => "friendli",
         "lepton-ai" => "lepton",
+        "lambda-ai" => "lambda_ai",
+        "github-models" => "github_models",
         "step" => "stepfun",
         "kilo" => "kilocli",
         // Moonshot / Kimi (regional + code variants fold to one family).
@@ -1705,15 +1707,18 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
     use factory::CompatFamilySpec;
     use zeroclaw_config::schema::{
         Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
-        AstraiModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
-        CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
-        DeepinfraModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-        FireworksModelProviderConfig, FriendliModelProviderConfig, HuggingfaceModelProviderConfig,
-        HyperbolicModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-        MistralModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
-        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
+        ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
+        BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
+        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
+        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
+        HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
+        InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
+        NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+        OpencodeModelProviderConfig, PerplexityModelProviderConfig, RekaModelProviderConfig,
+        SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+        SyntheticModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
         VercelModelProviderConfig, VllmModelProviderConfig, YiModelProviderConfig,
     };
 
@@ -1755,6 +1760,13 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "nebius" => Some(<NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "friendli" => Some(<FriendliModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "lepton" => Some(<LeptonModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "morph" => Some(<MorphModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "github_models" => Some(<GithubModelsModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "upstage" => Some(<UpstageModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "featherless" => Some(<FeatherlessModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -1841,6 +1853,13 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("atomic_chat", "Atomic Chat", true),
             ("astrai", "Astrai", false),
             ("deepmyst", "DeepMyst", false),
+            ("morph", "Morph (Fast Apply)", false),
+            ("github_models", "GitHub Models", false),
+            ("upstage", "Upstage Solar", false),
+            ("featherless", "Featherless AI", false),
+            ("arcee", "Arcee AI", false),
+            ("lambda_ai", "Lambda AI", false),
+            ("inception", "Inception Labs (Mercury)", false),
             ("custom", "Custom (OpenAI-compatible)", false),
         ],
     );
@@ -2698,6 +2717,80 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_deepmyst_env_deleted() {}
+
+    // ── OpenAI-compatible aggregators & inference hosts ──────
+
+    #[test]
+    fn factory_morph() {
+        assert!(create_model_provider("morph", Some("sk-morph-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_github_models() {
+        assert!(create_model_provider("github_models", Some("ghp_test_token")).is_ok());
+        // Hyphenated form canonicalizes to the underscore slot.
+        assert!(create_model_provider("github-models", Some("ghp_test_token")).is_ok());
+    }
+
+    #[test]
+    fn factory_upstage() {
+        assert!(create_model_provider("upstage", Some("up-test-key")).is_ok());
+    }
+
+    #[test]
+    fn factory_featherless() {
+        assert!(create_model_provider("featherless", Some("featherless-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_arcee() {
+        assert!(create_model_provider("arcee", Some("arcee-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_lambda_ai() {
+        assert!(create_model_provider("lambda_ai", Some("lambda-test")).is_ok());
+        // Hyphenated form canonicalizes to the underscore slot.
+        assert!(create_model_provider("lambda-ai", Some("lambda-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_inception() {
+        assert!(create_model_provider("inception", Some("inception-test")).is_ok());
+    }
+
+    #[test]
+    fn default_url_matches_compat_spec_for_new_providers() {
+        assert_eq!(
+            default_model_provider_url("morph"),
+            Some("https://api.morphllm.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("github_models"),
+            Some("https://models.github.ai/inference")
+        );
+        assert_eq!(
+            default_model_provider_url("upstage"),
+            Some("https://api.upstage.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("featherless"),
+            Some("https://api.featherless.ai/v1")
+        );
+        // Arcee publishes at the non-standard `/api/v1` path.
+        assert_eq!(
+            default_model_provider_url("arcee"),
+            Some("https://api.arcee.ai/api/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("lambda_ai"),
+            Some("https://api.lambda.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("inception"),
+            Some("https://api.inceptionlabs.ai/v1")
+        );
+    }
 
     // ── Custom / BYOP model model_provider ─────────────────────────
     //
