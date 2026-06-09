@@ -22,8 +22,7 @@ pub struct SkillSummary {
     pub frontmatter: SkillFrontmatter,
 }
 
-/// Behaviour selector for [`SkillsService::remove_skill`] and
-/// [`SkillsService::remove_bundle`].
+/// Behaviour selector for [`SkillsService::remove_skill`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveMode {
     /// Move to `<install>/shared/skills/_deleted/<name>-<unix-ts>/`.
