@@ -292,6 +292,14 @@ pub struct Config {
     #[nested]
     pub identity: IdentityConfig,
 
+    /// Cryptographic principal configuration (`[identity_provider]`).
+    /// Picks the keypair/sign/verify backend. Distinct from `[identity]`,
+    /// which is the agent self-description format. See
+    /// [`IdentityProviderConfig`] for the current provider set.
+    #[serde(default)]
+    #[nested]
+    pub identity_provider: IdentityProviderConfig,
+
     /// Cost tracking and budget enforcement configuration (`[cost]`).
     #[serde(default)]
     #[nested]
@@ -1899,6 +1907,68 @@ impl Default for IdentityConfig {
             format: default_identity_format(),
             aieos_path: None,
             aieos_inline: None,
+        }
+    }
+}
+
+// ── Identity provider (cryptographic principal) ────────────────
+
+/// Cryptographic principal configuration (`[identity_provider]` section).
+///
+/// Distinct from `[identity]` (which is the agent self-description format —
+/// openclaw vs aieos). `[identity_provider]` picks the *backend* that
+/// generates the keypair, signs assertions, and verifies them.
+///
+/// ## Current providers
+/// - `local` (default) — Ed25519 keypair generated on first boot, stored
+///   encrypted via `SecretStore` at `<identity_dir>/identity_state.json`.
+///   No network. The trust tier is always `KeyRegistered`; the issuer
+///   status is always `Unqueried` because there is no issuer to query.
+///
+/// ## Future providers
+/// - `wardtoken` — remote-issuer-backed identity. Will be added by
+///   `daemonclaw-wardtoken` and registered with the same factory shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "identity_provider"]
+pub struct IdentityProviderConfig {
+    /// Provider name: `"local"` (default) or `"wardtoken"`.
+    #[serde(default = "default_identity_provider_name")]
+    pub provider: String,
+    /// Directory holding identity artifacts. Defaults to
+    /// `~/.daemonclaw/identity`.
+    #[serde(default)]
+    pub identity_dir: Option<String>,
+    /// Host label used to derive artifact basenames (the `<host>` in
+    /// `<host>.spki.pem`). Defaults to the system hostname.
+    #[serde(default)]
+    pub host_label: Option<String>,
+    /// When false, identity artifacts are written as plaintext (the
+    /// `enc2:` blob is still the default wire format, but the
+    /// `SecretStore` is in sovereign mode). Operators opt in.
+    #[serde(default = "default_secrets_encrypt")]
+    pub secrets_encrypt: bool,
+    /// Issuer base URL (used by `wardtoken`, ignored by `local`).
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+}
+
+fn default_identity_provider_name() -> String {
+    "local".into()
+}
+
+fn default_secrets_encrypt() -> bool {
+    true
+}
+
+impl Default for IdentityProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_identity_provider_name(),
+            identity_dir: None,
+            host_label: None,
+            secrets_encrypt: default_secrets_encrypt(),
+            issuer_url: None,
         }
     }
 }
@@ -9466,6 +9536,7 @@ impl Default for Config {
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
             identity: IdentityConfig::default(),
+            identity_provider: IdentityProviderConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
@@ -11655,6 +11726,7 @@ auto_save = true
             agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             identity: IdentityConfig::default(),
+            identity_provider: IdentityProviderConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),

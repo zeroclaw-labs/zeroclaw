@@ -5,21 +5,25 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskState {
+pub enum TaskStatus {
     Open,
-    Claimed,
+    Active,
     Blocked,
-    Done,
+    Paused,
+    Review,
+    Closed,
     Abandoned,
 }
 
-impl TaskState {
+impl TaskStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Open => "open",
-            Self::Claimed => "claimed",
+            Self::Active => "active",
             Self::Blocked => "blocked",
-            Self::Done => "done",
+            Self::Paused => "paused",
+            Self::Review => "review",
+            Self::Closed => "closed",
             Self::Abandoned => "abandoned",
         }
     }
@@ -27,59 +31,22 @@ impl TaskState {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "open" => Some(Self::Open),
-            "claimed" => Some(Self::Claimed),
+            "active" => Some(Self::Active),
             "blocked" => Some(Self::Blocked),
-            "done" => Some(Self::Done),
+            "paused" => Some(Self::Paused),
+            "review" => Some(Self::Review),
+            "closed" => Some(Self::Closed),
             "abandoned" => Some(Self::Abandoned),
             _ => None,
         }
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Abandoned)
+        matches!(self, Self::Closed | Self::Abandoned)
     }
 }
 
-impl fmt::Display for TaskState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskOrigin {
-    Heartbeat,
-    Cron,
-    Channel,
-    Manual,
-    Sop,
-}
-
-impl TaskOrigin {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Heartbeat => "heartbeat",
-            Self::Cron => "cron",
-            Self::Channel => "channel",
-            Self::Manual => "manual",
-            Self::Sop => "sop",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "heartbeat" => Some(Self::Heartbeat),
-            "cron" => Some(Self::Cron),
-            "channel" => Some(Self::Channel),
-            "manual" => Some(Self::Manual),
-            "sop" => Some(Self::Sop),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for TaskOrigin {
+impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -112,32 +79,84 @@ impl TaskOutcome {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    pub id: String,
-    pub title: String,
-    pub origin: TaskOrigin,
-    pub state: TaskState,
-    pub priority: u8,
-    pub created_at: String,
-    pub updated_at: String,
-    pub claimed_by_channel: Option<String>,
-    pub claimed_by_id: Option<String>,
-    pub blocked_reason: Option<String>,
-    pub outcome: Option<TaskOutcome>,
-    pub parent_task_id: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Autonomy {
+    Auto,
+    Assisted,
+    Gated,
+}
+
+impl Autonomy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Assisted => "assisted",
+            Self::Gated => "gated",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "assisted" => Some(Self::Assisted),
+            "gated" => Some(Self::Gated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Execution {
+    Agentic,
+    Deterministic,
+}
+
+impl Execution {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Agentic => "agentic",
+            Self::Deterministic => "deterministic",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "agentic" => Some(Self::Agentic),
+            "deterministic" => Some(Self::Deterministic),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskActivity {
-    pub id: i64,
-    pub task_id: String,
-    pub old_state: Option<TaskState>,
-    pub new_state: TaskState,
-    pub actor_channel: String,
-    pub actor_id: Option<String>,
-    pub reason: Option<String>,
-    pub timestamp: String,
+pub struct AcceptanceItem {
+    pub kind: String, // "machine" | "human"
+    pub check: String,
+    pub satisfied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub intent: Option<String>,
+    pub acceptance: Vec<AcceptanceItem>,
+    pub status: TaskStatus,
+    pub priority: u8,
+    pub assigned_to: Option<String>,
+    pub autonomy: Autonomy,
+    pub execution: Execution,
+    pub tools: Vec<String>,
+    pub blockers: serde_json::Value,
+    pub template_id: Option<String>,
+    pub source: String,
+    pub abandon_reason: Option<String>,
+    pub outcome: Option<TaskOutcome>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -151,28 +170,75 @@ pub enum Transition {
     Claim,
     Block,
     Unblock,
-    Complete,
+    Pause,
+    Resume,
+    Submit,
+    Close,
     Abandon,
 }
 
 impl Transition {
-    pub fn valid_from(&self) -> &[TaskState] {
+    pub fn valid_from(&self) -> &[TaskStatus] {
         match self {
-            Self::Claim => &[TaskState::Open, TaskState::Blocked],
-            Self::Block => &[TaskState::Claimed],
-            Self::Unblock => &[TaskState::Blocked],
-            Self::Complete => &[TaskState::Claimed],
-            Self::Abandon => &[TaskState::Open, TaskState::Claimed, TaskState::Blocked],
+            Self::Claim => &[TaskStatus::Open],
+            Self::Block => &[TaskStatus::Active],
+            Self::Unblock => &[TaskStatus::Blocked],
+            Self::Pause => &[TaskStatus::Active],
+            Self::Resume => &[TaskStatus::Paused],
+            Self::Submit => &[TaskStatus::Active],
+            Self::Close => &[TaskStatus::Review],
+            Self::Abandon => &[
+                TaskStatus::Open,
+                TaskStatus::Active,
+                TaskStatus::Blocked,
+                TaskStatus::Paused,
+                TaskStatus::Review,
+            ],
         }
     }
 
-    pub fn target_state(&self) -> TaskState {
+    pub fn target_status(&self) -> TaskStatus {
         match self {
-            Self::Claim | Self::Unblock => TaskState::Claimed,
-            Self::Block => TaskState::Blocked,
-            Self::Complete => TaskState::Done,
-            Self::Abandon => TaskState::Abandoned,
+            Self::Claim | Self::Unblock | Self::Resume => TaskStatus::Active,
+            Self::Block => TaskStatus::Blocked,
+            Self::Pause => TaskStatus::Paused,
+            Self::Submit => TaskStatus::Review,
+            Self::Close => TaskStatus::Closed,
+            Self::Abandon => TaskStatus::Abandoned,
         }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Block => "block",
+            Self::Unblock => "unblock",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Submit => "submit",
+            Self::Close => "close",
+            Self::Abandon => "abandon",
+        }
+    }
+}
+
+/// Trait seam for machine acceptance verification.
+/// Track E swaps in git_operations/test-runner; Track A provides only the
+/// default implementation that shells out.
+pub trait AcceptanceVerifier: Send + Sync {
+    fn verify(&self, check: &str) -> std::result::Result<bool, String>;
+}
+
+pub struct ShellVerifier;
+
+impl AcceptanceVerifier for ShellVerifier {
+    fn verify(&self, check: &str) -> std::result::Result<bool, String> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(check)
+            .output()
+            .map_err(|e| format!("failed to run check: {e}"))?;
+        Ok(output.status.success())
     }
 }
 
@@ -180,19 +246,23 @@ impl Transition {
 pub enum TaskError {
     #[error("task not found: {0}")]
     NotFound(String),
-    #[error("invalid transition: cannot {transition} from {current_state}")]
+    #[error("invalid transition: cannot {transition} from {current_status}")]
     InvalidTransition {
-        current_state: TaskState,
+        current_status: TaskStatus,
         transition: String,
     },
-    #[error("claim conflict: task already claimed (expected state version {expected}, found {found})")]
-    ClaimConflict { expected: String, found: String },
+    #[error("claim conflict: task is already {actual_status} (not open)")]
+    ClaimConflict { actual_status: TaskStatus },
     #[error("abandon requires a reason")]
     AbandonRequiresReason,
-    #[error("complete requires an outcome")]
-    CompleteRequiresOutcome,
+    #[error("close refused: {reason}")]
+    CloseRefused { reason: String },
     #[error("priority must be 0-4, got {0}")]
     InvalidPriority(u8),
+    #[error("acceptance item not found: {0}")]
+    AcceptanceItemNotFound(String),
+    #[error("audit error: {0}")]
+    Audit(String),
     #[error("database error: {0}")]
     Db(#[from] anyhow::Error),
 }

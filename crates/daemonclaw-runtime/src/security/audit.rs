@@ -33,6 +33,7 @@ pub enum AuditEventType {
     SecurityEvent,
     ChainTruncation,
     ChainBoundary,
+    TaskTransition,
 }
 
 /// Actor information (who performed the action)

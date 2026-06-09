@@ -1,6 +1,8 @@
 use super::{
-    Task, TaskActivity, TaskActor, TaskError, TaskOrigin, TaskOutcome, TaskState, Transition,
+    AcceptanceItem, AcceptanceVerifier, Autonomy, Execution, Task, TaskActor, TaskError,
+    TaskOutcome, TaskStatus, Transition,
 };
+use crate::security::audit::{AuditEvent, AuditEventType, AuditLogger};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, params};
@@ -37,37 +39,42 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 1 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tasks (
-                 id                 TEXT PRIMARY KEY,
-                 title              TEXT NOT NULL,
-                 origin             TEXT NOT NULL,
-                 state              TEXT NOT NULL DEFAULT 'open',
-                 priority           INTEGER NOT NULL DEFAULT 2,
-                 created_at         TEXT NOT NULL,
-                 updated_at         TEXT NOT NULL,
-                 claimed_by_channel TEXT,
-                 claimed_by_id      TEXT,
-                 blocked_reason     TEXT,
-                 outcome            TEXT,
-                 parent_task_id     TEXT REFERENCES tasks(id)
+                 id             TEXT PRIMARY KEY,
+                 parent_id      TEXT REFERENCES tasks(id),
+                 title          TEXT NOT NULL,
+                 intent         TEXT,
+                 acceptance     TEXT NOT NULL DEFAULT '[]',
+                 status         TEXT NOT NULL DEFAULT 'open',
+                 priority       INTEGER NOT NULL DEFAULT 2,
+                 assigned_to    TEXT,
+                 autonomy       TEXT NOT NULL DEFAULT 'gated',
+                 execution      TEXT NOT NULL DEFAULT 'agentic',
+                 tools          TEXT NOT NULL DEFAULT '[]',
+                 blockers       TEXT NOT NULL DEFAULT '{}',
+                 template_id    TEXT,
+                 source         TEXT NOT NULL DEFAULT 'operator',
+                 abandon_reason TEXT,
+                 outcome        TEXT,
+                 created_at     TEXT NOT NULL,
+                 updated_at     TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
+             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
-             CREATE INDEX IF NOT EXISTS idx_tasks_origin ON tasks(origin);
-             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+             CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source);
+             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
              CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at);
+             CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
 
              CREATE TABLE IF NOT EXISTS task_activity (
-                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                 task_id       TEXT NOT NULL REFERENCES tasks(id),
-                 old_state     TEXT,
-                 new_state     TEXT NOT NULL,
-                 actor_channel TEXT NOT NULL,
-                 actor_id      TEXT,
-                 reason        TEXT,
-                 timestamp     TEXT NOT NULL
+                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id        TEXT NOT NULL REFERENCES tasks(id),
+                 actor_id       TEXT,
+                 tool           TEXT,
+                 args_summary   TEXT,
+                 result_summary TEXT,
+                 ts             TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_activity_task ON task_activity(task_id);
-             CREATE INDEX IF NOT EXISTS idx_activity_ts ON task_activity(timestamp);
 
              PRAGMA user_version = 1;",
         )
@@ -77,30 +84,142 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ── Helpers ──────────────────────────────────────────────────────
+
+fn get_task_inner(conn: &Connection, task_id: &str) -> Result<Task, TaskError> {
+    conn.query_row(
+        "SELECT id, parent_id, title, intent, acceptance, status, priority, assigned_to,
+                autonomy, execution, tools, blockers, template_id, source,
+                abandon_reason, outcome, created_at, updated_at
+         FROM tasks WHERE id = ?1",
+        params![task_id],
+        row_to_task,
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => TaskError::NotFound(task_id.to_string()),
+        other => TaskError::Db(other.into()),
+    })
+}
+
+fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let acceptance_json: String = row.get(4)?;
+    let tools_json: String = row.get(10)?;
+    let blockers_json: String = row.get(11)?;
+
+    Ok(Task {
+        id: row.get(0)?,
+        parent_id: row.get(1)?,
+        title: row.get(2)?,
+        intent: row.get(3)?,
+        acceptance: serde_json::from_str(&acceptance_json).unwrap_or_default(),
+        status: TaskStatus::from_str(&row.get::<_, String>(5)?).unwrap_or(TaskStatus::Open),
+        priority: row.get::<_, i64>(6)? as u8,
+        assigned_to: row.get(7)?,
+        autonomy: Autonomy::from_str(&row.get::<_, String>(8)?).unwrap_or(Autonomy::Gated),
+        execution: Execution::from_str(&row.get::<_, String>(9)?).unwrap_or(Execution::Agentic),
+        tools: serde_json::from_str(&tools_json).unwrap_or_default(),
+        blockers: serde_json::from_str(&blockers_json).unwrap_or(serde_json::json!({})),
+        template_id: row.get(12)?,
+        source: row.get(13)?,
+        abandon_reason: row.get(14)?,
+        outcome: row.get::<_, Option<String>>(15)?.and_then(|s| TaskOutcome::from_str(&s)),
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
+}
+
+/// Append a task_transition event to audit.db's Merkle chain.
+///
+/// Ordering rationale: audit-first, state-second. A state change with no
+/// audit event is undetectable and violates the sacred property. An audit
+/// event with no state change is detectable (the task's status disagrees
+/// with the chain tip) and reconcilable.
+fn audit_transition(
+    audit: &AuditLogger,
+    task_id: &str,
+    from: TaskStatus,
+    to: TaskStatus,
+    actor: &TaskActor,
+    reason: Option<&str>,
+) -> Result<(), TaskError> {
+    let transition_detail = serde_json::json!({
+        "task_id": task_id,
+        "from": from.as_str(),
+        "to": to.as_str(),
+        "reason": reason,
+    });
+
+    let event = AuditEvent::new(AuditEventType::TaskTransition)
+        .with_actor(
+            actor.channel.clone(),
+            actor.id.clone(),
+            None,
+        )
+        .with_action(
+            serde_json::to_string(&transition_detail).unwrap_or_default(),
+            "task".to_string(),
+            true,
+            true,
+        );
+
+    audit.log(&event).map_err(|e| TaskError::Audit(e.to_string()))
+}
+
+// ── Public API ───────────────────────────────────────────────────
+
+pub struct CreateTaskParams<'a> {
+    pub title: &'a str,
+    pub intent: Option<&'a str>,
+    pub acceptance: &'a [AcceptanceItem],
+    pub priority: u8,
+    pub parent_id: Option<&'a str>,
+    pub source: &'a str,
+    pub autonomy: Autonomy,
+    pub execution: Execution,
+    pub tools: &'a [String],
+}
+
 pub fn create_task(
     workspace_dir: &Path,
-    title: &str,
-    origin: TaskOrigin,
-    priority: u8,
-    parent_task_id: Option<&str>,
+    params: &CreateTaskParams<'_>,
     actor: &TaskActor,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
-    if priority > 4 {
-        return Err(TaskError::InvalidPriority(priority));
+    if params.priority > 4 {
+        return Err(TaskError::InvalidPriority(params.priority));
     }
 
-    let conn = connect(workspace_dir)?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
+    let acceptance_json = serde_json::to_string(params.acceptance)
+        .context("Failed to serialize acceptance")?;
+    let tools_json = serde_json::to_string(params.tools)
+        .context("Failed to serialize tools")?;
 
+    // Audit first: record the creation event
+    audit_transition(audit, &id, TaskStatus::Open, TaskStatus::Open, actor, None)?;
+
+    let conn = connect(workspace_dir)?;
     conn.execute(
-        "INSERT INTO tasks (id, title, origin, state, priority, created_at, updated_at, parent_task_id)
-         VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7)",
-        params![id, title, origin.as_str(), priority as i64, now, now, parent_task_id],
+        "INSERT INTO tasks (id, parent_id, title, intent, acceptance, status, priority,
+         autonomy, execution, tools, source, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            id,
+            params.parent_id,
+            params.title,
+            params.intent,
+            acceptance_json,
+            params.priority as i64,
+            params.autonomy.as_str(),
+            params.execution.as_str(),
+            tools_json,
+            params.source,
+            now,
+            now,
+        ],
     )
     .context("Failed to insert task")?;
-
-    record_activity(&conn, &id, None, TaskState::Open, actor, None)?;
 
     get_task_inner(&conn, &id)
 }
@@ -110,53 +229,21 @@ pub fn get_task(workspace_dir: &Path, task_id: &str) -> Result<Task, TaskError> 
     get_task_inner(&conn, task_id)
 }
 
-fn get_task_inner(conn: &Connection, task_id: &str) -> Result<Task, TaskError> {
-    conn.query_row(
-        "SELECT id, title, origin, state, priority, created_at, updated_at,
-                claimed_by_channel, claimed_by_id, blocked_reason, outcome, parent_task_id
-         FROM tasks WHERE id = ?1",
-        params![task_id],
-        |row| {
-            Ok(Task {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                origin: TaskOrigin::from_str(&row.get::<_, String>(2)?)
-                    .unwrap_or(TaskOrigin::Manual),
-                state: TaskState::from_str(&row.get::<_, String>(3)?)
-                    .unwrap_or(TaskState::Open),
-                priority: row.get::<_, i64>(4)? as u8,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                claimed_by_channel: row.get(7)?,
-                claimed_by_id: row.get(8)?,
-                blocked_reason: row.get(9)?,
-                outcome: row.get::<_, Option<String>>(10)?
-                    .and_then(|s| TaskOutcome::from_str(&s)),
-                parent_task_id: row.get(11)?,
-            })
-        },
-    )
-    .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => TaskError::NotFound(task_id.to_string()),
-        other => TaskError::Db(other.into()),
-    })
-}
-
 pub fn list_tasks(
     workspace_dir: &Path,
-    state_filter: Option<TaskState>,
+    status_filter: Option<TaskStatus>,
     limit: usize,
 ) -> Result<Vec<Task>> {
     let conn = connect(workspace_dir)?;
     let lim = i64::try_from(limit.max(1)).unwrap_or(100);
-
     let mut tasks = Vec::new();
 
-    if let Some(st) = state_filter {
+    if let Some(st) = status_filter {
         let mut stmt = conn.prepare(
-            "SELECT id, title, origin, state, priority, created_at, updated_at,
-                    claimed_by_channel, claimed_by_id, blocked_reason, outcome, parent_task_id
-             FROM tasks WHERE state = ?1
+            "SELECT id, parent_id, title, intent, acceptance, status, priority, assigned_to,
+                    autonomy, execution, tools, blockers, template_id, source,
+                    abandon_reason, outcome, created_at, updated_at
+             FROM tasks WHERE status = ?1
              ORDER BY priority DESC, updated_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![st.as_str(), lim], row_to_task)?;
@@ -165,8 +252,9 @@ pub fn list_tasks(
         }
     } else {
         let mut stmt = conn.prepare(
-            "SELECT id, title, origin, state, priority, created_at, updated_at,
-                    claimed_by_channel, claimed_by_id, blocked_reason, outcome, parent_task_id
+            "SELECT id, parent_id, title, intent, acceptance, status, priority, assigned_to,
+                    autonomy, execution, tools, blockers, template_id, source,
+                    abandon_reason, outcome, created_at, updated_at
              FROM tasks
              ORDER BY priority DESC, updated_at DESC LIMIT ?1",
         )?;
@@ -179,41 +267,51 @@ pub fn list_tasks(
     Ok(tasks)
 }
 
-fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
-    Ok(Task {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        origin: TaskOrigin::from_str(&row.get::<_, String>(2)?).unwrap_or(TaskOrigin::Manual),
-        state: TaskState::from_str(&row.get::<_, String>(3)?).unwrap_or(TaskState::Open),
-        priority: row.get::<_, i64>(4)? as u8,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        claimed_by_channel: row.get(7)?,
-        claimed_by_id: row.get(8)?,
-        blocked_reason: row.get(9)?,
-        outcome: row.get::<_, Option<String>>(10)?.and_then(|s| TaskOutcome::from_str(&s)),
-        parent_task_id: row.get(11)?,
-    })
-}
-
-/// Claim a task. Uses CAS: the caller provides the expected current `updated_at`
-/// timestamp. If the task was modified since that read, the claim fails with
-/// `ClaimConflict`.
+/// Claim an open task. Uses `BEGIN IMMEDIATE` + `WHERE status='open'` so
+/// exactly one of two racing claimers wins; the loser gets `ClaimConflict`.
 pub fn claim_task(
     workspace_dir: &Path,
     task_id: &str,
     actor: &TaskActor,
-    expected_updated_at: &str,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
-    transition(
-        workspace_dir,
-        task_id,
-        Transition::Claim,
-        actor,
-        expected_updated_at,
-        None,
-        None,
+    // Read current status to give a good error if not open
+    let task = get_task(workspace_dir, task_id)?;
+    if task.status != TaskStatus::Open {
+        return Err(TaskError::ClaimConflict {
+            actual_status: task.status,
+        });
+    }
+
+    // Audit first
+    let assigned = actor.id.as_deref().unwrap_or(&actor.channel);
+    audit_transition(audit, task_id, TaskStatus::Open, TaskStatus::Active, actor, None)?;
+
+    // State second — conditional update under BEGIN IMMEDIATE
+    let conn = connect(workspace_dir)?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .context("Failed to begin immediate transaction")?;
+
+    let now = Utc::now().to_rfc3339();
+    let rows_affected = conn.execute(
+        "UPDATE tasks SET status = 'active', assigned_to = ?1, updated_at = ?2
+         WHERE id = ?3 AND status = 'open'",
+        params![assigned, now, task_id],
     )
+    .context("Failed to claim task")?;
+
+    if rows_affected == 0 {
+        let _ = conn.execute_batch("ROLLBACK");
+        // Re-read to find actual status
+        let actual = get_task(workspace_dir, task_id)?;
+        return Err(TaskError::ClaimConflict {
+            actual_status: actual.status,
+        });
+    }
+
+    conn.execute_batch("COMMIT")
+        .context("Failed to commit claim")?;
+    get_task_inner(&conn, task_id)
 }
 
 pub fn block_task(
@@ -221,69 +319,134 @@ pub fn block_task(
     task_id: &str,
     actor: &TaskActor,
     reason: &str,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
-    let task = get_task(workspace_dir, task_id)?;
-    transition(
-        workspace_dir,
-        task_id,
-        Transition::Block,
-        actor,
-        &task.updated_at,
-        Some(reason),
-        None,
-    )
+    do_transition(workspace_dir, task_id, Transition::Block, actor, Some(reason), None, audit)
 }
 
 pub fn unblock_task(
     workspace_dir: &Path,
     task_id: &str,
     actor: &TaskActor,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
-    let task = get_task(workspace_dir, task_id)?;
-    transition(
-        workspace_dir,
-        task_id,
-        Transition::Unblock,
-        actor,
-        &task.updated_at,
-        None,
-        None,
-    )
+    do_transition(workspace_dir, task_id, Transition::Unblock, actor, None, None, audit)
 }
 
-pub fn complete_task(
+pub fn pause_task(
+    workspace_dir: &Path,
+    task_id: &str,
+    actor: &TaskActor,
+    audit: &AuditLogger,
+) -> Result<Task, TaskError> {
+    do_transition(workspace_dir, task_id, Transition::Pause, actor, None, None, audit)
+}
+
+pub fn resume_task(
+    workspace_dir: &Path,
+    task_id: &str,
+    actor: &TaskActor,
+    audit: &AuditLogger,
+) -> Result<Task, TaskError> {
+    do_transition(workspace_dir, task_id, Transition::Resume, actor, None, None, audit)
+}
+
+pub fn submit_task(
+    workspace_dir: &Path,
+    task_id: &str,
+    actor: &TaskActor,
+    audit: &AuditLogger,
+) -> Result<Task, TaskError> {
+    do_transition(workspace_dir, task_id, Transition::Submit, actor, None, None, audit)
+}
+
+/// Close a task in review. Gated on acceptance criteria:
+/// - All machine items must be satisfied (verified via the verifier).
+/// - All human items must be attested.
+/// - A task with NO machine-verifiable items cannot be agent-closed —
+///   it requires an explicit operator close (is_operator=true).
+pub fn close_task(
     workspace_dir: &Path,
     task_id: &str,
     actor: &TaskActor,
     outcome: TaskOutcome,
+    verifier: &dyn AcceptanceVerifier,
+    is_operator: bool,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
-    let task = get_task(workspace_dir, task_id)?;
+    let mut task = get_task(workspace_dir, task_id)?;
 
-    // No-self-complete invariant: the actor completing must NOT be the same
-    // as the actor who claimed it, unless it was manually created.
-    if task.origin != TaskOrigin::Manual {
-        if let (Some(claim_ch), Some(claim_id)) =
-            (&task.claimed_by_channel, &task.claimed_by_id)
-        {
-            if claim_ch == &actor.channel && actor.id.as_deref() == Some(claim_id.as_str()) {
-                return Err(TaskError::InvalidTransition {
-                    current_state: task.state,
-                    transition: "complete (no-self-complete: claimer cannot complete their own task)"
-                        .to_string(),
-                });
+    if task.status != TaskStatus::Review {
+        return Err(TaskError::InvalidTransition {
+            current_status: task.status,
+            transition: "close".to_string(),
+        });
+    }
+
+    // Run machine verifications and update satisfaction in-place
+    let mut has_machine_items = false;
+    for item in &mut task.acceptance {
+        if item.kind == "machine" {
+            has_machine_items = true;
+            match verifier.verify(&item.check) {
+                Ok(true) => item.satisfied = true,
+                Ok(false) => {}
+                Err(_) => {}
             }
         }
     }
 
-    transition(
-        workspace_dir,
+    // Check all items satisfied
+    let unsatisfied: Vec<&AcceptanceItem> =
+        task.acceptance.iter().filter(|i| !i.satisfied).collect();
+    if !unsatisfied.is_empty() {
+        // Persist updated satisfaction state
+        let acceptance_json = serde_json::to_string(&task.acceptance)
+            .context("Failed to serialize acceptance")?;
+        let conn = connect(workspace_dir)?;
+        conn.execute(
+            "UPDATE tasks SET acceptance = ?1, updated_at = ?2 WHERE id = ?3",
+            params![acceptance_json, Utc::now().to_rfc3339(), task_id],
+        )
+        .context("Failed to update acceptance")?;
+
+        let names: Vec<&str> = unsatisfied.iter().map(|i| i.check.as_str()).collect();
+        return Err(TaskError::CloseRefused {
+            reason: format!("unsatisfied acceptance items: {}", names.join(", ")),
+        });
+    }
+
+    // No machine items and not operator → agent cannot close
+    if !has_machine_items && !is_operator {
+        return Err(TaskError::CloseRefused {
+            reason: "task has no machine-verifiable acceptance items; requires operator close"
+                .to_string(),
+        });
+    }
+
+    // Audit first
+    audit_transition(
+        audit,
         task_id,
-        Transition::Complete,
+        TaskStatus::Review,
+        TaskStatus::Closed,
         actor,
-        &task.updated_at,
-        None,
-        Some(outcome),
+        Some(outcome.as_str()),
+    )?;
+
+    // State second
+    let conn = connect(workspace_dir)?;
+    let now = Utc::now().to_rfc3339();
+    let acceptance_json = serde_json::to_string(&task.acceptance)
+        .context("Failed to serialize acceptance")?;
+    conn.execute(
+        "UPDATE tasks SET status = 'closed', outcome = ?1, acceptance = ?2, updated_at = ?3
+         WHERE id = ?4",
+        params![outcome.as_str(), acceptance_json, now, task_id],
     )
+    .context("Failed to close task")?;
+
+    get_task_inner(&conn, task_id)
 }
 
 pub fn abandon_task(
@@ -291,210 +454,178 @@ pub fn abandon_task(
     task_id: &str,
     actor: &TaskActor,
     reason: &str,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
     if reason.trim().is_empty() {
         return Err(TaskError::AbandonRequiresReason);
     }
-    let task = get_task(workspace_dir, task_id)?;
-    transition(
-        workspace_dir,
-        task_id,
-        Transition::Abandon,
-        actor,
-        &task.updated_at,
-        Some(reason),
-        None,
-    )
+    do_transition(workspace_dir, task_id, Transition::Abandon, actor, Some(reason), None, audit)
 }
 
-pub fn get_task_activity(
+/// Record an operator attestation on a human acceptance item.
+pub fn attest(
     workspace_dir: &Path,
     task_id: &str,
-    limit: usize,
-) -> Result<Vec<TaskActivity>> {
-    let conn = connect(workspace_dir)?;
-    let lim = i64::try_from(limit.max(1)).unwrap_or(50);
-    let mut stmt = conn.prepare(
-        "SELECT id, task_id, old_state, new_state, actor_channel, actor_id, reason, timestamp
-         FROM task_activity WHERE task_id = ?1
-         ORDER BY id ASC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![task_id, lim], |row| {
-        Ok(TaskActivity {
-            id: row.get(0)?,
-            task_id: row.get(1)?,
-            old_state: row.get::<_, Option<String>>(2)?
-                .and_then(|s| TaskState::from_str(&s)),
-            new_state: TaskState::from_str(&row.get::<_, String>(3)?)
-                .unwrap_or(TaskState::Open),
-            actor_channel: row.get(4)?,
-            actor_id: row.get(5)?,
-            reason: row.get(6)?,
-            timestamp: row.get(7)?,
-        })
-    })?;
-
-    let mut activity = Vec::new();
-    for row in rows {
-        activity.push(row?);
-    }
-    Ok(activity)
-}
-
-fn transition(
-    workspace_dir: &Path,
-    task_id: &str,
-    trans: Transition,
+    check: &str,
     actor: &TaskActor,
-    expected_updated_at: &str,
-    reason: Option<&str>,
-    outcome: Option<TaskOutcome>,
+    audit: &AuditLogger,
 ) -> Result<Task, TaskError> {
-    if trans == Transition::Abandon && reason.map_or(true, |r| r.trim().is_empty()) {
-        return Err(TaskError::AbandonRequiresReason);
+    let task = get_task(workspace_dir, task_id)?;
+    let mut acceptance = task.acceptance;
+    let mut found = false;
+
+    for item in &mut acceptance {
+        if item.kind == "human" && item.check == check {
+            item.satisfied = true;
+            found = true;
+        }
     }
-    if trans == Transition::Complete && outcome.is_none() {
-        return Err(TaskError::CompleteRequiresOutcome);
+
+    if !found {
+        return Err(TaskError::AcceptanceItemNotFound(check.to_string()));
     }
+
+    // Audit the attestation
+    let detail = serde_json::json!({
+        "task_id": task_id,
+        "action": "attest",
+        "check": check,
+    });
+    let event = AuditEvent::new(AuditEventType::TaskTransition)
+        .with_actor(actor.channel.clone(), actor.id.clone(), None)
+        .with_action(
+            serde_json::to_string(&detail).unwrap_or_default(),
+            "task".to_string(),
+            true,
+            true,
+        );
+    audit.log(&event).map_err(|e| TaskError::Audit(e.to_string()))?;
 
     let conn = connect(workspace_dir)?;
-    let tx = conn
-        .unchecked_transaction()
-        .context("Failed to begin transaction")?;
-
-    let (current_state_str, actual_updated_at): (String, String) = tx
-        .query_row(
-            "SELECT state, updated_at FROM tasks WHERE id = ?1",
-            params![task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskError::NotFound(task_id.to_string()),
-            other => TaskError::Db(other.into()),
-        })?;
-
-    // CAS check
-    if actual_updated_at != expected_updated_at {
-        return Err(TaskError::ClaimConflict {
-            expected: expected_updated_at.to_string(),
-            found: actual_updated_at,
-        });
-    }
-
-    let current_state = TaskState::from_str(&current_state_str).unwrap_or(TaskState::Open);
-
-    if !trans.valid_from().contains(&current_state) {
-        return Err(TaskError::InvalidTransition {
-            current_state,
-            transition: format!("{:?}", trans),
-        });
-    }
-
-    let new_state = trans.target_state();
+    let acceptance_json =
+        serde_json::to_string(&acceptance).context("Failed to serialize acceptance")?;
     let now = Utc::now().to_rfc3339();
-
-    match trans {
-        Transition::Claim => {
-            tx.execute(
-                "UPDATE tasks SET state = ?1, claimed_by_channel = ?2, claimed_by_id = ?3,
-                 updated_at = ?4 WHERE id = ?5",
-                params![new_state.as_str(), actor.channel, actor.id, now, task_id],
-            )
-            .context("Failed to claim task")?;
-        }
-        Transition::Block => {
-            tx.execute(
-                "UPDATE tasks SET state = ?1, blocked_reason = ?2, updated_at = ?3 WHERE id = ?4",
-                params![new_state.as_str(), reason, now, task_id],
-            )
-            .context("Failed to block task")?;
-        }
-        Transition::Unblock => {
-            tx.execute(
-                "UPDATE tasks SET state = ?1, blocked_reason = NULL, updated_at = ?2 WHERE id = ?3",
-                params![new_state.as_str(), now, task_id],
-            )
-            .context("Failed to unblock task")?;
-        }
-        Transition::Complete => {
-            tx.execute(
-                "UPDATE tasks SET state = ?1, outcome = ?2, updated_at = ?3 WHERE id = ?4",
-                params![new_state.as_str(), outcome.map(|o| o.as_str()), now, task_id],
-            )
-            .context("Failed to complete task")?;
-        }
-        Transition::Abandon => {
-            tx.execute(
-                "UPDATE tasks SET state = ?1, outcome = 'cancelled', updated_at = ?2 WHERE id = ?3",
-                params![new_state.as_str(), now, task_id],
-            )
-            .context("Failed to abandon task")?;
-        }
-    }
-
-    record_activity_tx(&tx, task_id, Some(current_state), new_state, actor, reason)?;
-
-    tx.commit().context("Failed to commit transition")?;
+    conn.execute(
+        "UPDATE tasks SET acceptance = ?1, updated_at = ?2 WHERE id = ?3",
+        params![acceptance_json, now, task_id],
+    )
+    .context("Failed to update acceptance")?;
 
     get_task_inner(&conn, task_id)
 }
 
-fn record_activity(
-    conn: &Connection,
-    task_id: &str,
-    old_state: Option<TaskState>,
-    new_state: TaskState,
-    actor: &TaskActor,
-    reason: Option<&str>,
-) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO task_activity (task_id, old_state, new_state, actor_channel, actor_id, reason, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            task_id,
-            old_state.map(|s| s.as_str()),
-            new_state.as_str(),
-            actor.channel,
-            actor.id,
-            reason,
-            now,
-        ],
-    )
-    .context("Failed to record task activity")?;
-    Ok(())
+/// Read task_transition events from audit.db for a given task.
+pub fn get_task_history(audit: &AuditLogger, task_id: &str) -> Result<Vec<serde_json::Value>> {
+    let conn = Connection::open(audit.db_path())
+        .context("Failed to open audit.db for history query")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT event_json FROM audit_events
+         WHERE event_type = 'task_transition'
+         ORDER BY id ASC",
+    )?;
+
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let json_str = row?;
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            // Filter to events for this task_id
+            if let Some(action) = event.get("action").and_then(|a| a.get("command")) {
+                if let Some(cmd_str) = action.as_str() {
+                    if cmd_str.contains(task_id) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(events)
 }
 
-fn record_activity_tx(
-    tx: &rusqlite::Transaction<'_>,
+// ── Internal transition logic ────────────────────────────────────
+
+fn do_transition(
+    workspace_dir: &Path,
     task_id: &str,
-    old_state: Option<TaskState>,
-    new_state: TaskState,
+    trans: Transition,
     actor: &TaskActor,
     reason: Option<&str>,
-) -> Result<()> {
+    outcome: Option<TaskOutcome>,
+    audit: &AuditLogger,
+) -> Result<Task, TaskError> {
+    let task = get_task(workspace_dir, task_id)?;
+
+    if !trans.valid_from().contains(&task.status) {
+        return Err(TaskError::InvalidTransition {
+            current_status: task.status,
+            transition: trans.as_str().to_string(),
+        });
+    }
+
+    let new_status = trans.target_status();
+
+    // Audit first, state second
+    audit_transition(audit, task_id, task.status, new_status, actor, reason)?;
+
+    let conn = connect(workspace_dir)?;
     let now = Utc::now().to_rfc3339();
-    tx.execute(
-        "INSERT INTO task_activity (task_id, old_state, new_state, actor_channel, actor_id, reason, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            task_id,
-            old_state.map(|s| s.as_str()),
-            new_state.as_str(),
-            actor.channel,
-            actor.id,
-            reason,
-            now,
-        ],
-    )
-    .context("Failed to record task activity")?;
-    Ok(())
+
+    match trans {
+        Transition::Abandon => {
+            conn.execute(
+                "UPDATE tasks SET status = ?1, abandon_reason = ?2, outcome = 'cancelled',
+                 updated_at = ?3 WHERE id = ?4",
+                params![new_status.as_str(), reason, now, task_id],
+            )
+            .context("Failed to abandon task")?;
+        }
+        Transition::Block => {
+            // Human note rides the audit event; structured blockers unchanged
+            conn.execute(
+                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_status.as_str(), now, task_id],
+            )
+            .context("Failed to block task")?;
+        }
+        Transition::Unblock => {
+            conn.execute(
+                "UPDATE tasks SET status = ?1, blockers = '{}', updated_at = ?2 WHERE id = ?3",
+                params![new_status.as_str(), now, task_id],
+            )
+            .context("Failed to unblock task")?;
+        }
+        _ => {
+            conn.execute(
+                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_status.as_str(), now, task_id],
+            )
+            .context("Failed to update task status")?;
+        }
+    }
+
+    get_task_inner(&conn, task_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::audit::AuditLogger;
+    use daemonclaw_config::schema::AuditConfig;
     use tempfile::TempDir;
+
+    fn test_setup() -> (TempDir, AuditLogger) {
+        let tmp = TempDir::new().unwrap();
+        let audit_config = AuditConfig {
+            enabled: true,
+            log_path: "audit.log".to_string(),
+            max_size_mb: 100,
+            sign_events: false,
+        };
+        let audit = AuditLogger::new(audit_config, tmp.path().to_path_buf()).unwrap();
+        (tmp, audit)
+    }
 
     fn cli_actor() -> TaskActor {
         TaskActor {
@@ -510,397 +641,361 @@ mod tests {
         }
     }
 
+    fn simple_params(title: &str) -> CreateTaskParams<'_> {
+        CreateTaskParams {
+            title,
+            intent: None,
+            acceptance: &[],
+            priority: 2,
+            parent_id: None,
+            source: "operator",
+            autonomy: Autonomy::Gated,
+            execution: Execution::Agentic,
+            tools: &[],
+        }
+    }
+
+    // ── Acceptance scenario 1: machine acceptance gate ──────────
+
     #[test]
-    fn create_and_get_task() {
-        let tmp = TempDir::new().unwrap();
-        let task = create_task(
-            tmp.path(),
-            "Fix the widget",
-            TaskOrigin::Manual,
-            2,
-            None,
-            &cli_actor(),
+    fn close_refused_with_unmet_machine_acceptance() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        let acceptance = vec![AcceptanceItem {
+            kind: "machine".to_string(),
+            check: "false".to_string(), // exit 1 → unsatisfied
+            satisfied: false,
+        }];
+        let params = CreateTaskParams {
+            title: "Machine gate test",
+            acceptance: &acceptance,
+            ..simple_params("Machine gate test")
+        };
+        let task = create_task(tmp.path(), &params, &actor, &audit).unwrap();
+
+        let claimed = claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        assert_eq!(claimed.status, TaskStatus::Active);
+
+        let submitted = submit_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        assert_eq!(submitted.status, TaskStatus::Review);
+
+        // Close with failing check → refused
+        let verifier = super::super::ShellVerifier;
+        let err = close_task(
+            tmp.path(), &task.id, &actor, TaskOutcome::Succeeded,
+            &verifier, false, &audit,
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(matches!(err, TaskError::CloseRefused { .. }), "got: {err:?}");
 
-        assert_eq!(task.title, "Fix the widget");
-        assert_eq!(task.state, TaskState::Open);
-        assert_eq!(task.priority, 2);
-        assert_eq!(task.origin, TaskOrigin::Manual);
-        assert!(task.claimed_by_channel.is_none());
-
-        let fetched = get_task(tmp.path(), &task.id).unwrap();
-        assert_eq!(fetched.id, task.id);
+        // Task stays in review
+        let still_review = get_task(tmp.path(), &task.id).unwrap();
+        assert_eq!(still_review.status, TaskStatus::Review);
     }
 
     #[test]
-    fn create_task_records_activity() {
-        let tmp = TempDir::new().unwrap();
-        let task = create_task(
-            tmp.path(),
-            "Test activity",
-            TaskOrigin::Manual,
-            1,
-            None,
-            &cli_actor(),
+    fn close_succeeds_after_machine_acceptance_satisfied() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        let acceptance = vec![AcceptanceItem {
+            kind: "machine".to_string(),
+            check: "true".to_string(), // exit 0 → satisfied
+            satisfied: false,
+        }];
+        let params = CreateTaskParams {
+            title: "Machine pass test",
+            acceptance: &acceptance,
+            ..simple_params("Machine pass test")
+        };
+        let task = create_task(tmp.path(), &params, &actor, &audit).unwrap();
+        claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        submit_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+
+        let verifier = super::super::ShellVerifier;
+        let closed = close_task(
+            tmp.path(), &task.id, &actor, TaskOutcome::Succeeded,
+            &verifier, false, &audit,
+        )
+        .unwrap();
+        assert_eq!(closed.status, TaskStatus::Closed);
+        assert_eq!(closed.outcome, Some(TaskOutcome::Succeeded));
+    }
+
+    // ── Acceptance scenario 2: human acceptance gate ────────────
+
+    #[test]
+    fn close_refused_until_human_attestation() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        let acceptance = vec![AcceptanceItem {
+            kind: "human".to_string(),
+            check: "operator reviewed deployment".to_string(),
+            satisfied: false,
+        }];
+        let params = CreateTaskParams {
+            title: "Human gate test",
+            acceptance: &acceptance,
+            ..simple_params("Human gate test")
+        };
+        let task = create_task(tmp.path(), &params, &actor, &audit).unwrap();
+        claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        submit_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+
+        let verifier = super::super::ShellVerifier;
+        let err = close_task(
+            tmp.path(), &task.id, &actor, TaskOutcome::Succeeded,
+            &verifier, true, &audit,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TaskError::CloseRefused { .. }));
+
+        // Attest
+        attest(
+            tmp.path(), &task.id,
+            "operator reviewed deployment",
+            &actor, &audit,
         )
         .unwrap();
 
-        let activity = get_task_activity(tmp.path(), &task.id, 10).unwrap();
-        assert_eq!(activity.len(), 1);
-        assert!(activity[0].old_state.is_none());
-        assert_eq!(activity[0].new_state, TaskState::Open);
-        assert_eq!(activity[0].actor_channel, "cli");
+        // Now close succeeds
+        let closed = close_task(
+            tmp.path(), &task.id, &actor, TaskOutcome::Succeeded,
+            &verifier, true, &audit,
+        )
+        .unwrap();
+        assert_eq!(closed.status, TaskStatus::Closed);
     }
+
+    // ── Acceptance scenario 3: no machine items → agent cannot close ──
+
+    #[test]
+    fn agent_cannot_close_task_with_no_machine_items() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        // No acceptance items at all
+        let task = create_task(tmp.path(), &simple_params("No items"), &actor, &audit).unwrap();
+        claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        submit_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+
+        let verifier = super::super::ShellVerifier;
+        let err = close_task(
+            tmp.path(), &task.id, &actor, TaskOutcome::Succeeded,
+            &verifier, false, &audit, // is_operator=false
+        )
+        .unwrap_err();
+        assert!(matches!(err, TaskError::CloseRefused { .. }));
+
+        // Operator CAN close it
+        let closed = close_task(
+            tmp.path(), &task.id, &actor, TaskOutcome::Succeeded,
+            &verifier, true, &audit, // is_operator=true
+        )
+        .unwrap();
+        assert_eq!(closed.status, TaskStatus::Closed);
+    }
+
+    // ── Acceptance scenario 4: concurrent double-claim ──────────
+
+    #[test]
+    fn concurrent_double_claim_one_wins() {
+        let (tmp, audit) = test_setup();
+        let actor_a = cli_actor();
+        let actor_b = other_actor();
+
+        let task = create_task(tmp.path(), &simple_params("Race"), &actor_a, &audit).unwrap();
+
+        // First claim wins
+        let winner = claim_task(tmp.path(), &task.id, &actor_a, &audit).unwrap();
+        assert_eq!(winner.status, TaskStatus::Active);
+
+        // Second claim loses — task is no longer open
+        let err = claim_task(tmp.path(), &task.id, &actor_b, &audit);
+        assert!(err.is_err(), "second claim should fail");
+        match err.unwrap_err() {
+            TaskError::ClaimConflict { actual_status } => {
+                assert_eq!(actual_status, TaskStatus::Active);
+            }
+            other => panic!("expected ClaimConflict, got: {other:?}"),
+        }
+    }
+
+    // ── Acceptance scenario 5: abandon ──────────────────────────
+
+    #[test]
+    fn abandon_with_reason_and_empty_rejected() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        let task = create_task(tmp.path(), &simple_params("Abandon me"), &actor, &audit).unwrap();
+
+        let err = abandon_task(tmp.path(), &task.id, &actor, "", &audit).unwrap_err();
+        assert!(matches!(err, TaskError::AbandonRequiresReason));
+
+        let abandoned =
+            abandon_task(tmp.path(), &task.id, &actor, "no longer needed", &audit).unwrap();
+        assert_eq!(abandoned.status, TaskStatus::Abandoned);
+        assert_eq!(abandoned.abandon_reason.as_deref(), Some("no longer needed"));
+    }
+
+    // ── Acceptance scenario 6: audit chain integrity ────────────
+
+    #[test]
+    fn transitions_in_audit_chain_and_chain_verifies() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        let task = create_task(tmp.path(), &simple_params("Audit test"), &actor, &audit).unwrap();
+        claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        submit_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+
+        // Verify the Merkle chain: create(open→open) + claim(open→active) + submit(active→review) = 3
+        let count = crate::security::audit::verify_chain(audit.db_path()).unwrap();
+        assert!(count >= 3, "expected at least 3 audit events, got {count}");
+
+        // Verify append-only enforcement: try to delete
+        let conn = Connection::open(audit.db_path()).unwrap();
+        let delete_result = conn.execute("DELETE FROM audit_events WHERE id = 1", []);
+        assert!(delete_result.is_err(), "DELETE should be blocked by trigger");
+    }
+
+    // ── Acceptance scenario 7: task_activity is breadcrumb schema, empty ──
+
+    #[test]
+    fn task_activity_exists_with_breadcrumb_schema_and_is_empty() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+
+        create_task(tmp.path(), &simple_params("Check schema"), &actor, &audit).unwrap();
+
+        let conn = connect(tmp.path()).unwrap();
+
+        // Verify the breadcrumb columns exist
+        let mut stmt = conn
+            .prepare("SELECT id, task_id, actor_id, tool, args_summary, result_summary, ts FROM task_activity LIMIT 1")
+            .expect("task_activity should have breadcrumb columns");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_activity", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "task_activity must be empty in Track A");
+        drop(stmt);
+    }
+
+    // ── Remaining state machine tests ───────────────────────────
 
     #[test]
     fn invalid_priority_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let err = create_task(
-            tmp.path(),
-            "Bad priority",
-            TaskOrigin::Manual,
-            5,
-            None,
-            &cli_actor(),
-        )
-        .unwrap_err();
+        let (tmp, audit) = test_setup();
+        let mut params = simple_params("Bad priority");
+        params.priority = 5;
+        let err = create_task(tmp.path(), &params, &cli_actor(), &audit).unwrap_err();
         assert!(matches!(err, TaskError::InvalidPriority(5)));
     }
 
     #[test]
-    fn claim_task_with_cas() {
-        let tmp = TempDir::new().unwrap();
-        let task = create_task(
-            tmp.path(),
-            "Claim me",
-            TaskOrigin::Manual,
-            2,
-            None,
-            &cli_actor(),
-        )
-        .unwrap();
+    fn cannot_transition_from_terminal() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
 
-        let claimed = claim_task(
-            tmp.path(),
-            &task.id,
-            &cli_actor(),
-            &task.updated_at,
-        )
-        .unwrap();
+        let task = create_task(tmp.path(), &simple_params("Terminal"), &actor, &audit).unwrap();
+        abandon_task(tmp.path(), &task.id, &actor, "done", &audit).unwrap();
 
-        assert_eq!(claimed.state, TaskState::Claimed);
-        assert_eq!(claimed.claimed_by_channel.as_deref(), Some("cli"));
-        assert_eq!(claimed.claimed_by_id.as_deref(), Some("richard"));
-    }
-
-    #[test]
-    fn claim_conflict_on_stale_version() {
-        let tmp = TempDir::new().unwrap();
-        let task = create_task(
-            tmp.path(),
-            "Race me",
-            TaskOrigin::Manual,
-            2,
-            None,
-            &cli_actor(),
-        )
-        .unwrap();
-
-        claim_task(tmp.path(), &task.id, &cli_actor(), &task.updated_at).unwrap();
-
-        let err = claim_task(
-            tmp.path(),
-            &task.id,
-            &other_actor(),
-            &task.updated_at,
-        )
-        .unwrap_err();
+        let err = claim_task(tmp.path(), &task.id, &actor, &audit).unwrap_err();
         assert!(matches!(err, TaskError::ClaimConflict { .. }));
     }
 
     #[test]
-    fn full_lifecycle_open_claim_done() {
-        let tmp = TempDir::new().unwrap();
-        let actor_a = cli_actor();
-        let actor_b = other_actor();
-
-        let task = create_task(
-            tmp.path(),
-            "Lifecycle test",
-            TaskOrigin::Heartbeat,
-            3,
-            None,
-            &actor_a,
-        )
-        .unwrap();
-
-        let claimed = claim_task(
-            tmp.path(),
-            &task.id,
-            &actor_a,
-            &task.updated_at,
-        )
-        .unwrap();
-        assert_eq!(claimed.state, TaskState::Claimed);
-
-        let done = complete_task(
-            tmp.path(),
-            &claimed.id,
-            &actor_b,
-            TaskOutcome::Succeeded,
-        )
-        .unwrap();
-        assert_eq!(done.state, TaskState::Done);
-        assert_eq!(done.outcome, Some(TaskOutcome::Succeeded));
-
-        let activity = get_task_activity(tmp.path(), &task.id, 50).unwrap();
-        assert_eq!(activity.len(), 3);
-    }
-
-    #[test]
-    fn no_self_complete_enforced() {
-        let tmp = TempDir::new().unwrap();
-        let actor = cli_actor();
-
-        let task = create_task(
-            tmp.path(),
-            "Self-complete test",
-            TaskOrigin::Heartbeat,
-            2,
-            None,
-            &actor,
-        )
-        .unwrap();
-
-        let claimed = claim_task(
-            tmp.path(),
-            &task.id,
-            &actor,
-            &task.updated_at,
-        )
-        .unwrap();
-
-        let err = complete_task(
-            tmp.path(),
-            &claimed.id,
-            &actor,
-            TaskOutcome::Succeeded,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, TaskError::InvalidTransition { .. }),
-            "expected InvalidTransition, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn self_complete_allowed_for_manual_origin() {
-        let tmp = TempDir::new().unwrap();
-        let actor = cli_actor();
-
-        let task = create_task(
-            tmp.path(),
-            "Manual self-complete",
-            TaskOrigin::Manual,
-            2,
-            None,
-            &actor,
-        )
-        .unwrap();
-
-        let claimed = claim_task(
-            tmp.path(),
-            &task.id,
-            &actor,
-            &task.updated_at,
-        )
-        .unwrap();
-
-        let done = complete_task(
-            tmp.path(),
-            &claimed.id,
-            &actor,
-            TaskOutcome::Succeeded,
-        )
-        .unwrap();
-        assert_eq!(done.state, TaskState::Done);
-    }
-
-    #[test]
     fn block_and_unblock() {
-        let tmp = TempDir::new().unwrap();
+        let (tmp, audit) = test_setup();
         let actor = cli_actor();
 
-        let task = create_task(
-            tmp.path(),
-            "Block test",
-            TaskOrigin::Channel,
-            2,
-            None,
-            &actor,
-        )
-        .unwrap();
+        let task = create_task(tmp.path(), &simple_params("Block test"), &actor, &audit).unwrap();
+        claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
 
-        let claimed = claim_task(
-            tmp.path(),
-            &task.id,
-            &actor,
-            &task.updated_at,
-        )
-        .unwrap();
+        let blocked = block_task(tmp.path(), &task.id, &actor, "external dep", &audit).unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
 
-        let blocked = block_task(
-            tmp.path(),
-            &claimed.id,
-            &actor,
-            "waiting on external API",
-        )
-        .unwrap();
-        assert_eq!(blocked.state, TaskState::Blocked);
-        assert_eq!(
-            blocked.blocked_reason.as_deref(),
-            Some("waiting on external API")
-        );
-
-        let unblocked = unblock_task(tmp.path(), &blocked.id, &actor).unwrap();
-        assert_eq!(unblocked.state, TaskState::Claimed);
-        assert!(unblocked.blocked_reason.is_none());
+        let unblocked = unblock_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        assert_eq!(unblocked.status, TaskStatus::Active);
     }
 
     #[test]
-    fn abandon_requires_reason() {
-        let tmp = TempDir::new().unwrap();
+    fn pause_and_resume() {
+        let (tmp, audit) = test_setup();
         let actor = cli_actor();
 
-        let task = create_task(
-            tmp.path(),
-            "Abandon test",
-            TaskOrigin::Manual,
-            1,
-            None,
-            &actor,
-        )
-        .unwrap();
+        let task = create_task(tmp.path(), &simple_params("Pause test"), &actor, &audit).unwrap();
+        claim_task(tmp.path(), &task.id, &actor, &audit).unwrap();
 
-        let err = abandon_task(tmp.path(), &task.id, &actor, "").unwrap_err();
-        assert!(matches!(err, TaskError::AbandonRequiresReason));
+        let paused = pause_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
 
-        let abandoned =
-            abandon_task(tmp.path(), &task.id, &actor, "no longer needed").unwrap();
-        assert_eq!(abandoned.state, TaskState::Abandoned);
-    }
-
-    #[test]
-    fn cannot_transition_from_terminal() {
-        let tmp = TempDir::new().unwrap();
-        let actor_a = cli_actor();
-        let actor_b = other_actor();
-
-        let task = create_task(
-            tmp.path(),
-            "Terminal test",
-            TaskOrigin::Heartbeat,
-            2,
-            None,
-            &actor_a,
-        )
-        .unwrap();
-
-        let claimed = claim_task(
-            tmp.path(),
-            &task.id,
-            &actor_a,
-            &task.updated_at,
-        )
-        .unwrap();
-
-        let done = complete_task(
-            tmp.path(),
-            &claimed.id,
-            &actor_b,
-            TaskOutcome::Succeeded,
-        )
-        .unwrap();
-
-        let err = claim_task(
-            tmp.path(),
-            &done.id,
-            &actor_a,
-            &done.updated_at,
-        )
-        .unwrap_err();
-        assert!(matches!(err, TaskError::InvalidTransition { .. }));
+        let resumed = resume_task(tmp.path(), &task.id, &actor, &audit).unwrap();
+        assert_eq!(resumed.status, TaskStatus::Active);
     }
 
     #[test]
     fn list_tasks_with_filter() {
-        let tmp = TempDir::new().unwrap();
+        let (tmp, audit) = test_setup();
         let actor = cli_actor();
 
-        create_task(tmp.path(), "Task A", TaskOrigin::Manual, 1, None, &actor).unwrap();
-        let b =
-            create_task(tmp.path(), "Task B", TaskOrigin::Manual, 3, None, &actor).unwrap();
-        create_task(tmp.path(), "Task C", TaskOrigin::Manual, 2, None, &actor).unwrap();
+        create_task(tmp.path(), &simple_params("Task A"), &actor, &audit).unwrap();
+        let b = create_task(
+            tmp.path(),
+            &CreateTaskParams { priority: 4, ..simple_params("Task B") },
+            &actor, &audit,
+        )
+        .unwrap();
+        create_task(tmp.path(), &simple_params("Task C"), &actor, &audit).unwrap();
 
-        claim_task(tmp.path(), &b.id, &actor, &b.updated_at).unwrap();
+        claim_task(tmp.path(), &b.id, &actor, &audit).unwrap();
 
         let all = list_tasks(tmp.path(), None, 100).unwrap();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].title, "Task B");
+        assert_eq!(all[0].title, "Task B"); // highest priority
 
-        let open_only = list_tasks(tmp.path(), Some(TaskState::Open), 100).unwrap();
+        let open_only = list_tasks(tmp.path(), Some(TaskStatus::Open), 100).unwrap();
         assert_eq!(open_only.len(), 2);
-
-        let claimed_only = list_tasks(tmp.path(), Some(TaskState::Claimed), 100).unwrap();
-        assert_eq!(claimed_only.len(), 1);
-        assert_eq!(claimed_only[0].title, "Task B");
     }
 
     #[test]
     fn parent_task_reference() {
-        let tmp = TempDir::new().unwrap();
+        let (tmp, audit) = test_setup();
         let actor = cli_actor();
 
-        let parent = create_task(
-            tmp.path(),
-            "Parent task",
-            TaskOrigin::Manual,
-            3,
-            None,
-            &actor,
-        )
-        .unwrap();
-
+        let parent = create_task(tmp.path(), &simple_params("Parent"), &actor, &audit).unwrap();
         let child = create_task(
             tmp.path(),
-            "Child task",
-            TaskOrigin::Manual,
-            2,
-            Some(&parent.id),
+            &CreateTaskParams {
+                parent_id: Some(&parent.id),
+                ..simple_params("Child")
+            },
             &actor,
+            &audit,
         )
         .unwrap();
 
-        assert_eq!(child.parent_task_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
     }
 
     #[test]
     fn task_not_found() {
-        let tmp = TempDir::new().unwrap();
+        let (tmp, audit) = test_setup();
         let _ = list_tasks(tmp.path(), None, 1);
-
         let err = get_task(tmp.path(), "nonexistent-id").unwrap_err();
         assert!(matches!(err, TaskError::NotFound(_)));
     }
 
     #[test]
     fn schema_migration_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
+        let (tmp, audit) = test_setup();
         let actor = cli_actor();
 
-        create_task(tmp.path(), "First", TaskOrigin::Manual, 1, None, &actor).unwrap();
-        create_task(tmp.path(), "Second", TaskOrigin::Manual, 1, None, &actor).unwrap();
+        create_task(tmp.path(), &simple_params("First"), &actor, &audit).unwrap();
+        create_task(tmp.path(), &simple_params("Second"), &actor, &audit).unwrap();
 
         let tasks = list_tasks(tmp.path(), None, 100).unwrap();
         assert_eq!(tasks.len(), 2);

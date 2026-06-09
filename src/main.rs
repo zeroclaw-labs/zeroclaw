@@ -470,16 +470,17 @@ Examples:
     #[command(long_about = "\
 Manage work-model tasks.
 
-Create, inspect, claim, complete, and abandon tasks tracked in the \
-local tasks.db store. Tasks follow a state machine: \
-open \u{2192} claimed \u{2192} done|abandoned, with an optional blocked state.
+Create, inspect, claim, submit, close, and abandon tasks tracked in \
+tasks.db. Tasks follow a state machine: open \u{2192} active \u{2192} review \u{2192} closed, \
+with blocked/paused side-states. Close is gated on acceptance criteria.
 
 Examples:
   daemonclaw task list
-  daemonclaw task create 'Deploy new firmware' --origin manual --priority 3
+  daemonclaw task create 'Deploy new firmware' --source operator --priority 3
   daemonclaw task show <id>
   daemonclaw task claim <id>
-  daemonclaw task complete <id> --outcome succeeded
+  daemonclaw task submit <id>
+  daemonclaw task close <id> --outcome succeeded
   daemonclaw task abandon <id> --reason 'superseded by hotfix'")]
     Task {
         #[command(subcommand)]
@@ -705,15 +706,21 @@ enum TaskCommands {
     Create {
         /// Task title / description
         title: String,
-        /// Origin: manual, heartbeat, cron, channel, sop
-        #[arg(long, default_value = "manual")]
-        origin: String,
+        /// Source: operator, agent-decomposition, trigger:heartbeat, trigger:cron, etc.
+        #[arg(long, default_value = "operator")]
+        source: String,
         /// Priority 0 (lowest) to 4 (critical)
         #[arg(long, default_value = "2")]
         priority: u8,
         /// Parent task ID (for subtasks)
         #[arg(long)]
         parent: Option<String>,
+        /// Machine acceptance check (command, exit 0 = pass). Repeatable.
+        #[arg(long = "accept-machine")]
+        accept_machine: Vec<String>,
+        /// Human acceptance item (description). Repeatable.
+        #[arg(long = "accept-human")]
+        accept_human: Vec<String>,
     },
     /// Show a task by ID (prefix match supported)
     Show {
@@ -722,20 +729,25 @@ enum TaskCommands {
     },
     /// List tasks
     List {
-        /// Filter by state: open, claimed, blocked, done, abandoned
+        /// Filter by status: open, active, blocked, paused, review, closed, abandoned
         #[arg(long)]
-        state: Option<String>,
+        status: Option<String>,
         /// Maximum results
         #[arg(long, default_value = "50")]
         limit: usize,
     },
-    /// Claim an open or blocked task
+    /// Claim an open task (open → active)
     Claim {
         /// Task ID
         id: String,
     },
-    /// Mark a claimed task as done
-    Complete {
+    /// Submit an active task for review (active → review)
+    Submit {
+        /// Task ID
+        id: String,
+    },
+    /// Close a task in review (review → closed, gated on acceptance)
+    Close {
         /// Task ID
         id: String,
         /// Outcome: succeeded, failed, cancelled
@@ -750,7 +762,7 @@ enum TaskCommands {
         #[arg(long)]
         reason: String,
     },
-    /// Block a claimed task
+    /// Block an active task (active → blocked)
     Block {
         /// Task ID
         id: String,
@@ -758,18 +770,38 @@ enum TaskCommands {
         #[arg(long)]
         reason: String,
     },
-    /// Unblock a blocked task (returns to claimed)
+    /// Unblock a blocked task (blocked → active)
     Unblock {
         /// Task ID
         id: String,
     },
-    /// Show activity log for a task
+    /// Pause an active task (active → paused)
+    Pause {
+        /// Task ID
+        id: String,
+    },
+    /// Resume a paused task (paused → active)
+    Resume {
+        /// Task ID
+        id: String,
+    },
+    /// Attest a human acceptance item
+    Attest {
+        /// Task ID
+        id: String,
+        /// The acceptance check text to satisfy
+        #[arg(long)]
+        check: String,
+    },
+    /// Show transition history from audit.db
+    History {
+        /// Task ID
+        id: String,
+    },
+    /// Show breadcrumb activity (populated by Track C)
     Activity {
         /// Task ID
         id: String,
-        /// Maximum entries
-        #[arg(long, default_value = "50")]
-        limit: usize,
     },
 }
 
@@ -3804,9 +3836,10 @@ mod tests {
 }
 
 fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
+    use daemonclaw_runtime::security::audit::AuditLogger;
     use daemonclaw_runtime::tasks::{
-        TaskActor, TaskOrigin, TaskOutcome, TaskState,
-        store,
+        AcceptanceItem, Autonomy, Execution, ShellVerifier, TaskActor, TaskOutcome, TaskStatus,
+        store::{self, CreateTaskParams},
     };
 
     let workspace = &config.workspace_dir;
@@ -3814,25 +3847,45 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
         channel: "cli".to_string(),
         id: Some(std::env::var("USER").unwrap_or_else(|_| "operator".to_string())),
     };
+    let audit = AuditLogger::new(config.security.audit.clone(), workspace.clone())?;
 
     match cmd {
         TaskCommands::Create {
             title,
-            origin,
+            source,
             priority,
             parent,
+            accept_machine,
+            accept_human,
         } => {
-            let origin = TaskOrigin::from_str(&origin)
-                .ok_or_else(|| anyhow::anyhow!("invalid origin: {origin} (expected: manual, heartbeat, cron, channel, sop)"))?;
-            let task = store::create_task(
-                workspace,
-                &title,
-                origin,
+            let mut acceptance = Vec::new();
+            for check in &accept_machine {
+                acceptance.push(AcceptanceItem {
+                    kind: "machine".to_string(),
+                    check: check.clone(),
+                    satisfied: false,
+                });
+            }
+            for check in &accept_human {
+                acceptance.push(AcceptanceItem {
+                    kind: "human".to_string(),
+                    check: check.clone(),
+                    satisfied: false,
+                });
+            }
+            let params = CreateTaskParams {
+                title: &title,
+                intent: None,
+                acceptance: &acceptance,
                 priority,
-                parent.as_deref(),
-                &actor,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                parent_id: parent.as_deref(),
+                source: &source,
+                autonomy: Autonomy::Gated,
+                execution: Execution::Agentic,
+                tools: &[],
+            };
+            let task = store::create_task(workspace, &params, &actor, &audit)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("Created task {}", task.id);
             print_task(&task);
             Ok(())
@@ -3840,59 +3893,34 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
         TaskCommands::Show { id } => {
             let task = resolve_task(workspace, &id)?;
             print_task(&task);
-            let activity = store::get_task_activity(workspace, &task.id, 20)?;
-            if !activity.is_empty() {
-                println!("\nActivity:");
-                for a in &activity {
-                    let old = a
-                        .old_state
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let who = a.actor_id.as_deref().unwrap_or("?");
-                    let reason = a
-                        .reason
-                        .as_deref()
-                        .map(|r| format!(" ({r})"))
-                        .unwrap_or_default();
-                    println!(
-                        "  {} {} -> {} by {}/{}{}",
-                        &a.timestamp[..19],
-                        old,
-                        a.new_state,
-                        a.actor_channel,
-                        who,
-                        reason,
-                    );
-                }
-            }
             Ok(())
         }
-        TaskCommands::List { state, limit } => {
-            let state_filter = state
+        TaskCommands::List { status, limit } => {
+            let status_filter = status
                 .as_deref()
                 .map(|s| {
-                    TaskState::from_str(s).ok_or_else(|| {
+                    TaskStatus::from_str(s).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "invalid state: {s} (expected: open, claimed, blocked, done, abandoned)"
+                            "invalid status: {s} (expected: open, active, blocked, paused, review, closed, abandoned)"
                         )
                     })
                 })
                 .transpose()?;
-            let tasks = store::list_tasks(workspace, state_filter, limit)?;
+            let tasks = store::list_tasks(workspace, status_filter, limit)?;
             if tasks.is_empty() {
                 println!("No tasks found.");
                 return Ok(());
             }
             println!(
-                "{:<8}  {:<10}  {:<10}  {:<4}  {}",
-                "ID", "STATE", "ORIGIN", "PRI", "TITLE"
+                "{:<8}  {:<10}  {:<16}  {:<4}  {}",
+                "ID", "STATUS", "SOURCE", "PRI", "TITLE"
             );
             for t in &tasks {
                 println!(
-                    "{:<8}  {:<10}  {:<10}  {:<4}  {}",
+                    "{:<8}  {:<10}  {:<16}  {:<4}  {}",
                     &t.id[..8],
-                    t.state,
-                    t.origin,
+                    t.status,
+                    t.source,
                     t.priority,
                     t.title,
                 );
@@ -3902,28 +3930,39 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
         }
         TaskCommands::Claim { id } => {
             let task = resolve_task(workspace, &id)?;
-            let claimed = store::claim_task(workspace, &task.id, &actor, &task.updated_at)
+            let claimed = store::claim_task(workspace, &task.id, &actor, &audit)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("Claimed task {}", &claimed.id[..8]);
             print_task(&claimed);
             Ok(())
         }
-        TaskCommands::Complete { id, outcome } => {
+        TaskCommands::Submit { id } => {
+            let task = resolve_task(workspace, &id)?;
+            let submitted = store::submit_task(workspace, &task.id, &actor, &audit)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Submitted task {} for review", &submitted.id[..8]);
+            print_task(&submitted);
+            Ok(())
+        }
+        TaskCommands::Close { id, outcome } => {
             let outcome = TaskOutcome::from_str(&outcome).ok_or_else(|| {
                 anyhow::anyhow!(
                     "invalid outcome: {outcome} (expected: succeeded, failed, cancelled)"
                 )
             })?;
             let task = resolve_task(workspace, &id)?;
-            let done = store::complete_task(workspace, &task.id, &actor, outcome)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("Completed task {}", &done.id[..8]);
-            print_task(&done);
+            let verifier = ShellVerifier;
+            let closed = store::close_task(
+                workspace, &task.id, &actor, outcome, &verifier, true, &audit,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Closed task {}", &closed.id[..8]);
+            print_task(&closed);
             Ok(())
         }
         TaskCommands::Abandon { id, reason } => {
             let task = resolve_task(workspace, &id)?;
-            let abandoned = store::abandon_task(workspace, &task.id, &actor, &reason)
+            let abandoned = store::abandon_task(workspace, &task.id, &actor, &reason, &audit)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("Abandoned task {}", &abandoned.id[..8]);
             print_task(&abandoned);
@@ -3931,7 +3970,7 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
         }
         TaskCommands::Block { id, reason } => {
             let task = resolve_task(workspace, &id)?;
-            let blocked = store::block_task(workspace, &task.id, &actor, &reason)
+            let blocked = store::block_task(workspace, &task.id, &actor, &reason, &audit)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("Blocked task {}", &blocked.id[..8]);
             print_task(&blocked);
@@ -3939,41 +3978,74 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
         }
         TaskCommands::Unblock { id } => {
             let task = resolve_task(workspace, &id)?;
-            let unblocked = store::unblock_task(workspace, &task.id, &actor)
+            let unblocked = store::unblock_task(workspace, &task.id, &actor, &audit)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("Unblocked task {}", &unblocked.id[..8]);
             print_task(&unblocked);
             Ok(())
         }
-        TaskCommands::Activity { id, limit } => {
+        TaskCommands::Pause { id } => {
             let task = resolve_task(workspace, &id)?;
-            let activity = store::get_task_activity(workspace, &task.id, limit)?;
-            if activity.is_empty() {
-                println!("No activity for task {}.", &task.id[..8]);
+            let paused = store::pause_task(workspace, &task.id, &actor, &audit)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Paused task {}", &paused.id[..8]);
+            print_task(&paused);
+            Ok(())
+        }
+        TaskCommands::Resume { id } => {
+            let task = resolve_task(workspace, &id)?;
+            let resumed = store::resume_task(workspace, &task.id, &actor, &audit)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Resumed task {}", &resumed.id[..8]);
+            print_task(&resumed);
+            Ok(())
+        }
+        TaskCommands::Attest { id, check } => {
+            let task = resolve_task(workspace, &id)?;
+            let attested = store::attest(workspace, &task.id, &check, &actor, &audit)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Attested '{}' on task {}", check, &attested.id[..8]);
+            print_task(&attested);
+            Ok(())
+        }
+        TaskCommands::History { id } => {
+            let task = resolve_task(workspace, &id)?;
+            let events = store::get_task_history(&audit, &task.id)?;
+            if events.is_empty() {
+                println!("No history for task {}.", &task.id[..8]);
                 return Ok(());
             }
-            println!("Activity for task {} ({}):\n", &task.id[..8], task.title);
-            for a in &activity {
-                let old = a
-                    .old_state
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let who = a.actor_id.as_deref().unwrap_or("?");
-                let reason = a
-                    .reason
-                    .as_deref()
-                    .map(|r| format!(" ({r})"))
-                    .unwrap_or_default();
-                println!(
-                    "  {} {} -> {} by {}/{}{}",
-                    &a.timestamp[..19],
-                    old,
-                    a.new_state,
-                    a.actor_channel,
-                    who,
-                    reason,
-                );
+            println!("History for task {} ({}):\n", &task.id[..8], task.title);
+            for ev in &events {
+                let ts = ev
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let actor_ch = ev
+                    .get("actor")
+                    .and_then(|a| a.get("channel"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let actor_id = ev
+                    .get("actor")
+                    .and_then(|a| a.get("user_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let cmd = ev
+                    .get("action")
+                    .and_then(|a| a.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                println!("  {} {}/{} {}", &ts[..19.min(ts.len())], actor_ch, actor_id, cmd);
             }
+            Ok(())
+        }
+        TaskCommands::Activity { id } => {
+            let task = resolve_task(workspace, &id)?;
+            println!(
+                "No breadcrumb activity for task {} (populated by Track C).",
+                &task.id[..8]
+            );
             Ok(())
         }
     }
@@ -4006,23 +4078,30 @@ fn resolve_task(
 fn print_task(task: &daemonclaw_runtime::tasks::Task) {
     println!("  id:       {}", task.id);
     println!("  title:    {}", task.title);
-    println!("  state:    {}", task.state);
-    println!("  origin:   {}", task.origin);
+    println!("  status:   {}", task.status);
+    println!("  source:   {}", task.source);
     println!("  priority: {}", task.priority);
+    println!("  autonomy: {}", task.autonomy.as_str());
     println!("  created:  {}", task.created_at);
     println!("  updated:  {}", task.updated_at);
-    if let Some(ch) = &task.claimed_by_channel {
-        let who = task.claimed_by_id.as_deref().unwrap_or("?");
-        println!("  claimed:  {ch}/{who}");
-    }
-    if let Some(reason) = &task.blocked_reason {
-        println!("  blocked:  {reason}");
+    if let Some(assigned) = &task.assigned_to {
+        println!("  assigned: {assigned}");
     }
     if let Some(outcome) = &task.outcome {
         println!("  outcome:  {}", outcome.as_str());
     }
-    if let Some(parent) = &task.parent_task_id {
+    if let Some(reason) = &task.abandon_reason {
+        println!("  reason:   {reason}");
+    }
+    if let Some(parent) = &task.parent_id {
         println!("  parent:   {}", &parent[..8.min(parent.len())]);
+    }
+    if !task.acceptance.is_empty() {
+        println!("  acceptance:");
+        for item in &task.acceptance {
+            let mark = if item.satisfied { "+" } else { "-" };
+            println!("    [{mark}] {} ({})", item.check, item.kind);
+        }
     }
 }
 
