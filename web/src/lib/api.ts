@@ -1450,6 +1450,7 @@ export function triggerCronJob(id: string): Promise<CronTriggerResult> {
 export function patchCronJob(
   id: string,
   patch: {
+    agent?: string;
     name?: string;
     schedule?: string;
     tz?: string;

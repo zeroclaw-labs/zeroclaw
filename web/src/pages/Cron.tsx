@@ -367,6 +367,7 @@ export default function Cron() {
         const existingTimezone = scheduleTimezone(existingJob);
         const timezone = formTimezone.trim();
         const patch: Parameters<typeof patchCronJob>[1] = {
+          agent: formAgent.trim(),
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
@@ -638,31 +639,29 @@ export default function Cron() {
                   </div>
                 )}
               </div>
-              {!isEditing && (
-                <div>
-                  <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                    Agent <span style={{ color: 'var(--color-status-error)' }}>*</span>
-                  </label>
-                  <select
-                    value={formAgent}
-                    onChange={(e) => setFormAgent(e.target.value)}
-                    className="input-electric w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
-                  >
-                    {agentOptions.length === 0 ? (
-                      <option value="">no configured agents</option>
-                    ) : (
-                      agentOptions.map((alias) => (
-                        <option key={alias} value={alias}>
-                          agents.{alias}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <p className="text-xs mt-1" style={{ color: 'var(--pc-text-faint)' }}>
-                    Runs under this agent's risk profile, model provider, and channel bindings.
-                  </p>
-                </div>
-              )}
+              <div>
+                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                  Agent <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                </label>
+                <select
+                  value={formAgent}
+                  onChange={(e) => setFormAgent(e.target.value)}
+                  className="input-electric w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
+                >
+                  {agentOptions.length === 0 ? (
+                    <option value="">no configured agents</option>
+                  ) : (
+                    agentOptions.map((alias) => (
+                      <option key={alias} value={alias}>
+                        agents.{alias}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <p className="text-xs mt-1" style={{ color: 'var(--pc-text-faint)' }}>
+                  Runs under this agent's risk profile, model provider, and channel bindings.
+                </p>
+              </div>
               <div>
                 <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
                   {t('cron.name_optional')}
@@ -710,63 +709,59 @@ export default function Cron() {
                       className="input-electric w-full px-3 py-2.5 text-sm resize-y"
                     />
                   </div>
-                  {!isEditing && (
-                    <>
-                      <div>
-                        <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                          {t('cron.model_optional')}
-                        </label>
-                        <input
-                          type="text"
-                          value={formModel}
-                          onChange={(e) => setFormModel(e.target.value)}
-                          placeholder={t('cron.model_placeholder')}
-                          className="input-electric w-full px-3 py-2.5 text-sm"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                          {t('cron.session_target')}
-                        </label>
-                        <div className="flex gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setFormSessionTarget('isolated')}
-                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formSessionTarget === 'isolated'
-                                ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                                : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                              }`}
-                            style={formSessionTarget === 'isolated' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                          >
-                            {t('cron.session_isolated')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setFormSessionTarget('main')}
-                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formSessionTarget === 'main'
-                                ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                                : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                              }`}
-                            style={formSessionTarget === 'main' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                          >
-                            {t('cron.session_main')}
-                          </button>
-                        </div>
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                          {t('cron.allowed_tools_optional')}
-                        </label>
-                        <input
-                          type="text"
-                          value={formAllowedTools}
-                          onChange={(e) => setFormAllowedTools(e.target.value)}
-                          placeholder={t('cron.allowed_tools_placeholder')}
-                          className="input-electric w-full px-3 py-2.5 text-sm font-mono"
-                        />
-                      </div>
-                    </>
-                  )}
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.model_optional')}
+                    </label>
+                    <input
+                      type="text"
+                      value={formModel}
+                      onChange={(e) => setFormModel(e.target.value)}
+                      placeholder={t('cron.model_placeholder')}
+                      className="input-electric w-full px-3 py-2.5 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.session_target')}
+                    </label>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setFormSessionTarget('isolated')}
+                        className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formSessionTarget === 'isolated'
+                            ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                            : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                          }`}
+                        style={formSessionTarget === 'isolated' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                      >
+                        {t('cron.session_isolated')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFormSessionTarget('main')}
+                        className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formSessionTarget === 'main'
+                            ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                            : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                          }`}
+                        style={formSessionTarget === 'main' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                      >
+                        {t('cron.session_main')}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.allowed_tools_optional')}
+                    </label>
+                    <input
+                      type="text"
+                      value={formAllowedTools}
+                      onChange={(e) => setFormAllowedTools(e.target.value)}
+                      placeholder={t('cron.allowed_tools_placeholder')}
+                      className="input-electric w-full px-3 py-2.5 text-sm font-mono"
+                    />
+                  </div>
                 </>
               )}
 
@@ -777,78 +772,76 @@ export default function Cron() {
                   which channel goes where. Dangling channel refs are
                   accepted on add; the scheduler logs loudly when a
                   dangling delivery fires. */}
-              {!isEditing && (
-                <div className="border-t pt-4" style={{ borderColor: 'var(--pc-border)' }}>
-                  <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                    Delivery
-                  </label>
-                  <div className="flex gap-2 mb-2">
-                    <button
-                      type="button"
-                      onClick={() => setFormDeliveryMode('none')}
-                      className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formDeliveryMode === 'none'
-                          ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                          : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                        }`}
-                      style={formDeliveryMode === 'none' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                    >
-                      none
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFormDeliveryMode('announce')}
-                      className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formDeliveryMode === 'announce'
-                          ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                          : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                        }`}
-                      style={formDeliveryMode === 'announce' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                    >
-                      announce
-                    </button>
-                  </div>
-                  {formDeliveryMode === 'announce' && (
-                    <div className="space-y-2">
-                      <select
-                        value={formDeliveryChannel}
-                        onChange={(e) => setFormDeliveryChannel(e.target.value)}
-                        className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
-                      >
-                        <option value="">
-                          {boundChannels.length === 0
-                            ? 'no channels bound on this agent'
-                            : 'select a channel...'}
-                        </option>
-                        {boundChannels.map((ch) => (
-                          <option key={ch.composite} value={ch.composite}>
-                            {ch.composite}
-                            {ch.identity ? ` — ${ch.identity}` : ''}
-                          </option>
-                        ))}
-                      </select>
-                      <input
-                        type="text"
-                        value={formDeliveryTo}
-                        onChange={(e) => setFormDeliveryTo(e.target.value)}
-                        placeholder="target (room id, user id, channel id, address...)"
-                        className="input-electric w-full px-3 py-2 text-sm font-mono"
-                      />
-                      <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                        <input
-                          type="checkbox"
-                          checked={formDeliveryBestEffort}
-                          onChange={(e) => setFormDeliveryBestEffort(e.target.checked)}
-                        />
-                        best-effort: log on failure, don't mark the job as errored
-                      </label>
-                      <p className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-                        Channels from <code className="font-mono">agents.{formAgent || '<agent>'}.channels</code>.
-                        Picking one that isn't configured yet is allowed; the scheduler will warn
-                        loudly when the job fires.
-                      </p>
-                    </div>
-                  )}
+              <div className="border-t pt-4" style={{ borderColor: 'var(--pc-border)' }}>
+                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                  Delivery
+                </label>
+                <div className="flex gap-2 mb-2">
+                  <button
+                    type="button"
+                    onClick={() => setFormDeliveryMode('none')}
+                    className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formDeliveryMode === 'none'
+                        ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                        : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                      }`}
+                    style={formDeliveryMode === 'none' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                  >
+                    none
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormDeliveryMode('announce')}
+                    className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formDeliveryMode === 'announce'
+                        ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                        : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                      }`}
+                    style={formDeliveryMode === 'announce' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                  >
+                    announce
+                  </button>
                 </div>
-              )}
+                {formDeliveryMode === 'announce' && (
+                  <div className="space-y-2">
+                    <select
+                      value={formDeliveryChannel}
+                      onChange={(e) => setFormDeliveryChannel(e.target.value)}
+                      className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
+                    >
+                      <option value="">
+                        {boundChannels.length === 0
+                          ? 'no channels bound on this agent'
+                          : 'select a channel...'}
+                      </option>
+                      {boundChannels.map((ch) => (
+                        <option key={ch.composite} value={ch.composite}>
+                          {ch.composite}
+                          {ch.identity ? ` — ${ch.identity}` : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      value={formDeliveryTo}
+                      onChange={(e) => setFormDeliveryTo(e.target.value)}
+                      placeholder="target (room id, user id, channel id, address...)"
+                      className="input-electric w-full px-3 py-2 text-sm font-mono"
+                    />
+                    <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                      <input
+                        type="checkbox"
+                        checked={formDeliveryBestEffort}
+                        onChange={(e) => setFormDeliveryBestEffort(e.target.checked)}
+                      />
+                      best-effort: log on failure, don't mark the job as errored
+                    </label>
+                    <p className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+                      Channels from <code className="font-mono">agents.{formAgent || '&lt;agent&gt;'}.channels</code>.
+                      Picking one that isn't configured yet is allowed; the scheduler will warn
+                      loudly when the job fires.
+                    </p>
+                  </div>
+                )}
+              </div>
             </div>
             <div className="flex justify-end gap-3 mt-6">
               <button
