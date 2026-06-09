@@ -63,7 +63,7 @@ fn render_boards() -> String {
     let mut out = String::from(HEADER);
     out.push_str("| Board | Architecture | USB VID:PID |\n|---|---|---|\n");
     for b in known_boards() {
-        let arch = b.architecture.unwrap_or("—");
+        let arch = b.architecture.unwrap_or("(unspecified)");
         let _ = writeln!(
             out,
             "| `{}` | {} | `{:#06x}`:`{:#06x}` |",

@@ -12,7 +12,7 @@ For most Pi users, the **pre-built binary is the path of least resistance**.
 ## Hardware Compatibility
 
 Any Pi that can run a 64-bit (`aarch64`) or 32-bit (`armv7`) Raspberry Pi OS can
-run the **pre-built binary** — there is no meaningful memory floor for the
+run the **pre-built binary**: there is no meaningful memory floor for the
 runtime. The constraint is **building from source on the device**: the linker is
 memory-hungry, so lower-RAM boards need swap and a lighter build profile (see
 [Option 3](#option-3-build-on-the-pi)). Cross-compiling from a larger machine
