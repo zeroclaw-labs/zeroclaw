@@ -19,12 +19,10 @@ memory-hungry, so lower-RAM boards need swap and a lighter build profile (see
 ([Option 2](#option-2-cross-compile-from-another-machine)) sidesteps the
 on-device memory pressure entirely.
 
-The prebuilt Pi binaries come from these release targets:
+The prebuilt Pi binaries come from these release targets (64-bit `aarch64` for
+64-bit Raspberry Pi OS, 32-bit `armv7`/`arm` for 32-bit OS):
 
-{{#include ../_snippets/hardware-release-targets.md}}
-
-Use `aarch64-unknown-linux-gnu` for 64-bit Raspberry Pi OS and
-`armv7-unknown-linux-gnueabihf` for 32-bit.
+{{#include ../_snippets/hardware-pi-targets.md}}
 
 ## Option 1: Pre-built Binary (Recommended)
 
@@ -32,17 +30,9 @@ Fastest path. No compiler, no swap, no OOM risk.
 
 ### Using the install script
 
-<div class="os-tabs-src">
+{{#include ../_snippets/install.md:linux}}
 
-#### sh
-
-```sh
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
-```
-
-</div>
-
-The script auto-detects your architecture (`aarch64` or `armv7`) and installs the matching release binary into `$CARGO_HOME/bin/zeroclaw` (defaulting to `~/.cargo/bin/zeroclaw`). Make sure that directory is on your `PATH`.
+The script auto-detects your architecture (`aarch64`, `armv7`, or `armv6`) and installs the matching release binary into `$CARGO_HOME/bin/zeroclaw` (defaulting to `~/.cargo/bin/zeroclaw`). Make sure that directory is on your `PATH`.
 
 ### Manual download
 
@@ -74,9 +64,9 @@ sudo install -m 0755 zeroclaw /usr/local/bin/
 
 ```sh
 uname -m
-# aarch64 → 64-bit (use the aarch64 binary)
-# armv7l  → 32-bit (use the armv7 binary)
-# armv6l  → Pi 1 / Zero (not currently supported, see #4623)
+# aarch64 → 64-bit (use the aarch64-unknown-linux-gnu binary)
+# armv7l  → 32-bit (use the armv7-unknown-linux-gnueabihf binary)
+# armv6l  → Pi 1 / Zero / Zero W (use the arm-unknown-linux-gnueabihf binary)
 ```
 
 </div>

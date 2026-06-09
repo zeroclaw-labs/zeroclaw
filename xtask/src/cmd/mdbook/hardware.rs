@@ -53,6 +53,7 @@ pub fn run(root: &Path) -> Result<()> {
         dir.join("hardware-release-targets.md"),
         render_release_targets(root)?,
     )?;
+    std::fs::write(dir.join("hardware-pi-targets.md"), render_pi_targets(root)?)?;
     std::fs::write(dir.join("hardware-lowmem-lto.md"), render_lowmem_lto(root)?)?;
 
     println!("==> Generated hardware reference snippets from registry + catalog");
@@ -148,7 +149,10 @@ fn render_lowmem_lto(root: &Path) -> Result<String> {
     Ok(out)
 }
 
-fn render_release_targets(root: &Path) -> Result<String> {
+/// Parse the deduplicated, sorted `target:` matrix from the release workflow.
+/// The workflow is the canonical source for which architectures ship a prebuilt
+/// binary; the docs render whatever it carries so the two cannot drift.
+fn release_targets(root: &Path) -> Result<Vec<String>> {
     let workflow = std::fs::read_to_string(root.join(RELEASE_WORKFLOW)).map_err(|e| {
         anyhow::Error::msg(format!(
             "release workflow missing at {RELEASE_WORKFLOW}: {e}. It is the canonical \
@@ -165,9 +169,43 @@ fn render_release_targets(root: &Path) -> Result<String> {
     if targets.is_empty() {
         anyhow::bail!("no `target:` entries parsed from {RELEASE_WORKFLOW}");
     }
+    Ok(targets)
+}
+
+fn render_release_targets(root: &Path) -> Result<String> {
     let mut out = String::from(HEADER);
-    for t in targets {
+    for t in release_targets(root)? {
         let _ = writeln!(out, "- `{t}`");
+    }
+    Ok(out)
+}
+
+/// Render only the targets a Raspberry Pi can run: ARM Linux GNU/glibc release
+/// targets (32- and 64-bit). Derived from the same workflow matrix as the full
+/// list, filtered by triple rather than hand-listed, so a new ARM Linux release
+/// target appears here automatically and a dropped one disappears.
+fn render_pi_targets(root: &Path) -> Result<String> {
+    let pi: Vec<String> = release_targets(root)?
+        .into_iter()
+        .filter(|t| {
+            let arm = t.starts_with("aarch64-") || t.starts_with("armv7-") || t.starts_with("arm-");
+            arm && t.contains("-linux-gnu")
+        })
+        .collect();
+    if pi.is_empty() {
+        anyhow::bail!(
+            "no ARM Linux GNU release targets parsed from {RELEASE_WORKFLOW}; \
+             the Raspberry Pi prebuilt-binary list would be empty"
+        );
+    }
+    let mut out = String::from(HEADER);
+    for t in pi {
+        let bits = if t.starts_with("aarch64-") {
+            "64-bit"
+        } else {
+            "32-bit"
+        };
+        let _ = writeln!(out, "- `{t}` ({bits})");
     }
     Ok(out)
 }
@@ -191,5 +229,27 @@ mod tests {
             snippet.contains("CARGO_PROFILE_RELEASE_LTO=thin"),
             "rendered low-mem snippet missing the LTO override: {snippet}"
         );
+    }
+
+    #[test]
+    fn pi_targets_are_arm_linux_gnu_only() {
+        let root = crate::util::repo_root();
+        let snippet = render_pi_targets(&root).expect("pi targets must render");
+        // Must include the ARM Linux GNU targets and exclude every non-Pi target
+        // (macOS, Android, Windows, x86, musl) so the Pi page never lists a
+        // binary a Pi can't run.
+        assert!(snippet.contains("aarch64-unknown-linux-gnu"));
+        for excluded in [
+            "apple-darwin",
+            "linux-android",
+            "pc-windows",
+            "x86_64-",
+            "-linux-musl",
+        ] {
+            assert!(
+                !snippet.contains(excluded),
+                "Pi target list leaked non-Pi target containing {excluded:?}: {snippet}"
+            );
+        }
     }
 }
