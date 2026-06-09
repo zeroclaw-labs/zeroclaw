@@ -41,7 +41,7 @@ messages, which is the single most common "my bot does nothing" cause.
 Put the token from step 1 into your config. The token is a secret, so set it
 through a surface that encrypts it rather than typing it into `config.toml`:
 
-{{#config-where channels}}
+{{#config-where channels discord}}
 
 {{#secret-config channels.discord.<alias>.bot_token}}
 

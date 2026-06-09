@@ -1017,14 +1017,10 @@ body,
 .os-tabs > .os-tab-panel > pre {
   margin: 1rem 0;
 }
-.os-tabs > input:nth-of-type(1):checked ~ div.os-tab-panel:nth-of-type(1),
-.os-tabs > input:nth-of-type(2):checked ~ div.os-tab-panel:nth-of-type(2),
-.os-tabs > input:nth-of-type(3):checked ~ div.os-tab-panel:nth-of-type(3) {
+.os-tabs > .os-tab-panel.is-active {
   display: block;
 }
-.os-tabs > input:nth-of-type(1):checked ~ .os-tab-labels > label:nth-of-type(1),
-.os-tabs > input:nth-of-type(2):checked ~ .os-tab-labels > label:nth-of-type(2),
-.os-tabs > input:nth-of-type(3):checked ~ .os-tab-labels > label:nth-of-type(3) {
+.os-tabs > .os-tab-labels > label.is-active {
   color: var(--pc-accent);
   border-bottom-color: var(--pc-accent);
   background: var(--pc-bg, transparent);
@@ -1128,81 +1124,61 @@ html.js #mdbook-content main {
 }
 
 /* ── Config field accordion (mdbook config-fields directive) ──────────────── */
-.cfg-fields table {
-  width: 100%;
-  table-layout: auto;
+/* Each field is a native <details class="cfg-field"> so the description and tab
+   guidance inside are Markdown (translatable). */
+.cfg-fields .cfg-field {
+  border: 1px solid var(--pc-separator);
+  border-radius: var(--pc-radius);
+  margin: 0.35rem 0;
+  overflow: hidden;
 }
-.cfg-fields th,
-.cfg-fields .cfg-field-row td {
-  text-align: left;
-  white-space: nowrap;
-  width: 1%;
-}
-/* The meaning/detail content spans full width and wraps; only the trigger-row
-   cells shrink to content so field/type/default pack left without a gap. */
-.cfg-fields .cfg-field-row td:last-child {
-  width: auto;
-}
-.cfg-fields .cfg-field-row {
+.cfg-fields .cfg-field > summary {
   cursor: pointer;
-}
-.cfg-fields .cfg-field-row:hover {
-  background: var(--pc-hover);
-}
-.cfg-fields .cfg-field-row:focus-visible {
-  outline: 2px solid var(--pc-accent);
-  outline-offset: -2px;
-}
-.cfg-fields .cfg-field-name {
-  white-space: nowrap;
+  padding: 0.5rem 0.9rem;
+  list-style: none;
   display: flex;
-  align-items: center;
-  gap: 0.45em;
+  align-items: baseline;
+  gap: 0.5em;
 }
-.cfg-fields .cfg-field-name > code {
-  background: none;
-  padding: 0;
-  color: var(--pc-text-primary);
+.cfg-fields .cfg-field > summary::-webkit-details-marker {
+  display: none;
 }
-.cfg-fields .cfg-field-row:hover .cfg-field-name > code,
-.cfg-fields tr.cfg-field-open .cfg-field-name > code {
-  color: var(--pc-accent-light);
-}
-.cfg-fields .cfg-field-name::before {
+.cfg-fields .cfg-field > summary::before {
   content: "\25B8"; /* ▸ */
   color: var(--pc-accent);
   flex: 0 0 0.8em;
   text-align: center;
-  transition: transform 0.12s ease;
   font-size: 0.85em;
+  transition: transform 0.12s ease;
 }
-.cfg-fields tr.cfg-field-open .cfg-field-name::before {
+.cfg-fields .cfg-field[open] > summary::before {
   transform: rotate(90deg);
 }
-.cfg-fields tr.cfg-field-open {
+.cfg-fields .cfg-field > summary:hover,
+.cfg-fields .cfg-field[open] > summary {
   background: var(--pc-hover);
 }
-.cfg-fields .cfg-field-detail > td {
-  background: var(--pc-bg-secondary, transparent);
-  border-top: none;
-  padding: 0.6rem 1rem 1rem;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+.cfg-fields .cfg-field > summary > code:first-of-type {
+  background: none;
+  padding: 0;
+  color: var(--pc-text-primary);
 }
-.cfg-fields .cfg-field-detail > td > p:first-child {
-  margin-top: 0;
+.cfg-fields .cfg-field-meta {
+  margin-left: auto;
   color: var(--pc-text-secondary);
+  font-size: 0.9em;
+  white-space: nowrap;
 }
-.cfg-fields .cfg-field-detail p,
-.cfg-fields .cfg-field-detail li {
-  white-space: normal;
+.cfg-fields .cfg-field > :not(summary) {
+  padding-left: 0.9rem;
+  padding-right: 0.9rem;
+}
+.cfg-fields .cfg-field > p {
+  color: var(--pc-text-secondary);
   overflow-wrap: anywhere;
 }
-.cfg-fields .cfg-field-detail pre {
-  margin: 0.4rem 0 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+.cfg-fields .cfg-field > .os-tabs {
+  margin: 0.6rem 0.9rem 0.9rem;
 }
 
 /* ── Model-provider field accordion (mdbook model-provider-fields directive) ── */

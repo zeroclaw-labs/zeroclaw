@@ -25,7 +25,7 @@ Keep the daemon bound to localhost unless you have put it behind your own authen
 
 {{#config-fields channels.signal}}
 
-{{#config-where channels}}
+{{#config-where channels signal}}
 
 Bind the channel to an agent via that agent's `channels` list.
 

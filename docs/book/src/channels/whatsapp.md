@@ -42,7 +42,7 @@ The default `mode = "business"` does not apply the personal DM/group policy spli
 
 {{#config-fields channels.whatsapp}}
 
-{{#config-where channels}}
+{{#config-where channels whatsapp}}
 
 {{#secret-config channels.whatsapp.<alias>.access_token}}
 

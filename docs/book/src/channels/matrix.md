@@ -36,7 +36,7 @@ Before testing message flow:
 
 Matrix is configured as a `[channels.matrix.<alias>]` block. Set it through any of these surfaces:
 
-{{#config-where channels}}
+{{#config-where channels matrix}}
 
 ### Recommended setup: password + recovery key
 

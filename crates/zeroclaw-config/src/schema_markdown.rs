@@ -318,65 +318,59 @@ pub fn field_table(
         } else {
             format!("zeroclaw config set {full_path} <value>")
         };
+        // Env-var override form: `ZEROCLAW_` + dotted path with `.` -> `__`,
+        // lowercase tail (config-tree override). Mirrors the runtime resolver in
+        // `crate::env_overrides`, so the rendered example and the value the
+        // runtime accepts cannot disagree.
+        let env_var = format!("ZEROCLAW_{}", full_path.replace('.', "__"));
         let full_desc = resolved
             .get("description")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let grp = format!(
-            "cfgtab-{}",
-            full_path
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect::<String>()
-        );
 
-        let tabs = format!(
-            concat!(
-                "<div class=\"os-tabs\">",
-                "<input type=\"radio\" name=\"{grp}\" id=\"{grp}-0\" checked>",
-                "<input type=\"radio\" name=\"{grp}\" id=\"{grp}-1\">",
-                "<input type=\"radio\" name=\"{grp}\" id=\"{grp}-2\">",
-                "<nav class=\"os-tab-labels\">",
-                "<label for=\"{grp}-0\">Gateway dashboard</label>",
-                "<label for=\"{grp}-1\">zerocode</label>",
-                "<label for=\"{grp}-2\">zeroclaw config</label>",
-                "</nav>",
-                "<div class=\"os-tab-panel\"><p>Open <a href=\"http://127.0.0.1:42617/config/{section}\"><code>/config/{section}</code></a> and set the <code>{full_path}</code> field.</p></div>",
-                "<div class=\"os-tab-panel\"><p>In the <strong>Config</strong> pane, set the <code>{full_path}</code> field.</p></div>",
-                "<div class=\"os-tab-panel\"><pre><code>{set_cmd}</code></pre></div>",
-                "</div>",
-            ),
-            grp = grp,
-            section = html_escape(section),
-            full_path = html_escape(&full_path),
-            set_cmd = html_escape(&set_cmd),
-        );
-
+        // Detail is a `<div>` wrapping Markdown, not raw HTML table cells, so
+        // mdbook-i18n-helpers extracts the prose (field description and the
+        // tab guidance) for translation. Everything that must stay verbatim
+        // (field name, dotted path, `config set` command, env-var name) is in
+        // inline `code` spans or fenced blocks, which i18n-helpers leaves
+        // untouched. The `os-tabs-src` widget is the same one used elsewhere;
+        // `pc-enhance.js` turns it into the tab strip client-side.
         let _ = write!(
             rows,
             concat!(
-                "<tr class=\"cfg-field-row\" tabindex=\"0\" role=\"button\" aria-expanded=\"false\">",
-                "<td class=\"cfg-field-name\"><code>{key}</code>{req}{secret_mark}</td>",
-                "<td>{ty}</td><td>{default}</td>",
-                "</tr>\n",
-                "<tr class=\"cfg-field-detail\" hidden><td colspan=\"3\">",
-                "<p>{full_desc}</p>",
-                "{tabs}",
-                "</td></tr>\n",
+                "<details class=\"cfg-field\">\n",
+                "<summary><code>{key}</code>{req}{secret_mark} ",
+                "<span class=\"cfg-field-meta\"><code>{ty}</code> · default {default}</span>",
+                "</summary>\n\n",
+                "{full_desc}\n\n",
+                "**Set it on any surface:**\n\n",
+                "<div class=\"os-tabs-src\">\n\n",
+                "#### Gateway dashboard\n\n",
+                "Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{full_path}` field.\n\n",
+                "#### zerocode\n\n",
+                "In the **Config** pane, set the `{full_path}` field.\n\n",
+                "#### zeroclaw config\n\n",
+                "```sh\n{set_cmd}\n```\n\n",
+                "#### Environment variable\n\n",
+                "Export the override (POSIX shells; drop into `~/.bashrc`, `~/.zshrc`, `.env`, or a Dockerfile). Replace `<alias>` with the literal alias:\n\n",
+                "```sh\nexport {env_var}=\n```\n\n",
+                "</div>\n",
+                "</details>\n\n",
             ),
             key = html_escape(key),
             req = req,
             secret_mark = secret_mark,
             ty = html_escape(&ty),
             default = inline_code_html(&default),
-            full_desc = desc_html(full_desc),
-            tabs = tabs,
+            section = section,
+            full_path = full_path,
+            set_cmd = set_cmd,
+            env_var = env_var,
+            full_desc = markdown_prose(full_desc),
         );
     }
 
-    format!(
-        "<div class=\"cfg-fields\">\n<table>\n<thead><tr><th>field</th><th>type</th><th>default</th></tr></thead>\n<tbody>\n{rows}</tbody>\n</table>\n</div>\n"
-    )
+    format!("<div class=\"cfg-fields\">\n\n{rows}</div>\n")
 }
 
 /// Plain Markdown field table (no accordion), used when no config prefix is
@@ -423,32 +417,12 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// HTML-escape a description, then render Markdown `` `code` `` spans as
-/// `<code>`. Newlines collapse to spaces so multi-line doc comments read as a
-/// single paragraph in the expanded panel.
-fn desc_html(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut out = String::new();
-    let mut in_code = false;
-    let mut buf = String::new();
-    for ch in collapsed.chars() {
-        if ch == '`' {
-            if in_code {
-                out.push_str("<code>");
-                out.push_str(&html_escape(&buf));
-                out.push_str("</code>");
-            } else {
-                out.push_str(&html_escape(&buf));
-            }
-            buf.clear();
-            in_code = !in_code;
-        } else {
-            buf.push(ch);
-        }
-    }
-    // Trailing buffer (or an unbalanced backtick) renders as plain escaped text.
-    out.push_str(&html_escape(&buf));
-    out
+/// Collapse a multi-line schema doc-comment into a single Markdown paragraph,
+/// preserving inline `` `code` `` spans verbatim. The result is emitted as
+/// Markdown (not HTML), so mdbook-i18n-helpers extracts the prose for
+/// translation while leaving the code spans untouched.
+fn markdown_prose(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Render a `fmt_default`-style value (which may be wrapped in backticks) as

@@ -189,20 +189,31 @@ fn lookup<'a>(params: &'a [PeerParams], key: &str) -> anyhow::Result<&'a PeerPar
 /// label can never drift from the real UI.
 fn render_config_where(path: &str, depth: usize) -> anyhow::Result<String> {
     let _ = depth;
-    let label = config_section_label(path)?;
+    // Arg is `<section>` or `<section> <type>`. With a type, build the
+    // dashboard's `/config/<section>/<type>` route (e.g. `channels matrix` ->
+    // `/config/channels/matrix`); without one, `/config/<section>` with no
+    // trailing slash. The label is resolved from the section.
+    let mut parts = path.split_whitespace();
+    let section = parts.next().unwrap_or(path);
+    let type_seg = parts.next();
+    let label = config_section_label(section)?;
+    let route = match type_seg {
+        Some(ty) => format!("{section}/{ty}"),
+        None => section.to_string(),
+    };
     Ok(format!(
         r#"<div class="os-tabs-src">
 
 #### Gateway dashboard
 
-Open [`/config/{path}`](http://127.0.0.1:42617/config/{path}) in the web dashboard.
+Open [`/config/{route}`](http://127.0.0.1:42617/config/{route}) in the web dashboard.
 
 #### zerocode
 
 In the **Config** pane, under **{label}**.
 
 </div>"#,
-        path = path,
+        route = route,
         label = label,
     ))
 }

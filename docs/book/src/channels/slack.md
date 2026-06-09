@@ -48,7 +48,7 @@ the same app page.
 
 Both tokens are secrets, so set them through a surface that encrypts them:
 
-{{#config-where channels}}
+{{#config-where channels slack}}
 
 {{#secret-config channels.slack.<alias>.bot_token}}
 

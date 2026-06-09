@@ -198,6 +198,7 @@
       labels.className = 'os-tab-labels';
 
       const panels = [];
+      const labelEls = [];
       headings.forEach(function (h, i) {
         const id = group + '-' + i;
         const radio = document.createElement('input');
@@ -211,6 +212,7 @@
         label.setAttribute('for', id);
         label.textContent = h.textContent.replace(/\u00B6/g, '').trim();
         labels.appendChild(label);
+        labelEls.push(label);
 
         const panel = document.createElement('div');
         panel.className = 'os-tab-panel';
@@ -221,6 +223,21 @@
           node = next;
         }
         panels.push(panel);
+
+        // Active-state is driven here (any number of tabs), not by positional
+        // CSS selectors, so adding a tab needs no CSS change.
+        radio.addEventListener('change', function () {
+          panels.forEach(function (p, j) {
+            p.classList.toggle('is-active', j === i);
+          });
+          labelEls.forEach(function (l, j) {
+            l.classList.toggle('is-active', j === i);
+          });
+        });
+        if (i === 0) {
+          panel.classList.add('is-active');
+          label.classList.add('is-active');
+        }
       });
 
       wrap.appendChild(labels);
@@ -231,45 +248,6 @@
     });
   }
 
-  // ── Config field accordion ─────────────────────────────────────────────
-  // The mdbook preprocessor emits per-channel config tables as
-  // `.cfg-fields > table` where each `.cfg-field-row` is a clickable trigger
-  // and the row immediately after it is a hidden `.cfg-field-detail` row
-  // carrying the set-it-three-ways snippet. Clicking (or Enter/Space on) the
-  // field row expands that detail row in place.
-  function installConfigFieldRows() {
-    document.querySelectorAll('.cfg-fields .cfg-field-row').forEach(function (row) {
-      if (row.dataset.pcCfgWired) return;
-      const detail = row.nextElementSibling;
-      if (!detail || !detail.classList.contains('cfg-field-detail')) return;
-      row.dataset.pcCfgWired = '1';
-      function toggle() {
-        const open = !detail.hasAttribute('hidden');
-        if (open) {
-          detail.setAttribute('hidden', '');
-          row.classList.remove('cfg-field-open');
-          row.setAttribute('aria-expanded', 'false');
-        } else {
-          detail.removeAttribute('hidden');
-          row.classList.add('cfg-field-open');
-          row.setAttribute('aria-expanded', 'true');
-        }
-      }
-      row.addEventListener('click', function (e) {
-        // Let links/inputs inside the detail behave normally; the trigger row
-        // has none, so a plain click toggles.
-        if (e.target.closest('a, input, label, button')) return;
-        toggle();
-      });
-      row.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          toggle();
-        }
-      });
-    });
-  }
-
   ready(function () {
     installProgressBar();
     installHero();
@@ -277,6 +255,5 @@
     wrapTables();
     installFoldableRows();
     installOsTabs();
-    installConfigFieldRows();
   });
 })();
