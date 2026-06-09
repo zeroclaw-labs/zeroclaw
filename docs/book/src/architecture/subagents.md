@@ -113,13 +113,13 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 `delegate` enforces two gates in `crates/zeroclaw-runtime/src/tools/delegate.rs` before a target agent runs, in this order:
 
 1. **`delegation_policy.mode`**: the caller's risk profile must permit delegation. `[risk_profiles.<alias>].delegation_policy` is `{ mode = "forbidden" }` by default; set `mode = "allow"` to permit delegation at all. When forbidden, the refusal is:
-   ```
+   ```text
    delegation is forbidden by the caller's delegation_policy; set [risk_profiles.<caller_profile>].delegation_policy mode = "allow"
    ```
    This is editable in the gateway dashboard and zerocode at **Config → Risk profiles → `<profile>` → `delegation_policy.mode`** (a forbidden/allow select).
 
 2. **Shared risk profile**: the target agent must use the **same** risk profile as the caller. Delegation does not cross trust tiers: an agent on `hardened` cannot delegate to an agent on `permissive`. When they differ, the refusal is:
-   ```
+   ```text
    delegate target "<target>" uses risk profile "<target_profile>", but delegation requires the same risk profile as the caller ("<caller_profile>")
    ```
 
@@ -133,7 +133,7 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`.
 3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
 4. Background spawn success: output is the three-line literal
-   ```
+   ```text
    Background task started for agent '<target>'.
    task_id: <uuid>
    Use action='check_result' with task_id='<uuid>' to retrieve the result.
