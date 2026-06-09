@@ -423,7 +423,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.agent': 'Agent',
     'nav.agents': 'Agents',
     'nav.tools': 'Tools',
-    'nav.cron': 'Scheduled Jobs',
+    'nav.cron': 'Automations',
     'nav.integrations': 'Integrations',
     'nav.memory': 'Memory',
     'nav.config': 'Config',
@@ -533,8 +533,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.load_error': 'Failed to load tools',
 
     // Cron
-    'cron.title': 'Scheduled Jobs',
-    'cron.scheduled_tasks': 'Scheduled Tasks',
+    'cron.title': 'Automations',
+    'cron.scheduled_tasks': 'Automations',
     'cron.add': 'Add Job',
     'cron.add_job': 'Add Job',
     'cron.add_modal_title': 'Add Cron Job',
