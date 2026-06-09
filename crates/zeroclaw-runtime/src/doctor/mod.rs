@@ -500,7 +500,29 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
-            if let Some(reason) = provider_validation_error(family) {
+
+            // For "custom" family, the factory requires `api_url` which is
+            // resolved from `entry.uri` via `options.provider_api_url` only
+            // when config is available (production path). The doctor calls
+            // the legacy factory without config, so we validate directly
+            // against the config entry instead.
+            let reason = if family == "custom" {
+                match &entry.uri {
+                    Some(uri) if (uri.starts_with("http://") || uri.starts_with("https://")) => {
+                        None
+                    }
+                    Some(uri) => Some(format!(
+                        "uri \"{}\" is not a valid URL (must start with http:// or https://)",
+                        uri
+                    )),
+                    None => Some("Custom model_provider requires `uri`: set \
+                        `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.".to_string()),
+                }
+            } else {
+                provider_validation_error(family)
+            };
+
+            if let Some(reason) = reason {
                 items.push(DiagItem::error(
                     cat,
                     format!("model_provider \"{label}\" is invalid: {reason}"),
@@ -671,6 +693,11 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             .split_once('.')
             .map_or(agent.model_provider.as_str(), |(t, _)| t);
         if provider_type.is_empty() {
+            continue;
+        }
+        if provider_type == "custom" {
+            // Custom providers are validated above via entry.uri; the legacy
+            // factory has no config context so skip factory-based validation here.
             continue;
         }
         if let Some(reason) = provider_validation_error(provider_type) {
