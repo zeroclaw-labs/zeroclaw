@@ -2958,15 +2958,14 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         return String::new();
     }
     let stripped_summary = strip_tool_summary_prefix(trimmed_response);
-    // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
     let stripped_xml = if starts_with_visible_tool_call_tag_example(&stripped_summary) {
         stripped_summary
     } else {
         strip_tool_call_tags(&stripped_summary)
     };
-    // Strip isolated tool-call JSON artifacts
+    let stripped_results = strip_tool_result_content(&stripped_xml);
     let stripped_fenced_json =
-        strip_fenced_tool_protocol_artifacts(&stripped_xml, &known_tool_names);
+        strip_fenced_tool_protocol_artifacts(&stripped_results, &known_tool_names);
     let stripped_json =
         strip_isolated_tool_json_artifacts(&stripped_fenced_json, &known_tool_names);
     // Strip leading narration lines that announce tool usage
@@ -5668,12 +5667,8 @@ fn build_channel_by_id(
                     .matrix
                     .get("default")
                     .context("Matrix channel is not configured")?;
-                let state_dir = config
-                    .config_path
-                    .parent()
-                    .map(|p| p.join("state").join("matrix"))
-                    .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
                 let alias = "default".to_string();
+                let state_dir = matrix_state_dir(&config.config_path, &alias);
                 let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
                     let alias = alias.clone();
@@ -6370,6 +6365,18 @@ pub fn register_channels_for_tools(
     names
 }
 
+/// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
+/// must own its own session/crypto store so two bots under one daemon don't
+/// restore each other's `session.json` and run as the wrong account. The
+/// alias component is what keeps them distinct.
+#[cfg(feature = "channel-matrix")]
+fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|p| p.join("state").join("matrix").join(alias))
+        .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -6657,11 +6664,7 @@ fn collect_configured_channels(
         if !mx.enabled {
             continue;
         }
-        let state_dir = config
-            .config_path
-            .parent()
-            .map(|p| p.join("state").join("matrix"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
+        let state_dir = matrix_state_dir(&config.config_path, alias);
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
@@ -11342,7 +11345,17 @@ api_key = "anthropic-key"
                 .iter()
                 .find(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
             {
-                Ok(format!("session result:\n{}", tool_results.content))
+                if tool_results
+                    .content
+                    .contains("Current session: test-channel_chat-42_alice")
+                    && tool_results.content.contains("Messages: 1")
+                {
+                    return Ok(
+                        "Current session: test-channel_chat-42_alice\nMessages: 1".to_string()
+                    );
+                }
+
+                Ok("session result unavailable".to_string())
             } else {
                 self.chat_with_system(None, "", "", None).await
             }
@@ -16579,6 +16592,30 @@ This is an example JSON object for profile settings."#;
         assert_eq!(state, ChannelHealthState::Timeout);
     }
 
+    #[cfg(feature = "channel-matrix")]
+    #[test]
+    fn matrix_state_dir_is_distinct_per_alias() {
+        // Regression: two [channels.matrix.<alias>] blocks previously resolved
+        // to the same <config>/state/matrix dir, so the second listener to
+        // start restored the first's session.json and ran as the wrong Matrix
+        // account. The alias component must keep them separate.
+        let config_path = std::path::Path::new("/home/u/.zeroclaw/config.toml");
+        let clamps = matrix_state_dir(config_path, "clamps");
+        let bender = matrix_state_dir(config_path, "bender");
+        assert_ne!(
+            clamps, bender,
+            "distinct matrix aliases must not share a state dir"
+        );
+        assert_eq!(
+            clamps,
+            std::path::Path::new("/home/u/.zeroclaw/state/matrix/clamps")
+        );
+        assert_eq!(
+            bender,
+            std::path::Path::new("/home/u/.zeroclaw/state/matrix/bender")
+        );
+    }
+
     #[cfg(feature = "channel-mattermost")]
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
@@ -18864,6 +18901,30 @@ Done."#;
         assert!(result.contains("Done."));
         assert!(!result.contains("toolcalls"));
         assert!(!result.contains("shell"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_xml_tool_result_blocks() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "<tool_result>\n{\"results\":[]}\n</tool_result>\n<tool_result>\n{\"command\":\"ls\",\"exit_code\":0}\n</tool_result>Here is what I found.";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert!(!result.contains("tool_result"));
+        assert!(!result.contains("exit_code"));
+        assert!(result.contains("Here is what I found."));
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_mixed_tool_result_and_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "Let me check.\n<tool_result name=\"shell\">\noutput here\n</tool_result>\nThe answer is 42.";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert!(!result.contains("<tool_result"));
+        assert!(!result.contains("output here"));
+        assert!(result.contains("The answer is 42."));
     }
 
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
