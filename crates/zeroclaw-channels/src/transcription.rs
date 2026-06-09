@@ -876,6 +876,7 @@ impl TranscriptionManager {
     pub fn empty() -> Self {
         Self {
             transcription_providers: HashMap::new(),
+            max_audio_bytes: None,
             agent_transcription_provider: String::new(),
         }
     }
@@ -2043,6 +2044,7 @@ mod tests {
         // an empty manager shell directly, then apply typed providers.
         let manager = TranscriptionManager {
             transcription_providers: std::collections::HashMap::new(),
+            max_audio_bytes: None,
             agent_transcription_provider: String::new(),
         }
         .with_typed_providers(&typed);

@@ -215,9 +215,6 @@ impl ElevenLabsTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for ElevenLabsTtsProvider {
-    fn output_format(&self) -> &str {
-        "mp3"
-    }
     fn name(&self) -> &str {
         "elevenlabs"
     }
@@ -330,10 +327,6 @@ impl GoogleTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for GoogleTtsProvider {
-    fn output_format(&self) -> &str {
-        "mp3"
-    }
-
     fn name(&self) -> &str {
         "google"
     }
@@ -453,10 +446,6 @@ impl EdgeTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for EdgeTtsProvider {
-    fn output_format(&self) -> &str {
-        "mp3"
-    }
-
     fn name(&self) -> &str {
         "edge"
     }
@@ -554,10 +543,6 @@ impl PiperTtsProvider {
 
 #[async_trait::async_trait]
 impl TtsProvider for PiperTtsProvider {
-    fn output_format(&self) -> &str {
-        "wav"
-    }
-
     fn name(&self) -> &str {
         "piper"
     }
