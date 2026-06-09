@@ -385,7 +385,8 @@ ci-all = [
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
-    "browser-native", "plugins-wasm", "probe", "rag-pdf",
+    "browser-native", "probe", "rag-pdf",
+    "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
 ]
 
