@@ -6276,7 +6276,10 @@ mod tests {
     #[test]
     fn admin_reload_gate_loopback_always_allowed() {
         // Loopback is allowed regardless of the opt-in or pairing flags.
-        assert_eq!(admin_reload_gate(true, false, false), AdminReloadGate::Allow);
+        assert_eq!(
+            admin_reload_gate(true, false, false),
+            AdminReloadGate::Allow
+        );
         assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
         assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
         assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
