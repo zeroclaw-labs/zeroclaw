@@ -22,13 +22,13 @@ zeroclaw daemon --host 127.0.0.1 --port 42617
 
 ## Supported Boards
 
-| Board           | Transport | Path Example              |
-|-----------------|-----------|---------------------------|
-| nucleo-f401re   | serial    | /dev/ttyACM0, /dev/cu.usbmodem* |
-| arduino-uno     | serial    | /dev/ttyACM0, /dev/cu.usbmodem* |
-| arduino-uno-q   | bridge    | (Uno Q IP)                |
-| rpi-gpio        | native    | native                    |
-| esp32           | serial    | /dev/ttyUSB0              |
+Boards are identified by USB VID/PID. The canonical registry:
+
+{{#include ../_snippets/hardware-boards.md}}
+
+The `board` value in `[[peripherals.boards]]` is matched against these registry
+names (and a few transport-specific aliases such as `arduino-uno-q` / `rpi-gpio`
+handled in `peripherals/mod.rs`).
 
 ## Manual Config
 

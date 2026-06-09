@@ -244,15 +244,16 @@ only the relevant tools:
 ```
 ToolRegistry::load(devices)
 
-  # always loaded (Pico / GPIO)
-  register: gpio_write, gpio_read, gpio_toggle, pico_flash, device_list, device_status
+  # always loaded (base hardware tools — see catalog::BASE_TOOLS)
+  register: gpio_read, gpio_write, pico_flash,
+            device_read_code, device_write_code, device_exec
 
-  # only loaded if an Aardvark was found at boot
+  # only loaded if an Aardvark was found at boot (catalog::AARDVARK_TOOLS)
   if devices.has_aardvark():
     register: i2c_scan, i2c_read, i2c_write, spi_transfer, gpio_aardvark, datasheet
 ```
 
-This is why the `hardware_feature_registers_all_six_tools` test still passes in stub mode: `has_aardvark()` returns false, 0 extra tools load, count stays at 6.
+This is why the `hardware_feature_registers_catalog_base_tools` test still passes in stub mode: `has_aardvark()` returns false, 0 extra tools load, count stays at the base set.
 
 ---
 
@@ -274,7 +275,7 @@ This is why the `hardware_feature_registers_all_six_tools` test still passes in 
                        │                ▼
                        │         ToolRegistry::load()
                        │           has_aardvark() == true
-                       │           → load 6 aardvark tools
+                       │           → load aardvark tools
                        │
 ─────────────────────────────────────────────────────────────────
 
@@ -316,7 +317,7 @@ This is why the `hardware_feature_registers_all_six_tools` test still passes in 
 | `find_devices()` | returns `[]` | returns `[0]` |
 | `open_port(0)` | `Err(NotFound)` | opens USB, returns handle |
 | `i2c_scan()` | `[]` | probes bus, returns addresses |
-| tools loaded | only the 6 Pico tools | 6 Pico + 6 Aardvark tools |
+| tools loaded | only the base hardware tools | base tools + Aardvark tools |
 | `has_aardvark()` | `false` | `true` |
 | SDK needed | no | yes (`vendor/aardvark.h` + `.so`) |
 

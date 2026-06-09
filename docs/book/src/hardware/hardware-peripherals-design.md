@@ -165,11 +165,16 @@ pub trait Peripheral: Send + Sync {
 
 ### Board Support
 
-| Board              | Transport | Firmware / Driver      | Tools                    |
-|--------------------|-----------|------------------------|--------------------------|
-| nucleo-f401re      | serial    | Zephyr / Embassy       | gpio_read, gpio_write, adc_read |
-| rpi-gpio           | native    | rppal or sysfs         | gpio_read, gpio_write    |
-| esp32              | serial/ws | ESP-IDF / Embassy      | gpio, wifi, mqtt         |
+Boards are identified by USB VID/PID in the canonical registry:
+
+{{#include ../_snippets/hardware-boards.md}}
+
+Each connected board is driven over one of the subsystem transports:
+
+{{#include ../_snippets/hardware-transports.md}}
+
+The base tools every board exposes, plus the Aardvark-conditional set, are
+listed in [Hardware subsystem → Runtime tools](./subsystem.md#runtime-tools).
 
 ## 7. Communication Protocols
 
@@ -203,55 +208,40 @@ Simple JSON over serial for boards without gRPC support:
 - Implements the protocol above.
 - User flashes this to the board; ZeroClaw connects and discovers capabilities.
 
-## 9. Implementation Phases
+## 9. Capability Layers
 
-### Phase 1: Skeleton ✅ (Done)
+The subsystem is built in layers; each is independently usable. Rather than
+tracking phase status here (which drifts as work lands), the layers are:
 
-- [x] Add `Peripheral` trait, config schema, CLI (`zeroclaw peripheral list/add`)
-- [x] Add `--peripheral` flag to agent
-- [x] Document in AGENTS.md
+- **Skeleton.** The `Peripheral` trait, config schema, and `zeroclaw peripheral`
+  CLI. The `--peripheral` flag wires a board into the agent.
+- **Host-mediated discovery.** `zeroclaw hardware discover` enumerates USB
+  devices by VID/PID; the board registry maps them to architecture and name;
+  `zeroclaw hardware introspect <path>` reports the memory map and peripheral
+  list.
+- **Serial / probe transport.** `SerialPeripheral` carries the JSON protocol
+  over USB CDC; the `probe` feature adds probe-rs SWD for flash, memory map, and
+  memory read (see the `hardware_*` tools).
+- **RAG pipeline.** Datasheets are indexed and injected into LLM context on
+  hardware queries.
 
-### Phase 2: Host-Mediated: Hardware Discovery ✅ (Done)
+  **Usage:** `zeroclaw config set peripherals.datasheet-dir docs/datasheets`.
+  Place `.md` or `.txt` files named by board (e.g. `nucleo-f401re.md`,
+  `rpi-gpio.md`). Files in `_generic/` or named `generic.md` apply to all
+  boards. Chunks are retrieved by keyword match and injected into the user
+  message context.
 
-- [x] `zeroclaw hardware discover`: enumerate USB devices (VID/PID)
-- [x] Board registry: map VID/PID → architecture, name (e.g. Nucleo-F401RE)
-- [x] `zeroclaw hardware introspect <path>`: memory map, peripheral list
+- **Edge-native (Raspberry Pi).** ZeroClaw runs on the Pi with native GPIO via
+  rppal (the `peripheral-rpi` feature).
+- **ESP32.** Host-mediated over the serial transport, same JSON protocol as
+  STM32. ESP32 dev boards are in the registry by their CH340 USB VID/PID.
 
-### Phase 3: Host-Mediated: Serial / J-Link
+  **Usage:** Flash `firmware/esp32` to the ESP32, add `board = "esp32"`,
+  `transport = "serial"`, `path = "/dev/ttyUSB0"` to config.
 
-- [x] `SerialPeripheral` for STM32 over USB CDC
-- [ ] probe-rs or OpenOCD integration for flash/debug
-- [x] Tools: `gpio_read`, `gpio_write` (memory_read, flash_write in future)
-
-### Phase 4: RAG Pipeline ✅ (Done)
-
-- [x] Datasheet index (markdown/text → chunks)
-- [x] Retrieve-and-inject into LLM context on hardware-related queries
-- [x] Board-specific prompt augmentation
-
-**Usage:** `zeroclaw config set peripherals.datasheet-dir docs/datasheets`. Place `.md` or `.txt` files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`). Files in `_generic/` or named `generic.md` apply to all boards. Chunks are retrieved by keyword match and injected into the user message context.
-
-### Phase 5: Edge-Native: RPi ✅ (Done)
-
-- [x] ZeroClaw on Raspberry Pi (native GPIO via rppal)
-- [ ] gRPC/nanoRPC server for local peripheral access
-- [ ] Code persistence (store synthesized snippets)
-
-### Phase 6: Edge-Native: ESP32
-
-- [x] Host-mediated ESP32 (serial transport), same JSON protocol as STM32
-- [x] `esp32` firmware crate (`firmware/esp32`): GPIO over UART
-- [x] ESP32 in hardware registry (CH340 VID/PID)
-- [ ] ZeroClaw *on* ESP32 (WiFi + LLM, edge-native), future
-- [ ] Wasm or template-based execution for LLM-generated logic
-
-**Usage:** Flash `firmware/esp32` to ESP32, add `board = "esp32"`, `transport = "serial"`, `path = "/dev/ttyUSB0"` to config.
-
-### Phase 7: Dynamic Execution (LLM-Generated Code)
-
-- [ ] Template library: parameterized GPIO/I2C/SPI snippets
-- [ ] Optional: Wasm runtime for user-defined logic (sandboxed)
-- [ ] Persist and reuse optimized code paths
+- **Dynamic execution.** LLM-generated logic runs through parameterized
+  templates, with a sandboxed Wasm runtime as the longer-term direction for
+  user-defined logic.
 
 ## 10. Security Considerations
 

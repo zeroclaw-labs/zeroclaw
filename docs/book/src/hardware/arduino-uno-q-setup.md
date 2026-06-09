@@ -58,7 +58,7 @@ ssh arduino@<UNO_Q_IP>
 
 ## Phase 2: Install ZeroClaw on Uno Q
 
-### Option A: Build on the Device (Simpler, ~20–40 min)
+### Option A: Build on the Device (Simpler)
 
 <div class="os-tabs-src">
 
@@ -80,7 +80,7 @@ sudo apt-get install -y pkg-config libssl-dev
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
-# Build (takes ~15–30 min on Uno Q)
+# Build (on-device build is slow; cross-compile from a larger machine if build time matters)
 export CARGO_BUILD_JOBS=1 # build will be OOM-killed mid-link without this
 cargo build --release --features hardware
 

@@ -4,16 +4,20 @@ ZeroClaw's hardware subsystem lets the agent control microcontrollers, SBCs, and
 
 ## What's supported
 
-| Target | Protocol | Page |
-|---|---|---|
-| STM32 Nucleo (F401RE, others) | Serial / OpenOCD | [STM32 Nucleo](./nucleo-setup.md) |
-| Arduino Uno Q | Serial / USB | [Arduino Uno Q](./arduino-uno-q-setup.md) |
-| Raspberry Pi | GPIO / I2C / SPI (via `/dev/gpiochip*`, `/dev/i2c-*`, `/dev/spidev*`) | Covered by peripherals design |
-| Aardvark I2C/SPI host adapter | USB | [Aardvark](./aardvark.md) |
-| Android (via Termux) | Serial-over-USB / Bluetooth | [Android](./android-setup.md) |
-| Generic boards | `Peripheral` trait | [Adding boards & tools](./adding-boards-and-tools.md) |
+The hardware subsystem identifies boards by USB VID/PID. The boards in the
+canonical registry:
 
-See [Peripherals design](./hardware-peripherals-design.md) for the architecture.
+{{#include ../_snippets/hardware-boards.md}}
+
+Transports the subsystem speaks:
+
+{{#include ../_snippets/hardware-transports.md}}
+
+See [Peripherals design](./hardware-peripherals-design.md) for the architecture
+and the per-board setup guides ([Nucleo](./nucleo-setup.md),
+[Arduino Uno Q](./arduino-uno-q-setup.md), [Aardvark](./aardvark.md),
+[Raspberry Pi](./raspberry-pi-setup.md), [Android](./android-setup.md)) for
+wiring each one up.
 
 ## Enabling
 
@@ -29,28 +33,19 @@ cargo build --release --features hardware
 
 </div>
 
-Or, if you want only specific boards:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-cargo build --release --features "hardware board-nucleo board-arduino"
-```
-
-</div>
+The hardware features are `hardware` (core subsystem), `peripheral-rpi`
+(Raspberry Pi native GPIO), and `probe` (probe-rs SWD introspection). See the
+[Config reference](../reference/config.md) for the per-board config fields.
 
 ## Runtime tools
 
-With the feature enabled, the agent gains these tools:
+With the `hardware` feature, the agent gains these built-in tools:
 
-- `gpio_read` / `gpio_write`: digital I/O
-- `i2c_read` / `i2c_write`: I2C bus access
-- `spi_transfer`: SPI transfers
-- `adc_read`: analogue reads (where supported)
-- `peripheral_probe`: discover attached boards and sensors
-- `peripheral_flash`: flash firmware to a connected microcontroller
+{{#include ../_snippets/hardware-tools-base.md}}
+
+When an Aardvark adapter is connected at startup, these additional tools load:
+
+{{#include ../_snippets/hardware-tools-aardvark.md}}
 
 All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Hardware tools only reach the device paths explicitly listed in `[[peripherals.boards]]` entries:
 
@@ -81,7 +76,7 @@ The stock systemd unit sets `SupplementaryGroups=gpio spi i2c`.
 
 Hardware tools can brick things. Real, expensive things.
 
-- `peripheral_flash` writes firmware, a bad image can brick the board. The tool requires operator approval at `Supervised` autonomy regardless of autonomy level; there's no way to auto-approve it.
+- `pico_flash` writes firmware; a bad image can brick the board. The tool requires operator approval at `Supervised` autonomy regardless of autonomy level; there's no way to auto-approve it.
 - `i2c_write` / `spi_transfer` to device addresses the agent doesn't know can damage sensors.
 - GPIO writes that conflict with external drivers (voltage fights) damage pins.
 

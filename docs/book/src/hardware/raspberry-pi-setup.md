@@ -1,25 +1,30 @@
 # Raspberry Pi Setup
 
-This guide covers installing and running ZeroClaw on Raspberry Pi (Pi 3, Pi 4, Pi 5, Pi Zero 2 W).
+This guide covers installing and running ZeroClaw on Raspberry Pi.
 
-The README's "runs on <$10 hardware with <5 MB RAM" claim is true for the **runtime**. Build-time is a different story: Rust's compiler and linker need significantly more RAM than the resulting binary, so the on-device build path needs swap and a tuned profile to avoid OOM-kills during link.
+The runtime is small enough to run comfortably on a Pi. Build-time is a
+different story: Rust's compiler and linker need substantially more RAM than the
+resulting binary, so the on-device build path needs swap and a tuned profile to
+avoid OOM-kills during link.
 
 For most Pi users, the **pre-built binary is the path of least resistance**.
 
 ## Hardware Compatibility
 
-| Model | RAM | Pre-built binary | Build from source |
-|---|---|---|---|
-| Pi 5 (16 GB) | 16 GB | ✅ | ✅ comfortable |
-| Pi 5 (8 GB) | 8 GB | ✅ | ✅ with swap or `release-fast` profile |
-| Pi 5 (4 GB) | 4 GB | ✅ | ✅ with swap + `release-fast` profile |
-| Pi 4 (8 GB) | 8 GB | ✅ | ✅ with `release-fast` profile |
-| Pi 4 (4 GB) | 4 GB | ✅ | ✅ with swap + `release-fast` profile |
-| Pi 4 (2 GB) | 2 GB | ✅ | Marginal, swap required, slow |
-| Pi 3 (1 GB) | 1 GB | ✅ | ❌ Not recommended |
-| Pi Zero 2 W | 512 MB | ✅ | ❌ |
+Any Pi that can run a 64-bit (`aarch64`) or 32-bit (`armv7`) Raspberry Pi OS can
+run the **pre-built binary** — there is no meaningful memory floor for the
+runtime. The constraint is **building from source on the device**: the linker is
+memory-hungry, so lower-RAM boards need swap and a lighter build profile (see
+[Option 3](#option-3-build-on-the-pi)). Cross-compiling from a larger machine
+([Option 2](#option-2-cross-compile-from-another-machine)) sidesteps the
+on-device memory pressure entirely.
 
-**Runtime memory is minimal.** Even on a Pi Zero 2 W, the core agent runs in well under 5 MB RSS once it's started. The hardware ladder above is about whether you can compile on the device, not whether ZeroClaw can run on it.
+The prebuilt Pi binaries come from these release targets:
+
+{{#include ../_snippets/hardware-release-targets.md}}
+
+Use `aarch64-unknown-linux-gnu` for 64-bit Raspberry Pi OS and
+`armv7-unknown-linux-gnueabihf` for 32-bit.
 
 ## Option 1: Pre-built Binary (Recommended)
 
@@ -135,7 +140,7 @@ scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 
 ## Option 3: Build on the Pi
 
-Possible on Pi 4/5 if you set up swap and pick the right profile. Expect 20-40 minutes on a Pi 5 (8 GB), longer on Pi 4.
+Possible on a Pi if you set up swap and pick the right profile. Build time scales with the board; on lower-RAM boards it can be slow.
 
 ### Step 1: Install Rust toolchain
 
@@ -150,9 +155,11 @@ source $HOME/.cargo/env
 
 </div>
 
-### Step 2: Add swap (critical for Pi 5 with ≤ 8 GB or any Pi 4)
+### Step 2: Add swap (recommended for lower-RAM boards)
 
-The default `release` profile peaks around 8-10 GB RSS during fat LTO linking. Without swap, that triggers the OOM-killer mid-link.
+The default `release` profile uses fat LTO, which is memory-hungry at link time.
+On a board without enough RAM, that triggers the OOM-killer mid-link. Swap (plus
+a lighter profile, Step 3) avoids it.
 
 <div class="os-tabs-src">
 
@@ -176,7 +183,7 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ### Step 3: Choose a build profile
 
-The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile (`codegen-units = 8`, `lto = "thin"`) drops peak RAM by ~half, with only minor runtime impact.
+The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile raises `codegen-units` to 8 for more parallelism (lighter on the linker), at a minor runtime cost. The `ci` profile goes further with `lto = "thin"` and `codegen-units = 16` for the fastest, lowest-memory link.
 
 <div class="os-tabs-src">
 
@@ -186,13 +193,13 @@ The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best r
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
-# Pi 5 (8 GB, with swap): default release works
+# Higher-RAM board (with swap): default release works
 cargo build --release
 
-# Pi 4 (4 GB, with swap): use release-fast
+# Mid-RAM board (with swap): use release-fast for a lighter link
 cargo build --profile release-fast
 
-# Pi 4 (2 GB) or constrained: use ci profile (debug-info-stripped, fast link)
+# Low-RAM or constrained board: use ci profile (debug-info-stripped, fast link)
 cargo build --profile ci
 ```
 
@@ -218,28 +225,19 @@ If you want to use Pi GPIO peripherals from skills, enable the relevant feature 
 
 ## Containerized deployment (Podman recommended over Docker)
 
-**Pis are memory-constrained, and that's the operating reality this section is written against.** The 2 GB Pi 4 is the low-bar test unit for this guide. If a setup doesn't leave headroom on a 2 GB box, it's not a setup we recommend. ZeroClaw itself runs in well under 5 MB RSS at runtime, but everything you stack alongside it (channel transports, browser-control, MCP servers, an adjacent agent or two, plus the OS) competes for the same fixed pool. Memory you don't spend on container infrastructure is memory ZeroClaw and its tools get to use.
-
-Concrete budget on a 2 GB Pi 4 running Raspberry Pi OS Bookworm/Trixie headless:
-
-| Component | Approx RSS |
-|---|---|
-| Kernel + base userspace + sshd | ~150-250 MB |
-| `dockerd` (idle, no containers) | ~150-200 MB |
-| ZeroClaw runtime (gateway only) | ~5 MB |
-| One agent container (e.g. ghcr.io/zeroclaw-labs/zeroclaw) | ~30-80 MB |
-| **Available with Docker** | ~1.3-1.5 GB |
-| **Available with Podman (no daemon)** | ~1.5-1.7 GB |
-
-The Podman delta is on the order of ~150-200 MB freed up, small in absolute terms, large as a percentage of what's left over after the OS gets its share. On a 2 GB unit that's the difference between comfortably running ZeroClaw + a heavy channel transport (Matrix with media, browser-automation skills) and OOM-killing under load.
+Pis are memory-constrained, and on a small board everything you stack alongside
+ZeroClaw (channel transports, browser-control, MCP servers, an adjacent agent or
+two, plus the OS) competes for the same fixed pool. Memory you don't spend on
+container infrastructure is memory ZeroClaw and its tools get to use, which is
+why container runtime choice matters more here than on a developer laptop.
 
 **Three reasons Podman is the better fit on Pi than Docker:**
 
 1. **Rootless by default → security headroom.** Podman doesn't need a root daemon; containers run as your user. On an exposed edge device that matters more than on a developer laptop.
 2. **systemd-native via Quadlets → operational simplicity.** Podman ships `.container` unit files that systemd manages directly, same lifecycle, logging, and dependency model as any other unit. No separate `docker.service` to babysit, no separate logging layer.
-3. **No daemon RSS → memory headroom.** Skipping `dockerd`'s persistent ~150-200 MB is the single biggest knob you can turn on a 2 GB Pi without sacrificing isolation.
+3. **No persistent daemon → memory headroom.** Docker keeps a long-running `dockerd` resident; Podman does not. Dropping that daemon is the single biggest memory knob you can turn without sacrificing isolation.
 
-The trade-off: Podman's rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker's daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that's worth measuring. For ZeroClaw's typical "one or two long-running agent containers" pattern, the difference is negligible, and on memory-constrained hardware, the daemon-RSS savings dominate the calculation anyway.
+The trade-off: Podman's rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker's daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that's worth measuring. For ZeroClaw's typical "one or two long-running agent containers" pattern, the difference is negligible, and on memory-constrained hardware the daemon savings dominate the calculation anyway.
 
 ### Quick install (Raspberry Pi OS Bookworm/Trixie)
 
@@ -403,17 +401,17 @@ If you want skills to drive GPIO pins (LEDs, buttons, sensors, etc.):
 
 ### OOM-killed during build
 
-The `release` profile peaks at ~8-10 GB RSS during the final link. Either:
+Fat LTO linking in the `release` profile is the memory peak. Either:
 
-- Switch to `cargo build --profile release-fast` (drops peak to ~4-6 GB).
-- Add a 4 GB swap file (Step 2 above).
-- Cross-compile from a beefier machine (Option 2).
+- Switch to `cargo build --profile release-fast` (more codegen parallelism, lighter link).
+- Add swap (Step 2 above).
+- Cross-compile from a larger machine (Option 2).
 
-If you're using `release-fast` and still OOMing on a Pi 4 (2 GB), drop to `--profile ci` or use the pre-built binary.
+If you're using `release-fast` and still OOMing on a low-RAM board, drop to `--profile ci` or use the pre-built binary.
 
 ### Build extremely slow
 
-Expected on Pi 4. A clean release build takes 30-60 minutes; incremental builds are reasonable. Use cross-compilation (Option 2) if build time matters.
+Expected on lower-RAM boards; build time scales with the board. Use cross-compilation (Option 2) if build time matters.
 
 ### Pre-built binary: "Exec format error"
 
