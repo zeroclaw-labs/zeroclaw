@@ -525,6 +525,30 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
+    // Family-map container (e.g. `providers.models`, `channels`): every field
+    // is a `HashMap<String, T>` slot. Listing all slots here, each an empty
+    // `map | —` row, then recursing into every one, duplicates the per-slot
+    // detail that already lives on the dedicated section page. Collapse to a
+    // single note instead. Detected structurally (all fields are maps), not by
+    // a hardcoded path, so it can never drift.
+    let all_maps = !props.is_empty()
+        && props.values().all(|v| {
+            resolve(v, defs)
+                .get("additionalProperties")
+                .map(Value::is_object)
+                .unwrap_or(false)
+        });
+    if all_maps {
+        let slots: Vec<String> = props.keys().map(|k| format!("`{k}`")).collect();
+        let _ = writeln!(
+            out,
+            "One slot per family ({}). Each slot is a `[{path_str}.<slot>.<alias>]` map; \
+             see the dedicated section page for the per-field reference.\n",
+            slots.join(", ")
+        );
+        return;
+    }
+
     out.push_str("| Key | Type | Default | Description |\n");
     out.push_str("|-----|------|---------|-------------|\n");
 
@@ -710,7 +734,7 @@ fn fmt_value(value: Option<&Value>) -> String {
         Some(Value::Array(a)) if a.is_empty() => "`[]`".to_owned(),
         Some(Value::Object(o)) if o.is_empty() => "`{}`".to_owned(),
         Some(v) => format!("`{v}`"),
-        None => "—".to_owned(),
+        None => "`—`".to_owned(),
     }
 }
 

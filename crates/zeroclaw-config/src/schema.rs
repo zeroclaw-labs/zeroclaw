@@ -671,7 +671,7 @@ pub enum AuthMode {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this model_provider — grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
@@ -684,18 +684,18 @@ pub struct ModelProviderConfig {
     /// "openai-compatible"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
+    /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL; there is no separate path-suffix field.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// Model identifier to send with each request — the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
+    /// Model identifier to send with each request: the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Ordered list of other provider aliases to try when every model on this
     /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
     /// `providers.models` and resolves with its own credentials, endpoint, and
-    /// model — a fallback never inherits this alias's key. The walk is
+    /// model. A fallback never inherits this alias's key. The walk is
     /// depth-first: this alias's models are exhausted first, then each fallback
     /// alias is descended in turn (applying its own `fallback_models` and
     /// `fallback`). Empty means no provider-level fallback.
@@ -704,7 +704,7 @@ pub struct ModelProviderConfig {
     pub fallback: Vec<crate::providers::ModelProviderRef>,
     /// Ordered alternate models to try on THIS provider before falling over to
     /// the `fallback` aliases. Same endpoint, key, and headers as the primary
-    /// `model` — only the model identifier changes. Use this when a provider
+    /// `model`. Only the model identifier changes. Use this when a provider
     /// serves a backup model (e.g. a smaller or older variant) that should be
     /// tried before leaving the provider entirely. Empty means only `model` is
     /// tried.
@@ -712,8 +712,8 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
-    /// deterministic, near-verbatim output — fits code, routing, summarization.
-    /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
+    /// deterministic, near-verbatim output, which fits code, routing, summarization.
+    /// Higher values (0.7–1.2) give more varied output, which fits open-ended chat.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -721,13 +721,13 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
-    /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
+    /// Extra HTTP headers sent with every request. Niche: used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
-    /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider — only override if you're forcing an unusual combination.
+    /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider; only override if you're forcing an unusual combination.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
@@ -736,11 +736,11 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     #[credential_class = "external_auth_store"]
     pub requires_openai_auth: bool,
-    /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
+    /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already; leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
+    /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role, e.g. certain older Mistral variants.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
@@ -884,7 +884,7 @@ pub struct AzureModelProviderConfig {
         alias = "azure_openai_resource"
     )]
     pub resource: Option<String>,
-    /// Azure deployment name — the deployment created in Azure AI Studio.
+    /// Azure deployment name: the deployment created in Azure AI Studio.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1031,7 +1031,7 @@ pub struct QwenModelProviderConfig {
     /// Long-lived Qwen OAuth refresh token. When set, the runtime
     /// exchanges it for a short-lived access token at provider
     /// construction time. Operators relying on the upstream `qwen login`
-    /// tool (which writes `~/.qwen/oauth_creds.json`) leave this unset —
+    /// tool (which writes `~/.qwen/oauth_creds.json`) leave this unset;
     /// the file-cache integration takes over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
@@ -1119,7 +1119,7 @@ pub struct OllamaModelProviderConfig {
     /// Force every Ollama `/api/chat` request to use this temperature,
     /// overriding the per-call value passed through
     /// `ModelProvider::chat_with_system(.., temperature)`. When unset
-    /// (`None`, the default), the per-call temperature wins — full
+    /// (`None`, the default), the per-call temperature wins: full
     /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_override: Option<f64>,
@@ -2126,7 +2126,7 @@ pub struct MinimaxModelProviderConfig {
     #[secret(category = "model_provider")]
     pub oauth_refresh_token: Option<String>,
     /// Override of MiniMax's published OAuth client_id. Most operators
-    /// should leave this unset — the runtime defaults to the
+    /// should leave this unset; the runtime defaults to the
     /// vendor-published client_id (same one MiniMax's own portal uses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
@@ -2328,7 +2328,7 @@ pub struct GeminiModelProviderConfig {
     /// Google OAuth app `client_id`, used when this alias drives ZeroClaw's
     /// own browser/device-code login flow (`zeroclaw auth login
     /// --model-provider gemini --profile <alias>`). Operators relying on
-    /// the upstream `gemini login` tool don't need this — that tool writes
+    /// the upstream `gemini login` tool don't need this; that tool writes
     /// its own client_id / client_secret into `~/.gemini/oauth_creds.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
@@ -3071,7 +3071,7 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub skill_bundles: Vec<String>,
-    /// Knowledge bundle aliases. Additive — the agent loads every listed
+    /// Knowledge bundle aliases. Additive: the agent loads every listed
     /// bundle.
     #[tab(Bundles)]
     #[serde(default)]
@@ -3082,7 +3082,7 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
-    /// Cron job aliases. Each entry references `cron[key]` — a declarative
+    /// Cron job aliases. Each entry references `cron[key]`, a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
     #[tab(Cron)]
@@ -3114,7 +3114,7 @@ pub struct AliasedAgentConfig {
     ///
     /// Source of truth for api_key / uri / model / temperature etc. is the
     /// referenced `[providers.models.<type>.<alias>]` entry. This field is
-    /// a reference only (NEVER a copy) — per AGENTS.md SINGLE SOURCE OF TRUTH.
+    /// a reference only (NEVER a copy), per AGENTS.md SINGLE SOURCE OF TRUTH.
     ///
     /// Empty (`Default`) = inherit the main agent's resolved provider+model
     /// (preserves pre-PR behavior; backward compatible).
@@ -3129,7 +3129,7 @@ pub struct AliasedAgentConfig {
     /// underlying `model = "kimi-k2.5"` string can still contain dots.
     ///
     /// ACP channels (IDE-direct) always reply and skip the classifier
-    /// entirely — this field has no effect on ACP traffic.
+    /// entirely, so this field has no effect on ACP traffic.
     #[tab(Providers)]
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
@@ -12180,8 +12180,8 @@ pub struct NextcloudTalkConfig {
     pub excluded_tools: Vec<String>,
     /// Controls whether and how streaming draft updates are delivered.
     ///
-    /// - `"off"` (default) — responses are sent as a single final message.
-    /// - `"partial"` — a placeholder is posted first and edited incrementally
+    /// - `"off"` (default): responses are sent as a single final message.
+    /// - `"partial"`: a placeholder is posted first and edited incrementally
     ///   as tokens arrive, making long responses visible in real time.
     #[tab(Behavior)]
     #[serde(default)]
@@ -12625,17 +12625,17 @@ pub struct LineConfig {
     pub channel_secret: String,
     /// DM (1:1 chat) access policy. Default: `pairing`.
     ///
-    /// - `open`      — respond to everyone
-    /// - `pairing`   — require one-time `/bind <code>` handshake on first contact
-    /// - `allowlist` — respond only to user IDs listed in `allowed_users`
+    /// - `open`: respond to everyone
+    /// - `pairing`: require one-time `/bind <code>` handshake on first contact
+    /// - `allowlist`: respond only to user IDs listed in `allowed_users`
     #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: LineDmPolicy,
     /// Group / multi-person chat policy. Default: `mention`.
     ///
-    /// - `open`     — respond to every message
-    /// - `mention`  — respond only when @mentioned
-    /// - `disabled` — ignore all group messages
+    /// - `open`: respond to every message
+    /// - `mention`: respond only when @mentioned
+    /// - `disabled`: ignore all group messages
     #[tab(Advanced)]
     #[serde(default)]
     pub group_policy: LineGroupPolicy,
@@ -13592,7 +13592,7 @@ pub struct VoiceWakeConfig {
     /// Default: `"hey zeroclaw"`.
     #[serde(default = "default_voice_wake_word")]
     pub wake_word: String,
-    /// Silence timeout in milliseconds — how long to wait after the last
+    /// Silence timeout in milliseconds: how long to wait after the last
     /// energy spike before finalizing a capture window. Default: `2000`.
     #[serde(default = "default_voice_wake_silence_timeout_ms")]
     pub silence_timeout_ms: u32,

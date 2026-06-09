@@ -666,7 +666,7 @@ fn render_model_provider_catalog_table() -> String {
         for p in rows {
             let url = zeroclaw_providers::default_model_provider_url(p.name)
                 .map(|u| format!("`{u}`"))
-                .unwrap_or_else(|| "—".to_string());
+                .unwrap_or_else(|| "`—`".to_string());
             let local = if p.local { "✓" } else { "" };
             out.push_str(&format!("| `{}` | {} | {} |\n", p.name, url, local));
         }
@@ -777,9 +777,9 @@ fn render_model_provider_fields() -> String {
             if extras.is_empty() {
                 // Fully described by the shared base; a plain row, nothing to
                 // expand into.
-                let _ = write!(
+                let _ = writeln!(
                     out,
-                    "<div class=\"provider-row\"><code>{slot}</code> <span class=\"provider-endpoint\">{endpoint}{local}</span></div>\n",
+                    "<div class=\"provider-row\"><code>{slot}</code> <span class=\"provider-endpoint\">{endpoint}{local}</span></div>",
                     slot = p.name,
                     endpoint = endpoint,
                     local = local,
@@ -914,4 +914,119 @@ under no map section; it cannot be derived from the schema"
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod generated_prose_gate {
+    //! Mirror of the `scripts/ci/docs_quality_gate.sh` em-dash rule, applied to
+    //! the preprocessor's *generated* output. The bash gate only lints the
+    //! checked-in source pages, so without this the generators could emit
+    //! prose em-dashes that bypass the rule. Any directive that emits prose is
+    //! exercised here.
+
+    /// True if `s` contains a U+2014 em-dash outside inline `code` spans,
+    /// `<code>` HTML elements, and fenced code blocks, matching the gate's
+    /// definition of a prose em-dash. The directives emit a mix of Markdown and
+    /// raw HTML, so both code-span forms are recognised.
+    fn has_prose_em_dash(s: &str) -> bool {
+        let mut in_fence = false;
+        for line in s.lines() {
+            let t = line.trim_start();
+            if t.starts_with("```") || t.starts_with("~~~") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            // Drop `<code>…</code>` HTML spans; their em-dashes are code, not prose.
+            let mut cleaned = String::with_capacity(line.len());
+            let mut rest = line;
+            while let Some(open) = rest.find("<code>") {
+                cleaned.push_str(&rest[..open]);
+                rest = &rest[open + "<code>".len()..];
+                if let Some(close) = rest.find("</code>") {
+                    rest = &rest[close + "</code>".len()..];
+                } else {
+                    rest = "";
+                }
+            }
+            cleaned.push_str(rest);
+
+            let mut in_span = false;
+            for ch in cleaned.chars() {
+                match ch {
+                    '`' => in_span = !in_span,
+                    '\u{2014}' if !in_span => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn directives_emit_no_prose_em_dashes() {
+        // Walk every book source page, expand its directives through the exact
+        // production dispatch (`expand_directives`), and lint the generated
+        // output. No path is hardcoded here: the book source is the source of
+        // truth for which directives exist, so adding or removing a directive
+        // on any page is covered automatically and this guard cannot drift.
+        let root = crate::util::repo_root();
+        let src = crate::util::book_dir(&root).join("src");
+        let params = super::load_params().expect("load peer-group params");
+        let env_vars = super::load_env_var_params().expect("load env-var params");
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // mdBook `{{#include}}` is resolved by the links preprocessor
+                // before ours; skip pages whose directives we cannot resolve
+                // standalone by simply expanding what is present.
+                let depth = path
+                    .strip_prefix(&src)
+                    .ok()
+                    .map(|rel| rel.components().count().saturating_sub(1))
+                    .unwrap_or(0);
+                let expanded = match super::expand_directives(&content, &params, &env_vars, depth) {
+                    Ok(t) => t,
+                    Err(_) => continue, // pages with non-directive `{{#...}}` (e.g. include)
+                };
+                // Only the *generated* prose is in scope: a page's own
+                // hand-written em-dashes are the source gate's job. Flag only
+                // when expansion introduced an em-dash the source did not have.
+                if has_prose_em_dash(&expanded) && !has_prose_em_dash(&content) {
+                    offenders.push(
+                        path.strip_prefix(&root)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "generated docs emit prose em-dashes (U+2014) outside code spans on these pages: \
+             {offenders:?}. The em-dash usually comes from a schema doc-comment that flows into a \
+             rendered field description; fix it at the source (comma, colon, semicolon, or period), \
+             not in the page."
+        );
+    }
 }
