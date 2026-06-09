@@ -43,15 +43,18 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     crate::cmd::mdbook::themes::run(root)?;
     crate::cmd::mdbook::keymap::run(root)?;
     let mdbook = mdbook_program()?;
+    let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     for entry in &entries {
         let dest = format!("book/{}/{}", tag_dir, entry.code);
-        run_cmd(
-            Command::new(&mdbook)
-                .args(["build", "-d", &dest])
-                .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
-                .current_dir(&book),
-        )?;
+        let mut cmd = Command::new(&mdbook);
+        cmd.args(["build", "-d", &dest])
+            .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
+            .current_dir(&book);
+        if let Some((key, value)) = &preprocessor_env {
+            cmd.env(key, value);
+        }
+        run_cmd(&mut cmd)?;
     }
     Ok(())
 }

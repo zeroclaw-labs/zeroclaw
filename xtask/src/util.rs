@@ -107,6 +107,33 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     )
 }
 
+/// Point mdBook's `peer-groups` preprocessor at the xtask binary Cargo actually
+/// built, rather than the repo-relative `target/release/mdbook` hardcoded in
+/// `book.toml`. With a non-default `CARGO_TARGET_DIR` the helper lands under the
+/// external target dir while mdBook still tries the repo-relative path and fails
+/// with "preprocessor not found". The running xtask binary *is* the preprocessor
+/// (its `preprocess` subcommand), so the override resolves wherever Cargo placed
+/// it. mdBook maps `MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND` to the
+/// `preprocessor.peer-groups.command` key (`__` -> `.`, `_` -> `-`) and splits
+/// the value with shlex, so the path is quoted.
+pub fn peer_groups_preprocessor_env() -> Option<(String, String)> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_str = exe.to_string_lossy();
+    Some(peer_groups_preprocessor_env_for(&exe_str))
+}
+
+/// Pure form of [`peer_groups_preprocessor_env`] over an explicit helper path,
+/// so the mdBook env-key mapping and shlex quoting are unit-testable without
+/// resolving `current_exe`.
+fn peer_groups_preprocessor_env_for(helper_path: &str) -> (String, String) {
+    let quoted =
+        shlex::try_quote(helper_path).map_or_else(|_| helper_path.to_string(), |q| q.into_owned());
+    (
+        "MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND".to_string(),
+        format!("{quoted} preprocess"),
+    )
+}
+
 pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     let status = cmd.status()?;
     if !status.success() {
@@ -273,4 +300,29 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_groups_env_key_matches_mdbook_mapping() {
+        let (key, value) = peer_groups_preprocessor_env_for("/some/dir/mdbook");
+        // mdBook lowercases, maps `__` -> `.` and `_` -> `-`, so this key must
+        // resolve to `preprocessor.peer-groups.command`.
+        assert_eq!(
+            key.strip_prefix("MDBOOK_")
+                .map(|k| k.to_lowercase().replace("__", ".").replace('_', "-")),
+            Some("preprocessor.peer-groups.command".to_string())
+        );
+        assert_eq!(value, "/some/dir/mdbook preprocess");
+    }
+
+    #[test]
+    fn peer_groups_env_quotes_paths_with_spaces() {
+        let (_, value) = peer_groups_preprocessor_env_for("/tmp/my target/release/mdbook");
+        let words: Vec<String> = shlex::Shlex::new(&value).collect();
+        assert_eq!(words, ["/tmp/my target/release/mdbook", "preprocess"]);
+    }
 }
