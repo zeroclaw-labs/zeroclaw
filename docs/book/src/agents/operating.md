@@ -32,14 +32,14 @@ There are two ways one agent reaches another, each separately gated:
 
 - **Messaging** on a shared channel: two agents can address each other only
   where they share a [peer group](../channels/peer-groups.md).
-- **Delegation**: an agent can hand a task to another agent only when **both**
+- **[Delegation](./delegation.md)**: an agent can hand a task to another agent only when **both**
   conditions hold, its own risk profile's `delegation_policy.mode` is `allow`
   (the default is `forbidden`), **and** the target agent shares the **same risk
   profile**. Delegation never crosses trust tiers, an agent on a hardened
   profile cannot delegate to one on a permissive profile. The shared risk
   profile is itself the allow-list: the delegate roster offered to the model is
   exactly the other agents on the caller's profile, and only when delegation is
-  permitted. See [SubAgents](./delegation.md) for the full gate
+  permitted. See [Delegation & SubAgents](./delegation.md) for the full gate
   behavior and the exact refusal messages.
 
 When an agent needs a one-off helper instead of an existing peer, it spawns an

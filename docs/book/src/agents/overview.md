@@ -56,7 +56,7 @@ channels, and keep entirely separate memory.
 
 Agents reach each other two ways, each gated separately: they can **message**
 on a channel where they share a [peer group](../channels/peer-groups.md), and
-they can **delegate** a task to one another only when the caller's risk profile
+they can **[delegate](./delegation.md)** a task to one another only when the caller's risk profile
 permits delegation and both agents share the same risk profile (see
 [Running agents](./operating.md#coexistence-and-isolation)).
 
@@ -72,9 +72,9 @@ permits delegation and both agents share the same risk profile (see
 Two agents share one model provider, run under different risk profiles, answer
 on different channels, and meet only where they share a peer group.
 
-A SubAgent is the short-lived exception to coexistence: an agent can spawn an
+A [SubAgent](./delegation.md) is the short-lived exception to coexistence: an agent can spawn an
 ephemeral SubAgent that inherits the parent's identity and security policy for a
-single task. See [SubAgents](./delegation.md).
+single task. See [Delegation & SubAgents](./delegation.md).
 
 ## Where to go next
 
