@@ -99,6 +99,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-irc"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Twitch"),
+        type_keys: &["twitch"],
+        compiled: cfg!(feature = "channel-twitch"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Lark"),
         type_keys: &["lark", "feishu"],
         compiled: cfg!(feature = "channel-lark"),
@@ -204,7 +209,7 @@ fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
 
 /// Returns one entry per channel type compiled into this binary.
 ///
-/// Filters the canonical channel list from [`ChannelsConfig::channels`] down to
+/// Filters the canonical channel list from [`zeroclaw_config::schema::ChannelsConfig::channels`] down to
 /// only those enabled at compile time via `channel-*` / `voice-wake` feature
 /// flags. Name, desc, and configured status come from the config crate's single
 /// source of truth; this function contributes only the compile-time filter.

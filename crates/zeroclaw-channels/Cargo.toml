@@ -53,6 +53,7 @@ hmac = "0.12"
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
   "png",
+  "webp",
 ], optional = true }
 lettre = { version = "0.11.22", default-features = false, features = [
   "builder",
@@ -190,6 +191,7 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
   "channel-wati",
@@ -199,7 +201,8 @@ channels-full = [
 ]
 # Channels with optional deps
 channel-email = ["dep:async-imap", "dep:lettre", "dep:mail-parser", "dep:pulldown-cmark"]
-channel-telegram = ["dep:image"]
+image-normalization = ["dep:image"]
+channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk"]
@@ -214,6 +217,7 @@ whatsapp-web = [
   "dep:whatsapp-rust",
   "dep:whatsapp-rust-tokio-transport",
   "dep:whatsapp-rust-ureq-http-client",
+  "image-normalization",
 ]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
@@ -221,6 +225,7 @@ channel-slack = []
 channel-signal = []
 channel-mattermost = []
 channel-irc = []
+channel-twitch = ["channel-irc"]
 channel-imessage = []
 channel-dingtalk = []
 channel-qq = []
@@ -260,6 +265,7 @@ axum = { version = "0.8", default-features = false, features = [
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
   "png",
+  "webp",
 ] }
 tempfile = "3.26"
 toml = "1.0"

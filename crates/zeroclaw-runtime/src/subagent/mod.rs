@@ -18,7 +18,7 @@
 //!
 //! The memory allowlist is carried as a set of agent **aliases** (the
 //! `[agents.<alias>]` config keys), not backend storage identifiers.
-//! Consumers that build an [`AgentScopedMemory`] must resolve aliases
+//! Consumers that build an [`zeroclaw_memory::AgentScopedMemory`] must resolve aliases
 //! to backend identifiers via
 //! [`zeroclaw_memory::Memory::ensure_agent_uuid`] first — SQL-backed
 //! stores use UUIDs from the `agents` table; Markdown / Qdrant / None
@@ -53,7 +53,7 @@ pub struct SubAgentOverrides {
     /// list is rejected.
     ///
     /// These are config-layer aliases, not backend storage
-    /// identifiers. Consumers that build an [`AgentScopedMemory`]
+    /// identifiers. Consumers that build an [`zeroclaw_memory::AgentScopedMemory`]
     /// must resolve aliases to backend identifiers via
     /// [`zeroclaw_memory::Memory::ensure_agent_uuid`] before passing
     /// them to the wrapper (SQL backends use UUIDs; Markdown / Qdrant
@@ -85,7 +85,7 @@ pub struct SubAgentContext {
     ///
     /// See [`SubAgentOverrides::allowed_agent_aliases`] for the
     /// alias-vs-backend-identifier distinction; consumers that build
-    /// an [`AgentScopedMemory`] must resolve to backend identifiers
+    /// an [`zeroclaw_memory::AgentScopedMemory`] must resolve to backend identifiers
     /// before passing the set to the wrapper.
     pub allowed_agent_aliases: HashSet<String>,
 }
