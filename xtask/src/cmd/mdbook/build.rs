@@ -105,7 +105,7 @@ pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()>
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     let api_dest = book.join("book").join(tag_dir).join("api");
     let _ = std::fs::remove_dir_all(&api_dest);
-    copy_dir_all(root.join("target/doc"), &api_dest)?;
+    copy_dir_all(doc_dir(root), &api_dest)?;
 
     const INDEX_HTML: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0; url=./en/\">\n<link rel=\"canonical\" href=\"./en/\">\n<title>ZeroClaw Docs</title>\n";
     let out_dir = book.join("book").join(tag_dir);

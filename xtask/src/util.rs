@@ -16,6 +16,33 @@ pub fn ref_dir(root: &Path) -> PathBuf {
     root.join("docs/book/src/reference")
 }
 
+/// Resolve the Cargo target directory, honoring `CARGO_TARGET_DIR`, a
+/// `.cargo/config.toml` `build.target-dir`, and any other override Cargo
+/// applies. `cargo doc` writes its output under `<target-dir>/doc`; hardcoding
+/// `<root>/target/doc` breaks whenever the target dir is relocated (CI runners,
+/// shared caches, `CARGO_TARGET_DIR`). Falls back to `<root>/target` only when
+/// `cargo metadata` is unavailable.
+pub fn target_dir(root: &Path) -> PathBuf {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output();
+    if let Ok(out) = output
+        && out.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(dir) = json.get("target_directory").and_then(|v| v.as_str())
+    {
+        return PathBuf::from(dir);
+    }
+    root.join("target")
+}
+
+/// The rustdoc output directory (`<target-dir>/doc`), resolved through
+/// [`target_dir`] so it tracks `cargo doc`'s actual output location.
+pub fn doc_dir(root: &Path) -> PathBuf {
+    target_dir(root).join("doc")
+}
+
 pub fn po_dir(root: &Path) -> PathBuf {
     root.join("docs/book/po")
 }
@@ -324,5 +351,29 @@ mod tests {
         let (_, value) = peer_groups_preprocessor_env_for("/tmp/my target/release/mdbook");
         let words: Vec<String> = shlex::Shlex::new(&value).collect();
         assert_eq!(words, ["/tmp/my target/release/mdbook", "preprocess"]);
+    }
+
+    #[test]
+    fn doc_dir_follows_cargo_target_dir_override() {
+        // cargo metadata reflects CARGO_TARGET_DIR; doc_dir must resolve to
+        // <override>/doc so the assemble()/refs copy reads from where `cargo doc`
+        // actually wrote. This is the exact failure the hardcoded `target/doc`
+        // path had under a non-default CARGO_TARGET_DIR.
+        // SAFETY: single-threaded body; env is saved and restored.
+        let prev = std::env::var_os("CARGO_TARGET_DIR");
+        let alt = std::env::temp_dir().join("zc-xtask-target-dir-test");
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", &alt);
+        }
+        let resolved_target = target_dir(&repo_root());
+        let resolved_doc = doc_dir(&repo_root());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
+                None => std::env::remove_var("CARGO_TARGET_DIR"),
+            }
+        }
+        assert_eq!(resolved_target, alt);
+        assert_eq!(resolved_doc, alt.join("doc"));
     }
 }
