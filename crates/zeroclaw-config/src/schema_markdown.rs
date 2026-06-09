@@ -41,11 +41,11 @@ pub fn field_table_for_path(
         display_segments.push(seg.to_string());
         node = next;
         // If this node is a map, step into its value type and record `<alias>`.
-        if let Some(add) = node.get("additionalProperties") {
-            if add.is_object() {
-                node = resolve(add, defs);
-                display_segments.push("<alias>".to_string());
-            }
+        if let Some(add) = node.get("additionalProperties")
+            && add.is_object()
+        {
+            node = resolve(add, defs);
+            display_segments.push("<alias>".to_string());
         }
     }
 
