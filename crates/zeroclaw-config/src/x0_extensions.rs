@@ -40,41 +40,10 @@ pub struct DelegateAgentConfig {
     pub max_depth: u32,
 }
 
-// ── Bot Workspace Isolation ──────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct BotConfig {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub workspace_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub identity: Option<serde_json::Value>,
-    #[serde(default)]
-    pub soul: Option<SoulConfig>,
-    pub port: u16,
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-    #[serde(default)]
-    pub channels: Option<serde_json::Value>,
-    #[serde(default)]
-    pub memory: Option<serde_json::Value>,
-    #[serde(default)]
-    pub max_memory_mb: Option<u64>,
-    #[serde(default)]
-    pub max_concurrent_requests: Option<u32>,
-    #[serde(default)]
-    pub max_tokens_per_minute: Option<u64>,
-}
+// Bot workspace isolation was superseded by the per-agent model
+// (`[agents.<alias>]` already carries identity, soul, workspace, memory,
+// gateway_port, and channels). The former `BotConfig` / `Config.bots`
+// scaffolding was never wired into the daemon and has been retired.
 
 /// Simple token-bucket rate limiter for per-bot resource enforcement.
 #[derive(Debug)]
@@ -1705,7 +1674,6 @@ macro_rules! impl_x0_prop_kind {
 impl_x0_prop_kind!(
     AgentConfig,
     AutonomyConfig,
-    BotConfig,
     CognitiveConfig,
     ConscienceConfig,
     ConsciousnessConfig,
@@ -1731,7 +1699,3 @@ impl_x0_prop_kind!(
     WalletConfig,
     WasmRuntimeConfig,
 );
-
-impl crate::traits::HasPropKind for Vec<BotConfig> {
-    const PROP_KIND: crate::traits::PropKind = crate::traits::PropKind::ObjectArray;
-}
