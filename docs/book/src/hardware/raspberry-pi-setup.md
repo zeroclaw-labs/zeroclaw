@@ -34,6 +34,10 @@ Fastest path. No compiler, no swap, no OOM risk.
 
 The script auto-detects your architecture (`aarch64`, `armv7`, or `armv6`) and installs the matching release binary into `$CARGO_HOME/bin/zeroclaw` (defaulting to `~/.cargo/bin/zeroclaw`). Make sure that directory is on your `PATH`.
 
+When the script builds from source instead of taking a prebuilt binary, it also adapts the build to the board's available memory:
+
+{{#include ../_snippets/hardware-lowmem-lto.md}}
+
 ### Manual download
 
 Pick the matching tarball from the [latest release](https://github.com/zeroclaw-labs/zeroclaw/releases/latest):
@@ -175,12 +179,10 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile raises `codegen-units` to 8 for more parallelism (lighter on the linker), at a minor runtime cost. The `ci` profile goes further with `lto = "thin"` and `codegen-units = 16` for the fastest, lowest-memory link.
 
-#### Automatic low-memory LTO (install.sh)
-
-If you install via `install.sh` rather than building by hand, the script already
-applies the low-memory build heuristic for you:
-
-{{#include ../_snippets/hardware-lowmem-lto.md}}
+When you build by hand (below), you pick the profile yourself. If you let
+`install.sh` build from source instead, it applies the low-memory LTO heuristic
+automatically (described under [Using the install
+script](#using-the-install-script)).
 
 <div class="os-tabs-src">
 
