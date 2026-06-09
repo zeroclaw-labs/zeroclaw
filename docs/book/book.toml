@@ -33,7 +33,7 @@ level = 0
 after = ["links"]
 
 [preprocessor.peer-groups]
-command = "../../target/debug/mdbook preprocess"
+command = "../../target/release/mdbook preprocess"
 before = ["links"]
 
 [preprocessor.mermaid]
