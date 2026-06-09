@@ -774,24 +774,32 @@ fn render_model_provider_fields() -> String {
                 &base,
             )
             .unwrap_or_default();
-            let detail = if extras.is_empty() {
-                "<p>No slot-specific fields beyond the shared fields above.</p>".to_string()
+            if extras.is_empty() {
+                // Fully described by the shared base; a plain row, nothing to
+                // expand into.
+                let _ = write!(
+                    out,
+                    "<div class=\"provider-row\"><code>{slot}</code> <span class=\"provider-endpoint\">{endpoint}{local}</span></div>\n",
+                    slot = p.name,
+                    endpoint = endpoint,
+                    local = local,
+                );
             } else {
-                format!("<p><strong>Slot-specific fields:</strong></p>\n\n{extras}")
-            };
-            let _ = write!(
-                out,
-                concat!(
-                    "<details class=\"provider-entry\">",
-                    "<summary><code>{slot}</code> <span class=\"provider-endpoint\">{endpoint}{local}</span></summary>\n\n",
-                    "{detail}\n",
-                    "</details>\n",
-                ),
-                slot = p.name,
-                endpoint = endpoint,
-                local = local,
-                detail = detail,
-            );
+                // Extends the base; expandable to its slot-specific fields.
+                let _ = write!(
+                    out,
+                    concat!(
+                        "<details class=\"provider-entry\">",
+                        "<summary><code>{slot}</code> <span class=\"provider-endpoint\">{endpoint}{local}</span></summary>\n\n",
+                        "<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>\n\n{extras}\n",
+                        "</details>\n",
+                    ),
+                    slot = p.name,
+                    endpoint = endpoint,
+                    local = local,
+                    extras = extras,
+                );
+            }
         }
         out.push_str("</div>\n");
     }

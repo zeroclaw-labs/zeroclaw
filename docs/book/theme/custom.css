@@ -1215,6 +1215,20 @@ html.js #mdbook-content main {
   margin: 0.4rem 0;
   overflow: hidden;
 }
+/* Base-only providers: a plain non-expandable row aligned with the
+   expandable entries, but no caret, no pointer, nothing to reveal. */
+.provider-fields .provider-row {
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  margin: 0.4rem 0;
+  padding: 0.55rem 0.9rem;
+  /* match the summary text indent (caret width + gap) so slots line up */
+  padding-left: calc(0.9rem + 0.85em + 0.6rem);
+}
+.provider-fields .provider-row .provider-endpoint {
+  color: var(--pc-text-secondary);
+  font-size: 0.9em;
+}
 .provider-entry > summary {
   cursor: pointer;
   padding: 0.55rem 0.9rem;
