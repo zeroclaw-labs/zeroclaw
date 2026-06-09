@@ -267,6 +267,7 @@ pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
     _use_cache: bool,
+    show_model_names: bool,
 ) -> Result<()> {
     let targets = doctor_model_targets(config, provider_override);
 
@@ -298,6 +299,11 @@ pub async fn run_models(
             Ok(models) => {
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
+                if show_model_names && !models.is_empty() {
+                    for m in &models {
+                        println!("      • {}", m);
+                    }
+                }
                 matrix_rows.push((
                     provider_name.clone(),
                     ModelProbeOutcome::Ok,
