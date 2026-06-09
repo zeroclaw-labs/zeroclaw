@@ -32,9 +32,19 @@ Use assignees for active work. Use area stewardship for routing responsibility w
 
 ## Canonical spelling
 
-Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `security:policy`, and similar labels. The size and risk families intentionally keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`.
+Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `security:policy`, and similar labels. The size, risk, and most type families currently keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`, and `type: docs`.
 
-Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Future no-space spelling for size, risk, or type labels is also a migration question, not a casual rename. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+
+## Automation contract
+
+Live PR label automation is split by source. `pr-path-labeler.yml` runs `actions/labeler` from `.github/labeler.yml` on PR open, reopen, and every pushed update. Because that workflow uses `sync-labels: true`, labels owned by `.github/labeler.yml` are recalculated from the current PR file set: matching path labels are added, and path labels that no longer match are removed.
+
+Dependabot also seeds configured labels on its own PRs from `.github/dependabot.yml`: Cargo updates get `dependencies`; GitHub Actions and Docker updates get `ci` and `dependencies`. Those labels are initial Dependabot PR metadata, not the synchronized path-labeler contract.
+
+Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
+
+If risk or size automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk: manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
 
 ## Cleanup protocol
 
@@ -62,7 +72,7 @@ Type labels capture the high-level work class. They are separate from path label
 
 ## Path labels
 
-Applied automatically by `pr-path-labeler.yml` (the only labeling automation currently active). Globs live in `.github/labeler.yml`.
+Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.yml`; when this page and the config disagree, treat `.github/labeler.yml` as the operational source and update this page.
 
 ### Base scope labels
 
@@ -72,27 +82,27 @@ Applied automatically by `pr-path-labeler.yml` (the only labeling automation cur
 | `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
-| `agent` | `src/agent/**` |
-| `channel` | `src/channels/**` |
-| `gateway` | `src/gateway/**` |
-| `config` | `src/config/**` |
-| `cron` | `src/cron/**` |
-| `daemon` | `src/daemon/**` |
-| `doctor` | `src/doctor/**` |
-| `health` | `src/health/**` |
-| `heartbeat` | `src/heartbeat/**` |
-| `integration` | `src/integrations/**` |
-| `memory` | `src/memory/**` |
-| `security` | `src/security/**` |
-| `runtime` | `src/runtime/**` |
-| `onboard` | `src/onboard/**` |
-| `provider` | `src/providers/**` |
-| `service` | `src/service/**` |
-| `skillforge` | `src/skillforge/**` |
-| `skills` | `src/skills/**` |
-| `tool` | `src/tools/**` |
-| `tunnel` | `src/tunnel/**` |
-| `observability` | `src/observability/**` |
+| `agent` | `src/agent/**`, `crates/zeroclaw-runtime/src/agent/**` |
+| `channel` | `src/channels/**`, `crates/zeroclaw-channels/src/**` |
+| `gateway` | `src/gateway/**`, `crates/zeroclaw-gateway/src/**` |
+| `config` | `src/config/**`, `crates/zeroclaw-config/src/**` |
+| `cron` | `src/cron/**`, `crates/zeroclaw-runtime/src/cron/**` |
+| `daemon` | `src/daemon/**`, `crates/zeroclaw-runtime/src/daemon/**` |
+| `doctor` | `src/doctor/**`, `crates/zeroclaw-runtime/src/doctor/**` |
+| `health` | `src/health/**`, `crates/zeroclaw-runtime/src/health/**` |
+| `heartbeat` | `src/heartbeat/**`, `crates/zeroclaw-runtime/src/heartbeat/**` |
+| `integration` | `src/integrations/**`, `crates/zeroclaw-runtime/src/integrations/**` |
+| `memory` | `src/memory/**`, `crates/zeroclaw-memory/src/**` |
+| `security` | `src/security/**`, `crates/zeroclaw-runtime/src/security/**` |
+| `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
+| `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
+| `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
+| `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
+| `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
+| `skills` | `src/skills/**`, `crates/zeroclaw-runtime/src/skills/**` |
+| `tool` | `src/tools/**`, `crates/zeroclaw-tools/src/**` |
+| `tunnel` | `src/tunnel/**`, `crates/zeroclaw-runtime/src/tunnel/**` |
+| `observability` | `src/observability/**`, `crates/zeroclaw-runtime/src/observability/**` |
 | `tests` | `tests/**` |
 | `scripts` | `scripts/**` |
 | `dev` | `dev/**` |
@@ -173,7 +183,7 @@ Tools are grouped by logical function rather than one label per file.
 
 ## Size labels
 
-Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually** — the size automation that previously computed these was removed during CI simplification.
+Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually** — the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
 
 | Label | Threshold |
 |---|---|
@@ -185,7 +195,7 @@ Based on effective changed line count, normalized for docs-only and lockfile-hea
 
 ## Risk labels
 
-For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**.
+For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**. Future risk automation should follow the [automation contract](#automation-contract).
 
 | Label | Meaning |
 |---|---|

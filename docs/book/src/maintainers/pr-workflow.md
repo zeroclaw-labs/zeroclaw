@@ -19,7 +19,7 @@ The control loop that delivers this is layered on purpose:
 - **Risk-based review depth** — high-risk paths get deep review, low-risk paths stay fast.
 - **Rollback-first merge contract** — every merge path includes a concrete recovery story.
 
-Automation handles intake labels and CI gating. Final merge accountability stays with human maintainers and PR authors.
+Automation handles path/scope labels and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors.
 
 ## Project board contract
 

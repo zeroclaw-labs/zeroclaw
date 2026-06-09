@@ -25,7 +25,11 @@ Runs `cargo audit` nightly against the dependency tree. Opens an issue on findin
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
-Auto-applies scope and risk labels based on changed file paths. Runs silently on every PR — if a PR is missing labels, check whether the paths in `.github/labeler.yml` cover the changes.
+Auto-applies path and scope labels based on changed files. It runs on PR open, reopen, and every pushed update to the PR branch. Because `sync-labels: true` is enabled, labels defined in `.github/labeler.yml` are recalculated from the current PR file set.
+
+This workflow does not currently apply `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels. If a PR is missing a path/scope label, check whether the paths in `.github/labeler.yml` cover the changes.
+
+Dependabot has separate label configuration in `.github/dependabot.yml` for its own PRs. Cargo update PRs start with `dependencies`; GitHub Actions and Docker update PRs start with `ci` and `dependencies`.
 
 ### Discord Release (`discord-release.yml`)
 
@@ -100,7 +104,7 @@ The repository runs Actions in `selected` mode — only the actions in this allo
 | `actions/checkout@v4` | All workflows | Repository checkout |
 | `actions/upload-artifact@v4` | release | Upload build artifacts |
 | `actions/download-artifact@v4` | release | Download build artifacts for packaging |
-| `actions/labeler@v5` | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
+| `actions/labeler@v6` | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain@stable` | All workflows | Install Rust toolchain |
 | `Swatinem/rust-cache@v2` | All workflows | Cargo build/dependency caching |
 | `softprops/action-gh-release@v2` | release | Create GitHub Releases |
