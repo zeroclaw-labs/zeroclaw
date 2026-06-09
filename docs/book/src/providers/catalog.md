@@ -131,7 +131,7 @@ api_key = "..."
 ```
 
 Cloud API via Kilo AI Gateway. Bearer-token auth with multiple model tiers (free, balanced, pro).
-Catalog sourced from models.dev under the `kilo` key. The `/models` endpoint is public — model listing works without a credential.
+The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing works without a credential — and because it is queried live, it is the source that carries pricing into the cost-rates editor. The shared models.dev catalog (`kilo` key) is only a fallback for when the live endpoint is unreachable, and it does not include pricing.
 
 > **Naming migration:** `kilo` now refers to this gateway provider. The KiloCLI
 > subprocess provider keeps its `kilocli` slot (synonym `kilo-cli`). If you

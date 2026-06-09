@@ -143,6 +143,39 @@ pub async fn list_models_for_vendor_with_pricing(
     filter_by_vendor_with_pricing(catalog, vendor_prefix)
 }
 
+/// Map an enriched catalog into `ModelInfo` entries, preserving the full
+/// `<vendor>/<slug>` id (no prefix stripping). Sorted and deduped by id. Pure —
+/// separated from the live fetch so it can be unit-tested. Used by the
+/// first-class `openrouter` provider, which lists the entire catalog rather
+/// than a single vendor's slice.
+fn all_models_with_pricing(
+    catalog: &[ModelEntryWithPricing],
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    let mut models: Vec<ModelInfo> = catalog
+        .iter()
+        .map(|e| ModelInfo {
+            id: e.id.clone(),
+            pricing: e.pricing.clone(),
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
+}
+
+/// Return every OpenRouter model with pricing, keeping the full
+/// `<vendor>/<slug>` id. Sorted and deduplicated by id. Backs the first-class
+/// `OpenRouterModelProvider::list_models_with_pricing` so the cost-rates editor
+/// can prefill rates from the public catalog.
+pub async fn list_all_models_with_pricing() -> Result<Vec<zeroclaw_api::model_provider::ModelInfo>>
+{
+    let catalog = CACHED_CATALOG_WITH_PRICING
+        .get_or_try_init(fetch_catalog_with_pricing)
+        .await?;
+    Ok(all_models_with_pricing(catalog))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +231,51 @@ mod tests {
     #[test]
     fn parse_errors_on_malformed_json() {
         assert!(parse_catalog(b"not json").is_err());
+    }
+
+    const PRICED_CATALOG: &str = r#"{
+        "data": [
+            {"id": "x-ai/grok-4.3", "pricing": {"prompt": "0.000005", "completion": "0.000020"}},
+            {"id": "anthropic/claude-sonnet-4-6", "pricing": {"prompt": "0.000003"}},
+            {"id": "vendor/no-pricing"}
+        ]
+    }"#;
+
+    #[test]
+    fn all_models_preserves_full_id_and_pricing() {
+        let catalog = parse_catalog_with_pricing(PRICED_CATALOG.as_bytes()).unwrap();
+        let models = all_models_with_pricing(&catalog);
+        // Full `<vendor>/<slug>` ids are preserved (no prefix stripping), sorted.
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-sonnet-4-6",
+                "vendor/no-pricing",
+                "x-ai/grok-4.3"
+            ]
+        );
+        // Pricing carried through where the catalog supplies it.
+        let grok = models.iter().find(|m| m.id == "x-ai/grok-4.3").unwrap();
+        assert_eq!(
+            grok.pricing.as_ref().unwrap().prompt.as_deref(),
+            Some("0.000005")
+        );
+        assert_eq!(
+            grok.pricing.as_ref().unwrap().completion.as_deref(),
+            Some("0.000020")
+        );
+        // Entries without a pricing object stay `None`.
+        let bare = models.iter().find(|m| m.id == "vendor/no-pricing").unwrap();
+        assert!(bare.pricing.is_none());
+    }
+
+    #[test]
+    fn all_models_dedups_by_id() {
+        let raw = r#"{"data": [{"id":"v/m"},{"id":"v/m"},{"id":"v/n"}]}"#;
+        let catalog = parse_catalog_with_pricing(raw.as_bytes()).unwrap();
+        let models = all_models_with_pricing(&catalog);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["v/m", "v/n"]);
     }
 }
