@@ -1797,6 +1797,13 @@ fn push_family(
 ///
 /// This is intentionally separate from the factory match in `create_model_provider`
 /// (display concern vs. construction concern).
+///
+/// This handwritten list and the `for_each_model_provider_slot!` macro in
+/// `zeroclaw-config` are a dual-maintenance surface: the macro carries the
+/// canonical slot set, this list adds display-only fields (`display_name`,
+/// `local`). The `listed_model_providers_match_canonical_slots` test enforces
+/// that the two cover exactly the same slots, so a provider added to the macro
+/// without a display entry here (or vice versa) fails `cargo test`.
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     let mut out: Vec<ModelProviderInfo> = Vec::new();
     push_family(
