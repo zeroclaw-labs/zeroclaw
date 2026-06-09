@@ -11693,8 +11693,11 @@ pub struct MatrixConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub device_id: Option<String>,
-    /// Allowed Matrix room IDs or aliases. Empty = allow all rooms.
-    /// Supports canonical room IDs (`!abc:server`) and aliases (`#room:server`).
+    /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Entries are matched literally against the canonical room ID
+    /// (`!abc:server`) of each incoming message; `#room:server` aliases are
+    /// not resolved for this allowlist (they are resolved only for outbound
+    /// delivery targets such as cron `delivery.to`).
     #[tab(Behavior)]
     #[serde(default)]
     pub allowed_rooms: Vec<String>,

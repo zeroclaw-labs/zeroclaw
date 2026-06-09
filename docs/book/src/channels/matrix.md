@@ -26,7 +26,7 @@ Before testing message flow:
 
 1. The bot account is joined to the target room.
 2. Credentials authenticate the bot account: either `user_id` + `password` (recommended, see [§2](#2-configuration)) or an `access_token` (token path, [§3](#3-token-path-alternative-obtaining-access_token-and-device_id)).
-3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Each entry is either a canonical room ID (`!room:server`) or an alias (`#alias:server`); ZeroClaw resolves aliases.
+3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Entries are matched literally against the canonical room ID (`!room:server`) of each incoming message, so list canonical room IDs here: ZeroClaw does **not** resolve a `#alias:server` entry for this allowlist. (Aliases are resolved only for outbound delivery targets such as cron `delivery.to`.) Find a room's canonical ID in its client (in Element: Room settings → Advanced → Internal room ID).
 4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing, see [§6](#b-sender-allowlist-peer-groups)).
 5. For E2EE rooms, the bot can decrypt: a `recovery_key` (recommended) restores keys automatically, or keys are shared to the bot device manually.
 
@@ -63,9 +63,9 @@ full for operators who must reuse a pre-existing token, but it requires you to
 keep a stable `device_id` yourself, so prefer password + recovery key unless
 you have a specific reason not to.
 
-{{#secret-config channels.matrix.<alias>.access_token}}
+{{#secret-config channels.matrix.<alias>.password}}
 
-The same applies to `password` and `recovery_key`.
+{{#secret-config channels.matrix.<alias>.access_token}}
 
 `homeserver` is required. For the recommended setup, also set `user_id`,
 `password`, and `recovery_key`. `access_token` and `device_id` are only needed
@@ -85,6 +85,10 @@ rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to
 - Only on the `access_token` path do you set `device_id` manually: a token
   login carries a device the server already minted, and ZeroClaw needs that
   exact id for E2EE session restore (see [§5H](#h-finding-device_id-for-an-existing-token) to find it).
+
+### Threads and context
+
+{{#thread-context channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread"}}
 
 ## 3. Token path (alternative): obtaining `access_token` and `device_id`
 
@@ -148,7 +152,7 @@ Work through in order.
 ### A. Room and membership
 
 - Confirm the bot account has joined the room.
-- If using an alias (`#...`), verify it resolves to the expected canonical room.
+- If you put a room in `allowed_rooms`, it must be the **canonical** room ID (`!room:server`), not a `#alias:server`. Aliases are not resolved for the allowlist, so an alias entry silently matches nothing. Find the canonical ID in Element via Room settings → Advanced → Internal room ID.
 
 ### B. Sender allowlist (peer groups)
 
@@ -331,8 +335,9 @@ A recovery key lets ZeroClaw automatically restore room keys and cross-signing s
 1. Log into the bot account in Element (web or desktop).
 2. Settings → Security & Privacy → Encryption → Secure Backup.
 3. If backup is already set up, your recovery key was shown when you first enabled it. If you saved it, use that.
-4. If backup isn't set up, click "Set up Secure Backup" → "Generate a Security Key". Save the key: it looks like `EsTj 3yST y93F SLpB ...`.
-5. Log out of Element.
+4. If backup isn't set up, click "Set up Secure Backup" → "Generate a Security Key". Element shows the key (it looks like `EsTj 3yST y93F SLpB ...`); copy it somewhere safe.
+5. Continue past the key display: Element then asks you to **re-enter the key** in a confirmation box to prove you saved it. Paste it and continue to finish setup. This is the same value you put in `recovery_key`.
+6. (Optional) Log out of the bot's Element session once the key is saved: click the account menu → **All settings** → Account, then **Remove this device**. Leaving it logged in is fine; removing it just keeps the device list tidy.
 
 #### Step 2: Add the recovery key to ZeroClaw
 
@@ -400,7 +405,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 
 - Keep Matrix tokens out of logs and screenshots.
 - Start with permissive `external_peers = ["*"]`, tighten to explicit user IDs once verified.
-- Prefer canonical room IDs in production to avoid alias drift.
+- Always use canonical room IDs in `allowed_rooms`: aliases are not resolved for the inbound allowlist (they are resolved only for outbound `delivery.to`).
 - **Threading:** when `channels.matrix.reply_in_thread` is `true` (default), every bot reply lives in a thread rooted at the user's message. Top-level user messages open a fresh thread; existing threads are continued. The main room timeline only carries the user-initiated messages.
 - **Thread root context:** the first inbound message ZeroClaw sees in any given thread is prefixed with `[Thread root from @sender]: <root body>` so the agent has the conversation that triggered the reply. Threads the bot itself started skip the preamble. Tracking is in-memory only; after a daemon restart, the next message in each active thread re-injects the preamble exactly once.
 - **Inline-reply media:** `channels.matrix.mention_only = true` makes the bot ignore naked media uploads (no text body to mention against). When the user inline-replies to such a dropped event with a question (`@bot can you see this?`), ZeroClaw walks the reply's `m.relates_to.m.in_reply_to.event_id`, fetches the parent event, and pulls its media into the current message: the agent's vision pipeline sees the image even though the original upload was filtered out.

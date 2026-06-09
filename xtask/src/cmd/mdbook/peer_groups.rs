@@ -123,6 +123,8 @@ fn expand_directives(
     const MARKERS: &[&str] = &[
         "{{#peer-group-example ",
         "{{#model-provider-catalog-table",
+        "{{#thread-context ",
+        "{{#config-fields ",
         "{{#env-var-bridge",
         "{{#env-var-table",
         "{{#env-var-name ",
@@ -146,7 +148,9 @@ fn expand_directives(
         let arg = after[..end].trim();
         let rendered = match marker {
             "{{#config-where " => render_config_where(arg, depth)?,
+            "{{#config-fields " => render_config_fields(arg)?,
             "{{#secret-config " => render_secret_config(arg),
+            "{{#thread-context " => render_thread_context(arg)?,
             "{{#peer-group-example " => render_example(lookup(params, arg)?),
             "{{#env-var-table" => render_env_var_table(env_vars),
             "{{#model-provider-catalog-table" => render_model_provider_catalog_table(),
@@ -194,6 +198,46 @@ In the **Config** pane, under **{label}**.
     ))
 }
 
+/// Render a channel's full field-reference table directly from its config
+/// struct's JSON Schema, so the table can never drift from the schema. The arg
+/// is the channel key (`mattermost`, `matrix`, …), parsed into the canonical
+/// `ChannelKind` registry. New promoted channel pages map their variant here
+/// once; the schema stays the single source of truth for fields, types,
+/// defaults, and descriptions.
+fn render_config_fields(arg: &str) -> anyhow::Result<String> {
+    use std::str::FromStr;
+    use zeroclaw_api::attribution::ChannelKind;
+    use zeroclaw_config::schema;
+
+    let key = arg.trim();
+    let kind = ChannelKind::from_str(key).map_err(|_| {
+        anyhow::Error::msg(format!("config-fields: `{key}` is not a known channel key"))
+    })?;
+
+    macro_rules! table_for {
+        ($ty:ty, $prefix:expr) => {{
+            let s = schemars::schema_for!($ty);
+            zeroclaw_config::schema_markdown::field_table(&s.to_value(), false, Some($prefix))
+        }};
+    }
+
+    let table = match kind {
+        ChannelKind::Matrix => table_for!(schema::MatrixConfig, "channels.matrix.<alias>"),
+        ChannelKind::Mattermost => {
+            table_for!(schema::MattermostConfig, "channels.mattermost.<alias>")
+        }
+        ChannelKind::Slack => table_for!(schema::SlackConfig, "channels.slack.<alias>"),
+        ChannelKind::Discord => table_for!(schema::DiscordConfig, "channels.discord.<alias>"),
+        other => {
+            let name: &'static str = other.into();
+            anyhow::bail!(
+                "config-fields: channel `{name}` has no promoted page mapping yet. Add its config struct to render_config_fields in xtask/src/cmd/mdbook/peer_groups.rs."
+            )
+        }
+    };
+    Ok(table)
+}
+
 /// Resolve the display label for a config section path. Prefers the curated
 /// `Section` registry label; falls back to the schema-humanized key for real
 /// schema sections that aren't curated quickstart sections (e.g. `browser`).
@@ -221,17 +265,18 @@ fn config_section_label(path: &str) -> anyhow::Result<String> {
 /// encrypt on write: the gateway dashboard, zerocode, and `zeroclaw config set`
 /// (masked input). The arg is the full dotted path to the secret field.
 fn render_secret_config(path: &str) -> String {
+    let path = path.trim();
     // Section = first dotted segment, for the dashboard deep-link.
     let section = path.split('.').next().unwrap_or(path);
     format!(
-        r#"> **`{path}` is a secret.** It is stored encrypted — never put it in plain
+        r#"> **`{path}` is a secret.** Stored encrypted, never in plain
 > `config.toml`. Set it through one of these, which encrypt on write:
 
 <div class="os-tabs-src">
 
 #### Gateway dashboard
 
-Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the field there.
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{path}` field there.
 
 #### zerocode
 
@@ -244,9 +289,143 @@ zeroclaw config set {path}    # prompts for masked input, stores encrypted
 ```
 
 </div>"#,
-        path = path,
-        section = section,
     )
+}
+
+/// Shared "context management in threads" explainer for channels whose replies
+/// live in threads. Args are `key="value"` pairs:
+///   - `channel` (required): display name, e.g. `Slack`, `Matrix`.
+///   - `prop` (optional): the channel's thread-reply config property, e.g.
+///     `thread_replies`. When present, the channel exposes a toggle and the
+///     copy names it; when absent (threads are native, no toggle, e.g.
+///     Discord), the toggle sentence is dropped.
+///   - `path` (optional): the full dotted config path to `prop`, e.g.
+///     `channels.matrix.<alias>.reply_in_thread`. When present, renders the
+///     set-it-three-ways surface tabs so the section is actionable.
+fn render_thread_context(arg: &str) -> anyhow::Result<String> {
+    let kv = parse_kv_args(arg);
+    let channel = kv.get("channel").filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "thread-context directive needs channel=\"...\"; got `{arg}`"
+        ))
+    })?;
+    let prop = kv.get("prop").filter(|s| !s.is_empty());
+    let path = kv.get("path").filter(|s| !s.is_empty());
+
+    let toggle = match prop {
+        Some(p) => format!(
+            " For {channel} this is controlled by `{p}`: when it is on, top-level \
+             messages open a thread and each thread is a separate conversation; \
+             when off, replies post at the channel root and history is keyed by \
+             sender and target instead of by thread."
+        ),
+        None => format!(
+            " For {channel}, threads are native channels, so each thread is \
+             already a separate conversation: no toggle to set."
+        ),
+    };
+
+    let configure = match path {
+        Some(p) => {
+            let section = p.split('.').next().unwrap_or(p);
+            format!(
+                r#"
+
+Set the thread behavior on any surface:
+
+<div class="os-tabs-src">
+
+#### Gateway dashboard
+
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and toggle the `{p}` field.
+
+#### zerocode
+
+In the **Config** pane, set the `{p}` field.
+
+#### zeroclaw config
+
+```sh
+zeroclaw config set {p} true     # thread replies on
+zeroclaw config set {p} false    # replies at the channel root
+```
+
+</div>"#
+            )
+        }
+        None => String::new(),
+    };
+
+    Ok(format!(
+        r#"When a {channel} conversation happens in a thread, that thread is its own
+conversation. ZeroClaw derives a distinct session key per thread, so every
+thread carries an independent context window and history: messages in one
+thread never bleed into another, and the agent does not see a sibling thread's
+earlier turns.{toggle}
+
+- **Isolation is the point.** Each thread's context is self-contained: it does
+  not leak outside the thread, and nothing from outside the thread leaks in.
+  Parallel threads hold separate conversational state, so unrelated tasks never
+  contaminate each other.
+- **Long threads grow context.** A thread accumulates history while it stays
+  active, so a very long thread eventually fills the model's context window
+  like any other long conversation. Start a new thread to reset.
+- **In-flight work is scoped per thread.** A new message in one thread does not
+  cancel an in-flight response in another; each thread's task stands alone.{configure}"#
+    ))
+}
+
+/// Parse `key="value"` (and bare `key=value`) pairs from a directive arg into a
+/// map. Tolerant of extra whitespace; values may contain spaces only when
+/// double-quoted.
+fn parse_kv_args(arg: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let bytes = arg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if key_start == i {
+            break;
+        }
+        let key = arg[key_start..i].to_string();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            map.insert(key, String::new());
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let value = if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let v = arg[start..i].to_string();
+            if i < bytes.len() {
+                i += 1;
+            }
+            v
+        } else {
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            arg[start..i].to_string()
+        };
+        map.insert(key, value);
+    }
+    map
 }
 
 fn render_example(p: &PeerParams) -> String {

@@ -268,8 +268,6 @@ mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-#[cfg(feature = "schema-export")]
-mod schema_markdown;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
@@ -2910,7 +2908,10 @@ async fn main() -> Result<()> {
             #[cfg(feature = "schema-export")]
             {
                 let schema = schemars::schema_for!(config::Config);
-                print!("{}", schema_markdown::generate(&schema.to_value()));
+                print!(
+                    "{}",
+                    zeroclaw_config::schema_markdown::generate(&schema.to_value())
+                );
                 return Ok(());
             }
             #[cfg(not(feature = "schema-export"))]

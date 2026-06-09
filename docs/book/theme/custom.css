@@ -1126,3 +1126,81 @@ html.js #mdbook-content main {
     animation: none;
   }
 }
+
+/* ── Config field accordion (mdbook config-fields directive) ──────────────── */
+.cfg-fields table {
+  width: 100%;
+  table-layout: auto;
+}
+.cfg-fields th,
+.cfg-fields .cfg-field-row td {
+  text-align: left;
+  white-space: nowrap;
+  width: 1%;
+}
+/* The meaning/detail content spans full width and wraps; only the trigger-row
+   cells shrink to content so field/type/default pack left without a gap. */
+.cfg-fields .cfg-field-row td:last-child {
+  width: auto;
+}
+.cfg-fields .cfg-field-row {
+  cursor: pointer;
+}
+.cfg-fields .cfg-field-row:hover {
+  background: var(--pc-hover);
+}
+.cfg-fields .cfg-field-row:focus-visible {
+  outline: 2px solid var(--pc-accent);
+  outline-offset: -2px;
+}
+.cfg-fields .cfg-field-name {
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+}
+.cfg-fields .cfg-field-name > code {
+  background: none;
+  padding: 0;
+  color: var(--pc-text-primary);
+}
+.cfg-fields .cfg-field-row:hover .cfg-field-name > code,
+.cfg-fields tr.cfg-field-open .cfg-field-name > code {
+  color: var(--pc-accent-light);
+}
+.cfg-fields .cfg-field-name::before {
+  content: "\25B8"; /* ▸ */
+  color: var(--pc-accent);
+  flex: 0 0 0.8em;
+  text-align: center;
+  transition: transform 0.12s ease;
+  font-size: 0.85em;
+}
+.cfg-fields tr.cfg-field-open .cfg-field-name::before {
+  transform: rotate(90deg);
+}
+.cfg-fields tr.cfg-field-open {
+  background: var(--pc-hover);
+}
+.cfg-fields .cfg-field-detail > td {
+  background: var(--pc-bg-secondary, transparent);
+  border-top: none;
+  padding: 0.6rem 1rem 1rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.cfg-fields .cfg-field-detail > td > p:first-child {
+  margin-top: 0;
+  color: var(--pc-text-secondary);
+}
+.cfg-fields .cfg-field-detail p,
+.cfg-fields .cfg-field-detail li {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.cfg-fields .cfg-field-detail pre {
+  margin: 0.4rem 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

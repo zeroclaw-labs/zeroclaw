@@ -231,6 +231,45 @@
     });
   }
 
+  // ── Config field accordion ─────────────────────────────────────────────
+  // The mdbook preprocessor emits per-channel config tables as
+  // `.cfg-fields > table` where each `.cfg-field-row` is a clickable trigger
+  // and the row immediately after it is a hidden `.cfg-field-detail` row
+  // carrying the set-it-three-ways snippet. Clicking (or Enter/Space on) the
+  // field row expands that detail row in place.
+  function installConfigFieldRows() {
+    document.querySelectorAll('.cfg-fields .cfg-field-row').forEach(function (row) {
+      if (row.dataset.pcCfgWired) return;
+      const detail = row.nextElementSibling;
+      if (!detail || !detail.classList.contains('cfg-field-detail')) return;
+      row.dataset.pcCfgWired = '1';
+      function toggle() {
+        const open = !detail.hasAttribute('hidden');
+        if (open) {
+          detail.setAttribute('hidden', '');
+          row.classList.remove('cfg-field-open');
+          row.setAttribute('aria-expanded', 'false');
+        } else {
+          detail.removeAttribute('hidden');
+          row.classList.add('cfg-field-open');
+          row.setAttribute('aria-expanded', 'true');
+        }
+      }
+      row.addEventListener('click', function (e) {
+        // Let links/inputs inside the detail behave normally; the trigger row
+        // has none, so a plain click toggles.
+        if (e.target.closest('a, input, label, button')) return;
+        toggle();
+      });
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
+      });
+    });
+  }
+
   ready(function () {
     installProgressBar();
     installHero();
@@ -238,5 +277,6 @@
     wrapTables();
     installFoldableRows();
     installOsTabs();
+    installConfigFieldRows();
   });
 })();

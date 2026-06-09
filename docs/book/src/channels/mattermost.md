@@ -27,23 +27,9 @@ To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
 
 {{#secret-config channels.mattermost.<alias>.bot_token}}
 
-Field reference:
+### Field reference
 
-| field | type | default | meaning |
-|---|---|---|---|
-| `enabled` | bool | `false` | Loaded only when true. |
-| `url` | string | (required) | Base URL of the Mattermost server, no trailing slash. |
-| `bot_token` | secret | none | Bot Account access token. Preferred. |
-| `login_id` | string | none | Email or username for password login. Used only when `bot_token` is unset. |
-| `password` | secret | none | Account password. Must pair with `login_id`. |
-| `channel_ids` | list | `[]` | Empty or `["*"]` triggers auto-discovery. Explicit IDs pin the bot to that exact set. |
-| `team_ids` | list | `[]` | Auto-discovery allowlist for team channels. Empty = every team the bot belongs to. DM and group-DM channels are unaffected (they carry no `team_id`). |
-| `discover_dms` | bool | `true` | When auto-discovering, include `type=D` and `type=G` channels. Set `false` to scope the bot to public/private team channels only. No effect when `channel_ids` is explicit. |
-| `thread_replies` | bool | `true` | New top-level reply opens a thread rooted on the user's post. Replies inside an existing thread always stay in that thread regardless. |
-| `mention_only` | bool | `false` | Public/private team channels: ignore posts that do not `@mention` the bot. DMs and group DMs always bypass this filter. |
-| `interrupt_on_new_message` | bool | `false` | A newer post from the same sender in the same channel cancels the in-flight turn. |
-| `proxy_url` | string | none | Per-channel proxy override (`http`, `https`, `socks5`, `socks5h`). |
-| `excluded_tools` | list | `[]` | Tool names hidden from the model on this channel. |
+{{#config-fields mattermost}}
 
 ## Channel discovery
 
@@ -74,6 +60,10 @@ Authorization for DM senders still goes through the channel's peer-group resolve
 1. Inbound post is inside an existing thread (`root_id` is set) → the reply always lands in that thread, regardless of `thread_replies`.
 2. Inbound post is top-level and `thread_replies = true` (default) → the reply opens a thread rooted on the inbound post.
 3. Inbound post is top-level and `thread_replies = false` → the reply is posted at channel root.
+
+### Context management
+
+{{#thread-context channel="Mattermost" prop="thread_replies" path="channels.mattermost.<alias>.thread_replies"}}
 
 ## Authentication
 
