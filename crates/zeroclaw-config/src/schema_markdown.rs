@@ -127,6 +127,15 @@ pub fn field_table_for_path(
             node = resolve(add, defs);
             display_segments.push("<alias>".to_string());
         }
+        // If this node is an array (Vec<T> -> schemars `items`), step into the
+        // element type so a list section (e.g. `mcp.servers`) renders its
+        // entry struct's fields. List entries have no named key; the prefix is
+        // left at the section name (TOML `[[section]]` blocks).
+        else if let Some(items) = node.get("items")
+            && items.is_object()
+        {
+            node = resolve(items, defs);
+        }
     }
 
     if node.get("properties").and_then(Value::as_object).is_none() {
@@ -162,6 +171,10 @@ pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeS
             && add.is_object()
         {
             node = resolve(add, defs);
+        } else if let Some(items) = node.get("items")
+            && items.is_object()
+        {
+            node = resolve(items, defs);
         }
     }
     node.get("properties")
@@ -210,6 +223,10 @@ pub fn field_table_for_path_excluding(
             {
                 node = resolve(&add, defs).clone();
                 display_segments.push("<alias>".to_string());
+            } else if let Some(items) = node.get("items").cloned()
+                && items.is_object()
+            {
+                node = resolve(&items, defs).clone();
             }
             cur = &node;
         }
@@ -750,5 +767,28 @@ mod tests {
             }
         }
         assert!(linked > 10, "expected many linked sections, got {linked}");
+    }
+
+    #[test]
+    fn config_fields_descends_array_section_to_entry_struct() {
+        // `mcp.servers` is a Vec<McpServerConfig> (schemars `items`), not a map.
+        // The path walker must step into the element struct so a `[[mcp.servers]]`
+        // list section renders its entry fields instead of erroring with
+        // "no fields to render".
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let table = field_table_for_path(&schema.to_value(), "mcp.servers", false, None)
+            .expect("mcp.servers should resolve to its entry struct fields");
+        for field in [
+            "transport",
+            "command",
+            "url",
+            "headers",
+            "tool_timeout_secs",
+        ] {
+            assert!(
+                table.contains(&format!("<code>{field}</code>")),
+                "mcp.servers field table missing `{field}`"
+            );
+        }
     }
 }
