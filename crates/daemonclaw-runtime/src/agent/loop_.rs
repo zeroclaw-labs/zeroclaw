@@ -3191,13 +3191,10 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let task_view = crate::tasks::store::render_priority_view(&config.workspace_dir, None, 15);
+        let context = format!("{task_view}\n{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {effective_msg}")
-        } else {
-            format!("{context}[{now}] {effective_msg}")
-        };
+        let enriched = format!("{context}[{now}] {effective_msg}");
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
@@ -3500,13 +3497,10 @@ pub async fn run(
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
                 .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
+            let task_view = crate::tasks::store::render_priority_view(&config.workspace_dir, None, 15);
+            let context = format!("{task_view}\n{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let enriched = if context.is_empty() {
-                format!("[{now}] {effective_input}")
-            } else {
-                format!("{context}[{now}] {effective_input}")
-            };
+            let enriched = format!("{context}[{now}] {effective_input}");
 
             history.push(ChatMessage::user(&enriched));
 
@@ -4089,13 +4083,10 @@ pub async fn process_message(
         .as_ref()
         .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
         .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
+    let task_view = crate::tasks::store::render_priority_view(&config.workspace_dir, None, 15);
+    let context = format!("{task_view}\n{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let enriched = if context.is_empty() {
-        format!("[{now}] {effective_message}")
-    } else {
-        format!("{context}[{now}] {effective_message}")
-    };
+    let enriched = format!("{context}[{now}] {effective_message}");
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
