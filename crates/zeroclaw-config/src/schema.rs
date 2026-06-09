@@ -6245,7 +6245,12 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`)
+    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
+    /// Exact and subdomain matches are supported. An explicit entry also bypasses
+    /// `allowed_domains`. The `*` wildcard permits any literal private/local host
+    /// (IP literals, localhost, .local) and lets a name already in `allowed_domains`
+    /// resolve to a private IP, but it does NOT widen `allowed_domains` itself —
+    /// so `*` cannot be used to reach an arbitrary public host.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
