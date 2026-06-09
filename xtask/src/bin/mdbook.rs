@@ -70,6 +70,8 @@ enum Cmd {
     RetrofitSelector,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
+    /// Regenerate hardware reference snippets from the board registry + catalog
+    Hardware,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -116,5 +118,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
+        Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
     }
 }
