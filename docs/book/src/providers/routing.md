@@ -19,7 +19,26 @@ For ad-hoc multi-step routing inside a single conversation, the `spawn_subagent`
 
 A narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent.
 
+```toml
+[[model_routes]]
+hint           = "reasoning"
+model_provider = "deepseek.reasoner"
+model          = "deepseek-reasoner"
+```
+
 Routes only fire when a prompt explicitly carries the matching hint. The default request path uses the agent's primary `model_provider`.
+
+`model_provider` is always a provider profile reference in dotted `<type>.<alias>` form, such as `anthropic.sonnet` or `openai.default`. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model. The `model` field is provider-local state under that profile.
+
+## Runtime model switching
+
+Runtime switches use the same provider-profile contract as config-backed routing:
+
+- `/models <type>.<alias>` selects the active provider profile for the sender session. Channel runtimes can also accept a bare `<type>` shorthand when exactly one configured alias exists for that provider family.
+- `/model <model-id>` selects a model within the active provider profile. If the value matches a `[[model_routes]]` hint or model, that route can switch both provider profile and model together.
+- The `model_switch` tool uses `model_provider = "<type>.<alias>"` plus `model = "<provider-local-model-id>"`.
+
+Runtime switches are session/runtime state. They do not edit `config.toml`; persisted defaults require an explicit config write. For tool-driven switches, bare provider family names such as `openai` are not switch targets because they do not identify which configured profile, credential, endpoint, or compatibility mode should be used.
 
 ## Observability
 

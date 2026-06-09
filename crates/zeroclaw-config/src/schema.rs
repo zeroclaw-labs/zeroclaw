@@ -10026,12 +10026,12 @@ impl Default for SchedulerConfig {
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// model_provider = "openrouter"
+/// model_provider = "openrouter.default"
 /// model = "anthropic/claude-opus-4-20250514"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// model_provider = "groq"
+/// model_provider = "groq.low-latency"
 /// model = "llama-3.3-70b-versatile"
 /// ```
 ///
@@ -10041,9 +10041,9 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Model provider to route to (must match a known model-provider name)
+    /// Dotted provider profile ref to route to (must resolve to providers.models.<type>.<alias>)
     pub model_provider: String,
-    /// Model to use with that model provider
+    /// Provider-local model identifier to use with that provider profile
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
@@ -10057,7 +10057,7 @@ pub struct ModelRouteConfig {
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// model_provider = "openai"
+/// model_provider = "openai.embeddings"
 /// model = "text-embedding-3-small"
 /// dimensions = 1536
 ///
@@ -10069,9 +10069,9 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
+    /// Dotted embedding-capable provider profile ref
     pub model_provider: String,
-    /// Embedding model to use with that model provider
+    /// Provider-local embedding model identifier to use with that provider profile
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]

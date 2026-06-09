@@ -61,7 +61,9 @@ For accepted or protected issues, prefer one of these visible owner sources befo
 - a public Project active-owner or area-steward field;
 - a linked public tracker entry that names the steward or owner source.
 
-If none of those exists, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
+Active release trackers and active RFC or design trackers are durable coordination surfaces. When the issue title, body, labels, or milestone clearly identify an active tracker or RFC, the tracker itself supplies the stale-exemption reason and contributor-visible steward surface; it does not need repetitive per-issue owner comments. Revisit the exemption when the milestone closes, the tracker drifts from live release state, the RFC reaches a decision, is superseded, or closes, or the issue no longer represents an active project decision surface.
+
+If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
 ## PR lanes
 
@@ -154,7 +156,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - First maintainer triage target: **within 48 hours**.
 - Blocked PRs get one actionable checklist comment, not a series of partial reviews.
-- `status:no-stale` is reserved for accepted or otherwise long-lived work and is governed by the [issue ownership path](#issue-ownership-path): it needs a recorded stale-exemption reason and a contributor-visible owner or steward path. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
+- `status:no-stale` is reserved for accepted or otherwise long-lived work with a recorded stale-exemption reason and contributor-visible active owner or steward path when the issue is not already protected by another stale exclusion. Active release trackers and active RFC or design trackers may use the tracker itself as that visible reason and steward surface while they remain active. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 
