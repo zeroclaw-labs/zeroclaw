@@ -485,7 +485,8 @@ in
         badNames = lib.filter (n: !nameOk n) names;
 
         dirs = mapAttrsToList (_: i: i.dataDir) cfg.instances;
-        users = mapAttrsToList (_: i: i.user) cfg.instances;
+        createdInstances = filterAttrs (_: i: i.createUser) cfg.instances;
+        createdUsers = mapAttrsToList (_: i: i.user) createdInstances;
       in
       [
         {
@@ -506,11 +507,12 @@ in
           '';
         }
         {
-          assertion = lib.length users == lib.length (lib.unique users);
+          assertion = lib.length createdUsers == lib.length (lib.unique createdUsers);
           message = ''
             services.zeroclaw.instances: two or more instances declare the
-            same `user`. If you intend to share a user across instances,
-            set `createUser = false` on all but one.
+            same `user` while also setting `createUser = true`. If you intend
+            to share a user across instances, set `createUser = false` on all
+            but one.
           '';
         }
       ];

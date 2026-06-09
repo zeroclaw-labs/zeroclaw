@@ -331,20 +331,6 @@ rpc_type! {
     }
 }
 
-rpc_type! {
-    pub struct SessionRenameParams {
-        pub session_id: String,
-        pub name: String,
-    }
-}
-
-rpc_type! {
-    pub struct SessionRenameResult {
-        pub session_id: String,
-        pub name: String,
-    }
-}
-
 // ══════════════════════════════════════════════════════════════════════
 // ── Memory ───────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════

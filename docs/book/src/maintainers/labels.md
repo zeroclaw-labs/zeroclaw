@@ -21,10 +21,14 @@ answer fast-moving review and merge questions.
 Keep the split based on update frequency:
 
 - Labels own durable classification: work type, scope/component, review risk, measured PR size, and stale exemption.
-- Project board fields are appropriate for issue planning stage, active owner, dependency state, and roadmap grouping when those fields are actively maintained.
+- Project board fields are appropriate for issue planning stage, active owner or steward path, dependency state, stale-exemption reason, and roadmap grouping when those fields are actively maintained.
 - Native GitHub PR state owns fast-changing review state: review decision, required checks, mergeability, conflicts, and stale approvals.
 
 The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
+
+Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security:*`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in the [Project board contract](./pr-workflow.md#project-board-contract).
+
+Use assignees for active work. Use area stewardship for routing responsibility when nobody is implementing yet. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes.
 
 ## Canonical spelling
 
@@ -54,7 +58,7 @@ Type labels capture the high-level work class. They are separate from path label
 | `type: ci` | CI, workflow, or repository automation work |
 | `type: dependencies` | Dependency or lockfile maintenance |
 | `type: docs` | Documentation-only or docs-primary work |
-| `type:rfc` | RFC issue or proposal; protected from stale closure |
+| `type:rfc` | RFC issue or proposal; protected from stale closure while active |
 
 ## Path labels
 
@@ -215,7 +219,7 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 | `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
 | `status:stale` | No author activity for the stale window; may close if not refreshed |
-| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Use only when a maintainer comment, issue body, or tracker entry records why the issue should stay open. |
+| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-ownership-path) has a contributor-visible stale-exemption reason and owner path. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and steward surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
 
 ## Resolution labels
 

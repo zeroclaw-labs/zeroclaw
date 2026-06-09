@@ -692,6 +692,25 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Ordered list of other provider aliases to try when every model on this
+    /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
+    /// `providers.models` and resolves with its own credentials, endpoint, and
+    /// model — a fallback never inherits this alias's key. The walk is
+    /// depth-first: this alias's models are exhausted first, then each fallback
+    /// alias is descended in turn (applying its own `fallback_models` and
+    /// `fallback`). Empty means no provider-level fallback.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<crate::providers::ModelProviderRef>,
+    /// Ordered alternate models to try on THIS provider before falling over to
+    /// the `fallback` aliases. Same endpoint, key, and headers as the primary
+    /// `model` — only the model identifier changes. Use this when a provider
+    /// serves a backup model (e.g. a smaller or older variant) that should be
+    /// tried before leaving the provider entirely. Empty means only `model` is
+    /// tried.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
     /// deterministic, near-verbatim output — fits code, routing, summarization.
     /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
@@ -2528,6 +2547,183 @@ pub struct LeptonModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Morph ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MorphEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for MorphEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.morphllm.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.morph"]
+pub struct MorphModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── GitHub Models ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GithubModelsEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for GithubModelsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://models.github.ai/inference",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.github_models"]
+pub struct GithubModelsModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Upstage ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UpstageEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for UpstageEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.upstage.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.upstage"]
+pub struct UpstageModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Featherless ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FeatherlessEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for FeatherlessEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.featherless.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.featherless"]
+pub struct FeatherlessModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Arcee ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ArceeEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ArceeEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            // Arcee publishes its OpenAI-compatible API at the `/api/v1` path
+            // (not the conventional `/v1` root). Confirmed against Arcee docs.
+            Self::Default => "https://api.arcee.ai/api/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.arcee"]
+pub struct ArceeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Lambda AI ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LambdaAiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for LambdaAiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.lambda.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.lambda_ai"]
+pub struct LambdaAiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Inception ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum InceptionEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for InceptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.inceptionlabs.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.inception"]
+pub struct InceptionModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Synthetic ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2742,6 +2938,13 @@ impl_default_family_endpoint! {
     OsaurusModelProviderConfig,
     LitellmModelProviderConfig,
     LeptonModelProviderConfig,
+    MorphModelProviderConfig,
+    GithubModelsModelProviderConfig,
+    UpstageModelProviderConfig,
+    FeatherlessModelProviderConfig,
+    ArceeModelProviderConfig,
+    LambdaAiModelProviderConfig,
+    InceptionModelProviderConfig,
     SyntheticModelProviderConfig,
     OpencodeModelProviderConfig,
     KiloCliModelProviderConfig,
@@ -7468,7 +7671,7 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -7488,6 +7691,19 @@ pub struct CodexCliConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_codex_cli_timeout_secs() -> u64 {
@@ -7505,6 +7721,7 @@ impl Default for CodexCliConfig {
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -9438,7 +9655,10 @@ pub struct RuntimeProfileConfig {
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
-    /// Maximum actions allowed per hour. `0` inherits the global limit.
+    /// Maximum actions allowed per hour. `0` is a hard zero budget — the
+    /// per-sender rate tracker treats a max of 0 as always exhausted
+    /// (`PerSenderTracker::is_exhausted`), blocking every action. For an
+    /// effectively-unlimited budget use a high value (e.g. `u32::MAX`), not 0.
     /// `SecurityPolicy::ensure_no_escalation_beyond` rejects subagents
     /// that try to raise this above the parent's value.
     pub max_actions_per_hour: u32,
@@ -9818,12 +10038,12 @@ impl Default for SchedulerConfig {
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// model_provider = "openrouter"
+/// model_provider = "openrouter.default"
 /// model = "anthropic/claude-opus-4-20250514"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// model_provider = "groq"
+/// model_provider = "groq.low-latency"
 /// model = "llama-3.3-70b-versatile"
 /// ```
 ///
@@ -9833,9 +10053,9 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Model provider to route to (must match a known model-provider name)
+    /// Dotted provider profile ref to route to (must resolve to providers.models.<type>.<alias>)
     pub model_provider: String,
-    /// Model to use with that model provider
+    /// Provider-local model identifier to use with that provider profile
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
@@ -9849,7 +10069,7 @@ pub struct ModelRouteConfig {
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// model_provider = "openai"
+/// model_provider = "openai.embeddings"
 /// model = "text-embedding-3-small"
 /// dimensions = 1536
 ///
@@ -9861,9 +10081,9 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
+    /// Dotted embedding-capable provider profile ref
     pub model_provider: String,
-    /// Embedding model to use with that model provider
+    /// Provider-local embedding model identifier to use with that provider profile
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
@@ -10466,6 +10686,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub irc: HashMap<String, IrcConfig>,
+    /// Twitch chat channel instances (`[channels.twitch.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub twitch: HashMap<String, TwitchConfig>,
     /// Lark channel instances (`[channels.lark.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10663,6 +10887,12 @@ impl ChannelsConfig {
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
+                kind: "twitch",
+                name: "Twitch",
+                desc: "Twitch chat (IRC)",
+                configured: !self.twitch.is_empty(),
+            },
+            ChannelInfo {
                 kind: "irc",
                 name: "IRC",
                 desc: "IRC over TLS",
@@ -10794,6 +11024,7 @@ impl ChannelsConfig {
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
             || self.irc.values().any(|c| c.enabled)
+            || self.twitch.values().any(|c| c.enabled)
             || self.lark.values().any(|c| c.enabled)
             || self.line.values().any(|c| c.enabled)
             || self.dingtalk.values().any(|c| c.enabled)
@@ -10841,6 +11072,7 @@ impl Default for ChannelsConfig {
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -12206,6 +12438,50 @@ impl ChannelConfig for IrcConfig {
     }
     fn desc() -> &'static str {
         "IRC over TLS"
+    }
+}
+
+/// Twitch chat channel configuration. A thin adapter over IRC
+/// (`irc.chat.twitch.tv:6697` over TLS); see the `twitch` channel module.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.twitch"]
+pub struct TwitchConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Twitch login name of the bot account (case-insensitive — lowercased
+    /// before send).
+    #[tab(Connection)]
+    pub bot_username: String,
+    /// Twitch OAuth user-access token. The `oauth:` prefix is added
+    /// automatically if missing, so both `"oauth:abcdef"` and `"abcdef"`
+    /// work. Mint via <https://twitchapps.com/tmi/> or the Twitch CLI.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub oauth_token: String,
+    /// Twitch channels to join. Each entry receives a `#` prefix if missing
+    /// and is lowercased before send (Twitch channel names are
+    /// case-insensitive). E.g. `["mychannel", "#anotherchannel"]`.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// When true, only respond to messages that mention the bot's login
+    /// name. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_only: bool,
+}
+
+impl ChannelConfig for TwitchConfig {
+    fn name() -> &'static str {
+        "Twitch"
+    }
+    fn desc() -> &'static str {
+        "Twitch chat (IRC)"
     }
 }
 
@@ -14843,6 +15119,7 @@ impl Config {
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
+        self.collect_fallback_warnings(&mut warnings);
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -14862,6 +15139,119 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
+    /// (a fallback naming an alias that is not configured) and cycles (a
+    /// fallback path that loops back onto itself). Both are warn-and-skip — the
+    /// chain still loads and runs with the offending edge pruned at build time.
+    fn collect_fallback_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (family, alias, cfg) in self.providers.models.iter_entries() {
+            self.collect_fallback_model_warnings(family, alias, cfg, warnings);
+            if cfg.fallback.is_empty() {
+                continue;
+            }
+            let root = format!("{family}.{alias}");
+            let mut visited: Vec<String> = vec![root.clone()];
+            self.walk_fallback(&root, &cfg.fallback, &mut visited, 1, warnings);
+        }
+    }
+
+    /// Surface `fallback_models` entries the build path silently skips: blank
+    /// entries and entries that duplicate the alias's primary `model`. The skip
+    /// itself is safe, but without a warning an operator never learns that a
+    /// listed fallback model is doing nothing.
+    fn collect_fallback_model_warnings(
+        &self,
+        family: &str,
+        alias: &str,
+        cfg: &ModelProviderConfig,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let Some(primary) = cfg.model.as_deref() else {
+            return;
+        };
+        for (i, model) in cfg.fallback_models.iter().enumerate() {
+            let path = format!("providers.models.{family}.{alias}.fallback_models[{i}]");
+            if model.trim().is_empty() {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "empty_fallback_model",
+                    format!(
+                        "fallback_models entry {i} on {family}.{alias} is empty; \
+                         it is skipped at runtime"
+                    ),
+                    path,
+                ));
+            } else if model == primary {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "fallback_model_duplicates_primary",
+                    format!(
+                        "fallback_models entry {model:?} on {family}.{alias} duplicates the \
+                         primary model; it is skipped at runtime"
+                    ),
+                    path,
+                ));
+            }
+        }
+    }
+
+    fn walk_fallback(
+        &self,
+        from: &str,
+        refs: &[crate::providers::ModelProviderRef],
+        visited: &mut Vec<String>,
+        depth: usize,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if depth > crate::providers::MAX_FALLBACK_DEPTH {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "max_fallback_depth_exceeded",
+                format!(
+                    "fallback chain from {from} exceeds the maximum depth of {}; \
+                     deeper links are pruned at runtime",
+                    crate::providers::MAX_FALLBACK_DEPTH
+                ),
+                format!("providers.models.{from}.fallback"),
+            ));
+            return;
+        }
+        for (i, fallback_ref) in refs.iter().enumerate() {
+            let raw = fallback_ref.as_str().trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let path = format!("providers.models.{from}.fallback[{i}]");
+            let Some((family, alias, cfg)) = self.providers.models.find_by_name(raw) else {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "dangling_fallback_ref",
+                    format!(
+                        "fallback {raw:?} on {from} does not resolve to a configured \
+                         providers.models entry; this fallback link is skipped at runtime"
+                    ),
+                    path,
+                ));
+                continue;
+            };
+            let resolved = format!("{family}.{alias}");
+            if visited.iter().any(|v| v == &resolved) {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "fallback_cycle",
+                    format!(
+                        "fallback {raw:?} on {from} closes a cycle \
+                         ({} -> {resolved}); the cycle edge is pruned at runtime",
+                        visited.join(" -> ")
+                    ),
+                    path,
+                ));
+                continue;
+            }
+            visited.push(resolved.clone());
+            self.walk_fallback(&resolved, &cfg.fallback, visited, depth + 1, warnings);
+            visited.pop();
+        }
     }
 
     /// Walk every channel HashMap that carries reply pacing fields and yield
@@ -16140,6 +16530,11 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        // Stamp the current schema version on every write. The in-memory
+        // config is always at `CURRENT_SCHEMA_VERSION` (load-time migration
+        // brings it forward), but pin it explicitly so a full save can never
+        // emit a body-newer-than-label file. See `save_dirty` and #7271.
+        config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
         let zeroclaw_dir = config_path
             .parent()
@@ -16260,6 +16655,19 @@ impl Config {
         for path in &self.dirty_paths {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table);
         }
+
+        // Stamp the current schema version. An incremental save writes
+        // current-schema-shaped sections (e.g. the dashboard saving a single
+        // `agents.<name>.model_provider`) but `schema_version` is never a
+        // dirty path, so without this it keeps whatever an older binary first
+        // wrote on disk. The resulting body-newer-than-label file then crashes
+        // older binaries with an opaque `missing field ...` serde error. See
+        // #7271. `insert` updates the existing key in place (preserving its
+        // position at the top of the file) or appends it when absent.
+        doc.as_table_mut().insert(
+            "schema_version",
+            toml_edit::value(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
+        );
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
@@ -16725,6 +17133,13 @@ impl_enum_prop_kind!(
     OsaurusEndpoint,
     LitellmEndpoint,
     LeptonEndpoint,
+    MorphEndpoint,
+    GithubModelsEndpoint,
+    UpstageEndpoint,
+    FeatherlessEndpoint,
+    ArceeEndpoint,
+    LambdaAiEndpoint,
+    InceptionEndpoint,
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
@@ -17551,6 +17966,7 @@ auto_save = true
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
                 irc: HashMap::new(),
+                twitch: HashMap::new(),
                 lark: HashMap::new(),
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
@@ -19007,6 +19423,7 @@ allowed_users = ["@u:matrix.org"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -19447,6 +19864,7 @@ allowed_numbers = ["+1", "+2"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -21374,6 +21792,55 @@ group_policy = "disabled"
         assert_eq!(
             hardened_mode, 0o600,
             "Saving config should restore owner-only permissions (0600)"
+        );
+    }
+
+    #[test]
+    async fn save_dirty_stamps_current_schema_version_on_stale_label() {
+        // Regression for #7271. An incremental save writes current-schema-shaped
+        // sections, but `schema_version` is never a dirty path. Without an
+        // explicit stamp, a file first written by an older binary keeps its
+        // stale `schema_version` label while gaining a current-schema body — a
+        // state that crashes older binaries with `missing field ...`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file labeled with a stale schema version so the
+        // incremental path (not the new-file fallback to full `save`) runs.
+        std::fs::write(
+            &config_path,
+            "schema_version = 2\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.observability.backend = "otel".to_string();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains(&format!(
+                "schema_version = {}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            )),
+            "save_dirty must stamp the current schema_version; got:\n{written}"
+        );
+        assert!(
+            !written.contains("schema_version = 2"),
+            "stale schema_version label must be overwritten; got:\n{written}"
+        );
+        // The dirty value still lands, and the stamp sits at the top of the file.
+        assert!(
+            written.contains("backend = \"otel\""),
+            "dirty value must still be written; got:\n{written}"
+        );
+        assert!(
+            written.trim_start().starts_with("schema_version ="),
+            "schema_version should remain the first key; got:\n{written}"
         );
     }
 
@@ -24445,5 +24912,176 @@ allowed_users = []
                 .classifier_provider
                 .is_empty()
         );
+    }
+
+    fn provider_entry_with_fallback(fallback: &[&str]) -> OpenAIModelProviderConfig {
+        OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                fallback: fallback
+                    .iter()
+                    .map(|s| crate::providers::ModelProviderRef::new(*s))
+                    .collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    async fn fallback_warns_on_dangling_ref() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            provider_entry_with_fallback(&["openai.ghost"]),
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "dangling_fallback_ref");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.openai.primary.fallback[0]"
+        );
+    }
+
+    #[test]
+    async fn fallback_no_warning_when_ref_resolves() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            provider_entry_with_fallback(&["openai.backup"]),
+        );
+        config
+            .providers
+            .models
+            .openai
+            .insert("backup".to_string(), provider_entry_with_fallback(&[]));
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn fallback_warns_on_two_node_cycle() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("a".to_string(), provider_entry_with_fallback(&["openai.b"]));
+        config
+            .providers
+            .models
+            .openai
+            .insert("b".to_string(), provider_entry_with_fallback(&["openai.a"]));
+
+        let cycle_warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "fallback_cycle")
+            .collect();
+        assert!(
+            !cycle_warnings.is_empty(),
+            "a->b->a must surface at least one fallback_cycle warning"
+        );
+    }
+
+    #[test]
+    async fn fallback_self_reference_is_a_cycle() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "loop".to_string(),
+            provider_entry_with_fallback(&["openai.loop"]),
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "fallback_cycle");
+    }
+
+    #[test]
+    async fn fallback_empty_ref_is_skipped() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), provider_entry_with_fallback(&[""]));
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn fallback_warns_when_chain_exceeds_max_depth() {
+        let mut config = Config::default();
+        let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
+        for i in 0..n {
+            let next = if i + 1 < n {
+                vec![format!("openai.a{}", i + 1)]
+            } else {
+                vec![]
+            };
+            let refs: Vec<&str> = next.iter().map(String::as_str).collect();
+            config
+                .providers
+                .models
+                .openai
+                .insert(format!("a{i}"), provider_entry_with_fallback(&refs));
+        }
+
+        let depth_warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "max_fallback_depth_exceeded")
+            .collect();
+        assert!(
+            !depth_warnings.is_empty(),
+            "a chain deeper than MAX_FALLBACK_DEPTH must surface a max_fallback_depth_exceeded warning"
+        );
+    }
+
+    #[test]
+    async fn fallback_models_warns_on_empty_entry() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_fallback_model");
+    }
+
+    #[test]
+    async fn fallback_models_warns_on_duplicate_of_primary() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["gpt-4o".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn fallback_models_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        let mut entry = provider_entry_with_fallback(&[]);
+        entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
+        config
+            .providers
+            .models
+            .openai
+            .insert("primary".to_string(), entry);
+
+        assert!(config.collect_warnings().is_empty());
     }
 }
