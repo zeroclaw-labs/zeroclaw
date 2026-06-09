@@ -1694,10 +1694,20 @@ pub async fn run_gateway(
 
     // ── Plugin management API (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
-        "/api/plugins",
-        get(api_plugins::plugin_routes::list_plugins),
-    );
+    let inner = inner
+        .route("/api/plugins", get(api_plugins::plugin_routes::list_plugins))
+        .route(
+            "/api/plugins/install",
+            post(api_plugins::plugin_routes::install_plugin),
+        )
+        .route(
+            "/api/plugins/enabled",
+            post(api_plugins::plugin_routes::set_plugins_enabled),
+        )
+        .route(
+            "/api/plugins/{name}",
+            delete(api_plugins::plugin_routes::remove_plugin),
+        );
 
     let inner = inner
         // ── SSE event stream ──
