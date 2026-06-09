@@ -2820,12 +2820,10 @@ mod plugin_skill_discovery_tests {
     #[test]
     fn runtime_plugin_skill_discovery_uses_configured_plugins_dir() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
         let plugins_dir = tmp.path().join("configured-plugins");
         write_skill_plugin(&plugins_dir, "configured-plugin", "configured-skill");
 
         let config = Config {
-            workspace_dir: workspace,
             config_path: tmp.path().join("config.toml"),
             plugins: PluginsConfig {
                 enabled: true,
@@ -2844,7 +2842,7 @@ mod plugin_skill_discovery_tests {
     fn runtime_plugin_skill_discovery_falls_back_to_legacy_workspace_plugins() {
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().join("config");
-        let workspace = tmp.path().join("workspace");
+        let workspace = config_dir.join("workspace");
         write_skill_plugin(&workspace.join("plugins"), "legacy-plugin", "legacy-skill");
 
         let plugins = PluginsConfig {
@@ -2854,7 +2852,6 @@ mod plugin_skill_discovery_tests {
         };
 
         let config = Config {
-            workspace_dir: workspace,
             config_path: config_dir.join("config.toml"),
             plugins,
             ..Config::default()

@@ -7106,8 +7106,20 @@ impl Config {
     /// This performs filesystem `read_dir` I/O to preserve legacy discovery
     /// fallback behavior.
     pub fn resolved_plugins_discovery_dir(&self) -> PathBuf {
-        self.plugins
-            .resolved_plugins_discovery_dir(&self.config_path, &self.workspace_dir)
+        let pre_migration_workspace = self.install_root_dir().join("workspace");
+        let resolved = self
+            .plugins
+            .resolved_plugins_discovery_dir(&self.config_path, &pre_migration_workspace);
+        if resolved != self.plugins.resolved_plugins_dir() {
+            return resolved;
+        }
+
+        let migrated = self.install_root_dir().join("shared").join("plugins");
+        if has_plugin_entries(&migrated) {
+            return migrated;
+        }
+
+        resolved
     }
 }
 

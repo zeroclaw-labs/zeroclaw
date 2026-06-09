@@ -2776,6 +2776,7 @@ pub const V2_WORKSPACE_TOPLEVEL_DISPATCH: &[(&str, V2WorkspaceDest)] = &[
     ("sessions", V2WorkspaceDest::DataDir),
     ("state", V2WorkspaceDest::DataDir),
     ("skills", V2WorkspaceDest::SharedDir),
+    ("plugins", V2WorkspaceDest::SharedDir),
     // Top-level instance-state file. The DeviceRegistry reader at
     // `api_pairing.rs:40` opens `<data_dir>/devices.db`, so unlike
     // per-agent files this has to land in `data/`, not in the agent
@@ -3825,6 +3826,15 @@ mod fs_db_migration_tests {
         fs::create_dir_all(install.join("workspace/skills/my-skill")).unwrap();
         fs::write(install.join("workspace/skills/my-skill/SKILL.md"), b"skill").unwrap();
 
+        // workspace/plugins/ (wholesale → shared/plugins/): host-level WASM
+        // tools shared across agents, same class as skills.
+        fs::create_dir_all(install.join("workspace/plugins/my-plugin")).unwrap();
+        fs::write(
+            install.join("workspace/plugins/my-plugin/manifest.toml"),
+            b"name = \"my-plugin\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+
         // workspace/memory/ subentries: split between data/memory/ and
         // agents/default/workspace/memory/ per V2_MEMORY_DATA_NAMES.
         let mem_dir = install.join("workspace/memory");
@@ -3930,6 +3940,19 @@ mod fs_db_migration_tests {
         assert!(
             !install.join("workspace").exists(),
             "legacy workspace must be removed after a clean split"
+        );
+
+        // Plugins are host-level shared tools: they land in shared/, not
+        // the per-agent workspace.
+        assert!(
+            install
+                .join("shared/plugins/my-plugin/manifest.toml")
+                .exists(),
+            "plugins must migrate to shared/plugins/"
+        );
+        assert!(
+            !install.join("agents/default/workspace/plugins").exists(),
+            "plugins must not land in the per-agent workspace"
         );
 
         // Nothing outside the V3 root names + backup + (no config.toml in

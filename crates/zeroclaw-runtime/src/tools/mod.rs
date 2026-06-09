@@ -1451,7 +1451,7 @@ permissions = []
         .unwrap();
 
         let security = Arc::new(SecurityPolicy::default());
-        let mem: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new());
+        let mem: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("test-agent"));
         let mut cfg = test_config(&tmp);
         cfg.plugins = PluginsConfig {
             enabled: true,
@@ -1459,9 +1459,11 @@ permissions = []
             ..PluginsConfig::default()
         };
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let tools = all_tools(
             Arc::new(cfg.clone()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1473,7 +1475,10 @@ permissions = []
             None,
             &cfg,
             None,
-        );
+            false,
+            None,
+        )
+        .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"configured-tool"));
     }
