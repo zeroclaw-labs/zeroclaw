@@ -455,13 +455,16 @@ pub fn generate(root: &Value) -> String {
         return out;
     };
 
-    // Index table
+    // Index table. Each section name links to its detail heading below; the
+    // mdBook anchor for a `## `<key>`` heading is the key verbatim (keys are
+    // lowercase ASCII with underscores, which slugify to themselves), so a
+    // `#<key>` fragment resolves without computing the slug.
     out.push_str("| Section | Description |\n");
     out.push_str("|---------|-------------|\n");
     for (key, schema) in props {
         let resolved = resolve(schema, defs);
         let desc = first_line(resolved.get("description").and_then(Value::as_str));
-        let _ = writeln!(out, "| `{key}` | {desc} |");
+        let _ = writeln!(out, "| [`{key}`](#{key}) | {desc} |");
     }
     out.push('\n');
 
@@ -714,4 +717,38 @@ fn fmt_value(value: Option<&Value>) -> String {
 
 fn first_line(s: Option<&str>) -> String {
     s.and_then(|d| d.lines().next()).unwrap_or("").to_owned()
+}
+
+#[cfg(all(test, feature = "schema-export"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_links_each_section_to_its_anchor() {
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+
+        // Every section in the index table must be a link to the detail
+        // heading below. mdBook slugs a `## `<key>`` heading to the bare key,
+        // so the index cell links `[`<key>`](#<key>)`. A plain `` `<key>` ``
+        // cell (no link) is the regression this guards against.
+        let mut linked = 0usize;
+        for line in md.lines() {
+            // Index rows look like: | [`acp`](#acp) | ... |
+            if let Some(rest) = line.strip_prefix("| [`") {
+                let key = rest.split('`').next().unwrap_or("");
+                assert!(
+                    line.contains(&format!("](#{key})")),
+                    "index row for `{key}` is not linked to its anchor: {line}"
+                );
+                // The matching detail heading must exist verbatim.
+                assert!(
+                    md.contains(&format!("# `{key}`")),
+                    "no detail heading for indexed section `{key}`"
+                );
+                linked += 1;
+            }
+        }
+        assert!(linked > 10, "expected many linked sections, got {linked}");
+    }
 }
