@@ -3,6 +3,23 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+#[derive(Debug, Clone)]
+pub struct TaskBinding {
+    pub task_id: String,
+    pub actor_id: String,
+}
+
+tokio::task_local! {
+    pub static CURRENT_TASK_BINDING: Option<TaskBinding>;
+}
+
+pub fn with_task_binding<F: std::future::Future>(
+    binding: Option<TaskBinding>,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    CURRENT_TASK_BINDING.scope(binding, f)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {

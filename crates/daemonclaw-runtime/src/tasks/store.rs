@@ -544,6 +544,49 @@ pub fn get_task_history(audit: &AuditLogger, task_id: &str) -> Result<Vec<serde_
     Ok(events)
 }
 
+pub fn insert_breadcrumb(
+    workspace_dir: &Path,
+    task_id: &str,
+    actor_id: Option<&str>,
+    tool: &str,
+    args_summary: Option<&str>,
+    result_summary: Option<&str>,
+) -> Result<()> {
+    let conn = connect(workspace_dir)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO task_activity (task_id, actor_id, tool, args_summary, result_summary, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![task_id, actor_id, tool, args_summary, result_summary, now],
+    )
+    .context("Failed to insert breadcrumb into task_activity")?;
+    Ok(())
+}
+
+pub fn get_task_activity(workspace_dir: &Path, task_id: &str) -> Result<Vec<serde_json::Value>> {
+    let conn = connect(workspace_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, task_id, actor_id, tool, args_summary, result_summary, ts
+         FROM task_activity WHERE task_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![task_id], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "task_id": row.get::<_, String>(1)?,
+            "actor_id": row.get::<_, Option<String>>(2)?,
+            "tool": row.get::<_, Option<String>>(3)?,
+            "args_summary": row.get::<_, Option<String>>(4)?,
+            "result_summary": row.get::<_, Option<String>>(5)?,
+            "ts": row.get::<_, String>(6)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
 // ── Internal transition logic ────────────────────────────────────
 
 fn do_transition(
@@ -1006,5 +1049,47 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn breadcrumb_insert_and_retrieve() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+        let task = create_task(tmp.path(), &simple_params("Breadcrumb test"), &actor, &audit).unwrap();
+
+        insert_breadcrumb(
+            tmp.path(),
+            &task.id,
+            Some("richard"),
+            "shell",
+            Some("echo hello"),
+            Some("hello\n"),
+        )
+        .unwrap();
+        insert_breadcrumb(
+            tmp.path(),
+            &task.id,
+            Some("richard"),
+            "read_file",
+            Some("/etc/hosts"),
+            Some("127.0.0.1 localhost"),
+        )
+        .unwrap();
+
+        let activity = get_task_activity(tmp.path(), &task.id).unwrap();
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0]["tool"].as_str().unwrap(), "shell");
+        assert_eq!(activity[1]["tool"].as_str().unwrap(), "read_file");
+        assert!(activity[0]["ts"].as_str().is_some());
+    }
+
+    #[test]
+    fn breadcrumb_unbound_task_yields_no_rows() {
+        let (tmp, audit) = test_setup();
+        let actor = cli_actor();
+        let task = create_task(tmp.path(), &simple_params("No crumbs"), &actor, &audit).unwrap();
+
+        let activity = get_task_activity(tmp.path(), &task.id).unwrap();
+        assert!(activity.is_empty());
     }
 }

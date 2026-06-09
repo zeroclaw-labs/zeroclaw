@@ -676,6 +676,10 @@ impl Agent {
                     }
                 }
 
+                runner.register(Box::new(crate::hooks::builtin::BreadcrumbHook::new(
+                    config.workspace_dir.clone(),
+                )));
+
                 Some(Arc::new(runner))
             } else {
                 None
