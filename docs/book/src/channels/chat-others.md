@@ -14,19 +14,6 @@ Use case: paired-identity channels where sub-second replies are an AI-tell. Wire
 
 > **Webhook caveat:** on a synchronous webhook channel the outbound reply is the HTTP response to the caller's request. A non-zero `reply_min_interval_secs` floor can hold that response open for the floor duration, which may exceed the caller's own request timeout. Set the floor only when the webhook caller tolerates a delayed response, or leave it at `0` and pace upstream.
 
-## Discord
-
-{{#peer-group discord}}
-
-- **Bot intents needed:** Message Content Intent, Server Members Intent. Set in the Developer Portal.
-- **[Streaming](../providers/streaming.md):** full: edits messages in place and splits long replies into multiple messages.
-- **Tool-call indicator:** typing indicator while tools run; visible code-block preview for shell and browser calls.
-
-## Slack
-
-- **Socket Mode** is the default when `app_token` is set (no public webhook URL needed).
-- Supports streaming drafts (`stream_drafts`), threaded replies (`thread_replies`), and slash-command ingress.
-
 ## Telegram
 
 {{#peer-group telegram}}
@@ -73,6 +60,8 @@ Treats a Notion database as a message surface. Useful for asynchronous workflows
 Channels with more intricate setup (OAuth flows, end-to-end encryption, multi-device considerations) live in their own pages:
 
 - [Matrix](./matrix.md): E2EE, device verification, Synapse/Dendrite specifics
+- [Discord](./discord.md)
+- [Slack](./slack.md)
 - [Mattermost](./mattermost.md)
 - [LINE](./line.md)
 - [Nextcloud Talk](./nextcloud-talk.md)

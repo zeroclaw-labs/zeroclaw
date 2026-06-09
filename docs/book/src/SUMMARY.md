@@ -53,6 +53,8 @@
 - [Channels & Integrations](./channels/overview.md)
   - [Peer Groups](./channels/peer-groups.md)
   - [Matrix](./channels/matrix.md)
+  - [Discord](./channels/discord.md)
+  - [Slack](./channels/slack.md)
   - [Mattermost](./channels/mattermost.md)
   - [LINE](./channels/line.md)
   - [Nextcloud Talk](./channels/nextcloud-talk.md)

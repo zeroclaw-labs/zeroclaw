@@ -125,6 +125,7 @@ fn expand_directives(
         "{{#model-provider-catalog-table",
         "{{#thread-context ",
         "{{#config-fields ",
+        "{{#streaming ",
         "{{#env-var-bridge",
         "{{#env-var-table",
         "{{#env-var-name ",
@@ -151,6 +152,7 @@ fn expand_directives(
             "{{#config-fields " => render_config_fields(arg)?,
             "{{#secret-config " => render_secret_config(arg),
             "{{#thread-context " => render_thread_context(arg)?,
+            "{{#streaming " => render_streaming(arg)?,
             "{{#peer-group-example " => render_example(lookup(params, arg)?),
             "{{#env-var-table" => render_env_var_table(env_vars),
             "{{#model-provider-catalog-table" => render_model_provider_catalog_table(),
@@ -357,6 +359,84 @@ earlier turns.{toggle}
 - **In-flight work is scoped per thread.** A new message in one thread does not
   cancel an in-flight response in another; each thread's task stands alone.{configure}"#
     ))
+}
+
+/// Shared "how this channel streams replies" explainer. Args are `key="value"`
+/// pairs:
+///   - `channel` (required): display name, e.g. `Discord`, `Slack`.
+///   - `mode` (required): `stream_mode` (the off/partial/multi_message enum,
+///     e.g. Discord, Matrix, Telegram), `stream_drafts` (a partial-only
+///     boolean, e.g. Slack), or `none` (no streaming, single message only).
+///   - `path` (optional): dotted config path to the streaming field, for the
+///     actionable config tabs.
+fn render_streaming(arg: &str) -> anyhow::Result<String> {
+    let kv = parse_kv_args(arg);
+    let channel = kv.get("channel").filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "streaming directive needs channel=\"...\"; got `{arg}`"
+        ))
+    })?;
+    let mode = kv.get("mode").map(String::as_str).unwrap_or("");
+    let path = kv.get("path").filter(|s| !s.is_empty());
+
+    const STREAM_MODE: &str = "stream_mode";
+    const STREAM_DRAFTS: &str = "stream_drafts";
+    const NONE: &str = "none";
+
+    let body = if mode == STREAM_MODE {
+        format!(
+            "{channel} streams replies via the `stream_mode` setting:\n\n\
+             - **`off`** (default): the whole reply posts as one message once the agent finishes. Simplest, and it never shows a half-written answer.\n\
+             - **`partial`**: the bot posts a draft immediately and edits it in place as the answer streams in. `draft_update_interval_ms` paces the edits; raise it if {channel} rate-limits them.\n\
+             - **`multi_message`**: each paragraph posts as its own message, separated by `multi_message_delay_ms`. Good for long answers that would otherwise be one wall of text."
+        )
+    } else if mode == STREAM_DRAFTS {
+        format!(
+            "{channel} streams replies via the `stream_drafts` boolean:\n\n\
+             - **`false`** (default): the whole reply posts as one message once the agent finishes.\n\
+             - **`true`**: the bot posts a placeholder immediately and edits it in place as the answer streams in. `draft_update_interval_ms` paces the edits; raise it if {channel} rate-limits them."
+        )
+    } else if mode == NONE {
+        format!(
+            "{channel} does not stream: each reply posts as a single message once the agent finishes generating it."
+        )
+    } else {
+        anyhow::bail!(
+            "streaming directive needs mode=\"stream_mode\"|\"stream_drafts\"|\"none\"; got `{mode}`"
+        );
+    };
+
+    let configure = match (path, mode) {
+        (Some(p), m) if m == STREAM_MODE || m == STREAM_DRAFTS => {
+            let section = dashboard_section(p);
+            format!(
+                r#"
+
+Set it on any surface:
+
+<div class="os-tabs-src">
+
+#### Gateway dashboard
+
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{p}` field.
+
+#### zerocode
+
+In the **Config** pane, set the `{p}` field.
+
+#### zeroclaw config
+
+```sh
+zeroclaw config set {p} <value>
+```
+
+</div>"#
+            )
+        }
+        _ => String::new(),
+    };
+
+    Ok(format!("{body}{configure}"))
 }
 
 /// Parse `key="value"` (and bare `key=value`) pairs from a directive arg into a

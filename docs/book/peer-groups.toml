@@ -49,6 +49,13 @@ agents_example = ["researcher", "summariser"]
 ignore_example = "222222222222222222"
 
 [[channel]]
+key = "slack"
+sender_desc = "the Slack user ID"
+sender_example = "U01ABC2DEF3"
+agents_example = ["researcher", "summariser"]
+ignore_example = "U09XYZ8WUV7"
+
+[[channel]]
 key = "telegram"
 sender_desc = "the Telegram user ID or @username"
 sender_example = "111111111"
