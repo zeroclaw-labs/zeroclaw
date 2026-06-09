@@ -585,8 +585,6 @@ pub struct Config {
     #[serde(skip)]
     pub nvidia: crate::x0_extensions::NvidiaConfig,
     #[serde(skip)]
-    pub bots: Vec<crate::x0_extensions::BotConfig>,
-    #[serde(skip)]
     pub agent: Option<crate::x0_extensions::AgentConfig>,
 }
 
@@ -13161,7 +13159,6 @@ impl Default for Config {
             taskqueue: Default::default(),
             sce: Default::default(),
             nvidia: Default::default(),
-            bots: Vec::new(),
             agent: None,
         }
     }
@@ -16796,7 +16793,6 @@ auto_save = true
             taskqueue: Default::default(),
             sce: Default::default(),
             nvidia: Default::default(),
-            bots: Vec::new(),
             agent: None,
         };
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -17412,7 +17408,6 @@ default_temperature = 0.7
             taskqueue: Default::default(),
             sce: Default::default(),
             nvidia: Default::default(),
-            bots: Vec::new(),
             agent: None,
         };
 
