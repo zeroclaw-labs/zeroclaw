@@ -1856,10 +1856,8 @@ mod inbound {
         // boundary. Strip it from interruption_scope_id so in-flight
         // cancellation keys match the sender+room scope used by
         // conversation_history_key.
-        let interruption_scope = match outbound_anchor.as_deref() {
-            Some(anchor) if anchor == ev.event_id.as_str() => None,
-            _ => outbound_anchor.clone(),
-        };
+        let interruption_scope =
+            interruption_scope_from_anchor(outbound_anchor.as_deref(), &ev.event_id);
 
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
@@ -1924,6 +1922,22 @@ mod inbound {
                 None
             }
         })
+    }
+
+    /// When the resolved outbound anchor points at the inbound event
+    /// itself (a self-anchored root), the anchor is a delivery/threading
+    /// detail — not a conversation boundary. Return `None` so the
+    /// interruption scope falls back to sender+room, matching the key
+    /// used by `conversation_history_key`. For real thread replies the
+    /// anchor is kept as the cancellation scope.
+    pub(super) fn interruption_scope_from_anchor(
+        outbound_anchor: Option<&str>,
+        event_id: &OwnedEventId,
+    ) -> Option<String> {
+        match outbound_anchor {
+            Some(anchor) if anchor == event_id.as_str() => None,
+            other => other.map(ToString::to_string),
+        }
     }
 
     pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
@@ -5126,7 +5140,8 @@ mod tests {
 
     mod thread_extraction {
         use super::super::inbound::{
-            extract_mentions_user_ids, extract_thread_id, resolve_outbound_anchor,
+            extract_mentions_user_ids, extract_thread_id,
+            interruption_scope_from_anchor, resolve_outbound_anchor,
         };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
@@ -5198,6 +5213,54 @@ mod tests {
             assert_eq!(
                 resolve_outbound_anchor(Some(&thread_root), &event_id, false).as_deref(),
                 Some("$root:server")
+            );
+        }
+
+        // ── interruption_scope_from_anchor ──────────────────────────
+
+        #[test]
+        fn self_anchored_root_strips_interruption_scope() {
+            // #7349: when reply_in_thread anchors on the inbound event
+            // itself the anchor is a delivery detail, not a conversation
+            // boundary — interruption_scope_id should be None so
+            // cancellation keys match sender+room.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, true);
+            // thread_ts stays set to the event_id
+            assert_eq!(outbound.as_deref(), Some("$ev:server"));
+            // interruption_scope_id is stripped
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
+        }
+
+        #[test]
+        fn real_thread_reply_preserves_interruption_scope() {
+            // A reply inside an existing thread: outbound anchor is the
+            // thread root, not the inbound event itself.
+            // interruption_scope_id must stay set to the thread root.
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread root");
+            let outbound =
+                resolve_outbound_anchor(Some(&thread_root), &event_id, true);
+            assert_eq!(outbound.as_deref(), Some("$root:server"));
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id)
+                    .as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn no_anchor_yields_no_interruption_scope() {
+            // reply_in_thread disabled on a root event: no anchor at all.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, false);
+            assert_eq!(outbound, None);
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
             );
         }
 
