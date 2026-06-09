@@ -69,8 +69,13 @@ coexist from the first line of config.
 Because each agent joins its own references and its own filesystem, agents can
 share some axes and diverge on others independently. Two agents might share one
 model provider but run under different risk profiles, answer on different
-channels, and keep entirely separate memory, while being able to talk to each
-other on a channel where they share a peer group.
+channels, and keep entirely separate memory.
+
+Agents reach each other two ways, each gated separately: they can **message**
+on a channel where they share a [peer group](../channels/peer-groups.md), and
+they can **delegate** a task to one another only when the caller's risk profile
+permits delegation and both agents share the same risk profile (see
+[Running agents](./operating.md#coexistence-and-isolation)).
 
 ```mermaid
 flowchart TB
@@ -92,13 +97,13 @@ flowchart TB
     S --- RP2
     R --- DISCORD
     S --- SLACK
-    R -. peers .- PEER
-    S -. peers .- PEER
+    R -. peers .-> PEER
+    S -. peers .-> PEER
 ```
 
 A SubAgent is the short-lived exception to coexistence: an agent can spawn an
 ephemeral SubAgent that inherits the parent's identity and security policy for a
-single task. See [SubAgents](../architecture/subagents.md).
+single task. See [SubAgents](./delegation.md).
 
 ## Where to go next
 
@@ -110,4 +115,4 @@ single task. See [SubAgents](../architecture/subagents.md).
   agent surfaces in the zerocode Code and Chat panes.
 
 For the runtime internals, the permission model, the memory model, and the
-agent loop, see [Architecture → Multi-agent runtime](../architecture/multi-agent.md).
+agent loop, see [Runtime internals](./internals.md).

@@ -7,35 +7,32 @@ running build. Click a field to expand it; click again to see how to set it.
 
 {{#config-fields agents}}
 
-## The reference axes
+## Where the references point
 
-Most of an agent's config is dotted aliases pointing at other sections. The
-agent owns none of these, it points, and the same target can be shared by many
-agents.
+Most of an agent's config is dotted aliases pointing at things configured in
+their own sections. The agent owns none of them, it points, and the same target
+can be shared by many agents. The field table above is the authoritative list;
+here is where each kind of reference leads:
 
-- **`model_provider`** points at a `[providers.models.<type>.<alias>]` entry.
-  The companion `tts_provider`, `transcription_provider`, and
-  `classifier_provider` point at their own provider entries. All of these live
-  in [Model Providers](../providers/overview.md).
-- **`risk_profile`** and **`runtime_profile`** name a
-  `[risk_profiles.<alias>]` and `[runtime_profiles.<alias>]`. The risk profile
-  sets the autonomy and sandbox posture; the runtime profile sets operational
-  tuning (tool-iteration caps, budgets, timeouts, context limits). Both are
-  explained in [Security & Autonomy](../security/autonomy.md).
-- **`channels`** lists the channel instances the agent answers on, each a dotted
-  `<type>.<alias>` into `[channels]`. See [Channels](../channels/overview.md).
-  When two agents share a channel, a [peer group](../channels/peer-groups.md)
-  decides whether they can address each other.
-- **`skill_bundles`**, **`knowledge_bundles`**, and **`mcp_bundles`** attach
-  reusable groups of skills, knowledge, and MCP servers by alias. See
-  [Tools](../tools/overview.md).
-- **`cron_jobs`** binds named scheduled jobs to the agent.
+- **Providers** ([Model Providers](../providers/overview.md)): the agent's
+  chat model and its companion text-to-speech, transcription, and classifier
+  providers each name a `[providers.models.<type>.<alias>]` entry.
+- **Profiles** ([Security & Autonomy](../security/autonomy.md)): the risk
+  profile sets the autonomy and sandbox posture; the runtime profile sets
+  operational tuning (tool-iteration caps, budgets, timeouts, context limits).
+- **Channels** ([Channels](../channels/overview.md)): the messaging surfaces
+  the agent answers on. When two agents share a channel, a
+  [peer group](../channels/peer-groups.md) decides whether they can address each
+  other.
+- **Bundles** ([Tools](../tools/overview.md)): reusable groups of skills,
+  knowledge, and MCP servers attached by alias.
+- **Cron**: named scheduled jobs bound to the agent.
 
 ## The per-agent overrides
 
-A handful of fields are not references but per-agent settings that override a
-global default: the `workspace`, `memory`, and `identity` blocks. Those are the
-on-disk side of the join and are covered in
+Some of an agent's config is not a reference but a per-agent block that
+overrides a global default: the workspace, memory, and identity. Those are the
+on-disk side of the join, covered in
 [Filesystem components](./filesystem.md).
 
 ## Validation

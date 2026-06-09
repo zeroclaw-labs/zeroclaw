@@ -1,6 +1,6 @@
 # Multi-agent setup walkthrough
 
-This is the operator-side companion to the [multi-agent architecture page](../architecture/multi-agent.md). Follow it to add a second agent to an install, configure cross-agent memory access, and put both agents in a peer group on the same channel.
+This is the operator-side companion to the [Agents section](../agents/overview.md). Follow it to add a second agent to an install, configure cross-agent memory access, and put both agents in a peer group on the same channel.
 
 Background: each agent has its own workspace dir at `<install>/agents/<alias>/workspace/`, picks one memory backend at creation (immutable), and is gated by a `[risk_profiles.<profile>]` entry.
 

@@ -90,7 +90,7 @@ The backend defaults to SQLite for a new agent, and once the agent has written
 on-disk data the value is locked, so you cannot silently swap a backend out from
 under existing memory. Cross-agent memory sharing is opt-in through the
 workspace `read_memory_from` allowlist. For the memory model itself, see
-[Architecture → Multi-agent runtime](../architecture/multi-agent.md).
+[Runtime internals](./internals.md).
 
 ## Identity
 

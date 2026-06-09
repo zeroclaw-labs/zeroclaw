@@ -26,12 +26,25 @@ surface and every flag, see the generated
 Agents run side by side from one install. Each one keeps its own workspace,
 memory, and identity (see [Filesystem components](./filesystem.md)), so by
 default nothing one agent does leaks into another. They share only what their
-config references share, a provider, a channel, a bundle, and they can address
-each other only where they share a [peer group](../channels/peer-groups.md).
+config references share, a provider, a channel, a bundle.
 
-When an agent needs a one-off helper, it spawns an ephemeral
-[SubAgent](../architecture/subagents.md) that inherits its identity and security
-policy for a single task, then disappears.
+There are two ways one agent reaches another, each separately gated:
+
+- **Messaging** on a shared channel: two agents can address each other only
+  where they share a [peer group](../channels/peer-groups.md).
+- **Delegation**: an agent can hand a task to another agent only when **both**
+  conditions hold, its own risk profile's `delegation_policy.mode` is `allow`
+  (the default is `forbidden`), **and** the target agent shares the **same risk
+  profile**. Delegation never crosses trust tiers, an agent on a hardened
+  profile cannot delegate to one on a permissive profile. The shared risk
+  profile is itself the allow-list: the delegate roster offered to the model is
+  exactly the other agents on the caller's profile, and only when delegation is
+  permitted. See [SubAgents](./delegation.md) for the full gate
+  behavior and the exact refusal messages.
+
+When an agent needs a one-off helper instead of an existing peer, it spawns an
+ephemeral [SubAgent](./delegation.md) that inherits its identity and
+security policy for a single task, then disappears.
 
 ## Agents in zerocode
 
@@ -55,4 +68,4 @@ block, wire its references, and it joins the running set, the existing agents
 are untouched.
 
 For the runtime internals, the permission model, the memory model, and the
-agent loop, see [Architecture → Multi-agent runtime](../architecture/multi-agent.md).
+agent loop, see [Runtime internals](./internals.md).

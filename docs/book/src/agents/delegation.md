@@ -1,10 +1,10 @@
-# SubAgents
+# Delegation & SubAgents
 
 A SubAgent is an **ephemeral child run** spawned by a parent agent that inherits the parent's identity by default: same agent alias, same `SecurityPolicy`, same memory allowlist, same configured model provider, same tool registry. Auditable as a child via a tracing span `agent.<alias>.subagent.<run_id>`.
 
 SubAgents are not a separate configuration concept. There is no `[subagents.*]` block in the schema. Every SubAgent's identity is whichever parent's agent loop spawned it.
 
-## When to use a SubAgent vs `delegate`
+## When to use `spawn_subagent` vs `delegate`
 
 Two tools sit nearby. They are not interchangeable.
 

@@ -13,7 +13,7 @@ Notable submodules:
 - `agent/`: the main request/response loop, streaming, tool-call orchestration
 - `security/`: policy types, sandbox detection, OTP, emergency stop
 - `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
-- `subagent/`: SubAgent spawning and lifecycle (see [SubAgents](./subagents.md))
+- `subagent/`: SubAgent spawning and lifecycle (see [Delegation & SubAgents](../agents/delegation.md))
 - `cron/`, `daemon/`, `heartbeat/`: scheduling and long-running process management
 - `skillforge/`, `skills/`: skill compilation and execution
 - `service/`: systemd / launchctl / Windows Service integration

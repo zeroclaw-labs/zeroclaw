@@ -5,4 +5,4 @@ workspace directory, and its own memory backend. An agent can spawn an
 ephemeral **SubAgent** that inherits its parent's identity and security policy,
 and agents can talk to each other when they share a **peer group**. In the
 config each agent is an `[agents.<alias>]` block. See
-[Architecture → Multi-agent runtime](../architecture/multi-agent.md).
+[Agents → Runtime internals](../agents/internals.md).
