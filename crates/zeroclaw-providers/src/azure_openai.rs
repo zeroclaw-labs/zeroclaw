@@ -635,8 +635,14 @@ mod tests {
 
     #[test]
     fn url_construction_default_version() {
-        let p =
-            AzureOpenAiModelProvider::new("test", Some("test-key"), "my-resource", "gpt-4o", None, None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("test-key"),
+            "my-resource",
+            "gpt-4o",
+            None,
+            None,
+        );
         assert_eq!(
             p.chat_completions_url(),
             "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview"
@@ -867,7 +873,14 @@ mod tests {
 
     #[test]
     fn capabilities_reports_native_tools_and_vision() {
-        let p = AzureOpenAiModelProvider::new("test", Some("key"), "resource", "deployment", None, None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("key"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
         let caps = <AzureOpenAiModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -875,13 +888,27 @@ mod tests {
 
     #[test]
     fn supports_native_tools_returns_true() {
-        let p = AzureOpenAiModelProvider::new("test", Some("key"), "resource", "deployment", None, None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("key"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
         assert!(p.supports_native_tools());
     }
 
     #[test]
     fn supports_vision_returns_true() {
-        let p = AzureOpenAiModelProvider::new("test", Some("key"), "resource", "deployment", None, None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("key"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
         assert!(p.supports_vision());
     }
 
