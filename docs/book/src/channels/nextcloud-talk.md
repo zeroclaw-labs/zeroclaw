@@ -22,13 +22,13 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 
 ## Configuration
 
+{{#config-fields nextcloud_talk}}
+
 The channel is read from the `default` alias. Set it through any config surface:
 
 {{#config-where channels}}
 
 `webhook_secret` can also be supplied at runtime via the generic env override {{#env-var-name channels.nextcloud_talk.default.webhook_secret}}, useful for rotating it without editing the config.
-
-Full field reference: [config reference](../reference/config.md#channels).
 
 ## Gateway endpoint
 

@@ -6,6 +6,8 @@ The `webhook` channel is a generic inbound/outbound HTTP adapter. It runs its ow
 
 ## Configuration
 
+{{#config-fields webhook}}
+
 Full field reference: [config reference](../reference/config.md#channels).
 
 ## Inbound

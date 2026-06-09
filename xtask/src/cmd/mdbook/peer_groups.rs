@@ -210,9 +210,22 @@ fn render_config_fields(arg: &str) -> anyhow::Result<String> {
     use zeroclaw_config::schema;
 
     let key = arg.trim();
-    let kind = ChannelKind::from_str(key).map_err(|_| {
-        anyhow::Error::msg(format!("config-fields: `{key}` is not a known channel key"))
-    })?;
+    // Doc pages address a channel by its config-section key (`whatsapp`,
+    // `acp`, `nextcloud_talk`), which can differ from the `ChannelKind`
+    // snake_case serialize form (`whatsapp_business`, `acp_channel`). Try the
+    // registry first, then the two page-key aliases, then match on the enum
+    // variant so there is no string-literal dispatch.
+    const WHATSAPP_PAGE_KEY: &str = "whatsapp";
+    const ACP_PAGE_KEY: &str = "acp";
+    let kind = if let Ok(k) = ChannelKind::from_str(key) {
+        k
+    } else if key == WHATSAPP_PAGE_KEY {
+        ChannelKind::WhatsappBusiness
+    } else if key == ACP_PAGE_KEY {
+        ChannelKind::AcpChannel
+    } else {
+        anyhow::bail!("config-fields: `{key}` is not a known channel key");
+    };
 
     macro_rules! table_for {
         ($ty:ty, $prefix:expr) => {{

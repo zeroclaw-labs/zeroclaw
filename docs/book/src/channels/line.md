@@ -29,7 +29,9 @@ LINE layers `dm_policy` and `group_policy` on top of the peer set, see [Access P
 
 ## 2. Configure ZeroClaw
 
-Configure the LINE channel under `[channels.line.<alias>]` with at minimum `channel_access_token` and `channel_secret`. See the [config reference](../reference/config.md#channels) for the full field index, defaults, and the `dm_policy` / `group_policy` enums (whose user-facing semantics are also covered in §6 below).
+{{#config-fields line}}
+
+Configure the LINE channel under `[channels.line.<alias>]` with at minimum `channel_access_token` and `channel_secret`. The `dm_policy` / `group_policy` user-facing semantics are covered in §6 below.
 
 ### Using environment variables instead of config file
 

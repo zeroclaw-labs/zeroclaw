@@ -32,6 +32,8 @@ Before testing message flow:
 
 ## 2. Configuration
 
+{{#config-fields matrix}}
+
 Matrix is configured as a `[channels.matrix.<alias>]` block. Set it through any of these surfaces:
 
 {{#config-where channels}}

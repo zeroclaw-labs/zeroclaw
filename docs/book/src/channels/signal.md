@@ -23,9 +23,11 @@ Keep the daemon bound to localhost unless you have put it behind your own authen
 
 ## Configure the channel
 
+{{#config-fields signal}}
+
 {{#config-where channels}}
 
-The required fields and their meanings are in the [config reference](../reference/config.md#channels). Bind the channel to an agent via that agent's `channels` list.
+Bind the channel to an agent via that agent's `channels` list.
 
 ## Start and check
 
