@@ -257,6 +257,33 @@ fn render_config_fields(arg: &str) -> anyhow::Result<String> {
         ChannelKind::WhatsappBusiness | ChannelKind::WhatsappWeb => {
             table_for!(schema::WhatsAppConfig, "channels.whatsapp.<alias>")
         }
+        ChannelKind::Email => {
+            table_for!(
+                zeroclaw_config::scattered_types::EmailConfig,
+                "channels.email.<alias>"
+            )
+        }
+        ChannelKind::GmailPush => {
+            table_for!(
+                zeroclaw_config::scattered_types::GmailPushConfig,
+                "channels.gmail_push.<alias>"
+            )
+        }
+        ChannelKind::ClawdTalk => {
+            table_for!(
+                zeroclaw_config::scattered_types::ClawdTalkConfig,
+                "channels.clawdtalk.<alias>"
+            )
+        }
+        ChannelKind::VoiceCall => {
+            table_for!(
+                zeroclaw_config::scattered_types::VoiceCallConfig,
+                "channels.voice_call.<alias>"
+            )
+        }
+        ChannelKind::VoiceWake => {
+            table_for!(schema::VoiceWakeConfig, "channels.voice_wake.<alias>")
+        }
         ChannelKind::AcpChannel => table_for!(schema::AcpConfig, "acp"),
         other => {
             let name: &'static str = other.into();

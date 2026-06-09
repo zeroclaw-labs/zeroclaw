@@ -10,6 +10,8 @@ Two email channels depending on how you want inbound messages delivered.
 
 The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. Works with Gmail, Outlook, Fastmail, self-hosted Postfix, and anything else that speaks IMAP/SMTP.
 
+{{#config-fields email}}
+
 `password` (and `smtp_password` if you use a separate relay) are secrets:
 
 {{#secret-config channels.email.<alias>.password}}
@@ -29,6 +31,8 @@ The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. 
 ## Gmail Push (`gmail_push`)
 
 Real-time delivery via Google Cloud Pub/Sub, no polling.
+
+{{#config-fields gmail_push}}
 
 `oauth_token` and `webhook_secret` are secrets:
 
