@@ -5352,8 +5352,11 @@ pub struct GatewayConfig {
     /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
     /// When false (default), those endpoints reject any non-loopback peer.
     /// When true, a non-loopback request is accepted only if it also passes
-    /// pairing authentication. `/admin/shutdown` and the pairing-code
-    /// endpoints stay localhost-only regardless. (default: false)
+    /// pairing authentication — which requires `require_pairing = true`; with
+    /// pairing off a remote caller cannot be authenticated and is rejected, so
+    /// this flag never exposes an anonymous remote reload. `/admin/shutdown`
+    /// and the pairing-code endpoints stay localhost-only regardless.
+    /// (default: false)
     #[serde(default)]
     pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)

@@ -3384,34 +3384,53 @@ async fn handle_admin_shutdown(
 }
 
 /// Authorization decision for `POST /admin/reload`, derived purely from the
-/// caller's loopback status and the `gateway.allow_remote_admin` flag.
+/// caller's loopback status, the `gateway.allow_remote_admin` flag, and
+/// whether pairing is enabled.
 #[derive(Debug, PartialEq, Eq)]
 enum AdminReloadGate {
     /// Loopback caller (the CLI) — allow without further checks.
     Allow,
-    /// Non-loopback caller, opted in — allow only if pairing auth passes.
+    /// Non-loopback caller, opted in with pairing on — allow only if pairing
+    /// auth passes.
     RequireAuth,
     /// Non-loopback caller, not opted in — reject.
     Forbidden,
+    /// Non-loopback caller opted in, but pairing is disabled — reject rather
+    /// than allow an unauthenticated remote reload. `require_auth` is a no-op
+    /// when pairing is off, so without this guard `allow_remote_admin` would
+    /// expose reload to anonymous remote callers.
+    ForbiddenNoPairing,
 }
 
 /// Pure gate decision for `/admin/reload`. Auth enforcement (for the
 /// `RequireAuth` case) is handled separately by the caller.
-fn admin_reload_gate(is_loopback: bool, allow_remote_admin: bool) -> AdminReloadGate {
+///
+/// Remote access requires *both* `allow_remote_admin` and pairing: opting in
+/// without pairing yields `ForbiddenNoPairing`, never an unauthenticated
+/// allow.
+fn admin_reload_gate(
+    is_loopback: bool,
+    allow_remote_admin: bool,
+    require_pairing: bool,
+) -> AdminReloadGate {
     if is_loopback {
         AdminReloadGate::Allow
-    } else if allow_remote_admin {
+    } else if !allow_remote_admin {
+        AdminReloadGate::Forbidden
+    } else if require_pairing {
         AdminReloadGate::RequireAuth
     } else {
-        AdminReloadGate::Forbidden
+        AdminReloadGate::ForbiddenNoPairing
     }
 }
 
 /// POST /admin/reload — reload the daemon in place.
 ///
 /// Loopback callers (the CLI) are always allowed. Non-loopback callers are
-/// rejected unless `gateway.allow_remote_admin` is enabled, in which case
-/// the request must also pass pairing authentication (`require_auth`).
+/// rejected unless `gateway.allow_remote_admin` is enabled *and* pairing is
+/// on, in which case the request must also pass pairing authentication
+/// (`require_auth`). Opting in with pairing disabled is rejected rather than
+/// allowing an unauthenticated remote reload.
 ///
 /// Sends `true` on the reload channel the daemon owns. The daemon's main
 /// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
@@ -3434,9 +3453,14 @@ async fn handle_admin_reload(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
     // unless the operator opted in via `gateway.allow_remote_admin`, and even
-    // then must pass pairing auth.
+    // then must pass pairing auth — which requires pairing to be enabled, so
+    // opting in without pairing is rejected rather than left unauthenticated.
     let allow_remote = state.config.read().gateway.allow_remote_admin;
-    match admin_reload_gate(peer.ip().is_loopback(), allow_remote) {
+    // Source pairing status from the guard `require_auth` consults, not the
+    // raw config field, so the gate's `RequireAuth` decision can never
+    // diverge from what `require_auth` will actually enforce.
+    let require_pairing = state.pairing.require_pairing();
+    match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
         AdminReloadGate::Allow => {}
         AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
         AdminReloadGate::Forbidden => {
@@ -3444,8 +3468,20 @@ async fn handle_admin_reload(
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
                     "error": "Remote admin reload is disabled. Call from localhost, \
-                              or set gateway.allow_remote_admin = true (and pair) to \
-                              allow authenticated remote reloads."
+                              or set gateway.allow_remote_admin = true (with pairing \
+                              enabled, then pair) to allow authenticated remote reloads."
+                })),
+            ));
+        }
+        AdminReloadGate::ForbiddenNoPairing => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload requires pairing. \
+                              gateway.allow_remote_admin is enabled but \
+                              gateway.require_pairing is off, so remote callers \
+                              cannot be authenticated. Enable require_pairing, or \
+                              call /admin/reload from localhost."
                 })),
             ));
         }
@@ -5858,21 +5894,44 @@ mod tests {
 
     #[test]
     fn admin_reload_gate_loopback_always_allowed() {
-        // Loopback is allowed regardless of the opt-in flag.
-        assert_eq!(admin_reload_gate(true, false), AdminReloadGate::Allow);
-        assert_eq!(admin_reload_gate(true, true), AdminReloadGate::Allow);
+        // Loopback is allowed regardless of the opt-in or pairing flags.
+        assert_eq!(admin_reload_gate(true, false, false), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
     }
 
     #[test]
     fn admin_reload_gate_remote_blocked_by_default() {
-        // Non-loopback caller with the flag off is rejected outright.
-        assert_eq!(admin_reload_gate(false, false), AdminReloadGate::Forbidden);
+        // Non-loopback caller with the flag off is rejected outright,
+        // regardless of pairing.
+        assert_eq!(
+            admin_reload_gate(false, false, true),
+            AdminReloadGate::Forbidden
+        );
+        assert_eq!(
+            admin_reload_gate(false, false, false),
+            AdminReloadGate::Forbidden
+        );
     }
 
     #[test]
     fn admin_reload_gate_remote_opt_in_requires_auth() {
-        // Non-loopback caller with the flag on still must authenticate.
-        assert_eq!(admin_reload_gate(false, true), AdminReloadGate::RequireAuth);
+        // Non-loopback caller with the flag on and pairing on must authenticate.
+        assert_eq!(
+            admin_reload_gate(false, true, true),
+            AdminReloadGate::RequireAuth
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_without_pairing_is_rejected() {
+        // Opting in with pairing off cannot authenticate the caller, so the
+        // request is rejected rather than allowed anonymously.
+        assert_eq!(
+            admin_reload_gate(false, true, false),
+            AdminReloadGate::ForbiddenNoPairing
+        );
     }
 
     #[test]
