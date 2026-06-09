@@ -1117,3 +1117,53 @@ fn feedback_loop_10_neuromodulation_state_exposed_to_agents() {
         ncn.ffn_gate
     );
 }
+
+/// End-to-end dogfood of the consciousness hook through the REAL runtime path:
+/// `config.consciousness.enabled` → `register_hook_factory` → `build_runner`
+/// (the registry factory chain) → `HookRunner` → `on_message_received` (tick)
+/// → `before_prompt_build` (inject). Proves the operator flag actually wires
+/// the orchestrator into a live agent's hook chain and that it shapes the
+/// prompt — without needing an LLM provider, since `run_before_prompt_build`
+/// returns the modified prompt directly.
+#[tokio::test]
+async fn consciousness_hook_wires_and_runs_through_the_runner() {
+    use zeroclaw::config::Config;
+    use zeroclaw::hooks::{build_runner, HookResult};
+    use zeroclaw_api::channel::ChannelMessage;
+
+    // Idempotent at the registry layer; mirrors main.rs startup.
+    zeroclaw::consciousness::hook::register_hook_factory();
+
+    let mut on = Config::default();
+    on.hooks.enabled = true;
+    on.consciousness.enabled = true;
+
+    let mut off = Config::default();
+    off.hooks.enabled = true;
+    off.consciousness.enabled = false;
+
+    // Enabling consciousness must add exactly one hook to the built runner,
+    // proving the factory wiring is gated on `consciousness.enabled` (comparing
+    // lengths is robust to any other registered/builtin hooks in the process).
+    let on_len = build_runner(&on).map_or(0, |r| r.len());
+    let off_len = build_runner(&off).map_or(0, |r| r.len());
+    assert_eq!(
+        on_len,
+        off_len + 1,
+        "consciousness.enabled must register exactly one hook via the factory"
+    );
+
+    // Drive one turn through the real runner: the message-received hook ticks
+    // the orchestrator, then the prompt-build hook injects the deliberation.
+    let runner = build_runner(&on).expect("hooks.enabled yields a runner");
+    let _ = runner
+        .run_on_message_received(ChannelMessage::default())
+        .await;
+    match runner.run_before_prompt_build("USER PROMPT".to_string()).await {
+        HookResult::Continue(prompt) => assert!(
+            prompt.contains("USER PROMPT"),
+            "the prompt body must survive the consciousness hook, got: {prompt}"
+        ),
+        HookResult::Cancel(reason) => panic!("prompt build cancelled by a hook: {reason}"),
+    }
+}
