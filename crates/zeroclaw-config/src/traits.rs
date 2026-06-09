@@ -88,6 +88,9 @@ impl HasPropKind for Vec<String> {
 impl HasPropKind for crate::providers::ModelProviderRef {
     const PROP_KIND: PropKind = PropKind::String;
 }
+impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
 impl HasPropKind for crate::providers::TtsProviderRef {
     const PROP_KIND: PropKind = PropKind::String;
 }
@@ -769,7 +772,7 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
-/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+/// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     /// Canonical kebab-case identifier used in config TOML

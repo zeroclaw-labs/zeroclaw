@@ -4,18 +4,20 @@ use zeroclaw_macros::Configurable;
 
 use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, AstraiModelProviderConfig, AtomicChatModelProviderConfig,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
-    BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FireworksModelProviderConfig,
-    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
+    AtomicChatModelProviderConfig, AvianModelProviderConfig, AzureModelProviderConfig,
+    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
+    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
+    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
-    KiloModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-    LlamacppModelProviderConfig, LmstudioModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, ModelProviderConfig, MoonshotModelProviderConfig,
+    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    ModelProviderConfig, MoonshotModelProviderConfig, MorphModelProviderConfig,
     NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
     NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
     OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
@@ -23,8 +25,8 @@ use super::schema::{
     QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
     SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
     SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -153,6 +155,14 @@ define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
+/// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
+/// guard only bounds chains that loop; a long acyclic chain would otherwise
+/// recurse one stack frame per alias at config-load and build time, turning a
+/// pathological config into a startup stack overflow. Both the validation walk
+/// and the runtime build walk stop descending past this depth and prune the
+/// rest of the branch.
+pub const MAX_FALLBACK_DEPTH: usize = 3;
+
 /// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
 /// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
@@ -229,6 +239,13 @@ macro_rules! for_each_model_provider_slot {
             (osaurus, "osaurus", OsaurusModelProviderConfig),
             (litellm, "litellm", LitellmModelProviderConfig),
             (lepton, "lepton", LeptonModelProviderConfig),
+            (morph, "morph", MorphModelProviderConfig),
+            (github_models, "github_models", GithubModelsModelProviderConfig),
+            (upstage, "upstage", UpstageModelProviderConfig),
+            (featherless, "featherless", FeatherlessModelProviderConfig),
+            (arcee, "arcee", ArceeModelProviderConfig),
+            (lambda_ai, "lambda_ai", LambdaAiModelProviderConfig),
+            (inception, "inception", InceptionModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
             (opencode, "opencode", OpencodeModelProviderConfig),
             (kilocli, "kilocli", KiloCliModelProviderConfig),

@@ -494,7 +494,7 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to providers.models.<type>.<alias>.temperature)
+        /// Temperature (0.0 - 2.0, defaults to `providers.models.<type>.<alias>.temperature`)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -573,6 +573,13 @@ Examples:
         /// Self-terminate after all socket clients disconnect (with grace period)
         #[arg(long)]
         ephemeral: bool,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load. Without this, the daemon refuses to
+        /// start with a weakened posture; with it, the daemon boots so the
+        /// operator can reach repair surfaces, emitting a repeating warning.
+        #[arg(long)]
+        allow_degraded_security: bool,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -700,7 +707,7 @@ Examples:
     /// Browse the shared workspace one directory at a time
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
-List children of a directory under <install>/shared/. Paths are relative \
+List children of a directory under `<install>`/shared/. Paths are relative \
 to the shared workspace root; `..` traversal that escapes the root is \
 rejected. Used by the dashboard's skill-bundle directory picker and by \
 operators who want to inspect what's installed.
@@ -936,7 +943,7 @@ Examples:
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
-repository and install them under <config-dir>/data/ftl/<locale>/, where the \
+repository and install them under `<config-dir>/data/ftl/<locale>/`, where the \
 runtime and zerocode loaders read them.
 
 Pass a single locale. By default every catalogue is fetched; restrict with \
@@ -3328,7 +3335,12 @@ async fn main() -> Result<()> {
 
         Commands::Gateway { gateway_command } => {
             match gateway_command {
-                Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
+                Some(zeroclaw::GatewayCommands::Restart {
+                    port,
+                    host,
+                    allow_degraded_security,
+                }) => {
+                    let _nag = gate_security_posture(&config, allow_degraded_security)?;
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let addr = format!("{host}:{port}");
                     ::zeroclaw_log::record!(
@@ -3393,20 +3405,46 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                Some(zeroclaw::GatewayCommands::GetPaircode {
+                    new,
+                    rotate,
+                    rotate_device,
+                    port,
+                    host,
+                }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
 
-                    // Fetch live pairing code from running gateway
-                    // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(&host, port, config.gateway.path_prefix.as_deref(), new)
-                        .await
+                    let action = if rotate {
+                        PaircodeAction::RotateAll
+                    } else if let Some(id) = rotate_device {
+                        PaircodeAction::RotateDevice(id)
+                    } else if new {
+                        PaircodeAction::AddClient
+                    } else {
+                        PaircodeAction::Show
+                    };
+                    let rotating = action.is_rotation();
+
+                    match fetch_paircode(
+                        &host,
+                        port,
+                        config.gateway.path_prefix.as_deref(),
+                        &action,
+                    )
+                    .await
                     {
-                        Ok(Some(code)) => {
+                        Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
                             );
                             println!();
+                            if let Some(message) = message.as_deref() {
+                                if rotating {
+                                    println!("  ✅ {message}");
+                                    println!();
+                                }
+                            }
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
                             println!("  └──────────────┘");
@@ -3427,8 +3465,10 @@ async fn main() -> Result<()> {
                                 )
                             );
                         }
-                        Ok(None) => {
-                            if config.gateway.require_pairing {
+                        Ok(PaircodeResult::NoCode { message }) => {
+                            if let Some(message) = message {
+                                println!("⚠️  {message}");
+                            } else if config.gateway.require_pairing {
                                 println!(
                                     "🔐 Gateway pairing is enabled, but no active pairing code available."
                                 );
@@ -3479,12 +3519,20 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                Some(zeroclaw::GatewayCommands::Start { port, host }) => {
+                Some(zeroclaw::GatewayCommands::Start {
+                    port,
+                    host,
+                    allow_degraded_security,
+                }) => {
+                    let _nag = gate_security_posture(&config, allow_degraded_security)?;
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
                 None => {
+                    // Bare `zeroclaw gateway` has no flag, so degraded security
+                    // is never auto-allowed here — fail closed.
+                    let _nag = gate_security_posture(&config, false)?;
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
@@ -3497,7 +3545,15 @@ async fn main() -> Result<()> {
             port,
             host,
             ephemeral,
+            allow_degraded_security,
         } => {
+            // Fail closed before any setup work: refuse to serve with a
+            // degraded security posture unless explicitly allowed. This branch
+            // never spawns the nag (the `!allow` path only bails); the nag is
+            // managed per reload-iteration in the loop below.
+            if !config.degraded_security.is_empty() && !allow_degraded_security {
+                gate_security_posture(&config, allow_degraded_security)?;
+            }
             if let Ok(exe) = std::env::current_exe() {
                 let under_home = directories::UserDirs::new()
                     .map(|u| u.home_dir().to_path_buf())
@@ -3609,6 +3665,11 @@ async fn main() -> Result<()> {
             // the same across reloads — only the in-process subsystems
             // tear down + re-instantiate.
             let mut current_config = config;
+            // Nag task for the degraded-security warning, scoped to the
+            // current config. Re-evaluated each reload iteration so a repaired
+            // config stops the warning and a freshly-degraded one starts it.
+            let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
+                gate_security_posture(&current_config, allow_degraded_security)?;
             loop {
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
@@ -3733,9 +3794,22 @@ async fn main() -> Result<()> {
                             "🔄 Daemon reload — re-reading config from disk"
                         );
                         current_config = Box::pin(Config::load_or_init()).await?;
+                        // Stop the stale nag and re-gate against the fresh
+                        // config: a repaired posture silences the warning, a
+                        // newly-degraded one (still allowed) restarts it. A
+                        // newly-degraded posture without the allow flag set
+                        // hard-fails the reload, same as first boot.
+                        if let Some(handle) = degraded_nag.take() {
+                            handle.abort();
+                        }
+                        degraded_nag =
+                            gate_security_posture(&current_config, allow_degraded_security)?;
                         // Continue loop: fresh subsystems with the new config.
                     }
                 }
+            }
+            if let Some(handle) = degraded_nag.take() {
+                handle.abort();
             }
             Ok(())
         }
@@ -4074,12 +4148,12 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            let model_provider = match &model_command {
-                ModelCommands::Refresh { model_provider, .. }
-                | ModelCommands::List { model_provider } => model_provider.as_deref(),
-                _ => None,
+            let (model_provider, show_names) = match &model_command {
+                ModelCommands::Refresh { model_provider, .. } => (model_provider.as_deref(), false),
+                ModelCommands::List { model_provider } => (model_provider.as_deref(), true),
+                _ => (None, false),
             };
-            doctor::run_models(&config, model_provider, false).await
+            doctor::run_models(&config, model_provider, false, show_names).await
         }
 
         Commands::Providers => {
@@ -4122,7 +4196,7 @@ async fn main() -> Result<()> {
             Some(DoctorCommands::Models {
                 model_provider,
                 use_cache,
-            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache).await,
+            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache, false).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,
@@ -5633,27 +5707,87 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
     }
 }
 
-/// Fetch the current pairing code from a running gateway.
-/// If `new` is true, generates a fresh pairing code via POST request.
+/// What the `get-paircode` CLI command should do against the running gateway.
+///
+/// Keeps the "add another client" path distinct from the destructive
+/// "rotate after compromise" paths (#6984) without resorting to bare flag
+/// booleans threaded through the fetch helper.
+#[cfg(feature = "agent-runtime")]
+enum PaircodeAction {
+    /// GET the current code; do not mint or revoke anything.
+    Show,
+    /// Issue a fresh code for an additional client; revoke nothing.
+    AddClient,
+    /// Revoke every paired token + clear the registry, then issue a code.
+    RotateAll,
+    /// Revoke a single device's token, then issue a code.
+    RotateDevice(String),
+}
+
+#[cfg(feature = "agent-runtime")]
+impl PaircodeAction {
+    /// True when the action mints a new code (POST), false for `Show` (GET).
+    fn mints_code(&self) -> bool {
+        !matches!(self, PaircodeAction::Show)
+    }
+
+    /// True when the action revokes existing tokens.
+    fn is_rotation(&self) -> bool {
+        matches!(
+            self,
+            PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_)
+        )
+    }
+
+    /// The `rotate` query value to send, if any.
+    fn rotate_query(&self) -> Option<String> {
+        match self {
+            PaircodeAction::RotateAll => Some("all".to_string()),
+            PaircodeAction::RotateDevice(id) => Some(id.clone()),
+            PaircodeAction::Show | PaircodeAction::AddClient => None,
+        }
+    }
+}
+
+/// Outcome of a `get-paircode` request.
+#[cfg(feature = "agent-runtime")]
+enum PaircodeResult {
+    /// A code was returned (with an optional human-readable message).
+    Code {
+        code: String,
+        message: Option<String>,
+    },
+    /// No code is available (with an optional explanatory message from the
+    /// gateway, e.g. a revoke that succeeded but could not issue a code).
+    NoCode { message: Option<String> },
+}
+
+/// Fetch or generate the gateway pairing code from a running gateway.
+///
+/// `Show` issues a GET; the other actions POST to `/admin/paircode/new`,
+/// optionally carrying a `rotate` query so the gateway revokes the matching
+/// tokens before minting the new code.
 #[cfg(feature = "agent-runtime")]
 async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
-    new: bool,
-) -> Result<Option<String>> {
+    action: &PaircodeAction,
+) -> Result<PaircodeResult> {
     let client = reqwest::Client::new();
 
-    let response = if new {
-        // Generate a new pairing code via POST
-        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+    let response = if action.mints_code() {
+        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+        if let Some(rotate) = action.rotate_query() {
+            url.push_str("?rotate=");
+            url.push_str(&urlencoding::encode(&rotate));
+        }
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
     } else {
-        // Get existing pairing code via GET
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
@@ -5673,37 +5807,50 @@ async fn fetch_paircode(
         anyhow::Error::msg(format!("Failed to connect to gateway: {e}"))
     })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"status": status.as_u16()})),
-            "gateway paircode fetch returned non-success status"
-        );
-        anyhow::bail!("Gateway responded with status: {status}");
-    }
-
+    // A rotation that revoked tokens but could not issue a code (registry
+    // disabled, device not found, persist failure) returns a non-2xx with an
+    // explanatory message in the body. Surface that message rather than
+    // collapsing it into a bare status line, so the operator knows what
+    // state the gateway is in after the revoke attempt.
+    let status = response.status();
     let json: serde_json::Value = response.json().await.map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                .with_attrs(
+                    ::serde_json::json!({"error": format!("{}", e), "status": status.as_u16()})
+                ),
             "gateway paircode response: JSON parse failed"
         );
-        anyhow::Error::msg(format!("Failed to parse response: {e}"))
+        anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
 
+    let message = json
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
-        return Ok(None);
+        if !status.is_success() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"status": status.as_u16()})),
+                "gateway paircode fetch returned non-success status"
+            );
+        }
+        return Ok(PaircodeResult::NoCode { message });
     }
 
-    Ok(json
-        .get("pairing_code")
-        .and_then(|v| v.as_str())
-        .map(String::from))
+    match json.get("pairing_code").and_then(|v| v.as_str()) {
+        Some(code) => Ok(PaircodeResult::Code {
+            code: code.to_string(),
+            message,
+        }),
+        None => Ok(PaircodeResult::NoCode { message }),
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -6013,6 +6160,61 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Gate every serving entry point on the loaded security posture.
+///
+/// `Config.degraded_security` lists security-critical sections (`security`,
+/// `risk_profiles`, `peer_groups`) that failed to parse and were reset to
+/// their defaults during load — the running posture may then be WEAKER than
+/// intended. "Secure by default" must fail loud here (FND-006 §4.5), so every
+/// path that brings up the serving surface (daemon, `gateway start`,
+/// `gateway restart`) routes through this before binding.
+///
+/// Returns `Err` when degraded and `allow_degraded` is false (the caller
+/// propagates and the process never serves). When degraded and explicitly
+/// allowed, boots but returns the `JoinHandle` of a repeating-WARN nag task so
+/// the caller can abort it on reload; `Ok(None)` means a clean posture.
+fn gate_security_posture(
+    config: &zeroclaw::config::Config,
+    allow_degraded: bool,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    if config.degraded_security.is_empty() {
+        return Ok(None);
+    }
+    let sections = config.degraded_security.join(", ");
+    if !allow_degraded {
+        anyhow::bail!(
+            "Config contains malformed security-critical sections ({sections}); \
+             they were reset to defaults, so the running posture may be weaker \
+             than intended. Refusing to serve with a degraded security posture. \
+             Repair these sections in {} and restart — run `zeroclaw config \
+             migrate` to see the precise error. To boot anyway (e.g. to reach \
+             the gateway config editor and repair from there), re-run with \
+             `--allow-degraded-security`.",
+            config.config_path.display()
+        );
+    }
+    let config_path = config.config_path.display().to_string();
+    let handle = ::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "degraded_security": sections })),
+                &format!(
+                    "Running with DEGRADED security: sections ({sections}) were reset to \
+                     defaults and `--allow-degraded-security` was set. The posture may be \
+                     weaker than intended — repair {config_path} and reload \
+                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                )
+            );
+        }
+    });
+    Ok(Some(handle))
+}
+
 #[cfg(feature = "gateway")]
 async fn run_gateway_if_enabled(
     host: &str,
@@ -6249,14 +6451,72 @@ mod tests {
 
         match cli.command {
             Commands::Gateway {
-                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+                gateway_command:
+                    Some(zeroclaw::GatewayCommands::GetPaircode {
+                        new,
+                        rotate,
+                        rotate_device,
+                        port,
+                        host,
+                    }),
             } => {
                 assert!(new);
+                assert!(!rotate);
+                assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }
+    }
+
+    /// `--rotate` parses and is mutually exclusive with `--new` and
+    /// `--rotate-device` so the destructive path cannot be silently combined
+    /// with "add another client".
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_rotate_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "get-paircode", "--rotate"])
+            .expect("gateway get-paircode --rotate should parse");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { rotate, .. }),
+            } => assert!(rotate),
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--rotate-device",
+            "dash-1",
+        ])
+        .expect("gateway get-paircode --rotate-device should parse");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { rotate_device, .. }),
+            } => assert_eq!(rotate_device.as_deref(), Some("dash-1")),
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["zeroclaw", "gateway", "get-paircode", "--new", "--rotate"])
+                .is_err(),
+            "--new and --rotate must conflict"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "gateway",
+                "get-paircode",
+                "--rotate",
+                "--rotate-device",
+                "dash-1"
+            ])
+            .is_err(),
+            "--rotate and --rotate-device must conflict"
+        );
     }
 
     /// Regression for PR #6192: when the user passes `--port`/`--host` to
@@ -6710,5 +6970,40 @@ mod tests {
         });
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gate_security_posture_fails_closed_unless_allowed() {
+        use crate::config::schema::Config;
+
+        // Clean posture: no gate, no nag.
+        let clean = Config::default();
+        assert!(clean.degraded_security.is_empty());
+        let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
+        assert!(handle.is_none(), "clean posture must not spawn a nag");
+
+        // Degraded posture, not allowed: must refuse to serve.
+        let mut degraded = Config::default();
+        degraded.degraded_security = vec!["security".to_string()];
+        assert!(
+            gate_security_posture(&degraded, false).is_err(),
+            "degraded posture must fail closed when not explicitly allowed"
+        );
+
+        // Degraded posture, explicitly allowed: boots and returns a nag handle.
+        let nag = gate_security_posture(&degraded, true)
+            .expect("degraded posture must boot when allowed")
+            .expect("allowed degraded posture must spawn a nag task");
+        nag.abort();
+
+        // Whole-config loss (sentinel marker) is degraded too: same fail-closed
+        // behavior so a defaulted security posture cannot serve silently.
+        let mut whole = Config::default();
+        whole.degraded_security = vec![crate::config::migration::WHOLE_CONFIG_SENTINEL.to_string()];
+        assert!(
+            gate_security_posture(&whole, false).is_err(),
+            "whole-config loss must fail closed when not explicitly allowed"
+        );
     }
 }
