@@ -6793,13 +6793,13 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             )
             .await?;
 
-            println!("Email OAuth2 device-code login started.");
-            println!("Visit:  {}", device.verification_uri);
-            println!("Code:   {}", device.user_code);
+            println!("Email OAuth2 device-code login started."); // i18n-exempt: interactive device-code CLI prompt
+            println!("Visit:  {}", device.verification_uri); // i18n-exempt: interactive device-code CLI prompt
+            println!("Code:   {}", device.user_code); // i18n-exempt: interactive device-code CLI prompt
             if let Some(ref uri) = device.verification_uri_complete {
-                println!("Or open directly: {uri}");
+                println!("Or open directly: {uri}"); // i18n-exempt: interactive device-code CLI prompt
             }
-            println!("Waiting for authorization…");
+            println!("Waiting for authorization…"); // i18n-exempt: interactive device-code CLI prompt
 
             let token_set = auth::email_oauth2::poll_device_code_tokens(
                 &client,
@@ -6813,7 +6813,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             auth_service
                 .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
                 .await?;
-            println!("Saved profile {profile} for {channel_alias}");
+            println!("Saved profile {profile} for {channel_alias}"); // i18n-exempt: interactive device-code CLI prompt
             Ok(())
         }
     }
