@@ -1374,13 +1374,6 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
-/// Decide whether an inbound Discord message passes the listener gate.
-/// Returns the cleaned text body when admitted, or `None` to drop the
-/// message. Attachment-only messages (empty `content` plus at least one
-/// attachment) are admitted as long as the mention requirement is
-/// satisfied; otherwise a Discord message that contained only an image,
-/// PDF, ZIP, video, or audio with no caption would never reach the
-/// media pipeline.
 /// Whether a Discord message `type` represents a real user turn the bot should
 /// act on, versus a system/auto message it must ignore.
 ///
@@ -1393,6 +1386,13 @@ fn is_conversational_message_type(message_type: u64) -> bool {
     matches!(message_type, 0 | 19)
 }
 
+/// Decide whether an inbound Discord message passes the listener gate.
+/// Returns the cleaned text body when admitted, or `None` to drop the
+/// message. Attachment-only messages (empty `content` plus at least one
+/// attachment) are admitted as long as the mention requirement is
+/// satisfied; otherwise a Discord message that contained only an image,
+/// PDF, ZIP, video, or audio with no caption would never reach the
+/// media pipeline.
 fn admit_discord_message(
     content: &str,
     has_attachments: bool,
