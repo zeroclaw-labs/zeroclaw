@@ -22,6 +22,8 @@ pub mod transcription;
 pub mod tts;
 
 // Feature-gated channels
+#[cfg(feature = "channel-amqp")]
+pub mod amqp;
 #[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
 #[cfg(feature = "channel-clawdtalk")]

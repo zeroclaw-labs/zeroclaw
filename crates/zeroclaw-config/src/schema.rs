@@ -10745,6 +10745,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
+    /// AMQP channel instances (`[channels.amqp.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub amqp: HashMap<String, AmqpConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -10983,6 +10987,12 @@ impl ChannelsConfig {
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
+                kind: "amqp",
+                name: "AMQP",
+                desc: "AMQP topic consumer",
+                configured: !self.amqp.is_empty(),
+            },
+            ChannelInfo {
                 kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
@@ -11030,6 +11040,7 @@ impl ChannelsConfig {
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
+            || self.amqp.values().any(|c| c.enabled)
     }
 }
 
@@ -11078,6 +11089,7 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -12358,6 +12370,152 @@ fn default_mqtt_qos() -> u8 {
 
 fn default_mqtt_keep_alive_secs() -> u64 {
     30
+}
+
+/// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
+///
+/// Subscribes to an exchange via routing keys and lifts each delivery into an
+/// inbound `ChannelMessage`. The mapping from a JSON delivery body to message
+/// fields is config-driven (`content_template`, `thread_id_field`) so a new
+/// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
+/// configuration rather than code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.amqp"]
+pub struct AmqpConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
+    /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[tab(Connection)]
+    pub amqp_url: String,
+    /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
+    #[tab(Advanced)]
+    pub exchange: String,
+    /// Routing keys to bind. Scope these to the topics of interest; binding
+    /// `#` consumes the entire exchange and is almost never what you want.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub routing_keys: Vec<String>,
+    /// Queue name. Leave unset for a server-generated, transient,
+    /// auto-deleted, exclusive queue. Set a stable name (UUID recommended)
+    /// only when durable delivery across reconnects is required.
+    #[tab(Advanced)]
+    pub queue: Option<String>,
+    /// Path to the CA certificate bundle for `amqps://` connections.
+    #[tab(Connection)]
+    pub ca_cert: Option<PathBuf>,
+    /// Path to the client certificate for broker mutual-TLS auth
+    /// (Fedora Messaging requires a client cert).
+    #[tab(Connection)]
+    pub client_cert: Option<PathBuf>,
+    /// Path to the client private key matching `client_cert`.
+    #[tab(Connection)]
+    pub client_key: Option<PathBuf>,
+    /// Value placed in `ChannelMessage.sender` for every delivery from this
+    /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
+    /// per-channel routing identify the origin.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_sender_label")]
+    pub sender_label: String,
+    /// Template for the inbound message content. `{field}` placeholders are
+    /// interpolated from the JSON delivery body's top-level keys. When empty,
+    /// the raw delivery body is used verbatim.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub content_template: String,
+    /// Dotted path into the JSON delivery body whose value becomes the
+    /// message `thread_ts`, correlating replies to the originating event
+    /// (e.g. `message.project.name`). Empty disables threading.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub thread_id_field: String,
+    /// Acknowledgement mode. When `true` (default), deliveries are acked only
+    /// after the message is durably handed to the agent loop, giving
+    /// at-least-once semantics: a crash before hand-off redelivers the event.
+    /// Set `false` for at-most-once (broker acks on dispatch), which silently
+    /// drops in-flight events on crash and is only appropriate for
+    /// non-side-effecting, drop-on-overload consumers.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_durable_ack")]
+    pub durable_ack: bool,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl AmqpConfig {
+    /// Validate the AMQP configuration.
+    ///
+    /// Checks:
+    /// - `amqp_url` uses a valid scheme (`amqp://` or `amqps://`)
+    /// - `amqps://` connections carry a CA certificate
+    /// - `client_cert` and `client_key` are supplied together (mutual TLS)
+    /// - the exchange is non-empty
+    /// - at least one routing key is bound
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let is_tls = self.amqp_url.starts_with("amqps://");
+        let is_plain = self.amqp_url.starts_with("amqp://");
+
+        if !is_tls && !is_plain {
+            anyhow::bail!(
+                "amqp_url must start with 'amqp://' or 'amqps://', got: {}",
+                self.amqp_url
+            );
+        }
+
+        if is_tls && self.ca_cert.is_none() {
+            anyhow::bail!("amqps:// requires ca_cert to verify the broker");
+        }
+
+        match (self.client_cert.is_some(), self.client_key.is_some()) {
+            (true, false) => {
+                anyhow::bail!(
+                    "client_cert is set but client_key is missing (both are required for mutual TLS)"
+                )
+            }
+            (false, true) => {
+                anyhow::bail!(
+                    "client_key is set but client_cert is missing (both are required for mutual TLS)"
+                )
+            }
+            _ => {}
+        }
+
+        if self.exchange.is_empty() {
+            validation_bail!(RequiredFieldEmpty, "exchange", "exchange must not be empty");
+        }
+
+        if self.routing_keys.is_empty() {
+            anyhow::bail!("at least one routing key must be configured");
+        }
+
+        Ok(())
+    }
+}
+
+impl ChannelConfig for AmqpConfig {
+    fn name() -> &'static str {
+        "AMQP"
+    }
+    fn desc() -> &'static str {
+        "AMQP topic consumer"
+    }
+}
+
+fn default_amqp_sender_label() -> String {
+    "amqp".to_string()
+}
+
+fn default_amqp_durable_ack() -> bool {
+    true
 }
 
 /// IRC channel configuration.
@@ -17150,6 +17308,43 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    async fn amqp_validate_requires_paired_client_cert_and_key() {
+        let base = AmqpConfig {
+            enabled: true,
+            amqp_url: "amqps://broker.example.org:5671/%2Fpublic".into(),
+            exchange: "amq.topic".into(),
+            routing_keys: vec!["org.example.release".into()],
+            ca_cert: Some(std::path::PathBuf::from("/etc/ssl/ca.pem")),
+            ..AmqpConfig::default()
+        };
+
+        // Both absent: server-auth only, valid.
+        assert!(base.validate().is_ok());
+
+        // Cert without key: invalid.
+        let cert_only = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            ..base.clone()
+        };
+        assert!(cert_only.validate().is_err());
+
+        // Key without cert: invalid.
+        let key_only = AmqpConfig {
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base.clone()
+        };
+        assert!(key_only.validate().is_err());
+
+        // Both present: valid.
+        let both = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base
+        };
+        assert!(both.validate().is_ok());
+    }
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -17972,6 +18167,7 @@ auto_save = true
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
+                amqp: HashMap::new(),
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -19429,6 +19625,7 @@ allowed_users = ["@u:matrix.org"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -19870,6 +20067,7 @@ allowed_numbers = ["+1", "+2"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
