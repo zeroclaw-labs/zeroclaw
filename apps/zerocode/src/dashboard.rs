@@ -271,23 +271,20 @@ impl Dashboard {
                 }
             }
             Tab::Health => {} // health already fetched above
-            Tab::Cost => {
-                match self.rpc.cost_query(None).await {
-                    Ok(c) => {
-                        self.cost = Some(c);
-                        self.cost_error = None;
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("not available") {
-                            self.cost_error =
-                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
-                        } else {
-                            self.cost_error = Some(msg);
-                        }
+            Tab::Cost => match self.rpc.cost_query(None).await {
+                Ok(c) => {
+                    self.cost = Some(c);
+                    self.cost_error = None;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not available") {
+                        self.cost_error = Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                    } else {
+                        self.cost_error = Some(msg);
                     }
                 }
-            }
+            },
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
@@ -1358,9 +1355,8 @@ impl Dashboard {
 
         if let Some(ref err) = self.cost_error {
             frame.render_widget(
-                Paragraph::new(Span::styled(err.as_str(), theme::warn_style())).wrap(Wrap {
-                    trim: true,
-                }),
+                Paragraph::new(Span::styled(err.as_str(), theme::warn_style()))
+                    .wrap(Wrap { trim: true }),
                 inner,
             );
             return;
