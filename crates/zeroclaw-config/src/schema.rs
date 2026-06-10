@@ -2802,6 +2802,48 @@ pub struct KiloCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Kilo (AI Gateway — OpenAI-compatible) ──
+
+/// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloEndpoint {
+    #[default]
+    Gateway,
+}
+impl ModelEndpoint for KiloEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Gateway => "https://api.kilo.ai/api/gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilo"]
+pub struct KiloModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Kilo endpoint variant. Defaults to the canonical Kilo AI Gateway.
+    #[serde(default, skip_serializing_if = "KiloEndpoint::is_default")]
+    pub endpoint: KiloEndpoint,
+}
+
+impl KiloEndpoint {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+}
+
+impl FamilyEndpoint for KiloModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -5551,6 +5593,17 @@ pub struct GatewayConfig {
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// Allow authenticated remote callers to use admin endpoints that are
+    /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
+    /// When false (default), those endpoints reject any non-loopback peer.
+    /// When true, a non-loopback request is accepted only if it also passes
+    /// pairing authentication — which requires `require_pairing = true`; with
+    /// pairing off a remote caller cannot be authenticated and is rejected, so
+    /// this flag never exposes an anonymous remote reload. `/admin/shutdown`
+    /// and the pairing-code endpoints stay localhost-only regardless.
+    /// (default: false)
+    #[serde(default)]
+    pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -5679,6 +5732,7 @@ impl Default for GatewayConfig {
             host: default_gateway_host(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -10756,6 +10810,12 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Per-channel multiplier for the global channel message in-flight budget.
+    /// Runtime multiplies this value by the configured channel count, then
+    /// applies its global minimum and maximum bounds to one shared dispatcher
+    /// semaphore. Default: `4`.
+    #[serde(default = "default_channel_max_concurrent_per_channel")]
+    pub max_concurrent_per_channel: usize,
     /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
@@ -11048,6 +11108,10 @@ fn default_channel_message_timeout_secs() -> u64 {
     300
 }
 
+fn default_channel_max_concurrent_per_channel() -> usize {
+    4
+}
+
 fn default_session_backend() -> String {
     "sqlite".into()
 }
@@ -11091,6 +11155,7 @@ impl Default for ChannelsConfig {
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
             session_persistence: true,
@@ -12710,6 +12775,36 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Time in seconds an approval card waits for user response before
+    /// the runtime auto-denies. Default: 300 (5 minutes).
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub per_user_session: bool,
+
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive `update_draft` PATCH calls in
+    /// milliseconds. Default 1000 ms tunes to Feishu's 5 QPS-per-message
+    /// edit cap; raise on enterprise plans with higher quotas.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -15501,6 +15596,13 @@ impl Config {
                 "transcription.max_audio_bytes must be greater than zero"
             );
         }
+        if self.channels.max_concurrent_per_channel == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.max_concurrent_per_channel",
+                "channels.max_concurrent_per_channel must be greater than 0"
+            );
+        }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
         if self.heartbeat.enabled {
@@ -17289,6 +17391,7 @@ impl_enum_prop_kind!(
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
+    KiloEndpoint,
     CustomEndpoint,
 );
 
@@ -17977,6 +18080,42 @@ auto_save = true
         assert!(c.discord.is_empty());
         assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+        assert_eq!(
+            c.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+    }
+
+    #[test]
+    async fn channels_max_concurrent_per_channel_defaults_and_round_trips() {
+        let parsed: ChannelsConfig = toml::from_str("cli = true").unwrap();
+        assert_eq!(
+            parsed.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+
+        let parsed: ChannelsConfig =
+            toml::from_str("cli = true\nmax_concurrent_per_channel = 2").unwrap();
+        assert_eq!(parsed.max_concurrent_per_channel, 2);
+
+        let toml_str = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reparsed.max_concurrent_per_channel, 2);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_channel_max_concurrent_per_channel() {
+        let mut config = Config::default();
+        config.channels.max_concurrent_per_channel = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero channel concurrency budget must fail validate");
+        assert!(
+            err.to_string()
+                .contains("channels.max_concurrent_per_channel must be greater than 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -18169,6 +18308,7 @@ auto_save = true
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
                 message_timeout_secs: 300,
+                max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
@@ -18960,6 +19100,10 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
 
@@ -19627,6 +19771,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -20069,6 +20214,7 @@ allowed_numbers = ["+1", "+2"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -20151,6 +20297,7 @@ allowed_numbers = ["+1", "+2"]
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -21139,6 +21286,10 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
         config.save().await.unwrap();
@@ -21702,6 +21853,10 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -21726,6 +21881,10 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();

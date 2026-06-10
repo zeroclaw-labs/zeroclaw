@@ -1485,7 +1485,7 @@ async fn run_quickstart_cli(
                     // leaves the descriptor unchanged → free-text fallback.
                     let upgraded;
                     let d_used = if d.key.eq_ignore_ascii_case("model") {
-                        let (models, live) =
+                        let (models, _pricing, live) =
                             zeroclaw_runtime::quickstart::model_catalog(&chosen.kind).await;
                         if live && !models.is_empty() {
                             upgraded = zeroclaw_runtime::quickstart::FieldDescriptor {
@@ -4685,7 +4685,7 @@ async fn main() -> Result<()> {
                     // hand. Falls back to free text on `live=false`
                     // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
-                    let (models, live) =
+                    let (models, _pricing, live) =
                         zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();

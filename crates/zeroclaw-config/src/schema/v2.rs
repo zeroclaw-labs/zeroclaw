@@ -628,8 +628,8 @@ fn normalize_provider_type(
         "github_models" | "github-models" => Some("github_models"),
         // Stepfun: was stepfun|step (stepfun-intl handled below as variant)
         "stepfun" | "step" => Some("stepfun"),
-        // KiloCli: was kilocli|kilo
-        "kilocli" | "kilo" => Some("kilocli"),
+        // KiloCli: was kilocli|kilo-cli
+        "kilocli" | "kilo-cli" => Some("kilocli"),
         _ => None,
     };
 
@@ -3213,6 +3213,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> MigResult<()> {
 /// PRAGMA detection.
 pub const SQLITE_MEMORY_SCHEMA_VERSION: i64 = 1;
 
+#[cfg(feature = "memory-postgres")]
+fn postgres_memory_schema_version() -> MigResult<i32> {
+    i32::try_from(SQLITE_MEMORY_SCHEMA_VERSION)
+        .context("Postgres memory schema version exceeds INTEGER range")
+}
+
 /// Migrate a SQLite memory database to the V3 multi-agent shape.
 ///
 /// Adds the `agents` table, the `agent_id` column on `memories`,
@@ -3602,13 +3608,14 @@ pub fn migrate_postgres_memory_to_v3(
             applied_at TIMESTAMPTZ NOT NULL
         );"
     ))?;
+    let memory_schema_version = postgres_memory_schema_version()?;
     client.execute(
         &format!(
             "INSERT INTO {schema_ident}.schema_version (component, version, applied_at) \
              VALUES ('memories', $1, NOW()) \
              ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at"
         ),
-        &[&SQLITE_MEMORY_SCHEMA_VERSION],
+        &[&memory_schema_version],
     )?;
     Ok(())
 }
@@ -4084,6 +4091,20 @@ mod fs_db_migration_tests {
             )
             .unwrap();
         assert_eq!(count, 1, "existing memory row must survive the migration");
+    }
+
+    #[cfg(feature = "memory-postgres")]
+    #[test]
+    fn memory_schema_version_binds_to_postgres_int4() {
+        use postgres::types::{ToSql, Type};
+
+        fn accepts_int4<T: ToSql>(_: &T) -> bool {
+            T::accepts(&Type::INT4)
+        }
+
+        let version = postgres_memory_schema_version().expect("version fits Postgres INTEGER");
+        assert_eq!(i64::from(version), SQLITE_MEMORY_SCHEMA_VERSION);
+        assert!(accepts_int4(&version));
     }
 
     /// Predict the V3 absolute path for a legacy path relative to

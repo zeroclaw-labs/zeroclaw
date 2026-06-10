@@ -25,6 +25,7 @@ lapin = { version = "2", optional = true, default-features = false, features = [
 ] }
 tokio-executor-trait = { version = "2", optional = true }
 tokio-reactor-trait = { version = "1", optional = true }
+async-reactor-trait = { version = "1", optional = true }
 p12-keystore = { version = "0.1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 axum = { version = "0.8", default-features = false, features = [
@@ -127,25 +128,29 @@ webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
 # WhatsApp Web (optional)
-# Upstream crates from oxidezap/whatsapp-rust, temporarily pinned to commit
-# 9734fb2 (the MSRV-fix branch carrying oxidezap/whatsapp-rust#632). The
-# published 0.6.0 crate uses an `if let` guard at wacore/src/history_sync.rs:93
-# that is stable only on Rust 1.94+; ZeroClaw CI pins 1.93.0. Pinning via a
-# plain `git` source (not `[patch.crates-io]`) keeps the workspace buildable
-# until oxidezap publishes the fix as 0.6.1, at which point this block
-# reverts to versioned crates.io deps.
-# Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false, features = [
+# Upstream crates from oxidezap/whatsapp-rust, pinned to commit cbcdd2a.
+# Pinning via a plain `git` source (not `[patch.crates-io]`) keeps the
+# workspace buildable until oxidezap publishes the fix as 0.6.1, at which
+# point this block reverts to versioned crates.io deps.
+#
+# Commit history:
+# - 9734fb2: MSRV fix for `if let` guard (wacore/src/history_sync.rs:93)
+#            stable only on Rust 1.94+; ZeroClaw CI pins 1.93.0.
+#            Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
+# - cbcdd2a: PR #636 fix for LID namespace conversion. Fixes ACK 400
+#            "server requires all participants to share the same JID
+#            namespace" error when sending DMs to LID-addressed recipients.
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false, features = [
   "tokio-runtime",
 ] }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.15", optional = true }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true }
-whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
 # `bytes` is required for the `Bytes` return types in wacore 0.6 storage
 # traits (SignalStore::get_session / load_prekey). Feature-gated to
@@ -162,9 +167,7 @@ ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
 [features]
-default = [
-  "default-channels",
-]
+default = ["default-channels"]
 default-channels = [
   "channel-acp-server",
   "channel-email",
@@ -172,7 +175,6 @@ default-channels = [
   "channel-webhook",
 ]
 channels-full = [
-  "default-channels",
   "channel-bluesky",
   "channel-clawdtalk",
   "channel-dingtalk",
@@ -198,9 +200,15 @@ channels-full = [
   "channel-wecom",
   "channel-wecom-ws",
   "channel-whatsapp-cloud",
+  "default-channels",
 ]
 # Channels with optional deps
-channel-email = ["dep:async-imap", "dep:lettre", "dep:mail-parser", "dep:pulldown-cmark"]
+channel-email = [
+  "dep:async-imap",
+  "dep:lettre",
+  "dep:mail-parser",
+  "dep:pulldown-cmark",
+]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
@@ -234,7 +242,7 @@ channel-twitter = []
 channel-reddit = []
 channel-notion = []
 channel-mqtt = ["dep:rumqttc"]
-channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
+channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
 channel-linq = []
 channel-wati = []
 channel-nextcloud = []
