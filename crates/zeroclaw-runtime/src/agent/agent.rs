@@ -1358,7 +1358,11 @@ impl Agent {
         // Bundle-aware so `[agents.<alias>].skill_bundles` aliases resolve
         // through to `[skill_bundles.<alias>].directory` (defaulting to
         // `<install>/shared/skills/<alias>/`).
-        let skills = crate::skills::load_skills_for_agent(&config.data_dir, config, agent_alias);
+        let skills = crate::skills::load_skills_for_agent(
+            &config.agent_workspace_dir(agent_alias),
+            config,
+            agent_alias,
+        );
         // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
         // skill elevation (kind = "builtin" / "mcp") can resolve either target.
         let skill_resolution_registry: Vec<Arc<dyn tools::Tool>> = all_tools_result
