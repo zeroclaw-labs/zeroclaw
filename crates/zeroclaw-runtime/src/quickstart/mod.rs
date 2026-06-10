@@ -1605,20 +1605,37 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
-/// Live model catalog for a provider type. `(models, live)`:
+/// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
-/// means fall back to free text. Tries `ModelProvider::list_models()`
-/// first, then the family catalog table.
-pub async fn model_catalog(model_provider: &str) -> (Vec<String>, bool) {
+/// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
+/// first, then the family catalog table (no pricing for fallbacks).
+pub async fn model_catalog(
+    model_provider: &str,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
     if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
-        && let Ok(models) = handle.list_models().await
+        && let Ok(models) = handle.list_models_with_pricing().await
         && !models.is_empty()
     {
-        return (models, true);
+        let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
+            models
+                .iter()
+                .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+                .collect();
+        let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+        let pricing = if pricing.is_empty() {
+            None
+        } else {
+            Some(pricing)
+        };
+        return (ids, pricing, true);
     }
     match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
-        Ok(models) if !models.is_empty() => (models, true),
-        _ => (Vec::new(), false),
+        Ok(models) if !models.is_empty() => (models, None, true),
+        _ => (Vec::new(), None, false),
     }
 }
 

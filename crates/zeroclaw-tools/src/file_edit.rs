@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Edit a file by replacing an exact string match with new content.
@@ -12,11 +12,31 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
+    /// Whether edits to the workspace persist on the host filesystem. `false`
+    /// on an ephemeral runtime (Docker tmpfs / no volume mount), where the
+    /// rewritten file succeeds inside the container but is invisible on the
+    /// host and discarded at session end. When `false`, successful edits carry
+    /// a loud ephemeral-workspace warning. Mirrors
+    /// [`super::file_write::FileWriteTool`]. See issue #4627.
+    persistent_writes: bool,
 }
 
 impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            persistent_writes: true,
+        }
+    }
+
+    /// Construct with an explicit persistence flag derived from the active
+    /// runtime adapter's `has_filesystem_access()`. Mirrors
+    /// [`super::file_write::FileWriteTool::new_with_persistence`].
+    pub fn new_with_persistence(security: Arc<SecurityPolicy>, persistent_writes: bool) -> Self {
+        Self {
+            security,
+            persistent_writes,
+        }
     }
 }
 
@@ -52,6 +72,20 @@ impl Tool for FileEditTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let mut result = self.edit_file(args).await?;
+        // A successful edit on an ephemeral runtime rewrites a file that never
+        // reaches the host and is lost at session end; warn loudly (issue #4627).
+        if !self.persistent_writes && result.success {
+            result.output = with_ephemeral_workspace_warning(&result.output);
+        }
+        Ok(result)
+    }
+}
+
+impl FileEditTool {
+    /// Perform the exact-string replacement edit. The ephemeral workspace
+    /// warning is applied by the `Tool::execute` wrapper above.
+    async fn edit_file(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // ── 1. Extract parameters ──────────────────────────────────
         let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -314,10 +348,106 @@ mod tests {
         FileEditTool::new(security)
     }
 
+    fn ephemeral_tool(workspace: std::path::PathBuf) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        FileEditTool::new_with_persistence(security, false)
+    }
+
     #[test]
     fn file_edit_name() {
         let tool = test_tool(std::env::temp_dir());
         assert_eq!(tool.name(), "file_edit");
+    }
+
+    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+
+    /// A successful edit on an ephemeral runtime rewrites a file that won't
+    /// persist; the output carries a loud warning while preserving the status.
+    #[tokio::test]
+    async fn file_edit_warns_on_ephemeral_workspace() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_ephemeral");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("doc.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = ephemeral_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "world", "new_string": "there"}))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present, got: {}",
+            result.output
+        );
+        assert!(result.output.contains("mount_workspace"));
+        assert!(
+            result.output.contains("Edited"),
+            "original edit status must be preserved, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A failed edit performs no write — not data loss — so no banner is added.
+    #[tokio::test]
+    async fn file_edit_failure_not_warned_on_ephemeral_workspace() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_ephemeral_fail");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("doc.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = ephemeral_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "absent", "new_string": "x"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(!result.output.contains("EPHEMERAL WORKSPACE"));
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("EPHEMERAL WORKSPACE")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// On a persistent runtime (the default) no warning is attached.
+    #[tokio::test]
+    async fn file_edit_no_warning_when_persistent() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_persistent");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("doc.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "world", "new_string": "there"}))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            !result.output.contains("EPHEMERAL WORKSPACE"),
+            "no ephemeral warning expected on a persistent runtime, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]

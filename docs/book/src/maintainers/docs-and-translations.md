@@ -140,6 +140,7 @@ cargo mdbook sync --model-provider anthropic.<alias> --config-dir ~/.zeroclaw  #
 The pipeline has built-in resilience:
 
 - **Leak detection**: if a model returns its own instructions instead of a translation, the tool detects the pattern (via response-length ratio and bullet-list structure), attempts to recover the real translation from the response tail, and blanks the entry for re-translation if recovery fails.
+- **Protected literal checks**: `cargo mdbook check` also rejects high-confidence literal corruption in generated `.po` files. Product names such as `ZeroClaw Maturity Framework`, command literals such as `zeroclaw daemon`, and fenced TOML section/key literals must stay byte-for-byte intact inside translations. Translate the surrounding prose, not the machine-facing text.
 - **Incremental writes**: after each batch, the `.po` file is rewritten. A Ctrl-C mid-run doesn't lose the progress up to that point.
 - **Obsolete stripping**: `msgmerge` + `msgattrib --no-obsolete` keep removed source strings from accumulating as `#~` entries.
 

@@ -2802,6 +2802,48 @@ pub struct KiloCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Kilo (AI Gateway — OpenAI-compatible) ──
+
+/// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloEndpoint {
+    #[default]
+    Gateway,
+}
+impl ModelEndpoint for KiloEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Gateway => "https://api.kilo.ai/api/gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilo"]
+pub struct KiloModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Kilo endpoint variant. Defaults to the canonical Kilo AI Gateway.
+    #[serde(default, skip_serializing_if = "KiloEndpoint::is_default")]
+    pub endpoint: KiloEndpoint,
+}
+
+impl KiloEndpoint {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+}
+
+impl FamilyEndpoint for KiloModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -5551,6 +5593,17 @@ pub struct GatewayConfig {
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// Allow authenticated remote callers to use admin endpoints that are
+    /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
+    /// When false (default), those endpoints reject any non-loopback peer.
+    /// When true, a non-loopback request is accepted only if it also passes
+    /// pairing authentication — which requires `require_pairing = true`; with
+    /// pairing off a remote caller cannot be authenticated and is rejected, so
+    /// this flag never exposes an anonymous remote reload. `/admin/shutdown`
+    /// and the pairing-code endpoints stay localhost-only regardless.
+    /// (default: false)
+    #[serde(default)]
+    pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -5679,6 +5732,7 @@ impl Default for GatewayConfig {
             host: default_gateway_host(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -6201,6 +6255,12 @@ pub struct HttpRequestConfig {
     /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
+    /// Named authorization secrets for `auth_secret` requests.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub secrets: HashMap<String, String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -6212,6 +6272,7 @@ impl Default for HttpRequestConfig {
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
             allowed_private_hosts: vec![],
+            secrets: HashMap::new(),
         }
     }
 }
@@ -10756,6 +10817,12 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Per-channel multiplier for the global channel message in-flight budget.
+    /// Runtime multiplies this value by the configured channel count, then
+    /// applies its global minimum and maximum bounds to one shared dispatcher
+    /// semaphore. Default: `4`.
+    #[serde(default = "default_channel_max_concurrent_per_channel")]
+    pub max_concurrent_per_channel: usize,
     /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
@@ -11048,6 +11115,10 @@ fn default_channel_message_timeout_secs() -> u64 {
     300
 }
 
+fn default_channel_max_concurrent_per_channel() -> usize {
+    4
+}
+
 fn default_session_backend() -> String {
     "sqlite".into()
 }
@@ -11091,6 +11162,7 @@ impl Default for ChannelsConfig {
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
             session_persistence: true,
@@ -12713,6 +12785,36 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Time in seconds an approval card waits for user response before
+    /// the runtime auto-denies. Default: 300 (5 minutes).
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub per_user_session: bool,
+
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive `update_draft` PATCH calls in
+    /// milliseconds. Default 1000 ms tunes to Feishu's 5 QPS-per-message
+    /// edit cap; raise on enterprise plans with higher quotas.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -12945,7 +13047,9 @@ pub struct OtpConfig {
     #[serde(default = "default_otp_cache_valid_secs")]
     pub cache_valid_secs: u64,
 
-    /// Tool/action names gated by OTP.
+    /// Tool/action names gated by OTP. Empty or malformed entries are rejected
+    /// at config load; an entry that does not match a known gated action is
+    /// accepted but logged at WARN, since it cannot be enforced.
     #[serde(default = "default_otp_gated_actions")]
     pub gated_actions: Vec<String>,
 
@@ -15489,6 +15593,21 @@ impl Config {
             }
         }
 
+        for name in self.http_request.secrets.keys() {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("http_request.secrets.{name}"),
+                    "http_request.secrets key {name:?} must contain 1..=64 ASCII letters, numbers, underscores, or hyphens"
+                );
+            }
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             validation_bail!(
@@ -15502,6 +15621,13 @@ impl Config {
                 InvalidNumericRange,
                 "transcription.max_audio_bytes",
                 "transcription.max_audio_bytes must be greater than zero"
+            );
+        }
+        if self.channels.max_concurrent_per_channel == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.max_concurrent_per_channel",
+                "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
         // Heartbeat agent: when heartbeat is enabled, the agent field
@@ -15660,6 +15786,21 @@ impl Config {
             {
                 anyhow::bail!(
                     "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !default_otp_gated_actions()
+                .iter()
+                .any(|known| known == normalized)
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "action": normalized,
+                            "known_actions": default_otp_gated_actions(),
+                        })),
+                    "security.otp.gated_actions entry does not match a known gated action and will not be enforced: "
                 );
             }
         }
@@ -17292,6 +17433,7 @@ impl_enum_prop_kind!(
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
+    KiloEndpoint,
     CustomEndpoint,
 );
 
@@ -17463,6 +17605,7 @@ mod tests {
         assert_eq!(cfg.allowed_domains, vec!["*".to_string()]);
         assert!(!cfg.allow_private_hosts);
         assert!(cfg.allowed_private_hosts.is_empty());
+        assert!(cfg.secrets.is_empty());
     }
 
     #[test]
@@ -17478,6 +17621,36 @@ allowed_private_hosts = ["localhost", "10.0.0.1"]
         assert_eq!(
             c.http_request.allowed_private_hosts,
             vec!["localhost".to_string(), "10.0.0.1".to_string()]
+        );
+    }
+
+    #[test]
+    async fn http_request_config_deserializes_auth_secrets() {
+        let c = parse_test_config(
+            r#"
+[http_request.secrets]
+api_token = "Bearer test-token"
+"#,
+        );
+
+        assert_eq!(
+            c.http_request.secrets.get("api_token").map(String::as_str),
+            Some("Bearer test-token")
+        );
+    }
+
+    #[test]
+    async fn http_request_auth_secret_names_are_validated() {
+        let mut config = Config::default();
+        config
+            .http_request
+            .secrets
+            .insert("bad.name".to_string(), "Bearer test-token".to_string());
+
+        let err = config.validate().expect_err("invalid secret name");
+        assert!(
+            err.to_string().contains("http_request.secrets.bad.name"),
+            "validation error must name the bad auth secret path: {err}"
         );
     }
 
@@ -17980,6 +18153,42 @@ auto_save = true
         assert!(c.discord.is_empty());
         assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+        assert_eq!(
+            c.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+    }
+
+    #[test]
+    async fn channels_max_concurrent_per_channel_defaults_and_round_trips() {
+        let parsed: ChannelsConfig = toml::from_str("cli = true").unwrap();
+        assert_eq!(
+            parsed.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+
+        let parsed: ChannelsConfig =
+            toml::from_str("cli = true\nmax_concurrent_per_channel = 2").unwrap();
+        assert_eq!(parsed.max_concurrent_per_channel, 2);
+
+        let toml_str = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reparsed.max_concurrent_per_channel, 2);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_channel_max_concurrent_per_channel() {
+        let mut config = Config::default();
+        config.channels.max_concurrent_per_channel = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero channel concurrency budget must fail validate");
+        assert!(
+            err.to_string()
+                .contains("channels.max_concurrent_per_channel must be greater than 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -18172,6 +18381,7 @@ auto_save = true
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
                 message_timeout_secs: 300,
+                max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
@@ -18949,6 +19159,10 @@ default_temperature = 0.7
             "Authorization".to_string(),
             "Bearer upload-credential".to_string(),
         )]);
+        config.http_request.secrets = HashMap::from([(
+            "api_token".to_string(),
+            "Bearer http-request-credential".to_string(),
+        )]);
         config.channels.lark.insert(
             "feishu".to_string(),
             LarkConfig {
@@ -18963,6 +19177,10 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
 
@@ -19032,6 +19250,7 @@ default_temperature = 0.7
             "nodes-auth-credential",
             "Bearer otel-credential",
             "Bearer upload-credential",
+            "Bearer http-request-credential",
             "mcp-env-credential",
             "Bearer mcp-cred",
             "tenant-42",
@@ -19165,6 +19384,13 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(upload_auth).unwrap(),
             "Bearer upload-credential"
+        );
+
+        let http_request_auth = stored.http_request.secrets.get("api_token").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(http_request_auth));
+        assert_eq!(
+            store.decrypt(http_request_auth).unwrap(),
+            "Bearer http-request-credential"
         );
 
         let feishu = stored.channels.lark.get("feishu").unwrap();
@@ -19630,6 +19856,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -20072,6 +20299,7 @@ allowed_numbers = ["+1", "+2"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -20154,6 +20382,7 @@ allowed_numbers = ["+1", "+2"]
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -21142,6 +21371,10 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
         config.save().await.unwrap();
@@ -21705,6 +21938,10 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -21729,6 +21966,10 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -22228,6 +22469,45 @@ require_otp_to_resume = true
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_accepts_all_default_gated_actions_without_warning() {
+        let mut config = Config::default();
+        config.security.otp.gated_actions = default_otp_gated_actions();
+
+        config
+            .validate()
+            .expect("the canonical default gated actions must validate clean");
+    }
+
+    #[test]
+    async fn security_validation_accepts_unknown_gated_action_but_does_not_bail() {
+        // An unknown but well-formed action name is a silent no-op today
+        // (OTP enforcement of gated_actions is not wired through). Config load
+        // must not fail on it — the operator's whole config would be rejected
+        // for a typo'd gate — but the runtime emits a WARN so the no-op is not
+        // silent. This asserts the warn-and-continue contract: load succeeds.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec!["kubectl_write".into()];
+
+        config
+            .validate()
+            .expect("an unknown gated action must warn, not reject the config");
+    }
+
+    #[test]
+    async fn security_validation_still_rejects_malformed_gated_action() {
+        // The unknown-name warn must not weaken the existing hard checks from
+        // the charset/empty validation: a name with invalid characters still
+        // bails rather than degrading to a warn.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec!["kubectl write".into()];
+
+        let err = config
+            .validate()
+            .expect_err("malformed gated action must still be rejected");
+        assert!(err.to_string().contains("gated_actions"));
     }
 
     // The two `validate_*_transcription_default_provider` tests were removed
@@ -23246,6 +23526,10 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         assert!(names.contains(&"channels.matrix.access_token"));
         assert!(names.contains(&"channels.matrix.recovery_key"));
+        assert!(
+            names.contains(&"http_request.secrets"),
+            "http_request.secrets must be classified as a secret map"
+        );
     }
 
     #[test]
@@ -23341,6 +23625,65 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 .set_secret("nonexistent.field", "val".into())
                 .is_err()
         );
+    }
+
+    #[test]
+    async fn config_set_http_request_secret_map_key_is_masked_and_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: dir.path().join("workspace"),
+            secrets: SecretsConfig { encrypt: true },
+            ..Config::default()
+        };
+        let path = "http_request.secrets.api_token";
+
+        assert!(
+            Config::prop_is_secret(path),
+            "dynamic http_request secret map entries must be classified as secret before the key exists"
+        );
+        config
+            .set_prop_persistent(path, "Bearer from-config-set")
+            .unwrap();
+
+        assert_eq!(
+            config
+                .http_request
+                .secrets
+                .get("api_token")
+                .map(String::as_str),
+            Some("Bearer from-config-set")
+        );
+        assert_eq!(config.get_prop(path).unwrap(), "****");
+
+        let field = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("dynamic secret map prop field");
+        assert!(field.is_secret);
+        assert_eq!(field.display_value, "****");
+        assert_eq!(
+            field.credential_class,
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+
+        config.save_dirty().await.unwrap();
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !contents.contains("Bearer from-config-set"),
+            "auth secret must not be written in plaintext: {contents}"
+        );
+
+        let stored = crate::migration::migrate_to_current(&contents).unwrap();
+        let encrypted = stored.http_request.secrets.get("api_token").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(encrypted));
+        let store = crate::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(encrypted).unwrap(), "Bearer from-config-set");
     }
 
     #[test]

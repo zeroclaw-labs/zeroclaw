@@ -52,6 +52,23 @@ Voice-oriented AI endpoint. Pair with the `clawdtalk` channel for real-time SIP 
 
 Local inference via KiloCLI.
 
+### Kilo AI Gateway: slot `kilo`
+
+```toml
+[providers.models.kilo.home]
+model   = "anthropic/claude-sonnet-4-6"
+api_key = "..."
+# endpoint = "gateway"  # default → https://api.kilo.ai/api/gateway
+```
+
+Cloud API via Kilo AI Gateway. Bearer-token auth with multiple model tiers (free, balanced, pro).
+The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing works without a credential. Because it is queried live, it is the source that carries pricing into the cost-rates editor. The shared models.dev catalog (`kilo` key) is only a fallback for when the live endpoint is unreachable, and it does not include pricing.
+
+> **Naming migration:** `kilo` now refers to this gateway provider. The KiloCLI
+> subprocess provider keeps its `kilocli` slot (synonym `kilo-cli`). If you
+> previously configured the CLI provider under the `kilo` shorthand, switch to
+> `kilocli`.
+
 ---
 
 ## All slots

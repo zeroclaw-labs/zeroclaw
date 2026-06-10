@@ -1086,7 +1086,6 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "lambda-ai" => "lambda_ai",
         "github-models" => "github_models",
         "step" => "stepfun",
-        "kilo" => "kilocli",
         // Moonshot / Kimi (regional + code variants fold to one family).
         "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
         | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
@@ -1848,6 +1847,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
             ("kilocli", "KiloCLI", true),
+            ("kilo", "Kilo", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2698,6 +2698,11 @@ mod tests {
     #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
+    }
+
+    #[test]
+    fn factory_kilo() {
+        assert!(create_model_provider("kilo", Some("kilo-test-key")).is_ok());
     }
 
     #[test]

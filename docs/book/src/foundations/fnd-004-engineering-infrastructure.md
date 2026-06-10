@@ -188,7 +188,11 @@ This is implemented using `cargo metadata` to extract the dependency graph and a
     save-if: ${{ github.ref == 'refs/heads/master' }}
 ```
 
-The `save-if` condition means cache is only written on `master` pushes, not on every PR. PRs read from the cache but do not write competing versions. This avoids cache thrashing when multiple PRs are open simultaneously.
+Because cache saves are limited to `refs/heads/master`, the workflow must run on
+trusted `master` pushes. PRs read the master-seeded cache but do not write
+competing branch artifacts. This avoids cache thrashing when multiple PRs are
+open simultaneously, while still letting post-merge runs warm Linux, macOS, and
+Windows build caches for the next review loop.
 
 ---
 
