@@ -275,6 +275,13 @@ Examples:
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
         peripheral: Vec<String>,
+
+        /// Bind this agent session to a task from tasks.db.
+        /// If the task is Open it will be claimed; if Active and assigned
+        /// to the CLI actor it will be continued. The agent must call
+        /// `task_submit` to move the task to review — no auto-submit.
+        #[arg(long)]
+        task: Option<String>,
     },
 
     /// Start/manage the gateway server (webhooks, websockets)
@@ -1495,6 +1502,7 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
+            task: task_id_opt,
         } => {
             let final_temperature = temperature.unwrap_or_else(|| {
                 daemonclaw_config::provider_store::get_fallback_provider()
@@ -1507,6 +1515,78 @@ async fn main() -> Result<()> {
             daemonclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(daemonclaw_channels::cli::CliChannel::new())
             }));
+
+            // ── --task binding ──────────────────────────────────────
+            if let Some(ref task_id) = task_id_opt {
+                use daemonclaw_runtime::tasks::{self, TaskActor, TaskBinding, TaskStatus};
+
+                let cli_actor = TaskActor {
+                    channel: "cli".to_string(),
+                    id: Some(std::env::var("USER").unwrap_or_else(|_| "cli".to_string())),
+                };
+                let audit = daemonclaw_runtime::security::audit::AuditLogger::new(
+                    config.security.audit.clone(),
+                    config.workspace_dir.clone(),
+                )?;
+
+                let task = tasks::store::get_task(&config.workspace_dir, task_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                let actor_name = cli_actor.id.as_deref().unwrap_or(&cli_actor.channel);
+
+                match task.status {
+                    TaskStatus::Open => {
+                        tasks::store::claim_task(&config.workspace_dir, task_id, &cli_actor, &audit)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        tracing::info!("Claimed task {}", &task_id[..8.min(task_id.len())]);
+                    }
+                    TaskStatus::Active
+                        if task.assigned_to.as_deref() == Some(actor_name) =>
+                    {
+                        tracing::info!(
+                            "Continuing active task {}",
+                            &task_id[..8.min(task_id.len())]
+                        );
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Cannot bind to task {}: status is {other}, assigned to {:?}",
+                            &task_id[..8.min(task_id.len())],
+                            task.assigned_to,
+                        );
+                    }
+                }
+
+                // Build synthetic session
+                let session_dir = config.workspace_dir.join("sessions");
+                let _ = std::fs::create_dir_all(&session_dir);
+                let task_session = session_dir.join(format!("task_{task_id}.jsonl"));
+
+                let binding = Some(TaskBinding {
+                    task_id: task_id.clone(),
+                    actor_id: actor_name.to_string(),
+                });
+
+                // Run agent under task binding — do NOT auto-submit
+                let result = tasks::with_task_binding(binding, async {
+                    Box::pin(agent::run(
+                        config,
+                        message,
+                        provider,
+                        model,
+                        final_temperature,
+                        peripheral,
+                        true,
+                        Some(task_session),
+                        None,
+                        daemonclaw_api::agent::TurnSource::Cli,
+                    ))
+                    .await
+                })
+                .await;
+
+                return result.map(|_| ());
+            }
 
             Box::pin(agent::run(
                 config,
