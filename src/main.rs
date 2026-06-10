@@ -1557,11 +1557,6 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Build synthetic session
-                let session_dir = config.workspace_dir.join("sessions");
-                let _ = std::fs::create_dir_all(&session_dir);
-                let task_session = session_dir.join(format!("task_{task_id}.jsonl"));
-
                 let binding = Some(TaskBinding {
                     task_id: task_id.clone(),
                     actor_id: actor_name.to_string(),
@@ -1577,7 +1572,7 @@ async fn main() -> Result<()> {
                         final_temperature,
                         peripheral,
                         true,
-                        Some(task_session),
+                        agent::SessionPersistence::Db(format!("task_{task_id}")),
                         None,
                         daemonclaw_api::agent::TurnSource::Cli,
                     ))
@@ -1588,6 +1583,10 @@ async fn main() -> Result<()> {
                 return result.map(|_| ());
             }
 
+            let session = match session_state_file {
+                Some(path) => agent::SessionPersistence::File(path),
+                None => agent::SessionPersistence::None,
+            };
             Box::pin(agent::run(
                 config,
                 message,
@@ -1596,7 +1595,7 @@ async fn main() -> Result<()> {
                 final_temperature,
                 peripheral,
                 true,
-                session_state_file,
+                session,
                 None,
                 daemonclaw_api::agent::TurnSource::Cli,
             ))

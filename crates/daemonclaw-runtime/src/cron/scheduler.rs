@@ -352,10 +352,7 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
-    // Assign a unique session ID so memories written during this run can be
-    // purged atomically if the run fails (prevents snowball accumulation).
     let run_session_id = uuid::Uuid::new_v4().to_string();
-    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -370,7 +367,7 @@ async fn run_agent_job(
                     .unwrap_or(0.7),
                 vec![],
                 false,
-                Some(session_path.clone()),
+                crate::agent::SessionPersistence::None,
                 job.allowed_tools.clone(),
                 daemonclaw_api::agent::TurnSource::Cron,
             ))
@@ -390,7 +387,7 @@ async fn run_agent_job(
         Err(e) => {
             // Purge memories written during this failed run so they don't
             // pollute future recall and cause context snowball.
-            let mem_session_key = format!("cli:{}", session_path.display());
+            let mem_session_key = format!("cli:cron-{run_session_id}");
             if let Ok(mem) = daemonclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,

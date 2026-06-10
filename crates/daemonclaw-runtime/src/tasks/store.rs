@@ -1605,4 +1605,158 @@ mod tests {
         assert_eq!(t.status, TaskStatus::Active, "task must stay active after a turn with no submit/block");
         assert_eq!(t.turn_count, 1);
     }
+
+    // ── Session persistence acceptance tests ──────────────────────
+
+    #[test]
+    fn task_session_two_tick_conversation_in_sessions_db() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let task_id = "abc12345-dead-beef-0000-111122223333";
+        let key = format!("task_{task_id}");
+        let actor_id = Some("heartbeat");
+        let actor_type = Some("task_agent");
+
+        // Tick 1: user prompt + assistant response
+        backend.append_with_actor(&key, &ChatMessage::user("[Heartbeat Task | P2] Fix the widget\n\nIntent: repair broken widget"), actor_id, actor_type).unwrap();
+        backend.append_with_actor(&key, &ChatMessage::assistant("I'll check the widget code. ZXCV_DISTINCTIVE_MARKER_TICK1"), actor_id, actor_type).unwrap();
+
+        // Tick 2: continuation — load prior, add new turn
+        let prior = backend.load(&key);
+        assert_eq!(prior.len(), 2, "tick 2 must see tick 1's conversation");
+        assert_eq!(prior[0].role, "user");
+        assert!(prior[1].content.contains("ZXCV_DISTINCTIVE_MARKER_TICK1"));
+
+        backend.append_with_actor(&key, &ChatMessage::user("[Heartbeat Task | P2] Fix the widget\n\nIntent: repair broken widget"), actor_id, actor_type).unwrap();
+        backend.append_with_actor(&key, &ChatMessage::assistant("Widget is now fixed. Calling task_submit."), actor_id, actor_type).unwrap();
+
+        let full = backend.load(&key);
+        assert_eq!(full.len(), 4, "both ticks' messages must be present");
+    }
+
+    #[test]
+    fn task_session_metadata_row_exists() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let key = "task_deadbeef";
+        backend.append_with_actor(key, &ChatMessage::user("hello"), Some("heartbeat"), Some("task_agent")).unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].key, key);
+        assert_eq!(meta[0].message_count, 1);
+    }
+
+    #[test]
+    fn task_session_fts_finds_distinctive_string() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let key = "task_fts_test";
+        backend.append_with_actor(key, &ChatMessage::assistant("The QWERTY_UNIQUE_PAYLOAD was processed successfully"), Some("heartbeat"), Some("task_agent")).unwrap();
+
+        let results = backend.search(&daemonclaw_infra::session_backend::SessionQuery {
+            keyword: Some("QWERTY_UNIQUE_PAYLOAD".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, key);
+    }
+
+    #[test]
+    fn task_session_no_jsonl_files_created() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Simulate what the daemon does: use Db persistence (sessions.db), not jsonl
+        {
+            use daemonclaw_infra::session_backend::SessionBackend;
+            let backend = daemonclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend.append("task_nojsonl", &daemonclaw_providers::ChatMessage::user("test")).unwrap();
+        }
+
+        // Verify no task_*.jsonl files exist
+        let jsonl_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("task_") && name.ends_with(".jsonl")
+            })
+            .collect();
+        assert!(jsonl_files.is_empty(), "no task_*.jsonl files should exist, found: {jsonl_files:?}");
+    }
+
+    #[test]
+    fn task_session_isolated_from_channel_sessions() {
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Task session
+        backend.append_with_actor("task_isolated", &ChatMessage::assistant("SECRET_TASK_CONTENT_MUST_NOT_LEAK"), Some("heartbeat"), Some("task_agent")).unwrap();
+
+        // Channel session
+        backend.append("telegram_user_123", &ChatMessage::user("What's up?")).unwrap();
+        backend.append("telegram_user_123", &ChatMessage::assistant("Hello!")).unwrap();
+
+        // Channel session must NOT contain task content
+        let channel_msgs = backend.load("telegram_user_123");
+        for msg in &channel_msgs {
+            assert!(!msg.content.contains("SECRET_TASK_CONTENT_MUST_NOT_LEAK"),
+                "task session content must never appear in channel session");
+        }
+
+        // Task session must NOT contain channel content
+        let task_msgs = backend.load("task_isolated");
+        assert_eq!(task_msgs.len(), 1);
+        assert!(!task_msgs[0].content.contains("What's up?"));
+
+        // list_sessions shows both, confirming isolation by key
+        let all = backend.list_sessions();
+        assert!(all.contains(&"task_isolated".to_string()));
+        assert!(all.contains(&"telegram_user_123".to_string()));
+    }
+
+    #[test]
+    fn task_session_actor_attribution_persisted() {
+        use daemonclaw_infra::session_sqlite::SqliteSessionBackend;
+        use daemonclaw_infra::session_backend::SessionBackend;
+        use daemonclaw_providers::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let key = "task_actor_test";
+        backend.append_with_actor(key, &ChatMessage::user("hello"), Some("heartbeat"), Some("task_agent")).unwrap();
+
+        // Verify actor columns via raw SQL
+        let db_path = tmp.path().join("sessions").join("sessions.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (actor_id, actor_type): (Option<String>, Option<String>) = conn.query_row(
+            "SELECT actor_id, actor_type FROM sessions WHERE session_key = ?1",
+            rusqlite::params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(actor_id.as_deref(), Some("heartbeat"));
+        assert_eq!(actor_type.as_deref(), Some("task_agent"));
+    }
 }

@@ -535,10 +535,6 @@ async fn run_task_pickup_tick(
 
     let mut had_error = false;
 
-    // Synthetic per-task session directory
-    let session_dir = config.workspace_dir.join("sessions");
-    let _ = std::fs::create_dir_all(&session_dir);
-
     // Process my-active tasks first (continuation turns using existing session)
     for task in &my_active {
         tracing::info!(
@@ -548,8 +544,8 @@ async fn run_task_pickup_tick(
             task.title,
         );
 
-        let session_file = session_dir.join(format!("task_{}.jsonl", task.id));
-        had_error |= execute_task_turn(config, task, &session_file, delivery, &audit).await;
+        let session_key = format!("task_{}", task.id);
+        had_error |= execute_task_turn(config, task, &session_key, delivery, &audit).await;
     }
 
     // Then pick up new tasks from eligible
@@ -578,15 +574,15 @@ async fn run_task_pickup_tick(
             claimed.title,
         );
 
-        let session_file = session_dir.join(format!("task_{}.jsonl", claimed.id));
-        had_error |= execute_task_turn(config, &claimed, &session_file, delivery, &audit).await;
+        let session_key = format!("task_{}", claimed.id);
+        had_error |= execute_task_turn(config, &claimed, &session_key, delivery, &audit).await;
     }
 
     (had_error, has_high_priority)
 }
 
-/// Execute a single agent turn for a task under its task binding with a
-/// synthetic per-task session file. Returns `true` if an error occurred.
+/// Execute a single agent turn for a task under its task binding, persisting
+/// conversation in sessions.db under the given key. Returns `true` if an error occurred.
 ///
 /// Enforces `max_task_turns`: increments turn_count before running, and if
 /// the count exceeds the budget, blocks the task with "turn budget exhausted"
@@ -598,7 +594,7 @@ async fn run_task_pickup_tick(
 async fn execute_task_turn(
     config: &Config,
     task: &crate::tasks::Task,
-    session_file: &std::path::Path,
+    session_key: &str,
     delivery: &Option<(String, String)>,
     audit: &crate::security::audit::AuditLogger,
 ) -> bool {
@@ -658,7 +654,7 @@ async fn execute_task_turn(
         actor_id: "heartbeat".to_string(),
     });
 
-    let session_path = session_file.to_path_buf();
+    let session = crate::agent::SessionPersistence::Db(session_key.to_string());
     let agent_fut = tasks::with_task_binding(binding, async {
         crate::agent::run(
             config.clone(),
@@ -668,7 +664,7 @@ async fn execute_task_turn(
             temp,
             vec![],
             false,
-            Some(session_path),
+            session,
             None,
             daemonclaw_api::agent::TurnSource::Heartbeat,
         )

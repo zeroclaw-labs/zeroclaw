@@ -50,6 +50,7 @@ use uuid::Uuid;
 use daemonclaw_api::channel::Channel;
 use daemonclaw_api::provider::StreamEvent;
 use daemonclaw_config::schema::Config;
+use daemonclaw_infra::session_backend::SessionBackend as _;
 use daemonclaw_memory::{self, Memory, MemoryCategory, decay};
 use daemonclaw_providers::multimodal;
 use daemonclaw_providers::{
@@ -77,6 +78,16 @@ pub use super::history::{
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Where to persist session history across agent turns.
+pub enum SessionPersistence {
+    /// No persistence — single-shot execution.
+    None,
+    /// Interactive CLI session file (JSON blob with full history).
+    File(PathBuf),
+    /// SQLite sessions.db backend, keyed by session key (e.g. `task_{id}`).
+    Db(String),
+}
 
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((provider, model)) if a switch was requested, None otherwise.
@@ -2603,7 +2614,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
-    session_state_file: Option<PathBuf>,
+    session: SessionPersistence,
     allowed_tools: Option<Vec<String>>,
     turn_source: daemonclaw_api::agent::TurnSource,
 ) -> Result<String> {
@@ -3021,14 +3032,14 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
-    let memory_session_id = session_state_file.as_deref().and_then(|path| {
-        let raw = path.to_string_lossy().trim().to_string();
-        if raw.is_empty() {
-            None
-        } else {
-            Some(format!("cli:{raw}"))
+    let memory_session_id = match &session {
+        SessionPersistence::File(path) => {
+            let raw = path.to_string_lossy().trim().to_string();
+            if raw.is_empty() { None } else { Some(format!("cli:{raw}")) }
         }
-    });
+        SessionPersistence::Db(key) => Some(format!("db:{key}")),
+        SessionPersistence::None => None,
+    };
 
     // ── Cost tracking context (scoped for CLI / cron / web agents) ──
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
@@ -3196,10 +3207,41 @@ pub async fn run(
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = format!("{context}[{now}] {effective_msg}");
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        // Load prior conversation from sessions.db when using Db persistence.
+        let db_backend = if let SessionPersistence::Db(ref key) = session {
+            match daemonclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.workspace_dir) {
+                Ok(b) => {
+                    let user_msg = ChatMessage::user(&enriched);
+                    let (actor_id, actor_type) = session_actor_attribution(turn_source);
+                    if let Err(e) = b.append_with_actor(key, &user_msg, actor_id, actor_type) {
+                        tracing::warn!("Failed to save user message to sessions.db: {e}");
+                    }
+                    Some(b)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open sessions.db: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut history = if let Some(ref backend) = db_backend {
+            let prior = backend.load(match &session {
+                SessionPersistence::Db(key) => key,
+                _ => unreachable!(),
+            });
+            let mut h = vec![ChatMessage::system(&system_prompt)];
+            h.extend(prior);
+            h
+        } else {
+            vec![
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&enriched),
+            ]
+        };
+        let pre_tool_history_len = history.len();
 
         // Prune history for token efficiency (when enabled).
         if config.agent.history_pruning.enabled {
@@ -3314,6 +3356,16 @@ pub async fn run(
             }
         }
 
+        // Save new messages (assistant/tool) to sessions.db
+        if let (Some(backend), SessionPersistence::Db(key)) = (&db_backend, &session) {
+            let (actor_id, actor_type) = session_actor_attribution(turn_source);
+            for msg in &history[pre_tool_history_len..] {
+                if let Err(e) = backend.append_with_actor(key, msg, actor_id, actor_type) {
+                    tracing::warn!("Failed to save turn message to sessions.db: {e}");
+                }
+            }
+        }
+
         // After successful multi-step execution, attempt autonomous skill creation.
         if config.skills.skill_creation.enabled {
             let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
@@ -3345,10 +3397,11 @@ pub async fn run(
         );
 
         // Persistent conversation history across turns
-        let mut history = if let Some(path) = session_state_file.as_deref() {
-            load_interactive_session_history(path, &system_prompt)?
-        } else {
-            vec![ChatMessage::system(&system_prompt)]
+        let mut history = match &session {
+            SessionPersistence::File(path) => {
+                load_interactive_session_history(path, &system_prompt)?
+            }
+            _ => vec![ChatMessage::system(&system_prompt)],
         };
 
         loop {
@@ -3426,7 +3479,7 @@ pub async fn run(
                     } else {
                         println!("Conversation cleared.\n");
                     }
-                    if let Some(path) = session_state_file.as_deref() {
+                    if let SessionPersistence::File(ref path) = session {
                         save_interactive_session_history(path, &history)?;
                     }
                     continue;
@@ -3745,7 +3798,7 @@ pub async fn run(
                 sys_msg.content.clone_from(&base_system_prompt);
             }
 
-            if let Some(path) = session_state_file.as_deref() {
+            if let SessionPersistence::File(ref path) = session {
                 save_interactive_session_history(path, &history)?;
             }
         }
@@ -3761,6 +3814,18 @@ pub async fn run(
     });
 
     Ok(final_output)
+}
+
+fn session_actor_attribution(
+    turn_source: daemonclaw_api::agent::TurnSource,
+) -> (Option<&'static str>, Option<&'static str>) {
+    use daemonclaw_api::agent::TurnSource;
+    match turn_source {
+        TurnSource::Heartbeat => (Some("heartbeat"), Some("task_agent")),
+        TurnSource::Cron => (None, Some("cron")),
+        TurnSource::Cli => (None, Some("cli")),
+        TurnSource::Channel => (None, Some("channel")),
+    }
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
