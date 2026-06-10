@@ -37,6 +37,7 @@ pub mod sop_approve;
 pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
+pub mod task_ops;
 pub mod verifiable_intent;
 
 // Tool types from daemonclaw-tools (direct imports, no shims)
@@ -137,6 +138,7 @@ pub use sop_approve::SopApproveTool;
 pub use sop_execute::SopExecuteTool;
 pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
+pub use task_ops::{TaskBlockTool, TaskSubmitTool};
 pub use verifiable_intent::VerifiableIntentTool;
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
@@ -384,6 +386,14 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
+        Arc::new(TaskSubmitTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.security.audit.clone(),
+        )),
+        Arc::new(TaskBlockTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.security.audit.clone(),
+        )),
     ];
 
     // Register discord_search if discord_history channel is configured
