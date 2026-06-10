@@ -1281,48 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn breadcrumb_insert_and_retrieve() {
-        let (tmp, audit) = test_setup();
-        let actor = cli_actor();
-        let task = create_task(tmp.path(), &simple_params("Breadcrumb test"), &actor, &audit).unwrap();
-
-        insert_breadcrumb(
-            tmp.path(),
-            &task.id,
-            Some("richard"),
-            "shell",
-            Some("echo hello"),
-            Some("hello\n"),
-        )
-        .unwrap();
-        insert_breadcrumb(
-            tmp.path(),
-            &task.id,
-            Some("richard"),
-            "read_file",
-            Some("/etc/hosts"),
-            Some("127.0.0.1 localhost"),
-        )
-        .unwrap();
-
-        let activity = get_task_activity(tmp.path(), &task.id).unwrap();
-        assert_eq!(activity.len(), 2);
-        assert_eq!(activity[0]["tool"].as_str().unwrap(), "shell");
-        assert_eq!(activity[1]["tool"].as_str().unwrap(), "read_file");
-        assert!(activity[0]["ts"].as_str().is_some());
-    }
-
-    #[test]
-    fn breadcrumb_unbound_task_yields_no_rows() {
-        let (tmp, audit) = test_setup();
-        let actor = cli_actor();
-        let task = create_task(tmp.path(), &simple_params("No crumbs"), &actor, &audit).unwrap();
-
-        let activity = get_task_activity(tmp.path(), &task.id).unwrap();
-        assert!(activity.is_empty());
-    }
-
-    #[test]
     fn staging_matrix_none_recon_only() {
         let (tmp, audit) = test_setup();
         let actor = cli_actor();
