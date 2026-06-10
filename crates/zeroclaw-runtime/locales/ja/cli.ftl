@@ -343,6 +343,8 @@ channel-wecom-ws-dm-access-denied =
     あなたのユーザーID: {$userid}
 
     管理者に、あなたのユーザーIDを {$allowed_users_path} に追加するよう依頼してください。
+channel-discord-interaction-unauthorized = このコマンドをここで使用する権限がありません。
+channel-discord-interaction-malformed = 不明または不正なコマンドです。
 channel-discord-delivery-failure-note-one = （注意：{$count}個のファイルを配信できませんでした。）
 channel-discord-delivery-failure-note-many = （注意：{$count}個のファイルを配信できませんでした。）
 onboard-openai-auth-note =

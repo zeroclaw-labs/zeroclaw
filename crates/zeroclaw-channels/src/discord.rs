@@ -77,8 +77,27 @@ pub struct DiscordChannel {
     gateway_session: Mutex<DiscordGatewaySession>,
     /// When true, register and serve Discord slash commands (e.g. `/ask`)
     /// over the existing Gateway WebSocket. Default false. (Prototype.)
+    /// Construction-time wiring of `DiscordConfig.slash_commands` — config
+    /// is the source of truth; reloads rebuild the channel.
     slash_commands: bool,
+    /// Live interaction credentials, held channel-locally so the bearer
+    /// token never enters reply targets, logs, session keys, or memory
+    /// rows. Keyed by interaction id; swept on insert; entries expire with
+    /// Discord's 15-minute followup window.
+    pending_interactions: Arc<Mutex<HashMap<String, PendingInteraction>>>,
 }
+
+/// Credentials needed to answer a deferred interaction later: the followup
+/// webhook is addressed by application id + interaction token.
+#[derive(Clone)]
+struct PendingInteraction {
+    app_id: String,
+    token: String,
+    created: std::time::Instant,
+}
+
+/// Discord interaction followup tokens are valid for 15 minutes.
+const INTERACTION_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Default)]
 struct DiscordGatewaySession {
@@ -143,6 +162,7 @@ impl DiscordChannel {
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
+            pending_interactions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -263,87 +283,7 @@ impl DiscordChannel {
     /// Failures (network, 429, missing fields) return `None` without
     /// caching so the next message retries.
     async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
-        {
-            let cache = self.thread_channels.lock().await;
-            if let Some(value) = cache.get(channel_id) {
-                return value.clone();
-            }
-        }
-
-        // Only a successful API response is cached. A transient network blip
-        // or 429 must not poison the cache for the channel's lifetime; the
-        // next message should retry the lookup. Failure paths return `None`
-        // (the safe default) without writing to the cache. The whole request
-        // is wrapped in an explicit timeout so a hung Discord API call can
-        // never stall the listener; the shared channel HTTP client may not
-        // carry a request-level timeout.
-        let url = format!("https://discord.com/api/v10/channels/{channel_id}");
-        let lookup = async {
-            let resp = client
-                .get(&url)
-                .header("Authorization", format!("Bot {}", self.bot_token))
-                .send()
-                .await
-                .map_err(|e| {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "request failed"
-                    );
-                    anyhow::Error::msg(format!("request failed: {e}"))
-                })?;
-            if !resp.status().is_success() {
-                anyhow::bail!("non-success status {}", resp.status());
-            }
-            let body: serde_json::Value = resp.json().await.map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "body parse failed"
-                );
-                anyhow::Error::msg(format!("body parse failed: {e}"))
-            })?;
-            let is_thread = body
-                .get("type")
-                .and_then(serde_json::Value::as_u64)
-                .map(is_thread_channel_type)
-                .unwrap_or(false);
-            Ok::<Option<String>, anyhow::Error>(if is_thread {
-                body.get("parent_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            })
-        };
-        let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(
-                            ::serde_json::json!({"channel_id": channel_id, "error": format!("{}", e)})
-                        ),
-                    "channel lookup failed"
-                );
-                return None;
-            }
-            Err(_) => {
-                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
-                return None;
-            }
-        };
-
-        self.thread_channels
-            .lock()
-            .await
-            .insert(channel_id.to_string(), result.clone());
-        result
+        discord_thread_parent(client, &self.bot_token, &self.thread_channels, channel_id).await
     }
 
     /// Apply the trust-boundary / delivery-failure emoji reactions to the
@@ -1209,30 +1149,38 @@ async fn delete_discord_message(
 /// via the interaction followup webhook rather than a normal channel message.
 pub(crate) const DISCORD_INTERACTION_PREFIX: &str = "interaction:";
 
-/// Build the sentinel reply target embedding the application id + token.
-fn discord_interaction_reply_target(app_id: &str, token: &str) -> String {
-    format!("{DISCORD_INTERACTION_PREFIX}{app_id}:{token}")
+/// Build the sentinel reply target carrying only the interaction id. The
+/// bearer token deliberately never enters the reply target: reply targets
+/// flow into logs, session keys (and thus on-disk filenames), and memory
+/// rows — `send()` resolves the credentials from the channel-local
+/// `pending_interactions` store instead.
+fn discord_interaction_reply_target(interaction_id: &str) -> String {
+    format!("{DISCORD_INTERACTION_PREFIX}{interaction_id}")
 }
 
-/// Parse `interaction:{app_id}:{token}` back into `(app_id, token)`.
-pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<(String, String)> {
-    let rest = target.strip_prefix(DISCORD_INTERACTION_PREFIX)?;
-    let (app_id, token) = rest.split_once(':')?;
-    if app_id.is_empty() || token.is_empty() {
+/// Parse `interaction:{interaction_id}` back into the id. Rejects empty ids
+/// and anything with extra segments (the legacy `app:token` form must never
+/// round-trip as valid).
+pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<&str> {
+    let id = target.strip_prefix(DISCORD_INTERACTION_PREFIX)?;
+    if id.is_empty() || id.contains(':') {
         return None;
     }
-    Some((app_id.to_string(), token.to_string()))
+    Some(id)
 }
 
-/// Register the prototype `/ask` global command (idempotent — Discord upserts
-/// by name). Global commands can take up to an hour to propagate the first time.
+/// Register the prototype `/ask` global command. POST upserts by name and
+/// leaves any other global commands the application owner registered
+/// through other tooling untouched (PUT to this endpoint would bulk
+/// overwrite the entire set). Global commands can take up to an hour to
+/// propagate the first time.
 async fn register_slash_commands(
     client: &reqwest::Client,
     bot_token: &str,
     app_id: &str,
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/applications/{app_id}/commands");
-    let body = json!([{
+    let body = json!({
         "name": "ask",
         "description": "Ask the agent a question",
         "type": 1, // CHAT_INPUT
@@ -1242,13 +1190,14 @@ async fn register_slash_commands(
             "type": 3, // STRING
             "required": true
         }]
-    }]);
+    });
     let resp = client
-        .put(&url)
+        .post(&url)
         .header("Authorization", format!("Bot {bot_token}"))
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
@@ -1269,7 +1218,14 @@ async fn discord_defer_interaction(
     );
     // type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
     let body = json!({ "type": 5 });
-    let resp = client.post(&url).json(&body).send().await?;
+    // without_url: reqwest transport errors embed the full request URL,
+    // which here contains the interaction token (a live credential).
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
@@ -1326,6 +1282,7 @@ async fn discord_reject_interaction(
     client: &reqwest::Client,
     interaction_id: &str,
     interaction_token: &str,
+    message: &str,
 ) -> anyhow::Result<()> {
     let url = format!(
         "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
@@ -1333,11 +1290,17 @@ async fn discord_reject_interaction(
     let body = json!({
         "type": 4,
         "data": {
-            "content": "You're not authorized to use this command here.",
+            "content": message,
             "flags": 64
         }
     });
-    let resp = client.post(&url).json(&body).send().await?;
+    // without_url: transport errors embed the token-bearing URL.
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
@@ -1359,11 +1322,24 @@ async fn discord_edit_interaction_response(
         "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
     );
     let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
+    if trimmed.chars().count() < content.chars().count() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "content_chars": content.chars().count(),
+                })),
+            "interaction reply truncated to Discord's 2000-char limit (chunked followups are a planned follow-up)"
+        );
+    }
+    // without_url: transport errors embed the token-bearing URL.
     let resp = client
         .patch(&url)
         .json(&json!({ "content": trimmed }))
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
@@ -1639,6 +1615,97 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Free-function form of the thread-parent lookup so spawned tasks (which
+/// cannot borrow the channel) share the same cache and semantics.
+async fn discord_thread_parent(
+    client: &reqwest::Client,
+    bot_token: &str,
+    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    channel_id: &str,
+) -> Option<String> {
+    {
+        let cache = thread_channels.lock().await;
+        if let Some(value) = cache.get(channel_id) {
+            return value.clone();
+        }
+    }
+
+    // Only a successful API response is cached. A transient network blip
+    // or 429 must not poison the cache for the channel's lifetime; the
+    // next message should retry the lookup. Failure paths return `None`
+    // (the safe default) without writing to the cache. The whole request
+    // is wrapped in an explicit timeout so a hung Discord API call can
+    // never stall the listener; the shared channel HTTP client may not
+    // carry a request-level timeout.
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}");
+    let lookup = async {
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bot {bot_token}"))
+            .send()
+            .await
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "request failed"
+                );
+                anyhow::Error::msg(format!("request failed: {e}"))
+            })?;
+        if !resp.status().is_success() {
+            anyhow::bail!("non-success status {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "body parse failed"
+            );
+            anyhow::Error::msg(format!("body parse failed: {e}"))
+        })?;
+        let is_thread = body
+            .get("type")
+            .and_then(serde_json::Value::as_u64)
+            .map(is_thread_channel_type)
+            .unwrap_or(false);
+        Ok::<Option<String>, anyhow::Error>(if is_thread {
+            body.get("parent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        })
+    };
+    let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"channel_id": channel_id, "error": format!("{}", e)})
+                    ),
+                "channel lookup failed"
+            );
+            return None;
+        }
+        Err(_) => {
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
+            return None;
+        }
+    };
+
+    thread_channels
+        .lock()
+        .await
+        .insert(channel_id.to_string(), result.clone());
+    result
+}
+
 fn is_fatal_gateway_close_code(code: u16) -> bool {
     matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
 }
@@ -1686,12 +1753,30 @@ impl Channel for DiscordChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Slash-command replies: the recipient carries an
-        // `interaction:{app_id}:{token}` sentinel. Answer by editing the
-        // deferred interaction response instead of posting a channel message.
-        if let Some((app_id, token)) = parse_discord_interaction_target(&message.recipient) {
+        // `interaction:{interaction_id}` sentinel. Resolve the credentials
+        // from the channel-local store (never from the reply target — the
+        // token is a live credential) and answer by editing the deferred
+        // interaction response instead of posting a channel message.
+        if let Some(interaction_id) = parse_discord_interaction_target(&message.recipient) {
+            let pending = {
+                let guard = self.pending_interactions.lock();
+                guard.get(interaction_id).cloned()
+            };
+            let Some(pending) = pending else {
+                anyhow::bail!("interaction reply target unknown or expired (id {interaction_id})");
+            };
+            if pending.created.elapsed() > INTERACTION_TOKEN_TTL {
+                anyhow::bail!("interaction followup token expired (id {interaction_id}, >15min)");
+            }
             let content = crate::util::strip_tool_call_tags(&message.content);
             let client = self.http_client();
-            return discord_edit_interaction_response(&client, &app_id, &token, &content).await;
+            return discord_edit_interaction_response(
+                &client,
+                &pending.app_id,
+                &pending.token,
+                &content,
+            )
+            .await;
         }
 
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
@@ -2108,13 +2193,13 @@ impl Channel for DiscordChannel {
                         _ => {}
                     }
 
-                    // Slash commands arrive as INTERACTION_CREATE over this same
-                    // gateway. Handle APPLICATION_COMMAND (type 2) interactions:
-                    // ack within 3s (deferred), then enqueue the prompt as a
-                    // normal ChannelMessage whose reply_target carries the
-                    // interaction sentinel so send() answers via the followup
-                    // webhook. The defer POST is spawned so it never blocks the
-                    // heartbeat.
+                    // Slash commands arrive as INTERACTION_CREATE over this
+                    // same gateway. The entire handling sequence — thread
+                    // lookup, authorization gate, ephemeral reject or type-5
+                    // defer, then enqueue — runs in one spawned task so no
+                    // REST call can starve the heartbeat, and the enqueue
+                    // happens only after a successful defer: an agent
+                    // completion whose followup PATCH is doomed never starts.
                     if self.slash_commands && event_type == "INTERACTION_CREATE" {
                         if let Some(d) = event.get("d") {
                             let itype = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -2123,7 +2208,7 @@ impl Channel for DiscordChannel {
                                 let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let command = d.get("data").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                                let command = d.get("data").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 // user is under `member.user` (guild) or `user` (DM)
                                 let user_id = d
                                     .get("member")
@@ -2147,82 +2232,150 @@ impl Channel for DiscordChannel {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
 
-                                if command == "ask"
-                                    && !interaction_id.is_empty()
+                                // Without id/token/app there is nothing we
+                                // can even acknowledge.
+                                if !interaction_id.is_empty()
                                     && !interaction_token.is_empty()
                                     && !app_id.is_empty()
-                                    && !prompt.is_empty()
                                 {
-                                    // Authorization: same gates as MESSAGE_CREATE.
-                                    // Global commands are visible to the whole
-                                    // guild; only configured peers in allowed
-                                    // guilds/channels may actually invoke.
-                                    let interaction_guild =
-                                        d.get("guild_id").and_then(serde_json::Value::as_str);
-                                    let interaction_channel = d
-                                        .get("channel_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or("");
-                                    let parent_id = if !channel_filter.is_empty()
-                                        && !interaction_channel.is_empty()
-                                        && !channel_filter.iter().any(|c| c == interaction_channel)
-                                    {
-                                        self.thread_parent(&self.http_client(), interaction_channel)
-                                            .await
-                                    } else {
-                                        None
-                                    };
-                                    if let Err(denial) = interaction_gate(
-                                        &(self.peer_resolver)(),
-                                        &guild_filter,
-                                        &channel_filter,
-                                        &user_id,
-                                        interaction_guild,
-                                        interaction_channel,
-                                        parent_id.as_deref(),
-                                    ) {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized slash command interaction");
-                                        let client = self.http_client();
-                                        let reject_id = interaction_id.clone();
-                                        let reject_token = interaction_token.clone();
-                                        zeroclaw_spawn::spawn!(async move {
-                                            if let Err(e) = discord_reject_interaction(&client, &reject_id, &reject_token).await {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let thread_channels = Arc::clone(&self.thread_channels);
+                                    let pending = Arc::clone(&self.pending_interactions);
+                                    let alias = self.alias.clone();
+                                    let tx = tx.clone();
+
+                                    zeroclaw_spawn::spawn!(async move {
+                                        // Unknown command or missing prompt:
+                                        // answer ephemerally instead of leaving
+                                        // Discord's "did not respond" timeout.
+                                        if command != "ask" || prompt.is_empty() {
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-malformed",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
                                             }
-                                        });
-                                        continue;
-                                    }
+                                            return;
+                                        }
 
-                                    // Ack within 3s (spawned, off the heartbeat loop).
-                                    let client = self.http_client();
-                                    let defer_id = interaction_id.clone();
-                                    let defer_token = interaction_token.clone();
-                                    zeroclaw_spawn::spawn!(async move {
-                                        if let Err(e) = discord_defer_interaction(&client, &defer_id, &defer_token).await {
+                                        // Authorization: same gates as
+                                        // MESSAGE_CREATE. Global commands are
+                                        // visible to the whole guild; only
+                                        // configured peers in allowed
+                                        // guilds/channels may invoke.
+                                        // Cheap peer check first: an
+                                        // unauthorized invoker must not be
+                                        // able to trigger the authenticated
+                                        // thread-lookup REST call (parity
+                                        // with MESSAGE_CREATE's ordering).
+                                        // interaction_gate re-checks below.
+                                        if !crate::allowlist::is_user_allowed(
+                                            &peers,
+                                            &user_id,
+                                            crate::allowlist::Match::Sensitive,
+                                        ) {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized slash command interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+                                        let parent_id = if !channel_filter.is_empty()
+                                            && !interaction_channel.is_empty()
+                                            && !channel_filter.iter().any(|c| c == &interaction_channel)
+                                        {
+                                            discord_thread_parent(
+                                                &client,
+                                                &bot_token,
+                                                &thread_channels,
+                                                &interaction_channel,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
+                                        if let Err(denial) = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            parent_id.as_deref(),
+                                        ) {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized slash command interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stash credentials before the defer so
+                                        // a fast reply can never race an absent
+                                        // entry; sweep expired entries while
+                                        // holding the lock anyway.
+                                        {
+                                            let mut guard = pending.lock();
+                                            guard.retain(|_, p| {
+                                                p.created.elapsed() < INTERACTION_TOKEN_TTL
+                                            });
+                                            guard.insert(
+                                                interaction_id.clone(),
+                                                PendingInteraction {
+                                                    app_id: app_id.clone(),
+                                                    token: interaction_token.clone(),
+                                                    created: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                        // Ack within the 3s window; only a
+                                        // successful defer earns an enqueue.
+                                        if let Err(e) = discord_defer_interaction(&client, &interaction_id, &interaction_token).await {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction defer failed");
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        }
+
+                                        let channel_msg = ChannelMessage {
+                                            id: format!("discord_interaction_{interaction_id}"),
+                                            sender: user_id,
+                                            reply_target: discord_interaction_reply_target(&interaction_id),
+                                            content: prompt,
+                                            channel: "discord".to_string(),
+                                            channel_alias: Some(alias),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            interruption_scope_id: None,
+                                            thread_ts: None,
+                                            attachments: Vec::new(),
+                                            subject: None,
+                                        };
+                                        if tx.send(channel_msg).await.is_err() {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
                                         }
                                     });
-
-                                    let channel_msg = ChannelMessage {
-                                        id: format!("discord_interaction_{interaction_id}"),
-                                        sender: user_id,
-                                        reply_target: discord_interaction_reply_target(&app_id, &interaction_token),
-                                        content: prompt,
-                                        channel: "discord".to_string(),
-                                        channel_alias: Some(self.alias.clone()),
-                                        timestamp: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs(),
-                                        interruption_scope_id: None,
-                                        thread_ts: None,
-                                        attachments: Vec::new(),
-                                        subject: None,
-                                    };
-                                    if tx.send(channel_msg).await.is_err() {
-                                        break;
-                                    }
                                 }
                             }
                         }
@@ -2517,6 +2670,11 @@ impl Channel for DiscordChannel {
     }
 
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        // Interaction sentinels are not channel ids; the deferred "thinking…"
+        // state already plays the typing role for slash replies.
+        if parse_discord_interaction_target(recipient).is_some() {
+            return Ok(());
+        }
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
@@ -2563,6 +2721,12 @@ impl Channel for DiscordChannel {
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         use zeroclaw_config::schema::StreamMode;
+        // Interaction replies have no channel to draft into — the recipient
+        // is a sentinel, not a channel id. The final answer arrives via the
+        // followup-webhook edit in send().
+        if parse_discord_interaction_target(&message.recipient).is_some() {
+            return Ok(None);
+        }
         match self.stream_mode {
             StreamMode::Off => Ok(None),
             StreamMode::Partial => {
@@ -2606,6 +2770,10 @@ impl Channel for DiscordChannel {
         text: &str,
     ) -> anyhow::Result<()> {
         use zeroclaw_config::schema::StreamMode;
+        // Sentinel recipients have no draft message (see send_draft).
+        if parse_discord_interaction_target(recipient).is_some() {
+            return Ok(());
+        }
         match self.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
@@ -2920,6 +3088,11 @@ impl Channel for DiscordChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // Interaction sentinels are not channel ids; a reaction REST call
+        // against one is guaranteed 404 (with the sentinel in the URL).
+        if parse_discord_interaction_target(channel_id).is_some() {
+            return Ok(());
+        }
         let url = discord_reaction_url(channel_id, message_id, emoji);
 
         let resp = self
@@ -2948,6 +3121,10 @@ impl Channel for DiscordChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // Interaction sentinels are not channel ids (see add_reaction).
+        if parse_discord_interaction_target(channel_id).is_some() {
+            return Ok(());
+        }
         let url = discord_reaction_url(channel_id, message_id, emoji);
 
         let resp = self
@@ -2974,6 +3151,13 @@ impl Channel for DiscordChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        // Approval prompts can't be delivered over a deferred interaction
+        // reply (the sentinel is not a channel and the single @original
+        // edit is reserved for the answer). Fail fast so the agent loop's
+        // deny-by-default applies instead of a doomed REST round-trip.
+        if parse_discord_interaction_target(recipient).is_some() {
+            anyhow::bail!("approval prompts are not supported over interaction replies");
+        }
         let token = crate::util::new_approval_token();
         let text = format!(
             "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
@@ -3076,25 +3260,82 @@ mod tests {
 
     #[test]
     fn interaction_reply_target_roundtrips() {
-        let target = discord_interaction_reply_target("app123", "tok456");
-        assert_eq!(target, "interaction:app123:tok456");
-        assert_eq!(
-            parse_discord_interaction_target(&target),
-            Some(("app123".to_string(), "tok456".to_string()))
-        );
+        let target = discord_interaction_reply_target("123456789");
+        assert_eq!(target, "interaction:123456789");
+        assert_eq!(parse_discord_interaction_target(&target), Some("123456789"));
     }
 
     #[test]
     fn non_interaction_targets_are_ignored() {
         // A normal Discord channel id must NOT be treated as an interaction.
         assert_eq!(parse_discord_interaction_target("123456789012345678"), None);
-        // Malformed sentinels (missing token / app id) are rejected.
+        // Empty ids are rejected.
+        assert_eq!(parse_discord_interaction_target("interaction:"), None);
+        // The legacy `app:token` form (which carried a live credential in the
+        // reply target) must never round-trip as valid again.
         assert_eq!(
-            parse_discord_interaction_target("interaction:app-only"),
+            parse_discord_interaction_target("interaction:app123:tok456"),
             None
         );
-        assert_eq!(parse_discord_interaction_target("interaction::tok"), None);
-        assert_eq!(parse_discord_interaction_target("interaction:app:"), None);
+    }
+
+    #[tokio::test]
+    async fn send_to_unknown_interaction_sentinel_fails_without_rest() {
+        // A sentinel whose credentials are not in the pending store (expired,
+        // restarted process, forged) must error out before any HTTP happens.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "interaction:999".into(),
+            subject: None,
+            thread_ts: None,
+            cancellation_token: None,
+            attachments: Vec::new(),
+            in_reply_to: None,
+        };
+        let err = ch.send(&msg).await.unwrap_err();
+        assert!(err.to_string().contains("unknown or expired"));
+    }
+
+    #[test]
+    fn pending_interaction_sweep_drops_expired_entries() {
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let mut guard = ch.pending_interactions.lock();
+        guard.insert(
+            "live".into(),
+            PendingInteraction {
+                app_id: "a".into(),
+                token: "t".into(),
+                created: std::time::Instant::now(),
+            },
+        );
+        guard.insert(
+            "stale".into(),
+            PendingInteraction {
+                app_id: "a".into(),
+                token: "t".into(),
+                created: std::time::Instant::now()
+                    - INTERACTION_TOKEN_TTL
+                    - std::time::Duration::from_secs(1),
+            },
+        );
+        guard.retain(|_, p| p.created.elapsed() < INTERACTION_TOKEN_TTL);
+        assert!(guard.contains_key("live"));
+        assert!(!guard.contains_key("stale"));
     }
 
     #[test]

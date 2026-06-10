@@ -383,6 +383,8 @@ channel-wecom-ws-dm-access-denied =
     Your userid: {$userid}
 
     Ask an administrator to add your userid to {$allowed_users_path}.
+channel-discord-interaction-unauthorized = You're not authorized to use this command here.
+channel-discord-interaction-malformed = Unknown or malformed command.
 channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 
