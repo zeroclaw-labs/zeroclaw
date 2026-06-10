@@ -24,6 +24,22 @@ impl DefaultMemoryStrategy {
         memory_config: zeroclaw_config::schema::MemoryConfig,
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
+        // #6722: rerank_enabled is declared on the config schema but the
+        // retrieval-pipeline rerank stage was never landed (PR #4245 closed
+        // unmerged).  Emit a one-time warning so operators who set these
+        // fields know they currently have no effect.
+        if memory_config.rerank_enabled {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "rerank_enabled": true,
+                        "rerank_threshold": memory_config.rerank_threshold,
+                    })),
+                "memory.rerank_enabled is set but the rerank stage is not yet implemented; this setting currently has no effect"
+            );
+        }
         Self {
             memory,
             limit: 5,

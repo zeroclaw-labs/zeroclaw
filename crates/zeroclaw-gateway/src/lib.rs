@@ -4279,9 +4279,18 @@ mod tests {
     /// channel could be exercised.
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.zeroclaw/data (see #7054).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
         // Default Config has no [agents.*] entries — the exact shape
         // a fresh install presents on first daemon boot.
-        let config = Config::default();
         assert!(
             config.agents.is_empty(),
             "regression assumes default Config has no agents",
@@ -4337,7 +4346,16 @@ mod tests {
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
         use zeroclaw_config::schema::AliasedAgentConfig;
 
-        let mut config = Config::default();
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.zeroclaw/data (see #7054).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
         // Enabled agent whose `risk_profile` does not resolve. No
         // matching [risk_profiles.<key>] entry exists.
         let agent = AliasedAgentConfig {
