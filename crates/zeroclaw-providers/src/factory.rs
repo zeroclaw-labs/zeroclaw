@@ -800,6 +800,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
         }
+        if let Some(t) = opts.provider_timeout_secs {
+            p = p.with_timeout_secs(t);
+        }
         Ok(Box::new(p))
     }
 }

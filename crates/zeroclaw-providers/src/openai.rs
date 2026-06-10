@@ -27,6 +27,9 @@ pub struct OpenAiModelProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    /// Per-request timeout in seconds. Falls back to 120 when unset,
+    /// matching the historical hardcoded default.
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,12 +219,20 @@ impl OpenAiModelProvider {
                 .unwrap_or_else(|| BASE_URL.to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            timeout_secs: None,
         }
     }
 
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the per-request timeout in seconds.
+    /// Falls back to 120 when unset, matching the historical default.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
         self
     }
 
@@ -368,9 +379,10 @@ impl OpenAiModelProvider {
     }
 
     fn http_client(&self) -> Client {
+        let timeout = self.timeout_secs.unwrap_or(120);
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.openai",
-            120,
+            timeout,
             10,
         )
     }
