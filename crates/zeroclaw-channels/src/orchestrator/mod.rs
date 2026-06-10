@@ -24,6 +24,8 @@ pub mod media_pipeline;
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
+#[cfg(feature = "channel-amqp")]
+pub use crate::amqp::AmqpChannel;
 #[cfg(feature = "channel-bluesky")]
 pub use crate::bluesky::BlueskyChannel;
 #[cfg(feature = "channel-clawdtalk")]
@@ -7103,6 +7105,51 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "IRC channel is configured but this build was compiled without \
              `channel-irc`; skipping IRC."
+        );
+    }
+
+    #[cfg(feature = "channel-amqp")]
+    for (alias, amqp) in &config.channels.amqp {
+        if !active_channel_aliases.contains(&format!("amqp.{alias}")) {
+            continue;
+        }
+        if !amqp.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("amqp", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "AMQP",
+            alias: Some(alias.clone()),
+            channel: Arc::new(AmqpChannel::new(crate::amqp::AmqpChannelConfig {
+                amqp_url: amqp.amqp_url.clone(),
+                exchange: amqp.exchange.clone(),
+                routing_keys: amqp.routing_keys.clone(),
+                queue: amqp.queue.clone(),
+                ca_cert: amqp.ca_cert.clone(),
+                client_cert: amqp.client_cert.clone(),
+                client_key: amqp.client_key.clone(),
+                sender_label: amqp.sender_label.clone(),
+                content_template: amqp.content_template.clone(),
+                thread_id_field: amqp.thread_id_field.clone(),
+                durable_ack: amqp.durable_ack,
+                alias: alias.clone(),
+                peer_resolver,
+            })),
+        });
+    }
+
+    #[cfg(not(feature = "channel-amqp"))]
+    if !config.channels.amqp.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "AMQP channel is configured but this build was compiled without \
+             `channel-amqp`; skipping AMQP."
         );
     }
 

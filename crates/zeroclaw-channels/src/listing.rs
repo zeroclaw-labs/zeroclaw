@@ -184,6 +184,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-mqtt"),
     },
     ChannelCompileSpec {
+        schema_name: Some("AMQP"),
+        type_keys: &["amqp"],
+        compiled: cfg!(feature = "channel-amqp"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Webhook"),
         type_keys: &["webhook"],
         compiled: cfg!(feature = "channel-webhook"),
