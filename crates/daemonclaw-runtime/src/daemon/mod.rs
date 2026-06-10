@@ -630,6 +630,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             match phase2_result {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
+                    crate::health::touch_liveness(&config.workspace_dir);
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = task_start.elapsed().as_millis() as i64;
                     let now = chrono::Utc::now();
