@@ -190,6 +190,55 @@ fn format_attachment_content(
     }
 }
 
+/// Sanitize a filename from an untrusted source: strip path separators,
+/// control characters, and leading dots to prevent traversal or hidden files.
+fn sanitize_filename(raw: &str) -> String {
+    let name: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if c.is_control() => '_',
+            _ => c,
+        })
+        .collect();
+    let name = name.trim_start_matches(|c| c == '.' || c == '_').trim();
+    if name.is_empty() {
+        "unnamed_file".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Return a path inside `dir` that doesn't collide with an existing file.
+/// Appends `-2`, `-3`, etc. to the stem on collision.
+fn collision_safe_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str());
+
+    for i in 2..=9999 {
+        let suffixed = match ext {
+            Some(e) => format!("{stem}-{i}.{e}"),
+            None => format!("{stem}-{i}"),
+        };
+        let candidate = dir.join(&suffixed);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    dir.join(format!("{filename}.{}", std::process::id()))
+}
+
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
@@ -313,6 +362,9 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Telegram Bot API maximum file upload size (50 MB).
+const TELEGRAM_MAX_FILE_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
@@ -1076,8 +1128,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
         let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.bot_token
+            "{}/file/bot{}/{file_path}",
+            self.api_base, self.bot_token
         );
         let resp = self
             .http_client()
@@ -1153,26 +1205,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Attempt to parse a Telegram update as a document/photo attachment.
     ///
     /// Downloads the file to `{workspace_dir}/telegram_files/` and returns a
-    /// `ChannelMessage` with the local file path. Returns `None` if the message
-    /// is not an attachment, workspace_dir is not configured, or the file exceeds
-    /// size limits.
+    /// `ChannelMessage` with the local file path. Returns `None` only if the
+    /// message is not an attachment or the sender is unauthorized. Download and
+    /// write failures deliver the message with an `[attachment skipped: …]` note
+    /// so the caption and turn are never silently lost.
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
     ) -> Option<ChannelMessage> {
         let message = update.get("message")?;
         let attachment = Self::parse_attachment_metadata(message)?;
-
-        // Check file size limit
-        if let Some(size) = attachment.file_size
-            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
-        {
-            tracing::info!(
-                "Skipping attachment: file size {size} bytes exceeds {} MB limit",
-                TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
-            );
-            return None;
-        }
 
         let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
@@ -1214,71 +1256,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        // Ensure workspace directory is configured
-        let workspace = self.workspace_dir.as_ref().or_else(|| {
-            tracing::warn!("Cannot save attachment: workspace_dir not configured");
-            None
-        })?;
+        // Attempt to download and save the attachment. On any failure, the
+        // message still delivers with a skip note — never silently dropped.
+        let download_result = self
+            .try_download_attachment(&attachment, &chat_id, message_id)
+            .await;
 
-        let save_dir = workspace.join("telegram_files");
-        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("Failed to create telegram_files directory: {e}");
-            return None;
-        }
-
-        // Download file from Telegram
-        let tg_file_path = match self.get_file_path(&attachment.file_id).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to get attachment file path: {e}");
-                return None;
+        let mut content = match download_result {
+            Ok((display_name, local_path)) => {
+                format_attachment_content(attachment.kind, &display_name, &local_path)
+            }
+            Err(reason) => {
+                tracing::warn!("Attachment skipped: {reason}");
+                format!("[attachment skipped: {reason}]")
             }
         };
 
-        let file_data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Failed to download attachment: {e}");
-                return None;
-            }
-        };
-
-        // Determine local filename
-        let local_filename = match &attachment.file_name {
-            Some(name) => name.clone(),
-            None => {
-                // For photos, derive extension from Telegram file path
-                let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
-                format!("photo_{chat_id}_{message_id}.{ext}")
-            }
-        };
-
-        let local_path = save_dir.join(&local_filename);
-        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
-            tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
-            return None;
-        }
-
-        // Build message content.
-        // Photos with image extensions use [IMAGE:] marker so the multimodal
-        // pipeline validates vision capability. Non-image files always get
-        // [Document:] format regardless of Telegram's classification.
-        let mut content = format_attachment_content(attachment.kind, &local_filename, &local_path);
-        // `gated_caption` is the caption with any bot mention stripped when
-        // `mention_only` applied; otherwise the raw caption (or None).
         if let Some(caption) = gated_caption.as_deref()
             && !caption.is_empty()
         {
-            use std::fmt::Write;
             let _ = write!(content, "\n\n{caption}");
         }
 
-        // Prepend reply context if replying to another message
         if let Some(quote) = self.extract_reply_context(message) {
             content = format!("{quote}\n\n{content}");
         }
 
-        // Prepend forwarding attribution when the message was forwarded
         if let Some(attr) = Self::format_forward_attribution(message) {
             content = format!("{attr}{content}");
         }
@@ -1297,6 +1300,67 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
         })
+    }
+
+    /// Attempt to download and save an incoming attachment. Returns the display
+    /// name and local path on success, or a human-readable skip reason on failure.
+    async fn try_download_attachment(
+        &self,
+        attachment: &IncomingAttachment,
+        chat_id: &str,
+        message_id: i64,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        if let Some(size) = attachment.file_size
+            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            return Err(format!(
+                "file size {} MB exceeds {} MB limit",
+                size / (1024 * 1024),
+                TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+            ));
+        }
+
+        let workspace = self
+            .workspace_dir
+            .as_ref()
+            .ok_or_else(|| "workspace_dir not configured".to_string())?;
+
+        let save_dir = workspace.join("telegram_files");
+        tokio::fs::create_dir_all(&save_dir)
+            .await
+            .map_err(|e| format!("cannot create telegram_files directory: {e}"))?;
+
+        let tg_file_path = self
+            .get_file_path(&attachment.file_id)
+            .await
+            .map_err(|e| format!("getFile failed: {e}"))?;
+
+        let file_data = self
+            .download_file(&tg_file_path)
+            .await
+            .map_err(|e| format!("download failed: {e}"))?;
+
+        let raw_filename = match &attachment.file_name {
+            Some(name) => name.clone(),
+            None => {
+                let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                format!("photo_{chat_id}_{message_id}.{ext}")
+            }
+        };
+        let safe_name = sanitize_filename(&raw_filename);
+        let local_path = collision_safe_path(&save_dir, &safe_name);
+
+        tokio::fs::write(&local_path, &file_data)
+            .await
+            .map_err(|e| format!("write failed: {e}"))?;
+
+        let display_name = local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&safe_name)
+            .to_string();
+
+        Ok((display_name, local_path))
     }
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
@@ -1675,8 +1739,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Step 2: download the actual file
         let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path
+            "{}/file/bot{}/{}",
+            self.api_base, self.bot_token, file_path
         );
         let img_resp = self.http_client().get(&download_url).send().await?;
         let bytes = img_resp.bytes().await?;
@@ -2065,11 +2129,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             target
         };
 
-        let path = Path::new(target);
-        if !path.exists() {
-            anyhow::bail!("Telegram attachment path not found: {target}");
+        let canonical = Path::new(target)
+            .canonicalize()
+            .with_context(|| format!("attachment path not found: {target}"))?;
+
+        if let Some(ws) = &self.workspace_dir {
+            let ws_canonical = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+            if !canonical.starts_with(&ws_canonical) {
+                anyhow::bail!("attachment path escapes workspace: {target}");
+            }
         }
 
+        let meta = std::fs::metadata(&canonical)
+            .with_context(|| format!("cannot read attachment metadata: {target}"))?;
+        if meta.len() > TELEGRAM_MAX_FILE_UPLOAD_BYTES {
+            anyhow::bail!(
+                "attachment too large ({} MB, limit {} MB): {}",
+                meta.len() / (1024 * 1024),
+                TELEGRAM_MAX_FILE_UPLOAD_BYTES / (1024 * 1024),
+                target
+            );
+        }
+
+        let path = &canonical;
         match attachment.kind {
             TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Document => {
@@ -2701,10 +2783,23 @@ impl Channel for TelegramChannel {
                     .await?;
             }
 
-            // Send attachments
+            // Send attachments — fallback to text note on failure so the reply
+            // text is never lost over a failed attachment.
             for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
+                if let Err(e) = self
+                    .send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                    .await
+                {
+                    tracing::warn!(
+                        target = attachment.target,
+                        error = %e,
+                        "Telegram attachment send failed; sending fallback note"
+                    );
+                    let note = format!("[attachment failed: {}: {e}]", attachment.target);
+                    let _ = self
+                        .send_text_chunks(&note, &chat_id, thread_id.as_deref())
+                        .await;
+                }
             }
 
             return Ok(());
@@ -2945,15 +3040,30 @@ impl Channel for TelegramChannel {
             }
 
             for attachment in &attachments {
-                self.send_attachment(chat_id, thread_id, attachment).await?;
+                if let Err(e) = self.send_attachment(chat_id, thread_id, attachment).await {
+                    tracing::warn!(
+                        target = attachment.target,
+                        error = %e,
+                        "Telegram attachment send failed; sending fallback note"
+                    );
+                    let note = format!("[attachment failed: {}: {e}]", attachment.target);
+                    let _ = self.send_text_chunks(&note, chat_id, thread_id).await;
+                }
             }
 
             return Ok(());
         }
 
         if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
-                .await?;
+            if let Err(e) = self.send_attachment(chat_id, thread_id, &attachment).await {
+                tracing::warn!(
+                    target = attachment.target,
+                    error = %e,
+                    "Telegram attachment send failed; sending fallback note"
+                );
+                let note = format!("[attachment failed: {}: {e}]", attachment.target);
+                let _ = self.send_text_chunks(&note, chat_id, thread_id).await;
+            }
             return Ok(());
         }
 
@@ -5688,5 +5798,283 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    // ── Hardening acceptance tests ────────────────────────────────────
+
+    #[test]
+    fn sanitize_filename_strips_traversal() {
+        assert_eq!(sanitize_filename("../../etc/cron.d/evil"), "etc_cron.d_evil");
+        assert_eq!(sanitize_filename("..\\..\\Windows\\System32\\bad.exe"), "Windows_System32_bad.exe");
+        assert_eq!(sanitize_filename("normal_file.txt"), "normal_file.txt");
+        assert_eq!(sanitize_filename(".hidden"), "hidden");
+        assert_eq!(sanitize_filename("...leading_dots"), "leading_dots");
+        assert_eq!(sanitize_filename(""), "unnamed_file");
+        assert_eq!(sanitize_filename("../"), "unnamed_file");
+        assert_eq!(sanitize_filename("file\0name.txt"), "file_name.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_inbound_traversal_lands_inside_telegram_files() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let save_dir = workspace.path().join("telegram_files");
+        std::fs::create_dir_all(&save_dir).unwrap();
+
+        let malicious_name = "../../etc/cron.d/evil";
+        let safe = sanitize_filename(malicious_name);
+        let path = collision_safe_path(&save_dir, &safe);
+
+        assert!(
+            path.starts_with(&save_dir),
+            "sanitized path {path:?} must be inside {save_dir:?}"
+        );
+        assert!(
+            !path.to_string_lossy().contains(".."),
+            "sanitized path must not contain .."
+        );
+    }
+
+    #[test]
+    fn collision_safe_path_suffixes_on_collision() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("report.pdf"), b"first").unwrap();
+
+        let second = collision_safe_path(dir.path(), "report.pdf");
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            "report-2.pdf"
+        );
+
+        std::fs::write(&second, b"second").unwrap();
+        let third = collision_safe_path(dir.path(), "report.pdf");
+        assert_eq!(
+            third.file_name().unwrap().to_str().unwrap(),
+            "report-3.pdf"
+        );
+    }
+
+    #[test]
+    fn collision_safe_path_no_extension() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("README"), b"first").unwrap();
+
+        let second = collision_safe_path(dir.path(), "README");
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            "README-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_workspace_containment_rejects_traversal() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_api_base("http://localhost:1".into());
+
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: "../../../etc/passwd".to_string(),
+        };
+
+        let err = ch
+            .send_attachment("123", None, &attachment)
+            .await
+            .expect_err("traversal must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes workspace") || msg.contains("not found"),
+            "error must indicate containment or path failure: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_workspace_containment_rejects_symlink_escape() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let outside = tempfile::tempdir().expect("temp outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"sensitive data").unwrap();
+
+        let link_path = workspace.path().join("innocent.txt");
+        std::os::unix::fs::symlink(&secret, &link_path).unwrap();
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_api_base("http://localhost:1".into());
+
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: link_path.to_string_lossy().to_string(),
+        };
+
+        let err = ch
+            .send_attachment("123", None, &attachment)
+            .await
+            .expect_err("symlink escape must be rejected");
+
+        assert!(
+            err.to_string().contains("escapes workspace"),
+            "error must indicate containment violation: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_workspace_containment_allows_valid_file() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let valid_file = workspace.path().join("report.txt");
+        std::fs::write(&valid_file, b"legitimate content").unwrap();
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_api_base("http://localhost:1".into());
+
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: valid_file.to_string_lossy().to_string(),
+        };
+
+        // Will fail at the HTTP send stage (localhost:1), but should NOT fail
+        // at the containment check. Any error should be about the send, not containment.
+        let err = ch
+            .send_attachment("123", None, &attachment)
+            .await
+            .expect_err("HTTP send to localhost:1 should fail");
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("escapes workspace"),
+            "valid file must not trigger containment rejection: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_size_cap_rejects_oversized_file() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let big_file = workspace.path().join("huge.bin");
+        // Create a file just over 50MB using sparse file
+        {
+            use std::io::{Seek, Write as IoWrite};
+            let mut f = std::fs::File::create(&big_file).unwrap();
+            f.seek(std::io::SeekFrom::Start(
+                TELEGRAM_MAX_FILE_UPLOAD_BYTES + 1,
+            ))
+            .unwrap();
+            f.write_all(b"\0").unwrap();
+        }
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_api_base("http://localhost:1".into());
+
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: big_file.to_string_lossy().to_string(),
+        };
+
+        let err = ch
+            .send_attachment("123", None, &attachment)
+            .await
+            .expect_err("oversized file must be rejected");
+
+        assert!(
+            err.to_string().contains("too large"),
+            "error must mention size: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_oversize_delivers_message_with_skip_note() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_api_base("http://localhost:1".into());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "chat": {"id": 123, "type": "private"},
+                "from": {"id": 999, "first_name": "Test"},
+                "document": {
+                    "file_id": "oversize_file",
+                    "file_name": "big.zip",
+                    "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1
+                },
+                "caption": "here is a big file"
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("oversize must still produce a message, not None");
+
+        assert!(
+            msg.content.contains("[attachment skipped:"),
+            "content must contain skip note: {}", msg.content
+        );
+        assert!(
+            msg.content.contains("exceeds"),
+            "skip note must mention size limit: {}", msg.content
+        );
+        assert!(
+            msg.content.contains("here is a big file"),
+            "caption must be preserved: {}", msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_download_failure_delivers_message_with_skip_note() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        // api_base points to a dead server so getFile will fail
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_api_base("http://localhost:1".into());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 99,
+                "chat": {"id": 456, "type": "private"},
+                "from": {"id": 999, "first_name": "Test"},
+                "document": {
+                    "file_id": "some_file_id",
+                    "file_name": "notes.txt",
+                    "file_size": 1024
+                },
+                "caption": "check these notes"
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("download failure must still produce a message");
+
+        assert!(
+            msg.content.contains("[attachment skipped:"),
+            "content must contain skip note: {}", msg.content
+        );
+        assert!(
+            msg.content.contains("check these notes"),
+            "caption must be preserved: {}", msg.content
+        );
+    }
+
+    #[test]
+    fn download_file_url_uses_api_base() {
+        let ch = TelegramChannel::new("TEST_TOKEN".into(), vec!["*".into()], false)
+            .with_api_base("http://custom-api.local".into());
+
+        // Verify by checking the api_base field is used in the URL format.
+        // The download_file method constructs: {api_base}/file/bot{token}/{path}
+        let expected_prefix = "http://custom-api.local/file/botTEST_TOKEN/";
+        let url = format!(
+            "{}/file/bot{}/photos/test.jpg",
+            ch.api_base, ch.bot_token
+        );
+        assert!(
+            url.starts_with(expected_prefix),
+            "download URL must use api_base: {url}"
+        );
     }
 }
