@@ -25,6 +25,7 @@ lapin = { version = "2", optional = true, default-features = false, features = [
 ] }
 tokio-executor-trait = { version = "2", optional = true }
 tokio-reactor-trait = { version = "1", optional = true }
+async-reactor-trait = { version = "1", optional = true }
 p12-keystore = { version = "0.1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 axum = { version = "0.8", default-features = false, features = [
@@ -234,7 +235,7 @@ channel-twitter = []
 channel-reddit = []
 channel-notion = []
 channel-mqtt = ["dep:rumqttc"]
-channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
+channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
 channel-linq = []
 channel-wati = []
 channel-nextcloud = []
