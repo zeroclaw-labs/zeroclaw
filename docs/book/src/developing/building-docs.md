@@ -16,4 +16,3 @@ English markdown is the only source maintained by humans. Translations live in `
 - **Fast iteration on translations:** edit `po/<locale>.po` and reload the browser, mdbook serve detects `.po` changes and rebuilds automatically.
 - **Cleaning up:** `rm -rf docs/book/book target/doc` removes everything generated.
 - **Zero-cost re-runs:** `cargo mdbook sync` against unchanged English source completes in seconds, no AI calls, no cost.
-</content>

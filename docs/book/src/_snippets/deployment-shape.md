@@ -20,4 +20,3 @@ on disk (everything but the binary can move)
 
 logs                                      — journald / launchctl / Windows Event Log (platform-native)
 ```
-</content>

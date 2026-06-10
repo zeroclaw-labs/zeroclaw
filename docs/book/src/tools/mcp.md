@@ -72,4 +72,3 @@ MCP tool calls go through the same approval gate as every other tool, governed b
 - `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
 
 See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
-</content>
