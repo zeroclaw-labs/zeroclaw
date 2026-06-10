@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{RwLock, broadcast};
-use zeroclaw_hardware::util::{serial_open_baud, should_open_serial_nonexclusive};
+use zeroclaw_hardware::util::serial_open_baud;
+#[cfg(unix)]
+use zeroclaw_hardware::util::should_open_serial_nonexclusive;
 
 const PTY_FIRMWARE_PATH: &str = "/tmp/zc-sim-firmware";
 const PTY_HOST_PATH: &str = "/tmp/zc-sim-esp32";
@@ -276,6 +278,7 @@ async fn open_firmware_serial() -> Result<tokio_serial::SerialStream> {
 
         let mut builder =
             tokio_serial::new(PTY_FIRMWARE_PATH, serial_open_baud(PTY_FIRMWARE_PATH, BAUD));
+        #[cfg(unix)]
         if should_open_serial_nonexclusive(PTY_FIRMWARE_PATH) {
             builder = builder.exclusive(false);
         }
