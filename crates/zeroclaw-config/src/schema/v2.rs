@@ -113,6 +113,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "voice_wake",
     "voice_duplex",
     "mqtt",
+    "amqp",
 ];
 
 impl V2Config {
