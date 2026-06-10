@@ -229,7 +229,6 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -3535,13 +3534,23 @@ fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::E
     }
 }
 
-fn compute_max_in_flight_messages(channel_count: usize) -> usize {
+fn compute_max_in_flight_messages(
+    channel_count: usize,
+    max_concurrent_per_channel: usize,
+) -> usize {
     channel_count
-        .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
+        .saturating_mul(max_concurrent_per_channel)
         .clamp(
             CHANNEL_MIN_IN_FLIGHT_MESSAGES,
             CHANNEL_MAX_IN_FLIGHT_MESSAGES,
         )
+}
+
+fn max_in_flight_messages_for_config(
+    channel_count: usize,
+    config: &zeroclaw_config::schema::ChannelsConfig,
+) -> usize {
+    compute_max_in_flight_messages(channel_count, config.max_concurrent_per_channel)
 }
 
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
@@ -5752,7 +5761,12 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
-                Ok(Arc::new(LarkChannel::from_config(lk, alias, peer_resolver)))
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk, alias, peer_resolver)
+                        .with_approval_timeout_secs(lk.approval_timeout_secs)
+                        .with_per_user_session(lk.per_user_session)
+                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -7209,6 +7223,9 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
+                    .with_approval_timeout_secs(lk.approval_timeout_secs)
+                    .with_per_user_session(lk.per_user_session)
+                    .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone()),
             ),
         });
@@ -8619,7 +8636,7 @@ pub async fn start_channels(
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
 
-            let in_flight = compute_max_in_flight_messages(channels.len());
+            let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
@@ -9153,7 +9170,10 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("lark", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = LarkChannel::from_config(lk, alias, peer_resolver);
+            let ch = LarkChannel::from_config(lk, alias, peer_resolver)
+                .with_approval_timeout_secs(lk.approval_timeout_secs)
+                .with_per_user_session(lk.per_user_session)
+                .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-lark"))]
@@ -9786,6 +9806,34 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_uses_configured_per_channel_budget() {
+        assert_eq!(compute_max_in_flight_messages(3, 4), 12);
+        assert_eq!(compute_max_in_flight_messages(3, 8), 24);
+    }
+
+    #[test]
+    fn max_in_flight_messages_for_config_uses_channel_budget() {
+        let config = zeroclaw_config::schema::ChannelsConfig {
+            max_concurrent_per_channel: 8,
+            ..Default::default()
+        };
+
+        assert_eq!(max_in_flight_messages_for_config(3, &config), 24);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_preserves_global_bounds() {
+        assert_eq!(
+            compute_max_in_flight_messages(1, 1),
+            CHANNEL_MIN_IN_FLIGHT_MESSAGES
+        );
+        assert_eq!(
+            compute_max_in_flight_messages(100, 4),
+            CHANNEL_MAX_IN_FLIGHT_MESSAGES
+        );
     }
 
     #[test]
@@ -19420,6 +19468,8 @@ Done."#;
                 use_feishu: false,
                 app_id: "cli_test".to_string(),
                 app_secret: "secret".to_string(),
+                approval_timeout_secs: 300,
+                per_user_session: false,
                 ..Default::default()
             },
         );

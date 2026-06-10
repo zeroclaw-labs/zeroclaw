@@ -3,8 +3,8 @@ use crate::multimodal;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
-    TokenUsage, ToolCall as ProviderToolCall,
+    ModelInfo, ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
@@ -526,6 +526,15 @@ impl ModelProvider for OpenRouterModelProvider {
         let mut ids: Vec<String> = body.data.into_iter().map(|e| e.id).collect();
         ids.sort();
         Ok(ids)
+    }
+
+    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        // OpenRouter's public `/models` payload carries a `pricing` object per
+        // model. The default trait impl would discard it (delegates to
+        // `list_models` → `pricing: None`); override to surface pricing so the
+        // cost-rates editor can prefill rates for the first-class `openrouter`
+        // slot, matching the OpenAI-compatible vendor-fallback path.
+        crate::openrouter_catalog::list_all_models_with_pricing().await
     }
 
     async fn chat_with_system(

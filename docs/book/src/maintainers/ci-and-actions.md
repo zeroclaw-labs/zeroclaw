@@ -28,6 +28,10 @@ Runs `cargo audit` nightly against the dependency tree. Opens an issue on findin
 
 Auto-applies scope and risk labels based on changed file paths. Runs silently on every PR — if a PR is missing labels, check whether the paths in `.github/labeler.yml` cover the changes.
 
+### Docker Image PR Check (`docker-image-pr.yml`)
+
+Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default and Debian compatibility images without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
+
 ### Discord Release (`discord-release.yml`)
 
 Fires after a successful stable release. Posts the release notes to the community Discord.
@@ -105,9 +109,9 @@ The repository runs Actions in `selected` mode — only the actions in this allo
 | `dtolnay/rust-toolchain@stable` | All workflows | Install Rust toolchain |
 | `Swatinem/rust-cache@v2` | All workflows | Cargo build/dependency caching |
 | `softprops/action-gh-release@v2` | release | Create GitHub Releases |
-| `docker/setup-buildx-action@v3` | release | Docker Buildx setup |
+| `docker/setup-buildx-action@v4` | release | Docker Buildx setup |
 | `docker/login-action@v3` | release | GHCR authentication |
-| `docker/build-push-action@v6` | release | Multi-platform image build and push |
+| `docker/build-push-action@v7` | release | Multi-platform image build and push |
 
 Equivalent allowlist patterns (kept narrow on purpose):
 
@@ -133,6 +137,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 - Keep `CI Required Gate` deterministic and small. Adding jobs to the gate needs a clear quality argument.
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
 - Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned — the same quality gates run locally and in CI.
+- Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
 - `docs-quality` checks are not in the required gate. Run them locally with `bash scripts/ci/docs_quality_gate.sh`.
 
 ## Emergency rollback
