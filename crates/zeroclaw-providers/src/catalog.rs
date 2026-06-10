@@ -74,7 +74,8 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // the provider's `/models` endpoint serves the list directly.
         "sambanova" | "hyperbolic" | "anyscale" | "nscale" | "lepton" | "yi" | "baichuan"
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
-        | "llamacpp" | "ollama" | "custom" => (None, None),
+        | "llamacpp" | "ollama" | "morph" | "github_models" | "upstage" | "featherless"
+        | "arcee" | "lambda_ai" | "inception" | "custom" => (None, None),
         _ => return None,
     };
     Some(pair)

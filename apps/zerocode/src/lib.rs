@@ -11,6 +11,7 @@
 // reasoning.
 #![allow(clippy::disallowed_methods)]
 
+mod color_depth;
 mod theme;
 mod widgets;
 

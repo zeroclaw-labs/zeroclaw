@@ -7,8 +7,15 @@
   - [Quickstart](./getting-started/quickstart.md)
   - [YOLO mode](./getting-started/yolo.md)
   - [Multi-model setup](./getting-started/multi-model-setup.md)
-  - [zerocode](./getting-started/tui.md)
+  - [zerocode](./getting-started/zerocode.md)
   - [Language & translations](./getting-started/language.md)
+
+- [zerocode]()
+  - [Overview](./zerocode/overview.md)
+  - [Config pane](./zerocode/config.md)
+  - [Themes & terminal colours](./zerocode/themes.md)
+  - [Remote setup (WSS)](./zerocode/remote.md)
+  - [Environment pass-through](./zerocode/environment.md)
 
 - [Installation](./setup/index.md)
   - [Linux](./setup/linux.md)

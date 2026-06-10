@@ -35,10 +35,11 @@ const MAX_INPUT_ROWS: u16 = 5;
 const SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
+    "/clear-queue",
     "/detach",
-    "/toggle-thinking",
     "/model",
     "/model-provider",
+    "/toggle-thinking",
 ];
 
 // ── Action type ──────────────────────────────────────────────────
@@ -52,6 +53,19 @@ pub(crate) enum InputBarAction {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
     },
+    /// User requested immediate injection (Ctrl+Enter) — skip the queue.
+    Inject {
+        text: Option<String>,
+        attachments: Vec<PendingAttachment>,
+    },
+    /// Empty Enter (no text, no attachments). Carries no payload but is still
+    /// a deliberate keystroke — the parent uses it to resume a paused queue so
+    /// a silent pause can never trap the user.
+    ResumeQueue,
+    /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
+    /// it hands removal up to the parent. None = clear all; Some(N) = the
+    /// 1-based queue position (Some(0) is an invalid-index sentinel).
+    ClearQueue(Option<usize>),
     /// Status message to show in conversation (e.g. "Attached: photo.png").
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
@@ -78,6 +92,10 @@ enum SlashCommand<'a> {
     Attach(&'a str),
     Detach(Option<usize>),
     ListAttachments,
+    /// `/clear-queue` (None = clear all) or `/clear-queue N` (Some(N), 1-based).
+    /// A malformed index parses to `Some(0)` so the handler can reject it
+    /// rather than silently clearing the whole queue.
+    ClearQueue(Option<usize>),
     ToggleThinking,
     /// `/model <name>` — switch model directly.
     Model(&'a str),
@@ -100,6 +118,12 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::Detach(idx.trim().parse().ok())
     } else if trimmed == "/detach" {
         SlashCommand::Detach(None)
+    } else if let Some(arg) = trimmed.strip_prefix("/clear-queue ") {
+        // Malformed index -> Some(0): an invalid index, never a clear-all, so a
+        // typo cannot wipe the whole queue. Only the bare form clears all.
+        SlashCommand::ClearQueue(Some(arg.trim().parse().unwrap_or(0)))
+    } else if trimmed == "/clear-queue" {
+        SlashCommand::ClearQueue(None)
     } else if trimmed == "/attachments" {
         SlashCommand::ListAttachments
     } else if trimmed == "/toggle-thinking" {
@@ -505,6 +529,10 @@ impl InputBarState {
         &self.input
     }
 
+    pub fn has_pending_attachments(&self) -> bool {
+        !self.pending_attachments.is_empty()
+    }
+
     #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
@@ -513,6 +541,11 @@ impl InputBarState {
     #[cfg(test)]
     pub fn pending_attachments(&self) -> &[PendingAttachment] {
         &self.pending_attachments
+    }
+
+    #[cfg(test)]
+    pub fn clipboard_temps(&self) -> &[PathBuf] {
+        &self.clipboard_temps
     }
 
     #[cfg(test)]
@@ -798,6 +831,22 @@ impl InputBarState {
         self.pending_attachments.push(att);
     }
 
+    pub fn load_for_edit(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        self.input = text;
+        self.cursor = self.input.len();
+        self.scroll_offset = 0;
+        self.clear_selection();
+        self.dismiss_autocomplete();
+        for att in &attachments {
+            if att.source == crate::attachment::AttachmentSource::Clipboard
+                && !self.clipboard_temps.contains(&att.path)
+            {
+                self.clipboard_temps.push(att.path.clone());
+            }
+        }
+        self.pending_attachments = attachments;
+    }
+
     pub fn remove_attachment(&mut self, index: usize) {
         if index < self.pending_attachments.len() {
             self.pending_attachments.remove(index);
@@ -805,7 +854,13 @@ impl InputBarState {
     }
 
     pub fn take_attachments(&mut self) -> Vec<PendingAttachment> {
-        std::mem::take(&mut self.pending_attachments)
+        let taken = std::mem::take(&mut self.pending_attachments);
+        for att in &taken {
+            if att.source == crate::attachment::AttachmentSource::Clipboard {
+                self.clipboard_temps.retain(|p| p != &att.path);
+            }
+        }
+        taken
     }
 
     // ── Lifecycle ────────────────────────────────────────────
@@ -832,10 +887,7 @@ impl InputBarState {
     // ── Key handling ─────────────────────────────────────────
 
     /// Process a key event. Returns an action for the parent pane.
-    ///
-    /// `turn_in_flight` tells us whether the agent is currently responding
-    /// (disables input).
-    pub fn handle_key(&mut self, key: KeyEvent, turn_in_flight: bool) -> InputBarAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -870,11 +922,6 @@ impl InputBarState {
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
-        }
-
-        // Don't handle input while agent is responding.
-        if turn_in_flight {
-            return InputBarAction::NotHandled;
         }
 
         use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
@@ -929,6 +976,9 @@ impl InputBarState {
             }
             Some(IbWidgetAction::Submit) => {
                 return self.handle_enter();
+            }
+            Some(IbWidgetAction::Inject) => {
+                return self.handle_inject();
             }
             Some(IbWidgetAction::HistoryPrev) => {
                 self.move_cursor_up();
@@ -1172,6 +1222,7 @@ impl InputBarState {
                         ))
                     }
                 }
+                SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
@@ -1191,6 +1242,30 @@ impl InputBarState {
             // Empty text but has attachments: send attachments only.
             let attachments = self.take_attachments();
             InputBarAction::Submit {
+                text: None,
+                attachments,
+            }
+        } else {
+            InputBarAction::ResumeQueue
+        }
+    }
+
+    fn handle_inject(&mut self) -> InputBarAction {
+        let msg = self.take_input();
+        if !msg.is_empty() {
+            if matches!(parse_slash_command(&msg), SlashCommand::NotACommand) {
+                let attachments = self.take_attachments();
+                InputBarAction::Inject {
+                    text: Some(msg),
+                    attachments,
+                }
+            } else {
+                self.insert_text(&msg);
+                self.handle_enter()
+            }
+        } else if !self.pending_attachments.is_empty() {
+            let attachments = self.take_attachments();
+            InputBarAction::Inject {
                 text: None,
                 attachments,
             }
@@ -1330,6 +1405,7 @@ impl InputBarState {
         show_cursor: bool,
         turn_status: &TurnStatus,
         turn_started_at: Instant,
+        queue_paused_hint: Option<&str>,
     ) -> Rect {
         let has_attachments = !self.pending_attachments.is_empty();
 
@@ -1388,12 +1464,20 @@ impl InputBarState {
             .title_bottom(Span::styled("?=help", theme::dim_style()));
 
         if self.input.is_empty() && !turn_in_flight {
-            let placeholder: String = if self.file_explorer.is_some() {
-                String::new()
+            // A paused queue takes the empty input line as ghost text in the
+            // action colour, so the paused state and how to clear it are shown
+            // exactly where the user would act on it.
+            let (text, style) = if let Some(hint) = queue_paused_hint {
+                (hint.to_string(), theme::accent_style())
+            } else if self.file_explorer.is_some() {
+                (String::new(), theme::dim_style())
             } else {
-                crate::i18n::t("zc-input-placeholder-chat")
+                (
+                    crate::i18n::t("zc-input-placeholder-chat"),
+                    theme::dim_style(),
+                )
             };
-            let p = Paragraph::new(Span::styled(placeholder, theme::dim_style())).block(block);
+            let p = Paragraph::new(Span::styled(text, style)).block(block);
             f.render_widget(p, input_area);
         } else {
             // Wrapped input content with optional selection highlighting.
@@ -1617,6 +1701,44 @@ mod tests {
     }
 
     #[test]
+    fn taking_attachments_releases_clipboard_temp_ownership() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_release.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.add_attachment(PendingAttachment {
+            path: tmp.clone(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        });
+
+        let taken = bar.take_attachments();
+        assert_eq!(taken.len(), 1);
+        assert!(bar.clipboard_temps().is_empty());
+
+        bar.cleanup_temps();
+        assert!(tmp.exists(), "queued clipboard temp must survive cleanup");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn loading_for_edit_retakes_clipboard_temp_ownership() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_retake.png");
+        let att = PendingAttachment {
+            path: tmp.clone(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        };
+        bar.load_for_edit("edit".into(), vec![att]);
+        assert!(bar.clipboard_temps().contains(&tmp));
+    }
+
+    #[test]
     fn slash_attach_empty_opens_explorer() {
         let mut bar = InputBarState::new();
         bar.insert_text("/attach");
@@ -1635,11 +1757,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_enter_with_no_attachments_consumed() {
-        let _bar = InputBarState::new();
-        // Empty input, no attachments -> Consumed (nothing to do)
-        // Can't easily test handle_enter directly without take_input side effects,
-        // but we test the handle_key path.
+    fn empty_enter_resumes_queue() {
+        let mut bar = InputBarState::new();
+        // Empty input, no attachments -> ResumeQueue: a deliberate Enter must
+        // never be silently swallowed; the parent uses it to unpause.
+        assert!(matches!(bar.handle_enter(), InputBarAction::ResumeQueue));
     }
 
     #[test]
@@ -1677,6 +1799,18 @@ mod tests {
         assert!(matches!(
             parse_slash_command("/attachments"),
             SlashCommand::ListAttachments
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue"),
+            SlashCommand::ClearQueue(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue 2"),
+            SlashCommand::ClearQueue(Some(2))
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue xyz"),
+            SlashCommand::ClearQueue(Some(0))
         ));
         assert!(matches!(
             parse_slash_command("/toggle-thinking"),
@@ -1801,7 +1935,7 @@ mod tests {
         );
         bar.insert_text("/model ");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         // First catalog entry is accepted and the line is submitted in one
         // keystroke — no picker modal.
         assert!(matches!(action, InputBarAction::SetModel(m) if m == "claude-opus-4-8"));
@@ -1813,7 +1947,7 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("/mod");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         // `/model` still needs an argument: accept-and-fill, do not open the
         // picker or submit.
         assert!(matches!(action, InputBarAction::Consumed));
@@ -1826,7 +1960,7 @@ mod tests {
         bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);
         bar.insert_text("/model-provider open");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(action, InputBarAction::SetModelProvider(p) if p == "openai"));
         assert!(!bar.autocomplete_active);
     }

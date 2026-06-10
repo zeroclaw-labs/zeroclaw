@@ -4,6 +4,11 @@
 ///
 /// The renderer joins keys with " / " so you don't have to format manually.
 /// An entry with all-empty keys/action renders as a blank spacer row.
+///
+/// Keys are owned `String`s so callers can pass live chord displays resolved
+/// from the keymap (`Action::Variant.resolved()[..].display()`) instead of
+/// hardcoded literals — the help always reflects the actual bindings, including
+/// user overrides.
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
     /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,

@@ -264,7 +264,7 @@ fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
 #[allow(dead_code)]
 fn render_keycode(code: &KeyCode) -> String {
     match code {
-        KeyCode::Char(c) => c.to_uppercase().to_string(),
+        KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".into(),
         KeyCode::Esc => "Esc".into(),
         KeyCode::Tab => "Tab".into(),
@@ -362,20 +362,21 @@ mod tests {
     }
 
     #[test]
-    fn display_bare_letter_uppercases() {
-        assert_eq!(Chord::char('k').display(), "K");
+    fn display_bare_letter_preserves_case() {
+        assert_eq!(Chord::char('k').display(), "k");
+        assert_eq!(Chord::char('K').display(), "K");
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn display_ctrl_on_non_darwin() {
-        assert_eq!(Chord::ctrl('k').display(), "Ctrl+K");
+        assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn display_ctrl_on_darwin() {
-        assert_eq!(Chord::ctrl('k').display(), "⌘K");
+        assert_eq!(Chord::ctrl('k').display(), "⌘k");
     }
 
     #[test]

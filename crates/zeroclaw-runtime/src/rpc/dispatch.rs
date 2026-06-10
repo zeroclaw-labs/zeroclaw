@@ -1267,7 +1267,7 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -1363,7 +1363,9 @@ impl RpcDispatcher {
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
         let cancel_cause = self.ctx.sessions.take_cancel_cause(sid);
-        self.ctx.sessions.remove_cancel_token(sid);
+        self.ctx
+            .sessions
+            .remove_cancel_token(sid, cancel_generation);
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
