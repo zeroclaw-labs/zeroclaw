@@ -31,11 +31,14 @@ FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b570861605
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
 
-# Install build dependencies
+# Install build dependencies. g++ is required by inkjet (zerocode's syntax
+# highlighter) to compile its tree-sitter grammars; the slim base ships cc but
+# not a C++ compiler.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
         pkg-config \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests to cache dependencies
@@ -84,9 +87,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --locked -p zeroclawlabs -p zerocode --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
-      cargo build --release --locked; \
+      cargo build --release --locked -p zeroclawlabs -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -122,9 +125,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/deps/zerocode-* \
            target/release/incremental/zerocode-* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --locked -p zeroclawlabs -p zerocode --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
-      cargo build --release --locked; \
+      cargo build --release --locked -p zeroclawlabs -p zerocode; \
     fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     cp target/release/zerocode /app/zerocode && \
