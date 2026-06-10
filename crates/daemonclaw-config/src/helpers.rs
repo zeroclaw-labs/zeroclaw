@@ -146,12 +146,27 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
         }
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
         PropKind::StringArray => {
-            let items = value_str
-                .split(',')
-                .map(|s| toml::Value::String(s.trim().to_string()))
-                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-                .collect();
-            Ok(toml::Value::Array(items))
+            let trimmed = value_str.trim();
+            if trimmed.starts_with('[') {
+                // TOML/JSON array syntax — parse as TOML value directly
+                let parsed: toml::Value = format!("v = {trimmed}")
+                    .parse::<toml::Table>()
+                    .map_err(|e| anyhow::anyhow!("Invalid array syntax: {e}"))?
+                    .remove("v")
+                    .unwrap_or(toml::Value::Array(vec![]));
+                if parsed.is_array() {
+                    Ok(parsed)
+                } else {
+                    Ok(toml::Value::Array(vec![parsed]))
+                }
+            } else {
+                let items = value_str
+                    .split(',')
+                    .map(|s| toml::Value::String(s.trim().to_string()))
+                    .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    .collect();
+                Ok(toml::Value::Array(items))
+            }
         }
     }
 }
