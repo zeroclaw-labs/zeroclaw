@@ -55,6 +55,12 @@ One thing: the child's **final assistant message**, as a string, wrapped in `Too
 
 There is no streaming or partial-progress channel back to the parent. Long-running SubAgents stall the parent's tool execution for their full duration; there is no per-call timeout knob.
 
+### Multiple calls in one turn
+
+The agent loop applies a per-turn duplicate-call guard: a tool called twice with identical arguments in the same turn normally has the second call skipped. `spawn_subagent` and `delegate` are **exempt** from that guard. Launching several with the same prompt (redundancy, sampling, fan-out) is an intentional pattern, not an accidental repeat, so each identical call runs and each result is returned. Without the exemption only the first identical call would execute and only its output would reach the model.
+
+When parallel tool execution is enabled (`parallel_tools = true` in the runtime profile), multiple `spawn_subagent` calls in one turn run concurrently and every child's final response is returned to the parent, keyed to its own tool call. `delegate` has its own explicit fan-out via the `parallel: [...]` argument (see the output-strings section); that path spawns each target on its own task and aggregates all results.
+
 ## Permission inheritance
 
 A SubAgent inherits the parent's permissions verbatim unless the spawn site supplies a narrowing `SubAgentOverrides`. Today both in-tree spawn sites pass `SubAgentOverrides::default()` (inherit everything). The override surface is shipped and validated; a future caller-supplied narrowing path drops in without runtime changes.
@@ -66,9 +72,9 @@ Inheritance axis by axis:
 3. **Tool registry**: the child's registry is built fresh by `tools::all_tools_with_runtime` under the inherited policy. The registry then passes through `apply_policy_tool_filter` (`crates/zeroclaw-runtime/src/agent/loop_.rs`), which drops any tool whose name fails either gate:
    - The policy's `allowed_tools` / `excluded_tools` (sourced from the parent's `risk_profile`).
    - The caller-supplied `allowed_tools` argument to `agent::run`.
-   `spawn_subagent` is in the registry but its `is_subagent_caller` flag is set to `true` for the child, so the depth-1 refusal fires before any spawn work.
+   `spawn_subagent` is in the registry but its `is_subagent_caller` flag is set to `true` for the child, so the depth-1 refusal fires before any spawn work. The same `is_subagent_caller` flag drops `model_switch` from the child's registry entirely: a SubAgent inherits the parent's model verbatim (see axis 5) and must not be able to switch the active model out from under the parent, so the tool is simply not offered to it.
 4. **Memory allowlist**: a `HashSet<String>` of sibling agent **aliases** (the `[agents.<alias>]` config keys). Inherited from the parent's `workspace.read_memory_from` plus the parent's own alias. Override path (`SubAgentOverrides::allowed_agent_aliases`) is validated as a subset; any alias not on the parent's list is rejected by name. The parent's own alias is always re-added so a SubAgent always sees its parent's rows.
-5. **Model provider**: inherited from the parent's `[agents.<alias>] model_provider` resolution. Temperature comes from the parent's provider entry (`config.model_provider_for_agent(parent_alias).and_then(|e| e.temperature)`).
+5. **Model provider**: inherited from the parent's `[agents.<alias>] model_provider` resolution. Temperature comes from the parent's provider entry (`config.model_provider_for_agent(parent_alias).and_then(|e| e.temperature)`). This inheritance is enforced, not merely a default: `model_switch` is excluded from the SubAgent's tool registry (see axis 3), so a SubAgent cannot switch its own model. To run a subtask on a different model, use `delegate` to a sibling agent whose `model_provider` names that model.
 6. **Identity at the data layer**: same UUID in the `agents` table (SQL backends), same workspace dir for Markdown, same secret store. The parent-vs-child distinction is purely observability: a separate tracing span and a separate conversation-history session key.
 
 ## How a user makes one fire
@@ -165,7 +171,7 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 | **Model provider** | Parent's | Target agent's configured provider |
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
-| **Parallel fan-out** | Not supported | `parallel: [...]` runs multiple targets concurrently |
+| **Parallel fan-out** | No built-in argument; multiple calls in one turn run concurrently when `parallel_tools = true` | `parallel: [...]` runs multiple targets concurrently |
 | **Gating** | `risk_profile.allowed_tools` must list `spawn_subagent` | `allowed_tools` must list `delegate`, caller's `delegation_policy mode = "allow"`, and target shares the caller's risk profile |
 | **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) on the **same trust tier** to handle the task |
 
