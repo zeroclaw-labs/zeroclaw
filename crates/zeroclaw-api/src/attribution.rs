@@ -71,6 +71,8 @@ pub enum Role {
 pub enum ChannelKind {
     #[strum(serialize = "acp")]
     AcpChannel,
+    #[strum(serialize = "amqp")]
+    Amqp,
     Bluesky,
     #[strum(serialize = "clawdtalk")]
     ClawdTalk,
