@@ -548,6 +548,8 @@ fn uninstall_linux(_config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             for unit in [
+                "/etc/systemd/system/daemonclaw-witness.timer",
+                "/etc/systemd/system/daemonclaw-witness.service",
                 "/etc/systemd/system/daemonclaw-watchdog.timer",
                 "/etc/systemd/system/daemonclaw-watchdog.service",
                 "/etc/systemd/system/daemonclaw.service",
@@ -559,7 +561,7 @@ fn uninstall_linux(_config: &Config, init_system: InitSystem) -> Result<()> {
                 }
             }
             let _ = run_checked(Command::new("systemctl").args(["daemon-reload"]));
-            println!("✅ Service uninstalled (daemonclaw + watchdog units)");
+            println!("✅ Service uninstalled (daemonclaw + watchdog + witness units)");
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/daemonclaw");
@@ -1073,6 +1075,9 @@ WantedBy=multi-user.target
     let tmpfiles_path = Path::new("/etc/tmpfiles.d/daemonclaw-backups.conf");
     let watchdog_timer_path = Path::new("/etc/systemd/system/daemonclaw-watchdog.timer");
     let watchdog_svc_path = Path::new("/etc/systemd/system/daemonclaw-watchdog.service");
+    let witness_timer_path = Path::new("/etc/systemd/system/daemonclaw-witness.timer");
+    let witness_svc_path = Path::new("/etc/systemd/system/daemonclaw-witness.service");
+    let witness_dir = Path::new("/var/lib/daemonclaw-witness");
 
     if dry_run {
         println!("[dry-run] would write systemd units and backup infrastructure");
@@ -1148,6 +1153,53 @@ WantedBy=multi-user.target
         fs::write(watchdog_svc_path, &watchdog_svc)
             .with_context(|| format!("write {}", watchdog_svc_path.display()))?;
 
+        // Witness: root-owned anchor chain for audit tail-truncation detection
+        let audit_db_path = format!("{home}/.daemonclaw/workspace/audit/audit.db", home = HOME_DIR);
+        let anchor_path = "/var/lib/daemonclaw-witness/anchors.jsonl";
+
+        if !witness_dir.exists() {
+            fs::create_dir_all(witness_dir)
+                .with_context(|| format!("mkdir {}", witness_dir.display()))?;
+            set_mode(witness_dir, 0o755)?;
+            set_owner(witness_dir, "root", "root")?;
+        }
+
+        // Touch anchor file with root ownership
+        let anchor_file = witness_dir.join("anchors.jsonl");
+        if !anchor_file.exists() {
+            fs::write(&anchor_file, "")
+                .with_context(|| format!("touch {}", anchor_file.display()))?;
+            set_mode(&anchor_file, 0o644)?;
+            set_owner(&anchor_file, "root", "root")?;
+        }
+
+        let witness_timer = "[Unit]\n\
+             Description=DaemonClaw audit chain witness anchor\n\n\
+             [Timer]\n\
+             OnActiveSec=5min\n\
+             OnUnitActiveSec=5min\n\
+             AccuracySec=1min\n\
+             Persistent=true\n\n\
+             [Install]\n\
+             WantedBy=timers.target\n";
+        fs::write(witness_timer_path, witness_timer)
+            .with_context(|| format!("write {}", witness_timer_path.display()))?;
+
+        let witness_svc = format!(
+            "[Unit]\n\
+             Description=DaemonClaw audit chain witness anchor\n\n\
+             [Service]\n\
+             Type=oneshot\n\
+             ExecStart={bin} witness-anchor --db-path {db} --anchor-path {anchor}\n\
+             User=root\n\
+             Group=root\n",
+            bin = target_bin.display(),
+            db = audit_db_path,
+            anchor = anchor_path,
+        );
+        fs::write(witness_svc_path, &witness_svc)
+            .with_context(|| format!("write {}", witness_svc_path.display()))?;
+
         // Enable units
         run_install_cmd("systemctl", &["daemon-reload"])?;
         run_install_cmd("systemctl", &["enable", "daemonclaw.service"])?;
@@ -1155,6 +1207,8 @@ WantedBy=multi-user.target
         run_install_cmd("systemctl", &["start", "daemonclaw-backup.timer"])?;
         run_install_cmd("systemctl", &["enable", "daemonclaw-watchdog.timer"])?;
         run_install_cmd("systemctl", &["start", "daemonclaw-watchdog.timer"])?;
+        run_install_cmd("systemctl", &["enable", "daemonclaw-witness.timer"])?;
+        run_install_cmd("systemctl", &["start", "daemonclaw-witness.timer"])?;
 
         // Copy binary
         if exe.to_string_lossy() != target_bin.to_string_lossy() {

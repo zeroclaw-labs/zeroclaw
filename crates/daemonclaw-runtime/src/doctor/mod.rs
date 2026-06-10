@@ -83,6 +83,7 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     check_config_semantics(config, &mut items);
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
+    check_audit_chain(config, &mut items);
     check_environment(&mut items);
     check_cli_tools(&mut items);
 
@@ -929,6 +930,68 @@ fn check_daemon_state_legacy(config: &Config, items: &mut Vec<DiagItem>) {
             items.push(DiagItem::ok(cat, format!("heartbeat fresh ({age}s ago) [legacy JSON]")));
         } else {
             items.push(DiagItem::error(cat, format!("heartbeat stale ({age}s ago) [legacy JSON]")));
+        }
+    }
+}
+
+// ── Audit chain checks ──────────────────────────────────────────
+
+fn check_audit_chain(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "audit";
+    let audit_db = config.workspace_dir.join("audit").join("audit.db");
+
+    if !audit_db.exists() {
+        items.push(DiagItem::warn(cat, "audit.db not found (audit may not be enabled)"));
+        return;
+    }
+
+    // Internal linkage check
+    match crate::security::audit::verify_chain(&audit_db) {
+        Ok(count) => {
+            items.push(DiagItem::ok(cat, format!("chain integrity: {count} entries verified")));
+        }
+        Err(e) => {
+            items.push(DiagItem::error(cat, format!("chain integrity FAILED: {e}")));
+        }
+    }
+
+    // Anchor cross-check
+    let anchor_path = std::path::Path::new("/var/lib/daemonclaw-witness/anchors.jsonl");
+    match crate::security::audit::verify_chain_anchored(&audit_db, anchor_path) {
+        Ok(result) => {
+            match &result.anchor_status {
+                crate::security::audit::AnchorStatus::Verified => {
+                    if let Some(ref anchor) = result.latest_anchor {
+                        items.push(DiagItem::ok(
+                            cat,
+                            format!("anchor verified (seq={}, ts={})", anchor.sequence, anchor.ts),
+                        ));
+                    } else {
+                        items.push(DiagItem::ok(cat, "anchor verified".to_string()));
+                    }
+                }
+                crate::security::audit::AnchorStatus::NoAnchor => {
+                    items.push(DiagItem::warn(
+                        cat,
+                        format!("no anchor file at {} (install daemonclaw-witness.timer)", anchor_path.display()),
+                    ));
+                }
+                crate::security::audit::AnchorStatus::AnchorMismatch { expected_seq, .. } => {
+                    items.push(DiagItem::error(
+                        cat,
+                        format!("anchor MISMATCH at seq={expected_seq} — possible tail truncation"),
+                    ));
+                }
+                crate::security::audit::AnchorStatus::AnchorUnreadable(e) => {
+                    items.push(DiagItem::warn(
+                        cat,
+                        format!("anchor file unreadable: {e}"),
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            items.push(DiagItem::warn(cat, format!("anchor check failed: {e}")));
         }
     }
 }

@@ -685,6 +685,37 @@ timer. It does not load config or initialize logging."
         state_dir: PathBuf,
     },
 
+    /// Anchor the audit chain tip to the root-owned witness file.
+    ///
+    /// Reads audit.db read-only, appends (sequence, entry_hash, ts, chain_id)
+    /// to the anchor file. Intended to be called by the daemonclaw-witness
+    /// systemd timer running as root. Does not load config or initialize logging.
+    #[command(name = "witness-anchor", hide = true)]
+    WitnessAnchor {
+        /// Path to audit.db
+        #[arg(long)]
+        db_path: PathBuf,
+
+        /// Path to the anchor JSONL file
+        #[arg(long, default_value = "/var/lib/daemonclaw-witness/anchors.jsonl")]
+        anchor_path: PathBuf,
+    },
+
+    /// Audit chain inspection and verification
+    #[command(long_about = "\
+Inspect and verify the audit chain.
+
+Verify internal Merkle hash-chain integrity and cross-check against
+root-owned anchor records to detect tail truncation.
+
+Examples:
+  daemonclaw audit verify
+  daemonclaw audit verify --anchor-path /var/lib/daemonclaw-witness/anchors.jsonl")]
+    Audit {
+        #[command(subcommand)]
+        audit_command: AuditCommands,
+    },
+
     /// Deprecated: use `daemonclaw config` instead
     #[command(hide = true)]
     Props {
@@ -1047,6 +1078,16 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum AuditCommands {
+    /// Verify audit chain integrity (internal linkage + anchor cross-check)
+    Verify {
+        /// Path to the anchor JSONL file
+        #[arg(long, default_value = "/var/lib/daemonclaw-witness/anchors.jsonl")]
+        anchor_path: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MemoryCommands {
     /// List memory entries with optional filters
     List {
@@ -1130,6 +1171,46 @@ async fn main() -> Result<()> {
             );
             std::process::exit(1);
         }
+        std::process::exit(0);
+    }
+
+    // WitnessAnchor: early intercept like WatchdogCheck — no config load needed.
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::WitnessAnchor {
+        db_path,
+        anchor_path,
+    } = &cli.command
+    {
+        // Read chain tip (read-only)
+        let tip = security::read_chain_tip(db_path)?;
+        let Some((sequence, entry_hash)) = tip else {
+            // Empty chain — nothing to anchor
+            std::process::exit(0);
+        };
+
+        // Check if anchor already covers this sequence
+        if let Ok(Some(latest)) = security::read_latest_anchor(anchor_path) {
+            if latest.sequence == sequence {
+                // No advance — skip
+                std::process::exit(0);
+            }
+        }
+
+        // Compute chain_id from genesis entry
+        let chain_id = match security::read_genesis_hash(db_path)? {
+            Some(genesis_hash) => security::compute_chain_id(&genesis_hash),
+            None => String::new(),
+        };
+
+        let record = security::AnchorRecord {
+            sequence,
+            entry_hash,
+            ts: chrono::Utc::now().to_rfc3339(),
+            chain_id,
+            signature: None,
+        };
+
+        security::append_anchor(anchor_path, &record)?;
         std::process::exit(0);
     }
 
@@ -1405,7 +1486,7 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     match cli.command {
-        Commands::Onboard { .. } | Commands::Completions { .. } | Commands::WatchdogCheck { .. } => unreachable!(),
+        Commands::Onboard { .. } | Commands::Completions { .. } | Commands::WatchdogCheck { .. } | Commands::WitnessAnchor { .. } => unreachable!(),
 
         Commands::Agent {
             message,
@@ -2271,6 +2352,65 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        Commands::Audit { audit_command } => {
+            match audit_command {
+                AuditCommands::Verify { anchor_path } => {
+                    let audit_db = config.workspace_dir.join("audit").join("audit.db");
+                    if !audit_db.exists() {
+                        bail!("audit.db not found at {}", audit_db.display());
+                    }
+
+                    let result = security::verify_chain_anchored(&audit_db, &anchor_path)?;
+
+                    // Internal chain
+                    if result.internal_ok {
+                        println!("Internal chain: OK ({} entries)", result.chain_length);
+                    } else {
+                        println!("Internal chain: FAILED ({} entries)", result.chain_length);
+                    }
+
+                    // Anchor status
+                    match &result.anchor_status {
+                        security::AnchorStatus::Verified => {
+                            if let Some(ref anchor) = result.latest_anchor {
+                                println!(
+                                    "Anchor: VERIFIED (seq={}, chain_id={})",
+                                    anchor.sequence,
+                                    &anchor.chain_id[..16.min(anchor.chain_id.len())]
+                                );
+                            } else {
+                                println!("Anchor: VERIFIED");
+                            }
+                        }
+                        security::AnchorStatus::NoAnchor => {
+                            println!("Anchor: NONE (no anchor file or records at {})", anchor_path.display());
+                        }
+                        security::AnchorStatus::AnchorMismatch {
+                            expected_seq,
+                            expected_hash,
+                            found_hash,
+                        } => {
+                            println!("Anchor: MISMATCH");
+                            println!("  expected seq={} hash={}", expected_seq, &expected_hash[..16.min(expected_hash.len())]);
+                            match found_hash {
+                                Some(h) => println!("  found hash={}", &h[..16.min(h.len())]),
+                                None => println!("  sequence {} not found in chain", expected_seq),
+                            }
+                            std::process::exit(1);
+                        }
+                        security::AnchorStatus::AnchorUnreadable(e) => {
+                            println!("Anchor: UNREADABLE ({})", e);
+                        }
+                    }
+
+                    if !result.internal_ok {
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Ok(())
+        }
 
         Commands::Props { .. } => {
             anyhow::bail!(
