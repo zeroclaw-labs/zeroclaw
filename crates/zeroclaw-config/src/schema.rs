@@ -2547,6 +2547,183 @@ pub struct LeptonModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Morph ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MorphEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for MorphEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.morphllm.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.morph"]
+pub struct MorphModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── GitHub Models ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GithubModelsEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for GithubModelsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://models.github.ai/inference",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.github_models"]
+pub struct GithubModelsModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Upstage ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UpstageEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for UpstageEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.upstage.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.upstage"]
+pub struct UpstageModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Featherless ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FeatherlessEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for FeatherlessEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.featherless.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.featherless"]
+pub struct FeatherlessModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Arcee ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ArceeEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ArceeEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            // Arcee publishes its OpenAI-compatible API at the `/api/v1` path
+            // (not the conventional `/v1` root). Confirmed against Arcee docs.
+            Self::Default => "https://api.arcee.ai/api/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.arcee"]
+pub struct ArceeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Lambda AI ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LambdaAiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for LambdaAiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.lambda.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.lambda_ai"]
+pub struct LambdaAiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Inception ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum InceptionEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for InceptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.inceptionlabs.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.inception"]
+pub struct InceptionModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Synthetic ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2761,6 +2938,13 @@ impl_default_family_endpoint! {
     OsaurusModelProviderConfig,
     LitellmModelProviderConfig,
     LeptonModelProviderConfig,
+    MorphModelProviderConfig,
+    GithubModelsModelProviderConfig,
+    UpstageModelProviderConfig,
+    FeatherlessModelProviderConfig,
+    ArceeModelProviderConfig,
+    LambdaAiModelProviderConfig,
+    InceptionModelProviderConfig,
     SyntheticModelProviderConfig,
     OpencodeModelProviderConfig,
     KiloCliModelProviderConfig,
@@ -7475,7 +7659,7 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -7495,6 +7679,19 @@ pub struct CodexCliConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_codex_cli_timeout_secs() -> u64 {
@@ -7512,6 +7709,7 @@ impl Default for CodexCliConfig {
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -9445,7 +9643,10 @@ pub struct RuntimeProfileConfig {
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
-    /// Maximum actions allowed per hour. `0` inherits the global limit.
+    /// Maximum actions allowed per hour. `0` is a hard zero budget — the
+    /// per-sender rate tracker treats a max of 0 as always exhausted
+    /// (`PerSenderTracker::is_exhausted`), blocking every action. For an
+    /// effectively-unlimited budget use a high value (e.g. `u32::MAX`), not 0.
     /// `SecurityPolicy::ensure_no_escalation_beyond` rejects subagents
     /// that try to raise this above the parent's value.
     pub max_actions_per_hour: u32,
@@ -9825,12 +10026,12 @@ impl Default for SchedulerConfig {
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// model_provider = "openrouter"
+/// model_provider = "openrouter.default"
 /// model = "anthropic/claude-opus-4-20250514"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// model_provider = "groq"
+/// model_provider = "groq.low-latency"
 /// model = "llama-3.3-70b-versatile"
 /// ```
 ///
@@ -9840,9 +10041,9 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Model provider to route to (must match a known model-provider name)
+    /// Dotted provider profile ref to route to (must resolve to providers.models.<type>.<alias>)
     pub model_provider: String,
-    /// Model to use with that model provider
+    /// Provider-local model identifier to use with that provider profile
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
@@ -9856,7 +10057,7 @@ pub struct ModelRouteConfig {
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// model_provider = "openai"
+/// model_provider = "openai.embeddings"
 /// model = "text-embedding-3-small"
 /// dimensions = 1536
 ///
@@ -9868,9 +10069,9 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
+    /// Dotted embedding-capable provider profile ref
     pub model_provider: String,
-    /// Embedding model to use with that model provider
+    /// Provider-local embedding model identifier to use with that provider profile
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
@@ -10473,6 +10674,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub irc: HashMap<String, IrcConfig>,
+    /// Twitch chat channel instances (`[channels.twitch.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub twitch: HashMap<String, TwitchConfig>,
     /// Lark channel instances (`[channels.lark.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10540,6 +10745,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
+    /// AMQP channel instances (`[channels.amqp.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub amqp: HashMap<String, AmqpConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -10670,6 +10879,12 @@ impl ChannelsConfig {
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
+                kind: "twitch",
+                name: "Twitch",
+                desc: "Twitch chat (IRC)",
+                configured: !self.twitch.is_empty(),
+            },
+            ChannelInfo {
                 kind: "irc",
                 name: "IRC",
                 desc: "IRC over TLS",
@@ -10772,6 +10987,12 @@ impl ChannelsConfig {
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
+                kind: "amqp",
+                name: "AMQP",
+                desc: "AMQP topic consumer",
+                configured: !self.amqp.is_empty(),
+            },
+            ChannelInfo {
                 kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
@@ -10801,6 +11022,7 @@ impl ChannelsConfig {
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
             || self.irc.values().any(|c| c.enabled)
+            || self.twitch.values().any(|c| c.enabled)
             || self.lark.values().any(|c| c.enabled)
             || self.line.values().any(|c| c.enabled)
             || self.dingtalk.values().any(|c| c.enabled)
@@ -10818,6 +11040,7 @@ impl ChannelsConfig {
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
+            || self.amqp.values().any(|c| c.enabled)
     }
 }
 
@@ -10848,6 +11071,7 @@ impl Default for ChannelsConfig {
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -10865,6 +11089,7 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -12147,6 +12372,152 @@ fn default_mqtt_keep_alive_secs() -> u64 {
     30
 }
 
+/// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
+///
+/// Subscribes to an exchange via routing keys and lifts each delivery into an
+/// inbound `ChannelMessage`. The mapping from a JSON delivery body to message
+/// fields is config-driven (`content_template`, `thread_id_field`) so a new
+/// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
+/// configuration rather than code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.amqp"]
+pub struct AmqpConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
+    /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[tab(Connection)]
+    pub amqp_url: String,
+    /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
+    #[tab(Advanced)]
+    pub exchange: String,
+    /// Routing keys to bind. Scope these to the topics of interest; binding
+    /// `#` consumes the entire exchange and is almost never what you want.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub routing_keys: Vec<String>,
+    /// Queue name. Leave unset for a server-generated, transient,
+    /// auto-deleted, exclusive queue. Set a stable name (UUID recommended)
+    /// only when durable delivery across reconnects is required.
+    #[tab(Advanced)]
+    pub queue: Option<String>,
+    /// Path to the CA certificate bundle for `amqps://` connections.
+    #[tab(Connection)]
+    pub ca_cert: Option<PathBuf>,
+    /// Path to the client certificate for broker mutual-TLS auth
+    /// (Fedora Messaging requires a client cert).
+    #[tab(Connection)]
+    pub client_cert: Option<PathBuf>,
+    /// Path to the client private key matching `client_cert`.
+    #[tab(Connection)]
+    pub client_key: Option<PathBuf>,
+    /// Value placed in `ChannelMessage.sender` for every delivery from this
+    /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
+    /// per-channel routing identify the origin.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_sender_label")]
+    pub sender_label: String,
+    /// Template for the inbound message content. `{field}` placeholders are
+    /// interpolated from the JSON delivery body's top-level keys. When empty,
+    /// the raw delivery body is used verbatim.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub content_template: String,
+    /// Dotted path into the JSON delivery body whose value becomes the
+    /// message `thread_ts`, correlating replies to the originating event
+    /// (e.g. `message.project.name`). Empty disables threading.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub thread_id_field: String,
+    /// Acknowledgement mode. When `true` (default), deliveries are acked only
+    /// after the message is durably handed to the agent loop, giving
+    /// at-least-once semantics: a crash before hand-off redelivers the event.
+    /// Set `false` for at-most-once (broker acks on dispatch), which silently
+    /// drops in-flight events on crash and is only appropriate for
+    /// non-side-effecting, drop-on-overload consumers.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_durable_ack")]
+    pub durable_ack: bool,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl AmqpConfig {
+    /// Validate the AMQP configuration.
+    ///
+    /// Checks:
+    /// - `amqp_url` uses a valid scheme (`amqp://` or `amqps://`)
+    /// - `amqps://` connections carry a CA certificate
+    /// - `client_cert` and `client_key` are supplied together (mutual TLS)
+    /// - the exchange is non-empty
+    /// - at least one routing key is bound
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let is_tls = self.amqp_url.starts_with("amqps://");
+        let is_plain = self.amqp_url.starts_with("amqp://");
+
+        if !is_tls && !is_plain {
+            anyhow::bail!(
+                "amqp_url must start with 'amqp://' or 'amqps://', got: {}",
+                self.amqp_url
+            );
+        }
+
+        if is_tls && self.ca_cert.is_none() {
+            anyhow::bail!("amqps:// requires ca_cert to verify the broker");
+        }
+
+        match (self.client_cert.is_some(), self.client_key.is_some()) {
+            (true, false) => {
+                anyhow::bail!(
+                    "client_cert is set but client_key is missing (both are required for mutual TLS)"
+                )
+            }
+            (false, true) => {
+                anyhow::bail!(
+                    "client_key is set but client_cert is missing (both are required for mutual TLS)"
+                )
+            }
+            _ => {}
+        }
+
+        if self.exchange.is_empty() {
+            validation_bail!(RequiredFieldEmpty, "exchange", "exchange must not be empty");
+        }
+
+        if self.routing_keys.is_empty() {
+            anyhow::bail!("at least one routing key must be configured");
+        }
+
+        Ok(())
+    }
+}
+
+impl ChannelConfig for AmqpConfig {
+    fn name() -> &'static str {
+        "AMQP"
+    }
+    fn desc() -> &'static str {
+        "AMQP topic consumer"
+    }
+}
+
+fn default_amqp_sender_label() -> String {
+    "amqp".to_string()
+}
+
+fn default_amqp_durable_ack() -> bool {
+    true
+}
+
 /// IRC channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -12213,6 +12584,50 @@ impl ChannelConfig for IrcConfig {
     }
     fn desc() -> &'static str {
         "IRC over TLS"
+    }
+}
+
+/// Twitch chat channel configuration. A thin adapter over IRC
+/// (`irc.chat.twitch.tv:6697` over TLS); see the `twitch` channel module.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.twitch"]
+pub struct TwitchConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Twitch login name of the bot account (case-insensitive — lowercased
+    /// before send).
+    #[tab(Connection)]
+    pub bot_username: String,
+    /// Twitch OAuth user-access token. The `oauth:` prefix is added
+    /// automatically if missing, so both `"oauth:abcdef"` and `"abcdef"`
+    /// work. Mint via <https://twitchapps.com/tmi/> or the Twitch CLI.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub oauth_token: String,
+    /// Twitch channels to join. Each entry receives a `#` prefix if missing
+    /// and is lowercased before send (Twitch channel names are
+    /// case-insensitive). E.g. `["mychannel", "#anotherchannel"]`.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// When true, only respond to messages that mention the bot's login
+    /// name. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_only: bool,
+}
+
+impl ChannelConfig for TwitchConfig {
+    fn name() -> &'static str {
+        "Twitch"
+    }
+    fn desc() -> &'static str {
+        "Twitch chat (IRC)"
     }
 }
 
@@ -16261,6 +16676,11 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        // Stamp the current schema version on every write. The in-memory
+        // config is always at `CURRENT_SCHEMA_VERSION` (load-time migration
+        // brings it forward), but pin it explicitly so a full save can never
+        // emit a body-newer-than-label file. See `save_dirty` and #7271.
+        config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
         let zeroclaw_dir = config_path
             .parent()
@@ -16381,6 +16801,19 @@ impl Config {
         for path in &self.dirty_paths {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table);
         }
+
+        // Stamp the current schema version. An incremental save writes
+        // current-schema-shaped sections (e.g. the dashboard saving a single
+        // `agents.<name>.model_provider`) but `schema_version` is never a
+        // dirty path, so without this it keeps whatever an older binary first
+        // wrote on disk. The resulting body-newer-than-label file then crashes
+        // older binaries with an opaque `missing field ...` serde error. See
+        // #7271. `insert` updates the existing key in place (preserving its
+        // position at the top of the file) or appends it when absent.
+        doc.as_table_mut().insert(
+            "schema_version",
+            toml_edit::value(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
+        );
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
@@ -16846,6 +17279,13 @@ impl_enum_prop_kind!(
     OsaurusEndpoint,
     LitellmEndpoint,
     LeptonEndpoint,
+    MorphEndpoint,
+    GithubModelsEndpoint,
+    UpstageEndpoint,
+    FeatherlessEndpoint,
+    ArceeEndpoint,
+    LambdaAiEndpoint,
+    InceptionEndpoint,
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
@@ -16868,6 +17308,43 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    async fn amqp_validate_requires_paired_client_cert_and_key() {
+        let base = AmqpConfig {
+            enabled: true,
+            amqp_url: "amqps://broker.example.org:5671/%2Fpublic".into(),
+            exchange: "amq.topic".into(),
+            routing_keys: vec!["org.example.release".into()],
+            ca_cert: Some(std::path::PathBuf::from("/etc/ssl/ca.pem")),
+            ..AmqpConfig::default()
+        };
+
+        // Both absent: server-auth only, valid.
+        assert!(base.validate().is_ok());
+
+        // Cert without key: invalid.
+        let cert_only = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            ..base.clone()
+        };
+        assert!(cert_only.validate().is_err());
+
+        // Key without cert: invalid.
+        let key_only = AmqpConfig {
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base.clone()
+        };
+        assert!(key_only.validate().is_err());
+
+        // Both present: valid.
+        let both = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base
+        };
+        assert!(both.validate().is_ok());
+    }
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -17672,6 +18149,7 @@ auto_save = true
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
                 irc: HashMap::new(),
+                twitch: HashMap::new(),
                 lark: HashMap::new(),
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
@@ -17689,6 +18167,7 @@ auto_save = true
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
+                amqp: HashMap::new(),
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -19128,6 +19607,7 @@ allowed_users = ["@u:matrix.org"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -19145,6 +19625,7 @@ allowed_users = ["@u:matrix.org"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -19568,6 +20049,7 @@ allowed_numbers = ["+1", "+2"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -19585,6 +20067,7 @@ allowed_numbers = ["+1", "+2"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -21494,6 +21977,55 @@ group_policy = "disabled"
         assert_eq!(
             hardened_mode, 0o600,
             "Saving config should restore owner-only permissions (0600)"
+        );
+    }
+
+    #[test]
+    async fn save_dirty_stamps_current_schema_version_on_stale_label() {
+        // Regression for #7271. An incremental save writes current-schema-shaped
+        // sections, but `schema_version` is never a dirty path. Without an
+        // explicit stamp, a file first written by an older binary keeps its
+        // stale `schema_version` label while gaining a current-schema body — a
+        // state that crashes older binaries with `missing field ...`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file labeled with a stale schema version so the
+        // incremental path (not the new-file fallback to full `save`) runs.
+        std::fs::write(
+            &config_path,
+            "schema_version = 2\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.observability.backend = "otel".to_string();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains(&format!(
+                "schema_version = {}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            )),
+            "save_dirty must stamp the current schema_version; got:\n{written}"
+        );
+        assert!(
+            !written.contains("schema_version = 2"),
+            "stale schema_version label must be overwritten; got:\n{written}"
+        );
+        // The dirty value still lands, and the stamp sits at the top of the file.
+        assert!(
+            written.contains("backend = \"otel\""),
+            "dirty value must still be written; got:\n{written}"
+        );
+        assert!(
+            written.trim_start().starts_with("schema_version ="),
+            "schema_version should remain the first key; got:\n{written}"
         );
     }
 
