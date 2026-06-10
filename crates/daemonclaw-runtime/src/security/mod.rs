@@ -50,7 +50,12 @@ pub mod webauthn;
 pub mod workspace_boundary;
 
 #[allow(unused_imports)]
-pub use audit::{AuditEvent, AuditEventType, AuditLogger};
+pub use audit::{
+    AuditEvent, AuditEventType, AuditLogger,
+    AnchorRecord, AnchorStatus, AnchoredVerification,
+    append_anchor, compute_chain_id, read_chain_tip, read_genesis_hash,
+    read_latest_anchor, verify_chain, verify_chain_anchored,
+};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;

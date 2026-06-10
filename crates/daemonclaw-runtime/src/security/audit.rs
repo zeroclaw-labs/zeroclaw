@@ -642,6 +642,218 @@ pub fn verify_chain(db_path: &Path) -> Result<u64> {
     Ok(expected_sequence)
 }
 
+// ── Anchor-chain anchoring (Track H) ─────────────────────────────
+//
+// A root-run systemd timer reads the chain tip (read-only) and appends
+// it to a root-owned anchor file. The daemon has verification-only
+// access. This makes tail-truncation detectable even if the daemon
+// user has owner-write on audit.db.
+
+/// A single witness anchor record written to the anchor file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorRecord {
+    pub sequence: u64,
+    pub entry_hash: String,
+    pub ts: String,
+    pub chain_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signature: Option<String>,
+}
+
+/// Result of anchor verification against the audit chain.
+#[derive(Debug)]
+pub enum AnchorStatus {
+    /// The latest anchor matches the audit chain.
+    Verified,
+    /// No anchor file or no anchor records found.
+    NoAnchor,
+    /// The anchor does not match the current chain state.
+    AnchorMismatch {
+        expected_seq: u64,
+        expected_hash: String,
+        found_hash: Option<String>,
+    },
+    /// The anchor file could not be read.
+    AnchorUnreadable(String),
+}
+
+/// Combined result of internal chain verification + anchor check.
+#[derive(Debug)]
+pub struct AnchoredVerification {
+    pub chain_length: u64,
+    pub internal_ok: bool,
+    pub anchor_status: AnchorStatus,
+    pub latest_anchor: Option<AnchorRecord>,
+}
+
+/// Read the chain tip (latest sequence + entry_hash) from audit.db using a read-only connection.
+pub fn read_chain_tip(db_path: &Path) -> Result<Option<(u64, String)>> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(db_path, flags)
+        .with_context(|| format!("Failed to open audit.db read-only: {}", db_path.display()))?;
+
+    let result: std::result::Result<(i64, String), _> = conn.query_row(
+        "SELECT sequence, entry_hash FROM audit_events ORDER BY id DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+
+    match result {
+        Ok((seq, hash)) => Ok(Some((seq as u64, hash))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the genesis entry's entry_hash from audit.db (used to compute chain_id).
+pub fn read_genesis_hash(db_path: &Path) -> Result<Option<String>> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(db_path, flags)?;
+
+    let result: std::result::Result<String, _> = conn.query_row(
+        "SELECT entry_hash FROM audit_events ORDER BY id ASC LIMIT 1",
+        [],
+        |row| row.get(0),
+    );
+
+    match result {
+        Ok(hash) => Ok(Some(hash)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Compute the chain_id: SHA-256 of the genesis entry's entry_hash.
+pub fn compute_chain_id(genesis_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(genesis_hash.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Read the latest anchor record from the anchor file (last non-empty line).
+pub fn read_latest_anchor(anchor_path: &Path) -> Result<Option<AnchorRecord>> {
+    let content = match std::fs::read_to_string(anchor_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let last_line = content
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty());
+
+    match last_line {
+        Some(line) => {
+            let record: AnchorRecord = serde_json::from_str(line)
+                .with_context(|| "Failed to parse last anchor record")?;
+            Ok(Some(record))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Verify audit chain integrity with anchor cross-check.
+///
+/// 1. Runs internal chain verification via `verify_chain`.
+/// 2. Reads the latest anchor from the anchor file.
+/// 3. If an anchor exists, verifies that the anchored (sequence, entry_hash)
+///    pair still exists in the database and the chain tip is >= anchor sequence.
+pub fn verify_chain_anchored(db_path: &Path, anchor_path: &Path) -> Result<AnchoredVerification> {
+    // Internal linkage check
+    let (chain_length, internal_ok) = match verify_chain(db_path) {
+        Ok(count) => (count, true),
+        Err(_) => {
+            // Try to get chain length even on failure
+            let len = read_chain_tip(db_path)
+                .ok()
+                .flatten()
+                .map(|(seq, _)| seq + 1)
+                .unwrap_or(0);
+            (len, false)
+        }
+    };
+
+    // Read latest anchor
+    let latest_anchor = match read_latest_anchor(anchor_path) {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(AnchoredVerification {
+                chain_length,
+                internal_ok,
+                anchor_status: AnchorStatus::AnchorUnreadable(e.to_string()),
+                latest_anchor: None,
+            });
+        }
+    };
+
+    let anchor_status = match &latest_anchor {
+        None => AnchorStatus::NoAnchor,
+        Some(anchor) => {
+            // Verify that the anchor's (sequence, entry_hash) exists in the DB
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let conn = Connection::open_with_flags(db_path, flags)?;
+
+            let db_hash: std::result::Result<String, _> = conn.query_row(
+                "SELECT entry_hash FROM audit_events WHERE sequence = ?1",
+                params![anchor.sequence as i64],
+                |row| row.get(0),
+            );
+
+            match db_hash {
+                Ok(hash) if hash == anchor.entry_hash => {
+                    // Also verify chain tip >= anchor sequence
+                    if chain_length > 0 && (chain_length - 1) >= anchor.sequence {
+                        AnchorStatus::Verified
+                    } else {
+                        AnchorStatus::AnchorMismatch {
+                            expected_seq: anchor.sequence,
+                            expected_hash: anchor.entry_hash.clone(),
+                            found_hash: Some(hash),
+                        }
+                    }
+                }
+                Ok(hash) => AnchorStatus::AnchorMismatch {
+                    expected_seq: anchor.sequence,
+                    expected_hash: anchor.entry_hash.clone(),
+                    found_hash: Some(hash),
+                },
+                Err(_) => AnchorStatus::AnchorMismatch {
+                    expected_seq: anchor.sequence,
+                    expected_hash: anchor.entry_hash.clone(),
+                    found_hash: None,
+                },
+            }
+        }
+    };
+
+    Ok(AnchoredVerification {
+        chain_length,
+        internal_ok,
+        anchor_status,
+        latest_anchor,
+    })
+}
+
+/// Append an anchor record to the anchor file (JSON Lines format).
+pub fn append_anchor(anchor_path: &Path, record: &AnchorRecord) -> Result<()> {
+    if let Some(parent) = anchor_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create anchor directory: {}", parent.display()))?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(anchor_path)
+        .with_context(|| format!("Failed to open anchor file: {}", anchor_path.display()))?;
+
+    let json = serde_json::to_string(record)?;
+    use std::io::Write;
+    writeln!(file, "{}", json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
