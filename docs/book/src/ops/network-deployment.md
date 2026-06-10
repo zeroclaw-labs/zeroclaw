@@ -4,7 +4,7 @@ Deploying ZeroClaw so it can receive inbound traffic: gateway exposure, webhook 
 
 ## When inbound ports matter
 
-| Mode | Needs inbound port | Notes |
+| Mode | Inbound port? | Notes |
 |---|:---:|---|
 | Telegram (long-poll) | No | ZeroClaw polls `api.telegram.org`, works behind NAT |
 | Matrix / Mattermost / Nextcloud Talk | No | Sync/WebSocket, outbound only |

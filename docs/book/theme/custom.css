@@ -428,6 +428,11 @@ pre > .buttons .clip-button:hover {
   border-bottom: 1px solid var(--pc-border-strong);
   padding: 0.5rem 0.9rem;
   vertical-align: middle;
+  /* Header labels are short; keep them on one line so a narrow column does not
+     stack a two-word header (e.g. "Inbound port?") into ragged lines. Prose in
+     body cells still wraps, and a genuinely wide table scrolls via
+     `.table-wrapper`. */
+  white-space: nowrap;
 }
 
 .content table td {
