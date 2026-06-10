@@ -80,6 +80,7 @@ jobs:
           --features ci-all
           -- -D warnings
       - name: Config-write isolation guard
+        if: runner.os == 'Linux'
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         if: runner.os == 'Linux'
