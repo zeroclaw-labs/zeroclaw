@@ -112,6 +112,10 @@ pub struct DelegateTool {
 }
 
 impl DelegateTool {
+    /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
+    /// rename cannot desync the two.
+    pub const NAME: &'static str = "delegate";
+
     pub fn new(
         agents: HashMap<String, AliasedAgentConfig>,
         global_credential: Option<String>,
@@ -550,7 +554,7 @@ impl DelegateTool {
 #[async_trait]
 impl Tool for DelegateTool {
     fn name(&self) -> &str {
-        "delegate"
+        Self::NAME
     }
 
     fn description(&self) -> &str {

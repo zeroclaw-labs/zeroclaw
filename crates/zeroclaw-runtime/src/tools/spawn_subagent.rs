@@ -28,6 +28,10 @@ pub struct SpawnSubagentTool {
 }
 
 impl SpawnSubagentTool {
+    /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
+    /// rename cannot desync the two.
+    pub const NAME: &'static str = "spawn_subagent";
+
     pub fn new(config: Arc<Config>, parent_alias: impl Into<String>) -> Self {
         Self {
             config,
@@ -49,7 +53,7 @@ impl SpawnSubagentTool {
 #[async_trait]
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str {
-        "spawn_subagent"
+        Self::NAME
     }
 
     fn description(&self) -> &str {

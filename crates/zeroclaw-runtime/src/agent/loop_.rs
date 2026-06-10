@@ -2493,7 +2493,8 @@ pub async fn run_tool_call_loop(
                     serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
                 (tool_name.trim().to_ascii_lowercase(), args_json)
             };
-            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
+            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name)
+                || crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
             if !dedup_exempt && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
@@ -2844,11 +2845,15 @@ pub async fn run_tool_call_loop(
                 history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
             }
         } else {
-            for (native_call, (_, result)) in
-                native_tool_calls.iter().zip(individual_results.iter())
-            {
+            // `zip` would drop trailing results on any length divergence,
+            // leaving a native tool_use id with no matching tool_result.
+            // Pair on each result's own id instead.
+            for (idx, (tool_call_id, result)) in individual_results.iter().enumerate() {
+                let resolved_id = tool_call_id
+                    .clone()
+                    .or_else(|| native_tool_calls.get(idx).map(|call| call.id.clone()));
                 let tool_msg = serde_json::json!({
-                    "tool_call_id": native_call.id,
+                    "tool_call_id": resolved_id,
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
@@ -5815,6 +5820,39 @@ mod tests {
             self.capabilities.native_tool_calling = true;
             self
         }
+
+        /// Build a native-tool-calling provider: one turn of structured
+        /// `tool_calls`, then a plain-text turn.
+        fn from_native_tool_calls(calls: Vec<(&str, &str, &str)>, final_text: &str) -> Self {
+            let tool_turn = ChatResponse {
+                text: None,
+                tool_calls: calls
+                    .into_iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                        extra_content: None,
+                    })
+                    .collect(),
+                usage: None,
+                reasoning_content: None,
+            };
+            let final_turn = ChatResponse {
+                text: Some(final_text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            };
+            let capabilities = ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            };
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::from(vec![tool_turn, final_turn]))),
+                capabilities,
+            }
+        }
     }
 
     #[async_trait]
@@ -7162,6 +7200,112 @@ mod tests {
         );
     }
 
+    /// Regression: a native provider emitting multiple parallel tool calls
+    /// in one turn must yield one role=tool message per call, each keyed to
+    /// its own tool_call_id and output.
+    #[tokio::test]
+    async fn run_tool_call_loop_native_emits_tool_message_per_parallel_call() {
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![
+                ("call_a", "delay_a", r#"{"value":"A"}"#),
+                ("call_b", "delay_b", r#"{"value":"B"}"#),
+                ("call_c", "delay_c", r#"{"value":"C"}"#),
+            ],
+            "done",
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_c",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+        ];
+
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run three tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            true, // parallel_tools
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("native parallel execution should complete");
+
+        assert!(result.ends_with("done"), "got: {result}");
+
+        let tool_messages: Vec<&ChatMessage> =
+            history.iter().filter(|msg| msg.role == "tool").collect();
+        assert_eq!(
+            tool_messages.len(),
+            3,
+            "every parallel native call must yield its own role=tool message, got: {tool_messages:?}"
+        );
+
+        for (id, value) in [("call_a", "A"), ("call_b", "B"), ("call_c", "C")] {
+            let msg = tool_messages
+                .iter()
+                .find(|m| m.content.contains(id))
+                .unwrap_or_else(|| panic!("missing tool message for {id}: {tool_messages:?}"));
+            assert!(
+                msg.content.contains(&format!("ok:{value}")),
+                "tool_call_id {id} must carry its own output ok:{value}, got: {}",
+                msg.content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
@@ -7531,6 +7675,75 @@ mod tests {
         assert!(
             !tool_results.content.contains("Skipped duplicate tool call"),
             "exempt tool calls should not be suppressed"
+        );
+    }
+
+    /// Identical-prompt calls to re-entrant agent tools (spawn_subagent /
+    /// delegate) must both run even with no config exemption — fan-out is
+    /// intentional, not a duplicate to collapse.
+    #[tokio::test]
+    async fn run_tool_call_loop_reentrant_agent_tools_are_dedup_exempt_by_default() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"spawn_subagent","arguments":{"prompt":"same"}}
+</tool_call>
+<tool_call>
+{"name":"spawn_subagent","arguments":{"prompt":"same"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "spawn_subagent",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("fan out two identical subagents"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[], // no config-provided dedup exemptions
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("loop should finish running both identical subagent calls");
+
+        assert!(result.ends_with("done"), "got: {result}");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "both identical spawn_subagent calls must execute"
         );
     }
 
