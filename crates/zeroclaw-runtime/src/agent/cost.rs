@@ -115,6 +115,27 @@ fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64, f64)
     (0.0, 0.0, 0.0)
 }
 
+/// Resolve the per-model pricing map for a provider reference.
+///
+/// `model_provider_name` always arrives as the composite `<type>.<alias>`
+/// (see `agent_provider_composite`), but the outer pricing map may be keyed
+/// either way depending on which builder populated it: the CLI / cron / web
+/// agent loop keys by the composite alias, while the channel orchestrator keys
+/// by the bare provider `<type>` (rates are per provider type, not per alias).
+/// Try the composite verbatim first, then fall back to the bare type prefix so
+/// cost tracking resolves regardless of the builder — and so the type-keyed
+/// `cost.rates` sheet is honored on the alias paths too.
+fn provider_pricing<'a>(
+    map: &'a ModelProviderPricing,
+    model_provider_name: &str,
+) -> Option<&'a HashMap<String, f64>> {
+    map.get(model_provider_name).or_else(|| {
+        model_provider_name
+            .split_once('.')
+            .and_then(|(provider_type, _alias)| map.get(provider_type))
+    })
+}
+
 /// Record token usage from an LLM response via the task-local cost tracker.
 /// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
 pub fn record_tool_loop_cost_usage(
@@ -134,7 +155,7 @@ pub fn record_tool_loop_cost_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    let pricing = ctx.model_provider_pricing.get(model_provider_name);
+    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
     let (input_rate, output_rate, cached_rate) = pricing
         .map(|map| resolve_rates(map, model))
         .unwrap_or((0.0, 0.0, 0.0));
@@ -283,6 +304,36 @@ mod tests {
         assert!(
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
             "different model under same model_provider is a distinct pair"
+        );
+    }
+
+    #[test]
+    fn provider_pricing_resolves_composite_and_bare_type_keys() {
+        let mut model_rates: HashMap<String, f64> = HashMap::new();
+        model_rates.insert("glm-5.1.input".to_string(), 1.4);
+        model_rates.insert("glm-5.1.output".to_string(), 4.4);
+
+        // CLI / agent-loop builder keys by the composite `<type>.<alias>`.
+        let mut composite_keyed: ModelProviderPricing = HashMap::new();
+        composite_keyed.insert("glm.default".to_string(), model_rates.clone());
+        assert!(
+            provider_pricing(&composite_keyed, "glm.default").is_some(),
+            "composite-keyed map must resolve via the verbatim composite lookup"
+        );
+
+        // Channel orchestrator builder keys by the bare provider `<type>`, yet
+        // the lookup still arrives as the composite alias — must fall back.
+        let mut type_keyed: ModelProviderPricing = HashMap::new();
+        type_keyed.insert("glm".to_string(), model_rates.clone());
+        assert!(
+            provider_pricing(&type_keyed, "glm.default").is_some(),
+            "type-keyed map must resolve the composite alias via the bare-type fallback"
+        );
+
+        // An unrelated provider must not accidentally match.
+        assert!(
+            provider_pricing(&type_keyed, "openai.default").is_none(),
+            "fallback must not resolve a provider type absent from the map"
         );
     }
 
