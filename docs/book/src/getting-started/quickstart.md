@@ -42,7 +42,7 @@ all-defaults, no-approvals config, see [YOLO mode](./yolo.md).
 
 ## zerocode
 
-In the [zerocode](./tui.md) terminal interface, the Quickstart pane is one of
+In the [zerocode](./zerocode.md) terminal interface, the Quickstart pane is one of
 the tabs. Drive it with the keyboard:
 
 Switch to the **Quickstart** pane:
@@ -90,7 +90,7 @@ for clients that want to validate first.
 
 ## After Quickstart
 
-- **Drive it from [zerocode](./tui.md):** the terminal interface is the best
+- **Drive it from [zerocode](./zerocode.md):** the terminal interface is the best
   way to chat, watch live logs, manage config, and monitor the daemon, all in
   one place. Just run `zerocode`.
 - **Quick one-off from the shell:** `zeroclaw agent -a <alias> -m "your message"`.
