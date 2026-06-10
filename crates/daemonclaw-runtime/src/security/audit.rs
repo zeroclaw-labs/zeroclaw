@@ -17,7 +17,11 @@ use daemonclaw_config::schema::AuditConfig;
 /// Well-known seed for the genesis entry's `prev_hash`.
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// RETIRED (Track H): audit chain is append-only. Retention is now an out-of-process operation.
+#[cfg(test)]
 const MAX_AUDIT_EVENTS: i64 = 500_000;
+/// RETIRED (Track H): audit chain is append-only. Retention is now an out-of-process operation.
+#[cfg(test)]
 const RETENTION_CHECK_INTERVAL: u64 = 1000;
 
 /// Audit event types
@@ -386,11 +390,8 @@ impl AuditLogger {
         })();
 
         match result {
-            Ok(next_seq) => {
+            Ok(_next_seq) => {
                 conn.execute_batch("COMMIT")?;
-                if next_seq % RETENTION_CHECK_INTERVAL == 0 {
-                    let _ = self.run_retention();
-                }
                 Ok(())
             }
             Err(e) => {
@@ -438,12 +439,15 @@ impl AuditLogger {
         })
     }
 
+    /// RETIRED (Track H): audit chain is append-only. Retention is now an out-of-process operation.
+    ///
     /// Perform retention pruning as a recorded operation.
     ///
     /// Appends a `chain_truncation` event documenting the removed sequence
     /// range, then temporarily drops the append-only trigger to execute the
     /// DELETE, and reinstalls it. The chain always documents its own
     /// truncation — a clean `verify_chain` cannot result from silent removal.
+    #[cfg(test)]
     fn run_retention(&self) -> Result<()> {
         let conn = self.connect()?;
 
