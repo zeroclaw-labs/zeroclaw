@@ -89,39 +89,81 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     items.into_iter().map(DiagItem::into_result).collect()
 }
 
-/// Run diagnostics and print human-readable report to stdout.
-async fn probe_models(config: &Config) -> Vec<DiagResult> {
-    let targets = doctor_model_targets(config, None);
-    let mut out = Vec::new();
+/// Outcome of probing one configured provider entry's live catalog.
+#[derive(Clone, PartialEq)]
+enum ModelProbe {
+    /// Catalog fetched — N models advertised.
+    Ok(usize),
+    /// Probe failed — severity + truncated message.
+    Err(Severity, String),
+}
 
-    for provider_name in &targets {
-        let result = match create_doctor_model_provider(config, provider_name) {
-            Ok(handle) => handle.list_models().await,
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(models) => out.push(DiagResult {
-                severity: Severity::Ok,
-                category: "providers.models".to_string(),
-                message: format!("{}: {} models", provider_name, models.len()),
-            }),
-            Err(e) => {
-                let text = format_error_chain(&e);
-                let severity = match classify_model_probe_error(&text) {
-                    ModelProbeOutcome::Skipped => Severity::Warn,
-                    ModelProbeOutcome::AuthOrAccess => Severity::Warn,
-                    ModelProbeOutcome::Ok | ModelProbeOutcome::Error => Severity::Error,
-                };
-                out.push(DiagResult {
-                    severity,
-                    category: "providers.models".to_string(),
-                    message: format!("{}: {}", provider_name, truncate_for_display(&text, 120)),
-                });
-            }
+/// Render one model-probe row (`<label>: <detail>`) as a `DiagResult`.
+fn model_probe_row(label: &str, probe: &ModelProbe) -> DiagResult {
+    let (severity, detail) = match probe {
+        ModelProbe::Ok(n) => (Severity::Ok, format!("{n} models")),
+        ModelProbe::Err(severity, text) => (*severity, text.clone()),
+    };
+    DiagResult {
+        severity,
+        category: "providers.models".to_string(),
+        message: format!("{label}: {detail}"),
+    }
+}
+
+/// Collapse per-type model probes: when ≥2 aliases of a provider type return
+/// the same result, emit a single `type: …` row; otherwise emit each alias as
+/// `type.alias: …` so divergence (or a single configured alias) stays visible.
+/// Input is in iteration order, where aliases of a type are contiguous (that's
+/// how `iter_entries` yields them). Pure — separated for unit testing.
+fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
+    let mut groups: Vec<(String, Vec<(String, ModelProbe)>)> = Vec::new();
+    for (name, probe) in probes {
+        let ty = name
+            .split_once('.')
+            .map(|(t, _)| t.to_string())
+            .unwrap_or_else(|| name.clone());
+        match groups.last_mut() {
+            Some((group_ty, entries)) if *group_ty == ty => entries.push((name, probe)),
+            _ => groups.push((ty, vec![(name, probe)])),
         }
     }
 
+    let mut out = Vec::new();
+    for (ty, entries) in groups {
+        let collapse = entries.len() >= 2 && entries.iter().all(|(_, p)| *p == entries[0].1);
+        if collapse {
+            out.push(model_probe_row(&ty, &entries[0].1));
+        } else {
+            for (name, probe) in &entries {
+                out.push(model_probe_row(name, probe));
+            }
+        }
+    }
     out
+}
+
+/// Run diagnostics and print human-readable report to stdout.
+async fn probe_models(config: &Config) -> Vec<DiagResult> {
+    let targets = doctor_model_targets(config, None);
+    let mut probes = Vec::with_capacity(targets.len());
+
+    for provider_name in &targets {
+        let probe = match fetch_provider_catalog(config, provider_name).await {
+            Ok(models) => ModelProbe::Ok(models.len()),
+            Err(e) => {
+                let text = format_error_chain(&e);
+                let severity = match classify_model_probe_error(&text) {
+                    ModelProbeOutcome::Skipped | ModelProbeOutcome::AuthOrAccess => Severity::Warn,
+                    ModelProbeOutcome::Ok | ModelProbeOutcome::Error => Severity::Error,
+                };
+                ModelProbe::Err(severity, truncate_for_display(&text, 120))
+            }
+        };
+        probes.push((provider_name.clone(), probe));
+    }
+
+    collapse_model_probes(probes)
 }
 
 pub async fn run(config: &Config) -> Result<()> {
@@ -1266,6 +1308,40 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn collapse_model_probes_groups_identical_and_breaks_divergent() {
+        use ModelProbe::{Err as E, Ok as K};
+        let probes = vec![
+            ("ollama.a".to_string(), K(8)),
+            ("ollama.b".to_string(), K(8)),
+            ("ollama.c".to_string(), K(8)),
+            ("opencode.x".to_string(), K(18)),
+            ("opencode.y".to_string(), K(18)),
+            ("kilo.solo".to_string(), K(335)),
+            ("openai.a".to_string(), K(10)),
+            ("openai.b".to_string(), K(12)),
+            (
+                "kilocli.free".to_string(),
+                E(Severity::Error, "not supported".to_string()),
+            ),
+        ];
+        let msgs: Vec<String> = collapse_model_probes(probes)
+            .into_iter()
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(
+            msgs,
+            vec![
+                "ollama: 8 models",      // 3 identical aliases → collapsed to type
+                "opencode: 18 models",   // 2 identical → collapsed
+                "kilo.solo: 335 models", // single alias → kept per-alias
+                "openai.a: 10 models",   // divergent counts → broken out
+                "openai.b: 12 models",
+                "kilocli.free: not supported", // single alias → kept
+            ]
+        );
+    }
 
     #[test]
     fn model_in_catalog_requires_exact_id_match() {
