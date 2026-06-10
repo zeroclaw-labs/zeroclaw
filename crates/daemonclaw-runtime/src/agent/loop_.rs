@@ -935,6 +935,7 @@ pub async fn run_tool_call_loop(
         crate::agent::context_pipeline::ContextPipeline::default_preemptive();
     let retry_policy = crate::agent::retry::RetryPolicy::default();
     let mut consecutive_retries: u32 = 0;
+    let mut truncation_continuations: u32 = 0;
     let mut hook_continuation_count: u32 = 0;
     let max_hook_continuations: u32 = pacing
         .max_hook_continuations
@@ -1680,7 +1681,7 @@ pub async fn run_tool_call_loop(
                     prefix_match && novel_len < 100 && novel_len * 10 < trimmed_response.len()
                 });
         if tool_calls.is_empty()
-            && consecutive_retries < 3
+            && truncation_continuations < 3
             && response_text.len() > 500
             && !response_text.trim_end().ends_with(|c: char| ".!?\u{3002}\u{300d}\u{3011}\n".contains(c))
             && !response_text.trim_end().ends_with(|c: char| c.is_ascii_punctuation())
@@ -1696,7 +1697,7 @@ pub async fn run_tool_call_loop(
                 "[System: your previous response was cut off. Resume directly from where you stopped — do not repeat.]".to_string()
             ));
             accumulated_display_text.push_str(&display_text);
-            consecutive_retries += 1;
+            truncation_continuations += 1;
             continue;
         }
 

@@ -565,6 +565,18 @@ impl TelegramChannel {
             .send()
             .await?;
 
+        let resp = if resp.status().as_u16() == 429 {
+            let err = resp.text().await.unwrap_or_default();
+            Self::sleep_for_rate_limit(&err).await;
+            self.client
+                .post(self.api_url("editMessageText"))
+                .json(&body)
+                .send()
+                .await?
+        } else {
+            resp
+        };
+
         if resp.status().is_success() {
             self.last_draft_edit
                 .lock()
@@ -632,6 +644,24 @@ impl TelegramChannel {
             "channel.telegram",
             self.proxy_url.as_deref(),
         )
+    }
+
+    fn parse_retry_after(body: &str) -> Option<u64> {
+        let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+        parsed.get("parameters")?.get("retry_after")?.as_u64()
+    }
+
+    async fn sleep_for_rate_limit(body: &str) -> bool {
+        if let Some(retry_after) = Self::parse_retry_after(body) {
+            let wait = retry_after.min(60);
+            tracing::warn!(retry_after = wait, "Telegram 429 rate limit, sleeping before retry");
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            true
+        } else {
+            tracing::warn!("Telegram 429 but no retry_after, sleeping 5s");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            true
+        }
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -1963,46 +1993,61 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let markdown_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
-                .send()
-                .await?;
+            let mut rate_limit_retried = false;
+            'chunk_send: loop {
+                let markdown_resp = self
+                    .http_client()
+                    .post(self.api_url("sendMessage"))
+                    .json(&markdown_body)
+                    .send()
+                    .await?;
 
-            if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                if markdown_resp.status().is_success() {
+                    break 'chunk_send;
                 }
-                continue;
-            }
 
-            let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                status = ?markdown_status,
-                "Telegram sendMessage with Markdown failed; retrying without parse_mode"
-            );
+                let markdown_status = markdown_resp.status();
+                let markdown_err = markdown_resp.text().await.unwrap_or_default();
 
-            let mut plain_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": text,
-            });
+                if markdown_status.as_u16() == 429 && !rate_limit_retried {
+                    rate_limit_retried = true;
+                    Self::sleep_for_rate_limit(&markdown_err).await;
+                    continue 'chunk_send;
+                }
 
-            // Add message_thread_id for forum topic support
-            if let Some(tid) = thread_id {
-                plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-            }
-            let plain_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
-                .await?;
+                tracing::warn!(
+                    status = ?markdown_status,
+                    "Telegram sendMessage with Markdown failed; retrying without parse_mode"
+                );
 
-            if !plain_resp.status().is_success() {
+                let mut plain_body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                });
+
+                if let Some(tid) = thread_id {
+                    plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+                }
+                let plain_resp = self
+                    .http_client()
+                    .post(self.api_url("sendMessage"))
+                    .json(&plain_body)
+                    .send()
+                    .await?;
+
+                if plain_resp.status().is_success() {
+                    break 'chunk_send;
+                }
+
                 let plain_status = plain_resp.status();
                 let plain_err = plain_resp.text().await.unwrap_or_default();
+
+                if plain_status.as_u16() == 429 && !rate_limit_retried {
+                    rate_limit_retried = true;
+                    Self::sleep_for_rate_limit(&plain_err).await;
+                    continue 'chunk_send;
+                }
+
                 anyhow::bail!(
                     "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
                     markdown_status,
@@ -2613,6 +2658,18 @@ impl Channel for TelegramChannel {
             .send()
             .await?;
 
+        let resp = if resp.status().as_u16() == 429 {
+            let err = resp.text().await.unwrap_or_default();
+            Self::sleep_for_rate_limit(&err).await;
+            self.client
+                .post(self.api_url("sendMessage"))
+                .json(&body)
+                .send()
+                .await?
+        } else {
+            resp
+        };
+
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
             anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
@@ -2839,12 +2896,23 @@ impl Channel for TelegramChannel {
             "parse_mode": "HTML",
         });
 
-        let resp = self
+        let mut resp = self
             .client
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
             .await?;
+
+        if resp.status().as_u16() == 429 {
+            let err = resp.text().await.unwrap_or_default();
+            Self::sleep_for_rate_limit(&err).await;
+            resp = self
+                .client
+                .post(self.api_url("editMessageText"))
+                .json(&body)
+                .send()
+                .await?;
+        }
 
         match Self::classify_edit_message_response(resp).await {
             EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
@@ -2863,12 +2931,23 @@ impl Channel for TelegramChannel {
             "text": text,
         });
 
-        let resp = self
+        let mut resp = self
             .client
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
             .await?;
+
+        if resp.status().as_u16() == 429 {
+            let err = resp.text().await.unwrap_or_default();
+            Self::sleep_for_rate_limit(&err).await;
+            resp = self
+                .client
+                .post(self.api_url("editMessageText"))
+                .json(&plain_body)
+                .send()
+                .await?;
+        }
 
         match Self::classify_edit_message_response(resp).await {
             EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
