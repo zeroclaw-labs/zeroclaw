@@ -10,7 +10,19 @@ Why "model" provider? We use the phrase "model provider" consistently, there are
 
 Providers are typed by family, addressed as `providers.models.<type>.<alias>`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot). There is one slot per vendor, with no synonyms: `azure_openai`, `azure-openai`, and `claude` (for Anthropic) are not accepted.
 
-`<alias>` is your operator-assigned instance name. Use it to distinguish multiple instances of the same provider, e.g. an `openai.work` and an `openai.personal` against the same vendor.
+`<alias>` is your operator-assigned instance name, and you can define **as many aliases per type as you want**. Run several profiles of the same vendor family side by side: same `type`, different aliases, each with its own key, model, and settings. For example, separate `personal` and `work` Anthropic accounts:
+
+```toml
+[providers.models.anthropic.personal]
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+
+[providers.models.anthropic.work]
+api_key = "sk-ant-..."
+model = "claude-opus-4-1"
+```
+
+An agent then references whichever it needs by `model_provider = "anthropic.personal"` (or `"anthropic.work"`).
 
 {{#config-where providers.models}}
 
