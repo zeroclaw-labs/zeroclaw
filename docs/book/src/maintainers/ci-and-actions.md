@@ -6,7 +6,8 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 ### Quality Gate (`ci.yml`)
 
-Fires on every PR targeting `master`. Composite job with multiple matrix legs:
+Fires on every PR targeting `master` and on trusted pushes to `master`.
+Composite job with multiple matrix legs:
 
 - **fmt** — `cargo fmt --all -- --check`
 - **lint** — `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
@@ -17,7 +18,7 @@ Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 - **test** — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security** — `cargo deny check`
 
-`fmt` runs first as the cheap serial gate. The Rust-heavy jobs fan out after formatting passes, and `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green.
+`fmt` runs first as the cheap serial gate. The Rust-heavy jobs fan out after formatting passes, and `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -73,11 +74,11 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 
 ## Build cache behavior
 
-Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `fmt` job and the Windows build leg do not. These behaviors are worth knowing when triaging cache-related flakes:
+Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `fmt` job does not. These behaviors are worth knowing when triaging cache-related flakes:
 
-- **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts.
+- **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
-- **Windows has no Rust cache.** `if: runner.os != 'Windows'` skips the cache step on the Windows leg — `rust-cache`'s path handling poisons on Windows. Windows always runs cold.
+- **Windows build cache is enabled.** The Windows build leg now runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
 - **`cargo-deny` is not cached.** The `security` job installs it fresh from source on every run. A future improvement is `taiki-e/install-action`, which already caches `cargo-nextest`.
 
