@@ -31,13 +31,18 @@ Then any device on the LAN can reach `http://<pi-ip>:42617`. Doesn't help for in
 
 Then restart the daemon, the tunnel is managed declaratively from config, starting alongside the gateway.
 
-The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router config, no opened ports. All three supported tunnels work similarly:
+The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router config, no opened ports. Set `tunnel.tunnel_provider` to one of the supported values; each works similarly:
 
 | Provider | Setup friction | Cost | Good for |
 |---|---|---|---|
-| Tailscale Funnel | Create account, install client | Free tier | Long-term, stable URLs |
-| Cloudflare Tunnel | Create Cloudflare account, install `cloudflared` | Free | Custom domains |
-| ngrok | Sign up, install CLI | Free with limits | Testing, short-lived |
+| `tailscale` | Account + client | Free tier | Long-term, stable URLs |
+| `cloudflare` | Account + `cloudflared` + token | Free | Custom domains |
+| `ngrok` | Account + agent + token | Free with limits | Testing, short-lived |
+| `pinggy` | SSH, no account | Free tier | Quick one-shot URLs |
+| `openvpn` | Your own OpenVPN egress | Self-hosted | Existing VPN infra |
+| `custom` | A command under `[tunnel.custom]` | Depends | Anything else |
+
+`tunnel_provider = "none"` (the default) keeps the gateway local with no tunnel. See the [Config reference](../reference/config.md#tunnel) for each provider's `[tunnel.<provider>]` fields.
 
 ### Option 3: Reverse proxy
 
