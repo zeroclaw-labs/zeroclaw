@@ -64,14 +64,19 @@ Full per-distro list: [Setup → Linux](../setup/linux.md).
 
 ### Build OOMs on low-RAM hosts
 
-Compiling ZeroClaw from source needs ~2 GB RAM at peak. On a 512 MB Raspberry Pi, you will OOM.
+Building ZeroClaw from source is memory-hungry, mostly during the final link. `install.sh` already adapts to this automatically when it builds from source:
 
-Options:
+{{#include ../_snippets/hardware-lowmem-lto.md}}
 
-1. **Use a prebuilt**: `./install.sh --prebuilt` skips the toolchain and downloads from GitHub Releases
-2. **Cross-compile on a bigger machine and copy the binary**
-3. **Serialise the build**: `CARGO_BUILD_JOBS=1 cargo build --release --locked`
-4. **Add swap** (works for RAM, costs disk, check you have both)
+If you still run out of memory, or you are not building through `install.sh`:
+
+1. **Use a prebuilt**: `./install.sh --prebuilt` skips the toolchain and downloads from GitHub Releases.
+2. **Cross-compile on a bigger machine and copy the binary.**
+3. **Pick a lighter build profile**: `cargo build --profile release-fast` (more codegen parallelism, lighter link) or `--profile ci` (thin LTO, fastest/lowest-memory).
+4. **Serialise the build**: `CARGO_BUILD_JOBS=1 cargo build --release --locked`.
+5. **Add swap** (works for RAM, costs disk, check you have both).
+
+For the Raspberry Pi specifics, see [Raspberry Pi setup → build profile](../hardware/raspberry-pi-setup.md#step-3-choose-a-build-profile).
 
 ### Build is very slow
 
