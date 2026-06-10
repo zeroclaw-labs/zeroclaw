@@ -6,7 +6,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -92,6 +92,14 @@ pub struct ShellTool {
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
     tui_env: Option<HashMap<String, String>>,
+    /// Whether workspace writes performed by the command persist on the host.
+    /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
+    /// a workspace volume mount), in which case files written via shell succeed
+    /// inside the container but are invisible on the host and discarded at
+    /// session end. The shell tool can't tell a read from a write, so rather
+    /// than refusing (like `file_write`) it attaches a loud warning to every
+    /// executed command's result. See issue #4627.
+    persistent_writes: bool,
 }
 
 impl ShellTool {
@@ -103,6 +111,7 @@ impl ShellTool {
             sandbox: Arc::new(crate::security::NoopSandbox),
             timeout_secs,
             tui_env: None,
+            persistent_writes: true,
         }
     }
 
@@ -118,7 +127,19 @@ impl ShellTool {
             sandbox,
             timeout_secs,
             tui_env: None,
+            persistent_writes: true,
         }
+    }
+
+    /// Mark whether the active runtime persists workspace writes to the host.
+    ///
+    /// Pass `false` for an ephemeral runtime (Docker tmpfs / no volume mount)
+    /// to attach a loud ephemeral-workspace warning to every executed command,
+    /// so silent data loss is visible (issue #4627). Defaults to `true`,
+    /// preserving existing behaviour on native runtimes and in tests.
+    pub fn with_persistent_writes(mut self, persistent: bool) -> Self {
+        self.persistent_writes = persistent;
+        self
     }
 
     /// Override the command execution timeout (in seconds).
@@ -367,51 +388,65 @@ impl Tool for ShellTool {
             Ok::<_, std::io::Error>((status, out.unwrap_or_default(), err.unwrap_or_default()))
         };
 
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {
-            Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
-                let mut stdout = decode_output(&stdout_bytes);
-                let mut stderr = decode_output(&stderr_bytes);
+        let mut result =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {
+                Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
+                    let mut stdout = decode_output(&stdout_bytes);
+                    let mut stderr = decode_output(&stderr_bytes);
 
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
-                    while b > 0 && !stdout.is_char_boundary(b) {
-                        b -= 1;
+                    if stdout.len() > MAX_OUTPUT_BYTES {
+                        let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
+                        while b > 0 && !stdout.is_char_boundary(b) {
+                            b -= 1;
+                        }
+                        stdout.truncate(b);
+                        stdout.push_str("\n... [output truncated at 1MB]");
                     }
-                    stdout.truncate(b);
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
-                    while b > 0 && !stderr.is_char_boundary(b) {
-                        b -= 1;
+                    if stderr.len() > MAX_OUTPUT_BYTES {
+                        let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
+                        while b > 0 && !stderr.is_char_boundary(b) {
+                            b -= 1;
+                        }
+                        stderr.truncate(b);
+                        stderr.push_str("\n... [stderr truncated at 1MB]");
                     }
-                    stderr.truncate(b);
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
 
-                Ok(ToolResult {
-                    success: status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                })
+                    ToolResult {
+                        success: status.success(),
+                        output: stdout,
+                        error: if stderr.is_empty() {
+                            None
+                        } else {
+                            Some(stderr)
+                        },
+                    }
+                }
+                Ok(Err(e)) => ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                },
+                Err(_) => ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {timeout_secs}s and was killed"
+                    )),
+                },
+            };
+
+        // The command ran inside an ephemeral workspace: any files it wrote are
+        // invisible on the host and discarded at session end (issue #4627).
+        // Inject the warning into whichever field the dispatcher surfaces to the
+        // model — `output` on success, `error` on failure — so it is never lost.
+        if !self.persistent_writes {
+            result.output = with_ephemeral_workspace_warning(&result.output);
+            if let Some(err) = result.error.take() {
+                result.error = Some(with_ephemeral_workspace_warning(&err));
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {timeout_secs}s and was killed"
-                )),
-            }),
         }
+
+        Ok(result)
     }
 }
 
@@ -581,6 +616,105 @@ mod tests {
             .await
             .expect("command with nonexistent path should return a result");
         assert!(!result.success);
+    }
+
+    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+
+    /// On an ephemeral runtime the shell tool stays usable but every executed
+    /// command's output carries a loud warning so writes that won't persist are
+    /// visible. The original command output must be preserved below the banner.
+    #[tokio::test]
+    async fn shell_warns_on_ephemeral_workspace() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_persistent_writes(false);
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("echo command should run");
+        assert!(result.success);
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present in output, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("mount_workspace"),
+            "warning must name the config key to fix it, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("hello"),
+            "original command output must be preserved, got: {}",
+            result.output
+        );
+    }
+
+    /// A failed command surfaces `error`, not `output`, to the model. The
+    /// ephemeral warning must be injected into the error field too so it is
+    /// never lost on the failure path.
+    #[tokio::test]
+    async fn shell_warns_on_ephemeral_workspace_failure_path() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_persistent_writes(false);
+        let result = tool
+            .execute(json!({"command": "ls /nonexistent_dir_xyz_4627"}))
+            .await
+            .expect("command should return a result");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must reach the error field on failures, got: {:?}",
+            result.error
+        );
+    }
+
+    /// A command that exits 0 but also writes to stderr yields
+    /// `{ success: true, output, error: Some }`. The dispatcher shows `output`
+    /// on success, but the banner must land in BOTH fields so it survives
+    /// regardless of which the model reads. Exercises the dual-field branch.
+    #[tokio::test]
+    async fn shell_warns_on_ephemeral_success_with_stderr() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
+            .with_persistent_writes(false);
+        let result = tool
+            .execute(json!({"command": "echo out; echo warn >&2"}))
+            .await
+            .expect("command should run");
+        assert!(
+            result.success,
+            "command should exit 0, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE") && result.output.contains("out"),
+            "output must carry banner and preserve stdout, got: {}",
+            result.output
+        );
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("EPHEMERAL WORKSPACE") && err.contains("warn"),
+            "error must carry banner and preserve stderr, got: {err:?}"
+        );
+    }
+
+    /// On a persistent runtime (the default) no warning is attached.
+    #[tokio::test]
+    async fn shell_no_warning_when_persistent() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("echo command should run");
+        assert!(result.success);
+        assert!(
+            !result.output.contains("EPHEMERAL WORKSPACE"),
+            "no ephemeral warning expected on a persistent runtime, got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
