@@ -2588,11 +2588,15 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a model_provider
+    /// List the models configured in config.toml
     List {
-        /// ModelProvider name (defaults to configured default model_provider)
+        /// ModelProvider name (defaults to all configured entries)
         #[arg(long)]
         model_provider: Option<String>,
+
+        /// Verify each configured model against the provider's live catalog
+        #[arg(long)]
+        check: bool,
     },
     /// Set the default model in config
     Set {
@@ -4119,14 +4123,16 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => {
-            let (model_provider, show_names) = match &model_command {
-                ModelCommands::Refresh { model_provider, .. } => (model_provider.as_deref(), false),
-                ModelCommands::List { model_provider } => (model_provider.as_deref(), true),
-                _ => (None, false),
-            };
-            doctor::run_models(&config, model_provider, false, show_names).await
-        }
+        Commands::Models { model_command } => match &model_command {
+            ModelCommands::List {
+                model_provider,
+                check,
+            } => doctor::run_configured_models(&config, model_provider.as_deref(), *check).await,
+            ModelCommands::Refresh { model_provider, .. } => {
+                doctor::run_models(&config, model_provider.as_deref(), false, false).await
+            }
+            _ => doctor::run_models(&config, None, false, false).await,
+        },
 
         Commands::Providers => {
             let model_providers = zeroclaw_providers::list_model_providers();
@@ -4177,8 +4183,8 @@ async fn main() -> Result<()> {
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {
                 model_provider,
-                use_cache,
-            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache, false).await,
+                use_cache: _,
+            }) => doctor::run_configured_models(&config, model_provider.as_deref(), true).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,

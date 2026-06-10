@@ -290,10 +290,7 @@ pub async fn run_models(
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        let outcome = match create_doctor_model_provider(config, provider_name) {
-            Ok(handle) => handle.list_models().await,
-            Err(e) => Err(e),
-        };
+        let outcome = fetch_provider_catalog(config, provider_name).await;
 
         match outcome {
             Ok(models) => {
@@ -392,6 +389,136 @@ pub async fn run_models(
 
     if provider_override.is_some() && ok_count == 0 {
         anyhow::bail!("Model probe failed for target model_provider")
+    }
+
+    Ok(())
+}
+
+/// Fetch a provider's live model catalog — the model IDs advertised by its
+/// `/models` endpoint. Extracted from the catalog probe so `models list
+/// --check` (configured-model verification) and future interactive flows (the
+/// `quickstart` model picker, which also wants pricing) share one fetch path.
+pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
+    create_doctor_model_provider(config, provider_ref)?
+        .list_models()
+        .await
+}
+
+/// Collect the configured `(provider_ref, model)` pairs from config, optionally
+/// narrowed to a single target (matched by full `type.alias` ref or by bare
+/// family name).
+fn configured_model_entries(
+    config: &Config,
+    provider_override: Option<&str>,
+) -> Vec<(String, Option<String>)> {
+    let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
+    config
+        .providers
+        .models
+        .iter_entries()
+        .map(|(ty, alias, entry)| (format!("{ty}.{alias}"), entry.model.clone()))
+        .filter(|(provider_ref, _)| match filter {
+            Some(f) => provider_ref == f || provider_ref.split('.').next() == Some(f),
+            None => true,
+        })
+        .collect()
+}
+
+/// Whether a configured model id appears verbatim in a provider's live catalog.
+/// Pure — separated so the membership rule is explicit and unit-testable
+/// without any network probe.
+fn model_in_catalog(model: &str, catalog: &[String]) -> bool {
+    catalog.iter().any(|id| id == model)
+}
+
+/// List the models configured in `config.toml` (one per `[providers.models.*]`
+/// entry). Default is an offline readout; `verify = true` (`models list
+/// --check`, and the `doctor models` health path) additionally probes each
+/// provider's live catalog and flags whether the configured model is actually
+/// available.
+pub async fn run_configured_models(
+    config: &Config,
+    provider_override: Option<&str>,
+    verify: bool,
+) -> Result<()> {
+    let entries = configured_model_entries(config, provider_override);
+
+    if entries.is_empty() {
+        anyhow::bail!(
+            "No configured model_providers — run `zeroclaw quickstart` to set one up first"
+        );
+    }
+
+    if verify {
+        println!("🩺 ZeroClaw — Configured Models (--check)");
+    } else {
+        println!("🩺 ZeroClaw — Configured Models");
+    }
+    println!();
+
+    let mut ok = 0usize;
+    let mut warn = 0usize;
+    let mut error = 0usize;
+
+    for (provider_ref, model) in &entries {
+        println!("  [{}]", provider_ref);
+
+        let Some(model) = model.as_deref() else {
+            warn += 1;
+            println!("    ⚠️  no model configured");
+            println!();
+            continue;
+        };
+
+        if !verify {
+            println!("    model: {model}");
+            println!();
+            continue;
+        }
+
+        match fetch_provider_catalog(config, provider_ref).await {
+            Ok(catalog) if model_in_catalog(model, &catalog) => {
+                ok += 1;
+                println!("    model: {model}  ✅ available");
+            }
+            Ok(catalog) => {
+                warn += 1;
+                println!(
+                    "    model: {model}  ⚠️  not in catalog ({} models advertised)",
+                    catalog.len()
+                );
+            }
+            Err(probe_error) => {
+                let text = format_error_chain(&probe_error);
+                match classify_model_probe_error(&text) {
+                    ModelProbeOutcome::Error | ModelProbeOutcome::Ok => {
+                        error += 1;
+                        println!(
+                            "    model: {model}  ❌ {}",
+                            truncate_for_display(&text, 140)
+                        );
+                    }
+                    _ => {
+                        warn += 1;
+                        println!(
+                            "    model: {model}  ⚠️  unverified: {}",
+                            truncate_for_display(&text, 140)
+                        );
+                    }
+                }
+            }
+        }
+        println!();
+    }
+
+    if verify {
+        println!("  Connectivity: {ok} ok, {warn} warning, {error} errors");
+        if provider_override.is_some() && ok == 0 {
+            anyhow::bail!("No configured model verified for target model_provider");
+        }
+    } else {
+        let n = entries.len();
+        println!("  {n} provider{} configured", if n == 1 { "" } else { "s" });
     }
 
     Ok(())
@@ -1139,6 +1266,20 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn model_in_catalog_requires_exact_id_match() {
+        let catalog = vec![
+            "anthropic/claude-sonnet-4.5".to_string(),
+            "openai/gpt-5".to_string(),
+        ];
+        assert!(model_in_catalog("openai/gpt-5", &catalog));
+        // Not present, partial, and empty all fail — no fuzzy/suffix matching.
+        assert!(!model_in_catalog("openai/gpt-4", &catalog));
+        assert!(!model_in_catalog("gpt-5", &catalog));
+        assert!(!model_in_catalog("", &catalog));
+        assert!(!model_in_catalog("anthropic/claude-sonnet-4.5", &[]));
+    }
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
