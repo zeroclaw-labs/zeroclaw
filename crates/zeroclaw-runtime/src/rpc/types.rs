@@ -964,6 +964,11 @@ rpc_type! {
     pub struct CatalogModelsResult {
         pub model_provider: String,
         pub models: Vec<String>,
+        /// Optional pricing data keyed by model id. Populated when the
+        /// provider's `/models` endpoint returns pricing (Kilo Gateway,
+        /// OpenRouter, etc.). Absent for catalog fallbacks without pricing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pricing: Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
         pub local: bool,
         pub live: bool,
     }

@@ -6,7 +6,8 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 ### Quality Gate (`ci.yml`)
 
-Fires on every PR targeting `master`. Composite job with multiple matrix legs:
+Fires on every PR targeting `master` and on trusted pushes to `master`.
+Composite job with multiple matrix legs:
 
 - **fmt** — `cargo fmt --all -- --check`
 - **lint** — `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
@@ -17,7 +18,7 @@ Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 - **test** — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security** — `cargo deny check`
 
-`fmt` runs first as the cheap serial gate. The Rust-heavy jobs fan out after formatting passes, and `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green.
+`fmt` runs first as the cheap serial gate. The Rust-heavy jobs fan out after formatting passes, and `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -26,6 +27,10 @@ Runs `cargo audit` nightly against the dependency tree. Opens an issue on findin
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
 Auto-applies scope and risk labels based on changed file paths. Runs silently on every PR — if a PR is missing labels, check whether the paths in `.github/labeler.yml` cover the changes.
+
+### Docker Image PR Check (`docker-image-pr.yml`)
+
+Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default and Debian compatibility images without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
 
 ### Discord Release (`discord-release.yml`)
 
@@ -73,11 +78,11 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 
 ## Build cache behavior
 
-Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `fmt` job and the Windows build leg do not. These behaviors are worth knowing when triaging cache-related flakes:
+Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The lightweight `fmt` job does not. These behaviors are worth knowing when triaging cache-related flakes:
 
-- **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts.
+- **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
-- **Windows has no Rust cache.** `if: runner.os != 'Windows'` skips the cache step on the Windows leg — `rust-cache`'s path handling poisons on Windows. Windows always runs cold.
+- **Windows build cache is enabled.** The Windows build leg now runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
 - **`cargo-deny` is not cached.** The `security` job installs it fresh from source on every run. A future improvement is `taiki-e/install-action`, which already caches `cargo-nextest`.
 
@@ -104,9 +109,9 @@ The repository runs Actions in `selected` mode — only the actions in this allo
 | `dtolnay/rust-toolchain@stable` | All workflows | Install Rust toolchain |
 | `Swatinem/rust-cache@v2` | All workflows | Cargo build/dependency caching |
 | `softprops/action-gh-release@v2` | release | Create GitHub Releases |
-| `docker/setup-buildx-action@v3` | release | Docker Buildx setup |
+| `docker/setup-buildx-action@v4` | release | Docker Buildx setup |
 | `docker/login-action@v3` | release | GHCR authentication |
-| `docker/build-push-action@v6` | release | Multi-platform image build and push |
+| `docker/build-push-action@v7` | release | Multi-platform image build and push |
 
 Equivalent allowlist patterns (kept narrow on purpose):
 
@@ -132,6 +137,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 - Keep `CI Required Gate` deterministic and small. Adding jobs to the gate needs a clear quality argument.
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
 - Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned — the same quality gates run locally and in CI.
+- Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
 - `docs-quality` checks are not in the required gate. Run them locally with `bash scripts/ci/docs_quality_gate.sh`.
 
 ## Emergency rollback

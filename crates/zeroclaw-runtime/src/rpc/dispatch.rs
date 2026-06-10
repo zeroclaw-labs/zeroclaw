@@ -2838,10 +2838,11 @@ impl RpcDispatcher {
     async fn handle_config_catalog_models(&self, params: &Value) -> RpcResult {
         let req: CatalogModelsParams = parse_params(params)?;
         let local = crate::quickstart::model_provider_is_local(&req.model_provider);
-        let (models, live) = crate::quickstart::model_catalog(&req.model_provider).await;
+        let (models, pricing, live) = crate::quickstart::model_catalog(&req.model_provider).await;
         to_result(CatalogModelsResult {
             model_provider: req.model_provider,
             models,
+            pricing,
             local,
             live,
         })

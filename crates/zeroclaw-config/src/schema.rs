@@ -2802,6 +2802,48 @@ pub struct KiloCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Kilo (AI Gateway — OpenAI-compatible) ──
+
+/// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloEndpoint {
+    #[default]
+    Gateway,
+}
+impl ModelEndpoint for KiloEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Gateway => "https://api.kilo.ai/api/gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilo"]
+pub struct KiloModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Kilo endpoint variant. Defaults to the canonical Kilo AI Gateway.
+    #[serde(default, skip_serializing_if = "KiloEndpoint::is_default")]
+    pub endpoint: KiloEndpoint,
+}
+
+impl KiloEndpoint {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+}
+
+impl FamilyEndpoint for KiloModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -5551,6 +5593,17 @@ pub struct GatewayConfig {
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// Allow authenticated remote callers to use admin endpoints that are
+    /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
+    /// When false (default), those endpoints reject any non-loopback peer.
+    /// When true, a non-loopback request is accepted only if it also passes
+    /// pairing authentication — which requires `require_pairing = true`; with
+    /// pairing off a remote caller cannot be authenticated and is rejected, so
+    /// this flag never exposes an anonymous remote reload. `/admin/shutdown`
+    /// and the pairing-code endpoints stay localhost-only regardless.
+    /// (default: false)
+    #[serde(default)]
+    pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -5679,6 +5732,7 @@ impl Default for GatewayConfig {
             host: default_gateway_host(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -10026,12 +10080,12 @@ impl Default for SchedulerConfig {
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// model_provider = "openrouter"
+/// model_provider = "openrouter.default"
 /// model = "anthropic/claude-opus-4-20250514"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// model_provider = "groq"
+/// model_provider = "groq.low-latency"
 /// model = "llama-3.3-70b-versatile"
 /// ```
 ///
@@ -10041,9 +10095,9 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Model provider to route to (must match a known model-provider name)
+    /// Dotted provider profile ref to route to (must resolve to providers.models.<type>.<alias>)
     pub model_provider: String,
-    /// Model to use with that model provider
+    /// Provider-local model identifier to use with that provider profile
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
@@ -10057,7 +10111,7 @@ pub struct ModelRouteConfig {
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// model_provider = "openai"
+/// model_provider = "openai.embeddings"
 /// model = "text-embedding-3-small"
 /// dimensions = 1536
 ///
@@ -10069,9 +10123,9 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
+    /// Dotted embedding-capable provider profile ref
     pub model_provider: String,
-    /// Embedding model to use with that model provider
+    /// Provider-local embedding model identifier to use with that provider profile
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
@@ -10745,6 +10799,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
+    /// AMQP channel instances (`[channels.amqp.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub amqp: HashMap<String, AmqpConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -10752,6 +10810,12 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Per-channel multiplier for the global channel message in-flight budget.
+    /// Runtime multiplies this value by the configured channel count, then
+    /// applies its global minimum and maximum bounds to one shared dispatcher
+    /// semaphore. Default: `4`.
+    #[serde(default = "default_channel_max_concurrent_per_channel")]
+    pub max_concurrent_per_channel: usize,
     /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
@@ -10983,6 +11047,12 @@ impl ChannelsConfig {
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
+                kind: "amqp",
+                name: "AMQP",
+                desc: "AMQP topic consumer",
+                configured: !self.amqp.is_empty(),
+            },
+            ChannelInfo {
                 kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
@@ -11030,11 +11100,16 @@ impl ChannelsConfig {
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
+            || self.amqp.values().any(|c| c.enabled)
     }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
     300
+}
+
+fn default_channel_max_concurrent_per_channel() -> usize {
+    4
 }
 
 fn default_session_backend() -> String {
@@ -11078,7 +11153,9 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
             session_persistence: true,
@@ -12360,6 +12437,152 @@ fn default_mqtt_keep_alive_secs() -> u64 {
     30
 }
 
+/// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
+///
+/// Subscribes to an exchange via routing keys and lifts each delivery into an
+/// inbound `ChannelMessage`. The mapping from a JSON delivery body to message
+/// fields is config-driven (`content_template`, `thread_id_field`) so a new
+/// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
+/// configuration rather than code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.amqp"]
+pub struct AmqpConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
+    /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[tab(Connection)]
+    pub amqp_url: String,
+    /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
+    #[tab(Advanced)]
+    pub exchange: String,
+    /// Routing keys to bind. Scope these to the topics of interest; binding
+    /// `#` consumes the entire exchange and is almost never what you want.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub routing_keys: Vec<String>,
+    /// Queue name. Leave unset for a server-generated, transient,
+    /// auto-deleted, exclusive queue. Set a stable name (UUID recommended)
+    /// only when durable delivery across reconnects is required.
+    #[tab(Advanced)]
+    pub queue: Option<String>,
+    /// Path to the CA certificate bundle for `amqps://` connections.
+    #[tab(Connection)]
+    pub ca_cert: Option<PathBuf>,
+    /// Path to the client certificate for broker mutual-TLS auth
+    /// (Fedora Messaging requires a client cert).
+    #[tab(Connection)]
+    pub client_cert: Option<PathBuf>,
+    /// Path to the client private key matching `client_cert`.
+    #[tab(Connection)]
+    pub client_key: Option<PathBuf>,
+    /// Value placed in `ChannelMessage.sender` for every delivery from this
+    /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
+    /// per-channel routing identify the origin.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_sender_label")]
+    pub sender_label: String,
+    /// Template for the inbound message content. `{field}` placeholders are
+    /// interpolated from the JSON delivery body's top-level keys. When empty,
+    /// the raw delivery body is used verbatim.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub content_template: String,
+    /// Dotted path into the JSON delivery body whose value becomes the
+    /// message `thread_ts`, correlating replies to the originating event
+    /// (e.g. `message.project.name`). Empty disables threading.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub thread_id_field: String,
+    /// Acknowledgement mode. When `true` (default), deliveries are acked only
+    /// after the message is durably handed to the agent loop, giving
+    /// at-least-once semantics: a crash before hand-off redelivers the event.
+    /// Set `false` for at-most-once (broker acks on dispatch), which silently
+    /// drops in-flight events on crash and is only appropriate for
+    /// non-side-effecting, drop-on-overload consumers.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_durable_ack")]
+    pub durable_ack: bool,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl AmqpConfig {
+    /// Validate the AMQP configuration.
+    ///
+    /// Checks:
+    /// - `amqp_url` uses a valid scheme (`amqp://` or `amqps://`)
+    /// - `amqps://` connections carry a CA certificate
+    /// - `client_cert` and `client_key` are supplied together (mutual TLS)
+    /// - the exchange is non-empty
+    /// - at least one routing key is bound
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let is_tls = self.amqp_url.starts_with("amqps://");
+        let is_plain = self.amqp_url.starts_with("amqp://");
+
+        if !is_tls && !is_plain {
+            anyhow::bail!(
+                "amqp_url must start with 'amqp://' or 'amqps://', got: {}",
+                self.amqp_url
+            );
+        }
+
+        if is_tls && self.ca_cert.is_none() {
+            anyhow::bail!("amqps:// requires ca_cert to verify the broker");
+        }
+
+        match (self.client_cert.is_some(), self.client_key.is_some()) {
+            (true, false) => {
+                anyhow::bail!(
+                    "client_cert is set but client_key is missing (both are required for mutual TLS)"
+                )
+            }
+            (false, true) => {
+                anyhow::bail!(
+                    "client_key is set but client_cert is missing (both are required for mutual TLS)"
+                )
+            }
+            _ => {}
+        }
+
+        if self.exchange.is_empty() {
+            validation_bail!(RequiredFieldEmpty, "exchange", "exchange must not be empty");
+        }
+
+        if self.routing_keys.is_empty() {
+            anyhow::bail!("at least one routing key must be configured");
+        }
+
+        Ok(())
+    }
+}
+
+impl ChannelConfig for AmqpConfig {
+    fn name() -> &'static str {
+        "AMQP"
+    }
+    fn desc() -> &'static str {
+        "AMQP topic consumer"
+    }
+}
+
+fn default_amqp_sender_label() -> String {
+    "amqp".to_string()
+}
+
+fn default_amqp_durable_ack() -> bool {
+    true
+}
+
 /// IRC channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -12552,6 +12775,36 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Time in seconds an approval card waits for user response before
+    /// the runtime auto-denies. Default: 300 (5 minutes).
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub per_user_session: bool,
+
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive `update_draft` PATCH calls in
+    /// milliseconds. Default 1000 ms tunes to Feishu's 5 QPS-per-message
+    /// edit cap; raise on enterprise plans with higher quotas.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -15343,6 +15596,13 @@ impl Config {
                 "transcription.max_audio_bytes must be greater than zero"
             );
         }
+        if self.channels.max_concurrent_per_channel == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.max_concurrent_per_channel",
+                "channels.max_concurrent_per_channel must be greater than 0"
+            );
+        }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
         if self.heartbeat.enabled {
@@ -17131,6 +17391,7 @@ impl_enum_prop_kind!(
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
+    KiloEndpoint,
     CustomEndpoint,
 );
 
@@ -17150,6 +17411,43 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    async fn amqp_validate_requires_paired_client_cert_and_key() {
+        let base = AmqpConfig {
+            enabled: true,
+            amqp_url: "amqps://broker.example.org:5671/%2Fpublic".into(),
+            exchange: "amq.topic".into(),
+            routing_keys: vec!["org.example.release".into()],
+            ca_cert: Some(std::path::PathBuf::from("/etc/ssl/ca.pem")),
+            ..AmqpConfig::default()
+        };
+
+        // Both absent: server-auth only, valid.
+        assert!(base.validate().is_ok());
+
+        // Cert without key: invalid.
+        let cert_only = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            ..base.clone()
+        };
+        assert!(cert_only.validate().is_err());
+
+        // Key without cert: invalid.
+        let key_only = AmqpConfig {
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base.clone()
+        };
+        assert!(key_only.validate().is_err());
+
+        // Both present: valid.
+        let both = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base
+        };
+        assert!(both.validate().is_ok());
+    }
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -17782,6 +18080,42 @@ auto_save = true
         assert!(c.discord.is_empty());
         assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+        assert_eq!(
+            c.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+    }
+
+    #[test]
+    async fn channels_max_concurrent_per_channel_defaults_and_round_trips() {
+        let parsed: ChannelsConfig = toml::from_str("cli = true").unwrap();
+        assert_eq!(
+            parsed.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+
+        let parsed: ChannelsConfig =
+            toml::from_str("cli = true\nmax_concurrent_per_channel = 2").unwrap();
+        assert_eq!(parsed.max_concurrent_per_channel, 2);
+
+        let toml_str = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reparsed.max_concurrent_per_channel, 2);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_channel_max_concurrent_per_channel() {
+        let mut config = Config::default();
+        config.channels.max_concurrent_per_channel = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero channel concurrency budget must fail validate");
+        assert!(
+            err.to_string()
+                .contains("channels.max_concurrent_per_channel must be greater than 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -17972,7 +18306,9 @@ auto_save = true
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
+                amqp: HashMap::new(),
                 message_timeout_secs: 300,
+                max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
@@ -18764,6 +19100,10 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
 
@@ -19429,7 +19769,9 @@ allowed_users = ["@u:matrix.org"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -19870,7 +20212,9 @@ allowed_numbers = ["+1", "+2"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -19953,6 +20297,7 @@ allowed_numbers = ["+1", "+2"]
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -20941,6 +21286,10 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
         config.save().await.unwrap();
@@ -21504,6 +21853,10 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -21528,6 +21881,10 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();

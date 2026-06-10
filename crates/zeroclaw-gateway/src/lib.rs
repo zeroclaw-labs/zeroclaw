@@ -2163,38 +2163,7 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.read().clone();
-        // Per-request dispatch: honor the caller's validated agent alias.
-        // Without one, fall back to the legacy pick — SSE / pairing
-        // endpoints still don't accept an explicit agent in the request
-        // payload, so the migration-synthesized "default" agent (or first
-        // enabled) remains their dispatch target.
-        let agent_alias = agent_override
-            .map(ToString::to_string)
-            .or_else(|| {
-                config
-                    .agents
-                    .keys()
-                    .find(|k| k.as_str() == "default")
-                    .or_else(|| {
-                        config
-                            .agents
-                            .iter()
-                            .find(|(_, a)| a.enabled)
-                            .map(|(alias, _)| alias)
-                    })
-                    .cloned()
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "webhook chat rejected: no configured [agents.<alias>] entry"
-                );
-                anyhow::Error::msg(
-                    "webhook chat requires at least one configured [agents.<alias>] entry",
-                )
-            })?;
+        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
 
         // Scope the cost tracking context so per-LLM-call usage flows into the
         // gateway's cost tracker and costs.jsonl. Without this scope, the
@@ -2250,6 +2219,31 @@ async fn run_gateway_chat_with_tools(
             cost_usd,
         })
     }
+}
+
+fn resolve_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> Option<String> {
+    agent_override
+        .map(ToString::to_string)
+        .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
+}
+
+#[cfg(not(test))]
+fn require_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> anyhow::Result<String> {
+    resolve_gateway_chat_agent_alias(config, agent_override).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "webhook chat rejected: no configured [agents.<alias>] entry"
+        );
+        anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
+    })
 }
 
 fn optional_channel_routes() -> Router<AppState> {
@@ -2455,24 +2449,29 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = {
+    let (provider_label, model_label) = {
         let cfg = state.config.read();
-        // When the request names an agent, label observability events with
-        // that agent's resolved provider; the first-entry pick is only the
-        // legacy-dispatch approximation.
-        agent_override
-            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias))
+        let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
+        let resolved_provider = resolved_agent_alias
+            .as_deref()
+            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
+        let provider_label = resolved_provider
+            .as_ref()
             .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .or_else(|| {
-                cfg.providers
-                    .models
-                    .iter_entries()
-                    .next()
-                    .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let model_label = resolved_provider
+            .and_then(|(_, _, entry)| {
+                entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(ToString::to_string)
             })
-            .unwrap_or_else(|| "unknown".to_string())
+            .or_else(|| cfg.resolve_default_model())
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        (provider_label, model_label)
     };
-    let model_label = state.model.clone();
     let started_at = Instant::now();
 
     state.observer.record_event(
@@ -2524,14 +2523,14 @@ async fn handle_webhook(
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
                     model_provider: provider_label,
-                    model: model_label,
+                    model: model_label.clone(),
                     duration,
                     tokens_used,
                     cost_usd,
                 },
             );
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": model_label});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -3386,7 +3385,54 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/reload — reload the daemon in place (localhost only).
+/// Authorization decision for `POST /admin/reload`, derived purely from the
+/// caller's loopback status, the `gateway.allow_remote_admin` flag, and
+/// whether pairing is enabled.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminReloadGate {
+    /// Loopback caller (the CLI) — allow without further checks.
+    Allow,
+    /// Non-loopback caller, opted in with pairing on — allow only if pairing
+    /// auth passes.
+    RequireAuth,
+    /// Non-loopback caller, not opted in — reject.
+    Forbidden,
+    /// Non-loopback caller opted in, but pairing is disabled — reject rather
+    /// than allow an unauthenticated remote reload. `require_auth` is a no-op
+    /// when pairing is off, so without this guard `allow_remote_admin` would
+    /// expose reload to anonymous remote callers.
+    ForbiddenNoPairing,
+}
+
+/// Pure gate decision for `/admin/reload`. Auth enforcement (for the
+/// `RequireAuth` case) is handled separately by the caller.
+///
+/// Remote access requires *both* `allow_remote_admin` and pairing: opting in
+/// without pairing yields `ForbiddenNoPairing`, never an unauthenticated
+/// allow.
+fn admin_reload_gate(
+    is_loopback: bool,
+    allow_remote_admin: bool,
+    require_pairing: bool,
+) -> AdminReloadGate {
+    if is_loopback {
+        AdminReloadGate::Allow
+    } else if !allow_remote_admin {
+        AdminReloadGate::Forbidden
+    } else if require_pairing {
+        AdminReloadGate::RequireAuth
+    } else {
+        AdminReloadGate::ForbiddenNoPairing
+    }
+}
+
+/// POST /admin/reload — reload the daemon in place.
+///
+/// Loopback callers (the CLI) are always allowed. Non-loopback callers are
+/// rejected unless `gateway.allow_remote_admin` is enabled *and* pairing is
+/// on, in which case the request must also pass pairing authentication
+/// (`require_auth`). Opting in with pairing disabled is rejected rather than
+/// allowing an unauthenticated remote reload.
 ///
 /// Sends `true` on the reload channel the daemon owns. The daemon's main
 /// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
@@ -3405,8 +3451,43 @@ async fn handle_admin_shutdown(
 async fn handle_admin_reload(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+    // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
+    // unless the operator opted in via `gateway.allow_remote_admin`, and even
+    // then must pass pairing auth — which requires pairing to be enabled, so
+    // opting in without pairing is rejected rather than left unauthenticated.
+    let allow_remote = state.config.read().gateway.allow_remote_admin;
+    // Source pairing status from the guard `require_auth` consults, not the
+    // raw config field, so the gate's `RequireAuth` decision can never
+    // diverge from what `require_auth` will actually enforce.
+    let require_pairing = state.pairing.require_pairing();
+    match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
+        AdminReloadGate::Allow => {}
+        AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
+        AdminReloadGate::Forbidden => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload is disabled. Call from localhost, \
+                              or set gateway.allow_remote_admin = true (with pairing \
+                              enabled, then pair) to allow authenticated remote reloads."
+                })),
+            ));
+        }
+        AdminReloadGate::ForbiddenNoPairing => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload requires pairing. \
+                              gateway.allow_remote_admin is enabled but \
+                              gateway.require_pairing is off, so remote callers \
+                              cannot be authenticated. Enable require_pairing, or \
+                              call /admin/reload from localhost."
+                })),
+            ));
+        }
+    }
 
     let Some(reload_tx) = state.reload_tx.clone() else {
         return Err((
@@ -4045,9 +4126,18 @@ mod tests {
     /// channel could be exercised.
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.zeroclaw/data (see #7054).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
         // Default Config has no [agents.*] entries — the exact shape
         // a fresh install presents on first daemon boot.
-        let config = Config::default();
         assert!(
             config.agents.is_empty(),
             "regression assumes default Config has no agents",
@@ -4103,7 +4193,16 @@ mod tests {
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
         use zeroclaw_config::schema::AliasedAgentConfig;
 
-        let mut config = Config::default();
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.zeroclaw/data (see #7054).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
         // Enabled agent whose `risk_profile` does not resolve. No
         // matching [risk_profiles.<key>] entry exists.
         let agent = AliasedAgentConfig {
@@ -4718,6 +4817,28 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CapturingObserver {
+        events: Mutex<Vec<zeroclaw_runtime::observability::ObserverEvent>>,
+    }
+
+    impl zeroclaw_runtime::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
+        }
+
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
     }
@@ -5007,16 +5128,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_explicit_agent_dispatches() {
+    async fn webhook_explicit_agent_reports_agent_model() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let observer_impl = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = observer_impl.clone();
 
         let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".into(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("agent-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let expected_provider = "anthropic.default".to_string();
         config.agents.insert(
             "nova".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 enabled: true,
+                model_provider: expected_provider.clone().into(),
                 ..Default::default()
             },
         );
@@ -5024,7 +5158,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider,
-            model: "test-model".into(),
+            model: "startup-model".into(),
             temperature: None,
             mem: memory,
             auto_save: false,
@@ -5050,7 +5184,7 @@ mod tests {
             wati: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
-            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
@@ -5089,6 +5223,20 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["model"], "agent-model");
+        let events = observer_impl.events.lock();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+                    model_provider,
+                    model,
+                } if model_provider == &expected_provider && model == "agent-model"
+            )),
+            "expected AgentStart to use the explicit agent model; events were: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -6189,6 +6337,176 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_reload_gate_loopback_always_allowed() {
+        // Loopback is allowed regardless of the opt-in or pairing flags.
+        assert_eq!(
+            admin_reload_gate(true, false, false),
+            AdminReloadGate::Allow
+        );
+        assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_blocked_by_default() {
+        // Non-loopback caller with the flag off is rejected outright,
+        // regardless of pairing.
+        assert_eq!(
+            admin_reload_gate(false, false, true),
+            AdminReloadGate::Forbidden
+        );
+        assert_eq!(
+            admin_reload_gate(false, false, false),
+            AdminReloadGate::Forbidden
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_requires_auth() {
+        // Non-loopback caller with the flag on and pairing on must authenticate.
+        assert_eq!(
+            admin_reload_gate(false, true, true),
+            AdminReloadGate::RequireAuth
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_without_pairing_is_rejected() {
+        // Opting in with pairing off cannot authenticate the caller, so the
+        // request is rejected rather than allowed anonymously.
+        assert_eq!(
+            admin_reload_gate(false, true, false),
+            AdminReloadGate::ForbiddenNoPairing
+        );
+    }
+
+    #[test]
+    fn allow_remote_admin_defaults_off() {
+        // Security default: remote admin reload is disabled until opted in.
+        assert!(!zeroclaw_config::schema::GatewayConfig::default().allow_remote_admin);
+    }
+
+    // ── handle_admin_reload route-level tests ─────────────────────
+    // Beyond the pure `admin_reload_gate` policy tests, these exercise the
+    // real handler path (ConnectInfo + HeaderMap + PairingGuard + config),
+    // proving `allow_remote_admin` cannot expose an unauthenticated remote
+    // reload and that a valid paired token is required and sufficient.
+
+    /// Build an `AppState` for `handle_admin_reload`: controls
+    /// `gateway.allow_remote_admin`, pairing (and its tokens), and wires a
+    /// live reload channel so the allowed path reaches `200` rather than the
+    /// `503` standalone-gateway branch.
+    fn admin_reload_state(
+        tmp: &tempfile::TempDir,
+        allow_remote_admin: bool,
+        require_pairing: bool,
+        tokens: &[String],
+    ) -> AppState {
+        let mut state = admin_paircode_state(tmp, require_pairing, false);
+        state.config.write().gateway.allow_remote_admin = allow_remote_admin;
+        state.pairing = Arc::new(PairingGuard::new(require_pairing, tokens));
+        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state
+    }
+
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 40000))
+    }
+
+    fn remote_peer() -> SocketAddr {
+        // RFC 5737 TEST-NET-3 documentation address — a stable non-loopback
+        // peer that is never a real host on anyone's network.
+        SocketAddr::from(([203, 0, 113, 50], 40000))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_reload_loopback_no_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let resp =
+            handle_admin_reload(State(state), ConnectInfo(loopback_peer()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_default_off_is_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_without_pairing_does_not_reload() {
+        // The fixed hole: allow_remote_admin = true + require_pairing = false
+        // must NOT permit an anonymous remote reload.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, false, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_missing_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_invalid_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("not-the-token"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_valid_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let resp = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("zc_test_token"),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
