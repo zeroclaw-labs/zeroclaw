@@ -4042,10 +4042,26 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
         }
         TaskCommands::Activity { id } => {
             let task = resolve_task(workspace, &id)?;
-            println!(
-                "No breadcrumb activity for task {} (populated by Track C).",
-                &task.id[..8]
-            );
+            let rows = daemonclaw_runtime::tasks::store::get_task_activity(workspace, &task.id)?;
+            if rows.is_empty() {
+                println!("No breadcrumb activity for task {}.", &task.id[..8]);
+            } else {
+                println!("Activity for task {} ({} entries):", &task.id[..8], rows.len());
+                for row in &rows {
+                    let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+                    let tool = row.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                    let summary = row
+                        .get("result_summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let preview = if summary.len() > 80 {
+                        &summary[..80]
+                    } else {
+                        summary
+                    };
+                    println!("  {ts} {tool}: {preview}");
+                }
+            }
             Ok(())
         }
     }
