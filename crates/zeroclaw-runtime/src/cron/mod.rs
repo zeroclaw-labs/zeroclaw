@@ -23,6 +23,21 @@ pub use types::{
     deserialize_maybe_stringified,
 };
 
+/// Channel names exposed by the cron tool schemas. Actual runtime delivery is
+/// provided by the registered channel delivery handler, not this static enum.
+pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "matrix",
+    "qq",
+    "webhook",
+    "lark",
+    "feishu",
+    "dingtalk",
+];
+
 /// Validate a shell command against an agent's security policy
 /// (allowlist + risk gate). `agent_alias` names the agent under whose
 /// risk profile the command will run. Returns `Ok(())` if the command

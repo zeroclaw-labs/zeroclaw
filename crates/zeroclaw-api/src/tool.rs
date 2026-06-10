@@ -49,6 +49,37 @@ pub struct ToolResult {
     pub error: Option<String>,
 }
 
+/// Loud, actionable banner that filesystem-touching tools surface when the
+/// active runtime uses an **ephemeral workspace** — e.g. a Docker container
+/// with no host volume mount, where the workspace is a private tmpfs. In that
+/// mode writes succeed *inside the container* but never reach the host and are
+/// discarded when the session ends, and reads may return stale or empty data.
+/// Surfacing this prevents the silent data loss reported in issue #4627.
+///
+/// `file_write` refuses outright (it exists only to persist data). The
+/// general-purpose `shell`, `file_read`, and `file_edit` tools stay usable but
+/// attach this warning so the agent — and through it the user — knows the
+/// workspace is ephemeral and how to fix it.
+pub const EPHEMERAL_WORKSPACE_WARNING: &str = "\u{26a0}\u{fe0f} EPHEMERAL WORKSPACE: the active runtime uses an ephemeral workspace \
+     (tmpfs / no host volume mount). Files written here do NOT persist on the host after this \
+     session ends, and reads may return stale or empty data. To make the workspace persistent, \
+     set `runtime.docker.mount_workspace = true` in your config and ensure the workspace \
+     directory is bind-mounted into the container.";
+
+/// Prepend [`EPHEMERAL_WORKSPACE_WARNING`] to a tool's output/error text as a
+/// clearly delimited banner, preserving the original text below it.
+///
+/// The banner must live in the field the dispatcher forwards to the model
+/// (`output` on success, `error` on failure), so call this for whichever field
+/// will be shown. Returns the banner alone when `text` is empty.
+pub fn with_ephemeral_workspace_warning(text: &str) -> String {
+    if text.is_empty() {
+        EPHEMERAL_WORKSPACE_WARNING.to_string()
+    } else {
+        format!("{EPHEMERAL_WORKSPACE_WARNING}\n\n{text}")
+    }
+}
+
 /// Description of a tool for the LLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -86,5 +117,34 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
             description: self.description().to_string(),
             parameters: self.parameters_schema(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_warning_names_cause_and_fix() {
+        assert!(EPHEMERAL_WORKSPACE_WARNING.contains("EPHEMERAL WORKSPACE"));
+        assert!(EPHEMERAL_WORKSPACE_WARNING.contains("tmpfs"));
+        assert!(EPHEMERAL_WORKSPACE_WARNING.contains("mount_workspace"));
+        // Line continuations must not leave doubled spaces.
+        assert!(!EPHEMERAL_WORKSPACE_WARNING.contains("  "));
+    }
+
+    #[test]
+    fn empty_text_returns_banner_alone() {
+        assert_eq!(
+            with_ephemeral_workspace_warning(""),
+            EPHEMERAL_WORKSPACE_WARNING
+        );
+    }
+
+    #[test]
+    fn nonempty_text_keeps_body_below_banner() {
+        let out = with_ephemeral_workspace_warning("body");
+        assert!(out.starts_with(EPHEMERAL_WORKSPACE_WARNING));
+        assert!(out.ends_with("\n\nbody"));
     }
 }
