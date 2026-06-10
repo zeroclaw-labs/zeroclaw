@@ -340,7 +340,16 @@ fn normalize_moral_compass(value: &Value) -> Vec<String> {
             values.push(format!("Conflict Style: {conflict_style}"));
         }
         if values.is_empty() {
-            values.extend(list_from_value(value));
+            if let Some(numeric) = numeric_map_from_value(value) {
+                let mut sorted_keys: Vec<_> = numeric.keys().collect();
+                sorted_keys.sort();
+                for key in sorted_keys {
+                    let label = key.replace('_', " ");
+                    values.push(format!("{label}: {:.2}", numeric[key]));
+                }
+            } else {
+                values.extend(list_from_value(value));
+            }
         }
     } else {
         values.extend(list_from_value(value));

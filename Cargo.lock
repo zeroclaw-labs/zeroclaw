@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-api"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2095,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-channels"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-config"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-gateway"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-hardware"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-identity"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2320,7 +2320,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-infra"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-macros"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-memory"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-plugins"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-providers"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-runtime"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-tool-call-parser"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "regex",
  "serde",
@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-tools"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclaw-tui"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "daemonclawlabs"
-version = "0.7.33"
+version = "0.7.35"
 dependencies = [
  "aardvark-sys",
  "anyhow",
