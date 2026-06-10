@@ -454,7 +454,7 @@ async fn run_task_pickup_tick(
     pickup: daemonclaw_config::schema::AutonomousPickup,
     _delivery: &Option<(String, String)>,
 ) -> (bool, bool) {
-    use crate::tasks::{self, Autonomy, Execution, TaskActor, TaskBinding, TaskStatus};
+    use crate::tasks::{self, Autonomy, Execution, TaskActor, TaskStatus};
 
     let workspace = &config.workspace_dir;
 
@@ -498,7 +498,21 @@ async fn run_task_pickup_tick(
         return (false, has_high_priority);
     }
 
-    if eligible.is_empty() {
+    // ── Continue-my-own-active: resume tasks assigned to heartbeat ──
+    let active_tasks = match tasks::store::list_tasks(workspace, Some(TaskStatus::Active), 50) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Heartbeat task-pickup: failed to list active tasks: {e}");
+            return (true, has_high_priority);
+        }
+    };
+    let my_active: Vec<_> = active_tasks
+        .into_iter()
+        .filter(|t| t.assigned_to.as_deref() == Some("heartbeat"))
+        .filter(|t| t.execution != Execution::Deterministic)
+        .collect();
+
+    if eligible.is_empty() && my_active.is_empty() {
         tracing::debug!("Heartbeat task-pickup: no eligible tasks");
         return (false, false);
     }
@@ -521,6 +535,24 @@ async fn run_task_pickup_tick(
 
     let mut had_error = false;
 
+    // Synthetic per-task session directory
+    let session_dir = config.workspace_dir.join("sessions");
+    let _ = std::fs::create_dir_all(&session_dir);
+
+    // Process my-active tasks first (continuation turns using existing session)
+    for task in &my_active {
+        tracing::info!(
+            "Heartbeat continuing active task {} (P{} {})",
+            &task.id[..8.min(task.id.len())],
+            task.priority,
+            task.title,
+        );
+
+        let session_file = session_dir.join(format!("task_{}.jsonl", task.id));
+        had_error |= execute_task_turn(config, task, &session_file).await;
+    }
+
+    // Then pick up new tasks from eligible
     for task in &eligible {
         // Claim via CAS — another agent may race us
         let claimed = match tasks::store::claim_task(workspace, &task.id, &actor, &audit) {
@@ -546,80 +578,93 @@ async fn run_task_pickup_tick(
             claimed.title,
         );
 
-        // Build prompt from task intent + title
-        let intent = claimed.intent.as_deref().unwrap_or(&claimed.title);
-        let prompt = format!(
-            "[Heartbeat Task | P{}] {}\n\nIntent: {}",
-            claimed.priority, claimed.title, intent,
-        );
-
-        let temp = daemonclaw_config::provider_store::get_fallback_provider()
-            .as_ref()
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7);
-
-        // Execute under task binding for breadcrumb trail
-        let binding = Some(TaskBinding {
-            task_id: claimed.id.clone(),
-            actor_id: "heartbeat".to_string(),
-        });
-
-        let agent_fut = tasks::with_task_binding(binding, async {
-            crate::agent::run(
-                config.clone(),
-                Some(prompt),
-                None,
-                None,
-                temp,
-                vec![],
-                false,
-                None,
-                None,
-                daemonclaw_api::agent::TurnSource::Heartbeat,
-            )
-            .await
-        });
-
-        let result = if config.heartbeat.task_timeout_secs > 0 {
-            match tokio::time::timeout(
-                Duration::from_secs(config.heartbeat.task_timeout_secs),
-                agent_fut,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "task {} timed out ({}s)",
-                    &claimed.id[..8.min(claimed.id.len())],
-                    config.heartbeat.task_timeout_secs,
-                )),
-            }
-        } else {
-            agent_fut.await
-        };
-
-        match result {
-            Ok(_output) => {
-                crate::health::mark_component_ok("heartbeat");
-                // No auto-submit — only the agent's task_submit tool moves to review.
-                // No channel delivery — zero channel output on task path.
-                // Task stays active until agent calls task_submit or task_block.
-            }
-            Err(e) => {
-                had_error = true;
-                tracing::warn!(
-                    "Heartbeat: task {} failed: {e}",
-                    &claimed.id[..8.min(claimed.id.len())]
-                );
-                crate::health::mark_component_error(
-                    "heartbeat",
-                    format!("task {} failed: {e}", &claimed.id[..8.min(claimed.id.len())]),
-                );
-            }
-        }
+        let session_file = session_dir.join(format!("task_{}.jsonl", claimed.id));
+        had_error |= execute_task_turn(config, &claimed, &session_file).await;
     }
 
     (had_error, has_high_priority)
+}
+
+/// Execute a single agent turn for a task under its task binding with a
+/// synthetic per-task session file. Returns `true` if an error occurred.
+async fn execute_task_turn(
+    config: &Config,
+    task: &crate::tasks::Task,
+    session_file: &std::path::Path,
+) -> bool {
+    use crate::tasks::{self, TaskBinding};
+
+    let intent = task.intent.as_deref().unwrap_or(&task.title);
+    let prompt = format!(
+        "[Heartbeat Task | P{}] {}\n\nIntent: {}",
+        task.priority, task.title, intent,
+    );
+
+    let temp = daemonclaw_config::provider_store::get_fallback_provider()
+        .as_ref()
+        .and_then(|e| e.temperature)
+        .unwrap_or(0.7);
+
+    let binding = Some(TaskBinding {
+        task_id: task.id.clone(),
+        actor_id: "heartbeat".to_string(),
+    });
+
+    let session_path = session_file.to_path_buf();
+    let agent_fut = tasks::with_task_binding(binding, async {
+        crate::agent::run(
+            config.clone(),
+            Some(prompt),
+            None,
+            None,
+            temp,
+            vec![],
+            false,
+            Some(session_path),
+            None,
+            daemonclaw_api::agent::TurnSource::Heartbeat,
+        )
+        .await
+    });
+
+    let result = if config.heartbeat.task_timeout_secs > 0 {
+        match tokio::time::timeout(
+            Duration::from_secs(config.heartbeat.task_timeout_secs),
+            agent_fut,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "task {} timed out ({}s)",
+                &task.id[..8.min(task.id.len())],
+                config.heartbeat.task_timeout_secs,
+            )),
+        }
+    } else {
+        agent_fut.await
+    };
+
+    match result {
+        Ok(_output) => {
+            crate::health::mark_component_ok("heartbeat");
+            // No auto-submit — only the agent's task_submit tool moves to review.
+            // No channel delivery — zero channel output on task path.
+            // Task stays active until agent calls task_submit or task_block.
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Heartbeat: task {} failed: {e}",
+                &task.id[..8.min(task.id.len())]
+            );
+            crate::health::mark_component_error(
+                "heartbeat",
+                format!("task {} failed: {e}", &task.id[..8.min(task.id.len())]),
+            );
+            true
+        }
+    }
 }
 
 /// Resolve delivery target: explicit config > auto-detect first configured channel.
