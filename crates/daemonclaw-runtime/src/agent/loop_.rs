@@ -3821,9 +3821,10 @@ fn session_actor_attribution(
 ) -> (Option<&'static str>, Option<&'static str>) {
     use daemonclaw_api::agent::TurnSource;
     match turn_source {
-        TurnSource::Heartbeat => (Some("heartbeat"), Some("task_agent")),
+        TurnSource::Heartbeat | TurnSource::Cli => {
+            (Some(crate::tasks::MAIN_AGENT_ACTOR_ID), Some("task_agent"))
+        }
         TurnSource::Cron => (None, Some("cron")),
-        TurnSource::Cli => (None, Some("cli")),
         TurnSource::Channel => (None, Some("channel")),
     }
 }

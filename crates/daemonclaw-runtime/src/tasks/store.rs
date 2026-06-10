@@ -1437,17 +1437,17 @@ mod tests {
     #[test]
     fn continue_my_own_active_vs_skip_others() {
         let (tmp, audit) = test_setup();
-        let heartbeat_actor = TaskActor {
+        let main_actor = TaskActor {
             channel: "heartbeat".to_string(),
-            id: Some("heartbeat".to_string()),
+            id: Some(crate::tasks::MAIN_AGENT_ACTOR_ID.to_string()),
         };
         let other = other_actor();
 
         // Create and claim two tasks by different actors
         let mut p = simple_params("My task");
         p.autonomy = Autonomy::Auto;
-        let my_task = create_task(tmp.path(), &p, &heartbeat_actor, &audit).unwrap();
-        claim_task(tmp.path(), &my_task.id, &heartbeat_actor, &audit).unwrap();
+        let my_task = create_task(tmp.path(), &p, &main_actor, &audit).unwrap();
+        claim_task(tmp.path(), &my_task.id, &main_actor, &audit).unwrap();
 
         let mut p2 = simple_params("Their task");
         p2.autonomy = Autonomy::Auto;
@@ -1460,7 +1460,7 @@ mod tests {
 
         let my_active: Vec<_> = active
             .iter()
-            .filter(|t| t.assigned_to.as_deref() == Some("heartbeat"))
+            .filter(|t| t.assigned_to.as_deref() == Some(crate::tasks::MAIN_AGENT_ACTOR_ID))
             .filter(|t| t.execution != Execution::Deterministic)
             .collect();
 
@@ -1619,7 +1619,7 @@ mod tests {
 
         let task_id = "abc12345-dead-beef-0000-111122223333";
         let key = format!("task_{task_id}");
-        let actor_id = Some("heartbeat");
+        let actor_id = Some(crate::tasks::MAIN_AGENT_ACTOR_ID);
         let actor_type = Some("task_agent");
 
         // Tick 1: user prompt + assistant response
@@ -1649,7 +1649,7 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         let key = "task_deadbeef";
-        backend.append_with_actor(key, &ChatMessage::user("hello"), Some("heartbeat"), Some("task_agent")).unwrap();
+        backend.append_with_actor(key, &ChatMessage::user("hello"), Some(crate::tasks::MAIN_AGENT_ACTOR_ID), Some("task_agent")).unwrap();
 
         let meta = backend.list_sessions_with_metadata();
         assert_eq!(meta.len(), 1);
@@ -1667,7 +1667,7 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         let key = "task_fts_test";
-        backend.append_with_actor(key, &ChatMessage::assistant("The QWERTY_UNIQUE_PAYLOAD was processed successfully"), Some("heartbeat"), Some("task_agent")).unwrap();
+        backend.append_with_actor(key, &ChatMessage::assistant("The QWERTY_UNIQUE_PAYLOAD was processed successfully"), Some(crate::tasks::MAIN_AGENT_ACTOR_ID), Some("task_agent")).unwrap();
 
         let results = backend.search(&daemonclaw_infra::session_backend::SessionQuery {
             keyword: Some("QWERTY_UNIQUE_PAYLOAD".into()),
@@ -1712,7 +1712,7 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         // Task session
-        backend.append_with_actor("task_isolated", &ChatMessage::assistant("SECRET_TASK_CONTENT_MUST_NOT_LEAK"), Some("heartbeat"), Some("task_agent")).unwrap();
+        backend.append_with_actor("task_isolated", &ChatMessage::assistant("SECRET_TASK_CONTENT_MUST_NOT_LEAK"), Some(crate::tasks::MAIN_AGENT_ACTOR_ID), Some("task_agent")).unwrap();
 
         // Channel session
         backend.append("telegram_user_123", &ChatMessage::user("What's up?")).unwrap();
@@ -1746,7 +1746,7 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         let key = "task_actor_test";
-        backend.append_with_actor(key, &ChatMessage::user("hello"), Some("heartbeat"), Some("task_agent")).unwrap();
+        backend.append_with_actor(key, &ChatMessage::user("hello"), Some(crate::tasks::MAIN_AGENT_ACTOR_ID), Some("task_agent")).unwrap();
 
         // Verify actor columns via raw SQL
         let db_path = tmp.path().join("sessions").join("sessions.db");
@@ -1756,7 +1756,7 @@ mod tests {
             rusqlite::params![key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
-        assert_eq!(actor_id.as_deref(), Some("heartbeat"));
+        assert_eq!(actor_id.as_deref(), Some(crate::tasks::MAIN_AGENT_ACTOR_ID));
         assert_eq!(actor_type.as_deref(), Some("task_agent"));
     }
 }

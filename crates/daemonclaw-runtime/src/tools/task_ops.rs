@@ -66,7 +66,7 @@ impl Tool for TaskSubmitTool {
         };
 
         let actor = crate::tasks::TaskActor {
-            channel: "heartbeat".to_string(),
+            channel: "task".to_string(),
             id: Some(binding.actor_id.clone()),
         };
 
@@ -166,7 +166,7 @@ impl Tool for TaskBlockTool {
         };
 
         let actor = crate::tasks::TaskActor {
-            channel: "heartbeat".to_string(),
+            channel: "task".to_string(),
             id: Some(binding.actor_id.clone()),
         };
 

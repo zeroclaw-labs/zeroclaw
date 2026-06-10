@@ -3,6 +3,8 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub const MAIN_AGENT_ACTOR_ID: &str = "main";
+
 #[derive(Debug, Clone)]
 pub struct TaskBinding {
     pub task_id: String,

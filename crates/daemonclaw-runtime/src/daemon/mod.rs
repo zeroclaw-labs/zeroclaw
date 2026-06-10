@@ -508,7 +508,7 @@ async fn run_task_pickup_tick(
     };
     let my_active: Vec<_> = active_tasks
         .into_iter()
-        .filter(|t| t.assigned_to.as_deref() == Some("heartbeat"))
+        .filter(|t| t.assigned_to.as_deref() == Some(tasks::MAIN_AGENT_ACTOR_ID))
         .filter(|t| t.execution != Execution::Deterministic)
         .collect();
 
@@ -520,7 +520,7 @@ async fn run_task_pickup_tick(
     // ── Assisted / Full mode: claim and execute ─────────────────
     let actor = TaskActor {
         channel: "heartbeat".to_string(),
-        id: Some("heartbeat".to_string()),
+        id: Some(tasks::MAIN_AGENT_ACTOR_ID.to_string()),
     };
     let audit = match crate::security::audit::AuditLogger::new(
         config.security.audit.clone(),
@@ -619,7 +619,7 @@ async fn execute_task_turn(
     if max_turns > 0 && turn_count > max_turns {
         let actor = TaskActor {
             channel: "heartbeat".to_string(),
-            id: Some("heartbeat".to_string()),
+            id: Some(tasks::MAIN_AGENT_ACTOR_ID.to_string()),
         };
         let reason = "turn budget exhausted";
         tracing::info!(
@@ -651,7 +651,7 @@ async fn execute_task_turn(
 
     let binding = Some(TaskBinding {
         task_id: task.id.clone(),
-        actor_id: "heartbeat".to_string(),
+        actor_id: tasks::MAIN_AGENT_ACTOR_ID.to_string(),
     });
 
     let session = crate::agent::SessionPersistence::Db(session_key.to_string());

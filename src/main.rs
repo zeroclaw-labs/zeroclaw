@@ -1522,7 +1522,7 @@ async fn main() -> Result<()> {
 
                 let cli_actor = TaskActor {
                     channel: "cli".to_string(),
-                    id: Some(std::env::var("USER").unwrap_or_else(|_| "cli".to_string())),
+                    id: Some(tasks::MAIN_AGENT_ACTOR_ID.to_string()),
                 };
                 let audit = daemonclaw_runtime::security::audit::AuditLogger::new(
                     config.security.audit.clone(),
