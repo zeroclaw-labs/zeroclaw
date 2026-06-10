@@ -16,6 +16,7 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     build_refs(&root)?;
     build_api(&root)?;
     build_locales(&root, tag)?;
+    crate::cmd::mdbook::linkcheck::check_internal_links(&root, tag.unwrap_or(DEFAULT_TAG))?;
     assemble(&root, tag)?;
     println!(
         "==> Done. Open: {}",

@@ -72,6 +72,8 @@ enum Cmd {
     Themes,
     /// Regenerate hardware reference snippets from the board registry + catalog
     Hardware,
+    /// Check internal links in the already-built book HTML
+    Linkcheck,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -119,5 +121,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
         Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
+        Cmd::Linkcheck => cmd::mdbook::linkcheck::check_internal_links(
+            &xtask::util::repo_root(),
+            tag.unwrap_or("master"),
+        ),
     }
 }
