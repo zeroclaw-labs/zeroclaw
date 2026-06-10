@@ -47,6 +47,10 @@ The project has contributors filing issues in non-English locales (the supported
 
 When the protocol refers to "maintainer comments" (e.g., stale clock computation), identify maintainers by checking the CODEOWNERS file or repository collaborator list. If neither is accessible, use org membership in `zeroclaw-labs`. Do not guess based on comment tone or authority — use an explicit check.
 
+### Issue stewardship
+
+For owner-path and stale-exemption decisions, use `docs/book/src/maintainers/issue-stewardship.md` as the source of truth. A label is not ownership by itself. Until the standing steward map is explicitly populated there, use only issue-visible assignees, maintainer comments, public Project fields, linked public trackers, or dated maintainer-triage plans as owner sources.
+
 ### Cross-mode session awareness
 
 If multiple modes run in the same session (e.g., triage then sweep), the later mode must be aware of actions taken by earlier modes. Specifically:
@@ -284,7 +288,7 @@ Activity is defined as: a follow-up comment or update from the **original author
 
 `status:in-progress` is a routing signal, not a permanent stale exemption by itself. During stale passes, verify that an open linked PR still exists. If the PR has closed without resolving the issue, remove or replace `status:in-progress` only after presenting the exact label change to the user.
 
-Target policy: `status:no-stale` protects an issue only when the reason and active owner or steward path are visible through the contributor-visible sources defined in the maintainer Project board contract. Assignees count as active owners. Public issue fields count only when they are visible to normal issue readers; organization-only or private issue and Project fields do not satisfy the contributor-visible requirement. Labels can identify the likely area, but they are not an owner source by themselves. Until the stale-exemption audit and repair packet lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
+Target policy: `status:no-stale` protects an issue only when the reason and active owner or steward path match the contributor-visible owner sources in `docs/book/src/maintainers/issue-stewardship.md`. Public issue fields count only when they are visible to normal issue readers; organization-only or private issue and Project fields do not satisfy the contributor-visible requirement. Labels can identify the likely area, but they are not an owner source by themselves. Until a standing steward map is explicitly populated there, use only assignees, issue-visible maintainer comments or body sections, public Project fields, linked public trackers, or dated maintainer-triage plans as owner sources. Missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
 ### Stale enforcement steps
 
@@ -303,7 +307,7 @@ Target policy: `status:no-stale` protects an issue only when the reason and acti
 
 4. Before proposing stale action, verify exclusions against current state:
    - Check current labels for `priority:p0`, `type:rfc`, and `status:no-stale`.
-   - For `status:no-stale`, inspect the cited visible source first: assignee, issue body/comment, Public issue field, public Project field, or linked public tracker entry. Record whether both the reason and active owner or steward path are present. If the issue does not cite a visible source or the source is ambiguous, add it to the stale-exemption audit findings and present the proposed correction to the user; reserve exhaustive source gathering for the stale-exemption audit/repair packet.
+   - For `status:no-stale`, inspect the visible owner sources defined in `docs/book/src/maintainers/issue-stewardship.md`. Record whether both the reason and active owner or steward path are present. If the issue does not cite a visible source or the source is ambiguous, add it to the stale-exemption audit findings and present the proposed correction to the user.
    - For `status:blocked`, fetch the issue body and relevant maintainer comments or tracker entry, then verify the recorded blocker and whether it is still unresolved. If not, present the label correction to the user first and do not treat the issue as exempt until the user approves the change.
    - Check the open PR batch for issue references before relying on `status:in-progress` or stale eligibility. Fall back to a per-issue PR search only when the batch result is ambiguous.
    - Check opening-post reactions for the 10-or-more 👍 threshold.
@@ -426,7 +430,7 @@ For issues, risk labels estimate likely fix blast radius from the report. Reasse
 - `status:accepted` — RFC or work item accepted by the team; not stale-exempt by itself
 - `status:blocked` — waiting on external blocker; exempt from stale while the blocker is recorded and unresolved
 - `status:in-progress` — linked open PR exists; verify live PR state before stale decisions
-- `status:no-stale` — explicitly exempt from stale automation for accepted or otherwise long-lived work that is not already protected by another exclusion; target policy requires a recorded reason and contributor-visible active owner or steward path, with existing gaps handled by the stale-exemption audit packet
+- `status:no-stale` — explicitly exempt from stale automation for accepted or otherwise long-lived work that is not already protected by another exclusion; target policy requires a recorded reason and contributor-visible owner source from `docs/book/src/maintainers/issue-stewardship.md`
 
 ### Resolution
 

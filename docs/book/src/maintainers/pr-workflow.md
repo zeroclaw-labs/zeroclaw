@@ -46,7 +46,7 @@ Use these meanings consistently:
 | Project active owner | The board-visible person or steward source currently responsible for the next movement. | A replacement for live PR review state. |
 | Labels | Durable classification and likely area routing. | Ownership by themselves. |
 
-Area stewardship is the issue-side analogue to CODEOWNERS, but it is not implemented through CODEOWNERS. If GitHub issue fields are enabled and visible to the public on the issue page, prefer a Public issue field for `Area steward` or `Owner path`. Organization-only or private issue and Project fields do not satisfy contributor-visible ownership. Otherwise, the contributor-visible source can be a maintained steward table, a public Project field, an issue-visible maintainer comment, or a public tracker entry linked from the issue.
+Area stewardship is the issue-side analogue to CODEOWNERS, but it is not implemented through CODEOWNERS. The active owner-source rules and standing-map process live in [Issue stewardship](./issue-stewardship.md). If GitHub issue fields are enabled and visible to the public on the issue page, prefer a Public issue field for `Area steward` or `Owner path`. Organization-only or private issue and Project fields do not satisfy contributor-visible ownership.
 
 Identifying the next implementation path does not mean the steward must personally implement the issue or guarantee staffing. It means they make the next step explicit: assign an active owner, make the issue contributor-ready, route it to a tracker or milestone, schedule it for maintainer triage, or close/defer it with a recorded rationale.
 
@@ -54,16 +54,9 @@ Stewardship is decision ownership, not indefinite delivery ownership. A stewarde
 
 Scheduling an issue for maintainer triage is valid only when the issue records what decision is needed, where that decision will be tracked, and when it will be revisited. After that triage pass, replace the triage routing with an active owner, contributor-ready scope, tracker or milestone route, blocked/deferred state, or closure rationale.
 
-For accepted or protected issues, prefer one of these visible owner sources before adding or keeping `status:no-stale`:
+For accepted or protected issues, use [Issue stewardship](./issue-stewardship.md) for the accepted owner sources, assignment process, and stale-exemption rule. That page owns the detailed list so Project board policy, label policy, stale passes, and future steward maps do not drift apart.
 
-- an assignee doing active work;
-- a Public issue field, issue comment, or body section naming the steward path;
-- a public Project active-owner or area-steward field;
-- a linked public tracker entry that names the steward or owner source.
-
-Active release trackers and active RFC or design trackers are durable coordination surfaces. When the issue title, body, labels, or milestone clearly identify an active tracker or RFC, the tracker itself supplies the stale-exemption reason and contributor-visible steward surface; it does not need repetitive per-issue owner comments. Revisit the exemption when the milestone closes, the tracker drifts from live release state, the RFC reaches a decision, is superseded, or closes, or the issue no longer represents an active project decision surface.
-
-If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or owner evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
+No standing area steward map is active until current maintainers confirm one in [Issue stewardship](./issue-stewardship.md#standing-steward-map). Until then, labels such as `channel:*`, `provider:*`, `tool:*`, `gateway`, `runtime`, `security:*`, or `docs` suggest likely routing but are not owner evidence by themselves.
 
 ## PR lanes
 

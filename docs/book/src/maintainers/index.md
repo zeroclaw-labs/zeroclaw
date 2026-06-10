@@ -8,6 +8,7 @@ This section covers everything beyond day-to-day development — docs, translati
 - [CI & Actions](./ci-and-actions.md) — workflow inventory, build cache behavior, allowed-actions policy, triage when CI goes red
 - [Claude Code Skills](./skills.md) — in-repo skills for PR reviews, issue triage, squash-merging, changelog generation
 - [PR workflow](./pr-workflow.md) — branch protection, DoR/DoD, AI-assisted contribution policy, failure recovery
+- [Issue stewardship](./issue-stewardship.md) — owner-source rules, maintainer-triage fallback, and future standing steward map process
 - [Reviewer playbook](./reviewer-playbook.md) — review depth matrix, intake triage, automation override, queue hygiene
 - [Labels](./labels.md) — single source of truth for every label and its automation status
 - [Superseding PRs](./superseding.md) — when to supersede, attribution rules, PR and commit templates

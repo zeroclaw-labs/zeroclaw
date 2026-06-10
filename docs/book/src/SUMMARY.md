@@ -126,6 +126,7 @@
   - [CI & Actions](./maintainers/ci-and-actions.md)
   - [Claude Code Skills](./maintainers/skills.md)
   - [PR workflow](./maintainers/pr-workflow.md)
+  - [Issue stewardship](./maintainers/issue-stewardship.md)
   - [Reviewer playbook](./maintainers/reviewer-playbook.md)
   - [Labels](./maintainers/labels.md)
   - [Superseding PRs](./maintainers/superseding.md)

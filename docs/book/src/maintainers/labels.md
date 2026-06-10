@@ -26,9 +26,9 @@ Keep the split based on update frequency:
 
 The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
 
-Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security:*`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in the [Project board contract](./pr-workflow.md#project-board-contract).
+Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security:*`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in [Issue stewardship](./issue-stewardship.md).
 
-Use assignees for active work. Use area stewardship for routing responsibility when nobody is implementing yet. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes.
+Use assignees for active work. Use area stewardship for routing responsibility when nobody is implementing yet. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines why issues need an ownership path; [Issue stewardship](./issue-stewardship.md) defines the accepted owner sources and assignment process.
 
 ## Canonical spelling
 
@@ -219,7 +219,7 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 | `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
 | `status:stale` | No author activity for the stale window; may close if not refreshed |
-| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-ownership-path) has a contributor-visible stale-exemption reason and owner path. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and steward surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
+| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Use only when [Issue stewardship](./issue-stewardship.md#stale-exemption-rule) records both a contributor-visible stale-exemption reason and an owner source. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and steward surface while they remain active. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
 
 ## Resolution labels
 

@@ -41,18 +41,13 @@ Discussions are part of the GitHub handoff system, not a replacement for issues,
 
 [github.com/zeroclaw-labs/zeroclaw/discussions](https://github.com/zeroclaw-labs/zeroclaw/discussions)
 
-## Maintainer contacts
+## Maintainer routing
 
-Core maintainers and their focus areas:
+Default to filing the issue or starting the discussion rather than guessing which maintainer to mention. Labels help identify likely areas, but labels do not prove ownership.
 
-| Handle | Role | Focus |
-|---|---|---|
-| [@JordanTheJet](https://github.com/JordanTheJet) | Project lead | Hardware, edge deployments |
-| [@theonlyhennygod](https://github.com/theonlyhennygod) | Original creator | Channels, gateway |
-| [@WareWolf-MoonWall](https://github.com/WareWolf-MoonWall) | Maintainer | Governance, docs, reviewer playbook |
-| [@singlerider](https://github.com/singlerider) | Maintainer | Runtime, providers, infra |
+Maintainer-side owner-source rules live in [Issue stewardship](../maintainers/issue-stewardship.md). Use that process when an issue needs an assignee, steward path, public tracker, maintainer-triage date, or stale-exemption reason.
 
-`@`-mention sparingly — CC maintainers only when the issue genuinely needs their attention. Default to letting the team triage.
+`@`-mention sparingly. CC a maintainer only when the issue genuinely needs that person's attention or when the stewardship process names them as the current owner source.
 
 ## Security issues
 

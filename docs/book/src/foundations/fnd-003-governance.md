@@ -88,6 +88,7 @@ Operational details intentionally live close to the workflow that uses them:
 | Project board purpose and stage gates | This document |
 | PR lanes and merge/review queue discipline | [Maintainer PR workflow](../maintainers/pr-workflow.md) |
 | Label definitions, ownership boundaries, and cleanup protocol | [Maintainer labels guide](../maintainers/labels.md) |
+| Issue owner sources, stewardship assignment, and stale-exemption criteria | [Issue stewardship](../maintainers/issue-stewardship.md) |
 | Reviewer intake, risk depth, issue triage, and queue hygiene | [Reviewer playbook](../maintainers/reviewer-playbook.md) |
 | Mechanical issue-triage procedure and stale pass details | [Maintainer skills guide](../maintainers/skills.md#issue-triage-workflow) and [Reviewer playbook](../maintainers/reviewer-playbook.md#issue-triage) |
 | Contributor-facing filing and PR mechanics | Issue templates, PR template, and [How to contribute](../contributing/how-to.md) |
@@ -993,7 +994,7 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 **Stale issue management (`.github/workflows/stale.yml`):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and a contributor-visible active owner or steward path. The maintainer label guide and issue-triage protocol carry the current operational details.
+Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while [Issue stewardship](../maintainers/issue-stewardship.md#stale-exemption-rule) records both the stale-exemption reason and a contributor-visible owner source. The maintainer issue-triage protocol carries the mechanical stale-pass procedure.
 
 **PR size labeling (`.github/workflows/pr-size.yml`):**
 
