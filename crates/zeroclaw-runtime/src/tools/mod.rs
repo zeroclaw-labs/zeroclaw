@@ -541,7 +541,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
         )),
         Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias)
+            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
                 .with_subagent_caller(is_subagent_caller),
         ),
         Arc::new(SendMessageToPeerTool::new(
