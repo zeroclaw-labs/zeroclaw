@@ -3385,7 +3385,54 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/reload — reload the daemon in place (localhost only).
+/// Authorization decision for `POST /admin/reload`, derived purely from the
+/// caller's loopback status, the `gateway.allow_remote_admin` flag, and
+/// whether pairing is enabled.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminReloadGate {
+    /// Loopback caller (the CLI) — allow without further checks.
+    Allow,
+    /// Non-loopback caller, opted in with pairing on — allow only if pairing
+    /// auth passes.
+    RequireAuth,
+    /// Non-loopback caller, not opted in — reject.
+    Forbidden,
+    /// Non-loopback caller opted in, but pairing is disabled — reject rather
+    /// than allow an unauthenticated remote reload. `require_auth` is a no-op
+    /// when pairing is off, so without this guard `allow_remote_admin` would
+    /// expose reload to anonymous remote callers.
+    ForbiddenNoPairing,
+}
+
+/// Pure gate decision for `/admin/reload`. Auth enforcement (for the
+/// `RequireAuth` case) is handled separately by the caller.
+///
+/// Remote access requires *both* `allow_remote_admin` and pairing: opting in
+/// without pairing yields `ForbiddenNoPairing`, never an unauthenticated
+/// allow.
+fn admin_reload_gate(
+    is_loopback: bool,
+    allow_remote_admin: bool,
+    require_pairing: bool,
+) -> AdminReloadGate {
+    if is_loopback {
+        AdminReloadGate::Allow
+    } else if !allow_remote_admin {
+        AdminReloadGate::Forbidden
+    } else if require_pairing {
+        AdminReloadGate::RequireAuth
+    } else {
+        AdminReloadGate::ForbiddenNoPairing
+    }
+}
+
+/// POST /admin/reload — reload the daemon in place.
+///
+/// Loopback callers (the CLI) are always allowed. Non-loopback callers are
+/// rejected unless `gateway.allow_remote_admin` is enabled *and* pairing is
+/// on, in which case the request must also pass pairing authentication
+/// (`require_auth`). Opting in with pairing disabled is rejected rather than
+/// allowing an unauthenticated remote reload.
 ///
 /// Sends `true` on the reload channel the daemon owns. The daemon's main
 /// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
@@ -3404,8 +3451,43 @@ async fn handle_admin_shutdown(
 async fn handle_admin_reload(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+    // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
+    // unless the operator opted in via `gateway.allow_remote_admin`, and even
+    // then must pass pairing auth — which requires pairing to be enabled, so
+    // opting in without pairing is rejected rather than left unauthenticated.
+    let allow_remote = state.config.read().gateway.allow_remote_admin;
+    // Source pairing status from the guard `require_auth` consults, not the
+    // raw config field, so the gate's `RequireAuth` decision can never
+    // diverge from what `require_auth` will actually enforce.
+    let require_pairing = state.pairing.require_pairing();
+    match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
+        AdminReloadGate::Allow => {}
+        AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
+        AdminReloadGate::Forbidden => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload is disabled. Call from localhost, \
+                              or set gateway.allow_remote_admin = true (with pairing \
+                              enabled, then pair) to allow authenticated remote reloads."
+                })),
+            ));
+        }
+        AdminReloadGate::ForbiddenNoPairing => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload requires pairing. \
+                              gateway.allow_remote_admin is enabled but \
+                              gateway.require_pairing is off, so remote callers \
+                              cannot be authenticated. Enable require_pairing, or \
+                              call /admin/reload from localhost."
+                })),
+            ));
+        }
+    }
 
     let Some(reload_tx) = state.reload_tx.clone() else {
         return Err((
@@ -6255,6 +6337,176 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_reload_gate_loopback_always_allowed() {
+        // Loopback is allowed regardless of the opt-in or pairing flags.
+        assert_eq!(
+            admin_reload_gate(true, false, false),
+            AdminReloadGate::Allow
+        );
+        assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_blocked_by_default() {
+        // Non-loopback caller with the flag off is rejected outright,
+        // regardless of pairing.
+        assert_eq!(
+            admin_reload_gate(false, false, true),
+            AdminReloadGate::Forbidden
+        );
+        assert_eq!(
+            admin_reload_gate(false, false, false),
+            AdminReloadGate::Forbidden
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_requires_auth() {
+        // Non-loopback caller with the flag on and pairing on must authenticate.
+        assert_eq!(
+            admin_reload_gate(false, true, true),
+            AdminReloadGate::RequireAuth
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_without_pairing_is_rejected() {
+        // Opting in with pairing off cannot authenticate the caller, so the
+        // request is rejected rather than allowed anonymously.
+        assert_eq!(
+            admin_reload_gate(false, true, false),
+            AdminReloadGate::ForbiddenNoPairing
+        );
+    }
+
+    #[test]
+    fn allow_remote_admin_defaults_off() {
+        // Security default: remote admin reload is disabled until opted in.
+        assert!(!zeroclaw_config::schema::GatewayConfig::default().allow_remote_admin);
+    }
+
+    // ── handle_admin_reload route-level tests ─────────────────────
+    // Beyond the pure `admin_reload_gate` policy tests, these exercise the
+    // real handler path (ConnectInfo + HeaderMap + PairingGuard + config),
+    // proving `allow_remote_admin` cannot expose an unauthenticated remote
+    // reload and that a valid paired token is required and sufficient.
+
+    /// Build an `AppState` for `handle_admin_reload`: controls
+    /// `gateway.allow_remote_admin`, pairing (and its tokens), and wires a
+    /// live reload channel so the allowed path reaches `200` rather than the
+    /// `503` standalone-gateway branch.
+    fn admin_reload_state(
+        tmp: &tempfile::TempDir,
+        allow_remote_admin: bool,
+        require_pairing: bool,
+        tokens: &[String],
+    ) -> AppState {
+        let mut state = admin_paircode_state(tmp, require_pairing, false);
+        state.config.write().gateway.allow_remote_admin = allow_remote_admin;
+        state.pairing = Arc::new(PairingGuard::new(require_pairing, tokens));
+        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state
+    }
+
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 40000))
+    }
+
+    fn remote_peer() -> SocketAddr {
+        // RFC 5737 TEST-NET-3 documentation address — a stable non-loopback
+        // peer that is never a real host on anyone's network.
+        SocketAddr::from(([203, 0, 113, 50], 40000))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_reload_loopback_no_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let resp =
+            handle_admin_reload(State(state), ConnectInfo(loopback_peer()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_default_off_is_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_without_pairing_does_not_reload() {
+        // The fixed hole: allow_remote_admin = true + require_pairing = false
+        // must NOT permit an anonymous remote reload.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, false, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_missing_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_invalid_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("not-the-token"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_valid_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let resp = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("zc_test_token"),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
