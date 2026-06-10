@@ -5,8 +5,18 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Maximum image file size we will read for metadata extraction (5 MB).
-const MAX_IMAGE_BYTES: u64 = 5_242_880;
+/// Upper bound on the image file size we will read for metadata extraction.
+///
+/// This is a coarse safety ceiling, not the multimodal size policy. The
+/// per-request decision on whether an image is small enough to inline for a
+/// vision model is the pipeline's `multimodal.max_image_size_mb`
+/// (`MultimodalConfig::effective_limits`, clamped to 1..=20 MB). We size this
+/// ceiling to that clamp's upper bound (20 MiB) so `image_info` never refuses
+/// to read — and therefore never silently withholds metadata for — a file the
+/// pipeline would otherwise have been configured to accept. When the pipeline
+/// limit is lower, the pipeline does the rejecting (with a model-facing note);
+/// `image_info` still returns the metadata text either way.
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Tool to read image metadata and expose the image to vision-capable models.
 ///
@@ -254,29 +264,38 @@ impl Tool for ImageInfoTool {
         let format = Self::detect_format(&bytes);
         let dimensions = Self::extract_dimensions(&bytes, format);
 
-        // Emit an explicit `[IMAGE:<absolute path>]` marker so the multimodal
-        // pipeline inlines the image bytes for vision-capable models. We use
-        // the canonicalized absolute `resolved_path` rather than the
-        // caller-supplied `path_str` (which may be workspace-relative): the
-        // tool-result marker promoter only recognizes absolute paths, so a
-        // relative path would be silently dropped and never reach the model.
-        // Referencing the path only inside the marker also avoids emitting a
-        // second bare path that the promoter would wrap into a duplicate
-        // marker. See issue #7436.
+        // We emit two things for the resolved image:
+        //   1. A durable `File: <absolute path>` line, and
+        //   2. A standalone `[IMAGE:<absolute path>]` marker
+        // both using the canonicalized absolute path (not the caller-supplied
+        // `path_str`, which may be workspace-relative — the tool-result marker
+        // promoter only recognizes absolute paths, so a relative path would be
+        // silently dropped and never reach the model; see issue #7436).
+        //
+        // The `[IMAGE:]` marker is what the multimodal pipeline inlines for
+        // vision models, but it is stripped from older turns to control
+        // context size. The separate `File:` line keeps the path visible in
+        // history *after* the marker is gone, so the model retains the path
+        // (and can re-read the file via `image_info`) across turns. Emitting
+        // the same path twice is safe: the promoter
+        // (`canonicalize_tool_result_media_markers`) dedups a bare path that
+        // already appears inside an explicit marker, so the `File:` line is
+        // not wrapped into a second, double-counted marker.
         //
         // On Windows `canonicalize` returns a verbatim path (`\\?\C:\…`); we
-        // strip that prefix so the marker carries a plain `C:\…` path the
-        // multimodal pipeline's `is_windows_path` detector accepts. Otherwise
-        // the leading backslashes make it drop the marker and the image never
-        // reaches the vision model. See #7436 (Windows follow-up to #7446).
+        // strip that prefix so both the `File:` line and the marker carry a
+        // plain `C:\…` path the multimodal pipeline's `is_windows_path`
+        // detector accepts. Using the identical string for both also keeps the
+        // promoter's dedup exact. See #7436 (Windows follow-up to #7446).
         let resolved_display = resolved_path.display().to_string();
         let marker_path = Self::strip_windows_verbatim_prefix(&resolved_display);
-        let mut output =
-            format!("File: [IMAGE:{marker_path}]\nFormat: {format}\nSize: {file_size} bytes");
+        let mut output = format!("File: {marker_path}\nFormat: {format}\nSize: {file_size} bytes");
 
         if let Some((w, h)) = dimensions {
             let _ = write!(output, "\nDimensions: {w}x{h}");
         }
+
+        let _ = write!(output, "\n[IMAGE:{marker_path}]");
 
         Ok(ToolResult {
             success: true,

@@ -1571,7 +1571,10 @@ pub async fn run_tool_call_loop(
         // ── Vision model_provider routing ──────────────────────────
         // When the default model_provider lacks vision support but a dedicated
         // vision_model_provider is configured, create it on demand and use it
-        // for this iteration.  Otherwise, preserve the original error.
+        // for this iteration. When no vision route exists at all, degrade
+        // gracefully (strip the image markers, keep the surrounding text)
+        // rather than aborting the whole turn — see `degrade_strip_images`.
+        let mut degrade_strip_images = false;
         let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
             && !model_provider.supports_vision()
         {
@@ -1596,6 +1599,9 @@ pub async fn run_tool_call_loop(
                         ))
                     })?;
                 if !vp_instance.supports_vision() {
+                    // Operator misconfiguration (named a non-vision provider as
+                    // the vision route) — surface it loudly rather than silently
+                    // degrading.
                     return Err(ProviderCapabilityError {
                         model_provider: vp.clone(),
                         capability: "vision".to_string(),
@@ -1607,14 +1613,26 @@ pub async fn run_tool_call_loop(
                 }
                 Some(vp_instance)
             } else {
-                return Err(ProviderCapabilityError {
-                        model_provider: provider_name.to_string(),
-                        capability: "vision".to_string(),
-                        message: format!(
-                            "received {image_marker_count} image marker(s), but this model_provider does not support vision input"
-                        ),
-                    }
-                    .into());
+                // No vision route configured. Previously this aborted the entire
+                // turn with a capability error, which turned an otherwise
+                // successful tool call (e.g. `image_info`, which always returns
+                // useful metadata text alongside its `[IMAGE:]` marker) into a
+                // hard failure. Instead, degrade: strip the image markers from
+                // the messages sent to the text-only provider while preserving
+                // the surrounding text, so the conversation continues and the
+                // model still receives any accompanying metadata/caption.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": provider_name,
+                            "image_marker_count": image_marker_count,
+                        })),
+                    "no vision route for image marker(s); degrading to text-only (markers stripped)"
+                );
+                degrade_strip_images = true;
+                None
             }
         } else {
             None
@@ -1635,8 +1653,22 @@ pub async fn run_tool_call_loop(
             (model_provider, provider_name, model)
         };
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = if degrade_strip_images {
+            // Text-only fallback: replace every media marker with a
+            // `[media attachment]` placeholder so no filesystem path or data
+            // URI reaches the text-only provider, while surrounding text
+            // (captions, tool metadata) survives.
+            let stripped: Vec<ChatMessage> = history
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: multimodal::strip_media_markers(&m.content),
+                })
+                .collect();
+            multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?
+        } else {
+            multimodal::prepare_messages_for_provider(history, multimodal_config).await?
+        };
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -6471,8 +6503,12 @@ mod tests {
         }
     }
 
+    /// A non-vision provider with no configured `vision_model_provider` no
+    /// longer aborts the turn: the loop degrades to text-only (stripping image
+    /// markers) and still calls the provider. See the text-only fallback in
+    /// the vision-routing block.
     #[tokio::test]
-    async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+    async fn run_tool_call_loop_degrades_to_text_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -6484,7 +6520,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &model_provider,
             &mut history,
             &tools_registry,
@@ -6516,11 +6552,10 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("model_provider without vision support should fail");
+        .expect("non-vision provider should degrade to text, not abort");
 
-        assert!(err.to_string().contains("provider_capability_error"));
-        assert!(err.to_string().contains("capability=vision"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -6642,10 +6677,13 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// When `vision_model_provider` is not set and the default model_provider lacks vision
-    /// support, the original `ProviderCapabilityError` should be returned.
+    /// When `vision_model_provider` is not set and the default model_provider
+    /// lacks vision support, the loop must NOT abort the turn. Instead it
+    /// degrades gracefully: image markers are stripped and the text-only
+    /// provider is still called so the conversation continues (and any
+    /// accompanying text/metadata survives).
     #[tokio::test]
-    async fn run_tool_call_loop_no_vision_provider_config_preserves_error() {
+    async fn run_tool_call_loop_no_vision_provider_config_degrades_to_text() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -6657,7 +6695,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &model_provider,
             &mut history,
             &tools_registry,
@@ -6689,10 +6727,11 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should fail without vision_model_provider config");
+        .expect("text-only fallback should succeed, not abort the turn");
 
-        assert!(err.to_string().contains("capability=vision"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Provider was invoked (no hard capability error) and returned text.
+        assert_eq!(result, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// When `vision_model_provider` is set but the model_provider factory cannot resolve
