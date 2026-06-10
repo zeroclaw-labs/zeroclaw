@@ -56,5 +56,8 @@ impl HookHandler for BreadcrumbHook {
         ) {
             tracing::warn!(task_id = %binding.task_id, tool, "breadcrumb write failed: {e}");
         }
+
+        // Touch liveness at every tool boundary during task-bound turns
+        crate::health::touch_liveness(&self.workspace_dir);
     }
 }
