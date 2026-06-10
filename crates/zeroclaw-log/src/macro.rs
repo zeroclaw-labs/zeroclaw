@@ -88,18 +88,6 @@ macro_rules! scope {
     }};
 }
 
-/// `tokio::spawn` that propagates the caller's current span(s) into
-/// the spawned task. Use everywhere a per-message child task needs the
-/// parent's attribution.
-#[macro_export]
-macro_rules! spawn {
-    ($body:expr) => {{
-        #[allow(unused_imports)]
-        use $crate::__private::tracing::Instrument as _;
-        ::tokio::spawn(($body).in_current_span())
-    }};
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{Action, Event, EventOutcome};

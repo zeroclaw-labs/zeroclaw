@@ -88,6 +88,30 @@ fn assistant_tool_calls_have_immediate_results(
     })
 }
 
+/// True when the assistant at `prev_idx` is itself an unresolved tool-call
+/// dispatch: it claims `tool_calls` but the rows between it and `next_idx`
+/// do not answer all of them. This is the genuinely poisoned shape where a
+/// second dispatch follows a first that never landed — distinct from a
+/// healthy `assistant(text preamble)` → `assistant(tool_calls)` turn, where
+/// the preamble has no tool_calls and is left untouched.
+fn assistant_is_unresolved_dispatch(
+    messages: &[ChatMessage],
+    prev_idx: usize,
+    next_idx: usize,
+) -> bool {
+    match extract_assistant_tool_call_ids(&messages[prev_idx].content) {
+        Some(ids) if !ids.is_empty() => {
+            let between = &messages[prev_idx + 1..next_idx];
+            !ids.iter().all(|id| {
+                between.iter().any(|m| {
+                    m.role == "tool" && extract_tool_call_id(&m.content).as_ref() == Some(id)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
 impl PrunedOrphans {
     pub fn is_empty(&self) -> bool {
         self.removed == 0
@@ -102,9 +126,21 @@ impl PrunedOrphans {
 /// The Anthropic API (and others) reject these with a 400 error.
 pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedOrphans {
     let mut outcome = PrunedOrphans::default();
-    // Pass 1: Remove assistant(tool_calls) + their tool_results when the
-    // assistant is preceded by another assistant. Normalization would merge
-    // them, destroying structured tool_use blocks and orphaning the results.
+    // Pass 1: Remove a second `assistant(tool_calls)` (and its immediate
+    // tool results) only when the *preceding* assistant is itself
+    // problematic in a way that normalization would corrupt:
+    //
+    //   * a collapsed tool-exchange summary whose merge would orphan this
+    //     dispatch's results (the GLM-history case, #7013), or
+    //   * an unresolved tool-call dispatch — a first dispatch that never
+    //     landed, immediately followed by this one (the poisoned
+    //     double-dispatch case).
+    //
+    // A healthy turn shape `assistant(text preamble)` → `assistant(tool_calls)`
+    // → `tool` must NOT be touched: the preamble has no tool_calls and is
+    // neither a summary nor an unresolved dispatch, so it is left intact.
+    // Nuking the dispatch there produces the "amnesia mid-tool-loop"
+    // failure where the model sees the next turn with none of its work.
     let mut i = 0;
     while i < messages.len() {
         let assistant_tool_call_ids = if messages[i].role == "assistant" {
@@ -115,8 +151,9 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
         if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
-            && (!is_tool_exchange_summary(&messages[i - 1].content)
-                || !assistant_tool_calls_have_immediate_results(messages, i, &doomed_ids))
+            && ((is_tool_exchange_summary(&messages[i - 1].content)
+                && !assistant_tool_calls_have_immediate_results(messages, i, &doomed_ids))
+                || assistant_is_unresolved_dispatch(messages, i - 1, i))
         {
             outcome
                 .orphan_tool_call_ids
@@ -972,38 +1009,60 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_assistant_with_tool_calls_stripped() {
-        // When poisoned turn removal leaves an assistant(text) followed by
-        // assistant(tool_calls), the second assistant and its tool_results
-        // must be removed — normalization would merge them, destroying the
-        // structured tool_use blocks and orphaning the results at the API.
-        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+    fn preamble_then_tool_calls_is_kept_intact() {
+        // Healthy shape: `[A: "let me check"] [A: tool_calls] [T: result]`.
+        // The assistant first emits a brief preamble, then dispatches the
+        // tool, then the tool returns. This is the normal flow of a real
+        // tool-using turn — Pass 1 must NOT touch it.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),
-            msg("assistant", "Here are the results."),
+            msg("assistant", "Let me check."),
             msg("assistant", tool_calls_assistant),
+            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_LIVE"}"#),
+            msg("assistant", "Here are the results."),
+        ];
+        let before = messages.len();
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(
+            pruned.removed, 0,
+            "preamble + dispatch + result is a healthy turn, not orphan poisoning"
+        );
+        assert_eq!(messages.len(), before);
+    }
+
+    #[test]
+    fn back_to_back_unresolved_tool_calls_strips_later_dispatch() {
+        // Genuinely poisoned shape: `[A: tool_calls A]` followed
+        // immediately by `[A: tool_calls B]` with no tool result for A
+        // sitting between them. The earlier dispatch is unresolved, so
+        // the later assistant + its results are removed to restore a
+        // well-formed turn.
+        let first_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_LOST","name":"shell","arguments":"{}"}]}"#;
+        let second_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "do something"),
+            msg("assistant", first_dispatch),
+            msg("assistant", second_dispatch),
             msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
-            msg(
-                "assistant",
-                "The model_provider returned an empty response.",
-            ),
+            msg("assistant", "summary"),
         ];
         let pruned = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
             pruned.removed, 2,
-            "should remove assistant(tool_calls) + tool_result"
+            "second dispatch + its tool_result must be removed when prior dispatch is unresolved"
         );
+        // What survives: sys, user, first_dispatch (now orphaned), summary.
+        // Pass 2 then sweeps any remaining orphan tool messages — there
+        // are none after Pass 1, but the orphaned first_dispatch itself
+        // (assistant with tool_calls and no responses) stays, because
+        // this function only removes *tool*-role orphans in Pass 2,
+        // not stranded assistant dispatches.
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "Here are the results.");
-        assert_eq!(messages[3].role, "assistant");
-        assert_eq!(
-            messages[3].content,
-            "The model_provider returned an empty response."
-        );
+        assert_eq!(messages[2].content, first_dispatch);
+        assert_eq!(messages[3].content, "summary");
     }
 
     #[test]

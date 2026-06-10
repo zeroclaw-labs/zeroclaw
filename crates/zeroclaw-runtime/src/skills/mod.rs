@@ -260,15 +260,22 @@ pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier
 /// Build the install-time tier banner. `Official` skills get a single
 /// informational line; everything else (including `Featured` and the
 /// missing-tag fallback) gets the Community warn block.
-pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
-    let version_label = version.unwrap_or("?");
-    let args = [("name", name), ("version", version_label)];
-    let key = match tier {
+/// Pure: the Fluent key for a tier's install banner. Split out so tests can
+/// resolve it against the English catalogue without depending on the process
+/// locale.
+fn install_tier_banner_key(tier: SkillTier) -> &'static str {
+    match tier {
         SkillTier::Official => "cli-skills-install-tier-official",
         SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => {
             "cli-skills-install-tier-community"
         }
-    };
+    }
+}
+
+pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+    let version_label = version.unwrap_or("?");
+    let args = [("name", name), ("version", version_label)];
+    let key = install_tier_banner_key(tier);
     let mut banner = crate::i18n::get_required_cli_string_with_args(key, &args);
     if !banner.ends_with('\n') {
         banner.push('\n');
@@ -1083,7 +1090,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     for line in s.lines() {
         // Collect indented continuation lines for YAML block scalars (>- or |)
         if let Some(ref key) = collecting_multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 multiline_parts.push(line.trim().to_string());
                 continue;
             }
@@ -2203,6 +2213,33 @@ mod registry_tests {
     use super::*;
 
     #[test]
+    fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. The parser must not truncate the description at it.
+        let frontmatter = "name: x\ndescription: >-\n  para one\n\n  para two\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        let desc = meta.description.expect("description should be parsed");
+        assert!(
+            desc.contains("para one"),
+            "first paragraph missing: {desc:?}"
+        );
+        assert!(
+            desc.contains("para two"),
+            "second paragraph after blank line was truncated: {desc:?}"
+        );
+        assert_eq!(meta.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_simple_frontmatter_block_scalar_stops_at_next_key() {
+        // A real, non-indented next key must still terminate the block scalar.
+        let frontmatter = "description: >-\n  hello\n  world\nversion: 1.2.3\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        assert_eq!(meta.description.as_deref(), Some("hello world"));
+        assert_eq!(meta.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
     fn test_is_registry_source_accepts_bare_names() {
         assert!(is_registry_source("auto-coder"));
         assert!(is_registry_source("web-researcher"));
@@ -2282,9 +2319,22 @@ mod registry_tests {
         );
     }
 
+    /// Resolve a tier banner against the English catalogue only — locale- and
+    /// filesystem-independent, mirroring build_install_tier_banner's assembly.
+    fn english_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+        let version_label = version.unwrap_or("?");
+        let args = [("name", name), ("version", version_label)];
+        let mut banner =
+            crate::i18n::get_english_cli_string_with_args(install_tier_banner_key(tier), &args);
+        if !banner.ends_with('\n') {
+            banner.push('\n');
+        }
+        banner
+    }
+
     #[test]
     fn build_install_tier_banner_official_is_single_line() {
-        let banner = build_install_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
+        let banner = english_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
         assert!(banner.contains("Official (zeroclaw-labs maintained)"));
         assert!(banner.contains("Installing auto-coder v0.3.0"));
         assert!(!banner.contains("not audited"));
@@ -2294,8 +2344,7 @@ mod registry_tests {
 
     #[test]
     fn build_install_tier_banner_community_warns() {
-        let banner =
-            build_install_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
+        let banner = english_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
         assert!(banner.contains("Community submission"));
         assert!(banner.contains("not audited by ZeroClaw"));
         assert!(banner.contains("zeroclaw skills audit discord-moderator"));
@@ -2303,14 +2352,14 @@ mod registry_tests {
 
     #[test]
     fn build_install_tier_banner_featured_uses_community_warning() {
-        let banner = build_install_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
+        let banner = english_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
         assert!(banner.contains("Community submission"));
         assert!(banner.contains("not audited by ZeroClaw"));
     }
 
     #[test]
     fn build_install_tier_banner_unknown_falls_back_to_community() {
-        let banner = build_install_tier_banner("legacy", None, SkillTier::Unknown);
+        let banner = english_tier_banner("legacy", None, SkillTier::Unknown);
         assert!(banner.contains("Community submission"));
         assert!(banner.contains("not audited by ZeroClaw"));
         // Missing version is rendered as `v?` rather than panicking.

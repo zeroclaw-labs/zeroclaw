@@ -315,9 +315,15 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
 }
 
 /// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
+///
+/// Preserves: the system prompt (if any), the first user message (the framing
+/// anchor — losing it is what caused the silent-amnesia bug where models said
+/// "the first message I have is 'Continue'"), and the most recent
+/// `max_history` messages (minus one slot already taken by the anchor).
+///
+/// Drops from the middle. Emits a WARN with counts on every fire so silent
+/// amnesia is impossible to miss again.
 pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -329,11 +335,67 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
         return;
     }
 
-    let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let system_offset = usize::from(has_system);
+
+    // Find the first user message (the framing anchor). If `max_history` is
+    // too small to fit both the anchor and any recent context, fall back to
+    // the old tail-only behaviour rather than producing a degenerate window.
+    let anchor_idx = history
+        .iter()
+        .enumerate()
+        .skip(system_offset)
+        .find(|(_, m)| m.role == "user")
+        .map(|(i, _)| i);
+
+    let messages_before = history.len();
+
+    let dropped_range = match anchor_idx {
+        Some(anchor) if max_history >= 2 => {
+            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
+            let tail_keep = max_history - 1;
+            let tail_start = history.len().saturating_sub(tail_keep);
+            // Middle range to drop: (anchor + 1) .. tail_start.
+            let drop_start = anchor + 1;
+            if tail_start <= drop_start {
+                // Anchor is already inside the tail window — nothing in the
+                // middle to drop. Fall through to plain head-drop below.
+                None
+            } else {
+                Some(drop_start..tail_start)
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(range) = dropped_range {
+        history.drain(range);
+    } else {
+        // No anchor, or `max_history < 2`: original head-drop behaviour.
+        let to_remove = non_system_count - max_history;
+        history.drain(system_offset..system_offset + to_remove);
+    }
+
     remove_orphaned_tool_messages(history);
     normalize_system_messages(history);
+
+    let dropped = messages_before.saturating_sub(history.len());
+    if dropped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "messages_before": messages_before,
+                    "messages_after": history.len(),
+                    "dropped": dropped,
+                    "max_history": max_history,
+                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                })),
+            "trim_history fired: middle of conversation dropped. Raise \
+             [runtime_profiles.<name>] max_history_messages or enable \
+             compact_context to avoid silent context loss."
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

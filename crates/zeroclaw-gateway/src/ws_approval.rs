@@ -2,7 +2,7 @@
 //! prompts to the gateway client and waits for the operator's decision.
 //!
 //! The agent's tool loop calls
-//! [`Channel::request_approval`](zeroclaw_api::channel::Channel::request_approval)
+//! [`zeroclaw_api::channel::Channel::request_approval`]
 //! whenever a supervised-mode tool needs operator consent. This struct mints
 //! a `request_id`, emits a [`TurnEvent::ApprovalRequest`] that the existing
 //! forward loop serialises onto the wire, and parks on a oneshot until the

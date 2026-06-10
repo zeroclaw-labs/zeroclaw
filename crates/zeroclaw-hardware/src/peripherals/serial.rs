@@ -29,6 +29,10 @@ const ALLOWED_PATH_PREFIXES: &[&str] = &[
     "/dev/tty.usbserial",
     "/dev/cu.usbserial", // Arduino Uno (FTDI), clones
     "COM",               // Windows
+    // Opt-in via `dev-sim` cargo feature: enables hardware-free simulation
+    // by allowing paths created by the `esp32_sim` example (socat / pty pair).
+    #[cfg(feature = "dev-sim")]
+    "/tmp/zc-sim-",
 ];
 
 fn is_path_allowed(path: &str) -> bool {
@@ -77,7 +81,7 @@ pub struct SerialTransport {
 const SERIAL_TIMEOUT_SECS: u64 = 5;
 
 impl SerialTransport {
-    async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
+    pub(crate) async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
         let mut port = self.port.lock().await;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(SERIAL_TIMEOUT_SECS),
@@ -143,9 +147,14 @@ impl SerialPeripheral {
         })?;
 
         if !is_path_allowed(path) {
+            #[cfg(feature = "dev-sim")]
+            let hint = ", /tmp/zc-sim-*";
+            #[cfg(not(feature = "dev-sim"))]
+            let hint = "";
             anyhow::bail!(
-                "Serial path not allowed: {}. Allowed: /dev/ttyACM*, /dev/ttyUSB*, /dev/tty.usbmodem*, /dev/cu.usbmodem*",
-                path
+                "Serial path not allowed: {}. Allowed: /dev/ttyACM*, /dev/ttyUSB*, /dev/tty.usbmodem*, /dev/cu.usbmodem*{}",
+                path,
+                hint
             );
         }
 

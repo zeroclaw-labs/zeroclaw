@@ -175,6 +175,13 @@ jobs:
             perl -0pi -e 's|(  depends_on "rust" => :build\n)|\1  depends_on "node" => :build\n|m' "$formula_file"
           fi
 
+          # Ship the zerocode TUI alongside the main binary. The upstream
+          # formula installs only the default-run bin via `cargo install`;
+          # append a second install for the zerocode crate.
+          if ! grep -q 'zerocode' "$formula_file"; then
+            perl -0pi -e 's|(    system "cargo", "install", \*std_cargo_args\n)|\1    system "cargo", "install", *std_cargo_args(path: "apps/zerocode")\n|m' "$formula_file"
+          fi
+
           git -C "$repo_dir" diff -- "$FORMULA_PATH" > "$tmp_repo/formula.diff"
           if [[ ! -s "$tmp_repo/formula.diff" ]]; then
             echo "::error::No formula changes generated. Nothing to publish."

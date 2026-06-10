@@ -79,9 +79,7 @@ Two agents become "peers" (each can address the other on a channel) only when **
 [peer_groups.research]
 channel = "telegram.prod"
 agents = ["primary", "researcher"]
-external_peers = [
-    { username = "operator" },
-]
+external_peers = ["operator"]
 ignore = []
 ```
 

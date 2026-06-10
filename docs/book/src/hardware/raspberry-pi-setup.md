@@ -251,7 +251,7 @@ For rootless setups, also run `loginctl enable-linger $USER` so the service star
 ### 1. Initialize ZeroClaw
 
 ```bash
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 This walks you through provider auth, gateway config, and creates `~/.zeroclaw/config.toml`.

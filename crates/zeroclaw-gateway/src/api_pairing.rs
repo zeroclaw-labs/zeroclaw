@@ -180,27 +180,42 @@ impl DeviceRegistry {
         rows.filter_map(|r| r.ok()).collect()
     }
 
-    pub fn revoke(&self, device_id: &str) -> bool {
+    /// Delete a device by id and return its SHA-256 token hash so the caller
+    /// can revoke the matching bearer token.
+    ///
+    /// `Ok(None)` means the device did not exist; real SQLite errors are
+    /// propagated so handlers can distinguish "nothing to do" from "DB is
+    /// broken" — confusing the two during incident response is dangerous.
+    /// Uses `DELETE … RETURNING` (SQLite ≥ 3.35) so the read and delete are
+    /// atomic under concurrent revoke calls.
+    pub fn revoke(&self, device_id: &str) -> Result<Option<String>, rusqlite::Error> {
         let conn = self.open_db();
-        let deleted = conn
-            .execute(
-                "DELETE FROM devices WHERE id = ?1",
+        let deleted: Option<String> = conn
+            .query_row(
+                "DELETE FROM devices WHERE id = ?1 RETURNING token_hash",
                 rusqlite::params![device_id],
+                |row| row.get::<_, String>(0),
             )
-            .unwrap_or(0);
-        if deleted > 0 {
-            let mut cache = self.cache.lock();
-            let key = cache
-                .iter()
-                .find(|(_, v)| v.id == device_id)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = key {
-                cache.remove(&key);
-            }
-            true
-        } else {
-            false
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if let Some(hash) = deleted.as_ref() {
+            self.cache.lock().remove(hash);
         }
+        Ok(deleted)
+    }
+
+    /// Delete every device row and clear the in-memory cache. Returns the
+    /// number of rows removed. Pairs with `PairingGuard::revoke_all_tokens`
+    /// for the "rotate after compromise — nuke everything" path so the device
+    /// registry does not silently coexist with the now-revoked token set.
+    pub fn clear(&self) -> Result<usize, rusqlite::Error> {
+        let conn = self.open_db();
+        let removed = conn.execute("DELETE FROM devices", [])?;
+        self.cache.lock().clear();
+        Ok(removed)
     }
 
     pub fn update_last_seen(&self, token_hash: &str) {
@@ -346,7 +361,27 @@ pub async fn submit_pairing_enhanced(
                     },
                 );
             }
+            if let Err(e) =
+                super::persist_pairing_tokens(state.config.clone(), &state.pairing).await
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "pairing succeeded but token persistence failed"
+                );
+                return Json(serde_json::json!({
+                    "paired": true,
+                    "persisted": false,
+                    "token": token,
+                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                }))
+                .into_response();
+            }
             Json(serde_json::json!({
+                "paired": true,
+                "persisted": true,
                 "token": token,
                 "message": "Pairing successful"
             }))
@@ -381,7 +416,7 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
     .into_response()
 }
 
-/// DELETE /api/devices/{id} — revoke a paired device
+/// DELETE /api/devices/{id} — revoke a paired device and its bearer token.
 pub async fn revoke_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -391,21 +426,46 @@ pub async fn revoke_device(
         return e.into_response();
     }
 
-    let revoked = state
-        .device_registry
-        .as_ref()
-        .map(|r| r.revoke(&device_id))
-        .unwrap_or(false);
+    let Some(registry) = state.device_registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Device registry is disabled",
+        )
+            .into_response();
+    };
 
-    if revoked {
-        Json(serde_json::json!({
-            "message": "Device revoked",
-            "device_id": device_id
-        }))
-        .into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Device not found").into_response()
+    let token_hash = match registry.revoke(&device_id) {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Device registry error: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    state.pairing.revoke_token_hash(&token_hash);
+
+    // If persistence fails after the in-memory revoke + row delete, the
+    // device row is already gone and the token is already invalid in this
+    // process; a daemon restart will resurrect the token from the unchanged
+    // on-disk config. Surface that to the caller so they know to re-pair
+    // and audit, rather than treating the operation as silently complete.
+    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Token revoked in memory but config persist failed: {e}"),
+        )
+            .into_response();
     }
+
+    Json(serde_json::json!({
+        "message": "Device revoked and bearer token invalidated",
+        "device_id": device_id,
+    }))
+    .into_response()
 }
 
 /// POST /api/devices/me/capabilities — the calling device replaces its capability list.
@@ -463,7 +523,22 @@ pub async fn update_my_capabilities(
     }
 }
 
-/// POST /api/devices/{id}/token/rotate — rotate a device's token
+/// POST /api/devices/{id}/token/rotate — revoke the device's current bearer
+/// token and issue a fresh pairing code for re-pairing.
+///
+/// The device row is removed because the schema keys on `token_hash`; once
+/// the token is revoked the row's primary key is dead anyway. Re-pairing
+/// inserts a fresh row with the new token's hash.
+///
+/// The rotation's load-bearing effect is invalidating the leaked token, not
+/// issuing a new code. If another flow holds the pairing-code slot the
+/// revoke still happens; the response reports that no new code was issued
+/// and the operator can use the pending code or call again once it clears.
+///
+/// If the caller is using the same bearer token as the device being rotated
+/// (self-revocation), the response is delivered over the now-invalid token;
+/// subsequent requests from that client will fail until they re-pair. That
+/// is the intended path for "rotate my own token after I think it leaked."
 pub async fn rotate_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -473,18 +548,65 @@ pub async fn rotate_token(
         return e.into_response();
     }
 
-    // Generate a new pairing code for re-pairing
-    match state.pairing.generate_new_pairing_code() {
-        Some(code) => Json(serde_json::json!({
+    let Some(registry) = state.device_registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Device registry is disabled",
+        )
+            .into_response();
+    };
+
+    let token_hash = match registry.revoke(&device_id) {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Device registry error: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    state.pairing.revoke_token_hash(&token_hash);
+
+    // Same persist-fail caveat as `revoke_device`: device row + in-memory
+    // token are already gone; surfacing the persist error tells the caller
+    // a restart could resurrect the token.
+    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Token revoked in memory but config persist failed: {e}"),
+        )
+            .into_response();
+    }
+
+    // Issue the new pairing code atomically against the slot. If another
+    // flow holds the slot, the revoke still stands — return 200 with
+    // `pairing_code: null` and a message that tells the operator what
+    // happened so they do not assume rotation failed.
+    match state.pairing.generate_pairing_code_if_vacant() {
+        Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
-            "message": "Use this code to re-pair the device"
+            "message": "Old token revoked. Use this code to re-pair the device.",
         }))
         .into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Cannot generate new pairing code",
-        )
-            .into_response(),
+        Err(zeroclaw_config::pairing::GeneratePairingCodeError::Pending) => {
+            Json(serde_json::json!({
+                "device_id": device_id,
+                "pairing_code": null,
+                "message": "Old token revoked. A pairing code is already pending; use it or call again after it clears.",
+            }))
+            .into_response()
+        }
+        Err(zeroclaw_config::pairing::GeneratePairingCodeError::PairingDisabled) => {
+            Json(serde_json::json!({
+                "device_id": device_id,
+                "pairing_code": null,
+                "message": "Old token revoked. Pairing is disabled; cannot issue a new code.",
+            }))
+            .into_response()
+        }
     }
 }

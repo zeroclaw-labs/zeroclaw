@@ -77,30 +77,26 @@ Persist in your shell profile.
 
 ---
 
-## Onboarding
+## Quickstart
 
-### Wizard insists on a config that doesn't exist
+### Quickstart won't overwrite an existing config
 
-If an earlier install left `~/.zeroclaw/config.toml`, re-run with `--force`:
-
-```bash
-zeroclaw onboard --force
-```
-
-Or just delete the directory and start over:
+`zeroclaw quickstart` does not have a `--force` flag — it intentionally leaves an existing `~/.zeroclaw/config.toml` alone. To run a fresh quickstart on a stale install, delete the directory and start over:
 
 ```bash
 rm -rf ~/.zeroclaw
-zeroclaw onboard
+zeroclaw quickstart
 ```
+
+Or, to edit a single stale field instead of wiping everything, use `zeroclaw config set <key>=<value>` directly.
 
 ### Homebrew install: config path mismatch
 
-Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works) while the default config dir is `~/.zeroclaw/`. Set `ZEROCLAW_WORKSPACE` to the Homebrew path before onboarding so the two paths line up:
+Homebrew installs prefer `$HOMEBREW_PREFIX/var/zeroclaw/` (so `brew services` works) while the default config dir is `~/.zeroclaw/`. Set `ZEROCLAW_WORKSPACE` to the Homebrew path before running quickstart so the two paths line up:
 
 ```bash
 export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
-zeroclaw onboard
+zeroclaw quickstart
 ```
 
 Or manually symlink once:
