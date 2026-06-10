@@ -4049,7 +4049,7 @@ pub struct McpServerConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub env: HashMap<String, String>,
-    /// Optional HTTP headers for HTTP/SSE transports. Treated as secret —
+    /// Optional HTTP headers for HTTP/SSE transports. Treated as secret:
     /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
     #[secret]
