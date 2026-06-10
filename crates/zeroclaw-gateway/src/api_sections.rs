@@ -66,10 +66,12 @@ pub async fn handle_catalog_models(
     }
     let _ = state;
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
-    let (models, live) = zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+    let (models, pricing, live) =
+        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
+        pricing,
         local,
         live,
     })

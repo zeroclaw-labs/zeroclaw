@@ -2802,6 +2802,48 @@ pub struct KiloCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Kilo (AI Gateway — OpenAI-compatible) ──
+
+/// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloEndpoint {
+    #[default]
+    Gateway,
+}
+impl ModelEndpoint for KiloEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Gateway => "https://api.kilo.ai/api/gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilo"]
+pub struct KiloModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Kilo endpoint variant. Defaults to the canonical Kilo AI Gateway.
+    #[serde(default, skip_serializing_if = "KiloEndpoint::is_default")]
+    pub endpoint: KiloEndpoint,
+}
+
+impl KiloEndpoint {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+}
+
+impl FamilyEndpoint for KiloModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -12733,6 +12775,36 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Time in seconds an approval card waits for user response before
+    /// the runtime auto-denies. Default: 300 (5 minutes).
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub per_user_session: bool,
+
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive `update_draft` PATCH calls in
+    /// milliseconds. Default 1000 ms tunes to Feishu's 5 QPS-per-message
+    /// edit cap; raise on enterprise plans with higher quotas.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -17319,6 +17391,7 @@ impl_enum_prop_kind!(
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
+    KiloEndpoint,
     CustomEndpoint,
 );
 
@@ -19027,6 +19100,10 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
 
@@ -21209,6 +21286,10 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
         config.save().await.unwrap();
@@ -21772,6 +21853,10 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -21796,6 +21881,10 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();

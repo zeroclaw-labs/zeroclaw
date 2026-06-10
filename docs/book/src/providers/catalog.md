@@ -121,6 +121,23 @@ model = "..."
 
 Local inference via KiloCLI.
 
+### Kilo AI Gateway — slot `kilo`
+
+```toml
+[providers.models.kilo.home]
+model   = "anthropic/claude-sonnet-4-6"
+api_key = "..."
+# endpoint = "gateway"  # default → https://api.kilo.ai/api/gateway
+```
+
+Cloud API via Kilo AI Gateway. Bearer-token auth with multiple model tiers (free, balanced, pro).
+The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing works without a credential — and because it is queried live, it is the source that carries pricing into the cost-rates editor. The shared models.dev catalog (`kilo` key) is only a fallback for when the live endpoint is unreachable, and it does not include pricing.
+
+> **Naming migration:** `kilo` now refers to this gateway provider. The KiloCLI
+> subprocess provider keeps its `kilocli` slot (synonym `kilo-cli`). If you
+> previously configured the CLI provider under the `kilo` shorthand, switch to
+> `kilocli`.
+
 ---
 
 ## OpenAI-compatible families
@@ -147,6 +164,7 @@ Every OpenAI-compatible vendor has its own canonical slot. There is no generic `
 | `arcee` | `https://api.arcee.ai/api/v1` | Trinity / Conductor / Maestro — note the non-standard `/api/v1` path |
 | `lambda_ai` | `https://api.lambda.ai/v1` | Lambda hosted inference (alias `lambda-ai`) |
 | `inception` | `https://api.inceptionlabs.ai/v1` | Mercury diffusion LLM |
+| `kilo` | `https://api.kilo.ai/api/gateway` | Public `/models` endpoint (no credential required for catalog) |
 | `lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm` | `http://localhost:<port>/v1` | Local-server slots with sensible defaults |
 
 Worked example (Groq):

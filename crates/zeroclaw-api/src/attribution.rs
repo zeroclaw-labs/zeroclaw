@@ -192,6 +192,7 @@ pub enum ModelProviderKind {
     Copilot,
     Glm,
     KiloCli,
+    Kilo,
     Router,
     Reliable,
     Moonshot,
