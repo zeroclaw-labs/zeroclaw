@@ -22,30 +22,7 @@ A server is reached over one of three transports (the `transport` field):
 
 `env` (stdio) and `headers` (http/sse) are stored as secrets; `headers` commonly carries the `Authorization: Bearer …` token for the upstream server.
 
-### stdio example
-
-```toml
-[mcp]
-enabled = true
-
-[[mcp.servers]]
-name = "filesystem"
-transport = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
-```
-
-### http / sse example
-
-```toml
-[[mcp.servers]]
-name = "search"
-transport = "http"
-url = "https://mcp.example.com/v1"
-
-[mcp.servers.headers]
-Authorization = "Bearer ${SEARCH_TOKEN}"
-```
+Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
 
 ## Server fields
 
