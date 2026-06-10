@@ -3,9 +3,11 @@ name: Quality Gate
 on:
   pull_request:
     branches: [master]
+  push:
+    branches: [master]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -91,7 +93,6 @@ jobs:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: runner.os != 'Windows'
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}

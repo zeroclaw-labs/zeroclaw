@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileDownloadConfig;
 
@@ -14,11 +14,37 @@ const RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024;
 pub struct FileDownloadTool {
     security: Arc<SecurityPolicy>,
     config: FileDownloadConfig,
+    /// Whether the downloaded file persists on the host filesystem. `false` on
+    /// an ephemeral runtime (Docker tmpfs / no volume mount), where the file is
+    /// written inside the container but invisible on the host and discarded at
+    /// session end. When `false`, a successful download carries a loud
+    /// ephemeral-workspace warning. Mirrors
+    /// [`super::file_write::FileWriteTool`]. See issue #4627.
+    persistent_writes: bool,
 }
 
 impl FileDownloadTool {
     pub fn new(security: Arc<SecurityPolicy>, config: FileDownloadConfig) -> Self {
-        Self { security, config }
+        Self {
+            security,
+            config,
+            persistent_writes: true,
+        }
+    }
+
+    /// Construct with an explicit persistence flag derived from the active
+    /// runtime adapter's `has_filesystem_access()`. Mirrors
+    /// [`super::file_write::FileWriteTool::new_with_persistence`].
+    pub fn new_with_persistence(
+        security: Arc<SecurityPolicy>,
+        config: FileDownloadConfig,
+        persistent_writes: bool,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            persistent_writes,
+        }
     }
 
     /// Stream a response body into `temp_path`, treating `max_bytes` as a hard
@@ -317,11 +343,22 @@ impl Tool for FileDownloadTool {
 
         match Self::stream_to_temp(response, &temp_path, self.config.max_file_size_bytes).await {
             Ok(written) => match tokio::fs::rename(&temp_path, &dest).await {
-                Ok(()) => Ok(ToolResult {
-                    success: true,
-                    output: format!("Downloaded {written} bytes to {dest_path} ({status})"),
-                    error: None,
-                }),
+                Ok(()) => {
+                    let output = format!("Downloaded {written} bytes to {dest_path} ({status})");
+                    // The download landed in an ephemeral workspace and will not
+                    // reach the host — warn loudly rather than report a bare
+                    // success (issue #4627).
+                    let output = if self.persistent_writes {
+                        output
+                    } else {
+                        with_ephemeral_workspace_warning(&output)
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    })
+                }
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&temp_path).await;
                     Ok(ToolResult {
@@ -560,6 +597,53 @@ mod tests {
             part_files(tmp.path()).is_empty(),
             "temp file must be cleaned up"
         );
+    }
+
+    /// On an ephemeral runtime a successful download lands in a workspace that
+    /// won't persist; the output must carry the loud warning while preserving
+    /// the original status, and the bytes must still be written (issue #4627).
+    #[tokio::test]
+    async fn execute_warns_on_ephemeral_workspace() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let body = b"downloaded-bytes".to_vec();
+
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .and(query_param("document_id", "doc-eph"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            ..FileDownloadConfig::default()
+        };
+        let tool = FileDownloadTool::new_with_persistence(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+            false,
+        );
+
+        let result = tool
+            .execute(json!({ "document_id": "doc-eph", "dest_path": "out.bin" }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected success, got {result:?}");
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present, got: {}",
+            result.output
+        );
+        assert!(result.output.contains("mount_workspace"));
+        assert!(
+            result.output.contains("out.bin"),
+            "original download status must be preserved, got: {}",
+            result.output
+        );
+        assert_eq!(fs::read(tmp.path().join("out.bin")).unwrap(), body);
     }
 
     #[tokio::test]
