@@ -69,9 +69,13 @@ coverage
 lcov.info
 
 # Application and script directories (not needed for Docker runtime)
-# Note: apps/tauri/Cargo.toml is required for workspace resolution in Docker build.
+# Note: apps/tauri and apps/zerocode are desktop/TUI apps not shipped in the
+# server image; only their Cargo.toml is needed for workspace resolution in the
+# Docker dependency-cache stage (their src + build.rs are stubbed in the
+# Dockerfile). Whitelisting just the manifest avoids cache-busting on app source.
 apps/*
 !apps/tauri/
 !apps/tauri/Cargo.toml
 !apps/zerocode/
+!apps/zerocode/Cargo.toml
 scripts/
