@@ -5,14 +5,14 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Maximum file size we will read and base64-encode (5 MB).
+/// Maximum image file size we will read for metadata extraction (5 MB).
 const MAX_IMAGE_BYTES: u64 = 5_242_880;
 
-/// Tool to read image metadata and optionally return base64-encoded data.
+/// Tool to read image metadata and expose the image to vision-capable models.
 ///
-/// Since model_providers are currently text-only, this tool extracts what it can
-/// (file size, format, dimensions from header bytes) and provides base64
-/// data for future multimodal model_provider support.
+/// Extracts file size, format, and dimensions from header bytes, and emits an
+/// `[IMAGE:<absolute path>]` marker so the multimodal pipeline inlines the
+/// image bytes for the next provider call when the model supports vision.
 pub struct ImageInfoTool {
     // Pre-canonicalization path-allowlist enforcement lives in the
     // PathGuardedTool wrapper. The concrete tool still resolves raw tool
@@ -127,7 +127,7 @@ impl Tool for ImageInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Read image file metadata (format, dimensions, size) and optionally return base64-encoded data."
+        "Read image file metadata (format, dimensions, size). The image is also made available to vision-capable models via an inline image marker."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -137,10 +137,6 @@ impl Tool for ImageInfoTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the image file (absolute or relative to workspace)"
-                },
-                "include_base64": {
-                    "type": "boolean",
-                    "description": "Include base64-encoded image data in output (default: false)"
                 }
             },
             "required": ["path"]
@@ -158,11 +154,6 @@ impl Tool for ImageInfoTool {
             );
             anyhow::Error::msg("Missing 'path' parameter")
         })?;
-
-        let include_base64 = args
-            .get("include_base64")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         // Path-allowlist checks are applied by the PathGuardedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod). Successful
@@ -241,24 +232,22 @@ impl Tool for ImageInfoTool {
         let format = Self::detect_format(&bytes);
         let dimensions = Self::extract_dimensions(&bytes, format);
 
-        let mut output = format!("File: {path_str}\nFormat: {format}\nSize: {file_size} bytes");
+        // Emit an explicit `[IMAGE:<absolute path>]` marker so the multimodal
+        // pipeline inlines the image bytes for vision-capable models. We use
+        // the canonicalized absolute `resolved_path` rather than the
+        // caller-supplied `path_str` (which may be workspace-relative): the
+        // tool-result marker promoter only recognizes absolute paths, so a
+        // relative path would be silently dropped and never reach the model.
+        // Referencing the path only inside the marker also avoids emitting a
+        // second bare path that the promoter would wrap into a duplicate
+        // marker. See issue #7436.
+        let mut output = format!(
+            "File: [IMAGE:{}]\nFormat: {format}\nSize: {file_size} bytes",
+            resolved_path.display()
+        );
 
         if let Some((w, h)) = dimensions {
             let _ = write!(output, "\nDimensions: {w}x{h}");
-        }
-
-        if include_base64 {
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let mime = match format {
-                "png" => "image/png",
-                "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "webp" => "image/webp",
-                "bmp" => "image/bmp",
-                _ => "application/octet-stream",
-            };
-            let _ = write!(output, "\ndata:{mime};base64,{encoded}");
         }
 
         Ok(ToolResult {
@@ -353,7 +342,9 @@ mod tests {
         let tool = ImageInfoTool::new(test_security());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
-        assert!(schema["properties"]["include_base64"].is_object());
+        // `include_base64` was removed: the image now reaches vision models via
+        // an inline `[IMAGE:]` marker, not a bare base64 blob (issue #7436).
+        assert!(schema["properties"]["include_base64"].is_null());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("path")));
     }
@@ -531,6 +522,16 @@ mod tests {
         assert!(result.output.contains("Format: png"));
         assert!(result.output.contains("Dimensions: 1x1"));
         assert!(!result.output.contains("data:"));
+        // The output carries an absolute-path [IMAGE:] marker so the
+        // multimodal pipeline can inline the image for vision models.
+        let canonical = tokio::fs::canonicalize(&png_path).await.unwrap();
+        assert!(
+            result
+                .output
+                .contains(&format!("[IMAGE:{}]", canonical.display())),
+            "expected absolute-path image marker, got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -611,6 +612,22 @@ mod tests {
             result.error
         );
         assert!(result.output.contains("Format: png"));
+        // Regression for issue #7436: a workspace-relative path must still be
+        // emitted as an absolute-path [IMAGE:] marker. Before the fix the tool
+        // echoed the relative input, which the marker promoter (anchored on a
+        // leading `/`) silently dropped, so the image never reached the model.
+        let canonical = tokio::fs::canonicalize(&png_path).await.unwrap();
+        assert!(
+            result
+                .output
+                .contains(&format!("[IMAGE:{}]", canonical.display())),
+            "expected absolute-path image marker, got: {}",
+            result.output
+        );
+        assert!(
+            canonical.is_absolute(),
+            "marker path must be absolute so the multimodal pipeline can load it"
+        );
     }
 
     #[cfg(unix)]
@@ -699,17 +716,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_with_base64() {
+    async fn emits_inline_image_marker_with_absolute_path() {
+        // The image must be exposed to vision models via an [IMAGE:] marker
+        // carrying the canonical absolute path, regardless of how the caller
+        // spelled the input path (issue #7436).
         let dir = TempDir::new().unwrap();
-        let png_path = dir.path().join("test_b64.png");
+        let png_path = dir.path().join("marker.png");
         tokio::fs::write(&png_path, MINIMAL_PNG).await.unwrap();
 
         let tool = ImageInfoTool::new(test_security());
         let result = tool
-            .execute(json!({"path": png_path.to_string_lossy(), "include_base64": true}))
+            .execute(json!({"path": png_path.to_string_lossy()}))
             .await
             .unwrap();
+
         assert!(result.success);
-        assert!(result.output.contains("data:image/png;base64,"));
+        let canonical = tokio::fs::canonicalize(&png_path).await.unwrap();
+        assert!(
+            result
+                .output
+                .contains(&format!("[IMAGE:{}]", canonical.display())),
+            "expected absolute-path image marker, got: {}",
+            result.output
+        );
+        // No bare base64 blob should leak into the text output anymore.
+        assert!(!result.output.contains("base64,"));
     }
 }
