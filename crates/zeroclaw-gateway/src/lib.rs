@@ -2163,38 +2163,7 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.read().clone();
-        // Per-request dispatch: honor the caller's validated agent alias.
-        // Without one, fall back to the legacy pick — SSE / pairing
-        // endpoints still don't accept an explicit agent in the request
-        // payload, so the migration-synthesized "default" agent (or first
-        // enabled) remains their dispatch target.
-        let agent_alias = agent_override
-            .map(ToString::to_string)
-            .or_else(|| {
-                config
-                    .agents
-                    .keys()
-                    .find(|k| k.as_str() == "default")
-                    .or_else(|| {
-                        config
-                            .agents
-                            .iter()
-                            .find(|(_, a)| a.enabled)
-                            .map(|(alias, _)| alias)
-                    })
-                    .cloned()
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "webhook chat rejected: no configured [agents.<alias>] entry"
-                );
-                anyhow::Error::msg(
-                    "webhook chat requires at least one configured [agents.<alias>] entry",
-                )
-            })?;
+        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
 
         // Scope the cost tracking context so per-LLM-call usage flows into the
         // gateway's cost tracker and costs.jsonl. Without this scope, the
@@ -2250,6 +2219,31 @@ async fn run_gateway_chat_with_tools(
             cost_usd,
         })
     }
+}
+
+fn resolve_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> Option<String> {
+    agent_override
+        .map(ToString::to_string)
+        .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
+}
+
+#[cfg(not(test))]
+fn require_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> anyhow::Result<String> {
+    resolve_gateway_chat_agent_alias(config, agent_override).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "webhook chat rejected: no configured [agents.<alias>] entry"
+        );
+        anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
+    })
 }
 
 fn optional_channel_routes() -> Router<AppState> {
@@ -2455,24 +2449,29 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = {
+    let (provider_label, model_label) = {
         let cfg = state.config.read();
-        // When the request names an agent, label observability events with
-        // that agent's resolved provider; the first-entry pick is only the
-        // legacy-dispatch approximation.
-        agent_override
-            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias))
+        let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
+        let resolved_provider = resolved_agent_alias
+            .as_deref()
+            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
+        let provider_label = resolved_provider
+            .as_ref()
             .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .or_else(|| {
-                cfg.providers
-                    .models
-                    .iter_entries()
-                    .next()
-                    .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let model_label = resolved_provider
+            .and_then(|(_, _, entry)| {
+                entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(ToString::to_string)
             })
-            .unwrap_or_else(|| "unknown".to_string())
+            .or_else(|| cfg.resolve_default_model())
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        (provider_label, model_label)
     };
-    let model_label = state.model.clone();
     let started_at = Instant::now();
 
     state.observer.record_event(
@@ -2524,14 +2523,14 @@ async fn handle_webhook(
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
                     model_provider: provider_label,
-                    model: model_label,
+                    model: model_label.clone(),
                     duration,
                     tokens_used,
                     cost_usd,
                 },
             );
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": model_label});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -4736,6 +4735,28 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CapturingObserver {
+        events: Mutex<Vec<zeroclaw_runtime::observability::ObserverEvent>>,
+    }
+
+    impl zeroclaw_runtime::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
+        }
+
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
     }
@@ -5025,16 +5046,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_explicit_agent_dispatches() {
+    async fn webhook_explicit_agent_reports_agent_model() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let observer_impl = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = observer_impl.clone();
 
         let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".into(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("agent-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let expected_provider = "anthropic.default".to_string();
         config.agents.insert(
             "nova".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 enabled: true,
+                model_provider: expected_provider.clone().into(),
                 ..Default::default()
             },
         );
@@ -5042,7 +5076,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider,
-            model: "test-model".into(),
+            model: "startup-model".into(),
             temperature: None,
             mem: memory,
             auto_save: false,
@@ -5068,7 +5102,7 @@ mod tests {
             wati: None,
             #[cfg(feature = "channel-email")]
             gmail_push: None,
-            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
@@ -5107,6 +5141,20 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["model"], "agent-model");
+        let events = observer_impl.events.lock();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+                    model_provider,
+                    model,
+                } if model_provider == &expected_provider && model == "agent-model"
+            )),
+            "expected AgentStart to use the explicit agent model; events were: {events:?}"
+        );
     }
 
     #[tokio::test]
