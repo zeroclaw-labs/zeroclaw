@@ -1278,6 +1278,74 @@ async fn discord_defer_interaction(
     Ok(())
 }
 
+/// Why a slash-command interaction was refused. Drives the WARN log and the
+/// ephemeral rejection text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionDenial {
+    UnauthorizedUser,
+    GuildNotAllowed,
+    ChannelNotAllowed,
+}
+
+/// Slash-command authorization: the same gates MESSAGE_CREATE applies to
+/// inbound messages, applied to the interaction's invoker and origin. A
+/// globally-registered command is visible to every guild member in every
+/// guild the bot was added to — visibility is Discord's, authorization is
+/// ours.
+fn interaction_gate(
+    peers: &[String],
+    guild_filter: &[String],
+    channel_filter: &[String],
+    user_id: &str,
+    guild_id: Option<&str>,
+    channel_id: &str,
+    thread_parent: Option<&str>,
+) -> Result<(), InteractionDenial> {
+    if !crate::allowlist::is_user_allowed(peers, user_id, crate::allowlist::Match::Sensitive) {
+        return Err(InteractionDenial::UnauthorizedUser);
+    }
+    if !guild_filter.is_empty()
+        && let Some(g) = guild_id
+        && !guild_filter.iter().any(|allowed| allowed == g)
+    {
+        return Err(InteractionDenial::GuildNotAllowed);
+    }
+    if !channel_filter.is_empty()
+        && !channel_passes_filter(channel_filter, channel_id, thread_parent)
+    {
+        return Err(InteractionDenial::ChannelNotAllowed);
+    }
+    Ok(())
+}
+
+/// Answer a refused interaction immediately with an ephemeral message
+/// (type 4, flags 64 = only the invoker sees it). Without any callback the
+/// invoker stares at "The application did not respond" for 3 seconds, which
+/// reads as a bug rather than a policy decision.
+async fn discord_reject_interaction(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    let body = json!({
+        "type": 4,
+        "data": {
+            "content": "You're not authorized to use this command here.",
+            "flags": 64
+        }
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction reject failed ({status}): {err}");
+    }
+    Ok(())
+}
+
 /// Deliver the agent's answer by editing the deferred interaction response
 /// (`PATCH /webhooks/{app_id}/{token}/messages/@original`). The token is valid
 /// for 15 minutes; no bot auth header is required for the followup webhook.
@@ -2086,6 +2154,46 @@ impl Channel for DiscordChannel {
                                     && !app_id.is_empty()
                                     && !prompt.is_empty()
                                 {
+                                    // Authorization: same gates as MESSAGE_CREATE.
+                                    // Global commands are visible to the whole
+                                    // guild; only configured peers in allowed
+                                    // guilds/channels may actually invoke.
+                                    let interaction_guild =
+                                        d.get("guild_id").and_then(serde_json::Value::as_str);
+                                    let interaction_channel = d
+                                        .get("channel_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("");
+                                    let parent_id = if !channel_filter.is_empty()
+                                        && !interaction_channel.is_empty()
+                                        && !channel_filter.iter().any(|c| c == interaction_channel)
+                                    {
+                                        self.thread_parent(&self.http_client(), interaction_channel)
+                                            .await
+                                    } else {
+                                        None
+                                    };
+                                    if let Err(denial) = interaction_gate(
+                                        &(self.peer_resolver)(),
+                                        &guild_filter,
+                                        &channel_filter,
+                                        &user_id,
+                                        interaction_guild,
+                                        interaction_channel,
+                                        parent_id.as_deref(),
+                                    ) {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized slash command interaction");
+                                        let client = self.http_client();
+                                        let reject_id = interaction_id.clone();
+                                        let reject_token = interaction_token.clone();
+                                        zeroclaw_spawn::spawn!(async move {
+                                            if let Err(e) = discord_reject_interaction(&client, &reject_id, &reject_token).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                        });
+                                        continue;
+                                    }
+
                                     // Ack within 3s (spawned, off the heartbeat loop).
                                     let client = self.http_client();
                                     let defer_id = interaction_id.clone();
@@ -2900,6 +3008,71 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|i| (*i).to_string()).collect()
+    }
+
+    #[test]
+    fn interaction_gate_applies_peer_allowlist() {
+        // Wildcard admits anyone; otherwise the invoker must be listed.
+        assert_eq!(
+            interaction_gate(&s(&["*"]), &[], &[], "u1", None, "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&s(&["u1"]), &[], &[], "u1", None, "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&s(&["u1"]), &[], &[], "intruder", None, "c1", None),
+            Err(InteractionDenial::UnauthorizedUser)
+        );
+        // Empty peer list = nobody, same as the message path.
+        assert_eq!(
+            interaction_gate(&[], &[], &[], "u1", None, "c1", None),
+            Err(InteractionDenial::UnauthorizedUser)
+        );
+    }
+
+    #[test]
+    fn interaction_gate_applies_guild_and_channel_filters() {
+        let peers = s(&["*"]);
+        let guilds = s(&["g1"]);
+        let channels = s(&["c1"]);
+
+        assert_eq!(
+            interaction_gate(&peers, &guilds, &channels, "u1", Some("g1"), "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&peers, &guilds, &[], "u1", Some("g2"), "c1", None),
+            Err(InteractionDenial::GuildNotAllowed)
+        );
+        // DM interactions carry no guild_id and pass the guild filter,
+        // mirroring MESSAGE_CREATE.
+        assert_eq!(
+            interaction_gate(&peers, &guilds, &[], "u1", None, "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&peers, &[], &channels, "u1", Some("g1"), "c2", None),
+            Err(InteractionDenial::ChannelNotAllowed)
+        );
+        // A thread whose parent is allowlisted passes, like threaded messages.
+        assert_eq!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channels,
+                "u1",
+                Some("g1"),
+                "thread9",
+                Some("c1")
+            ),
+            Ok(())
+        );
+    }
 
     #[test]
     fn interaction_reply_target_roundtrips() {
