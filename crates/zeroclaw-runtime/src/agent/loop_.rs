@@ -63,6 +63,8 @@ const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
     "mattermost",
     "matrix",
     "dingtalk",
+    "lark",
+    "feishu",
 ];
 
 /// Register the channel map factory. Called once at startup by the binary.
@@ -7413,6 +7415,154 @@ mod tests {
             .lock()
             .expect("recorded args lock should be valid");
         assert_eq!(recorded[0]["delivery"], serde_json::json!({"mode": "none"}));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_lark() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "lark",
+            Some("chat-99"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("lark cron_add delivery defaults should be injected");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "lark",
+                "to": "chat-99",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_feishu() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"feishu reminder","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a feishu reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "feishu",
+            Some("chat-77"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("feishu cron_add delivery defaults should be injected");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "feishu",
+                "to": "chat-77",
+            })
+        );
     }
 
     #[tokio::test]
