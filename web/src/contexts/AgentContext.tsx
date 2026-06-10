@@ -217,7 +217,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'message':
       case 'done': {
-        const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        const raw_content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        // Skip whitespace-only content (e.g. models that emit "\n\n"
+        // alongside tool_calls) to avoid accumulating blank lines in the
+        // assistant bubble. Ref: #6702.
+        const content = raw_content.trim();
         const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
         if (content) {
           localMessageMutationVersionRef.current += 1;
