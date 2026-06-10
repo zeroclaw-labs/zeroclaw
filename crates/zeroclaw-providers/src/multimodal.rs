@@ -261,6 +261,23 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+/// Count image markers that originate from genuine **user** messages (i.e.
+/// inbound attachments), excluding tool-result carriers (`role == "tool"` and
+/// `[Tool results]` user messages).
+///
+/// Callers use this to distinguish "the user sent an image we cannot see"
+/// (which should surface a user-facing capability error so the attachment is
+/// not silently ignored) from "an image marker arrived only via a tool result"
+/// (e.g. `image_info`/`screenshot`/`image_gen`), which can degrade to text-only
+/// on a non-vision provider without misleading the user.
+pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .sum()
+}
+
 /// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
 /// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
 /// `[media attachment]`. Match is case-insensitive to align with the channel

@@ -1573,13 +1573,20 @@ pub async fn run_tool_call_loop(
         let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
+        // Image markers that came from the user (inbound attachments), as
+        // opposed to tool results. A missing vision capability is handled
+        // differently for the two: a user image must surface an error (we
+        // cannot silently ignore what the user sent), while a tool-result
+        // image may degrade to text-only.
+        let user_image_marker_count = multimodal::count_user_image_markers(history);
 
         // ── Vision model_provider routing ──────────────────────────
         // When the default model_provider lacks vision support but a dedicated
         // vision_model_provider is configured, create it on demand and use it
-        // for this iteration. When no vision route exists at all, degrade
-        // gracefully (strip the image markers, keep the surrounding text)
-        // rather than aborting the whole turn — see `degrade_strip_images`.
+        // for this iteration. When no vision route exists at all, either
+        // surface a capability error (the user sent an image) or degrade
+        // gracefully (the markers came only from tool results) — see the
+        // no-vision-route branch below and `degrade_strip_images`.
         let mut degrade_strip_images = false;
         let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
             && !model_provider.supports_vision()
@@ -1618,15 +1625,31 @@ pub async fn run_tool_call_loop(
                     .into());
                 }
                 Some(vp_instance)
+            } else if user_image_marker_count > 0 {
+                // The user sent an image we cannot see. Surface a capability
+                // error so the attachment is not silently ignored — channels
+                // render this back to the user (e.g. "⚠️ Error … does not
+                // support vision"). Configuring a `vision_model_provider`
+                // routes around it.
+                return Err(ProviderCapabilityError {
+                        model_provider: provider_name.to_string(),
+                        capability: "vision".to_string(),
+                        message: format!(
+                            "received {image_marker_count} image marker(s), but this model_provider does not support vision input"
+                        ),
+                    }
+                    .into());
             } else {
-                // No vision route configured. Previously this aborted the entire
-                // turn with a capability error, which turned an otherwise
-                // successful tool call (e.g. `image_info`, which always returns
-                // useful metadata text alongside its `[IMAGE:]` marker) into a
-                // hard failure. Instead, degrade: strip the image markers from
-                // the messages sent to the text-only provider while preserving
-                // the surrounding text, so the conversation continues and the
-                // model still receives any accompanying metadata/caption.
+                // Markers came only from tool results (e.g. `image_info`,
+                // `screenshot`, `image_gen`). Previously this aborted the
+                // entire turn with a capability error, which turned an
+                // otherwise successful tool call (e.g. `image_info`, which
+                // always returns useful metadata text alongside its `[IMAGE:]`
+                // marker) into a hard failure. Instead, degrade: strip the
+                // image markers from the messages sent to the text-only
+                // provider while preserving the surrounding text, so the
+                // conversation continues and the model still receives any
+                // accompanying metadata/caption.
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1635,7 +1658,7 @@ pub async fn run_tool_call_loop(
                             "model_provider": provider_name,
                             "image_marker_count": image_marker_count,
                         })),
-                    "no vision route for image marker(s); degrading to text-only (markers stripped)"
+                    "no vision route for tool-result image marker(s); degrading to text-only (markers stripped)"
                 );
                 degrade_strip_images = true;
                 None
@@ -6548,12 +6571,12 @@ mod tests {
         }
     }
 
-    /// A non-vision provider with no configured `vision_model_provider` no
-    /// longer aborts the turn: the loop degrades to text-only (stripping image
-    /// markers) and still calls the provider. See the text-only fallback in
-    /// the vision-routing block.
+    /// A **user-supplied** image on a non-vision provider with no configured
+    /// `vision_model_provider` must surface a structured capability error
+    /// (channels render it back to the user) — we never silently ignore an
+    /// image the user actually sent.
     #[tokio::test]
-    async fn run_tool_call_loop_degrades_to_text_for_non_vision_provider() {
+    async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
@@ -6565,7 +6588,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
+        let err = run_tool_call_loop(
             &model_provider,
             &mut history,
             &tools_registry,
@@ -6597,10 +6620,11 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect("non-vision provider should degrade to text, not abort");
+        .expect_err("user image on a non-vision provider should error");
 
-        assert_eq!(result, "ok");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(err.to_string().contains("provider_capability_error"));
+        assert!(err.to_string().contains("capability=vision"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -6722,21 +6746,26 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// When `vision_model_provider` is not set and the default model_provider
-    /// lacks vision support, the loop must NOT abort the turn. Instead it
-    /// degrades gracefully: image markers are stripped and the text-only
-    /// provider is still called so the conversation continues (and any
-    /// accompanying text/metadata survives).
+    /// A **tool-result** image marker (e.g. from `image_info`/`screenshot`)
+    /// on a non-vision provider with no `vision_model_provider` must NOT abort
+    /// the turn. The user did not send an image, so the loop degrades
+    /// gracefully: markers are stripped and the text-only provider is still
+    /// called so the conversation continues (and any accompanying
+    /// text/metadata survives).
     #[tokio::test]
-    async fn run_tool_call_loop_no_vision_provider_config_degrades_to_text() {
+    async fn run_tool_call_loop_degrades_tool_result_image_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
+        // Marker lives in a tool result, not a user message.
+        let mut history = vec![
+            ChatMessage::user("inspect the screenshot".to_string()),
+            ChatMessage::tool(
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            ),
+        ];
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
