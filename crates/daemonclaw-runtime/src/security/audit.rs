@@ -1894,4 +1894,283 @@ mod tests {
         assert_eq!(event_type, "chain_boundary");
         Ok(())
     }
+
+    // ── Track H: Anchor-chain anchoring tests ─────────────────────
+
+    #[test]
+    fn anchor_truncation_detection() -> Result<()> {
+        // Populate chain (10+ events) -> anchor -> tail-truncate -> verify
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..12 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution)
+                .with_action(format!("cmd-{i}"), "low".into(), false, true);
+            logger.log(&event)?;
+        }
+
+        // Anchor the chain tip
+        let anchor_path = tmp.path().join("anchors.jsonl");
+        let (seq, hash) = read_chain_tip(logger.db_path())?.unwrap();
+        assert_eq!(seq, 11);
+
+        let genesis_hash = read_genesis_hash(logger.db_path())?.unwrap();
+        let chain_id = compute_chain_id(&genesis_hash);
+
+        let record = AnchorRecord {
+            sequence: seq,
+            entry_hash: hash.clone(),
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            chain_id,
+            signature: None,
+        };
+        append_anchor(&anchor_path, &record)?;
+
+        // Tail-truncate: drop trigger, DELETE last 3, reinstall
+        let conn = Connection::open(logger.db_path())?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS audit_no_delete")?;
+        conn.execute(
+            "DELETE FROM audit_events WHERE sequence >= 9",
+            [],
+        )?;
+        AuditLogger::install_append_only_triggers(&conn)?;
+
+        // Internal verify_chain PASSES (remaining chain 0..8 is valid)
+        let internal_count = verify_chain(logger.db_path())?;
+        assert_eq!(internal_count, 9);
+
+        // Anchored verification FAILS (anchor points to seq=11, which is gone)
+        let result = verify_chain_anchored(logger.db_path(), &anchor_path)?;
+        assert!(result.internal_ok);
+        match result.anchor_status {
+            AnchorStatus::AnchorMismatch { expected_seq, .. } => {
+                assert_eq!(expected_seq, 11);
+            }
+            other => panic!("expected AnchorMismatch, got: {:?}", other),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_store_permissions_failure() -> Result<()> {
+        // append_anchor on a non-writable path fails
+        let result = append_anchor(
+            std::path::Path::new("/proc/nonexistent/anchors.jsonl"),
+            &AnchorRecord {
+                sequence: 0,
+                entry_hash: "abc".into(),
+                ts: "2026-01-01T00:00:00Z".into(),
+                chain_id: "def".into(),
+                signature: None,
+            },
+        );
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_missing_file_returns_no_anchor() -> Result<()> {
+        // Missing anchor file -> AnchorStatus::NoAnchor, not error
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_action("cmd".into(), "low".into(), false, true);
+        logger.log(&event)?;
+
+        let anchor_path = tmp.path().join("nonexistent-anchors.jsonl");
+        let result = verify_chain_anchored(logger.db_path(), &anchor_path)?;
+
+        assert!(result.internal_ok);
+        assert!(matches!(result.anchor_status, AnchorStatus::NoAnchor));
+        assert!(result.latest_anchor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn retention_unreachable_via_log() -> Result<()> {
+        // Write 1001+ events via log() -> all survive (run_retention is gated out)
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 100,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..1005 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution)
+                .with_action(format!("cmd-{i}"), "low".into(), false, true);
+            logger.log(&event)?;
+        }
+
+        let conn = Connection::open(logger.db_path())?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1005, "all events must survive — retention is retired");
+
+        let chain_count = verify_chain(logger.db_path())?;
+        assert_eq!(chain_count, 1005);
+        Ok(())
+    }
+
+    #[test]
+    fn christening_and_anchor_verify() -> Result<()> {
+        // 20 events -> record_chain_boundary -> anchor -> verify -> Verified
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..20 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution)
+                .with_action(format!("cmd-{i}"), "low".into(), false, true);
+            logger.log(&event)?;
+        }
+
+        logger.record_chain_boundary("christening: initial chain boundary")?;
+
+        // Now anchor
+        let anchor_path = tmp.path().join("anchors.jsonl");
+        let (seq, hash) = read_chain_tip(logger.db_path())?.unwrap();
+        assert_eq!(seq, 20); // 20 events + 1 boundary = seq 20
+
+        let genesis_hash = read_genesis_hash(logger.db_path())?.unwrap();
+        let chain_id = compute_chain_id(&genesis_hash);
+
+        let record = AnchorRecord {
+            sequence: seq,
+            entry_hash: hash,
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            chain_id: chain_id.clone(),
+            signature: None,
+        };
+        append_anchor(&anchor_path, &record)?;
+
+        // Verify
+        let result = verify_chain_anchored(logger.db_path(), &anchor_path)?;
+        assert!(result.internal_ok);
+        assert!(matches!(result.anchor_status, AnchorStatus::Verified));
+        assert!(result.latest_anchor.is_some());
+
+        let anchor = result.latest_anchor.unwrap();
+        assert_eq!(anchor.chain_id, chain_id);
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_skip_on_no_advance() -> Result<()> {
+        // Anchor -> same chain state -> anchor file still 1 line
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..5 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution)
+                .with_action(format!("cmd-{i}"), "low".into(), false, true);
+            logger.log(&event)?;
+        }
+
+        let anchor_path = tmp.path().join("anchors.jsonl");
+        let (seq, hash) = read_chain_tip(logger.db_path())?.unwrap();
+
+        let genesis_hash = read_genesis_hash(logger.db_path())?.unwrap();
+        let chain_id = compute_chain_id(&genesis_hash);
+
+        // First anchor
+        let record = AnchorRecord {
+            sequence: seq,
+            entry_hash: hash.clone(),
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            chain_id: chain_id.clone(),
+            signature: None,
+        };
+        append_anchor(&anchor_path, &record)?;
+
+        // Simulate the no-advance check (as witness-anchor does)
+        let latest = read_latest_anchor(&anchor_path)?.unwrap();
+        let (current_seq, _) = read_chain_tip(logger.db_path())?.unwrap();
+        assert_eq!(latest.sequence, current_seq, "no advance");
+
+        // If we were to write again (we should NOT in the real flow),
+        // the file would have 2 lines. Verify it currently has exactly 1.
+        let content = std::fs::read_to_string(&anchor_path)?;
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "anchor file should have exactly 1 record");
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_chain_tip_empty_db() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let _logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        // DB exists but has no events
+        let tip = read_chain_tip(&tmp.path().join("audit").join("audit.db"))?;
+        assert!(tip.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn compute_chain_id_deterministic() {
+        let id1 = compute_chain_id("abc123");
+        let id2 = compute_chain_id("abc123");
+        assert_eq!(id1, id2);
+        assert_eq!(id1.len(), 64); // SHA-256 hex = 64 chars
+
+        let id3 = compute_chain_id("different");
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn read_latest_anchor_parses_last_line() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("anchors.jsonl");
+
+        // Write two anchor records
+        let r1 = AnchorRecord {
+            sequence: 5,
+            entry_hash: "hash5".into(),
+            ts: "2026-01-01T00:00:00Z".into(),
+            chain_id: "cid".into(),
+            signature: None,
+        };
+        let r2 = AnchorRecord {
+            sequence: 10,
+            entry_hash: "hash10".into(),
+            ts: "2026-01-01T01:00:00Z".into(),
+            chain_id: "cid".into(),
+            signature: None,
+        };
+        append_anchor(&path, &r1)?;
+        append_anchor(&path, &r2)?;
+
+        let latest = read_latest_anchor(&path)?.unwrap();
+        assert_eq!(latest.sequence, 10);
+        assert_eq!(latest.entry_hash, "hash10");
+        Ok(())
+    }
 }
