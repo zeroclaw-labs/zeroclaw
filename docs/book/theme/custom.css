@@ -453,10 +453,11 @@ pre > .buttons .clip-button:hover {
   border-bottom: none;
 }
 
-/* Keep Key/Type/Default reference columns from wrapping; Description flexes */
-.content table td:nth-child(1),
-.content table td:nth-child(2),
-.content table td:nth-child(3) {
+/* Reference tables (config Key/Type/Default) hold single code tokens that read
+   badly when wrapped mid-identifier. Keep a cell from wrapping only when its
+   sole content is one inline-code token; prose cells (e.g. the review-depth
+   matrix) wrap normally and the table scrolls if it overflows. */
+.content table td:has(> code:only-child) {
   white-space: nowrap;
 }
 
