@@ -348,6 +348,7 @@ channel-wecom-ws-dm-access-denied =
     Demandez à un administrateur d'ajouter votre userid à {$allowed_users_path}.
 channel-discord-interaction-unauthorized = Vous n'êtes pas autorisé à utiliser cette commande ici.
 channel-discord-interaction-malformed = Commande inconnue ou mal formée.
+channel-discord-interaction-unavailable = Cette commande n'est plus disponible ou son entrée était vide.
 channel-discord-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)
 channel-discord-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} fichiers.)
 onboard-openai-auth-note =
