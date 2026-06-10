@@ -56,6 +56,15 @@ type ChannelMapFn = Box<
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
 
+const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "matrix",
+    "dingtalk",
+];
+
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
@@ -1286,10 +1295,7 @@ fn maybe_inject_channel_delivery_defaults(
         return;
     }
 
-    if !matches!(
-        channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
-    ) {
+    if !AUTO_DELIVERY_DEFAULT_CHANNELS.contains(&channel_name) {
         return;
     }
 
@@ -2230,8 +2236,11 @@ pub async fn run_tool_call_loop(
             return Ok(accumulated_display_text);
         }
 
-        // Accumulate text from this iteration (tool calls present, loop continues).
-        accumulated_display_text.push_str(&display_text);
+        // Do not accumulate intermediate-turn display text into the final
+        // channel response. Native tool-call providers may emit narration or
+        // scratchpad-like text alongside tool calls; draft-capable channels
+        // can still see it live through `on_delta` below, but the final
+        // delivered response must only contain the final assistant turn.
 
         // Native tool-call model_providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
@@ -5122,7 +5131,8 @@ pub async fn process_message(
 mod tests {
     use super::{
         apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
-        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
+        fast_trim_tool_results, load_interactive_session_history,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
         truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
@@ -5139,6 +5149,44 @@ mod tests {
         FailingTool,
         NamedMockTool,
     );
+
+    // ── maybe_inject_channel_delivery_defaults tests ──────────────
+
+    #[test]
+    fn cron_delivery_defaults_include_dingtalk_channel() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "schedule": { "kind": "every", "every_ms": 60000 }
+        });
+
+        maybe_inject_channel_delivery_defaults("cron_add", &mut args, "dingtalk", Some("chat-42"));
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "dingtalk",
+                "to": "chat-42",
+            })
+        );
+    }
+
+    #[test]
+    fn cron_delivery_defaults_do_not_guess_webhook_shape() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "schedule": { "kind": "every", "every_ms": 60000 }
+        });
+
+        maybe_inject_channel_delivery_defaults("cron_add", &mut args, "webhook", Some("thread-42"));
+
+        assert!(
+            args.get("delivery").is_none(),
+            "webhook delivery needs sender/thread context and must not reuse reply_target as to"
+        );
+    }
 
     // ── truncate_tool_result tests ────────────────────────────────
 
@@ -9011,9 +9059,9 @@ This is an example, not an invocation."#;
                 .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)"))),
             "tool-call progress line should still be relayed"
         );
-        assert!(
-            result.ends_with("Final answer"),
-            "accumulated result should end with final answer, got: {result}"
+        assert_eq!(
+            result, "Final answer",
+            "final delivered result should not include intermediate tool-call narration"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }

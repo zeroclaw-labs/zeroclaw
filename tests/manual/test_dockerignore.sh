@@ -41,7 +41,6 @@ MUST_EXCLUDE=(
     "target"
     "docs"
     "examples"
-    "tests"
     "*.md"
     "*.png"
     "*.db"
@@ -108,7 +107,6 @@ CONTEXT_FILES=$(find . -type f \
     ! -path './target/*' \
     ! -path './docs/*' \
     ! -path './examples/*' \
-    ! -path './tests/*' \
     ! -name '*.md' \
     ! -name '*.png' \
     ! -name '*.svg' \

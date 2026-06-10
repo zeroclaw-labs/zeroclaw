@@ -20,6 +20,14 @@ zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
 rumqttc = { version = "0.25", optional = true }
+lapin = { version = "2", optional = true, default-features = false, features = [
+  "rustls",
+] }
+tokio-executor-trait = { version = "2", optional = true }
+tokio-reactor-trait = { version = "1", optional = true }
+async-reactor-trait = { version = "1", optional = true }
+p12-keystore = { version = "0.1", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 axum = { version = "0.8", default-features = false, features = [
   "http1",
   "json",
@@ -46,6 +54,7 @@ hmac = "0.12"
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
   "png",
+  "webp",
 ], optional = true }
 lettre = { version = "0.11.22", default-features = false, features = [
   "builder",
@@ -176,12 +185,14 @@ channels-full = [
   "channel-mattermost",
   "channel-mochat",
   "channel-mqtt",
+  "channel-amqp",
   "channel-nextcloud",
   "channel-notion",
   "channel-qq",
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
   "channel-wati",
@@ -191,7 +202,8 @@ channels-full = [
 ]
 # Channels with optional deps
 channel-email = ["dep:async-imap", "dep:lettre", "dep:mail-parser", "dep:pulldown-cmark"]
-channel-telegram = ["dep:image"]
+image-normalization = ["dep:image"]
+channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk"]
@@ -206,6 +218,7 @@ whatsapp-web = [
   "dep:whatsapp-rust",
   "dep:whatsapp-rust-tokio-transport",
   "dep:whatsapp-rust-ureq-http-client",
+  "image-normalization",
 ]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
@@ -213,6 +226,7 @@ channel-slack = []
 channel-signal = []
 channel-mattermost = []
 channel-irc = []
+channel-twitch = ["channel-irc"]
 channel-imessage = []
 channel-dingtalk = []
 channel-qq = []
@@ -221,6 +235,7 @@ channel-twitter = []
 channel-reddit = []
 channel-notion = []
 channel-mqtt = ["dep:rumqttc"]
+channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
 channel-linq = []
 channel-wati = []
 channel-nextcloud = []
@@ -251,6 +266,7 @@ axum = { version = "0.8", default-features = false, features = [
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
   "png",
+  "webp",
 ] }
 tempfile = "3.26"
 toml = "1.0"

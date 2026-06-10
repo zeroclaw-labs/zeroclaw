@@ -14,6 +14,7 @@ use ratatui::{
 use crate::acp;
 use crate::chat;
 use crate::client::{ConnectionState, RpcClient};
+use crate::config;
 use crate::config_manager;
 use crate::dashboard;
 use crate::keymap::{GlobalAction, ModalAction};
@@ -50,7 +51,7 @@ const MODES: [Mode; 6] = [
 
 // ── Mode enum ────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Dashboard,
     Config,
@@ -106,8 +107,11 @@ async fn switch_mode(
 
 // ── Top-level entry point ────────────────────────────────────────
 
-/// Run the TUI event loop. Returns `true` if the daemon disconnected
-/// (caller should attempt reconnection), `false` if the user quit normally.
+/// Run the TUI event loop. Owns the full session lifecycle: when the
+/// daemon disconnects it reconnects in-loop (keeping the cached UI alive
+/// and responsive) and rebuilds its panes against the recovered client.
+/// Returns when the user quits.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     rpc: Arc<RpcClient>,
     term: &mut config_manager::Term,
@@ -115,47 +119,124 @@ pub async fn run(
     insecure_tls: bool,
     reconnect_state: SharedReconnectState,
     config_dir: &std::path::Path,
-) -> Result<bool> {
+    target: &crate::ConnectTarget,
+    owns_ephemeral: bool,
+) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    // Per-agent theme overrides live in a process-global registry (theme.rs),
+    // mirroring how the global theme works: the Config pane writes there on
+    // assign/clear so changes apply live, and the draw loop reads it each frame
+    // to tint the Code/Chat pane for the focused agent. Seed it once from config
+    // here; an unknown override name resolves to the terminal theme rather than
+    // aborting.
+    theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut show_help = false;
     let mut reload_confirm = false;
     let mut quit_confirm = false;
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
-    let mut disconnect_since: Option<std::time::Instant> = None;
+    // In-loop reconnection state. `reconnect_last_attempt` throttles
+    // connect tries so the draw/input loop keeps running between them.
+    // `ephemeral_respawn_done` enforces the "owned ephemeral daemon is
+    // respawned at most once" policy; `needs_intervention` latches when
+    // that single respawn fails to come back, stopping auto-respawn while
+    // the UI stays responsive and quittable.
+    let mut reconnect_last_attempt: Option<std::time::Instant> = None;
+    let mut ephemeral_respawn_done = false;
+    let mut needs_intervention = false;
 
-    let mut dashboard_pane = dashboard::Dashboard::new(&rpc, connect_label, insecure_tls);
-    dashboard_pane.init().await?;
-    let mut config_app = config_manager::App::new(&rpc, config_dir);
-    config_app.init().await?;
-    let rpc_arc = rpc.clone();
-    let mut acp_pane = acp::Acp::new(Arc::clone(&rpc_arc));
-    acp_pane.init().await?;
-    let mut chat_pane = chat::Chat::new(Arc::clone(&rpc_arc), chat::PaneKind::Chat);
-    chat_pane.init().await?;
-    // Consume any post-reconnect intent — Quickstart's Stage 2 sets
-    // this before triggering disconnect/reconnect so the next run
-    // lands the user directly in the freshly-created agent's chat.
-    let pending_start_chat = {
-        let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
-        guard.start_chat_with.take()
-    };
-    let mut logs_pane = logs::Logs::new(&rpc);
-    logs_pane.init().await?;
-    let mut quickstart =
-        quickstart_pane::QuickstartPane::new(Arc::clone(&rpc_arc), Arc::clone(&reconnect_state));
-    quickstart.init().await?;
+    // The live client handle. Reassigned in place on a successful
+    // reconnect so every rebuilt pane talks to the recovered daemon.
+    let mut rpc = rpc;
 
-    // Apply any pending Stage-2 intent from the previous run.
-    if let Some(alias) = pending_start_chat {
-        chat_pane.focus_agent(&alias).await;
-        mode = Mode::Chat;
+    // (Re)build the full pane set against the current `rpc`. Used at
+    // startup and again after each reconnect so panes re-subscribe to the
+    // new client's notification channel (a stale `notif_rx` would leave
+    // chat/logs silently deaf). Consumes any pending Quickstart Stage-2
+    // intent so a freshly-created agent lands directly in Chat.
+    //
+    // Evaluates to `anyhow::Result<(panes…)>`: startup unwraps with `?`,
+    // but the recovery path treats a mid-init failure (daemon flapped
+    // again) as a transient disconnect and stays in the loop rather than
+    // tearing down the TUI.
+    macro_rules! build_panes {
+        ($resume_chat:expr, $resume_acp:expr) => {
+            async {
+                let mut dashboard_pane =
+                    dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
+                dashboard_pane.init().await?;
+                let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
+                config_app.init().await?;
+                let mut acp_pane = acp::Acp::new(rpc.clone());
+                // Carry the pre-disconnect session across a reconnect rebuild so
+                // the rebuilt pane resumes the daemon-retained session (#7182)
+                // instead of minting a fresh one. None on first build.
+                acp_pane.set_resume_session_id($resume_acp.0);
+                acp_pane.set_resume_agent_alias($resume_acp.1);
+                acp_pane.init().await?;
+                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                chat_pane.set_resume_session_id($resume_chat.0);
+                chat_pane.set_resume_agent_alias($resume_chat.1);
+                chat_pane.init().await?;
+                let pending_start_chat = {
+                    let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
+                    guard.start_chat_with.take()
+                };
+                let mut logs_pane = logs::Logs::new(rpc.clone());
+                logs_pane.init().await?;
+                let mut quickstart =
+                    quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
+                quickstart.init().await?;
+                if let Some(alias) = pending_start_chat {
+                    chat_pane.focus_agent(&alias).await;
+                    mode = Mode::Chat;
+                }
+                anyhow::Ok((
+                    dashboard_pane,
+                    config_app,
+                    acp_pane,
+                    chat_pane,
+                    logs_pane,
+                    quickstart,
+                ))
+            }
+            .await
+        };
     }
+
+    let (
+        mut dashboard_pane,
+        mut config_app,
+        mut acp_pane,
+        mut chat_pane,
+        mut logs_pane,
+        mut quickstart,
+    ) = build_panes!(
+        (None::<String>, None::<String>),
+        (None::<String>, None::<String>)
+    )?;
 
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+
+        // Per-agent theme override: while the Code or Chat pane is focused on
+        // an agent with a configured override, swap that palette in for the
+        // whole frame (backdrop, pane, bars) so the pane reads cohesively, then
+        // restore the base theme after drawing. The base theme is whatever the
+        // global currently holds, so live theme changes from the Config pane
+        // still take effect for non-overridden panes.
+        let base_theme = theme::active_raw();
+        let frame_theme = match mode {
+            Mode::Acp => acp_pane.selected_agent().and_then(theme::agent_override),
+            Mode::Chat => chat_pane.selected_agent().and_then(theme::agent_override),
+            _ => None,
+        };
+        if let Some(t) = frame_theme {
+            theme::set_active(t);
+        }
+
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
@@ -167,13 +248,30 @@ pub async fn run(
                     frame.area(),
                 );
             }
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
+            // The info bar appears as a dedicated row between the content and
+            // the status bar, only while the active pane has a message to show.
+            let info_message = match mode {
+                Mode::Chat => chat_pane.info_message().cloned(),
+                _ => None,
+            };
+            let has_info = info_message.is_some();
+            let constraints: Vec<Constraint> = if has_info {
+                vec![
+                    Constraint::Length(1), // mode bar
+                    Constraint::Min(0),    // content
+                    Constraint::Length(1), // info bar
+                    Constraint::Length(1), // status bar
+                ]
+            } else {
+                vec![
                     Constraint::Length(1), // mode bar
                     Constraint::Min(0),    // content
                     Constraint::Length(1), // status bar
-                ])
+                ]
+            };
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
                 .split(frame.area());
 
             bar_area = chunks[0];
@@ -189,6 +287,18 @@ pub async fn run(
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
             }
 
+            let status_idx = if has_info {
+                // Render the info bar in its own row above the status bar.
+                let info_area = chunks[2];
+                let bar = crate::widgets::InfoBar::new(info_message.as_ref());
+                if let Some(widget) = bar.widget(info_area.width as usize) {
+                    frame.render_widget(widget, info_area);
+                }
+                3
+            } else {
+                2
+            };
+
             let (ctx_input, ctx_max) = match mode {
                 Mode::Chat => chat_pane.ctx_tokens(),
                 Mode::Acp => acp_pane.ctx_tokens(),
@@ -196,32 +306,36 @@ pub async fn run(
             };
             draw_status_bar(
                 frame,
-                chunks[2],
+                chunks[status_idx],
                 &conn_state,
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
+                needs_intervention,
             );
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
+                use crate::keymap::RebindableActions;
+                let chord_keys = |chords: Vec<crate::keymap::Chord>| -> Vec<String> {
+                    chords.iter().map(crate::keymap::Chord::display).collect()
+                };
                 let mut node = HelpNode::entries(vec![
                     HelpEntry::new(
-                        vec![
-                            Box::leak(
-                                crate::keymap::GlobalAction::PaneNavLeft.default_chords()[0]
-                                    .display()
-                                    .into_boxed_str(),
-                            ),
-                            Box::leak(
-                                crate::keymap::GlobalAction::PaneNavRight.default_chords()[0]
-                                    .display()
-                                    .into_boxed_str(),
-                            ),
-                        ],
+                        [
+                            chord_keys(crate::keymap::GlobalAction::PaneNavLeft.resolved()),
+                            chord_keys(crate::keymap::GlobalAction::PaneNavRight.resolved()),
+                        ]
+                        .concat(),
                         crate::i18n::t("zc-app-help-cycle-mode"),
                     ),
-                    HelpEntry::key("Ctrl+R", crate::i18n::t("zc-app-help-reload")),
-                    HelpEntry::key("Ctrl+C", crate::i18n::t("zc-app-help-quit")),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::ReloadDaemon.resolved()),
+                        crate::i18n::t("zc-app-help-reload"),
+                    ),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
+                        crate::i18n::t("zc-app-help-quit"),
+                    ),
                     HelpEntry::spacer(),
                 ]);
                 let pane_node = match mode {
@@ -247,15 +361,102 @@ pub async fn run(
             }
         })?;
 
-        // Disconnect handoff runs every iteration, not just when the input
-        // poll times out. A steady stream of events (mouse scroll, resize,
-        // focus) would otherwise keep `event::poll` returning true and the
-        // grace timer would never start — the UI would sit frozen on the
-        // red "Disconnected" status bar indefinitely.
+        // Restore the base palette so the override never leaks into the next
+        // frame, a different pane, or live theme changes from the Config pane.
+        if frame_theme.is_some() {
+            theme::set_active(base_theme);
+        }
+
+        // In-loop recovery. The draw above already rendered the cached
+        // panes and the Disconnected status, and the input poll below keeps
+        // the UI responsive (quit always works), so reconnection happens
+        // here without ever leaving the event loop. This runs every
+        // iteration, not just when the input poll times out: a steady stream
+        // of events (mouse scroll, resize, focus) would otherwise keep
+        // `event::poll` returning true and the grace timer would never start,
+        // leaving the UI frozen on the red "Disconnected" status bar.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
-            let since = *disconnect_since.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() >= Duration::from_secs(2) {
-                return Ok(true);
+            // Owned ephemeral daemon: respawn exactly once. After that single
+            // respawn we set `needs_intervention` to stop auto-respawning and
+            // surface the state — but we keep polling below, so a manually
+            // restarted daemon still recovers gracefully. Attached daemons
+            // (external socket / WSS) are never spawned: multiple TUIs
+            // respawning would stampede; they only poll for the daemon to
+            // reappear at the expected address.
+            if owns_ephemeral && !ephemeral_respawn_done {
+                ephemeral_respawn_done = true;
+                if let crate::ConnectTarget::LocalSocket(_) = target {
+                    let _ = crate::spawn_ephemeral_daemon(config_dir);
+                }
+            }
+
+            // Always poll (throttled) for the daemon to become reachable —
+            // whether it is our respawned ephemeral one or a daemon the user
+            // brought back up by hand. `needs_intervention` only gates the
+            // auto-respawn above, never the reconnect poll, so recovery is
+            // never a dead end.
+            {
+                let now = std::time::Instant::now();
+                let due = reconnect_last_attempt
+                    .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due {
+                    reconnect_last_attempt = Some(now);
+                    // Reclaim the same TUI identity so the daemon restores
+                    // our UID via HMAC signature verification.
+                    let prev_id = rpc.tui_id().map(String::from);
+                    let prev_sig = rpc.tui_sig().map(String::from);
+                    if let Ok(new_client) = target
+                        .connect(prev_id.as_deref(), prev_sig.as_deref())
+                        .await
+                    {
+                        // Adopt the recovered client and rebuild every pane
+                        // against it (a kept-alive pane would still hold the
+                        // dead client's notification receiver). History is
+                        // not bulk-reloaded — panes refetch lazily and the
+                        // daemon rehydrates the session from its durable row
+                        // on the next prompt.
+                        rpc = Arc::new(new_client);
+                        // Carry the live sessions across the rebuild so the
+                        // recovered panes reattach to the daemon-retained
+                        // sessions instead of starting fresh. The agent alias
+                        // rides along so a multi-agent reconnect reattaches to
+                        // the right agent rather than dropping the session.
+                        let resume_chat = (
+                            chat_pane.current_session_id().map(String::from),
+                            chat_pane.current_agent_alias().map(String::from),
+                        );
+                        let resume_acp = (
+                            acp_pane.current_session_id().map(String::from),
+                            acp_pane.current_agent_alias().map(String::from),
+                        );
+                        match build_panes!(resume_chat, resume_acp) {
+                            Ok(panes) => {
+                                dashboard_pane = panes.0;
+                                config_app = panes.1;
+                                acp_pane = panes.2;
+                                chat_pane = panes.3;
+                                logs_pane = panes.4;
+                                quickstart = panes.5;
+                                reconnect_last_attempt = None;
+                                ephemeral_respawn_done = false;
+                                needs_intervention = false;
+                                continue;
+                            }
+                            Err(_) => {
+                                // Daemon flapped again mid-init. Stay in the
+                                // disconnected loop and retry on the next
+                                // throttle window rather than tearing down.
+                                continue;
+                            }
+                        }
+                    } else if owns_ephemeral && ephemeral_respawn_done {
+                        // The one permitted respawn did not come back — flag
+                        // for the user. We keep polling above, so a manual
+                        // daemon restart still recovers.
+                        needs_intervention = true;
+                    }
+                }
             }
         }
 
@@ -394,6 +595,17 @@ pub async fn run(
                 if quit {
                     break;
                 }
+                if mode == Mode::Quickstart && quickstart.take_leave_request() {
+                    switch_mode(
+                        &mut mode,
+                        Mode::Dashboard,
+                        &conn_state,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                    )
+                    .await;
+                }
             }
             Event::Mouse(mouse) => {
                 // Dismiss help on any click
@@ -440,10 +652,10 @@ pub async fn run(
                             logs_pane.handle_mouse(mouse, content_area);
                         }
                         Mode::Acp => {
-                            acp_pane.handle_mouse(mouse, content_area);
+                            acp_pane.handle_mouse(mouse, content_area).await;
                         }
                         Mode::Chat => {
-                            chat_pane.handle_mouse(mouse, content_area);
+                            chat_pane.handle_mouse(mouse, content_area).await;
                         }
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;
@@ -465,7 +677,28 @@ pub async fn run(
         }
     }
 
-    Ok(false)
+    Ok(())
+}
+
+/// Resolve every `[theme.agent_override.<alias>]` entry into a ready palette,
+/// keyed by agent alias. Loads the local zerocode config; an unreadable config
+/// or an override naming an unknown theme is skipped silently (never written to
+/// stderr — that would corrupt the alternate-screen TUI). The base theme
+/// remains in effect for any agent not present in the returned map; a bad
+/// override surfaces in the Config pane's own validation, not here.
+fn resolve_agent_overrides(
+    config_dir: &std::path::Path,
+) -> std::collections::HashMap<String, theme::Theme> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(cfg) = config::ensure_and_load(config_dir) else {
+        return out;
+    };
+    for alias in cfg.agent_override_aliases() {
+        if let Ok(Some(t)) = cfg.resolve_agent_theme(alias) {
+            out.insert(alias.to_string(), t);
+        }
+    }
+    out
 }
 
 // ── Mode bar ─────────────────────────────────────────────────────
@@ -499,6 +732,7 @@ fn draw_status_bar(
     state: &ConnectionState,
     tui_id: Option<&str>,
     ctx: CtxBar,
+    needs_intervention: bool,
 ) {
     let (dot, label, style) = match state {
         ConnectionState::Connected => (
@@ -506,9 +740,14 @@ fn draw_status_bar(
             " Connected".to_string(),
             Style::default().fg(HEALTHY_GREEN),
         ),
+        ConnectionState::Disconnected { reason } if needs_intervention => (
+            "\u{25cf}",
+            format!(" Daemon unavailable — restart required ({reason})"),
+            Style::default().fg(DEAD_RED),
+        ),
         ConnectionState::Disconnected { reason } => (
             "\u{25cf}",
-            format!(" Disconnected (reason: {reason})"),
+            format!(" Reconnecting… (reason: {reason})"),
             Style::default().fg(DEAD_RED),
         ),
     };
@@ -544,8 +783,11 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column.
-    if let Some(w) = ctx.widget() {
+    // Left: ctx bar, left-aligned in its own column. The bar is held back
+    // until the context-accounting feature is ready to show; there is no
+    // user-facing switch — the gate flips when the work lands.
+    const SHOW_CTX_BAR: bool = false;
+    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
 }

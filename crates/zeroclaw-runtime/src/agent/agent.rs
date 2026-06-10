@@ -2,7 +2,6 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -26,6 +25,68 @@ use zeroclaw_tool_call_parser::strip_think_tags;
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+/// Build a fresh `ModelProvider` box for a dotted `<type>.<alias>` reference,
+/// resolving the model from the override (when supplied) or the configured
+/// entry. Mirrors the model_provider-construction path in [`Agent::from_config`]
+/// so a live session switch produces the same wiring a fresh agent would.
+/// Returns the built box plus the resolved `(model_provider_name, model_name)`
+/// for attribution.
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    let (model_provider_name, model_provider_alias) = model_provider_ref
+        .split_once('.')
+        .map(|(t, a)| (t.to_string(), a.to_string()))
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
+            ))
+        })?;
+
+    let entry = config
+        .providers
+        .models
+        .find(&model_provider_name, &model_provider_alias);
+    let model_name = model_override
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            entry
+                .and_then(|e| e.model.as_deref())
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider `{model_provider_ref}` has no `model` configured and no model \
+                 override was supplied"
+            ))
+        })?;
+
+    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        config,
+        &model_provider_name,
+        &model_provider_alias,
+    );
+
+    let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
+        config,
+        model_provider_ref,
+        entry.and_then(|e| e.api_key.as_deref()),
+        entry.and_then(|e| e.uri.as_deref()),
+        &config.reliability,
+        &config.model_routes,
+        &model_name,
+        &model_provider_runtime_options,
+    )?;
+
+    Ok((model_provider, model_provider_name, model_name))
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -34,7 +95,7 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_loader: Box<dyn MemoryLoader>,
+    memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
     config: zeroclaw_config::schema::AliasedAgentConfig,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
@@ -181,7 +242,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
+    memory_strategy: Option<Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -223,7 +284,7 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_loader: None,
+            memory_strategy: None,
             config: None,
             multimodal_config: None,
             model_name: None,
@@ -281,8 +342,11 @@ impl AgentBuilder {
         self
     }
 
-    pub fn memory_loader(mut self, memory_loader: Box<dyn MemoryLoader>) -> Self {
-        self.memory_loader = Some(memory_loader);
+    pub fn memory_strategy(
+        mut self,
+        memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+    ) -> Self {
+        self.memory_strategy = Some(memory_strategy);
         self
     }
 
@@ -450,17 +514,14 @@ impl AgentBuilder {
         // replace the backend with NoneMemory, and force auto_save off.
         let exclude_memory = self.exclude_memory;
         if exclude_memory {
-            const MEMORY_TOOLS: &[&str] = &[
-                "memory_recall",
-                "memory_store",
-                "memory_forget",
-                "memory_export",
-                "memory_purge",
-            ];
-            tools.retain(|t| !MEMORY_TOOLS.contains(&t.name()));
+            tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
+        let workspace_dir = self
+            .workspace_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
 
         let memory: Arc<dyn Memory> = if exclude_memory {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
@@ -476,6 +537,13 @@ impl AgentBuilder {
                 anyhow::Error::msg("memory is required")
             })?
         };
+        // No-memory sessions must not retain a caller-provided strategy that
+        // still closes over persistent memory.
+        let memory_strategy = if exclude_memory {
+            None
+        } else {
+            self.memory_strategy
+        };
 
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
@@ -490,7 +558,7 @@ impl AgentBuilder {
             })?,
             tools,
             tool_specs,
-            memory,
+            memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -514,9 +582,15 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
-            memory_loader: self
-                .memory_loader
-                .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
+            memory_strategy: memory_strategy.unwrap_or_else(|| {
+                Arc::new(
+                    crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                        memory.clone(),
+                        zeroclaw_config::schema::MemoryConfig::default(),
+                        workspace_dir.clone(),
+                    ),
+                )
+            }),
             config: self.config.unwrap_or_default(),
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             // No silent vendor-default model. Callers that construct `Agent` via the
@@ -529,6 +603,7 @@ impl AgentBuilder {
                 .model_provider_name
                 .unwrap_or_else(|| "<unconfigured>".into()),
             temperature: self.temperature,
+            // Default for test callers that don't call workspace_dir().
             workspace_dir: self
                 .workspace_dir
                 .clone()
@@ -683,12 +758,8 @@ impl Agent {
         new_msgs: &mut Vec<ConversationMessage>,
     ) {
         let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
+            .memory_strategy
+            .load_context(user_message, self.memory_session_id.as_deref())
             .await
             .unwrap_or_default();
 
@@ -816,6 +887,14 @@ impl Agent {
         self.model_name = model_name;
     }
 
+    pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
+        self.model_provider = model_provider;
+    }
+
+    pub fn set_model_provider_name(&mut self, model_provider_name: String) {
+        self.model_provider_name = model_provider_name;
+    }
+
     /// Return the names of all registered tools.  Test-only — avoids
     /// exposing `Box<dyn Tool>` across the crate boundary.
     #[cfg(test)]
@@ -937,7 +1016,7 @@ impl Agent {
         .await
     }
 
-    /// Like [`from_config_with_session_cwd_and_mcp_backchannel`] but also
+    /// Like [`Self::from_config_with_session_cwd_and_mcp_backchannel`] but also
     /// injects the TUI's captured shell environment so that tools like
     /// `ShellTool` inherit the user's real `PATH`, `SSH_AUTH_SOCK`, etc.
     /// rather than the daemon's stripped-down process environment.
@@ -1304,14 +1383,18 @@ impl Agent {
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(tools)
-            .memory(memory)
+            .memory(memory.clone())
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(
-                config.effective_memory_recall_limit(agent_alias),
-                config.memory.min_relevance_score,
-            )))
+            .memory_strategy(Arc::new(
+                crate::agent::memory_strategy::DefaultMemoryStrategy::with_config_and_limit(
+                    memory.clone(),
+                    config.memory.clone(),
+                    security.workspace_dir.clone(),
+                    config.effective_memory_recall_limit(agent_alias),
+                ),
+            ))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
@@ -1461,6 +1544,32 @@ impl Agent {
                         })),
                     "trim_history: dropped orphan AssistantToolCalls at head"
                 );
+            }
+
+            // Safety: the orphan-removal cascades above can advance
+            // drop_count all the way to other_messages.len() when the only
+            // non-tool-call entry is the user message at position[0] and
+            // initial_drop_count drops it (e.g. max=50, history=[user,
+            // AC1, TR1, …, AC25, TR25]).  Sending zero messages to the
+            // provider causes a hard 400 "messages: at least one message
+            // is required".  When the cascade would wipe everything, skip
+            // this trim pass so the conversation stays functional even
+            // though it is temporarily over the message limit.
+            if drop_count >= other_messages.len() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "history_len": other_messages.len(),
+                            "max_history_messages": max,
+                        })),
+                    "trim_history: orphan-cascade would empty all non-system messages; skipping trim to preserve conversation"
+                );
+                self.history = system_messages;
+                self.history.extend(other_messages);
+                return;
             }
 
             ::zeroclaw_log::record!(
@@ -1906,12 +2015,8 @@ impl Agent {
         }
 
         let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
+            .memory_strategy
+            .load_context(user_message, self.memory_session_id.as_deref())
             .await
             .unwrap_or_default();
 
@@ -3046,6 +3151,30 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::observability_traits::ObserverMetric;
+
+    #[test]
+    fn build_session_model_provider_rejects_undotted_ref() {
+        let config = Config::default();
+        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
+            Ok(_) => panic!("undotted ref must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("<type>.<alias>"), "got: {err}");
+    }
+
+    #[test]
+    fn build_session_model_provider_requires_a_model() {
+        // No configured entry and no override → cannot resolve a model name.
+        let config = Config::default();
+        let err = match build_session_model_provider(&config, "anthropic.default", None) {
+            Ok(_) => panic!("missing model must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("no `model` configured"),
+            "got: {err}"
+        );
+    }
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
@@ -5449,6 +5578,281 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test for the orphan-cascade-empties-everything 400.
+    ///
+    /// When `max_history_messages` is small relative to a long single-turn
+    /// tool loop, the orphan-removal cascades in `trim_history` can advance
+    /// `drop_count` all the way to `other_messages.len()`. Before the guard,
+    /// `other_messages.drain(0..drop_count)` then emptied the entire
+    /// non-system history, `convert_messages` lifted the system entry into
+    /// `system_prompt`, and the provider received `messages: []` — a hard
+    /// 400 `"messages: at least one message is required"` from Anthropic.
+    ///
+    /// Minimal repro of the cascade:
+    ///   history = [user, AC1, TR1, AC2, TR2]   (no system message)
+    ///   max_history_messages = 4
+    ///   other_messages.len() = 5, initial_drop_count = 1 → drops `user`
+    ///   orphan-TR cascade: pos 1 = AC1, not TR → no-op
+    ///   orphan-AC cascade: pos 1 = AC1, pos 2 = TR1, pos 3 = AC2,
+    ///                      pos 4 = TR2 → drop_count = 5
+    ///   drop_count (5) >= other_messages.len() (5) → guard MUST fire.
+    ///
+    /// Without the guard this test fails: `agent.history` ends up empty,
+    /// which is exactly the shape that crashes the provider call.
+    /// With the guard, the original history is preserved unchanged so the
+    /// session stays over-limit-but-functional.
+    #[test]
+    fn trim_history_does_not_empty_all_messages_on_full_cascade() {
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                max_history_messages: 4,
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // user
+        agent.history.push(ConversationMessage::Chat(ChatMessage {
+            role: "user".into(),
+            content: "kick off a long tool loop".into(),
+        }));
+        // AC1, TR1
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 1".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc1".into(),
+                name: "tool1".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                content: "result1".into(),
+            }]));
+        // AC2, TR2
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 2".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc2".into(),
+                name: "tool2".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc2".into(),
+                content: "result2".into(),
+            }]));
+
+        assert_eq!(agent.history.len(), 5);
+        let before = agent.history.clone();
+
+        agent.trim_history();
+
+        // Load-bearing assertion: trim_history must NOT produce an empty
+        // provider-visible conversation. Without the guard this is an empty
+        // Vec and the next provider call returns 400.
+        assert!(
+            !agent.history.is_empty(),
+            "trim_history drained every non-system message; the next \
+             provider call would fail with 'messages: at least one message \
+             is required'"
+        );
+
+        // When the full cascade triggers the guard the contract is "skip the
+        // trim, leave history exactly as it was, accept being temporarily
+        // over the limit." Lock that exact behavior — anything weaker (e.g.
+        // partial trim) would silently regress the orphan-pair invariants
+        // the other trim tests cover.
+        assert_eq!(
+            agent.history.len(),
+            before.len(),
+            "trim_history dropped messages despite the orphan cascade \
+             reaching other_messages.len(); the guard's contract is to \
+             preserve the conversation untouched in this case"
+        );
+
+        // Session is temporarily over the configured limit by design. Codify
+        // that so a future "tighten trim_history" refactor cannot silently
+        // turn the guard back into the empty-messages crash.
+        assert!(
+            agent.history.len() > agent.config.resolved.max_history_messages,
+            "expected history to remain over max_history_messages after the \
+             guard fires (that is the documented trade-off); got len={} max={}",
+            agent.history.len(),
+            agent.config.resolved.max_history_messages,
+        );
+    }
+
+    /// Same cascade-to-empty path, but with a system message present.
+    ///
+    /// Verifies the guard's restore path puts the conversation back together
+    /// in the right order (`system_messages` first, then the original
+    /// non-system entries) rather than dropping the system message on the
+    /// floor or returning the slices reversed. Without the guard the system
+    /// message survives (it is held aside in `system_messages`) but the
+    /// non-system half is still drained — so `agent.history` would end up as
+    /// just `[system]` and `convert_messages` would lift it into
+    /// `system_prompt`, again producing `messages: []`.
+    #[test]
+    fn trim_history_full_cascade_with_system_message_preserves_full_history() {
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        // Same arithmetic as the previous test: 5 non-system entries with
+        // max=4 → initial_drop_count=1, orphan-AC cascade reaches the end.
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                max_history_messages: 4,
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // system (gets partitioned into system_messages by trim_history)
+        agent.history.push(ConversationMessage::Chat(ChatMessage {
+            role: "system".into(),
+            content: "you are a helpful agent".into(),
+        }));
+        // user
+        agent.history.push(ConversationMessage::Chat(ChatMessage {
+            role: "user".into(),
+            content: "kick off a long tool loop".into(),
+        }));
+        // AC1, TR1
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 1".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc1".into(),
+                name: "tool1".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                content: "result1".into(),
+            }]));
+        // AC2, TR2
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 2".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc2".into(),
+                name: "tool2".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc2".into(),
+                content: "result2".into(),
+            }]));
+
+        assert_eq!(agent.history.len(), 6);
+        let before_len = agent.history.len();
+
+        agent.trim_history();
+
+        // System message must still be present and at the head — that is
+        // where trim_history's partition+restore lands it.
+        match agent.history.first() {
+            Some(ConversationMessage::Chat(chat)) => assert_eq!(
+                chat.role, "system",
+                "expected system message at head after restore; got role={:?}",
+                chat.role
+            ),
+            other => panic!(
+                "expected Chat(system) at head of restored history, got {:?}",
+                other
+            ),
+        }
+
+        // The non-system half must not have been drained. Total length must
+        // equal the pre-trim length: guard's contract is "leave history
+        // unchanged" once the system + non-system halves are reassembled.
+        assert_eq!(
+            agent.history.len(),
+            before_len,
+            "trim_history dropped messages from the non-system half despite \
+             the orphan cascade reaching other_messages.len(); guard must \
+             preserve every entry when it fires"
+        );
+
+        // At least one non-system message must remain — without this the
+        // provider still sees `messages: []` after `convert_messages` lifts
+        // the system entry into `system_prompt`.
+        let non_system_remaining = agent
+            .history
+            .iter()
+            .filter(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .count();
+        assert!(
+            non_system_remaining > 0,
+            "trim_history left only the system message; convert_messages \
+             would produce messages: [] and the provider call would 400"
+        );
     }
 
     #[test]

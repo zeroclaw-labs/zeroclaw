@@ -3,9 +3,11 @@ name: Quality Gate
 on:
   pull_request:
     branches: [master]
+  push:
+    branches: [master]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -16,12 +18,38 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Stage 1: Lint (fast gate — fails early before burning compute) ────────
+  # ── Fast serial gate: fail formatting errors before burning compute ───────
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Lint ${{ matrix.target }}
+    needs: [fmt]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -29,35 +57,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.93.0
-          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
       - name: Ensure web/dist placeholder exists
+        shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Check formatting
-        run: cargo fmt --all -- --check
       - name: Clippy
+        shell: bash
         run: >
           cargo clippy
           --workspace
           --exclude zeroclaw-desktop
           --all-targets
+          --target ${{ matrix.target }}
           --features ci-all
           -- -D warnings
       - name: Config-write isolation guard
+        if: runner.os == 'Linux'
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
+        if: runner.os == 'Linux'
         run: cargo test --test architecture user_facing_strings_route_through_fluent
 
-  # ── Stage 2: Build + Check (parallel, gated on lint) ─────────────────────
+  # ── Post-format build + check fan-out ─────────────────────────────────────
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [lint]
+    needs: [fmt]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -77,7 +110,6 @@ jobs:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: runner.os != 'Windows'
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -96,7 +128,7 @@ jobs:
 
   check:
     name: Check (${{ matrix.name }})
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -128,7 +160,7 @@ jobs:
 
   check-32bit:
     name: Check (32-bit)
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -150,7 +182,7 @@ jobs:
 
   bench:
     name: Benchmarks Compile
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -167,11 +199,11 @@ jobs:
       - name: Verify benchmarks compile
         run: cargo bench --no-run --locked
 
-  # ── Stage 3: Test (gated on lint) ────────────────────────────────────────
+  # ── Post-format tests ─────────────────────────────────────────────────────
 
   test:
     name: Test
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -195,11 +227,11 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-  # ── Stage 4: Security (parallel with test, gated on lint) ────────────────
+  # ── Post-format security checks ───────────────────────────────────────────
 
   security:
     name: Security
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -216,14 +248,28 @@ jobs:
       - name: Check licenses, sources, and advisories
         run: cargo deny check
 
-  # ── Stage 5: Required gate ────────────────────────────────────────────────
+  nix-eval:
+    name: Nix Module Eval
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Nix
+        run: sudo apt-get update -qq && sudo apt-get install -y nix-bin nix-setup-systemd
+      - name: Verify Nix
+        run: sudo nix --version
+      - name: Evaluate Nix module assertions
+        run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
+
+  # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
 
   gate:
     name: CI Required Gate
     if: always()
-    needs: [lint, build, check, check-32bit, bench, test, security]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
