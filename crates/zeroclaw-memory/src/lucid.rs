@@ -47,7 +47,7 @@ impl LucidMemory {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn with_options(
         alias: &str,

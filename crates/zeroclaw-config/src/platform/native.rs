@@ -54,6 +54,7 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
 
             let mut process = tokio::process::Command::new("cmd.exe");
@@ -203,15 +204,14 @@ mod tests {
     /// On Windows, actually invoke `cmd /C` with a quoted `echo`
     /// argument to confirm the fix works end-to-end. Skipped on
     /// non-Windows hosts since there's no `cmd.exe`.
-    #[tokio::test]
+    #[test]
     #[cfg(target_os = "windows")]
-    async fn windows_echo_quoted_argument_succeeds() {
+    fn windows_echo_quoted_argument_succeeds() {
         let cwd = std::env::temp_dir();
         let output = NativeRuntime::new()
             .build_shell_command(r#"echo "hello world""#, &cwd)
             .unwrap()
             .output()
-            .await
             .expect("cmd /C echo should execute");
 
         assert!(output.status.success(), "cmd must exit 0");
@@ -225,15 +225,14 @@ mod tests {
     /// On Windows, verify `dir` with a quoted path works (previous
     /// behavior: "The filename, directory name, or volume label
     /// syntax is incorrect").
-    #[tokio::test]
+    #[test]
     #[cfg(target_os = "windows")]
-    async fn windows_dir_quoted_path_succeeds() {
+    fn windows_dir_quoted_path_succeeds() {
         let cwd = std::env::temp_dir();
         let output = NativeRuntime::new()
             .build_shell_command(r#"dir "C:\Windows" /b"#, &cwd)
             .unwrap()
             .output()
-            .await
             .expect("cmd /C dir should execute");
 
         assert!(output.status.success(), "cmd must exit 0");
@@ -258,15 +257,14 @@ mod tests {
 
     /// Verify `echo %VAR%` expansion syntax is preserved verbatim
     /// and not mangled by escaping.
-    #[tokio::test]
+    #[test]
     #[cfg(target_os = "windows")]
-    async fn windows_echo_percent_expansion_preserved() {
+    fn windows_echo_percent_expansion_preserved() {
         let cwd = std::env::temp_dir();
         let output = NativeRuntime::new()
             .build_shell_command("echo %USERPROFILE%", &cwd)
             .unwrap()
             .output()
-            .await
             .expect("cmd /C echo should execute");
 
         assert!(output.status.success(), "cmd must exit 0");

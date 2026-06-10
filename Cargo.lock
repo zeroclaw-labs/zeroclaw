@@ -13609,7 +13609,6 @@ dependencies = [
  "aes 0.8.4",
  "anyhow",
  "async-imap",
- "async-reactor-trait",
  "async-trait",
  "axum",
  "base64 0.22.1",
