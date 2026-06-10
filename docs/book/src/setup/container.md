@@ -44,6 +44,33 @@ docker exec -it zeroclaw zeroclaw quickstart
 
 </div>
 
+## Running zerocode (the TUI)
+
+The image ships the [zerocode](../zerocode/overview.md) terminal interface alongside the `zeroclaw` binary. The default entrypoint is `zeroclaw`, so launch zerocode by overriding it with `--entrypoint zerocode` and an interactive TTY (`-it`). Both image variants carry it:
+
+<div class="os-tabs-src">
+
+#### distroless (`:latest`)
+
+```sh
+docker run -it --entrypoint zerocode ghcr.io/zeroclaw-labs/zeroclaw:latest
+```
+
+#### debian
+
+```sh
+docker run -it --entrypoint zerocode ghcr.io/zeroclaw-labs/zeroclaw:debian
+```
+
+</div>
+
+zerocode connects to a running ZeroClaw daemon, so point it at one:
+
+- **Same container's daemon:** run it against the container that already runs the daemon (`docker exec -it zeroclaw zerocode`), which reaches the daemon over the local IPC socket.
+- **A remote daemon:** connect over WebSocket Secure with `zerocode --connect wss://<host>:<port>`; see [Remote setup (WSS)](../zerocode/remote.md). This is the portable way to drive a containerized or remote daemon from your own terminal.
+
+Persist `/zeroclaw-data` (as in [Minimum run](#minimum-run)) so the config and identity zerocode reads are the same ones the daemon uses.
+
 ## Compose
 
 A minimal `docker-compose.yml`:
