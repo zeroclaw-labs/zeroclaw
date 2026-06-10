@@ -5140,8 +5140,8 @@ mod tests {
 
     mod thread_extraction {
         use super::super::inbound::{
-            extract_mentions_user_ids, extract_thread_id,
-            interruption_scope_from_anchor, resolve_outbound_anchor,
+            extract_mentions_user_ids, extract_thread_id, interruption_scope_from_anchor,
+            resolve_outbound_anchor,
         };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
@@ -5242,12 +5242,10 @@ mod tests {
             // interruption_scope_id must stay set to the thread root.
             let event_id = "$reply:server".parse().expect("event id");
             let thread_root = "$root:server".parse().expect("thread root");
-            let outbound =
-                resolve_outbound_anchor(Some(&thread_root), &event_id, true);
+            let outbound = resolve_outbound_anchor(Some(&thread_root), &event_id, true);
             assert_eq!(outbound.as_deref(), Some("$root:server"));
             assert_eq!(
-                interruption_scope_from_anchor(outbound.as_deref(), &event_id)
-                    .as_deref(),
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id).as_deref(),
                 Some("$root:server")
             );
         }
