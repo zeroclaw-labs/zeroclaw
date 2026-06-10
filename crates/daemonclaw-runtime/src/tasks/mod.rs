@@ -172,6 +172,7 @@ pub struct Task {
     pub source: String,
     pub abandon_reason: Option<String>,
     pub outcome: Option<TaskOutcome>,
+    pub turn_count: u32,
     pub created_at: String,
     pub updated_at: String,
 }

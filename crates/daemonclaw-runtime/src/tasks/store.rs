@@ -81,6 +81,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         .context("Failed to run tasks.db migration v1")?;
     }
 
+    if version < 2 {
+        conn.execute_batch(
+            "ALTER TABLE tasks ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 2;",
+        )
+        .context("Failed to run tasks.db migration v2")?;
+    }
+
     Ok(())
 }
 
@@ -90,7 +98,7 @@ fn get_task_inner(conn: &Connection, task_id: &str) -> Result<Task, TaskError> {
     conn.query_row(
         "SELECT id, parent_id, title, intent, acceptance, status, priority, assigned_to,
                 autonomy, execution, tools, blockers, template_id, source,
-                abandon_reason, outcome, created_at, updated_at
+                abandon_reason, outcome, turn_count, created_at, updated_at
          FROM tasks WHERE id = ?1",
         params![task_id],
         row_to_task,
@@ -123,8 +131,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         source: row.get(13)?,
         abandon_reason: row.get(14)?,
         outcome: row.get::<_, Option<String>>(15)?.and_then(|s| TaskOutcome::from_str(&s)),
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        turn_count: row.get::<_, i64>(16)? as u32,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -242,7 +251,7 @@ pub fn list_tasks(
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, title, intent, acceptance, status, priority, assigned_to,
                     autonomy, execution, tools, blockers, template_id, source,
-                    abandon_reason, outcome, created_at, updated_at
+                    abandon_reason, outcome, turn_count, created_at, updated_at
              FROM tasks WHERE status = ?1
              ORDER BY priority DESC, updated_at DESC LIMIT ?2",
         )?;
@@ -254,7 +263,7 @@ pub fn list_tasks(
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, title, intent, acceptance, status, priority, assigned_to,
                     autonomy, execution, tools, blockers, template_id, source,
-                    abandon_reason, outcome, created_at, updated_at
+                    abandon_reason, outcome, turn_count, created_at, updated_at
              FROM tasks
              ORDER BY priority DESC, updated_at DESC LIMIT ?1",
         )?;
@@ -672,6 +681,24 @@ pub fn insert_breadcrumb(
     )
     .context("Failed to insert breadcrumb into task_activity")?;
     Ok(())
+}
+
+/// Atomically increment the turn_count for a task and return the new value.
+pub fn increment_turn_count(workspace_dir: &Path, task_id: &str) -> Result<u32> {
+    let conn = connect(workspace_dir)?;
+    conn.execute(
+        "UPDATE tasks SET turn_count = turn_count + 1 WHERE id = ?1",
+        params![task_id],
+    )
+    .context("Failed to increment turn_count")?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT turn_count FROM tasks WHERE id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .context("Failed to read turn_count after increment")?;
+    Ok(count as u32)
 }
 
 pub fn get_task_activity(workspace_dir: &Path, task_id: &str) -> Result<Vec<serde_json::Value>> {
@@ -1159,7 +1186,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]

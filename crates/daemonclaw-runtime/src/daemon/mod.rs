@@ -452,7 +452,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 async fn run_task_pickup_tick(
     config: &Config,
     pickup: daemonclaw_config::schema::AutonomousPickup,
-    _delivery: &Option<(String, String)>,
+    delivery: &Option<(String, String)>,
 ) -> (bool, bool) {
     use crate::tasks::{self, Autonomy, Execution, TaskActor, TaskStatus};
 
@@ -549,7 +549,7 @@ async fn run_task_pickup_tick(
         );
 
         let session_file = session_dir.join(format!("task_{}.jsonl", task.id));
-        had_error |= execute_task_turn(config, task, &session_file).await;
+        had_error |= execute_task_turn(config, task, &session_file, delivery, &audit).await;
     }
 
     // Then pick up new tasks from eligible
@@ -579,7 +579,7 @@ async fn run_task_pickup_tick(
         );
 
         let session_file = session_dir.join(format!("task_{}.jsonl", claimed.id));
-        had_error |= execute_task_turn(config, &claimed, &session_file).await;
+        had_error |= execute_task_turn(config, &claimed, &session_file, delivery, &audit).await;
     }
 
     (had_error, has_high_priority)
@@ -587,12 +587,60 @@ async fn run_task_pickup_tick(
 
 /// Execute a single agent turn for a task under its task binding with a
 /// synthetic per-task session file. Returns `true` if an error occurred.
+///
+/// Enforces `max_task_turns`: increments turn_count before running, and if
+/// the count exceeds the budget, blocks the task with "turn budget exhausted"
+/// instead of running the LLM.
+///
+/// After the turn, re-reads the task status. If blocked and `notify_on_block`
+/// is configured, emits a single channel notification — the ONLY permitted
+/// channel emission from the task path.
 async fn execute_task_turn(
     config: &Config,
     task: &crate::tasks::Task,
     session_file: &std::path::Path,
+    delivery: &Option<(String, String)>,
+    audit: &crate::security::audit::AuditLogger,
 ) -> bool {
-    use crate::tasks::{self, TaskBinding};
+    use crate::tasks::{self, TaskActor, TaskBinding, TaskStatus};
+
+    let workspace = &config.workspace_dir;
+    let max_turns = config.heartbeat.max_task_turns;
+
+    // Increment turn count before running
+    let turn_count = match tasks::store::increment_turn_count(workspace, &task.id) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "Heartbeat: failed to increment turn_count for {}: {e}",
+                &task.id[..8.min(task.id.len())]
+            );
+            return true;
+        }
+    };
+
+    // Enforce turn budget (0 = unlimited = skip check)
+    if max_turns > 0 && turn_count > max_turns {
+        let actor = TaskActor {
+            channel: "heartbeat".to_string(),
+            id: Some("heartbeat".to_string()),
+        };
+        let reason = "turn budget exhausted";
+        tracing::info!(
+            "Heartbeat: task {} blocked — {} (turn {}/{})",
+            &task.id[..8.min(task.id.len())],
+            reason,
+            turn_count,
+            max_turns,
+        );
+        crate::health::mark_component_error(
+            "heartbeat",
+            format!("task {} turn budget exhausted", &task.id[..8.min(task.id.len())]),
+        );
+        let _ = tasks::store::block_task(workspace, &task.id, &actor, reason, audit);
+        emit_notify_on_block(config, &task.id, delivery).await;
+        return false; // Not an error per se — budget enforcement is expected
+    }
 
     let intent = task.intent.as_deref().unwrap_or(&task.title);
     let prompt = format!(
@@ -645,7 +693,7 @@ async fn execute_task_turn(
         agent_fut.await
     };
 
-    match result {
+    let had_error = match result {
         Ok(_output) => {
             crate::health::mark_component_ok("heartbeat");
             // No auto-submit — only the agent's task_submit tool moves to review.
@@ -664,6 +712,32 @@ async fn execute_task_turn(
             );
             true
         }
+    };
+
+    // After the turn, re-read the task. If it's now Blocked, emit notify_on_block.
+    if let Ok(updated) = tasks::store::get_task(workspace, &task.id) {
+        if updated.status == TaskStatus::Blocked {
+            emit_notify_on_block(config, &task.id, delivery).await;
+        }
+    }
+
+    had_error
+}
+
+/// Emit a single channel notification when a task becomes blocked.
+/// This is the ONLY permitted channel emission from the task execution path.
+async fn emit_notify_on_block(
+    config: &Config,
+    task_id: &str,
+    delivery: &Option<(String, String)>,
+) {
+    if !config.heartbeat.notify_on_block {
+        return;
+    }
+    if let Some((channel, target)) = delivery {
+        let short_id = &task_id[..8.min(task_id.len())];
+        let msg = format!("\u{26a0} task {short_id} blocked");
+        let _ = crate::cron::scheduler::deliver_announcement(config, channel, target, &msg).await;
     }
 }
 

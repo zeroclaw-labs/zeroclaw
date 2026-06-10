@@ -6429,9 +6429,19 @@ pub struct HeartbeatConfig {
     #[serde(default = "default_heartbeat_task_timeout")]
     pub task_timeout_secs: u64,
     /// Controls whether the heartbeat autonomously picks up tasks from
-    /// `tasks.db`. Default: `none` (legacy HEARTBEAT.md path only).
+    /// `tasks.db`. Default: `none`.
     #[serde(default)]
     pub autonomous_pickup: AutonomousPickup,
+    /// Maximum number of agent turns allowed per task before the task is
+    /// automatically blocked with "turn budget exhausted". Default: `10`.
+    /// `0` disables the limit.
+    #[serde(default = "default_max_task_turns")]
+    pub max_task_turns: u32,
+    /// Emit a channel notification when a task becomes blocked (either by
+    /// the agent calling `task_block` or by turn budget exhaustion).
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub notify_on_block: bool,
 }
 
 fn default_heartbeat_interval() -> u32 {
@@ -6458,6 +6468,10 @@ fn default_heartbeat_task_timeout() -> u64 {
     600
 }
 
+fn default_max_task_turns() -> u32 {
+    10
+}
+
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
@@ -6477,6 +6491,8 @@ impl Default for HeartbeatConfig {
             load_session_context: false,
             task_timeout_secs: default_heartbeat_task_timeout(),
             autonomous_pickup: AutonomousPickup::None,
+            max_task_turns: default_max_task_turns(),
+            notify_on_block: true,
         }
     }
 }
