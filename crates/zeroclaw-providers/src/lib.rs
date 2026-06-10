@@ -9,7 +9,7 @@
 //!
 //! Each model_provider call goes through the [`ReliableModelProvider`] wrapper, which adds
 //! automatic retry with exponential backoff and API-key rotation on rate limits.
-//! Model routing across multiple model_providers is available via [`create_routed_model_provider`].
+//! Model routing across multiple model_providers is available via [`create_routed_model_provider_with_options`].
 //!
 //! # Extension
 //!
@@ -28,6 +28,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
@@ -1082,6 +1083,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "ai21-labs" => "ai21",
         "friendliai" => "friendli",
         "lepton-ai" => "lepton",
+        "lambda-ai" => "lambda_ai",
+        "github-models" => "github_models",
         "step" => "stepfun",
         "kilo" => "kilocli",
         // Moonshot / Kimi (regional + code variants fold to one family).
@@ -1323,15 +1326,161 @@ pub fn create_resilient_model_provider_for_alias(
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
+    let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
+    push_pinned_entries(
+        &mut model_providers,
+        config,
+        family,
+        alias,
+        primary_model_provider,
+    );
+
+    let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
+    if let Some(entry) = config.providers.models.find(family, alias) {
+        append_fallback_chain(
+            &mut model_providers,
+            config,
+            &entry.fallback,
+            &mut visited,
+            1,
+        );
+    }
+
     let reliable = ReliableModelProvider::new(
         alias,
-        vec![(family.to_string(), primary_model_provider)],
+        model_providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone());
 
     Ok(Box::new(reliable))
+}
+
+/// Wrap a freshly-built provider in one model-pinned entry per model the alias
+/// serves — its primary `model` first, then each `fallback_models` entry in
+/// order — so the resilient loop tries every model on this provider before the
+/// next alias. When the alias has no configured model, a single unpinned entry
+/// is pushed and the requested model flows through unchanged.
+fn push_pinned_entries(
+    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    built: Box<dyn ModelProvider>,
+) {
+    let entry = config.providers.models.find(family, alias);
+    let primary_model = entry.and_then(|e| e.model.as_deref());
+    let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
+
+    let Some(primary_model) = primary_model else {
+        out.push((family.to_string(), built));
+        return;
+    };
+
+    let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
+    out.push((
+        family.to_string(),
+        Box::new(crate::model_pin::ModelPinnedProvider::new(
+            alias,
+            primary_model,
+            Box::new(std::sync::Arc::clone(&built)),
+        )),
+    ));
+    for model in extra_models {
+        if model.trim().is_empty() || model == primary_model {
+            continue;
+        }
+        out.push((
+            family.to_string(),
+            Box::new(crate::model_pin::ModelPinnedProvider::new(
+                alias,
+                model,
+                Box::new(std::sync::Arc::clone(&built)),
+            )),
+        ));
+    }
+}
+
+/// Depth-first walk of an alias's `fallback` refs. Each resolvable target is
+/// built with its OWN credentials/endpoint/model and appended (model-pinned)
+/// before descending into its own `fallback`. Dangling refs, cycles, and chains
+/// deeper than `MAX_FALLBACK_DEPTH` are skipped — `Config::collect_warnings`
+/// already surfaces all three to operators.
+fn append_fallback_chain(
+    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    config: &zeroclaw_config::schema::Config,
+    refs: &[zeroclaw_config::providers::ModelProviderRef],
+    visited: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
+                })),
+            "fallback chain exceeds max depth; pruning"
+        );
+        return;
+    }
+    for fallback_ref in refs {
+        let raw = fallback_ref.as_str().trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Some((family, alias, entry)) = config.providers.models.find_by_name(raw) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"fallback": raw})),
+                "fallback ref does not resolve; skipping"
+            );
+            continue;
+        };
+        let resolved = format!("{family}.{alias}");
+        if visited.iter().any(|v| v == &resolved) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"fallback": resolved})),
+                "fallback ref closes a cycle; pruning"
+            );
+            continue;
+        }
+
+        let opts = provider_runtime_options_for_alias(config, family, &alias);
+        match create_model_provider_inner(
+            Some(config),
+            family,
+            &alias,
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
+            &opts,
+        ) {
+            Ok(built) => push_pinned_entries(out, config, family, &alias, built),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"fallback": resolved, "error": format!("{e}")})
+                        ),
+                    "fallback provider failed to build; skipping"
+                );
+                continue;
+            }
+        }
+
+        visited.push(resolved.clone());
+        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1);
+        visited.pop();
+    }
 }
 
 /// Build a resilient model provider from a name that may be either a bare
@@ -1505,15 +1654,18 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
     use factory::CompatFamilySpec;
     use zeroclaw_config::schema::{
         Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
-        AstraiModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
-        CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
-        DeepinfraModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-        FireworksModelProviderConfig, FriendliModelProviderConfig, HuggingfaceModelProviderConfig,
-        HyperbolicModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-        MistralModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
-        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
+        ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
+        BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
+        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
+        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
+        HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
+        InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
+        NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+        OpencodeModelProviderConfig, PerplexityModelProviderConfig, RekaModelProviderConfig,
+        SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+        SyntheticModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
         VercelModelProviderConfig, VllmModelProviderConfig, YiModelProviderConfig,
     };
 
@@ -1555,6 +1707,13 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "nebius" => Some(<NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "friendli" => Some(<FriendliModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "lepton" => Some(<LeptonModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "morph" => Some(<MorphModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "github_models" => Some(<GithubModelsModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "upstage" => Some(<UpstageModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "featherless" => Some(<FeatherlessModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -1876,6 +2035,42 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
         ModelProviderInfo {
             name: "avian",
             display_name: "Avian",
+            local: false,
+        },
+        // ── OpenAI-compatible aggregators & inference hosts ────
+        ModelProviderInfo {
+            name: "morph",
+            display_name: "Morph (Fast Apply)",
+            local: false,
+        },
+        ModelProviderInfo {
+            name: "github_models",
+            display_name: "GitHub Models",
+            local: false,
+        },
+        ModelProviderInfo {
+            name: "upstage",
+            display_name: "Upstage Solar",
+            local: false,
+        },
+        ModelProviderInfo {
+            name: "featherless",
+            display_name: "Featherless AI",
+            local: false,
+        },
+        ModelProviderInfo {
+            name: "arcee",
+            display_name: "Arcee AI",
+            local: false,
+        },
+        ModelProviderInfo {
+            name: "lambda_ai",
+            display_name: "Lambda AI",
+            local: false,
+        },
+        ModelProviderInfo {
+            name: "inception",
+            display_name: "Inception Labs (Mercury)",
             local: false,
         },
     ]
@@ -2664,6 +2859,80 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_deepmyst_env_deleted() {}
+
+    // ── OpenAI-compatible aggregators & inference hosts ──────
+
+    #[test]
+    fn factory_morph() {
+        assert!(create_model_provider("morph", Some("sk-morph-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_github_models() {
+        assert!(create_model_provider("github_models", Some("ghp_test_token")).is_ok());
+        // Hyphenated form canonicalizes to the underscore slot.
+        assert!(create_model_provider("github-models", Some("ghp_test_token")).is_ok());
+    }
+
+    #[test]
+    fn factory_upstage() {
+        assert!(create_model_provider("upstage", Some("up-test-key")).is_ok());
+    }
+
+    #[test]
+    fn factory_featherless() {
+        assert!(create_model_provider("featherless", Some("featherless-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_arcee() {
+        assert!(create_model_provider("arcee", Some("arcee-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_lambda_ai() {
+        assert!(create_model_provider("lambda_ai", Some("lambda-test")).is_ok());
+        // Hyphenated form canonicalizes to the underscore slot.
+        assert!(create_model_provider("lambda-ai", Some("lambda-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_inception() {
+        assert!(create_model_provider("inception", Some("inception-test")).is_ok());
+    }
+
+    #[test]
+    fn default_url_matches_compat_spec_for_new_providers() {
+        assert_eq!(
+            default_model_provider_url("morph"),
+            Some("https://api.morphllm.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("github_models"),
+            Some("https://models.github.ai/inference")
+        );
+        assert_eq!(
+            default_model_provider_url("upstage"),
+            Some("https://api.upstage.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("featherless"),
+            Some("https://api.featherless.ai/v1")
+        );
+        // Arcee publishes at the non-standard `/api/v1` path.
+        assert_eq!(
+            default_model_provider_url("arcee"),
+            Some("https://api.arcee.ai/api/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("lambda_ai"),
+            Some("https://api.lambda.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("inception"),
+            Some("https://api.inceptionlabs.ai/v1")
+        );
+    }
 
     // ── Custom / BYOP model model_provider ─────────────────────────
     //
@@ -3491,6 +3760,171 @@ mod tests {
             result.unwrap().capabilities().native_tool_calling,
             "openai.{arbitrary_alias} with requires_openai_auth=true must route to \
              OpenAiCodexModelProvider (native_tool_calling=true), not the standard provider"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_builds_with_fallback_chain() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    fallback_models: vec!["gpt-4o-mini".to_string()],
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            None,
+            None,
+            &reliability,
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "multi-alias fallback chain must build: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn resilient_alias_dangling_fallback_does_not_abort_build() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.ghost",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "a dangling fallback ref must be skipped, never abort the build"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_cyclic_fallback_does_not_loop_or_abort() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "a".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.b",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "b".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.a",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "a",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "a fallback cycle must be pruned, never loop or abort the build"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_deep_acyclic_fallback_does_not_overflow() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        let n = zeroclaw_config::providers::MAX_FALLBACK_DEPTH + 50;
+        for i in 0..n {
+            let fallback = if i + 1 < n {
+                vec![zeroclaw_config::providers::ModelProviderRef::new(format!(
+                    "openai.a{}",
+                    i + 1
+                ))]
+            } else {
+                vec![]
+            };
+            config.providers.models.openai.insert(
+                format!("a{i}"),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("gpt-4o".to_string()),
+                        fallback,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "a0",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
 }
