@@ -21,22 +21,19 @@ ZeroClaw enables microcontrollers (MCUs) and Single Board Computers (SBCs) to **
 
 ZeroClaw runs **directly on the device**. The board spins up a gRPC/nanoRPC server and communicates with peripherals locally.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  ZeroClaw on ESP32 / Raspberry Pi (Edge-Native)                             │
-│                                                                             │
-│  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────────────┐ │
-│  │ Channels    │───►│ Agent Loop   │───►│ RAG: datasheets, register maps  │ │
-│  │ WhatsApp    │    │ (LLM calls)  │    │ → LLM context                    │ │
-│  │ Telegram    │    └──────┬───────┘    └─────────────────────────────────┘ │
-│  └─────────────┘           │                                                 │
-│                            ▼                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ Code synthesis → Wasm / dynamic exec → GPIO / I2C / SPI → persist       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                             │
-│  gRPC/nanoRPC server ◄──► Peripherals (GPIO, I2C, SPI, sensors, actuators)  │
-└─────────────────────────────────────────────────────────────────────────────┘
+```text
+ZeroClaw on ESP32 / Raspberry Pi (Edge-Native)
+
+  Channels (WhatsApp, Telegram)
+        │
+        ▼
+  Agent Loop (LLM calls) ──► RAG: datasheets, register maps ──► LLM context
+        │
+        ▼
+  Code synthesis ──► Wasm / dynamic exec ──► GPIO / I2C / SPI ──► persist
+        │
+        ▼
+  gRPC/nanoRPC server ◄──► Peripherals (GPIO, I2C, SPI, sensors, actuators)
 ```
 
 **Workflow:**
@@ -55,15 +52,15 @@ ZeroClaw runs **directly on the device**. The board spins up a gRPC/nanoRPC serv
 
 ZeroClaw runs on the **host** and maintains a hardware-aware link to the target. Used for development, introspection, and flashing.
 
-```
-┌─────────────────────┐                    ┌──────────────────────────────────┐
-│  ZeroClaw on Mac    │   USB / J-Link /   │  STM32 Nucleo-F401RE              │
-│                     │   Aardvark         │  (or other MCU)                    │
-│  - Channels         │ ◄────────────────► │  - Memory map                     │
-│  - LLM              │                    │  - Peripherals (GPIO, ADC, I2C)    │
-│  - Hardware probe   │   VID/PID          │  - Flash / RAM                     │
-│  - Flash / debug    │   discovery        │                                    │
-└─────────────────────┘                    └──────────────────────────────────┘
+```text
+  ZeroClaw on Mac (host)              STM32 Nucleo-F401RE (or other MCU)
+  ─────────────────────              ──────────────────────────────────
+  - Channels                         - Memory map
+  - LLM                              - Peripherals (GPIO, ADC, I2C)
+  - Hardware probe        ◄────────► - Flash / RAM
+  - Flash / debug
+                       USB / J-Link / Aardvark
+                       VID/PID discovery
 ```
 
 **Workflow:**

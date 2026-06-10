@@ -10,18 +10,18 @@ A plain-language walkthrough of every piece and how they connect.
 ┌──────────────────────────────────────────────────────────────┐
 │                        STARTUP (boot)                        │
 │                                                              │
-│  1. Ask aardvark-sys: "any adapters plugged in?"            │
+│  1. Ask aardvark-sys: "any adapters plugged in?"             │
 │  2. For each one found → register a device + transport       │
 │  3. Load tools only if hardware was found                    │
 └──────────────────────────────────────────┬───────────────────┘
                                            │
-                    ┌──────────────────────▼──────────────────────┐
+                    ┌──────────────────────▼───────────────────────┐
                     │              RUNTIME (agent loop)            │
                     │                                              │
                     │  User: "scan i2c bus"                        │
                     │     → agent calls i2c_scan tool              │
                     │     → tool builds a ZcCommand                │
-                    │     → AardvarkTransport sends to hardware     │
+                    │     → AardvarkTransport sends to hardware    │
                     │     → response flows back as text            │
                     └──────────────────────────────────────────────┘
 ```
