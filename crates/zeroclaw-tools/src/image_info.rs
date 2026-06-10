@@ -25,6 +25,28 @@ impl ImageInfoTool {
         Self { security }
     }
 
+    /// Strip the Windows verbatim (`\\?\`) prefix that `canonicalize` prepends
+    /// on Windows, so the emitted `[IMAGE:]` marker carries a plain
+    /// drive-letter path (`C:\…`) instead of `\\?\C:\…`.
+    ///
+    /// This matters because the multimodal pipeline's path detector
+    /// (`zeroclaw-providers::multimodal::is_windows_path`) only recognizes
+    /// paths beginning with a drive letter; the leading backslashes of the
+    /// verbatim form make it reject the marker, so the image would never be
+    /// inlined for vision-capable models. The verbatim UNC form
+    /// (`\\?\UNC\server\share\…`) is unwrapped back to its `\\server\share\…`
+    /// spelling. Inputs without a verbatim prefix (e.g. all POSIX paths) are
+    /// returned unchanged and without allocating.
+    fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            std::borrow::Cow::Owned(format!(r"\\{rest}"))
+        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+            std::borrow::Cow::Borrowed(rest)
+        } else {
+            std::borrow::Cow::Borrowed(path)
+        }
+    }
+
     /// Detect image format from first few bytes (magic numbers).
     fn detect_format(bytes: &[u8]) -> &'static str {
         if bytes.len() < 4 {
@@ -241,10 +263,16 @@ impl Tool for ImageInfoTool {
         // Referencing the path only inside the marker also avoids emitting a
         // second bare path that the promoter would wrap into a duplicate
         // marker. See issue #7436.
-        let mut output = format!(
-            "File: [IMAGE:{}]\nFormat: {format}\nSize: {file_size} bytes",
-            resolved_path.display()
-        );
+        //
+        // On Windows `canonicalize` returns a verbatim path (`\\?\C:\…`); we
+        // strip that prefix so the marker carries a plain `C:\…` path the
+        // multimodal pipeline's `is_windows_path` detector accepts. Otherwise
+        // the leading backslashes make it drop the marker and the image never
+        // reaches the vision model. See #7436 (Windows follow-up to #7446).
+        let resolved_display = resolved_path.display().to_string();
+        let marker_path = Self::strip_windows_verbatim_prefix(&resolved_display);
+        let mut output =
+            format!("File: [IMAGE:{marker_path}]\nFormat: {format}\nSize: {file_size} bytes");
 
         if let Some((w, h)) = dimensions {
             let _ = write!(output, "\nDimensions: {w}x{h}");
@@ -355,6 +383,44 @@ mod tests {
         let spec = tool.spec();
         assert_eq!(spec.name, "image_info");
         assert!(spec.parameters.is_object());
+    }
+
+    // ── Windows verbatim-prefix stripping ───────────────────────
+
+    #[test]
+    fn strip_verbatim_disk_prefix() {
+        // `canonicalize` on Windows yields `\\?\C:\…`; the marker must carry
+        // the plain drive-letter path so `is_windows_path` accepts it.
+        assert_eq!(
+            ImageInfoTool::strip_windows_verbatim_prefix(r"\\?\C:\Users\me\Downloads\a.png"),
+            r"C:\Users\me\Downloads\a.png"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_unc_prefix() {
+        // Verbatim UNC unwraps back to the `\\server\share\…` spelling.
+        assert_eq!(
+            ImageInfoTool::strip_windows_verbatim_prefix(r"\\?\UNC\server\share\pic.png"),
+            r"\\server\share\pic.png"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_leaves_plain_paths_unchanged() {
+        // POSIX paths and already-plain Windows paths must pass through
+        // untouched (and without allocating).
+        for input in [
+            "/home/me/pictures/a.png",
+            r"C:\Users\me\a.png",
+            "relative/a.png",
+        ] {
+            assert!(matches!(
+                ImageInfoTool::strip_windows_verbatim_prefix(input),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            assert_eq!(ImageInfoTool::strip_windows_verbatim_prefix(input), input);
+        }
     }
 
     // ── Format detection ────────────────────────────────────────
