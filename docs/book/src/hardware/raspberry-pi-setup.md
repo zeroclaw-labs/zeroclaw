@@ -79,11 +79,9 @@ uname -m
 
 If you already have a beefier machine, cross-compiling is faster than building on the Pi.
 
-### From macOS (Apple Silicon or Intel)
-
 <div class="os-tabs-src">
 
-#### sh
+#### macOS (Apple Silicon or Intel)
 
 ```sh
 # Install the cross-compilation target
@@ -102,15 +100,9 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 ```
 
-</div>
-
 > **Note:** earlier drafts of this guide suggested `aarch64-elf-gcc` from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc. It will not produce a working Raspberry Pi OS binary. Use the `messense/macos-cross-toolchains` tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).
 
-### From Linux x86_64
-
-<div class="os-tabs-src">
-
-#### sh
+#### Linux x86_64
 
 ```sh
 # Install cross-compilation toolchain
