@@ -333,21 +333,13 @@ where
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    use crate::heartbeat::engine::{
-        HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
-    };
+    use crate::heartbeat::engine::compute_adaptive_interval;
     use std::sync::Arc;
 
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer_with_workspace(&config.observability, &config.workspace_dir));
-    let engine = HeartbeatEngine::new(
-        config.heartbeat.clone(),
-        config.workspace_dir.clone(),
-        observer,
-    );
-    let metrics = engine.metrics();
+    let metrics = Arc::new(parking_lot::Mutex::new(
+        crate::heartbeat::engine::HeartbeatMetrics::default(),
+    ));
     let delivery = resolve_heartbeat_delivery(&config)?;
-    let two_phase = config.heartbeat.two_phase;
     let adaptive = config.heartbeat.adaptive;
     let autonomous_pickup = config.heartbeat.autonomous_pickup;
     let start_time = std::time::Instant::now();
@@ -414,321 +406,10 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         let tick_start = std::time::Instant::now();
 
-        // ── Task-pickup path (tasks.db) ──────────────────────────
-        if autonomous_pickup != daemonclaw_config::schema::AutonomousPickup::None {
-            let (tick_had_error, has_high_priority) =
-                run_task_pickup_tick(&config, autonomous_pickup, &delivery).await;
+        // ── All modes go through run_task_pickup_tick ────────────
+        let (tick_had_error, has_high_priority) =
+            run_task_pickup_tick(&config, autonomous_pickup, &delivery).await;
 
-            #[allow(clippy::cast_precision_loss)]
-            let tick_elapsed = tick_start.elapsed().as_millis() as f64;
-            {
-                let mut m = metrics.lock();
-                if tick_had_error {
-                    m.record_failure(tick_elapsed);
-                } else {
-                    m.record_success(tick_elapsed);
-                }
-            }
-            if adaptive {
-                let failures = metrics.lock().consecutive_failures;
-                sleep_mins = compute_adaptive_interval(
-                    base_interval,
-                    config.heartbeat.min_interval_minutes,
-                    config.heartbeat.max_interval_minutes,
-                    failures,
-                    has_high_priority,
-                );
-            } else {
-                sleep_mins = base_interval;
-            }
-            continue;
-        }
-
-        // ── Legacy HEARTBEAT.md path ─────────────────────────────
-
-        // Collect runnable tasks (active only, sorted by priority)
-        let mut tasks = engine.collect_runnable_tasks().await?;
-        let has_high_priority = tasks.iter().any(|t| t.priority == TaskPriority::High);
-
-        if tasks.is_empty() {
-            if let Some(fallback) = config
-                .heartbeat
-                .message
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-            {
-                tasks.push(HeartbeatTask {
-                    text: fallback.to_string(),
-                    priority: TaskPriority::Medium,
-                    status: TaskStatus::Active,
-                });
-            } else {
-                #[allow(clippy::cast_precision_loss)]
-                let elapsed = tick_start.elapsed().as_millis() as f64;
-                metrics.lock().record_success(elapsed);
-                continue;
-            }
-        }
-
-        // ── Phase 1: LLM decision (two-phase mode) ──────────────
-        let tasks_to_run = if two_phase {
-            let decision_prompt = format!(
-                "[Heartbeat Task | decision] {}",
-                HeartbeatEngine::build_decision_prompt(&tasks),
-            );
-            let phase1_fut = Box::pin(crate::agent::run(
-                config.clone(),
-                Some(decision_prompt),
-                None,
-                None,
-                0.0,
-                vec![],
-                false,
-                None,
-                None,
-                daemonclaw_api::agent::TurnSource::Cron,
-            ));
-            let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
-                match tokio::time::timeout(
-                    Duration::from_secs(config.heartbeat.task_timeout_secs),
-                    phase1_fut,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "Phase 1 decision timed out ({}s)",
-                        config.heartbeat.task_timeout_secs
-                    )),
-                }
-            } else {
-                phase1_fut.await
-            };
-            match phase1_result {
-                Ok(response) => {
-                    let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
-                    if indices.is_empty() {
-                        tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
-                        crate::health::mark_component_ok("heartbeat");
-                        #[allow(clippy::cast_precision_loss)]
-                        let elapsed = tick_start.elapsed().as_millis() as f64;
-                        metrics.lock().record_success(elapsed);
-                        continue;
-                    }
-                    tracing::info!(
-                        "💓 Heartbeat Phase 1: run {} of {} tasks",
-                        indices.len(),
-                        tasks.len()
-                    );
-                    indices
-                        .into_iter()
-                        .filter_map(|i| tasks.get(i).cloned())
-                        .collect()
-                }
-                Err(e) => {
-                    tracing::warn!("💓 Heartbeat Phase 1 failed, running all tasks: {e}");
-                    tasks
-                }
-            }
-        } else {
-            tasks
-        };
-
-        // ── Phase 2: Execute selected tasks ─────────────────────
-        // Re-read session context on every tick so we pick up messages
-        // that arrived since the daemon started.
-        let session_context = if config.heartbeat.load_session_context {
-            load_heartbeat_session_context(&config)
-        } else {
-            None
-        };
-
-        // Create memory once per tick for recall + consolidation.
-        let heartbeat_memory: Option<Box<dyn daemonclaw_memory::Memory>> =
-            daemonclaw_memory::create_memory(
-                &config.memory,
-                &config.workspace_dir,
-                daemonclaw_config::provider_store::get_fallback_provider()
-                    .as_ref()
-                    .and_then(|e| e.api_key.as_deref()),
-            )
-            .ok();
-
-        let mut tick_had_error = false;
-        for task in &tasks_to_run {
-            let task_start = std::time::Instant::now();
-            let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
-
-            // Recall relevant memories so heartbeat tasks have context awareness.
-            // Exclude `Conversation` memories to prevent chat context from
-            // leaking into scheduled executions (see #5415).
-            let memory_context = if let Some(ref mem) = heartbeat_memory {
-                match mem.recall(&task.text, 5, None, None, None).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        let ctx: String = entries
-                            .iter()
-                            .filter(|e| {
-                                !matches!(
-                                    e.category,
-                                    daemonclaw_memory::traits::MemoryCategory::Conversation
-                                )
-                            })
-                            .map(|e| format!("- {}: {}", e.key, e.content))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if ctx.is_empty() {
-                            None
-                        } else {
-                            Some(format!("[Memory context]\n{ctx}\n[/Memory context]\n\n"))
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let prompt = match (&session_context, &memory_context) {
-                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
-                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
-                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
-                (None, None) => task_prompt,
-            };
-            let temp = daemonclaw_config::provider_store::get_fallback_provider()
-                .as_ref()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7);
-            let phase2_fut = Box::pin(crate::agent::run(
-                config.clone(),
-                Some(prompt),
-                None,
-                None,
-                temp,
-                vec![],
-                false,
-                None,
-                None,
-                daemonclaw_api::agent::TurnSource::Cron,
-            ));
-            let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
-                match tokio::time::timeout(
-                    Duration::from_secs(config.heartbeat.task_timeout_secs),
-                    phase2_fut,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "Heartbeat task timed out ({}s)",
-                        config.heartbeat.task_timeout_secs
-                    )),
-                }
-            } else {
-                phase2_fut.await
-            };
-            match phase2_result {
-                Ok(output) => {
-                    crate::health::mark_component_ok("heartbeat");
-                    crate::health::touch_liveness(&config.workspace_dir);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let duration_ms = task_start.elapsed().as_millis() as i64;
-                    let now = chrono::Utc::now();
-                    let _ = crate::heartbeat::store::record_run(
-                        &config.workspace_dir,
-                        &task.text,
-                        &task.priority.to_string(),
-                        now - chrono::Duration::milliseconds(duration_ms),
-                        now,
-                        "ok",
-                        Some(output.as_str()),
-                        duration_ms,
-                        config.heartbeat.max_run_history,
-                    );
-                    // Consolidate heartbeat output to memory for cross-session awareness.
-                    if config.memory.auto_save
-                        && output.chars().count() >= 50
-                        && let Some(ref mem) = heartbeat_memory
-                    {
-                        let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
-                        let summary = if output.len() > 500 {
-                            // Find a valid UTF-8 char boundary at or before 500.
-                            let mut end = 500;
-                            while end > 0 && !output.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            &output[..end]
-                        } else {
-                            &output
-                        };
-                        let _ = mem
-                            .store(
-                                &key,
-                                &format!("Heartbeat task '{}': {}", task.text, summary),
-                                daemonclaw_memory::MemoryCategory::Daily,
-                                None,
-                            )
-                            .await;
-                    }
-
-                    let announcement = if output.trim().is_empty() {
-                        format!("💓 heartbeat task completed: {}", task.text)
-                    } else {
-                        output
-                    };
-                    if let Some((channel, target)) = &delivery {
-                        let delivery_result = tokio::time::timeout(
-                            Duration::from_secs(30),
-                            crate::cron::scheduler::deliver_announcement(
-                                &config,
-                                channel,
-                                target,
-                                &announcement,
-                            ),
-                        )
-                        .await;
-                        match delivery_result {
-                            Ok(Err(e)) => {
-                                crate::health::mark_component_error(
-                                    "heartbeat",
-                                    format!("delivery failed: {e}"),
-                                );
-                                tracing::warn!("Heartbeat delivery failed: {e}");
-                            }
-                            Err(_) => {
-                                crate::health::mark_component_error(
-                                    "heartbeat",
-                                    "delivery timed out (30s)".to_string(),
-                                );
-                                tracing::warn!("Heartbeat delivery timed out (30s)");
-                            }
-                            Ok(Ok(())) => {}
-                        }
-                    }
-                }
-                Err(e) => {
-                    tick_had_error = true;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let duration_ms = task_start.elapsed().as_millis() as i64;
-                    let now = chrono::Utc::now();
-                    let _ = crate::heartbeat::store::record_run(
-                        &config.workspace_dir,
-                        &task.text,
-                        &task.priority.to_string(),
-                        now - chrono::Duration::milliseconds(duration_ms),
-                        now,
-                        "error",
-                        Some(&e.to_string()),
-                        duration_ms,
-                        config.heartbeat.max_run_history,
-                    );
-                    crate::health::mark_component_error("heartbeat", e.to_string());
-                    tracing::warn!("Heartbeat task failed: {e}");
-                }
-            }
-        }
-
-        // Update metrics
         #[allow(clippy::cast_precision_loss)]
         let tick_elapsed = tick_start.elapsed().as_millis() as f64;
         {
@@ -739,8 +420,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 m.record_success(tick_elapsed);
             }
         }
-
-        // Compute next sleep interval
         if adaptive {
             let failures = metrics.lock().consecutive_failures;
             sleep_mins = compute_adaptive_interval(
@@ -757,76 +436,74 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 /// Run one task-pickup tick: query tasks.db for open tasks eligible for autonomous
-/// execution, claim via CAS, execute under task binding, and record results.
+/// execution, claim via CAS, execute under task binding.
+///
+/// - `none`: silent recon — query tasks, log at debug, claim nothing, no LLM calls.
+/// - `assisted`: claims and works tasks with `autonomy == Assisted` or `Auto`.
+/// - `full`: claims and works tasks with `autonomy == Auto` only.
+///
+/// Gated tasks (`autonomy == Gated`) are never auto-claimed by any mode.
+/// Deterministic tasks (`execution == Deterministic`) are skipped (no runner until G1).
+///
+/// No channel output except `notify_on_block` (added in Phase 4).
+/// No auto-submit — only the agent's `task_submit` tool moves a task to review.
 ///
 /// Returns `(had_error, has_high_priority)` for adaptive interval computation.
 async fn run_task_pickup_tick(
     config: &Config,
     pickup: daemonclaw_config::schema::AutonomousPickup,
-    delivery: &Option<(String, String)>,
+    _delivery: &Option<(String, String)>,
 ) -> (bool, bool) {
-    use crate::tasks::{self, Autonomy, TaskActor, TaskBinding, TaskStatus};
+    use crate::tasks::{self, Autonomy, Execution, TaskActor, TaskBinding, TaskStatus};
 
     let workspace = &config.workspace_dir;
 
-    // ── Deterministic recon: find open tasks eligible for pickup ──
+    // Touch liveness at tick start
+    crate::health::touch_liveness(workspace);
+
+    // ── Recon: find open tasks ──────────────────────────────────
     let open_tasks = match tasks::store::list_tasks(workspace, Some(TaskStatus::Open), 50) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("💓 Heartbeat task-pickup: failed to list tasks: {e}");
+            tracing::warn!("Heartbeat task-pickup: failed to list tasks: {e}");
             return (true, false);
         }
     };
 
+    let open_count = open_tasks.len();
+
+    // Filter: skip deterministic tasks (no runner until G1).
+    // Filter: gated tasks are never auto-claimed.
     let eligible: Vec<_> = open_tasks
         .into_iter()
+        .filter(|t| t.execution != Execution::Deterministic)
         .filter(|t| match pickup {
             daemonclaw_config::schema::AutonomousPickup::Full => t.autonomy == Autonomy::Auto,
             daemonclaw_config::schema::AutonomousPickup::Assisted => {
                 t.autonomy == Autonomy::Auto || t.autonomy == Autonomy::Assisted
             }
+            // none mode: recon only — nothing is eligible for claiming
             daemonclaw_config::schema::AutonomousPickup::None => false,
         })
         .collect();
 
-    if eligible.is_empty() {
-        tracing::debug!("💓 Heartbeat task-pickup: no eligible tasks");
-        return (false, false);
-    }
-
     let has_high_priority = eligible.iter().any(|t| t.priority >= 3);
 
-    // ── Assisted mode: report and return (operator acts later) ──
-    if pickup == daemonclaw_config::schema::AutonomousPickup::Assisted {
-        let report: Vec<String> = eligible
-            .iter()
-            .take(15)
-            .map(|t| {
-                format!(
-                    "  P{} {} — {}",
-                    t.priority,
-                    &t.id[..8.min(t.id.len())],
-                    t.title
-                )
-            })
-            .collect();
-        let msg = format!(
-            "💓 Heartbeat found {} open task(s) awaiting pickup:\n{}",
-            eligible.len(),
-            report.join("\n"),
+    // ── None mode: silent recon, no LLM, no claims ──────────────
+    if pickup == daemonclaw_config::schema::AutonomousPickup::None {
+        tracing::debug!(
+            "Heartbeat recon: {} open tasks (none mode — no claims)",
+            open_count,
         );
-        tracing::info!("{msg}");
-        if let Some((channel, target)) = delivery {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(30),
-                crate::cron::scheduler::deliver_announcement(config, channel, target, &msg),
-            )
-            .await;
-        }
         return (false, has_high_priority);
     }
 
-    // ── Full mode: claim → execute → submit ──
+    if eligible.is_empty() {
+        tracing::debug!("Heartbeat task-pickup: no eligible tasks");
+        return (false, false);
+    }
+
+    // ── Assisted / Full mode: claim and execute ─────────────────
     let actor = TaskActor {
         channel: "heartbeat".to_string(),
         id: Some("heartbeat".to_string()),
@@ -837,7 +514,7 @@ async fn run_task_pickup_tick(
     ) {
         Ok(a) => a,
         Err(e) => {
-            tracing::warn!("💓 Heartbeat task-pickup: failed to create audit logger: {e}");
+            tracing::warn!("Heartbeat task-pickup: failed to create audit logger: {e}");
             return (true, has_high_priority);
         }
     };
@@ -845,27 +522,25 @@ async fn run_task_pickup_tick(
     let mut had_error = false;
 
     for task in &eligible {
-        let task_start = std::time::Instant::now();
-
         // Claim via CAS — another agent may race us
         let claimed = match tasks::store::claim_task(workspace, &task.id, &actor, &audit) {
             Ok(t) => t,
             Err(tasks::TaskError::ClaimConflict { .. }) => {
                 tracing::debug!(
-                    "💓 Heartbeat: task {} claimed by another agent, skipping",
+                    "Heartbeat: task {} claimed by another agent, skipping",
                     &task.id[..8.min(task.id.len())]
                 );
                 continue;
             }
             Err(e) => {
-                tracing::warn!("💓 Heartbeat: failed to claim task {}: {e}", &task.id[..8.min(task.id.len())]);
+                tracing::warn!("Heartbeat: failed to claim task {}: {e}", &task.id[..8.min(task.id.len())]);
                 had_error = true;
                 continue;
             }
         };
 
         tracing::info!(
-            "💓 Heartbeat claimed task {} (P{} {})",
+            "Heartbeat claimed task {} (P{} {})",
             &claimed.id[..8.min(claimed.id.len())],
             claimed.priority,
             claimed.title,
@@ -923,66 +598,19 @@ async fn run_task_pickup_tick(
             agent_fut.await
         };
 
-        #[allow(clippy::cast_possible_truncation)]
-        let duration_ms = task_start.elapsed().as_millis() as i64;
-        let now = chrono::Utc::now();
-
         match result {
-            Ok(output) => {
+            Ok(_output) => {
                 crate::health::mark_component_ok("heartbeat");
-                crate::health::touch_liveness(&config.workspace_dir);
-
-                // Record to heartbeat history
-                let _ = crate::heartbeat::store::record_run(
-                    workspace,
-                    &claimed.title,
-                    &claimed.priority.to_string(),
-                    now - chrono::Duration::milliseconds(duration_ms),
-                    now,
-                    "ok",
-                    Some(output.as_str()),
-                    duration_ms,
-                    config.heartbeat.max_run_history,
-                );
-
-                // Submit for review
-                let _ = tasks::store::submit_task(workspace, &claimed.id, &actor, &audit);
-
-                // Deliver result
-                let announcement = if output.trim().is_empty() {
-                    format!("💓 task {} completed: {}", &claimed.id[..8.min(claimed.id.len())], claimed.title)
-                } else {
-                    output
-                };
-                if let Some((channel, target)) = delivery {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(30),
-                        crate::cron::scheduler::deliver_announcement(
-                            config, channel, target, &announcement,
-                        ),
-                    )
-                    .await;
-                }
+                // No auto-submit — only the agent's task_submit tool moves to review.
+                // No channel delivery — zero channel output on task path.
+                // Task stays active until agent calls task_submit or task_block.
             }
             Err(e) => {
                 had_error = true;
                 tracing::warn!(
-                    "💓 Heartbeat: task {} failed: {e}",
+                    "Heartbeat: task {} failed: {e}",
                     &claimed.id[..8.min(claimed.id.len())]
                 );
-
-                let _ = crate::heartbeat::store::record_run(
-                    workspace,
-                    &claimed.title,
-                    &claimed.priority.to_string(),
-                    now - chrono::Duration::milliseconds(duration_ms),
-                    now,
-                    "error",
-                    Some(&e.to_string()),
-                    duration_ms,
-                    config.heartbeat.max_run_history,
-                );
-
                 crate::health::mark_component_error(
                     "heartbeat",
                     format!("task {} failed: {e}", &claimed.id[..8.min(claimed.id.len())]),
@@ -1021,186 +649,6 @@ fn resolve_heartbeat_delivery(config: &Config) -> Result<Option<(String, String)
         // Neither set — try auto-detect the first configured channel.
         (None, None) => Ok(auto_detect_heartbeat_channel(config)),
     }
-}
-
-/// Load recent conversation history for the heartbeat's delivery target and
-/// format it as a text preamble to inject into the task prompt.
-///
-/// Scans `{workspace}/sessions/` for JSONL files whose name starts with
-/// `{channel}_` and ends with `_{to}.jsonl` (or exactly `{channel}_{to}.jsonl`),
-/// then picks the most recently modified match. This handles session key
-/// formats such as `telegram_diskiller.jsonl` and
-/// `telegram_5673725398_diskiller.jsonl`.
-/// Returns `None` when `target`/`to` are not configured or no session exists.
-const HEARTBEAT_SESSION_CONTEXT_MESSAGES: usize = 20;
-
-fn load_heartbeat_session_context(config: &Config) -> Option<String> {
-    use daemonclaw_providers::traits::ChatMessage;
-
-    let channel = config
-        .heartbeat
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())?;
-    let to = config
-        .heartbeat
-        .to
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())?;
-
-    if channel.contains('/') || channel.contains('\\') || to.contains('/') || to.contains('\\') {
-        tracing::warn!("heartbeat session context: channel/to contains path separators, skipping");
-        return None;
-    }
-
-    let sessions_dir = config.workspace_dir.join("sessions");
-
-    // Find the most recently modified JSONL file that belongs to this target.
-    // Matches both `{channel}_{to}.jsonl` and `{channel}_{anything}_{to}.jsonl`.
-    let prefix = format!("{channel}_");
-    let suffix = format!("_{to}.jsonl");
-    let exact = format!("{channel}_{to}.jsonl");
-    let mid_prefix = format!("{channel}_{to}_");
-
-    let path = std::fs::read_dir(&sessions_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".jsonl")
-                && (name == exact
-                    || (name.starts_with(&prefix) && name.ends_with(&suffix))
-                    || name.starts_with(&mid_prefix))
-        })
-        .max_by_key(|e| {
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        })
-        .map(|e| e.path())?;
-
-    if !path.exists() {
-        tracing::debug!("💓 Heartbeat session context: no session file found for {channel}/{to}");
-        return None;
-    }
-
-    let messages = load_jsonl_messages(&path);
-    if messages.is_empty() {
-        return None;
-    }
-
-    let recent: Vec<&ChatMessage> = messages
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .rev()
-        .take(HEARTBEAT_SESSION_CONTEXT_MESSAGES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-
-    // Only inject context if there is at least one real user message in the
-    // window. If the JSONL contains only assistant messages (e.g. previous
-    // heartbeat outputs with no reply yet), skip context to avoid feeding
-    // Monika's own messages back to her in a loop.
-    let has_user_message = recent.iter().any(|m| m.role == "user");
-    if !has_user_message {
-        tracing::debug!(
-            "💓 Heartbeat session context: no user messages in recent history — skipping"
-        );
-        return None;
-    }
-
-    // Use the session file's mtime as a proxy for when the last message arrived.
-    let last_message_age = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|mtime| mtime.elapsed().ok());
-
-    let silence_note = match last_message_age {
-        Some(age) => {
-            let mins = age.as_secs() / 60;
-            if mins < 60 {
-                format!("(last message ~{mins} minutes ago)\n")
-            } else {
-                let hours = mins / 60;
-                let rem = mins % 60;
-                if rem == 0 {
-                    format!("(last message ~{hours}h ago)\n")
-                } else {
-                    format!("(last message ~{hours}h {rem}m ago)\n")
-                }
-            }
-        }
-        None => String::new(),
-    };
-
-    tracing::debug!(
-        "💓 Heartbeat session context: {} messages from {}, silence: {}",
-        recent.len(),
-        path.display(),
-        silence_note.trim(),
-    );
-
-    let mut ctx = format!(
-        "[Recent conversation history — use this for context when composing your message] {silence_note}",
-    );
-    for msg in &recent {
-        let label = if msg.role == "user" { "User" } else { "You" };
-        // Truncate very long messages to avoid bloating the prompt.
-        // Use char_indices to avoid panicking on multi-byte UTF-8 characters.
-        let content = if msg.content.len() > 500 {
-            let truncate_at = msg
-                .content
-                .char_indices()
-                .map(|(i, _)| i)
-                .take_while(|&i| i <= 500)
-                .last()
-                .unwrap_or(0);
-            format!("{}…", &msg.content[..truncate_at])
-        } else {
-            msg.content.clone()
-        };
-        ctx.push_str(label);
-        ctx.push_str(": ");
-        ctx.push_str(&content);
-        ctx.push('\n');
-    }
-
-    Some(ctx)
-}
-
-/// Read the last `HEARTBEAT_SESSION_CONTEXT_MESSAGES` `ChatMessage` lines from
-/// a JSONL session file using a bounded rolling window so we never hold the
-/// entire file in memory.
-fn load_jsonl_messages(path: &std::path::Path) -> Vec<daemonclaw_providers::traits::ChatMessage> {
-    use std::collections::VecDeque;
-    use std::io::BufRead;
-
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let reader = std::io::BufReader::new(file);
-    let mut window: VecDeque<daemonclaw_providers::traits::ChatMessage> =
-        VecDeque::with_capacity(HEARTBEAT_SESSION_CONTEXT_MESSAGES + 1);
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<daemonclaw_providers::traits::ChatMessage>(trimmed) {
-            window.push_back(msg);
-            if window.len() > HEARTBEAT_SESSION_CONTEXT_MESSAGES {
-                window.pop_front();
-            }
-        }
-    }
-    window.into_iter().collect()
 }
 
 /// Auto-detect the best channel for heartbeat delivery by checking which
