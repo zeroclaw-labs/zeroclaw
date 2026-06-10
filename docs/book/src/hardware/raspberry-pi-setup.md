@@ -2,25 +2,11 @@
 
 This guide covers installing and running ZeroClaw on Raspberry Pi.
 
-The runtime is small enough to run comfortably on a Pi. Build-time is a
-different story: Rust's compiler and linker need substantially more RAM than the
-resulting binary, so the on-device build path needs swap and a tuned profile to
-avoid OOM-kills during link.
-
-For most Pi users, the **pre-built binary is the path of least resistance**.
+The runtime is small enough to run comfortably on any Pi. The only constraint is **building from source on the device**: Rust's linker is memory-hungry (fat LTO can OOM a low-RAM board), so the on-device build path needs swap and a lighter profile. Most users should take the **pre-built binary** and skip all of that.
 
 ## Hardware Compatibility
 
-Any Pi that can run a 64-bit (`aarch64`) or 32-bit (`armv7`) Raspberry Pi OS can
-run the **pre-built binary**: there is no meaningful memory floor for the
-runtime. The constraint is **building from source on the device**: the linker is
-memory-hungry, so lower-RAM boards need swap and a lighter build profile (see
-[Option 3](#option-3-build-on-the-pi)). Cross-compiling from a larger machine
-([Option 2](#option-2-cross-compile-from-another-machine)) sidesteps the
-on-device memory pressure entirely.
-
-The prebuilt Pi binaries come from these release targets (64-bit `aarch64` for
-64-bit Raspberry Pi OS, 32-bit `armv7`/`arm` for 32-bit OS):
+Any Pi that can run a 64-bit (`aarch64`) or 32-bit (`armv7`) Raspberry Pi OS runs the pre-built binary; there is no meaningful memory floor for the runtime. The prebuilt Pi binaries come from these release targets (64-bit `aarch64` for 64-bit Raspberry Pi OS, 32-bit `armv7`/`arm` for 32-bit OS):
 
 {{#include ../_snippets/hardware-pi-targets.md}}
 
@@ -126,7 +112,7 @@ scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 
 ## Option 3: Build on the Pi
 
-Possible on a Pi if you set up swap and pick the right profile. Build time scales with the board; on lower-RAM boards it can be slow.
+The agent compiling itself on the device. Works on any Pi with swap and the right build profile; slower on lower-RAM boards.
 
 ### Step 1: Install Rust toolchain
 
@@ -141,11 +127,9 @@ source $HOME/.cargo/env
 
 </div>
 
-### Step 2: Add swap (recommended for lower-RAM boards)
+### Step 2: Add swap
 
-The default `release` profile uses fat LTO, which is memory-hungry at link time.
-On a board without enough RAM, that triggers the OOM-killer mid-link. Swap (plus
-a lighter profile, Step 3) avoids it.
+Fat LTO peaks during the final link; without swap, a low-RAM board OOM-kills mid-link.
 
 <div class="os-tabs-src">
 
@@ -167,14 +151,9 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 </div>
 
-### Step 3: Choose a build profile
+### Step 3: Build
 
-The default `release` profile uses `lto = "fat"` and `codegen-units = 1`: best runtime performance, worst build memory. The `release-fast` profile raises `codegen-units` to 8 for more parallelism (lighter on the linker), at a minor runtime cost. The `ci` profile goes further with `lto = "thin"` and `codegen-units = 16` for the fastest, lowest-memory link.
-
-When you build by hand (below), you pick the profile yourself. If you let
-`install.sh` build from source instead, it applies the low-memory LTO heuristic
-automatically (described under [Using the install
-script](#using-the-install-script)).
+Pick a profile by available RAM. `release` is fat LTO (best binary, heaviest link); `release-fast` raises codegen-units for a lighter link; `ci` uses thin LTO for the lowest-memory link. (`install.sh` picks this automatically; see [Using the install script](#using-the-install-script).)
 
 <div class="os-tabs-src">
 
@@ -184,51 +163,32 @@ script](#using-the-install-script)).
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
-# Higher-RAM board (with swap): default release works
-cargo build --release
+cargo build --release           # higher-RAM board
+cargo build --profile release-fast   # mid-RAM board
+cargo build --profile ci        # low-RAM / constrained board
 
-# Mid-RAM board (with swap): use release-fast for a lighter link
-cargo build --profile release-fast
-
-# Low-RAM or constrained board: use ci profile (debug-info-stripped, fast link)
-cargo build --profile ci
-```
-
-</div>
-
-### Step 4: Install the binary
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-# From the build profile you used:
+# Install the binary you built:
 sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
-# or target/release-fast/zeroclaw, or target/ci/zeroclaw
+# (or target/release-fast/zeroclaw, or target/ci/zeroclaw)
 ```
 
 </div>
 
-### Building with GPIO support
+### GPIO support
 
-If you want to use Pi GPIO peripherals from skills, enable the relevant feature flag (see the `peripherals` crate). Most users don't need this for typical agent workloads. It's only relevant if you're writing skills that talk to attached hardware.
+To drive Pi GPIO from skills, build with the relevant `peripherals` feature flag. Most agent workloads don't need it; see [Peripherals design](./hardware-peripherals-design.md).
 
 ## Containerized deployment (Podman recommended over Docker)
 
-Pis are memory-constrained, and on a small board everything you stack alongside
-ZeroClaw (channel transports, browser-control, MCP servers, an adjacent agent or
-two, plus the OS) competes for the same fixed pool. Memory you don't spend on
-container infrastructure is memory ZeroClaw and its tools get to use, which is
-why container runtime choice matters more here than on a developer laptop.
+On a memory-constrained Pi, container runtime choice matters: everything you stack alongside ZeroClaw competes for the same fixed pool, so memory not spent on container infrastructure is memory the agent gets.
 
-**Three reasons Podman is the better fit on Pi than Docker:**
+**Why Podman over Docker on a Pi:**
 
-1. **Rootless by default → security headroom.** Podman doesn't need a root daemon; containers run as your user. On an exposed edge device that matters more than on a developer laptop.
-2. **systemd-native via Quadlets → operational simplicity.** Podman ships `.container` unit files that systemd manages directly, same lifecycle, logging, and dependency model as any other unit. No separate `docker.service` to babysit, no separate logging layer.
-3. **No persistent daemon → memory headroom.** Docker keeps a long-running `dockerd` resident; Podman does not. Dropping that daemon is the single biggest memory knob you can turn without sacrificing isolation.
+1. **Rootless by default.** No root daemon; containers run as your user, which matters on an exposed edge device.
+2. **systemd-native via Quadlets.** `.container` unit files systemd manages directly, with no separate `docker.service` or logging layer.
+3. **No persistent daemon.** Docker keeps `dockerd` resident; Podman does not, freeing the largest single chunk of memory without losing isolation.
 
-The trade-off: Podman's rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker's daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that's worth measuring. For ZeroClaw's typical "one or two long-running agent containers" pattern, the difference is negligible, and on memory-constrained hardware the daemon savings dominate the calculation anyway.
+The trade-off: Podman's rootless network (slirp4netns/pasta) is slower than Docker's bridge. For ZeroClaw's "one or two long-running agent containers" pattern that's negligible, and the daemon savings dominate on constrained hardware.
 
 ### Quick install (Raspberry Pi OS Bookworm/Trixie)
 
@@ -390,61 +350,19 @@ If you want skills to drive GPIO pins (LEDs, buttons, sensors, etc.):
 
 ## Troubleshooting
 
-### OOM-killed during build
-
-Fat LTO linking in the `release` profile is the memory peak. Either:
-
-- Switch to `cargo build --profile release-fast` (more codegen parallelism, lighter link).
-- Add swap (Step 2 above).
-- Cross-compile from a larger machine (Option 2).
-
-If you're using `release-fast` and still OOMing on a low-RAM board, drop to `--profile ci` or use the pre-built binary.
-
-### Build extremely slow
-
-Expected on lower-RAM boards; build time scales with the board. Use cross-compilation (Option 2) if build time matters.
-
-### Pre-built binary: "Exec format error"
-
-Architecture mismatch. Check `uname -m` and download the matching binary. `aarch64` is 64-bit (most Pi 4/5 with 64-bit Raspberry Pi OS); `armv7l` is 32-bit.
-
-### GPIO permission denied
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-sudo usermod -aG gpio $USER
-# Log out and back in
-```
-
-</div>
-
-### Service won't start after reboot
-
-Make sure user-level systemd persists across logout:
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-loginctl enable-linger $USER
-```
-
-</div>
-
-### Container can't reach gateway from host
-
-ZeroClaw binds `127.0.0.1` by default. Inside a container that means localhost-of-the-container. Pass `--host 0.0.0.0` (or `ZEROCLAW_BIND=0.0.0.0`) when running in Podman/Docker.
+- **OOM-killed during build:** add swap (Option 3 Step 2), drop to a lighter profile (`release-fast` or `ci`), or use the pre-built binary / cross-compile.
+- **Build extremely slow:** expected on lower-RAM boards; cross-compile (Option 2) if it matters.
+- **Pre-built binary "Exec format error":** architecture mismatch. `uname -m` and grab the matching binary (`aarch64` = 64-bit, `armv7l` = 32-bit).
+- **GPIO permission denied:** you are not in the `gpio` group; `sudo usermod -aG gpio $USER`, then re-login.
+- **Service won't start after reboot:** `loginctl enable-linger $USER` so the user service survives logout.
+- **Container can't reach gateway from host:** the gateway binds `127.0.0.1`; pass `--host 0.0.0.0` (or `ZEROCLAW_BIND=0.0.0.0`).
 
 ## Performance tips
 
-- **Use an SSD or fast SD card.** Compilation is heavily I/O-bound; a USB 3.0 SSD on a Pi 4/5 cuts build time significantly.
-- **Run headless.** Stop the desktop environment if not needed: `sudo systemctl set-default multi-user.target`.
-- **tmpfs for build artifacts** (if you have RAM + swap headroom): `export CARGO_TARGET_DIR=/tmp/zeroclaw-target`.
-- **Check that `clk_ignore_unused` isn't set** on the kernel cmdline if you're using a custom image: that flag (occasionally seen on vendor BSPs) inhibits clock gating and increases idle power. Stock Raspberry Pi OS doesn't ship with it.
+- **Use an SSD or fast SD card.** Compilation is I/O-bound; a USB 3.0 SSD on a Pi 4/5 cuts build time significantly.
+- **Run headless:** `sudo systemctl set-default multi-user.target`.
+- **tmpfs for build artifacts** (with RAM + swap headroom): `export CARGO_TARGET_DIR=/tmp/zeroclaw-target`.
+- **Check `clk_ignore_unused`** isn't on the kernel cmdline if you use a custom image; it inhibits clock gating and raises idle power. Stock Raspberry Pi OS doesn't set it.
 
 ## Related
 

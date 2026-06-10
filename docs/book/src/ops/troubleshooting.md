@@ -76,7 +76,7 @@ If you still run out of memory, or you are not building through `install.sh`:
 4. **Serialise the build**: `CARGO_BUILD_JOBS=1 cargo build --release --locked`.
 5. **Add swap** (works for RAM, costs disk, check you have both).
 
-For the Raspberry Pi specifics, see [Raspberry Pi setup → build profile](../hardware/raspberry-pi-setup.md#step-3-choose-a-build-profile).
+For the Raspberry Pi specifics, see [Raspberry Pi setup → build](../hardware/raspberry-pi-setup.md#step-3-build).
 
 ### Build is very slow
 
