@@ -192,10 +192,6 @@ interface channel {
     /// Stub: return `ok(())`.
     stop-typing: func(recipient: string) -> result<_, string>;
 
-    /// Return `true` if this channel supports progressive draft-message edits.
-    /// Stub: return `false`.
-    supports-draft-updates: func() -> bool;
-
     /// Send an initial draft message. Returns a platform message-ID for later
     /// edits via `update-draft`, `finalize-draft`, or `cancel-draft`.
     /// Stub: return `ok(none)`.
@@ -229,10 +225,6 @@ interface channel {
     /// Cancel and remove a previously sent draft.
     /// Stub: return `ok(())`.
     cancel-draft: func(recipient: string, message-id: string) -> result<_, string>;
-
-    /// Return `true` if this channel supports multi-message streaming delivery.
-    /// Stub: return `false`.
-    supports-multi-message-streaming: func() -> bool;
 
     /// Minimum delay in milliseconds between paragraphs in multi-message mode.
     /// Stub: return `800`.
@@ -288,11 +280,6 @@ interface channel {
         choices: list<string>,
         timeout-secs: u64,
     ) -> result<option<string>, string>;
-
-    /// Return `true` if this channel can handle free-form (no-choices)
-    /// `ask-user` questions via the standard send + poll flow.
-    /// Stub: return `true`.
-    supports-free-form-ask: func() -> bool;
 }
 
 /// A component that exports `channel` is a messaging-platform channel plugin.
