@@ -282,7 +282,7 @@ pub fn dispatch_family_factory(
                     Err(anyhow::Error::msg(format!(
                         "Unknown model_provider family: {family}. After the V2 to typed-family migration, \
                          only canonical family names are valid. Run `zeroclaw quickstart` to reconfigure, \
-                         or set `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` for \
+                         or set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` for \
                          OpenAI-compatible custom endpoints."
                     )))
                 },
@@ -938,7 +938,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         // Reads typed Azure alias fields directly. Operator sets these
-        // under `[model_providers.azure.<alias>]` or via the schema-mirror
+        // under `[providers.models.azure.<alias>]` or via the schema-mirror
         // env grammar — env-var fallback eradicated.
         let resource = self.resource.as_deref().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -954,7 +954,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `resource`: set \
-                 `[model_providers.azure.<alias>] resource = \"...\"` in config.toml.",
+                 `[providers.models.azure.<alias>] resource = \"...\"` in config.toml.",
             )
         })?;
         let deployment = self.deployment.as_deref().ok_or_else(|| {
@@ -971,7 +971,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `deployment`: set \
-                 `[model_providers.azure.<alias>] deployment = \"...\"` in config.toml.",
+                 `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml.",
             )
         })?;
         let api_version = self.api_version.as_deref();
@@ -1103,7 +1103,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
         .with_models_dev_key("groq");
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
-        // via `[model_providers.groq.<alias>] native_tools = true`.
+        // via `[providers.models.groq.<alias>] native_tools = true`.
         if opts.native_tools != Some(true) {
             p = p.without_native_tools();
         }
@@ -1290,7 +1290,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Custom model_provider requires `uri`: set \
-                 `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(
@@ -1331,7 +1331,7 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         let base_url = api_url.ok_or_else(|| {
             anyhow::Error::msg(
                 "OpenAI-compatible model_provider requires `uri`: set \
-                 `[model_providers.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) =

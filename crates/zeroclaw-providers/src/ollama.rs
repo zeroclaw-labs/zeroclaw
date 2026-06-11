@@ -89,7 +89,7 @@ impl OllamaTuning {
 }
 
 pub struct OllamaModelProvider {
-    /// `[model_providers.ollama.<alias>]` config-key alias.
+    /// `[providers.models.ollama.<alias>]` config-key alias.
     alias: String,
     base_url: String,
     api_key: Option<String>,
