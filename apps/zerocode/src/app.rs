@@ -471,6 +471,9 @@ pub async fn run(
             if mode == Mode::Logs {
                 logs_pane.tick().await;
             }
+            if mode == Mode::Quickstart {
+                quickstart.tick().await;
+            }
             continue;
         }
 
@@ -783,8 +786,11 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column.
-    if let Some(w) = ctx.widget() {
+    // Left: ctx bar, left-aligned in its own column. The bar is held back
+    // until the context-accounting feature is ready to show; there is no
+    // user-facing switch — the gate flips when the work lands.
+    const SHOW_CTX_BAR: bool = false;
+    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
 }
