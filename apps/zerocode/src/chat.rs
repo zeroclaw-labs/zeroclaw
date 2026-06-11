@@ -4360,35 +4360,11 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
     }
 }
 
-fn editor_from_env_or_path() -> Option<String> {
-    std::env::var("VISUAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| {
-            ["nano", "vi", "vim", "editor"]
-                .into_iter()
-                .find(|candidate| executable_on_path(candidate))
-                .map(str::to_string)
-        })
-}
-
-fn executable_on_path(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-}
-
 /// Suspend the TUI, open `$VISUAL` / `$EDITOR` with `content`, return the edited text.
 /// Restores raw mode and alternate screen before returning.
 /// Falls back to `content` unchanged if no editor is available or the process fails.
 pub async fn open_editor_for_content(content: &str) -> String {
-    let Some(editor) = editor_from_env_or_path() else {
+    let Some(editor) = crate::editor::editor_from_env_or_path() else {
         return content.to_string();
     };
 

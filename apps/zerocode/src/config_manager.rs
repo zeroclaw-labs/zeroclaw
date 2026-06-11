@@ -3917,15 +3917,9 @@ fn edit_in_external_editor(
     content: &str,
     filename_hint: &str,
 ) -> Result<String, String> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "vi".into()
-            }
-        });
+    let Some(editor) = crate::editor::editor_from_env_or_path() else {
+        return Err("no external editor found; set VISUAL or EDITOR".to_string());
+    };
 
     // Write content to a temp file with the right extension.
     let dir = std::env::temp_dir();
