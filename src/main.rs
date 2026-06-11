@@ -380,8 +380,8 @@ impl LogLevel {
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
-    /// path. Non-interactive in this build: writes balanced defaults
-    /// for risk/runtime/memory and prints next-step instructions.
+    /// path. Interactive: the flags below pre-seed checklist selectors
+    /// but do not skip them; a terminal is required.
     Quickstart {
         /// Provider type (anthropic / openai / openrouter / ollama).
         #[arg(long)]
@@ -1080,6 +1080,22 @@ async fn run_quickstart_cli(
         FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
         snapshot_state,
     };
+
+    // The checklist below is driven by dialoguer prompts, which need an
+    // interactive terminal. With piped/redirected stdin the selector
+    // redraws in a tight loop forever instead of failing (#7507) — fail
+    // fast and point headless callers at the scriptable alternative.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!(
+            "{}",
+            t(
+                "cli-quickstart-needs-tty",
+                "Quickstart is interactive and needs a terminal. Run it from an \
+                 interactive shell, or use `zeroclaw config set <path> <value>` \
+                 for headless configuration."
+            )
+        );
+    }
 
     // ── Form state ──────────────────────────────────────────────
     //
