@@ -1,25 +1,14 @@
 # Raspberry Pi Setup
 
-This guide covers installing and running ZeroClaw on Raspberry Pi (Pi 3, Pi 4, Pi 5, Pi Zero 2 W).
+This guide covers installing and running ZeroClaw on Raspberry Pi.
 
-The README's "runs on <$10 hardware with <5 MB RAM" claim is true for the **runtime**. Build-time is a different story — Rust's compiler and linker need significantly more RAM than the resulting binary, so the on-device build path needs swap and a tuned profile to avoid OOM-kills during link.
-
-For most Pi users, the **pre-built binary is the path of least resistance**.
+The runtime is small enough to run comfortably on any Pi. The only constraint is **building from source on the device**: Rust's linker is memory-hungry (fat LTO can OOM a low-RAM board), so the on-device build path needs swap and a lighter profile. Most users should take the **pre-built binary** and skip all of that.
 
 ## Hardware Compatibility
 
-| Model | RAM | Pre-built binary | Build from source |
-|---|---|---|---|
-| Pi 5 (16 GB) | 16 GB | ✅ | ✅ comfortable |
-| Pi 5 (8 GB) | 8 GB | ✅ | ✅ with swap or `release-fast` profile |
-| Pi 5 (4 GB) | 4 GB | ✅ | ✅ with swap + `release-fast` profile |
-| Pi 4 (8 GB) | 8 GB | ✅ | ✅ with `release-fast` profile |
-| Pi 4 (4 GB) | 4 GB | ✅ | ✅ with swap + `release-fast` profile |
-| Pi 4 (2 GB) | 2 GB | ✅ | Marginal — swap required, slow |
-| Pi 3 (1 GB) | 1 GB | ✅ | ❌ Not recommended |
-| Pi Zero 2 W | 512 MB | ✅ | ❌ |
+Any Pi that can run a 64-bit (`aarch64`) or 32-bit (`armv7`) Raspberry Pi OS runs the pre-built binary; there is no meaningful memory floor for the runtime. The prebuilt Pi binaries come from these release targets (64-bit `aarch64` for 64-bit Raspberry Pi OS, 32-bit `armv7`/`arm` for 32-bit OS):
 
-**Runtime memory is minimal.** Even on a Pi Zero 2 W, the core agent runs in well under 5 MB RSS once it's started. The hardware ladder above is about whether you can compile on the device, not whether ZeroClaw can run on it.
+{{#include ../_snippets/hardware-pi-targets.md}}
 
 ## Option 1: Pre-built Binary (Recommended)
 
@@ -27,17 +16,23 @@ Fastest path. No compiler, no swap, no OOM risk.
 
 ### Using the install script
 
-```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
-```
+{{#include ../_snippets/install.md:linux}}
 
-The script auto-detects your architecture (`aarch64` or `armv7`) and installs the matching release binary into `$CARGO_HOME/bin/zeroclaw` (defaulting to `~/.cargo/bin/zeroclaw`). Make sure that directory is on your `PATH`.
+The script auto-detects your architecture (`aarch64`, `armv7`, or `armv6`) and installs the matching release binary into `$CARGO_HOME/bin/zeroclaw` (defaulting to `~/.cargo/bin/zeroclaw`). Make sure that directory is on your `PATH`.
+
+When the script builds from source instead of taking a prebuilt binary, it also adapts the build to the board's available memory:
+
+{{#include ../_snippets/hardware-lowmem-lto.md}}
 
 ### Manual download
 
 Pick the matching tarball from the [latest release](https://github.com/zeroclaw-labs/zeroclaw/releases/latest):
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # 64-bit (Pi 4/5 with 64-bit Raspberry Pi OS)
 curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-unknown-linux-gnu.tar.gz
 tar xzf zeroclaw-aarch64-unknown-linux-gnu.tar.gz
@@ -49,22 +44,32 @@ tar xzf zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz
 sudo install -m 0755 zeroclaw /usr/local/bin/
 ```
 
+</div>
+
 ### Check your architecture
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 uname -m
-# aarch64 → 64-bit (use the aarch64 binary)
-# armv7l  → 32-bit (use the armv7 binary)
-# armv6l  → Pi 1 / Zero (not currently supported, see #4623)
+# aarch64 → 64-bit (use the aarch64-unknown-linux-gnu binary)
+# armv7l  → 32-bit (use the armv7-unknown-linux-gnueabihf binary)
+# armv6l  → Pi 1 / Zero / Zero W (use the arm-unknown-linux-gnueabihf binary)
 ```
+
+</div>
 
 ## Option 2: Cross-Compile From Another Machine
 
 If you already have a beefier machine, cross-compiling is faster than building on the Pi.
 
-### From macOS (Apple Silicon or Intel)
+<div class="os-tabs-src">
 
-```bash
+#### macOS (Apple Silicon or Intel)
+
+```sh
 # Install the cross-compilation target
 rustup target add aarch64-unknown-linux-gnu
 
@@ -81,18 +86,18 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 ```
 
-> **Note:** earlier drafts of this guide suggested `aarch64-elf-gcc` from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc — it will not produce a working Raspberry Pi OS binary. Use the `messense/macos-cross-toolchains` tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).
+> **Note:** earlier drafts of this guide suggested `aarch64-elf-gcc` from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc. It will not produce a working Raspberry Pi OS binary. Use the `messense/macos-cross-toolchains` tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).
 
-### From Linux x86_64
+#### Linux x86_64
 
-```bash
+```sh
 # Install cross-compilation toolchain
 sudo apt-get install -y gcc-aarch64-linux-gnu
 
 # Add target
 rustup target add aarch64-unknown-linux-gnu
 
-# Configure linker (~/.cargo/config.toml)
+# Configure linker
 # [target.aarch64-unknown-linux-gnu]
 # linker = "aarch64-linux-gnu-gcc"
 
@@ -103,22 +108,34 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 ```
 
+</div>
+
 ## Option 3: Build on the Pi
 
-Possible on Pi 4/5 if you set up swap and pick the right profile. Expect 20-40 minutes on a Pi 5 (8 GB), longer on Pi 4.
+The agent compiling itself on the device. Works on any Pi with swap and the right build profile; slower on lower-RAM boards.
 
 ### Step 1: Install Rust toolchain
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
 
-### Step 2: Add swap (critical for Pi 5 with ≤ 8 GB or any Pi 4)
+</div>
 
-The default `release` profile peaks around 8-10 GB RSS during fat LTO linking. Without swap, that triggers the OOM-killer mid-link.
+### Step 2: Add swap
 
-```bash
+Fat LTO peaks during the final link; without swap, a low-RAM board OOM-kills mid-link.
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Create a 4 GB swap file
 sudo fallocate -l 4G /swapfile
 sudo chmod 600 /swapfile
@@ -132,74 +149,70 @@ free -h
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-### Step 3: Choose a build profile
+</div>
 
-The default `release` profile uses `lto = "fat"` and `codegen-units = 1` — best runtime performance, worst build memory. The `release-fast` profile (`codegen-units = 8`, `lto = "thin"`) drops peak RAM by ~half, with only minor runtime impact.
+### Step 3: Build
 
-```bash
+Pick a profile by available RAM. `release` is fat LTO (best binary, heaviest link); `release-fast` raises codegen-units for a lighter link; `ci` uses thin LTO for the lowest-memory link. (`install.sh` picks this automatically; see [Using the install script](#using-the-install-script).)
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
-# Pi 5 (8 GB, with swap): default release works
-cargo build --release
+cargo build --release           # higher-RAM board
+cargo build --profile release-fast   # mid-RAM board
+cargo build --profile ci        # low-RAM / constrained board
 
-# Pi 4 (4 GB, with swap): use release-fast
-cargo build --profile release-fast
-
-# Pi 4 (2 GB) or constrained: use ci profile (debug-info-stripped, fast link)
-cargo build --profile ci
-```
-
-### Step 4: Install the binary
-
-```bash
-# From the build profile you used:
+# Install the binary you built:
 sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
-# or target/release-fast/zeroclaw, or target/ci/zeroclaw
+# (or target/release-fast/zeroclaw, or target/ci/zeroclaw)
 ```
 
-### Building with GPIO support
+</div>
 
-If you want to use Pi GPIO peripherals from skills, enable the relevant feature flag (see the `peripherals` crate). Most users don't need this for typical agent workloads — it's only relevant if you're writing skills that talk to attached hardware.
+### GPIO support
+
+To drive Pi GPIO from skills, build with the relevant `peripherals` feature flag. Most agent workloads don't need it; see [Peripherals design](./hardware-peripherals-design.md).
 
 ## Containerized deployment (Podman recommended over Docker)
 
-**Pis are memory-constrained, and that's the operating reality this section is written against.** The 2 GB Pi 4 is the low-bar test unit for this guide — if a setup doesn't leave headroom on a 2 GB box, it's not a setup we recommend. ZeroClaw itself runs in well under 5 MB RSS at runtime, but everything you stack alongside it (channel transports, browser-control, MCP servers, an adjacent agent or two, plus the OS) competes for the same fixed pool. Memory you don't spend on container infrastructure is memory ZeroClaw and its tools get to use.
+On a memory-constrained Pi, container runtime choice matters: everything you stack alongside ZeroClaw competes for the same fixed pool, so memory not spent on container infrastructure is memory the agent gets.
 
-Concrete budget on a 2 GB Pi 4 running Raspberry Pi OS Bookworm/Trixie headless:
+**Why Podman over Docker on a Pi:**
 
-| Component | Approx RSS |
-|---|---|
-| Kernel + base userspace + sshd | ~150-250 MB |
-| `dockerd` (idle, no containers) | ~150-200 MB |
-| ZeroClaw runtime (gateway only) | ~5 MB |
-| One agent container (e.g. ghcr.io/zeroclaw-labs/zeroclaw) | ~30-80 MB |
-| **Available with Docker** | ~1.3-1.5 GB |
-| **Available with Podman (no daemon)** | ~1.5-1.7 GB |
+1. **Rootless by default.** No root daemon; containers run as your user, which matters on an exposed edge device.
+2. **systemd-native via Quadlets.** `.container` unit files systemd manages directly, with no separate `docker.service` or logging layer.
+3. **No persistent daemon.** Docker keeps `dockerd` resident; Podman does not, freeing the largest single chunk of memory without losing isolation.
 
-The Podman delta is on the order of ~150-200 MB freed up — small in absolute terms, large as a percentage of what's left over after the OS gets its share. On a 2 GB unit that's the difference between comfortably running ZeroClaw + a heavy channel transport (Matrix with media, browser-automation skills) and OOM-killing under load.
-
-**Three reasons Podman is the better fit on Pi than Docker:**
-
-1. **Rootless by default → security headroom.** Podman doesn't need a root daemon; containers run as your user. On an exposed edge device that matters more than on a developer laptop.
-2. **systemd-native via Quadlets → operational simplicity.** Podman ships `.container` unit files that systemd manages directly — same lifecycle, logging, and dependency model as any other unit. No separate `docker.service` to babysit, no separate logging layer.
-3. **No daemon RSS → memory headroom.** Skipping `dockerd`'s persistent ~150-200 MB is the single biggest knob you can turn on a 2 GB Pi without sacrificing isolation.
-
-The trade-off: Podman's rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker's daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that's worth measuring. For ZeroClaw's typical "one or two long-running agent containers" pattern, the difference is negligible — and on memory-constrained hardware, the daemon-RSS savings dominate the calculation anyway.
+The trade-off: Podman's rootless network (slirp4netns/pasta) is slower than Docker's bridge. For ZeroClaw's "one or two long-running agent containers" pattern that's negligible, and the daemon savings dominate on constrained hardware.
 
 ### Quick install (Raspberry Pi OS Bookworm/Trixie)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 sudo apt-get install -y podman
 # Optional: shorter aliases — many docker-compose flows just work with podman-compose
 sudo apt-get install -y podman-compose
 ```
 
+</div>
+
 ### Running ZeroClaw under Podman
 
 The published OCI image works under Podman without modification:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 podman pull ghcr.io/zeroclaw-labs/zeroclaw:latest
 
 podman run --rm -d \
@@ -209,6 +222,8 @@ podman run --rm -d \
   ghcr.io/zeroclaw-labs/zeroclaw:latest \
   daemon --host 0.0.0.0 --port 42617
 ```
+
+</div>
 
 > **Bind gotcha:** ZeroClaw defaults to `127.0.0.1` for the gateway. Inside a container that means the gateway is unreachable from the host. Always pass `--host 0.0.0.0` (or set `ZEROCLAW_BIND=0.0.0.0`) when running in a container.
 
@@ -239,10 +254,16 @@ RestartSec=10
 WantedBy=multi-user.target default.target
 ```
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 systemctl --user daemon-reload
 systemctl --user start zeroclaw.service
 ```
+
+</div>
 
 For rootless setups, also run `loginctl enable-linger $USER` so the service starts before you log in.
 
@@ -250,22 +271,38 @@ For rootless setups, also run `loginctl enable-linger $USER` so the service star
 
 ### 1. Initialize ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw quickstart
 ```
 
-This walks you through provider auth, gateway config, and creates `~/.zeroclaw/config.toml`.
+</div>
+
+This walks you through provider auth, gateway config, and creates your ZeroClaw config.
 
 ### 2. Verify it works
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw doctor
 zeroclaw agent -a assistant -m "what's 2+2?"
 ```
 
+</div>
+
 ### 3. Run as a persistent service
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install and start the systemd user service
 zeroclaw service install
 systemctl --user enable --now zeroclaw
@@ -274,13 +311,21 @@ systemctl --user enable --now zeroclaw
 loginctl enable-linger $USER
 ```
 
+</div>
+
 ### 4. Run as a foreground daemon
 
 For dev / debugging:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon --host 0.0.0.0 --port 42617
 ```
+
+</div>
 
 ### 5. Enable channels
 
@@ -291,61 +336,37 @@ ZeroClaw can connect to chat platforms (Matrix, Mattermost, Discord, Telegram, e
 If you want skills to drive GPIO pins (LEDs, buttons, sensors, etc.):
 
 1. Add your user to the `gpio` group:
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    sudo usermod -aG gpio $USER
    # Log out and back in for the group change to take effect
    ```
+
+   </div>
 2. Use the `peripherals` crate's GPIO bindings from your skills. See [Hardware → Peripherals design](./hardware-peripherals-design.md) for the abstraction model.
 
 ## Troubleshooting
 
-### OOM-killed during build
-
-The `release` profile peaks at ~8-10 GB RSS during the final link. Either:
-
-- Switch to `cargo build --profile release-fast` (drops peak to ~4-6 GB).
-- Add a 4 GB swap file (Step 2 above).
-- Cross-compile from a beefier machine (Option 2).
-
-If you're using `release-fast` and still OOMing on a Pi 4 (2 GB), drop to `--profile ci` or use the pre-built binary.
-
-### Build extremely slow
-
-Expected on Pi 4. A clean release build takes 30-60 minutes; incremental builds are reasonable. Use cross-compilation (Option 2) if build time matters.
-
-### Pre-built binary: "Exec format error"
-
-Architecture mismatch. Check `uname -m` and download the matching binary. `aarch64` is 64-bit (most Pi 4/5 with 64-bit Raspberry Pi OS); `armv7l` is 32-bit.
-
-### GPIO permission denied
-
-```bash
-sudo usermod -aG gpio $USER
-# Log out and back in
-```
-
-### Service won't start after reboot
-
-Make sure user-level systemd persists across logout:
-
-```bash
-loginctl enable-linger $USER
-```
-
-### Container can't reach gateway from host
-
-ZeroClaw binds `127.0.0.1` by default — inside a container that means localhost-of-the-container. Pass `--host 0.0.0.0` (or `ZEROCLAW_BIND=0.0.0.0`) when running in Podman/Docker.
+- **OOM-killed during build:** add swap (Option 3 Step 2), drop to a lighter profile (`release-fast` or `ci`), or use the pre-built binary / cross-compile.
+- **Build extremely slow:** expected on lower-RAM boards; cross-compile (Option 2) if it matters.
+- **Pre-built binary "Exec format error":** architecture mismatch. `uname -m` and grab the matching binary (`aarch64` = 64-bit, `armv7l` = 32-bit).
+- **GPIO permission denied:** you are not in the `gpio` group; `sudo usermod -aG gpio $USER`, then re-login.
+- **Service won't start after reboot:** `loginctl enable-linger $USER` so the user service survives logout.
+- **Container can't reach gateway from host:** the gateway binds `127.0.0.1`; pass `--host 0.0.0.0` (or `ZEROCLAW_BIND=0.0.0.0`).
 
 ## Performance tips
 
-- **Use an SSD or fast SD card.** Compilation is heavily I/O-bound; a USB 3.0 SSD on a Pi 4/5 cuts build time significantly.
-- **Run headless.** Stop the desktop environment if not needed: `sudo systemctl set-default multi-user.target`.
-- **tmpfs for build artifacts** (if you have RAM + swap headroom): `export CARGO_TARGET_DIR=/tmp/zeroclaw-target`.
-- **Check that `clk_ignore_unused` isn't set** on the kernel cmdline if you're using a custom image — that flag (occasionally seen on vendor BSPs) inhibits clock gating and increases idle power. Stock Raspberry Pi OS doesn't ship with it.
+- **Use an SSD or fast SD card.** Compilation is I/O-bound; a USB 3.0 SSD on a Pi 4/5 cuts build time significantly.
+- **Run headless:** `sudo systemctl set-default multi-user.target`.
+- **tmpfs for build artifacts** (with RAM + swap headroom): `export CARGO_TARGET_DIR=/tmp/zeroclaw-target`.
+- **Check `clk_ignore_unused`** isn't on the kernel cmdline if you use a custom image; it inhibits clock gating and raises idle power. Stock Raspberry Pi OS doesn't set it.
 
 ## Related
 
-- [Linux setup](../setup/linux.md) — non-Pi-specific Linux setup, applicable here too once the binary's installed
-- [Service management](../setup/service.md) — systemd patterns, deeper than what's above
-- [Hardware → Peripherals design](./hardware-peripherals-design.md) — GPIO and the peripherals crate
-- [Hardware → Adding boards & tools](./adding-boards-and-tools.md) — extending hardware support
+- [Linux setup](../setup/linux.md): non-Pi-specific Linux setup, applicable here too once the binary's installed
+- [Service management](../setup/service.md): systemd patterns, deeper than what's above
+- [Hardware → Peripherals design](./hardware-peripherals-design.md): GPIO and the peripherals crate
+- [Hardware → Adding boards & tools](./adding-boards-and-tools.md): extending hardware support

@@ -1743,7 +1743,10 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
-    pub active_sessions: usize,
+    #[serde(default)]
+    pub live_sessions: usize,
+    #[serde(default)]
+    pub persisted_sessions: usize,
     #[serde(default)]
     pub channels: Vec<String>,
 }

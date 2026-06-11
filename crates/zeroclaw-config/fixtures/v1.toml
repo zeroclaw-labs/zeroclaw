@@ -214,6 +214,7 @@ schedule = { kind = "every", every_ms = 60000 }
 [channels_config]
 cli = true
 message_timeout_secs = 300
+max_concurrent_per_channel = 4
 ack_reactions = true
 show_tool_calls = false
 session_persistence = true

@@ -993,9 +993,18 @@ export function getCatalog(): Promise<CatalogResponse> {
   return apiFetch<CatalogResponse>("/api/config/catalog");
 }
 
+export interface ModelPricing {
+  prompt?: string;
+  completion?: string;
+  input_cache_read?: string;
+  input_cache_write?: string;
+}
+
 export interface ModelsResponse {
   model_provider: string;
   models: string[];
+  /** Optional pricing data keyed by model ID. */
+  pricing?: Record<string, ModelPricing>;
   /** True when the provider family is local according to the gateway catalog. */
   local: boolean;
   /** false when the upstream catalog fetch failed; form should fall back to free-text. */
