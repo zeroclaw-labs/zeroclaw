@@ -1854,6 +1854,9 @@ pub async fn run_tool_call_loop(
             model_provider: active_model_provider_name.to_string(),
             model: active_model.to_string(),
             messages_count: history.len(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         {
             let _provider_guard =
@@ -2082,6 +2085,9 @@ pub async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -2230,6 +2236,9 @@ pub async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3710,6 +3719,9 @@ pub async fn run(
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -4177,6 +4189,9 @@ pub async fn run(
                             observer.record_event(&ObserverEvent::AgentStart {
                                 model_provider: provider_name.to_string(),
                                 model: model_name.to_string(),
+                                channel: None,
+                                agent_alias: None,
+                                turn_id: None,
                             });
 
                             continue;
@@ -4584,6 +4599,9 @@ pub async fn run(
                                 observer.record_event(&ObserverEvent::AgentStart {
                                     model_provider: provider_name.to_string(),
                                     model: model_name.to_string(),
+                                    channel: None,
+                                    agent_alias: None,
+                                    turn_id: None,
                                 });
 
                                 continue;
@@ -4728,6 +4746,9 @@ pub async fn run(
             duration,
             tokens_used: None,
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         Ok(final_output)

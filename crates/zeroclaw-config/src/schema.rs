@@ -98,6 +98,11 @@ pub struct Config {
     /// original on-disk credentials survive any save cycle.
     #[serde(skip)]
     pub pre_override_snapshots: std::collections::HashMap<String, String>,
+    /// Per-path snapshot of `op://` external secret references captured before
+    /// `decrypt_secrets()` resolves them for runtime use. `save()` restores
+    /// these references unless the same path was intentionally edited.
+    #[serde(skip)]
+    pub onepassword_reference_snapshots: std::collections::HashMap<String, String>,
     /// Dotted prop-paths mutated since the last persist; drives the
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
@@ -12046,6 +12051,10 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Cancel an in-flight response from this channel sender when a newer
+    /// WhatsApp message arrives. Default: `false`.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// In personal mode the bot applies dm_policy, group_policy, and
     /// self_chat_mode to decide which chats to respond in.
@@ -14374,6 +14383,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
+            onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
@@ -15353,8 +15363,15 @@ impl Config {
             }
 
             let store = crate::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            config.onepassword_reference_snapshots =
+                collect_onepassword_reference_snapshots(&config);
             // Decrypt all #[secret]-annotated fields via Configurable derive
-            config.decrypt_secrets(&store)?;
+            config = tokio::task::spawn_blocking(move || {
+                config.decrypt_secrets(&store)?;
+                Ok::<_, anyhow::Error>(config)
+            })
+            .await
+            .context("Config secret decryption task failed")??;
 
             // Apply ZEROCLAW_<lowercase_path> env-var overrides. Hard-errors
             // on any unresolvable path — no silent ignores. Tracks overridden
@@ -16914,6 +16931,11 @@ impl Config {
                 &self.pre_override_snapshots,
             )?;
         }
+        restore_onepassword_references_for_save(
+            &mut config_to_save,
+            &self.onepassword_reference_snapshots,
+            &self.dirty_paths,
+        )?;
 
         // Encrypt all #[secret]-annotated fields via Configurable derive
         config_to_save.encrypt_secrets(&store)?;
@@ -16992,6 +17014,11 @@ impl Config {
                 &self.pre_override_snapshots,
             )?;
         }
+        restore_onepassword_references_for_save(
+            &mut config_to_save,
+            &self.onepassword_reference_snapshots,
+            &self.dirty_paths,
+        )?;
         config_to_save.encrypt_secrets(&store)?;
 
         let full_table: toml::Table = toml::Value::try_from(&config_to_save)
@@ -17036,6 +17063,42 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn collect_onepassword_reference_snapshots(
+    config: &Config,
+) -> std::collections::HashMap<String, String> {
+    config
+        .prop_fields()
+        .into_iter()
+        .filter(|field| field.is_secret)
+        .filter_map(|field| {
+            let value = crate::env_overrides::raw_value_for_path(config, &field.name)?;
+            crate::secrets::SecretStore::is_onepassword_ref(&value).then_some((field.name, value))
+        })
+        .collect()
+}
+
+fn restore_onepassword_references_for_save(
+    config_to_save: &mut Config,
+    snapshots: &std::collections::HashMap<String, String>,
+    dirty_paths: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for (path, value) in snapshots {
+        if dirty_paths.contains(path) {
+            continue;
+        }
+        if let Err(err) = config_to_save.set_prop(path, value) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", err)})),
+                "1Password reference save-restore failed; field retains resolved value"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Atomic write shared by `save()` and `save_dirty()`.
@@ -17562,12 +17625,59 @@ mod tests {
         assert!(both.validate().is_ok());
     }
     use super::*;
+    use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::sync::MutexGuard;
     use tokio::test;
+
+    struct EnvValueGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvValueGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env vars serialize on env_override_lock().
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env vars serialize on env_override_lock().
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvValueGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests that mutate env vars serialize on env_override_lock().
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_op(bin_dir: &Path, script: &str) -> PathBuf {
+        let op_path = bin_dir.join("op");
+        std::fs::write(&op_path, script).expect("write fake op");
+        let mut perms = std::fs::metadata(&op_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&op_path, perms).unwrap();
+        op_path
+    }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
     #[prefix = "test.object_array.entries"]
@@ -18519,6 +18629,7 @@ auto_save = true
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
+            onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
         };
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -19175,6 +19286,7 @@ default_temperature = 0.7
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
+            onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
         };
 
@@ -20137,6 +20249,20 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn whatsapp_config_default_interrupt_on_new_message_is_false() {
+        let json = r#"{"session_path":"/tmp/zeroclaw-whatsapp-session.db"}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn whatsapp_config_deserializes_interrupt_on_new_message_true() {
+        let json = r#"{"session_path":"/tmp/zeroclaw-whatsapp-session.db","interrupt_on_new_message":true}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
+    }
+
+    #[test]
     async fn webhook_config_with_secret() {
         let json = r#"{"port":8080,"secret":"my-secret-key"}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
@@ -20212,6 +20338,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20244,6 +20371,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20299,6 +20427,7 @@ allowed_numbers = ["+1", "+2"]
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20328,6 +20457,7 @@ allowed_numbers = ["+1", "+2"]
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20369,6 +20499,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_code: None,
                     ws_url: None,
                     mention_only: false,
+                    interrupt_on_new_message: false,
                     mode: WhatsAppWebMode::default(),
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
@@ -24387,6 +24518,204 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             Some(original_secret),
             "original on-disk secret must survive an env-override + save cycle",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn onepassword_reference_survives_load_save_cycle() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
+  printf '%s\n' 'sk-proj-from-onepassword'
+  exit 0
+fi
+printf '%s\n' 'unexpected op invocation' >&2
+exit 65
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_init().await.unwrap();
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|entry| entry.base.api_key.as_deref()),
+            Some("sk-proj-from-onepassword"),
+            "runtime config uses resolved 1Password secret"
+        );
+
+        config.save().await.unwrap();
+        let raw_after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw_after.contains("op://zeroclaw/provider/openai-api-key"),
+            "on-disk config must keep the 1Password reference: {raw_after}"
+        );
+        assert!(
+            !raw_after.contains("sk-proj-from-onepassword"),
+            "resolved secret must not be written back to disk: {raw_after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test asserts Tokio worker responsiveness"
+    )]
+    #[test(flavor = "multi_thread", worker_threads = 1)]
+    async fn onepassword_reference_load_does_not_block_runtime_worker() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
+  sleep 1
+  printf '%s\n' 'sk-proj-from-onepassword'
+  exit 0
+fi
+exit 65
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let load_task = tokio::spawn(Config::load_or_init());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "op:// config load should not block the async runtime worker"
+        );
+
+        let config = load_task.await.unwrap().unwrap();
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|entry| entry.base.api_key.as_deref()),
+            Some("sk-proj-from-onepassword")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn dirty_onepassword_secret_edit_replaces_reference() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+printf '%s\n' 'sk-proj-from-onepassword'
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config::load_or_init().await.unwrap();
+        config
+            .set_prop_persistent(
+                "providers.models.openai.default.api_key",
+                "sk-proj-new-direct-key",
+            )
+            .unwrap();
+        config.save_dirty().await.unwrap();
+
+        let raw_after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw_after.contains("op://zeroclaw/provider/openai-api-key"),
+            "dirty secret edits should replace the old 1Password reference: {raw_after}"
+        );
+        assert!(
+            !raw_after.contains("sk-proj-new-direct-key"),
+            "direct replacement should still be encrypted at rest: {raw_after}"
+        );
+
+        let stored: Config = toml::from_str(&raw_after).unwrap();
+        let encrypted = stored
+            .providers
+            .models
+            .openai
+            .get("default")
+            .and_then(|entry| entry.base.api_key.as_deref())
+            .unwrap();
+        let store = crate::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(encrypted).unwrap(), "sk-proj-new-direct-key");
     }
 
     #[test]
