@@ -392,6 +392,19 @@ impl DelegateTool {
             )));
         }
         target_policy.tracker = self.security.tracker.clone();
+
+        // Inherit the caller's runtime workspace boundary so delegate
+        // children spawned from an ACP/gateway session see the same
+        // session cwd as the caller instead of falling back to the
+        // per-agent install dir declared in config. Identical risk
+        // profile is enforced above, so this carries no extra
+        // privilege — it copies the sandbox boundary the caller
+        // already runs under. Without this, delegating to a sibling
+        // inside an IDE session jails the child to
+        // `~/.zeroclaw/agents/<target>/workspace` even when the user
+        // opened the IDE in their own repo. See issue #7263.
+        target_policy.workspace_dir = self.security.workspace_dir.clone();
+
         Ok(Arc::new(target_policy))
     }
 
@@ -1851,7 +1864,7 @@ impl Observer for NoopObserver {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tokio::time::{Instant, sleep};
     use zeroclaw_config::schema::{
         DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
@@ -3961,6 +3974,51 @@ mod tests {
         assert!(
             !target_policy.tracker.record_within(bucket_key, max),
             "delegated target must consume from the caller's bucket; spawning the target should not reset the budget"
+        );
+    }
+
+    /// Regression for issue #7263: when the caller's policy was built
+    /// with a session cwd (the ACP / gateway path), delegating to a
+    /// sibling agent must carry that cwd into the target's policy.
+    /// Without this, the child run's file/shell tools jail to the
+    /// per-agent install dir declared in config rather than the IDE's
+    /// session cwd, breaking delegate-driven workflows in repos
+    /// outside the install root.
+    #[tokio::test]
+    async fn delegate_target_inherits_caller_session_workspace_dir() {
+        let config = config_with_two_agents("caller", 5, "target", 5);
+
+        // Build the caller's policy the way the interactive builders
+        // do: config-derived, then session_cwd override.
+        let session_cwd = PathBuf::from("/tmp/zeroclaw-test-delegate-session-cwd-7263");
+        let mut caller_policy =
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves");
+        caller_policy.workspace_dir = session_cwd.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        // Sanity: the target's config-derived workspace must differ so
+        // the assertion below is actually exercising the inheritance,
+        // not a coincidental match.
+        let target_config_workspace = config.agent_workspace_dir("target");
+        assert_ne!(
+            session_cwd, target_config_workspace,
+            "test precondition: session cwd must differ from target's config workspace"
+        );
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone());
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("same-profile target resolves");
+        assert_eq!(
+            target_policy.workspace_dir, session_cwd,
+            "delegated target must inherit the caller's session cwd; \
+             regression for issue #7263"
         );
     }
 
