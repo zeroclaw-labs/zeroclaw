@@ -790,6 +790,34 @@ macro_rules! for_each_tts_provider_slot {
     };
 }
 
+impl TtsProviders {
+    /// Canonical TTS family slot names. Mirrors
+    /// `ModelProviders::slot_names`; closed set, listed inline because
+    /// `for_each_tts_provider_slot!` carries a rate-type parameter that
+    /// makes it awkward for name-only collection. The
+    /// `provider_slot_names_match_struct_fields` test guards drift.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        &["openai", "elevenlabs", "google", "edge", "piper"]
+    }
+}
+
+impl TranscriptionProviders {
+    /// Canonical transcription family slot names. See
+    /// [`TtsProviders::slot_names`] for the drift guard.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        &[
+            "groq",
+            "openai",
+            "deepgram",
+            "assemblyai",
+            "google",
+            "local_whisper",
+        ]
+    }
+}
+
 /// Slot list for transcription providers.
 #[macro_export]
 macro_rules! for_each_transcription_provider_slot {

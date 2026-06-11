@@ -15035,30 +15035,41 @@ impl Config {
             .collect()
     }
 
-    /// Return `providers.models.<family>` table keys in `raw_toml` that are
-    /// not a known typed family slot. Serde silently drops these sections
-    /// at deserialize time, so a typo'd family (`[providers.models.antropic.x]`)
-    /// or one from a newer binary vanishes on reload — the alias "works"
-    /// in the session that created it, then disappears after restart.
+    /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
+    /// whose family is not a known typed slot (kinds: models, tts,
+    /// transcription). Serde silently drops these sections at deserialize
+    /// time, so a typo'd family (`[providers.models.antropic.x]`) or one
+    /// from a newer binary vanishes on reload: the alias "works" in the
+    /// session that created it, then disappears after restart.
     pub fn unknown_provider_families(raw_toml: &str) -> Vec<String> {
         let raw: toml::Table = match raw_toml.parse() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let Some(models) = raw
-            .get("providers")
-            .and_then(toml::Value::as_table)
-            .and_then(|p| p.get("models"))
-            .and_then(toml::Value::as_table)
-        else {
+        let Some(kinds) = raw.get("providers").and_then(toml::Value::as_table) else {
             return Vec::new();
         };
-        let slots = crate::providers::ModelProviders::slot_names();
-        models
-            .keys()
-            .filter(|k| !slots.contains(&k.as_str()))
-            .cloned()
-            .collect()
+        let kind_slots: &[(&str, &[&str])] = &[
+            ("models", crate::providers::ModelProviders::slot_names()),
+            ("tts", crate::providers::TtsProviders::slot_names()),
+            (
+                "transcription",
+                crate::providers::TranscriptionProviders::slot_names(),
+            ),
+        ];
+        let mut out = Vec::new();
+        for (kind, slots) in kind_slots {
+            let Some(families) = kinds.get(*kind).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            out.extend(
+                families
+                    .keys()
+                    .filter(|k| !slots.contains(&k.as_str()))
+                    .map(|k| format!("{kind}.{k}")),
+            );
+        }
+        out
     }
 
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
@@ -16492,7 +16503,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family — check [providers.models.<family>.<alias>] in config.toml (valid families: see `zeroclaw providers`)",
+                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
                         );
                     }
                     let exists = self
@@ -24430,6 +24441,43 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn provider_slot_names_match_struct_fields() {
+        // TtsProviders/TranscriptionProviders::slot_names are inline lists
+        // (their slot macros carry a rate-type param); pin them against the
+        // actual serialized field names so adding a family without updating
+        // slot_names fails here.
+        let tts = toml::Value::try_from(crate::providers::TtsProviders {
+            openai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            elevenlabs: std::iter::once(("a".to_string(), Default::default())).collect(),
+            google: std::iter::once(("a".to_string(), Default::default())).collect(),
+            edge: std::iter::once(("a".to_string(), Default::default())).collect(),
+            piper: std::iter::once(("a".to_string(), Default::default())).collect(),
+        })
+        .unwrap();
+        let mut tts_fields: Vec<&str> =
+            tts.as_table().unwrap().keys().map(String::as_str).collect();
+        tts_fields.sort_unstable();
+        let mut tts_slots = crate::providers::TtsProviders::slot_names().to_vec();
+        tts_slots.sort_unstable();
+        assert_eq!(tts_fields, tts_slots);
+
+        let tr = toml::Value::try_from(crate::providers::TranscriptionProviders {
+            groq: std::iter::once(("a".to_string(), Default::default())).collect(),
+            openai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            deepgram: std::iter::once(("a".to_string(), Default::default())).collect(),
+            assemblyai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            google: std::iter::once(("a".to_string(), Default::default())).collect(),
+            local_whisper: std::iter::once(("a".to_string(), Default::default())).collect(),
+        })
+        .unwrap();
+        let mut tr_fields: Vec<&str> = tr.as_table().unwrap().keys().map(String::as_str).collect();
+        tr_fields.sort_unstable();
+        let mut tr_slots = crate::providers::TranscriptionProviders::slot_names().to_vec();
+        tr_slots.sort_unstable();
+        assert_eq!(tr_fields, tr_slots);
+    }
+
+    #[test]
     async fn unknown_provider_families_flags_silent_serde_drop() {
         // serde ignores unknown keys under providers.models, so a typo'd
         // family parses cleanly and its aliases vanish on reload. The
@@ -24450,7 +24498,13 @@ model = "gpt-4o"
         );
         assert_eq!(
             Config::unknown_provider_families(raw),
-            vec!["antropic".to_string()]
+            vec!["models.antropic".to_string()]
+        );
+        assert_eq!(
+            Config::unknown_provider_families(
+                "schema_version = 3\n[providers.tts.bogustts.x]\nenabled = true\n",
+            ),
+            vec!["tts.bogustts".to_string()]
         );
         assert!(Config::unknown_provider_families("not even toml {{{").is_empty());
     }
