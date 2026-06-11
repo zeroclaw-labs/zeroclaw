@@ -1205,7 +1205,7 @@ async fn run_quickstart_cli(
             let mut fields: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
-                fields.insert("api-key".to_string(), key.to_string());
+                fields.insert("api_key".to_string(), key.to_string());
             }
             form.provider = Some(ProviderChoice::Fresh {
                 kind: found.kind.clone(),
