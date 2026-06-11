@@ -25,6 +25,8 @@ WhatsApp Web mode links a regular WhatsApp account through the optional Web back
 
 On first start, the Web backend pairs the account using QR or pair-code linking (`pair_phone` seeds pair-code linking; leave it unset for QR). Keep `session_path` on persistent storage; removing it forces a fresh device link. Bind the channel to an agent via that agent's `channels` list.
 
+The shared `interrupt_on_new_message` option applies to both Cloud API mode and Web mode. When enabled, a newer WhatsApp message from the same sender/chat cancels the in-flight response.
+
 ## Personal and business behavior
 
 For Web mode, `mode = "personal"` applies separate DM, group, and self-chat policies:

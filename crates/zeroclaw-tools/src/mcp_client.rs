@@ -633,4 +633,96 @@ mod tests {
             "got: {msg}"
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_stdio_registry_reaps_child_process() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use tokio::time::{Duration, sleep};
+
+        fn process_is_alive(pid: u32) -> bool {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+
+        async fn read_pid(path: &Path) -> u32 {
+            for _ in 0..50 {
+                if let Ok(raw) = tokio::fs::read_to_string(path).await
+                    && let Ok(pid) = raw.trim().parse()
+                {
+                    return pid;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            panic!("stdio MCP test server did not write its pid");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let server_path = temp.path().join("echo-mcp.sh");
+        let pid_path = temp.path().join("echo-mcp.pid");
+        let mut script = std::fs::File::create(&server_path).expect("script");
+        script
+            .write_all(
+                br#"#!/bin/sh
+echo "$$" > "$1"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"echo-mcp","version":"0.1.0"}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+      exec tail -f /dev/null
+      ;;
+  esac
+done
+"#,
+            )
+            .expect("write script");
+        drop(script);
+        let mut perms = std::fs::metadata(&server_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&server_path, perms).expect("chmod");
+
+        let config = McpServerConfig {
+            name: "echo".to_string(),
+            command: server_path.display().to_string(),
+            args: vec![pid_path.display().to_string()],
+            env: std::collections::HashMap::default(),
+            tool_timeout_secs: None,
+            transport: McpTransport::Stdio,
+            url: None,
+            headers: std::collections::HashMap::default(),
+        };
+
+        let registry = McpRegistry::connect_all(&[config])
+            .await
+            .expect("connect_all should not fail");
+        assert_eq!(registry.server_count(), 1);
+        assert_eq!(registry.tool_count(), 0);
+        let child_pid = read_pid(&pid_path).await;
+        assert!(
+            process_is_alive(child_pid),
+            "stdio MCP child should be alive while the registry is alive"
+        );
+
+        drop(registry);
+
+        for _ in 0..50 {
+            if !process_is_alive(child_pid) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stdio MCP child process {child_pid} survived after registry drop");
+    }
 }
