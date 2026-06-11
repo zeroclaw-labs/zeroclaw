@@ -54,6 +54,10 @@ pub struct ModelSwitchTool {
 }
 
 impl ModelSwitchTool {
+    /// Canonical tool name. Referenced by the subagent registry filter so
+    /// a rename cannot desync the two.
+    pub const NAME: &'static str = "model_switch";
+
     pub fn new(security: Arc<SecurityPolicy>, config: Arc<Config>) -> Self {
         Self { security, config }
     }
@@ -62,7 +66,7 @@ impl ModelSwitchTool {
 #[async_trait]
 impl Tool for ModelSwitchTool {
     fn name(&self) -> &str {
-        "model_switch"
+        Self::NAME
     }
 
     fn description(&self) -> &str {

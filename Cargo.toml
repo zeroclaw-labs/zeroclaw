@@ -26,6 +26,7 @@ zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-2" 
 zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-2" }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-2" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-2" }
+zerocode = { path = "apps/zerocode", version = "0.8.0-beta-2" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 

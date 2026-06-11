@@ -24,7 +24,7 @@ Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
 
 | File | Trigger | Purpose |
 |---|---|---|
-| `ci.yml` | `pull_request` → `master` | Lint + test + build on every PR |
+| `ci.yml` | `pull_request` → `master`; `push` → `master` | Lint + test + build on PRs and trusted post-merge cache-warming runs |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
@@ -36,12 +36,14 @@ Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
 | Event | What runs |
 |---|---|
 | PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
+| Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
-There is no automatic CI run on push to master and no automatic release on
-merge. Releases are always intentional — either a manual dispatch or a
-deliberate tag push.
+There is no automatic release on merge. `ci.yml` does run after trusted
+`master` pushes so post-merge Quality Gate runs can seed Rust caches for later
+PRs, but releases remain intentional — either a manual dispatch or a deliberate
+tag push.
 
 ---
 

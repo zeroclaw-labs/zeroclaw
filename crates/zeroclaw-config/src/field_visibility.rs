@@ -68,6 +68,18 @@ pub fn is_excluded(path: &str, excludes: &[String]) -> bool {
         .any(|e| path == e || (e.ends_with('.') && path.starts_with(e)))
 }
 
+/// Test whether `path` equals `prefix` or sits beneath it at a `.` segment
+/// boundary. A bare `starts_with` is wrong here: prefix `agents.aaa` must
+/// not match `agents.aaalore.workspace`.
+pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    match path.strip_prefix(prefix) {
+        Some(rest) => {
+            prefix.is_empty() || rest.is_empty() || rest.starts_with('.') || prefix.ends_with('.')
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +122,34 @@ mod tests {
         // Unrelated paths don't match.
         assert!(!is_excluded("memory.postgres.url", &excludes));
         assert!(!is_excluded("memory.foobar", &excludes));
+    }
+
+    #[test]
+    fn path_matches_prefix_requires_segment_boundary() {
+        // Exact match and children.
+        assert!(path_matches_prefix("agents.aaa", "agents.aaa"));
+        assert!(path_matches_prefix("agents.aaa.workspace", "agents.aaa"));
+        assert!(path_matches_prefix("agents.aaa.memory.limit", "agents.aaa"));
+        // Sibling aliases sharing a string prefix must NOT match (#7376-class bug).
+        assert!(!path_matches_prefix(
+            "agents.aaalore.workspace",
+            "agents.aaa"
+        ));
+        assert!(!path_matches_prefix(
+            "agents.aaatools.identity",
+            "agents.aaa"
+        ));
+        assert!(!path_matches_prefix("agents.aaalore", "agents.aaa"));
+        // Dot-terminated prefixes keep their sub-table semantics.
+        assert!(path_matches_prefix("agents.aaa.workspace", "agents.aaa."));
+        assert!(!path_matches_prefix("agents.aab.workspace", "agents.aaa."));
+        // Top-level sections.
+        assert!(path_matches_prefix("memory.backend", "memory"));
+        assert!(!path_matches_prefix("memory.backend", "mem"));
+        assert!(!path_matches_prefix("unrelated", "agents.aaa"));
+        // Empty prefix matches everything (no-filter semantics, parity
+        // with the bare starts_with behavior it replaced).
+        assert!(path_matches_prefix("anything.at.all", ""));
+        assert!(path_matches_prefix("", ""));
     }
 }

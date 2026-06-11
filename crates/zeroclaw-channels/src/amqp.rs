@@ -102,14 +102,14 @@ impl AmqpChannel {
 
     /// Establish a lapin connection on the existing tokio runtime, declaring
     /// the executor and reactor adapters so lapin does not spin its own
-    /// `async-global-executor`. A configured `ca_cert` is supplied as the
-    /// custom certificate chain for `amqps://` server verification, and a
-    /// configured `client_cert`/`client_key` pair is presented as the client
-    /// identity for broker mutual-TLS auth (Fedora Messaging requires this).
+    /// `async-global-executor`. The Tokio reactor adapter is Unix-only, so
+    /// non-Unix targets use lapin's cross-platform async-io reactor adapter.
+    /// A configured `ca_cert` is supplied as the custom certificate chain for
+    /// `amqps://` server verification, and a configured
+    /// `client_cert`/`client_key` pair is presented as the client identity for
+    /// broker mutual-TLS auth (Fedora Messaging requires this).
     async fn connect(&self) -> anyhow::Result<Connection> {
-        let props = ConnectionProperties::default()
-            .with_executor(tokio_executor_trait::Tokio::current())
-            .with_reactor(tokio_reactor_trait::Tokio);
+        let props = amqp_connection_properties();
 
         let cert_chain = match &self.ca_cert {
             Some(path) => Some(std::fs::read_to_string(path)?),
@@ -165,6 +165,21 @@ impl AmqpChannel {
             der,
             password: PKCS12_PASSWORD.to_string(),
         }))
+    }
+}
+
+fn amqp_connection_properties() -> ConnectionProperties {
+    let props =
+        ConnectionProperties::default().with_executor(tokio_executor_trait::Tokio::current());
+
+    #[cfg(unix)]
+    {
+        props.with_reactor(tokio_reactor_trait::Tokio)
+    }
+
+    #[cfg(not(unix))]
+    {
+        props.with_reactor(async_reactor_trait::AsyncIo)
     }
 }
 

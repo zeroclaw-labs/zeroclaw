@@ -935,8 +935,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         }
     }
 
+    /// Reports the instance's resolved endpoint so callers can verify which
+    /// host a responses provider will actually hit (e.g. a compat family's
+    /// default base vs. OpenAI's).
     fn default_base_url(&self) -> Option<&str> {
-        Some(RESPONSES_URL)
+        Some(&self.responses_url)
     }
 
     fn default_wire_api(&self) -> &str {
@@ -1126,6 +1129,19 @@ mod tests {
     fn creates_without_key() {
         let p = OpenAiModelProvider::new("test", None);
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn responses_url_appends_responses_to_custom_base() {
+        let p =
+            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
+        assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_defaults_to_openai_when_base_absent() {
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
     #[test]

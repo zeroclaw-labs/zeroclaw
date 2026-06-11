@@ -56,6 +56,15 @@ type ChannelMapFn = Box<
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
 
+const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "matrix",
+    "dingtalk",
+];
+
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
@@ -1286,10 +1295,7 @@ fn maybe_inject_channel_delivery_defaults(
         return;
     }
 
-    if !matches!(
-        channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
-    ) {
+    if !AUTO_DELIVERY_DEFAULT_CHANNELS.contains(&channel_name) {
         return;
     }
 
@@ -1567,11 +1573,21 @@ pub async fn run_tool_call_loop(
         let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
+        // Image markers that came from the user (inbound attachments), as
+        // opposed to tool results. A missing vision capability is handled
+        // differently for the two: a user image must surface an error (we
+        // cannot silently ignore what the user sent), while a tool-result
+        // image may degrade to text-only.
+        let user_image_marker_count = multimodal::count_user_image_markers(history);
 
         // ── Vision model_provider routing ──────────────────────────
         // When the default model_provider lacks vision support but a dedicated
         // vision_model_provider is configured, create it on demand and use it
-        // for this iteration.  Otherwise, preserve the original error.
+        // for this iteration. When no vision route exists at all, either
+        // surface a capability error (the user sent an image) or degrade
+        // gracefully (the markers came only from tool results) — see the
+        // no-vision-route branch below and `degrade_strip_images`.
+        let mut degrade_strip_images = false;
         let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
             && !model_provider.supports_vision()
         {
@@ -1596,6 +1612,9 @@ pub async fn run_tool_call_loop(
                         ))
                     })?;
                 if !vp_instance.supports_vision() {
+                    // Operator misconfiguration (named a non-vision provider as
+                    // the vision route) — surface it loudly rather than silently
+                    // degrading.
                     return Err(ProviderCapabilityError {
                         model_provider: vp.clone(),
                         capability: "vision".to_string(),
@@ -1606,7 +1625,12 @@ pub async fn run_tool_call_loop(
                     .into());
                 }
                 Some(vp_instance)
-            } else {
+            } else if user_image_marker_count > 0 {
+                // The user sent an image we cannot see. Surface a capability
+                // error so the attachment is not silently ignored — channels
+                // render this back to the user (e.g. "⚠️ Error … does not
+                // support vision"). Configuring a `vision_model_provider`
+                // routes around it.
                 return Err(ProviderCapabilityError {
                         model_provider: provider_name.to_string(),
                         capability: "vision".to_string(),
@@ -1615,6 +1639,29 @@ pub async fn run_tool_call_loop(
                         ),
                     }
                     .into());
+            } else {
+                // Markers came only from tool results (e.g. `image_info`,
+                // `screenshot`, `image_gen`). Previously this aborted the
+                // entire turn with a capability error, which turned an
+                // otherwise successful tool call (e.g. `image_info`, which
+                // always returns useful metadata text alongside its `[IMAGE:]`
+                // marker) into a hard failure. Instead, degrade: strip the
+                // image markers from the messages sent to the text-only
+                // provider while preserving the surrounding text, so the
+                // conversation continues and the model still receives any
+                // accompanying metadata/caption.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": provider_name,
+                            "image_marker_count": image_marker_count,
+                        })),
+                    "no vision route for tool-result image marker(s); degrading to text-only (markers stripped)"
+                );
+                degrade_strip_images = true;
+                None
             }
         } else {
             None
@@ -1635,8 +1682,22 @@ pub async fn run_tool_call_loop(
             (model_provider, provider_name, model)
         };
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = if degrade_strip_images {
+            // Text-only fallback: replace every media marker with a
+            // `[media attachment]` placeholder so no filesystem path or data
+            // URI reaches the text-only provider, while surrounding text
+            // (captions, tool metadata) survives.
+            let stripped: Vec<ChatMessage> = history
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: multimodal::strip_media_markers(&m.content),
+                })
+                .collect();
+            multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?
+        } else {
+            multimodal::prepare_messages_for_provider(history, multimodal_config).await?
+        };
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2493,7 +2554,8 @@ pub async fn run_tool_call_loop(
                     serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
                 (tool_name.trim().to_ascii_lowercase(), args_json)
             };
-            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
+            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name)
+                || crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
             if !dedup_exempt && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
@@ -2844,11 +2906,15 @@ pub async fn run_tool_call_loop(
                 history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
             }
         } else {
-            for (native_call, (_, result)) in
-                native_tool_calls.iter().zip(individual_results.iter())
-            {
+            // `zip` would drop trailing results on any length divergence,
+            // leaving a native tool_use id with no matching tool_result.
+            // Pair on each result's own id instead.
+            for (idx, (tool_call_id, result)) in individual_results.iter().enumerate() {
+                let resolved_id = tool_call_id
+                    .clone()
+                    .or_else(|| native_tool_calls.get(idx).map(|call| call.id.clone()));
                 let tool_msg = serde_json::json!({
-                    "tool_call_id": native_call.id,
+                    "tool_call_id": resolved_id,
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
@@ -3801,8 +3867,8 @@ pub async fn run(
                 &config.data_dir,
                 config.skills.install_suggestions.enabled,
             ) {
-                final_output = suggestion.clone();
-                println!("{suggestion}");
+                final_output = suggestion;
+                println!("{final_output}");
                 observer.record_event(&ObserverEvent::TurnComplete);
                 return Ok(final_output);
             }
@@ -4018,8 +4084,8 @@ pub async fn run(
                     }
                 }
             }
-            final_output = response.clone();
-            println!("{response}");
+            final_output = response;
+            println!("{final_output}");
             observer.record_event(&ObserverEvent::TurnComplete);
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
@@ -4168,11 +4234,11 @@ pub async fn run(
                     &config.data_dir,
                     config.skills.install_suggestions.enabled,
                 ) {
-                    final_output = suggestion.clone();
+                    final_output = suggestion;
                     if let Err(e) = zeroclaw_api::channel::Channel::send(
                         &*cli,
                         &zeroclaw_api::channel::SendMessage::new(
-                            format!("\n{suggestion}\n"),
+                            format!("\n{final_output}\n"),
                             "user",
                         ),
                     )
@@ -4444,12 +4510,12 @@ pub async fn run(
                 drop(delta_tx);
                 let _ = consumer_handle.await;
 
-                final_output = response.clone();
+                final_output = response;
                 if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
                     println!();
                 } else if let Err(e) = zeroclaw_api::channel::Channel::send(
                     &*cli,
-                    &zeroclaw_api::channel::SendMessage::new(format!("\n{response}\n"), "user"),
+                    &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
                 )
                 .await
                 {
@@ -5125,7 +5191,8 @@ pub async fn process_message(
 mod tests {
     use super::{
         apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
-        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
+        fast_trim_tool_results, load_interactive_session_history,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
         truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
@@ -5142,6 +5209,44 @@ mod tests {
         FailingTool,
         NamedMockTool,
     );
+
+    // ── maybe_inject_channel_delivery_defaults tests ──────────────
+
+    #[test]
+    fn cron_delivery_defaults_include_dingtalk_channel() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "schedule": { "kind": "every", "every_ms": 60000 }
+        });
+
+        maybe_inject_channel_delivery_defaults("cron_add", &mut args, "dingtalk", Some("chat-42"));
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "dingtalk",
+                "to": "chat-42",
+            })
+        );
+    }
+
+    #[test]
+    fn cron_delivery_defaults_do_not_guess_webhook_shape() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "remind me later",
+            "schedule": { "kind": "every", "every_ms": 60000 }
+        });
+
+        maybe_inject_channel_delivery_defaults("cron_add", &mut args, "webhook", Some("thread-42"));
+
+        assert!(
+            args.get("delivery").is_none(),
+            "webhook delivery needs sender/thread context and must not reuse reply_target as to"
+        );
+    }
 
     // ── truncate_tool_result tests ────────────────────────────────
 
@@ -5815,6 +5920,39 @@ mod tests {
             self.capabilities.native_tool_calling = true;
             self
         }
+
+        /// Build a native-tool-calling provider: one turn of structured
+        /// `tool_calls`, then a plain-text turn.
+        fn from_native_tool_calls(calls: Vec<(&str, &str, &str)>, final_text: &str) -> Self {
+            let tool_turn = ChatResponse {
+                text: None,
+                tool_calls: calls
+                    .into_iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                        extra_content: None,
+                    })
+                    .collect(),
+                usage: None,
+                reasoning_content: None,
+            };
+            let final_turn = ChatResponse {
+                text: Some(final_text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            };
+            let capabilities = ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            };
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::from(vec![tool_turn, final_turn]))),
+                capabilities,
+            }
+        }
     }
 
     #[async_trait]
@@ -6471,6 +6609,10 @@ mod tests {
         }
     }
 
+    /// A **user-supplied** image on a non-vision provider with no configured
+    /// `vision_model_provider` must surface a structured capability error
+    /// (channels render it back to the user) — we never silently ignore an
+    /// image the user actually sent.
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6516,7 +6658,7 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("model_provider without vision support should fail");
+        .expect_err("user image on a non-vision provider should error");
 
         assert!(err.to_string().contains("provider_capability_error"));
         assert!(err.to_string().contains("capability=vision"));
@@ -6642,22 +6784,30 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// When `vision_model_provider` is not set and the default model_provider lacks vision
-    /// support, the original `ProviderCapabilityError` should be returned.
+    /// A **tool-result** image marker (e.g. from `image_info`/`screenshot`)
+    /// on a non-vision provider with no `vision_model_provider` must NOT abort
+    /// the turn. The user did not send an image, so the loop degrades
+    /// gracefully: markers are stripped and the text-only provider is still
+    /// called so the conversation continues (and any accompanying
+    /// text/metadata survives).
     #[tokio::test]
-    async fn run_tool_call_loop_no_vision_provider_config_preserves_error() {
+    async fn run_tool_call_loop_degrades_tool_result_image_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
+        // Marker lives in a tool result, not a user message.
+        let mut history = vec![
+            ChatMessage::user("inspect the screenshot".to_string()),
+            ChatMessage::tool(
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            ),
+        ];
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &model_provider,
             &mut history,
             &tools_registry,
@@ -6689,10 +6839,11 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should fail without vision_model_provider config");
+        .expect("text-only fallback should succeed, not abort the turn");
 
-        assert!(err.to_string().contains("capability=vision"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Provider was invoked (no hard capability error) and returned text.
+        assert_eq!(result, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// When `vision_model_provider` is set but the model_provider factory cannot resolve
@@ -7162,6 +7313,112 @@ mod tests {
         );
     }
 
+    /// Regression: a native provider emitting multiple parallel tool calls
+    /// in one turn must yield one role=tool message per call, each keyed to
+    /// its own tool_call_id and output.
+    #[tokio::test]
+    async fn run_tool_call_loop_native_emits_tool_message_per_parallel_call() {
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![
+                ("call_a", "delay_a", r#"{"value":"A"}"#),
+                ("call_b", "delay_b", r#"{"value":"B"}"#),
+                ("call_c", "delay_c", r#"{"value":"C"}"#),
+            ],
+            "done",
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_c",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+        ];
+
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run three tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            true, // parallel_tools
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("native parallel execution should complete");
+
+        assert!(result.ends_with("done"), "got: {result}");
+
+        let tool_messages: Vec<&ChatMessage> =
+            history.iter().filter(|msg| msg.role == "tool").collect();
+        assert_eq!(
+            tool_messages.len(),
+            3,
+            "every parallel native call must yield its own role=tool message, got: {tool_messages:?}"
+        );
+
+        for (id, value) in [("call_a", "A"), ("call_b", "B"), ("call_c", "C")] {
+            let msg = tool_messages
+                .iter()
+                .find(|m| m.content.contains(id))
+                .unwrap_or_else(|| panic!("missing tool message for {id}: {tool_messages:?}"));
+            assert!(
+                msg.content.contains(&format!("ok:{value}")),
+                "tool_call_id {id} must carry its own output ok:{value}, got: {}",
+                msg.content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
@@ -7531,6 +7788,75 @@ mod tests {
         assert!(
             !tool_results.content.contains("Skipped duplicate tool call"),
             "exempt tool calls should not be suppressed"
+        );
+    }
+
+    /// Identical-prompt calls to re-entrant agent tools (spawn_subagent /
+    /// delegate) must both run even with no config exemption — fan-out is
+    /// intentional, not a duplicate to collapse.
+    #[tokio::test]
+    async fn run_tool_call_loop_reentrant_agent_tools_are_dedup_exempt_by_default() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"spawn_subagent","arguments":{"prompt":"same"}}
+</tool_call>
+<tool_call>
+{"name":"spawn_subagent","arguments":{"prompt":"same"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "spawn_subagent",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("fan out two identical subagents"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[], // no config-provided dedup exemptions
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("loop should finish running both identical subagent calls");
+
+        assert!(result.ends_with("done"), "got: {result}");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "both identical spawn_subagent calls must execute"
         );
     }
 

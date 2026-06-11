@@ -740,6 +740,10 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
+/// Runtime profile the Quickstart silently installs. The Runtime Profile
+/// picker was removed from every surface; apply always writes this preset.
+const FORCED_RUNTIME_PRESET: &str = "unbounded";
+
 fn apply_into(
     config: &mut Config,
     submission: &BuilderSubmission,
@@ -770,14 +774,17 @@ fn apply_into(
         &risk_alias,
     );
 
-    let runtime_alias = apply_named_preset(
-        config,
-        &submission.runtime_profile,
-        QuickstartStep::RuntimeProfile,
-        runtime_preset_keys,
-        write_runtime_preset,
-        errors,
-    )?;
+    let runtime_alias = match write_runtime_preset(config, FORCED_RUNTIME_PRESET) {
+        Ok(alias) => alias,
+        Err(msg) => {
+            errors.push(QuickstartError::new(
+                QuickstartStep::RuntimeProfile,
+                "",
+                msg,
+            ));
+            return None;
+        }
+    };
     emit_selector_pick(
         ctx,
         "runtime_profile",
@@ -1049,10 +1056,6 @@ where
 
 fn risk_preset_keys(config: &Config) -> Vec<String> {
     config.risk_profiles.keys().cloned().collect()
-}
-
-fn runtime_preset_keys(config: &Config) -> Vec<String> {
-    config.runtime_profiles.keys().cloned().collect()
 }
 
 fn write_risk_preset(config: &mut Config, preset_name: &str) -> Result<String, String> {
@@ -1602,20 +1605,37 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
-/// Live model catalog for a provider type. `(models, live)`:
+/// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
-/// means fall back to free text. Tries `ModelProvider::list_models()`
-/// first, then the family catalog table.
-pub async fn model_catalog(model_provider: &str) -> (Vec<String>, bool) {
+/// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
+/// first, then the family catalog table (no pricing for fallbacks).
+pub async fn model_catalog(
+    model_provider: &str,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
     if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
-        && let Ok(models) = handle.list_models().await
+        && let Ok(models) = handle.list_models_with_pricing().await
         && !models.is_empty()
     {
-        return (models, true);
+        let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
+            models
+                .iter()
+                .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+                .collect();
+        let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+        let pricing = if pricing.is_empty() {
+            None
+        } else {
+            Some(pricing)
+        };
+        return (ids, pricing, true);
     }
     match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
-        Ok(models) if !models.is_empty() => (models, true),
-        _ => (Vec::new(), false),
+        Ok(models) if !models.is_empty() => (models, None, true),
+        _ => (Vec::new(), None, false),
     }
 }
 
@@ -1946,21 +1966,23 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
+        // The runtime profile picker was removed; apply silently forces the
+        // `unbounded` preset regardless of the submitted runtime value.
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
         assert!(applied.risk_profiles.contains_key("balanced"));
-        assert!(applied.runtime_profiles.contains_key("balanced"));
+        assert!(applied.runtime_profiles.contains_key("unbounded"));
         let reloaded = reload(&dir);
         assert!(
             reloaded.risk_profiles.contains_key("balanced"),
             "risk_profiles.balanced must survive save_dirty + reload, not dangle"
         );
         assert!(
-            reloaded.runtime_profiles.contains_key("balanced"),
-            "runtime_profiles.balanced must survive save_dirty + reload, not dangle"
+            reloaded.runtime_profiles.contains_key("unbounded"),
+            "runtime_profiles.unbounded must survive save_dirty + reload, not dangle"
         );
         let agent = reloaded.agents.get("bot").expect("agent persisted");
         assert_eq!(agent.risk_profile, "balanced");
-        assert_eq!(agent.runtime_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "unbounded");
     }
 
     #[tokio::test]
