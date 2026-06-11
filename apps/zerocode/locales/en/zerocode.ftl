@@ -40,13 +40,13 @@ zc-zerocode-conn-edit-text = Enter to save, Esc to cancel.
 zc-zerocode-conn-edit-bool = Enter toggles; this field saves on toggle.
 zc-zerocode-conn-edit-routes = One route per line. Enter for a new line, Ctrl+S to save, Esc to cancel.
 zc-zerocode-locale-loading = loading locales…
-zc-zerocode-locale-download = ⬇ Download locale file
-zc-zerocode-locale-set = Locale set to { $locale }. Restart to apply.
+zc-zerocode-locale-download = ⬇ Download selected locale file
+zc-zerocode-locale-set = Locale set to { $locale }. Download its locale file if needed, then restart to apply.
 zc-zerocode-locale-fetching = Downloading locale files for { $locale }…
 zc-zerocode-locale-downloaded = Downloaded { $written } for { $locale }. Skipped: { $skipped }
 zc-zerocode-locale-fetch-failed = Locale download failed for { $locale }: { $err }
 zc-zerocode-locale-list-failed = Failed to load locale list: { $err }
-zc-zerocode-locale-pick-first = Select a locale first, then download.
+zc-zerocode-locale-pick-first = Select a locale row first, then download its locale file.
 zc-zerocode-help-locale = select / download locale
 zc-zerocode-help-conn = edit connection field
 
