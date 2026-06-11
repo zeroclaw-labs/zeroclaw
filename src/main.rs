@@ -39,6 +39,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
@@ -5893,10 +5894,10 @@ fn paircode_command(host: &str, port: u16, flag: Option<&str>) -> String {
         command.push_str(flag);
     }
     if port != 42617 {
-        command.push_str(&format!(" --port {port}"));
+        write!(command, " --port {port}").expect("writing to String cannot fail");
     }
     if host != "127.0.0.1" {
-        command.push_str(&format!(" --host {host}"));
+        write!(command, " --host {host}").expect("writing to String cannot fail");
     }
     command
 }
@@ -6352,7 +6353,7 @@ fn gateway_paircode_recovery_command(host: &str, port: u16) -> String {
 
     let mut command = format!("    zeroclaw gateway get-paircode --port {port}");
     if host != "127.0.0.1" {
-        command.push_str(&format!(" --host {host}"));
+        write!(command, " --host {host}").expect("writing to String cannot fail");
     }
     command
 }

@@ -2309,8 +2309,8 @@ fn is_model_field(field: &QuickstartFieldDescriptor) -> bool {
     field.key.eq_ignore_ascii_case("model") || field.label.eq_ignore_ascii_case("model")
 }
 
-fn sort_quickstart_models(_provider: &str, models: Vec<String>) -> Option<Vec<String>> {
-    (!models.is_empty()).then_some(models)
+fn sort_quickstart_models(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
+    zeroclaw_providers::catalog::sort_model_catalog_for_chat(provider, models)
 }
 
 fn build_field_form_rows(
