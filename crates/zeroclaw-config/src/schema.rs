@@ -7055,6 +7055,19 @@ pub struct PluginsConfig {
     pub security: PluginSecurityConfig,
 }
 
+impl PluginsConfig {
+    /// Resolve `plugins_dir` to an absolute path, expanding a leading `~/`.
+    ///
+    /// This is the single source of truth for the plugin directory: the CLI,
+    /// runtime tool/skill discovery, and the gateway all resolve through it so
+    /// that `zeroclaw plugin install` and the agent agree on one location.
+    /// Pure — performs no filesystem I/O.
+    #[must_use]
+    pub fn resolved_plugins_dir(&self) -> PathBuf {
+        expand_tilde_path(&self.plugins_dir)
+    }
+}
+
 /// Plugin signature verification configuration (`[plugins.security]`).
 ///
 /// Controls Ed25519 signature verification for plugin manifests.
@@ -14641,6 +14654,37 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     PathBuf::from(expanded_str)
 }
 
+/// Returns the legacy plugin directories that still hold installed plugins not
+/// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
+///
+/// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
+/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
+/// is reported only when it differs from the configured plugins dir and contains
+/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
+/// migration hint and to drive `zeroclaw plugin migrate`.
+#[must_use]
+pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
+    let target = config.plugins.resolved_plugins_dir();
+    [
+        config.data_dir.join("plugins"),
+        config.install_root_dir().join("workspace").join("plugins"),
+    ]
+    .into_iter()
+    .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
+    .collect()
+}
+
+/// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
+/// `manifest.toml`).
+fn dir_has_plugin(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().join("manifest.toml").exists())
+}
+
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
 /// the Homebrew-managed config directory.
 ///
@@ -18277,6 +18321,84 @@ mod tests {
                 "Tilde should be expanded when HOME is set"
             );
         }
+    }
+
+    // ── Plugins dir resolution ────────────────────────────────
+
+    #[test]
+    async fn resolved_plugins_dir_passes_absolute_path_through() {
+        let cfg = PluginsConfig {
+            plugins_dir: "/srv/plugins".to_string(),
+            ..PluginsConfig::default()
+        };
+        assert_eq!(cfg.resolved_plugins_dir(), PathBuf::from("/srv/plugins"));
+    }
+
+    #[test]
+    async fn resolved_plugins_dir_expands_leading_tilde() {
+        let cfg = PluginsConfig {
+            plugins_dir: "~/.zeroclaw/plugins".to_string(),
+            ..PluginsConfig::default()
+        };
+        let resolved = cfg.resolved_plugins_dir();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with(".zeroclaw/plugins"));
+        }
+    }
+
+    /// Build a `Config` whose data dir, install root, and configured plugins dir
+    /// live under `root`, and create a plugin at `<parent>/<name>/manifest.toml`.
+    fn config_with_dirs(root: &Path) -> Config {
+        let mut config = Config::default();
+        config.data_dir = root.join("data");
+        config.config_path = root.join("install").join("config.toml");
+        config.plugins.plugins_dir = root.join("plugins").to_string_lossy().into_owned();
+        config
+    }
+
+    fn write_plugin(parent: &Path, name: &str) {
+        std::fs::create_dir_all(parent.join(name)).unwrap();
+        std::fs::write(parent.join(name).join("manifest.toml"), "name = \"x\"\n").unwrap();
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_detects_data_and_workspace_locations() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        write_plugin(&config.data_dir.join("plugins"), "fromdata");
+        write_plugin(
+            &config.install_root_dir().join("workspace").join("plugins"),
+            "fromworkspace",
+        );
+
+        let dirs = legacy_plugin_dirs_with_entries(&config);
+        assert_eq!(dirs.len(), 2, "both legacy locations should be reported");
+        assert!(dirs.contains(&config.data_dir.join("plugins")));
+        assert!(dirs.contains(&config.install_root_dir().join("workspace").join("plugins")));
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_empty_when_no_legacy_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        // Plugin lives in the configured dir, not a legacy one.
+        write_plugin(&config.plugins.resolved_plugins_dir(), "current");
+
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_dir_equal_to_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        // Point the configured plugins dir AT the legacy data dir.
+        let data_plugins = config.data_dir.join("plugins");
+        config.plugins.plugins_dir = data_plugins.to_string_lossy().into_owned();
+        write_plugin(&data_plugins, "same");
+
+        // The data-dir candidate now equals the target → not a "legacy" dir.
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
     }
 
     // ── Defaults ─────────────────────────────────────────────
