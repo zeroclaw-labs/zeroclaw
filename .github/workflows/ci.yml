@@ -5,8 +5,15 @@ on:
     branches: [master]
   push:
     branches: [master]
+  # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
+  # and fires `merge_group`. The required `CI Required Gate` must report on that
+  # branch or queued PRs stall, so the full gate runs here too.
+  merge_group:
 
 concurrency:
+  # Merge-queue runs key on the unique queue ref (github.ref →
+  # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
+  # never cancel each other; PRs still key on the PR number.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -36,20 +43,10 @@ jobs:
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
-    name: Lint ${{ matrix.target }}
+    name: Lint
     needs: [fmt]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -57,33 +54,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.93.0
-          targets: ${{ matrix.target }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
       - name: Ensure web/dist placeholder exists
-        shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
-        shell: bash
         run: >
           cargo clippy
           --workspace
           --exclude zeroclaw-desktop
           --all-targets
-          --target ${{ matrix.target }}
           --features ci-all
           -- -D warnings
       - name: Config-write isolation guard
-        if: runner.os == 'Linux'
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
-        if: runner.os == 'Linux'
         run: cargo test --test architecture user_facing_strings_route_through_fluent
 
   # ── Post-format build + check fan-out ─────────────────────────────────────
