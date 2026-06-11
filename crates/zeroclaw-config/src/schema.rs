@@ -3318,13 +3318,13 @@ impl Config {
 
     // ── Effective per-agent runtime tunables ──────────────────────────
     //
-    // Precedence: `[runtime_profiles.<profile>].<field>` (when explicitly
-    // set / non-sentinel) wins over `[agents.<alias>].<field>`. This
-    // matches the documented "None inherits" semantics on
-    // `RuntimeProfileConfig` and the precedence that
-    // `crates/zeroclaw-runtime/src/tools/delegate.rs` already applies for
-    // subagent dispatch. The agent inline field remains the fallback so
-    // configs that only set the agent value keep working unchanged.
+    // Runtime tunables live on `[runtime_profiles.<profile>]`, referenced by an
+    // agent via `agents.<alias>.runtime_profile`. A profile value that is
+    // explicitly set (non-sentinel, i.e. `> 0` for `max_tool_iterations`) is
+    // authoritative; otherwise the global default applies. Agent-inline copies
+    // of these tunable keys are inert — superseded by runtime profiles (see the
+    // `agent_level_tunable_keys_are_inert` test) — so they are deliberately not
+    // consulted here as a fallback (#6877).
 
     #[must_use]
     pub fn effective_max_tool_iterations(&self, agent_alias: &str) -> usize {
@@ -4109,12 +4109,12 @@ pub struct McpServerConfig {
 pub struct McpConfig {
     /// Enable MCP tool loading.
     #[tab(Settings)]
-    #[serde(default)]
+    #[serde(default = "default_mcp_enabled")]
     pub enabled: bool,
     /// Load MCP tool schemas on-demand via `tool_search` instead of eagerly
-    /// including them in the LLM context window. When `true` (the default),
-    /// only tool names are listed in the system prompt; the LLM must call
-    /// `tool_search` to fetch full schemas before invoking a deferred tool.
+    /// including them in the LLM context window. When enabled, only tool names
+    /// are listed in the system prompt; the LLM must call `tool_search` to fetch
+    /// full schemas before invoking a deferred tool.
     #[tab(Settings)]
     #[serde(default = "default_deferred_loading")]
     pub deferred_loading: bool,
@@ -4129,14 +4129,18 @@ pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
 }
 
-fn default_deferred_loading() -> bool {
+fn default_mcp_enabled() -> bool {
     true
+}
+
+fn default_deferred_loading() -> bool {
+    false
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_mcp_enabled(),
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
         }
@@ -8901,7 +8905,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 /// Persistent storage configuration (`[storage]` section).
 ///
 /// Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
-/// parallel to `[model_providers.<type>.<alias>]`. Each backend has its own typed
+/// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
 /// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
 /// `"postgres.work"`) that resolves to one of these entries via
 /// [`Config::resolve_active_storage`].
@@ -9537,6 +9541,7 @@ fn default_auto_approve() -> Vec<String> {
         "content_search".into(),
         "image_info".into(),
         "weather".into(),
+        "tool_search".into(),
         "browser".into(),
         "browser_open".into(),
     ]
@@ -12041,6 +12046,10 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Cancel an in-flight response from this channel sender when a newer
+    /// WhatsApp message arrives. Default: `false`.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// In personal mode the bot applies dm_policy, group_policy, and
     /// self_chat_mode to decide which chats to respond in.
@@ -15035,6 +15044,43 @@ impl Config {
             .collect()
     }
 
+    /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
+    /// whose family is not a known typed slot (kinds: models, tts,
+    /// transcription). Serde silently drops these sections at deserialize
+    /// time, so a typo'd family (`[providers.models.antropic.x]`) or one
+    /// from a newer binary vanishes on reload: the alias "works" in the
+    /// session that created it, then disappears after restart.
+    pub fn unknown_provider_families(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let Some(kinds) = raw.get("providers").and_then(toml::Value::as_table) else {
+            return Vec::new();
+        };
+        let kind_slots: &[(&str, &[&str])] = &[
+            ("models", crate::providers::ModelProviders::slot_names()),
+            ("tts", crate::providers::TtsProviders::slot_names()),
+            (
+                "transcription",
+                crate::providers::TranscriptionProviders::slot_names(),
+            ),
+        ];
+        let mut out = Vec::new();
+        for (kind, slots) in kind_slots {
+            let Some(families) = kinds.get(*kind).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            out.extend(
+                families
+                    .keys()
+                    .filter(|k| !slots.contains(&k.as_str()))
+                    .map(|k| format!("{kind}.{k}")),
+            );
+        }
+        out
+    }
+
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
     /// override at load time. O(1) HashSet lookup; safe to call per row in
     /// list-rendering paths (`config list`, dashboard, quickstart).
@@ -15261,6 +15307,28 @@ impl Config {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"key": key})),
                     "Unknown config key ignored: \"\". Check config.toml for typos or deprecated options."
+                );
+            }
+            // Unknown provider families are dropped by serde, so an alias
+            // created under a typo'd or unsupported family silently vanishes
+            // on reload while agents.*.model_provider still references it.
+            for entry in Self::unknown_provider_families(&contents) {
+                let (kind, family) = entry.split_once('.').unwrap_or(("models", entry.as_str()));
+                let reference = if kind == "models" {
+                    "any agents.*.model_provider referencing them will fail to resolve; \
+                     run `zeroclaw providers` for valid family names"
+                } else {
+                    "references to its aliases will fail to resolve"
+                };
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"kind": kind, "family": family})),
+                    &format!(
+                        "[providers.{kind}.{family}] section dropped: not a known {kind} \
+                         provider family. Its aliases will not load and {reference}."
+                    )
                 );
             }
             // Set computed paths that are skipped during serialization
@@ -15853,7 +15921,7 @@ impl Config {
                 );
             }
             // Route refs are dotted `<type>.<alias>` and must resolve to a
-            // configured `[model_providers.<type>.<alias>]` entry. Unresolved
+            // configured `[providers.models.<type>.<alias>]` entry. Unresolved
             // routes are dropped at runtime construction; rejecting them here
             // keeps that drift visible at config-load time.
             match mp.split_once('.') {
@@ -16448,6 +16516,13 @@ impl Config {
             }
             match mp.split_once('.') {
                 Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.model_provider"),
+                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
+                        );
+                    }
                     let exists = self
                         .get_map_keys(&format!("providers.models.{ty}"))
                         .is_some_and(|keys| keys.iter().any(|k| k == inner));
@@ -16455,7 +16530,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
+                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
                         );
                     }
                 }
@@ -18115,7 +18190,7 @@ auto_save = true
         // Ollama-specific tuning lives on `OllamaModelProviderConfig`,
         // not on the generic `ModelProviderConfig` base. These knobs
         // ride alongside the flattened `base` so a TOML alias like
-        // `[model_providers.ollama.local]` accepts them at the same
+        // `[providers.models.ollama.local]` accepts them at the same
         // level as `model`, `api_key`, etc.
         let toml = r#"
             num_ctx = 16384
@@ -18598,6 +18673,12 @@ auto_approve = ["my_custom_tool", "another_tool"]
         }
     }
 
+    #[test]
+    async fn default_auto_approve_includes_tool_search() {
+        let defaults = default_auto_approve();
+        assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
     /// Regression test: empty auto_approve still gets defaults merged.
     #[test]
     async fn auto_approve_empty_list_gets_defaults() {
@@ -18818,6 +18899,38 @@ strict_tool_parsing = true
         assert_eq!(agent.resolved.max_tool_iterations, 10);
         assert_eq!(agent.resolved.tool_dispatcher, "auto");
         assert!(!agent.resolved.strict_tool_parsing);
+    }
+
+    #[test]
+    async fn runtime_profile_max_tool_iterations_is_honored() {
+        // #6877: `[runtime_profiles.*].max_tool_iterations` must actually take
+        // effect. It previously had no effect (the value had to be set on
+        // `[agents.*]`); now agent-inline is inert and the profile is the
+        // authoritative surface, so this guards the resolved value.
+        let raw = r#"
+[runtime_profiles.fast]
+max_tool_iterations = 25
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_unset_max_tool_iterations_uses_default() {
+        // A profile that does not set max_tool_iterations (sentinel 0) falls
+        // back to the global default rather than 0.
+        let raw = r#"
+[runtime_profiles.fast]
+max_history_messages = 80
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
     }
 
     #[test]
@@ -20028,6 +20141,20 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn whatsapp_config_default_interrupt_on_new_message_is_false() {
+        let json = r#"{"session_path":"/tmp/zeroclaw-whatsapp-session.db"}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn whatsapp_config_deserializes_interrupt_on_new_message_true() {
+        let json = r#"{"session_path":"/tmp/zeroclaw-whatsapp-session.db","interrupt_on_new_message":true}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
+    }
+
+    #[test]
     async fn webhook_config_with_secret() {
         let json = r#"{"port":8080,"secret":"my-secret-key"}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
@@ -20103,6 +20230,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20135,6 +20263,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20190,6 +20319,7 @@ allowed_numbers = ["+1", "+2"]
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20219,6 +20349,7 @@ allowed_numbers = ["+1", "+2"]
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -20260,6 +20391,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_code: None,
                     ws_url: None,
                     mention_only: false,
+                    interrupt_on_new_message: false,
                     mode: WhatsAppWebMode::default(),
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
@@ -22824,10 +22956,45 @@ require_otp_to_resume = true
     }
 
     #[test]
-    async fn mcp_config_default_disabled_with_empty_servers() {
+    async fn mcp_config_defaults_enabled_eager_loading_with_empty_servers() {
         let cfg = McpConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
+        assert!(!cfg.deferred_loading);
         assert!(cfg.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_config_parsed_missing_flags_uses_enabled_eager_defaults() {
+        let raw = r#"
+[mcp]
+
+[[mcp.servers]]
+name = "svc"
+transport = "http"
+url = "http://localhost:8080/mcp"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.mcp.enabled);
+        assert!(!parsed.mcp.deferred_loading);
+        assert_eq!(parsed.mcp.servers.len(), 1);
+    }
+
+    #[test]
+    async fn mcp_config_explicit_disable_and_deferred_loading_are_respected() {
+        let raw = r#"
+[mcp]
+enabled = false
+deferred_loading = true
+
+[[mcp.servers]]
+name = "svc"
+transport = "http"
+url = "http://localhost:8080/mcp"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(!parsed.mcp.enabled);
+        assert!(parsed.mcp.deferred_loading);
+        assert_eq!(parsed.mcp.servers.len(), 1);
     }
 
     #[test]
@@ -24380,6 +24547,127 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .create_map_key("not.a.real.section", "anything")
             .expect_err("unknown section path should error");
         assert!(err.contains("not.a.real.section"));
+    }
+
+    #[test]
+    async fn provider_slot_names_match_struct_fields() {
+        // TtsProviders/TranscriptionProviders::slot_names are inline lists
+        // (their slot macros carry a rate-type param); pin them against the
+        // actual serialized field names so adding a family without updating
+        // slot_names fails here.
+        let tts = toml::Value::try_from(crate::providers::TtsProviders {
+            openai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            elevenlabs: std::iter::once(("a".to_string(), Default::default())).collect(),
+            google: std::iter::once(("a".to_string(), Default::default())).collect(),
+            edge: std::iter::once(("a".to_string(), Default::default())).collect(),
+            piper: std::iter::once(("a".to_string(), Default::default())).collect(),
+        })
+        .unwrap();
+        let mut tts_fields: Vec<&str> =
+            tts.as_table().unwrap().keys().map(String::as_str).collect();
+        tts_fields.sort_unstable();
+        let mut tts_slots = crate::providers::TtsProviders::slot_names().to_vec();
+        tts_slots.sort_unstable();
+        assert_eq!(tts_fields, tts_slots);
+
+        let tr = toml::Value::try_from(crate::providers::TranscriptionProviders {
+            groq: std::iter::once(("a".to_string(), Default::default())).collect(),
+            openai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            deepgram: std::iter::once(("a".to_string(), Default::default())).collect(),
+            assemblyai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            google: std::iter::once(("a".to_string(), Default::default())).collect(),
+            local_whisper: std::iter::once(("a".to_string(), Default::default())).collect(),
+        })
+        .unwrap();
+        let mut tr_fields: Vec<&str> = tr.as_table().unwrap().keys().map(String::as_str).collect();
+        tr_fields.sort_unstable();
+        let mut tr_slots = crate::providers::TranscriptionProviders::slot_names().to_vec();
+        tr_slots.sort_unstable();
+        assert_eq!(tr_fields, tr_slots);
+    }
+
+    #[test]
+    async fn unknown_provider_families_flags_silent_serde_drop() {
+        // serde ignores unknown keys under providers.models, so a typo'd
+        // family parses cleanly and its aliases vanish on reload. The
+        // detector must flag it; known families must pass.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.antropic.main]
+model = "claude-sonnet-4-6"
+
+[providers.models.openai.work]
+model = "gpt-4o"
+"#;
+        let parsed: Config = toml::from_str(raw).expect("unknown family must not fail parse");
+        assert!(
+            parsed.providers.models.find("antropic", "main").is_none(),
+            "precondition: serde silently drops the unknown family"
+        );
+        assert_eq!(
+            Config::unknown_provider_families(raw),
+            vec!["models.antropic".to_string()]
+        );
+        assert_eq!(
+            Config::unknown_provider_families(
+                "schema_version = 3\n[providers.tts.bogustts.x]\nenabled = true\n",
+            ),
+            vec!["tts.bogustts".to_string()]
+        );
+        assert!(Config::unknown_provider_families("not even toml {{{").is_empty());
+        // Hostile shapes: scalar providers node, scalar kind node,
+        // array-of-tables family. as_table() filters all of them; the
+        // detector must stay silent rather than panic or false-positive.
+        assert!(Config::unknown_provider_families("providers = 3\n").is_empty());
+        assert!(Config::unknown_provider_families("[providers]\nmodels = 3\n").is_empty());
+        assert_eq!(
+            Config::unknown_provider_families("[[providers.models.weird]]\nx = 1\n"),
+            vec!["models.weird".to_string()],
+            "array-of-tables under an unknown family is still an unknown family"
+        );
+    }
+
+    #[test]
+    async fn map_key_create_survives_incremental_save() {
+        // Repro for the zerocode "providers vanish after restart" report:
+        // the RPC config/map-key-create path is create_map_key + mark_dirty
+        // + save_dirty. The new alias must reach config.toml, otherwise it
+        // exists only in-memory and a daemon restart silently drops it
+        // (and any agents.*.model_provider referencing it dangles).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed a non-empty on-disk file so the incremental path runs, not
+        // the new-file fallback to full save().
+        std::fs::write(
+            &config_path,
+            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        let created = config
+            .create_map_key("providers.models.openai", "myalias")
+            .expect("typed family slot accepts a new alias");
+        assert!(created);
+        config.mark_dirty("providers.models.openai.myalias");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "myalias")
+                .is_some(),
+            "created alias must survive save_dirty + reload; got:\n{written}"
+        );
     }
 
     #[test]

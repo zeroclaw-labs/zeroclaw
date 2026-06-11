@@ -41,6 +41,44 @@ Run a local-Ollama agent and a hosted-provider agent side by side; route each ch
 
 The `dev` agent runs from the CLI (no channel binding required, `zeroclaw agent -a dev` is enough). When Ollama is down, the dev agent fails fast and surfaces the error. The prod channels are unaffected.
 
+## Local-small no-text-fallback profile
+
+Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use `[runtime_profiles.<alias>]` to tighten the prompt/tool loop behavior.
+
+```toml
+[providers.models.ollama.local]
+uri   = "http://localhost:11434"
+model = "qwen2.5-coder:7b"
+
+[agents.local]
+model_provider  = "ollama.local"
+risk_profile    = "supervised"
+runtime_profile = "local_small"
+
+[risk_profiles.supervised]
+level                            = "supervised"
+workspace_only                   = true
+require_approval_for_medium_risk = true
+block_high_risk_commands         = true
+
+[runtime_profiles.local_small]
+compact_context          = true
+strict_tool_parsing      = true
+max_tool_iterations      = 4
+max_history_messages     = 20
+max_context_tokens       = 8000
+max_tool_result_chars    = 4000
+keep_tool_context_turns  = 1
+```
+
+This profile composes existing primitives:
+
+- `compact_context` keeps startup context small.
+- `strict_tool_parsing` treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.
+- `max_tool_iterations`, `max_context_tokens`, and `max_tool_result_chars` bound runaway loops and oversized tool context.
+
+With Ollama, this is a no-text-fallback profile: authorized tools remain configured in `risk_profile`, but text-form tool markup from the model is not executed. Use it for chat-first local agents, or for providers that return native/structured tool calls. If a local model must use ZeroClaw's text fallback tool syntax, set `strict_tool_parsing = false` and keep the other small-model limits.
+
 ## Cost tiering: heavy model when needed, fast model otherwise
 
 Run two agents and route channels to the appropriate tier. The `delegate` tool lets one agent hand off to another mid-conversation. [Delegation](../agents/delegation.md) is gated: the caller's risk profile must set `delegation_policy mode = "allow"`, and **both agents must share the same risk profile** (delegation does not cross trust tiers). So the frontline and heavy agents below run on the *same* `trusted` risk profile, they differ in model and runtime profile (iteration budget), not in trust surface.

@@ -794,7 +794,7 @@ pub async fn handle_list(
         .prop_fields()
         .into_iter()
         .filter(|info| match prefix {
-            Some(p) => info.name.starts_with(p),
+            Some(p) => field_visibility::path_matches_prefix(&info.name, p),
             None => true,
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
