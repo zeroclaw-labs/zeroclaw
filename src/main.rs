@@ -431,7 +431,7 @@ enum Commands {
         api_key: Option<String>,
 
         /// ModelProvider name. Used as the type key for the synthesized
-        /// `[model_providers.<type>.default]` entry.
+        /// `[providers.models.<type>.default]` entry.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -4159,8 +4159,8 @@ async fn main() -> Result<()> {
                 }
             }
             println!(
-                "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \
-                 OpenAI-compatible endpoint, or [model_providers.anthropic.<alias>] \
+                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
+                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
                  uri = \"<URL>\" for an Anthropic-compatible endpoint."
             );
             Ok(())
