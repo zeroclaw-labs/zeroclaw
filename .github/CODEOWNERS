@@ -213,7 +213,7 @@ Cargo.lock @JordanTheJet
 # Specific overrides (must be last)
 # ---------------------------------------------------------------------------
 # Channels-crate Cargo.toml: legacy steward + channels owners
-/crates/zeroclaw-channels/Cargo.toml @Audacity88 @singlerider @JordanTheJet
+/crates/zeroclaw-channels/Cargo.toml @Audacity88 @singlerider @JordanTheJet @Nillth
 
 # Matrix backend
 /crates/zeroclaw-channels/src/matrix.rs @tidux @Audacity88 @singlerider
