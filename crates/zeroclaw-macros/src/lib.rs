@@ -757,6 +757,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #inner_ty_name,
                             description: #field_doc,
+                            // HashMap arm: the alias IS the TOML key, so the
+                            // incremental writer needs no natural-key hint
+                            // to descend through it.
+                            natural_key: None,
                         });
                     });
 
@@ -1039,6 +1043,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #value_ty_name,
                             description: #field_doc,
+                            // Double-HashMap arm: same story as the single
+                            // HashMap arm above — the alias IS the TOML
+                            // key, no natural-key hint needed.
+                            natural_key: None,
                         });
                     });
                     let validate_create = if is_resource_key {
@@ -1315,6 +1323,16 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
                 let field_doc = extract_doc(&field.attrs);
                 let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
+                // Bridge the `#[natural_key = "<f>"]` attribute (extracted
+                // far above as `natural_key_field`) into the
+                // `MapKeySection.natural_key` constant. Some/None decides
+                // whether the incremental TOML writer treats this Vec as a
+                // natural-key array of tables or as a legacy whole-array
+                // round-trip section.
+                let vec_natural_key_token = match &natural_key_field {
+                    Some(name) => quote! { Some(#name) },
+                    None => quote! { None },
+                };
                 if !field_doc.is_empty() {
                     nested_section_help_arms.push(quote! {
                         #vec_field_name_lit => Some(#field_doc),
@@ -1334,6 +1352,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         kind: crate::config::MapKeyKind::List,
                         value_type: #vec_inner_name,
                         description: #field_doc,
+                        // `#[natural_key = "<f>"]` Vec sections (currently
+                        // `mcp.servers`) need this hint so the incremental
+                        // TOML writer can walk a `<section>.<alias>.<inner>`
+                        // dirty path through the `[[mcp.servers]]` array
+                        // of tables. Plain Vec sections without the
+                        // attribute go through the legacy whole-array
+                        // `ObjectArray` round-trip and don't need
+                        // per-element addressing.
+                        natural_key: #vec_natural_key_token,
                     });
                 });
                 // `create_map_key` on a Vec section. Two flavours:

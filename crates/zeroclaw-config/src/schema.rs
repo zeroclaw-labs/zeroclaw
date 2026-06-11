@@ -17199,6 +17199,22 @@ fn apply_dirty_path(
     if raw.is_empty() {
         return;
     }
+
+    // Natural-key `Vec<T>` sections (`#[natural_key = "<f>"]`, currently
+    // `mcp.servers`) serialize as `[[mcp.servers]]` — an
+    // `Item::ArrayOfTables`, not a Table. The generic walker below
+    // assumes every intermediate node is a Table (`as_table()` /
+    // `as_table_mut()`), so without this branch a dirty path like
+    // `mcp.servers.fs.command` would resolve to `None` in `full_table`,
+    // get misclassified as `should_delete`, then bail at the
+    // `ArrayOfTables` segment in `delete_path_in_doc` too. Net effect:
+    // the per-field MCP editor's edits go nowhere on disk. See the
+    // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
+    if let Some(section) = find_natural_key_section_for_path(dotted) {
+        apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
+        return;
+    }
+
     // Resolve each segment against the in-memory table: struct fields
     // serialize as snake_case (so `input-per-mtok` → `input_per_mtok`), but
     // HashMap keys are preserved verbatim and may legitimately carry hyphens
@@ -17223,6 +17239,398 @@ fn apply_dirty_path(
         let mut pruned = value.clone();
         prune_empty_leaves(&mut pruned);
         set_path_in_doc(root, &segs, &pruned);
+    }
+}
+
+/// Resolved metadata for a `#[natural_key]` Vec section that matches a
+/// given dirty path. `section_path` is the dotted section (e.g.
+/// `"mcp.servers"`); `natural_key_field` is the snake_case field name
+/// on the inner type that holds each element's alias (e.g. `"name"`).
+struct NaturalKeySection {
+    section_path: &'static str,
+    natural_key_field: &'static str,
+}
+
+/// Return the longest natural-key `Kind::List` section whose path is a
+/// strict prefix of `dotted` (i.e. `dotted` starts with `<path>.`).
+/// Strict-prefix wins so a nested natural-key section would always
+/// outscore its parent; today there's only `mcp.servers`, so the lookup
+/// is effectively a single-entry match, but the longest-match rule
+/// keeps the writer correct when a future `#[natural_key]` Vec lands
+/// inside another section.
+///
+/// Plain `Kind::List` Vec sections without `#[natural_key]` (their
+/// `natural_key` is `None`) are intentionally excluded — those use the
+/// legacy whole-array `ObjectArray` save path and don't need the
+/// array-of-tables walker.
+fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> {
+    use crate::traits::MapKeyKind;
+
+    let mut best: Option<NaturalKeySection> = None;
+    for section in Config::map_key_sections().iter() {
+        if section.kind != MapKeyKind::List {
+            continue;
+        }
+        let Some(natural_key_field) = section.natural_key else {
+            continue;
+        };
+        let prefix = format!("{}.", section.path);
+        if !dotted.starts_with(&prefix) {
+            continue;
+        }
+        // Empty alias segment ("mcp.servers." with nothing after) can't
+        // be addressed by name; skip to avoid matching every otherwise-
+        // unmatched path via the empty prefix. Same guard the in-memory
+        // `route_vec_path` applies to empty natural keys.
+        if dotted.len() == prefix.len() {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .is_none_or(|b| section.path.len() > b.section_path.len());
+        if better {
+            best = Some(NaturalKeySection {
+                section_path: section.path,
+                natural_key_field,
+            });
+        }
+    }
+    best
+}
+
+/// Apply a dirty path of the form
+/// `<section_path>.<alias>[.<inner_suffix>...]` against an
+/// `[[<section_path>]]` array of tables.
+///
+/// Three shapes show up in practice:
+///
+///   1. `<section>.<alias>.<inner>` — per-field edit (the dashboard /
+///      TUI editor). Locate the in-memory element whose natural-key
+///      field equals `<alias>` and reconcile its `<inner>` sub-path
+///      against the doc's matching `[[<section>]]` table.
+///
+///   2. `<section>.<alias>` with the element still in memory — the
+///      whole-element write the rename path emits for the *new* alias.
+///      Reseed the matching doc entry from the in-memory serialization
+///      so a rename `fs` → `filesystem` updates the entire
+///      `[[mcp.servers]]` table (in particular its `name` field).
+///
+///   3. `<section>.<alias>` with the element gone from memory — the
+///      delete path the rename emits for the *old* alias, and what
+///      `delete_map_key` plus an explicit `mark_dirty` would produce.
+///      Drop the matching doc entry.
+///
+/// All three are handled by walking the doc through the section's
+/// non-array parents, locating the `ArrayOfTables` at the section's
+/// last path segment, then either editing or removing the entry whose
+/// natural-key field matches `<alias>`. The `<inner>` recursion reuses
+/// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
+/// helpers against the located entry's table.
+fn apply_dirty_natural_key_path(
+    root: &mut toml_edit::Table,
+    section: &NaturalKeySection,
+    dotted: &str,
+    full_table: &toml::Table,
+    default_table: &toml::Table,
+) {
+    // `dotted` is known to start with `<section_path>.` thanks to
+    // `find_natural_key_section_for_path`; split the alias and inner
+    // suffix off the tail.
+    let rest = match dotted
+        .strip_prefix(section.section_path)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        Some(r) => r,
+        None => return,
+    };
+    let (alias, inner_suffix) = match rest.split_once('.') {
+        Some((a, i)) => (a, Some(i)),
+        None => (rest, None),
+    };
+    if alias.is_empty() {
+        return;
+    }
+
+    // Walk the in-memory serialized array at `section_path`. Each
+    // element is a `toml::Value::Table`; the alias lives in the
+    // `natural_key_field` column.
+    let section_segs: Vec<&str> = section.section_path.split('.').collect();
+    let mem_array = lookup_path_in_table(full_table, &section_segs).and_then(|v| v.as_array());
+    let mem_entry = mem_array.and_then(|arr| {
+        arr.iter().find_map(|item| {
+            let table = item.as_table()?;
+            let alias_value = table.get(section.natural_key_field)?.as_str()?;
+            (alias_value == alias).then_some(table)
+        })
+    });
+
+    // The doc cursor walks the section's parent Tables (e.g. `mcp`) and
+    // arrives at the array node (`servers`). The natural-key Vec is
+    // always at the deepest segment of `section_path`; the leading
+    // segments are plain struct fields and therefore Tables on disk.
+    let Some((array_key, parent_segs)) = section_segs.split_last() else {
+        return;
+    };
+
+    // Inner-suffix path: per-field edit (case 1). Reconcile the inner
+    // sub-path on the matched doc table the same way the generic
+    // Table-shaped walker does — mem-vs-default comparison decides
+    // delete vs write — and bail out before touching the array spine
+    // if the entry doesn't exist in either memory or the doc.
+    if let Some(inner) = inner_suffix {
+        // Look up the same inner sub-path on the default-shaped element.
+        // `Config::default()` always has an empty `mcp.servers` (and no
+        // default natural-key Vec entry is non-empty), so we synthesize
+        // the default by going through the inner type's own
+        // `Default` impl via the existing `default_table` plus an
+        // alias-keyed lookup. The Vec being empty in defaults means
+        // `default_array_entry` is always `None`, which mirrors the
+        // existing HashMap behaviour: `default_val` for an alias's
+        // child is None too, because the alias key doesn't exist in
+        // `Config::default()`. Keep the comparison shape identical so
+        // the delete-on-default rule degrades the same way the HashMap
+        // path already does (i.e. it doesn't catch "field is set to
+        // its serde default"; that limitation is shared and not a
+        // regression from this fix).
+        let _ = default_table; // currently unused — see note above.
+
+        let inner_raw: Vec<&str> = inner.split('.').collect();
+        let inner_segments: Vec<String> = match mem_entry {
+            Some(table) => resolve_dirty_segments_in(table, &inner_raw),
+            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
+
+        let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));
+
+        // mem missing → delete. mem present → write.
+        match mem_inner_val {
+            Some(value) => {
+                let entry_table = ensure_array_of_tables_entry(
+                    root,
+                    parent_segs,
+                    array_key,
+                    section.natural_key_field,
+                    alias,
+                );
+                let Some(entry_table) = entry_table else {
+                    return;
+                };
+                let mut pruned = value.clone();
+                prune_empty_leaves(&mut pruned);
+                set_path_in_doc(entry_table, &inner_segs, &pruned);
+            }
+            None => {
+                // Only walk the doc if we'd actually find something to
+                // delete; otherwise an "ambient" delete pass on a fresh
+                // alias would scribble an empty `[[mcp.servers]]` entry
+                // via `ensure_array_of_tables_entry`'s create path.
+                let Some(entry_table) = find_array_of_tables_entry_mut(
+                    root,
+                    parent_segs,
+                    array_key,
+                    section.natural_key_field,
+                    alias,
+                ) else {
+                    return;
+                };
+                delete_path_in_doc(entry_table, &inner_segs);
+            }
+        }
+        return;
+    }
+
+    // Bare-alias path (cases 2 and 3). No inner suffix → reconcile the
+    // whole element.
+    match mem_entry {
+        Some(entry) => {
+            // Case 2: rewrite the entire array entry from the in-memory
+            // serialization. Prunes empties so default fields don't
+            // sprawl, matching the per-field path's `prune_empty_leaves`
+            // pass.
+            let mut value = toml::Value::Table(entry.clone());
+            prune_empty_leaves(&mut value);
+            let entry_table = ensure_array_of_tables_entry(
+                root,
+                parent_segs,
+                array_key,
+                section.natural_key_field,
+                alias,
+            );
+            let Some(entry_table) = entry_table else {
+                return;
+            };
+            // Replace the table's contents wholesale so removed inner
+            // fields actually disappear from disk.
+            entry_table.clear();
+            if let toml::Value::Table(t) = value {
+                for (k, v) in t.into_iter() {
+                    entry_table.insert(&k, crate::migration::toml_value_to_edit_item(&v));
+                }
+            }
+        }
+        None => {
+            // Case 3: alias no longer in memory → drop the matching
+            // doc entry. If no doc entry matches, no-op.
+            delete_array_of_tables_entry(
+                root,
+                parent_segs,
+                array_key,
+                section.natural_key_field,
+                alias,
+            );
+        }
+    }
+}
+
+/// Same dash-aware segment resolution as [`resolve_dirty_segments`] but
+/// rooted at an arbitrary `toml::Table` (the natural-key element's own
+/// serialized form), so per-field inner suffixes inside an
+/// `[[mcp.servers]]` entry get the same `headers.<auth-key>` vs
+/// `tool_timeout_secs` treatment the top-level walker uses.
+fn resolve_dirty_segments_in(root: &toml::Table, raw: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut current: Option<&toml::Value> = None;
+    for seg in raw {
+        let table_opt: Option<&toml::Table> = if out.is_empty() {
+            Some(root)
+        } else {
+            current.and_then(|v| v.as_table())
+        };
+        let resolved = match table_opt {
+            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
+            Some(t) => {
+                let snake = seg.replace('-', "_");
+                if t.contains_key(&snake) {
+                    snake
+                } else {
+                    (*seg).to_string()
+                }
+            }
+            None => (*seg).to_string(),
+        };
+        current = table_opt.and_then(|t| t.get(&resolved));
+        out.push(resolved);
+    }
+    out
+}
+
+/// Locate or create the `[[<section_path>]]` entry whose natural-key
+/// field equals `alias`, returning a mutable reference to its inner
+/// `toml_edit::Table`.
+///
+/// Three shapes are reconciled here:
+///
+///   * Parent Tables along `parent_segs` are auto-created if missing
+///     (mirrors `set_path_in_doc`).
+///   * The `array_key` slot may not yet exist; insert an
+///     `ArrayOfTables` if so.
+///   * The array may not yet contain an entry whose natural-key field
+///     matches `alias`; push a new table with `<natural_key_field> =
+///     "<alias>"` seeded.
+///
+/// Returns `None` only when an existing doc node at `parent_segs` or
+/// `array_key` has the wrong kind (e.g. an operator hand-edited
+/// `mcp.servers = "foo"`); in that case we refuse to clobber the
+/// hand-edit and let the save bail silently rather than data-loss the
+/// user's file.
+fn ensure_array_of_tables_entry<'a>(
+    root: &'a mut toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+    alias: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    let mut cursor: &mut toml_edit::Table = root;
+    for seg in parent_segs {
+        if !cursor.contains_key(seg) {
+            cursor.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        cursor = cursor.get_mut(seg).and_then(|i| i.as_table_mut())?;
+    }
+    if !cursor.contains_key(array_key) {
+        cursor.insert(
+            array_key,
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+    let aot = cursor
+        .get_mut(array_key)
+        .and_then(|i| i.as_array_of_tables_mut())?;
+
+    let pos = aot
+        .iter()
+        .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias));
+    let idx = match pos {
+        Some(i) => i,
+        None => {
+            let mut new_table = toml_edit::Table::new();
+            new_table.insert(natural_key_field, toml_edit::value(alias.to_string()));
+            aot.push(new_table);
+            aot.len() - 1
+        }
+    };
+    aot.get_mut(idx)
+}
+
+/// Read-only counterpart to [`ensure_array_of_tables_entry`] used by
+/// the delete path: never creates a missing array or entry, just
+/// locates one if present. Returning `None` on a miss lets the caller
+/// skip the doc-mutation step entirely.
+fn find_array_of_tables_entry_mut<'a>(
+    root: &'a mut toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+    alias: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    let mut cursor: &mut toml_edit::Table = root;
+    for seg in parent_segs {
+        cursor = cursor.get_mut(seg).and_then(|i| i.as_table_mut())?;
+    }
+    let aot = cursor
+        .get_mut(array_key)
+        .and_then(|i| i.as_array_of_tables_mut())?;
+    let pos = aot
+        .iter()
+        .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias))?;
+    aot.get_mut(pos)
+}
+
+/// Remove the `[[<section_path>]]` entry whose natural-key field
+/// equals `alias`. No-op if the array or entry isn't present. When the
+/// removal empties the `ArrayOfTables`, drop the array slot too so the
+/// on-disk file doesn't carry a vestigial `[[mcp.servers]]`-shaped
+/// blank section header.
+fn delete_array_of_tables_entry(
+    root: &mut toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+    alias: &str,
+) {
+    let mut cursor: &mut toml_edit::Table = root;
+    for seg in parent_segs {
+        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
+            Some(t) => t,
+            None => return,
+        };
+    }
+    let aot = match cursor
+        .get_mut(array_key)
+        .and_then(|i| i.as_array_of_tables_mut())
+    {
+        Some(a) => a,
+        None => return,
+    };
+    let pos = aot
+        .iter()
+        .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias));
+    if let Some(idx) = pos {
+        aot.remove(idx);
+    }
+    if aot.is_empty() {
+        cursor.remove(array_key);
     }
 }
 
@@ -22509,6 +22917,380 @@ group_policy = "disabled"
             written.trim_start().starts_with("schema_version ="),
             "schema_version should remain the first key; got:\n{written}"
         );
+    }
+
+    /// Regression for the per-field `[[mcp.servers]]` editor: after
+    /// `d06ed25` shipped the natural-key arm, in-memory edits succeed
+    /// (the TUI / dashboard show the new value) but `save_dirty` is
+    /// silently a no-op because `apply_dirty_path` walks the serialized
+    /// TOML as if every segment is a `Table` — `mcp.servers` is an
+    /// array of tables, so `lookup_path_in_table` returns `None` at the
+    /// natural-key segment, the path is misclassified as
+    /// `should_delete`, and `delete_path_in_doc` bails when it hits the
+    /// array too. Net effect: the on-disk file keeps its stale value.
+    #[test]
+    async fn save_dirty_persists_mcp_server_field_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with a single MCP server so the
+        // incremental path (not the new-file fallback to full `save`)
+        // runs. Schema version is stamped to current so the writer
+        // doesn't have to migrate anything.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        // Build the in-memory config to match the seeded file. We
+        // don't need to round-trip through deserialization — the bug
+        // is purely on the save side, and the on-disk seed gives
+        // `save_dirty` an existing file to do an incremental write
+        // into (the new-file fallback to full `save` would mask the
+        // dirty-path bug because it serializes the whole struct).
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        assert_eq!(config.mcp.servers[0].command, "/usr/bin/mcp-fs");
+
+        // The same call site the dashboard / TUI use: set_prop_persistent
+        // on a natural-key-routed inner path, then flush via save_dirty.
+        config
+            .set_prop_persistent("mcp.servers.fs.command", "/usr/local/bin/mcp-fs")
+            .expect("set_prop_persistent must route through the natural-key arm");
+        // The in-memory mutation must land — this is what the UI sees.
+        assert_eq!(config.mcp.servers[0].command, "/usr/local/bin/mcp-fs");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("/usr/local/bin/mcp-fs"),
+            "save_dirty must write the new command for `mcp.servers.fs.command`; \
+             on-disk file still reads:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "stale command must be overwritten; got:\n{written}"
+        );
+        // The natural-key field itself must stay on disk — losing
+        // `name` would orphan every other field in the [[mcp.servers]]
+        // entry and break subsequent loads.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key `name` must survive the incremental save; got:\n{written}"
+        );
+    }
+
+    /// `create_map_key("mcp.servers", "new")` followed by per-field
+    /// edits must produce a complete `[[mcp.servers]]` table on disk —
+    /// including the seeded natural-key field. This is the path the
+    /// dashboard's `+ Add MCP server` affordance walks: insert, then
+    /// edit `command` / `transport` etc.
+    #[test]
+    async fn save_dirty_writes_new_mcp_server_added_via_create_map_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an unrelated existing entry so we exercise the
+        // append-into-existing-array path (not the create-array-from-
+        // scratch path). Both matter; the empty-doc case is covered by
+        // `save` instead of `save_dirty` (see the `!config_path.exists()`
+        // branch at the top of `save_dirty`).
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+
+        // The handle_config_map_key_create dispatch path runs
+        // create_map_key + mark_dirty(`<section>.<key>`). Replicate
+        // that here so we're testing the same wire sequence.
+        let created = config
+            .create_map_key("mcp.servers", "github")
+            .expect("create_map_key on a natural-key section must succeed");
+        assert!(created);
+        config.mark_dirty("mcp.servers.github");
+
+        // Per-field edit on the freshly-added entry.
+        config
+            .set_prop_persistent("mcp.servers.github.transport", "http")
+            .expect("set transport on freshly-added entry must route");
+        config
+            .set_prop_persistent("mcp.servers.github.url", "https://mcp.example/")
+            .expect("set url on freshly-added entry must route");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        // Both entries survive, with their distinct fields.
+        assert!(
+            written.contains("name = \"fs\""),
+            "pre-existing entry must survive; got:\n{written}"
+        );
+        assert!(
+            written.contains("name = \"github\""),
+            "new entry's natural-key field must land on disk; got:\n{written}"
+        );
+        assert!(
+            written.contains("transport = \"http\""),
+            "per-field edit on the new entry must land; got:\n{written}"
+        );
+        assert!(
+            written.contains("url = \"https://mcp.example/\""),
+            "second per-field edit on the new entry must land; got:\n{written}"
+        );
+        // Round-trip: parsing the written file must yield exactly the
+        // shape we built up in memory. Catches mis-shaped output (e.g.
+        // a nested `mcp.servers.github` inline table sneaking in instead
+        // of a second `[[mcp.servers]]`).
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 2);
+        let gh = reparsed
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "github")
+            .expect("reparse must surface the new entry by natural key");
+        assert_eq!(gh.transport, McpTransport::Http);
+        assert_eq!(gh.url.as_deref(), Some("https://mcp.example/"));
+    }
+
+    /// `rename_map_key("mcp.servers", "fs", "filesystem")` rewrites the
+    /// in-memory entry's `name` field in place and marks BOTH aliases
+    /// dirty. The incremental writer must update the matching
+    /// `[[mcp.servers]]` entry's `name` to the new value without
+    /// leaving a stale duplicate behind.
+    #[test]
+    async fn save_dirty_persists_mcp_server_rename_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+
+        // Mirror handle_config_map_key_rename: rename, then mark both
+        // the old and new aliases dirty.
+        let renamed = config
+            .rename_map_key("mcp.servers", "fs", "filesystem")
+            .expect("rename of a unique alias must succeed");
+        assert!(renamed);
+        config.mark_dirty("mcp.servers.fs");
+        config.mark_dirty("mcp.servers.filesystem");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("name = \"filesystem\""),
+            "rename target must land on disk; got:\n{written}"
+        );
+        assert!(
+            !written.contains("name = \"fs\""),
+            "stale rename source must NOT remain on disk; got:\n{written}"
+        );
+        // Other fields on the renamed entry are preserved.
+        assert!(
+            written.contains("command = \"/usr/bin/mcp-fs\""),
+            "rename must preserve sibling fields on the entry; got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "filesystem");
+        assert_eq!(reparsed.mcp.servers[0].command, "/usr/bin/mcp-fs");
+    }
+
+    /// `delete_map_key("mcp.servers", "fs")` removes the in-memory
+    /// entry and marks the alias dirty. The incremental writer must
+    /// drop the corresponding `[[mcp.servers]]` entry from disk,
+    /// dropping the array slot entirely when no entries remain so the
+    /// file doesn't carry a dangling `[[mcp.servers]]` section header.
+    #[test]
+    async fn save_dirty_removes_mcp_server_deleted_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Two entries on disk; we'll delete one and assert the other
+        // survives.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n\n\
+             [[mcp.servers]]\n\
+             name = \"github\"\n\
+             transport = \"http\"\n\
+             url = \"https://mcp.example/\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        config.mcp.servers.push(McpServerConfig {
+            name: "github".into(),
+            transport: McpTransport::Http,
+            url: Some("https://mcp.example/".to_string()),
+            ..Default::default()
+        });
+
+        let deleted = config
+            .delete_map_key("mcp.servers", "fs")
+            .expect("delete by natural key must resolve");
+        assert!(deleted);
+        config.mark_dirty("mcp.servers.fs");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("name = \"fs\""),
+            "deleted entry must not survive incremental save; got:\n{written}"
+        );
+        assert!(
+            written.contains("name = \"github\""),
+            "untouched sibling entry must survive; got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "github");
+    }
+
+    /// Deleting the last `[[mcp.servers]]` entry drops the array slot
+    /// entirely. A vestigial empty `[[mcp.servers]]` header would
+    /// reparse as a single default-shaped element with an empty
+    /// natural-key field, which the validator then rejects on next
+    /// load — actively breaking the file the writer just produced.
+    #[test]
+    async fn save_dirty_drops_array_header_when_last_mcp_server_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+
+        config.delete_map_key("mcp.servers", "fs").unwrap();
+        config.mark_dirty("mcp.servers.fs");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("[[mcp.servers]]"),
+            "empty array header must be dropped, otherwise it reparses as a default entry; got:\n{written}"
+        );
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert!(reparsed.mcp.servers.is_empty());
+    }
+
+    /// `Config::map_key_sections()` must surface the natural-key field
+    /// for `mcp.servers`. This is the metadata `apply_dirty_path` reads
+    /// to decide whether to take the array-of-tables branch; if the
+    /// derive ever stops emitting it for `#[natural_key = "..."]` Vec
+    /// fields, the dirty-path writer falls back to the broken
+    /// Table-only walker and silently drops MCP edits on the floor
+    /// again. Lock the contract here.
+    #[test]
+    async fn map_key_sections_exposes_natural_key_for_mcp_servers() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "mcp.servers")
+            .expect("mcp.servers must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("name"),
+            "natural_key must mirror the `#[natural_key = \"name\"]` attribute \
+             on McpConfig::servers; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+
+        // Sanity: a representative HashMap section (alias IS the TOML
+        // key) carries `natural_key: None`. The dirty-path writer's
+        // branch decision falls through to the generic Table walker
+        // for these.
+        let anthropic = sections
+            .iter()
+            .find(|s| s.path == "providers.models.anthropic")
+            .expect(
+                "providers.models.anthropic must surface as a HashMap-backed map-keyed section",
+            );
+        assert_eq!(anthropic.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(anthropic.natural_key, None);
     }
 
     #[test]
