@@ -33,7 +33,7 @@ v0.8.0 ships [zerocode](https://docs.zeroclawlabs.ai/master/en/zerocode/overview
 
 #### Connection: local socket or remote WSS
 
-Locally, zerocode connects over a Unix domain socket (a named pipe on Windows) with no setup at all. For a daemon on another machine, a [TLS WebSocket transport](https://docs.zeroclawlabs.ai/master/en/zerocode/remote.html) connects your workstation to a Raspberry Pi, home server, or VPS with a self-signed certificate and a token. **One daemon serves many zerocode instances at once:** each connecting TUI gets its own signed identity and environment snapshot in the daemon's registry, sessions are tmux-style persistent (#7182) so closing your laptop and reconnecting an hour later from a different network finds your session intact, and zerocode's own Dashboard pane can forcefully kill any session when needed.
+Locally, zerocode connects over a Unix domain socket (a named pipe on Windows) with no setup at all. For a daemon on another machine, a [TLS WebSocket transport](https://docs.zeroclawlabs.ai/master/en/zerocode/remote.html) connects your workstation to a Raspberry Pi, home server, or VPS with a self-signed certificate and a token. **One daemon serves many zerocode instances at once:** each connecting TUI gets its own signed identity and environment snapshot in the daemon's registry, sessions are tmux-style persistent (#7182) so closing your laptop and reconnecting an hour later from a different network finds your session intact.
 
 #### Shell environment pass-through
 
@@ -45,7 +45,7 @@ A daemon started as a service has a stripped-down environment; your terminal has
 
 #### Keybindings
 
-Four built-in presets (default, vim, emacs, arrows-only) plus per-action rebinding through an in-app capture modal. Changes apply live, no restart.
+Four built-in presets (default, vim, emacs, arrows-only) plus per-action rebinding through an in-app capture modal. Changes apply live, no restart. Press `?` on any pane for context-aware help showing the bindings that apply right where you are.
 
 #### Chat
 
