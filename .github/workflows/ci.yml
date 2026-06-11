@@ -60,6 +60,7 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -71,14 +72,45 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
         shell: bash
-        run: >
-          cargo clippy
-          --workspace
-          --exclude zeroclaw-desktop
-          --all-targets
-          --target ${{ matrix.target }}
-          --features ci-all
-          -- -D warnings
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy-${{ matrix.target }}.log"
+          SECONDS=0
+          cargo clippy \
+            --workspace \
+            --exclude zeroclaw-desktop \
+            --all-targets \
+            --target ${{ matrix.target }} \
+            --features ci-all \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Lint diagnostics: ${{ matrix.target }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`${{ matrix.target }}\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
       - name: Config-write isolation guard
         if: runner.os == 'Linux'
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
