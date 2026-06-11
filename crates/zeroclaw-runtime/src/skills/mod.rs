@@ -453,6 +453,25 @@ pub fn load_skills_for_agent(
     skills
 }
 
+/// Production helper: loads skills for an agent using the correct per-agent
+/// workspace directory. This is the single call site that all runtime paths
+/// (agent boot, message processing, WebSocket/daemon) must use to ensure
+/// skills are loaded from `<install>/agents/<alias>/workspace/skills/`
+/// rather than `config.data_dir`.
+///
+/// Source of truth for the workspace directory is `config.agent_workspace_dir(agent_alias)`;
+/// this helper resolves it on every call so config reloads take effect.
+pub fn load_skills_for_agent_from_config(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Vec<Skill> {
+    load_skills_for_agent(
+        &config.agent_workspace_dir(agent_alias),
+        config,
+        agent_alias,
+    )
+}
+
 /// Load skills using explicit open-skills settings.
 pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,
@@ -2854,8 +2873,8 @@ version = "0.1.0"
         .unwrap();
     }
 
-    /// Regression test for #7236: `load_skills_for_agent` must load skills
-    /// from the per-agent workspace directory, not from `data_dir`.
+    /// Regression test for #7236: `load_skills_for_agent_from_config` must
+    /// load skills from the per-agent workspace directory, not from `data_dir`.
     ///
     /// The bug: three call sites passed `&config.data_dir` instead of
     /// `&config.agent_workspace_dir(agent_alias)`, causing skills placed in
@@ -2864,10 +2883,13 @@ version = "0.1.0"
     /// This test constructs a config where `data_dir` and
     /// `agent_workspace_dir(agent_alias)` are distinct paths, places a skill
     /// only in the agent workspace, and verifies:
-    /// 1. Calling with `agent_workspace_dir` finds the skill (correct behavior)
-    /// 2. Calling with `data_dir` does NOT find the skill (the bug)
+    /// 1. `load_skills_for_agent_from_config` finds the skill (correct behavior)
+    /// 2. Calling `load_skills_for_agent` with `data_dir` does NOT find the skill (the bug)
+    ///
+    /// The test would fail if `load_skills_for_agent_from_config` reverted to
+    /// using `config.data_dir` instead of `config.agent_workspace_dir(agent_alias)`.
     #[test]
-    fn load_skills_for_agent_uses_workspace_dir_not_data_dir() {
+    fn load_skills_for_agent_from_config_uses_workspace_dir_not_data_dir() {
         let install_root = TempDir::new().unwrap();
         let data_dir = TempDir::new().unwrap();
         let agent_workspace = TempDir::new().unwrap();
@@ -2895,16 +2917,16 @@ version = "0.1.0"
             "workspace_dir and data_dir must be distinct for this test to be meaningful"
         );
 
-        let skills_from_workspace = load_skills_for_agent(&workspace_dir, &config, agent_alias);
-        let workspace_skill_names: Vec<&str> = skills_from_workspace
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
+        // Test the production helper — this is what the three call sites use.
+        let skills_from_helper = load_skills_for_agent_from_config(&config, agent_alias);
+        let helper_skill_names: Vec<&str> =
+            skills_from_helper.iter().map(|s| s.name.as_str()).collect();
         assert!(
-            workspace_skill_names.contains(&skill_name),
-            "skill in agent workspace must be loaded when passing agent_workspace_dir; got: {workspace_skill_names:?}"
+            helper_skill_names.contains(&skill_name),
+            "load_skills_for_agent_from_config must load skills from agent workspace; got: {helper_skill_names:?}"
         );
 
+        // Verify that using data_dir directly would NOT find the skill (the bug).
         let skills_from_data_dir = load_skills_for_agent(&config.data_dir, &config, agent_alias);
         let data_dir_skill_names: Vec<&str> = skills_from_data_dir
             .iter()
@@ -2916,12 +2938,12 @@ version = "0.1.0"
         );
     }
 
-    /// Verifies that `load_skills_for_agent` with an empty `skill_bundles`
-    /// list falls back to the install-wide skill set from the workspace dir.
-    /// This pins the contract that the first argument controls where
-    /// workspace skills are discovered.
+    /// Verifies that `load_skills_for_agent_from_config` with an empty
+    /// `skill_bundles` list falls back to the install-wide skill set from
+    /// the workspace dir. This pins the contract that the helper resolves
+    /// the correct workspace directory regardless of bundle configuration.
     #[test]
-    fn load_skills_for_agent_empty_bundles_uses_workspace_dir() {
+    fn load_skills_for_agent_from_config_empty_bundles_uses_workspace_dir() {
         let install_root = TempDir::new().unwrap();
         let data_dir = TempDir::new().unwrap();
         let agent_workspace = TempDir::new().unwrap();
@@ -2938,8 +2960,7 @@ version = "0.1.0"
             agent_workspace.path().to_path_buf(),
         );
 
-        let workspace_dir = config.agent_workspace_dir(agent_alias);
-        let skills = load_skills_for_agent(&workspace_dir, &config, agent_alias);
+        let skills = load_skills_for_agent_from_config(&config, agent_alias);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(
             names.contains(&skill_name),
