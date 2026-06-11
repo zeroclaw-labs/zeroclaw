@@ -2121,7 +2121,7 @@ pub(crate) async fn persist_pairing_tokens(
 }
 
 /// Result of a gateway chat turn. Carries the response text plus per-turn
-/// token / cost totals captured from the cost-tracking scope (when present)
+/// token / cost totals collected from `TOOL_LOOP_TURN_USAGE` (when scoped)
 /// so callers can populate observer-event annotations without racing
 /// concurrent webhook traffic that shares the same `CostTracker`.
 struct GatewayChatOutcome {
@@ -2243,50 +2243,42 @@ async fn run_gateway_chat_with_tools(
         let config = state.config.read().clone();
         let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
 
-        // Scope the cost tracking context so per-LLM-call usage flows into the
-        // gateway's cost tracker and costs.jsonl. Without this scope, the
-        // tracker exists on AppState but never receives any records from the
-        // runtime tool loop. The context's per-scope `turn_usage` accumulator
-        // also lets us read out this turn's tokens / cost after the scope
-        // exits without racing concurrent webhook traffic that shares the
-        // same tracker. Pricing comes from the V3 per-provider shape
-        // (`config.providers.models[*][*].pricing`), keyed as
-        // `<type>.<alias>` to match how the channels orchestrator builds
-        // its `ModelProviderPricing`.
+        // Scope the cost tracking context so per-LLM-call usage flows into
+        // the gateway's cost tracker and costs.jsonl. A separate
+        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals
+        // so callers can read the per-turn cost without racing concurrent
+        // requests sharing the same tracker. Pricing is built from the
+        // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
+        // wins over legacy per-alias pricing).
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
-            let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
-                .providers
-                .models
-                .iter_entries()
-                .filter(|(_, _, base)| !base.pricing.is_empty())
-                .map(|(type_k, alias_k, base)| {
-                    (format!("{type_k}.{alias_k}"), base.pricing.clone())
-                })
-                .collect();
+            let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
             zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
                 tracker.clone(),
                 std::sync::Arc::new(pricing),
             )
             .with_agent_alias(&agent_alias)
         });
-        let captured_usage = cost_tracking_context
-            .as_ref()
-            .map(|ctx| ctx.turn_usage.clone());
-        let response = Box::pin(
+        let turn_usage = state.cost_tracker.as_ref().map(|_| {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                zeroclaw_runtime::agent::cost::TurnUsage::default(),
+            ))
+        });
+        let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+            turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
             ),
-        )
+        ))
         .await?;
-        let usage = captured_usage
+        let usage = turn_usage
             .map(|cell| *cell.lock())
-            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
         let (input_tokens, output_tokens, cost_usd) = match usage {
-            Some(u) => (
-                Some(u.input_tokens),
-                Some(u.output_tokens),
-                Some(u.cost_usd),
+            Some(usage) => (
+                Some(usage.input_tokens),
+                Some(usage.output_tokens),
+                Some(usage.cost_usd),
             ),
             None => (None, None, None),
         };
