@@ -1,5 +1,9 @@
 pub mod build;
 pub mod check;
+pub mod hardware;
+pub mod keymap;
+pub mod linkcheck;
+pub mod peer_groups;
 pub mod refs;
 pub mod serve;
 pub mod stats;

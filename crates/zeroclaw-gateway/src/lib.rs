@@ -64,6 +64,38 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+/// Returns `true` when an error from a stream listener's `accept()` is
+/// transient and the listener itself remains usable, so the serve loop
+/// should log and keep running rather than terminating the daemon. Covers
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
+/// per-connection hiccups. Mirrors the non-fatal accept handling that
+/// `axum::serve` already performs on the plain-TCP path.
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -74,6 +106,7 @@ use uuid::Uuid;
     feature = "channel-whatsapp-cloud"
 ))]
 use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::tool::ToolSpec;
 #[cfg(feature = "channel-email")]
 use zeroclaw_channels::gmail_push::GmailPushChannel;
@@ -90,6 +123,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
+use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
@@ -401,6 +435,7 @@ pub struct AppState {
     /// `Option<f64>` end-to-end; never substitute a hardcoded default.
     pub temperature: Option<f64>,
     pub mem: Arc<dyn Memory>,
+    pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
@@ -694,6 +729,11 @@ pub async fn run_gateway(
             Arc::new(platform::NativeRuntime::new())
         }
     };
+    let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(DefaultMemoryStrategy::with_config(
+        mem.clone(),
+        config.memory.clone(),
+        config.data_dir.clone(),
+    ));
     // Gateway is infrastructure — it doesn't run as an agent. Endpoints
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the
@@ -1386,6 +1426,7 @@ pub async fn run_gateway(
         model,
         temperature,
         mem,
+        memory_strategy,
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
         pairing,
@@ -1768,7 +1809,21 @@ pub async fn run_gateway(
         loop {
             tokio::select! {
                 conn = listener.accept() => {
-                    let (tcp_stream, remote_addr) = conn?;
+                    let (tcp_stream, remote_addr) = match conn {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            if is_recoverable_accept_error(&e) {
+                                // Transient (e.g. EMFILE under fd pressure):
+                                // the listener is still valid. Back off
+                                // briefly to avoid hot-spinning, then keep
+                                // serving rather than killing the daemon (#7042).
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
+                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            return Err(e.into());
+                        }
+                    };
                     let tls_acceptor = tls_acceptor.clone();
                     let svc = tower::MakeService::<
                         SocketAddr,
@@ -2478,6 +2533,9 @@ async fn handle_webhook(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
     state.observer.record_event(
@@ -2485,6 +2543,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
 
@@ -2499,13 +2560,17 @@ async fn handle_webhook(
             let duration = started_at.elapsed();
             // Per-turn token / cost annotation captured from the cost-tracking
             // scope inside `run_gateway_chat_with_tools` (None outside of test
-            // / when no LLM call recorded). Cost is also persisted to
-            // /api/cost and costs.jsonl via the same scope.
-            let tokens_used = input_tokens
-                .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
+            // / when no LLM call recorded). `TurnUsage` always carries the real
+            // input/output split together, so `.zip` either gives both or
+            // neither — never fabricate `output_tokens: 0` from an aggregate.
+            // Cost is also persisted to /api/cost and costs.jsonl via the same
+            // scope.
+            let tokens_used = input_tokens.zip(output_tokens).map(|(i, o)| {
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                }
+            });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     model_provider: provider_label.clone(),
@@ -2513,8 +2578,11 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens,
+                    output_tokens,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2527,6 +2595,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -2546,6 +2617,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2564,6 +2638,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -3761,7 +3838,7 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
@@ -3847,6 +3924,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
@@ -3893,6 +3975,27 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
+        let dist_dir = tmp.path().join("web").join("dist");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(
+            dist_dir.join("index.html"),
+            r#"<!DOCTYPE html><html><head></head><body>dashboard shell</body></html>"#,
+        )
+        .unwrap();
+
+        let mut state = admin_paircode_state(tmp, false, false);
+        state.web_dist_dir = Some(dist_dir);
+        state
+    }
+
+    async fn spa_fallback_response(
+        path: &'static str,
+        state: AppState,
+    ) -> axum::response::Response {
+        static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
     }
 
     /// Pair a device into both the pairing guard and the device registry,
@@ -4118,6 +4221,96 @@ mod tests {
         assert_clone::<AppState>();
     }
 
+    #[tokio::test]
+    async fn spa_fallback_returns_json_not_html_for_unknown_api_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json")),
+            "unknown API paths must not be served as HTML"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "not_found");
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_api_root_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_path_prefixed_api_miss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = spa_fallback_state(&tmp);
+        state.path_prefix = "/gw".to_string();
+
+        let response = spa_fallback_response("/gw/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_still_serves_dashboard_routes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/config", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "dashboard routes should still receive the SPA shell"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("dashboard shell"));
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_does_not_treat_api_like_spa_paths_as_api() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/apiary", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "similarly named SPA routes should not be reserved as API paths"
+        );
+    }
+
     /// Regression: the gateway must boot with zero configured agents so
     /// a fresh install can reach `/admin/reload` and `/quickstart` to add
     /// one. Earlier the boot path returned
@@ -4289,6 +4482,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4368,6 +4566,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -4951,7 +5154,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5048,7 +5256,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5161,6 +5374,11 @@ mod tests {
             model: "startup-model".into(),
             temperature: None,
             mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5233,6 +5451,7 @@ mod tests {
                 zeroclaw_runtime::observability::ObserverEvent::AgentStart {
                     model_provider,
                     model,
+                    ..
                 } if model_provider == &expected_provider && model == "agent-model"
             )),
             "expected AgentStart to use the explicit agent model; events were: {events:?}"
@@ -5253,6 +5472,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: true,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5363,7 +5587,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5440,7 +5669,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5522,7 +5756,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5611,7 +5850,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5698,7 +5942,12 @@ mod tests {
             model_provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -5833,7 +6082,12 @@ mod tests {
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
-            mem: memory,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -6661,6 +6915,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -6739,6 +6998,11 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -6875,5 +7139,33 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
     }
 }

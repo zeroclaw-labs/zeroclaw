@@ -3686,7 +3686,7 @@ impl SlackChannel {
 
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
 
-/// Split `text` into chunks of at most `max_chars`, breaking at newline or
+/// Split `text` into chunks of at most `max_chars` bytes, breaking at newline or
 /// space boundaries when possible. Returns at most `max_chunks` pieces; if the
 /// text would require more, the last chunk includes a truncation indicator.
 fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Vec<String> {
@@ -3711,7 +3711,10 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
                 chunks.push(remaining.to_string());
             } else {
                 // Truncate with indicator.
-                let avail = max_chars - SLACK_TRUNCATION_INDICATOR.len();
+                let avail = crate::util::floor_char_boundary(
+                    remaining,
+                    max_chars.saturating_sub(SLACK_TRUNCATION_INDICATOR.len()),
+                );
                 let break_at = remaining[..avail]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -3725,7 +3728,7 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
         }
 
         // Normal chunk: find a good break point.
-        let limit = max_chars.min(remaining.len());
+        let limit = crate::util::floor_char_boundary(remaining, max_chars);
         let break_at = remaining[..limit]
             .rfind('\n')
             .map(|i| i + 1)
@@ -4684,6 +4687,25 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_text_into_chunks_safe_on_multibyte_utf8() {
+        let text = format!(
+            "{}{}{}",
+            "a".repeat(SLACK_BLOCK_TEXT_MAX_CHARS - 1),
+            "😀",
+            "tail"
+        );
+        let chunks = split_text_into_chunks(&text, SLACK_BLOCK_TEXT_MAX_CHARS, 3);
+
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(chunks[0].len(), SLACK_BLOCK_TEXT_MAX_CHARS - 1);
+        assert_eq!(chunks[1], "😀tail");
+        for chunk in &chunks {
+            assert!(chunk.len() <= SLACK_BLOCK_TEXT_MAX_CHARS);
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
+    }
 
     #[test]
     fn slack_channel_name() {

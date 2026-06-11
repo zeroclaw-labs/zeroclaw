@@ -146,6 +146,12 @@ pub use sop_status::SopStatusTool;
 pub use spawn_subagent::SpawnSubagentTool;
 pub use verifiable_intent::VerifiableIntentTool;
 
+/// Re-entrant agent-spawning tools that must never be collapsed by the
+/// per-turn duplicate-call guard: launching several with the same prompt
+/// (redundancy, sampling, fan-out) is intentional, not an accidental
+/// repeat. Unioned with config-provided exemptions in the tool-call loop.
+pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
+
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
 use async_trait::async_trait;
@@ -559,7 +565,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
         )),
         Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias)
+            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
                 .with_subagent_caller(is_subagent_caller),
         ),
         Arc::new(SendMessageToPeerTool::new(
@@ -584,6 +590,13 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
+
+    // A SubAgent runs as an ephemeral clone of its parent and inherits the
+    // parent's model verbatim; it must not be able to switch the active
+    // model out from under the parent (the switch signal is process-wide).
+    if is_subagent_caller {
+        tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
+    }
 
     // Register discord_search if any configured Discord alias has
     // archive enabled. Multiple Discord aliases are supported (one per
@@ -707,13 +720,15 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        match HttpRequestTool::new(
+        match HttpRequestTool::new_with_config(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.allow_private_hosts,
             http_config.allowed_private_hosts.clone(),
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
         ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
@@ -1837,5 +1852,55 @@ mod tests {
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
+    }
+
+    fn registry_names(tmp: &TempDir, is_subagent_caller: bool) -> Vec<String> {
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let cfg = test_config(tmp);
+
+        all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            is_subagent_caller,
+            None,
+        )
+        .tools
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect()
+    }
+
+    #[test]
+    fn model_switch_present_for_top_level_absent_for_subagent() {
+        let tmp = TempDir::new().unwrap();
+        let top = registry_names(&tmp, false);
+        assert!(
+            top.iter().any(|n| n == ModelSwitchTool::NAME),
+            "top-level agent must keep model_switch"
+        );
+        let subagent = registry_names(&tmp, true);
+        assert!(
+            !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
+            "subagent must not be able to switch the inherited model"
+        );
     }
 }

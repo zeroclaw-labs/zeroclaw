@@ -13450,7 +13450,10 @@ dependencies = [
  "clap",
  "fluent-syntax",
  "reqwest 0.12.28",
+ "schemars 1.2.1",
+ "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "tokio",
  "toml 0.8.23",
@@ -13458,7 +13461,9 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-gateway",
+ "zeroclaw-hardware",
  "zeroclaw-providers",
+ "zerocode",
 ]
 
 [[package]]
@@ -14250,6 +14255,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "unic-langid",
  "unicode-width 0.2.2",
+ "zeroclaw-providers",
 ]
 
 [[package]]
