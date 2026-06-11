@@ -24430,6 +24430,32 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn unknown_provider_families_flags_silent_serde_drop() {
+        // serde ignores unknown keys under providers.models, so a typo'd
+        // family parses cleanly and its aliases vanish on reload. The
+        // detector must flag it; known families must pass.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.antropic.main]
+model = "claude-sonnet-4-6"
+
+[providers.models.openai.work]
+model = "gpt-4o"
+"#;
+        let parsed: Config = toml::from_str(raw).expect("unknown family must not fail parse");
+        assert!(
+            parsed.providers.models.find("antropic", "main").is_none(),
+            "precondition: serde silently drops the unknown family"
+        );
+        assert_eq!(
+            Config::unknown_provider_families(raw),
+            vec!["antropic".to_string()]
+        );
+        assert!(Config::unknown_provider_families("not even toml {{{").is_empty());
+    }
+
+    #[test]
     async fn map_key_create_survives_incremental_save() {
         // Repro for the zerocode "providers vanish after restart" report:
         // the RPC config/map-key-create path is create_map_key + mark_dirty
