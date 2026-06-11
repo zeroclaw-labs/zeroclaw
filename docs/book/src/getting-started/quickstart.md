@@ -8,28 +8,7 @@ where you are.
 
 ## Install
 
-Pick one:
-
-**Linux / macOS (one-liner):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
-```
-
-**Homebrew (macOS, Linux):**
-
-```bash
-brew install zeroclaw
-```
-
-**Windows:** run `setup.bat` from the latest release, or see
-[Setup → Windows](../setup/windows.md).
-
-**From source** (inside a clone):
-
-```bash
-./install.sh
-```
+{{#include ../_snippets/install.md}}
 
 This builds and installs both `zeroclaw` and the `zerocode` terminal interface.
 Run it with no flags for an interactive picker that lets you choose the build
@@ -47,9 +26,15 @@ type, which apps to install, and which optional features to compile in.
 
 The fastest path on a headless box or over SSH:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw quickstart
 ```
+
+</div>
 
 You answer one prompt per step in the terminal. The built-in `cli` channel
 works immediately, so Channels and Peer groups can be skipped. For an
@@ -57,10 +42,16 @@ all-defaults, no-approvals config, see [YOLO mode](./yolo.md).
 
 ## zerocode
 
-In the [zerocode](./tui.md) terminal interface, the Quickstart pane is one of
+In the [zerocode](./zerocode.md) terminal interface, the Quickstart pane is one of
 the tabs. Drive it with the keyboard:
 
-{{#include ../_snippets/zerocode-quickstart-keys.md}}
+Switch to the **Quickstart** pane:
+
+{{#include ../_snippets/zerocode-pane-nav-keys.md}}
+
+Inside the pane:
+
+{{#include ../_snippets/zerocode-quickstart-pane-keys.md}}
 
 Mouse works too: click a tab in the mode bar to switch panes, click a step to
 select and open it, and scroll to move through the list.
@@ -72,9 +63,15 @@ option that lists the matching aliases already in your config.
 
 With the daemon running, open the dashboard in a browser:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon
 ```
+
+</div>
 
 `zeroclaw daemon` runs the full runtime: the gateway, your configured channels,
 the scheduler, and the heartbeat monitor. (`zeroclaw gateway` starts only the
@@ -93,7 +90,7 @@ for clients that want to validate first.
 
 ## After Quickstart
 
-- **Drive it from [zerocode](./tui.md):** the terminal interface is the best
+- **Drive it from [zerocode](./zerocode.md):** the terminal interface is the best
   way to chat, watch live logs, manage config, and monitor the daemon, all in
   one place. Just run `zerocode`.
 - **Quick one-off from the shell:** `zeroclaw agent -a <alias> -m "your message"`.

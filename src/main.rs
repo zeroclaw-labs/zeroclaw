@@ -268,8 +268,6 @@ mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-#[cfg(feature = "schema-export")]
-mod schema_markdown;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
@@ -1473,7 +1471,7 @@ async fn run_quickstart_cli(
                     // leaves the descriptor unchanged → free-text fallback.
                     let upgraded;
                     let d_used = if d.key.eq_ignore_ascii_case("model") {
-                        let (models, live) =
+                        let (models, _pricing, live) =
                             zeroclaw_runtime::quickstart::model_catalog(&chosen.kind).await;
                         if live && !models.is_empty() {
                             upgraded = zeroclaw_runtime::quickstart::FieldDescriptor {
@@ -2423,7 +2421,7 @@ enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
         /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
         #[arg(long)]
@@ -2910,7 +2908,10 @@ async fn main() -> Result<()> {
             #[cfg(feature = "schema-export")]
             {
                 let schema = schemars::schema_for!(config::Config);
-                print!("{}", schema_markdown::generate(&schema.to_value()));
+                print!(
+                    "{}",
+                    zeroclaw_config::schema_markdown::generate(&schema.to_value())
+                );
                 return Ok(());
             }
             #[cfg(not(feature = "schema-export"))]
@@ -4141,11 +4142,21 @@ async fn main() -> Result<()> {
             );
             println!("  ID (use in config)  DESCRIPTION"); // i18n-exempt: literal command/identifier example
             println!("  ─────────────────── ───────────");
-            for p in &model_providers {
-                let is_configured = configured_types.contains(p.name);
-                let marker = if is_configured { " (configured)" } else { "" };
-                let local_tag = if p.local { " [local]" } else { "" };
-                println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+            for category in zeroclaw_providers::ModelProviderCategory::all() {
+                let in_category: Vec<_> = model_providers
+                    .iter()
+                    .filter(|p| p.category == *category)
+                    .collect();
+                if in_category.is_empty() {
+                    continue;
+                }
+                println!("\n  {}:", category.as_str());
+                for p in in_category {
+                    let is_configured = configured_types.contains(p.name);
+                    let marker = if is_configured { " (configured)" } else { "" };
+                    let local_tag = if p.local { " [local]" } else { "" };
+                    println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+                }
             }
             println!(
                 "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \
@@ -4185,6 +4196,13 @@ async fn main() -> Result<()> {
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
+                #[cfg(feature = "hardware")]
+                zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                    Box::pin(async move {
+                        zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                    })
+                }));
+
                 let cancel = tokio_util::sync::CancellationToken::new();
                 Box::pin(channels::start_channels(config, None, cancel)).await
             }
@@ -4656,7 +4674,7 @@ async fn main() -> Result<()> {
                     // hand. Falls back to free text on `live=false`
                     // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
-                    let (models, live) =
+                    let (models, _pricing, live) =
                         zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();

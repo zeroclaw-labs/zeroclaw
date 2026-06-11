@@ -116,7 +116,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
-use crate::paced_channel::PacedChannel;
+use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
@@ -230,7 +230,6 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -392,6 +391,7 @@ struct ChannelRuntimeContext {
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
+    memory_strategy: Arc<dyn MemoryStrategy>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
@@ -634,6 +634,58 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         }
     }
 
+    // Does the tag structure run to the end of the message? A *real* truncated
+    // tool call is the model getting cut off, so the unterminated structure is
+    // the last thing in the message. If natural-language prose resumes after the
+    // tags, this is an inline *example* (the model is discussing tool calls), not
+    // a truncation — so we should keep it. Bias toward keeping: a little leaked
+    // XML beats eating the user's text.
+    fn tool_structure_runs_to_end(inner: &str) -> bool {
+        let mut rest = inner.trim_start();
+        while rest.starts_with('<') {
+            match rest.find('>') {
+                Some(gt) => rest = rest[gt + 1..].trim_start(),
+                None => return true,
+            }
+        }
+        let tail = rest.trim();
+        if tail.is_empty() {
+            return true;
+        }
+        !looks_like_prose(tail)
+    }
+
+    // Heuristic: does `text` read like resumed natural-language prose (as opposed
+    // to a cut-off parameter value)? True on an internal sentence boundary
+    // (". " / "! " / "? " + a letter) or a multi-word string that ends like a
+    // sentence. Deliberately lenient so ambiguous tails are kept, not dropped.
+    fn looks_like_prose(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len().saturating_sub(1) {
+            if matches!(bytes[i], b'.' | b'!' | b'?')
+                && matches!(bytes[i + 1], b' ' | b'\n' | b'\t')
+                && text[i + 1..]
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic())
+            {
+                return true;
+            }
+        }
+        let trimmed = text.trim_end();
+        let ends_like_sentence = trimmed
+            .chars()
+            .last()
+            .is_some_and(|c| matches!(c, '.' | '!' | '?'))
+            && trimmed
+                .chars()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| c.is_alphabetic());
+        ends_like_sentence && text.trim().contains(' ')
+    }
+
     let mut kept_segments = Vec::new();
     let mut remaining = message;
 
@@ -656,6 +708,26 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         if let Some(consumed_end) = extract_first_json_end(after_open) {
             remaining = strip_leading_close_tags(&after_open[consumed_end..]);
             continue;
+        }
+
+        // Unterminated open tag with no parseable JSON body. Drop the broken
+        // tail ONLY when it looks like tool-call structure AND that structure
+        // runs to the end of the message — a real truncation where the model was
+        // cut off mid-call. If prose resumes after the structure, the model is
+        // showing an *example*, not making a call, so keep it verbatim (a little
+        // leaked XML beats eating the reply). Text merely mentioning a tag is
+        // likewise kept.
+        let inner = after_open.trim_start();
+        let inner_lower = inner.to_ascii_lowercase();
+        let looks_like_tool_structure = inner_lower.starts_with("<invoke")
+            || inner_lower.starts_with("<parameter")
+            || inner_lower.starts_with("<tool")
+            || inner_lower.starts_with("<function")
+            || inner.starts_with('{')
+            || inner.starts_with('[');
+        if looks_like_tool_structure && tool_structure_runs_to_end(inner) {
+            remaining = "";
+            break;
         }
 
         kept_segments.push(remaining[start..].to_string());
@@ -1284,8 +1356,8 @@ async fn load_runtime_config_and_defaults(
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut parsed: Config =
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
+    let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
+        .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
 
     if let Some(zeroclaw_dir) = path.parent() {
@@ -1293,6 +1365,9 @@ async fn load_runtime_config_and_defaults(
             zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         parsed.decrypt_secrets(&store)?;
     }
+    let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
+    parsed.env_overridden_paths = applied.paths;
+    parsed.pre_override_snapshots = applied.snapshots;
 
     let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
     let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;
@@ -3536,13 +3611,23 @@ fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::E
     }
 }
 
-fn compute_max_in_flight_messages(channel_count: usize) -> usize {
+fn compute_max_in_flight_messages(
+    channel_count: usize,
+    max_concurrent_per_channel: usize,
+) -> usize {
     channel_count
-        .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
+        .saturating_mul(max_concurrent_per_channel)
         .clamp(
             CHANNEL_MIN_IN_FLIGHT_MESSAGES,
             CHANNEL_MAX_IN_FLIGHT_MESSAGES,
         )
+}
+
+fn max_in_flight_messages_for_config(
+    channel_count: usize,
+    config: &zeroclaw_config::schema::ChannelsConfig,
+) -> usize {
+    compute_max_in_flight_messages(channel_count, config.max_concurrent_per_channel)
 }
 
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
@@ -4727,22 +4812,22 @@ async fn process_channel_message_body(
             // means the provider sends no `temperature` field (necessary
             // for models that reject it, e.g. claude-opus-4-7).
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                let memory_strategy = Arc::clone(&ctx.memory_strategy);
                 let model_provider = Arc::clone(&ctx.model_provider);
                 let model = ctx.model.to_string();
                 let temperature = ctx.temperature;
-                let memory = Arc::clone(&ctx.memory);
                 let user_msg = msg.content.clone();
                 let assistant_resp = delivered_response.clone();
                 zeroclaw_spawn::spawn!(async move {
-                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        model_provider.as_ref(),
-                        &model,
-                        temperature,
-                        memory.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
+                    if let Err(e) = memory_strategy
+                        .consolidate_turn(
+                            &user_msg,
+                            &assistant_resp,
+                            model_provider.as_ref(),
+                            &model,
+                            temperature,
+                        )
+                        .await
                     {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -5753,7 +5838,12 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
-                Ok(Arc::new(LarkChannel::from_config(lk, alias, peer_resolver)))
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk, alias, peer_resolver)
+                        .with_approval_timeout_secs(lk.approval_timeout_secs)
+                        .with_per_user_session(lk.per_user_session)
+                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -6420,7 +6510,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(
+            channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
                     TelegramChannel::new(
                         tg.bot_token.clone(),
@@ -6506,7 +6596,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Discord",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(Arc::new(discord_ch), dc),
+            channel: crate::paced_channel::PacedChannel::wrap(Arc::new(discord_ch), dc),
         });
     }
 
@@ -6537,7 +6627,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Slack",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(
+            channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
                     SlackChannel::new(
                         sl.bot_token.clone(),
@@ -6589,7 +6679,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Mattermost",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(
+            channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
                     MattermostChannel::new(
                         mm.url.clone(),
@@ -6640,7 +6730,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "iMessage",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(
+            channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
                 im,
             ),
@@ -6682,7 +6772,7 @@ fn collect_configured_channels(
                 channels.push(ConfiguredChannel {
                     display_name: "Matrix",
                     alias: Some(alias.clone()),
-                    channel: PacedChannel::wrap(Arc::new(channel), mx),
+                    channel: crate::paced_channel::PacedChannel::wrap(Arc::new(channel), mx),
                 });
             }
             Err(e) => {
@@ -6726,7 +6816,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Signal",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(
+            channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
                     SignalChannel::new(
                         sig.http_url.clone(),
@@ -6787,7 +6877,7 @@ fn collect_configured_channels(
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: PacedChannel::wrap(
+                        channel: crate::paced_channel::PacedChannel::wrap(
                             Arc::new(
                                 WhatsAppChannel::new(
                                     wa.access_token.clone().unwrap_or_default(),
@@ -6843,7 +6933,7 @@ fn collect_configured_channels(
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: PacedChannel::wrap(
+                        channel: crate::paced_channel::PacedChannel::wrap(
                             Arc::new(
                                 WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
                                     .with_transcription(config.transcription.clone())
@@ -7210,6 +7300,9 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
+                    .with_approval_timeout_secs(lk.approval_timeout_secs)
+                    .with_per_user_session(lk.per_user_session)
+                    .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone()),
             ),
         });
@@ -7763,7 +7856,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Webhook",
             alias: Some(alias.clone()),
-            channel: PacedChannel::wrap(
+            channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(WebhookChannel::new(
                     alias.clone(),
                     wh.port,
@@ -8620,7 +8713,7 @@ pub async fn start_channels(
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
 
-            let in_flight = compute_max_in_flight_messages(channels.len());
+            let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
@@ -8691,6 +8784,14 @@ pub async fn start_channels(
             .get("default")
             .is_some_and(|mx| mx.interrupt_on_new_message);
 
+        let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::clone(&mem),
+                config.memory.clone(),
+                config.data_dir.clone(),
+            ),
+        );
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&channels_by_name),
             model_provider: Arc::clone(&model_provider),
@@ -8699,6 +8800,7 @@ pub async fn start_channels(
             agent_cfg: Arc::new(agent.clone()),
             prompt_config: Arc::new(config.clone()),
             memory: Arc::clone(&mem),
+            memory_strategy,
             tools_registry: Arc::clone(&tools_registry),
             observer: Arc::clone(&observer),
             system_prompt: Arc::new(system_prompt),
@@ -9154,7 +9256,10 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("lark", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = LarkChannel::from_config(lk, alias, peer_resolver);
+            let ch = LarkChannel::from_config(lk, alias, peer_resolver)
+                .with_approval_timeout_secs(lk.approval_timeout_secs)
+                .with_per_user_session(lk.per_user_session)
+                .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-lark"))]
@@ -9231,6 +9336,49 @@ mod tests {
             "expected `zeroclaw quickstart` reference, got: {msg}"
         );
     }
+
+    #[tokio::test]
+    async fn channel_runtime_reload_applies_env_overrides_after_migration() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "openrouter"
+
+[agents.demo]
+provider = "openrouter"
+model = "meta-llama/llama-3.1-8b-instruct"
+temperature = 0.3
+"#,
+        )
+        .unwrap();
+
+        let env_name = "ZEROCLAW_providers__models__openrouter__agent_demo__api_key";
+        // SAFETY: this test owns this specific env-var key and restores it
+        // before returning. The value is synthetic and not a real credential.
+        unsafe { std::env::set_var(env_name, "sk-or-v1-test-channel-reload") };
+
+        let result = load_runtime_config_and_defaults(&config_path, "demo").await;
+
+        // SAFETY: undo the test-only process env mutation above.
+        unsafe { std::env::remove_var(env_name) };
+
+        let (config, defaults) = result.unwrap();
+        assert_eq!(
+            defaults.api_key.as_deref(),
+            Some("sk-or-v1-test-channel-reload")
+        );
+        assert!(
+            config
+                .env_overridden_paths
+                .contains("providers.models.openrouter.agent_demo.api_key")
+        );
+    }
+
     use zeroclaw_runtime::observability::NoopObserver;
     use zeroclaw_runtime::tools::{Tool, ToolResult};
 
@@ -9502,6 +9650,13 @@ mod tests {
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(String::new()),
@@ -9787,6 +9942,34 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_uses_configured_per_channel_budget() {
+        assert_eq!(compute_max_in_flight_messages(3, 4), 12);
+        assert_eq!(compute_max_in_flight_messages(3, 8), 24);
+    }
+
+    #[test]
+    fn max_in_flight_messages_for_config_uses_channel_budget() {
+        let config = zeroclaw_config::schema::ChannelsConfig {
+            max_concurrent_per_channel: 8,
+            ..Default::default()
+        };
+
+        assert_eq!(max_in_flight_messages_for_config(3, &config), 24);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_preserves_global_bounds() {
+        assert_eq!(
+            compute_max_in_flight_messages(1, 1),
+            CHANNEL_MIN_IN_FLIGHT_MESSAGES
+        );
+        assert_eq!(
+            compute_max_in_flight_messages(100, 4),
+            CHANNEL_MAX_IN_FLIGHT_MESSAGES
+        );
     }
 
     #[test]
@@ -10076,6 +10259,13 @@ mod tests {
                 ..Default::default()
             }),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    zeroclaw_dir.to_path_buf(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -10191,6 +10381,8 @@ mod tests {
         tokio::fs::write(
             &config_path,
             r#"
+schema_version = 3
+
 [agents.agent_a]
 model_provider = "openrouter.hot"
 
@@ -10542,6 +10734,13 @@ api_key = "anthropic-key"
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -10671,6 +10870,13 @@ api_key = "anthropic-key"
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -10775,6 +10981,13 @@ api_key = "anthropic-key"
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -10881,6 +11094,13 @@ api_key = "anthropic-key"
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -11221,6 +11441,13 @@ api_key = "anthropic-key"
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(agent_cfg),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -11874,6 +12101,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11976,6 +12210,13 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(
                 zeroclaw_runtime::tools::SessionsCurrentTool::new(Arc::clone(&session_store)),
             )]),
@@ -12083,6 +12324,13 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12227,6 +12475,13 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12342,6 +12597,13 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12472,6 +12734,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12585,6 +12854,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12683,6 +12959,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12801,6 +13084,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12936,6 +13226,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13134,6 +13431,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13227,6 +13531,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13330,6 +13641,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13692,6 +14010,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13824,6 +14149,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13966,6 +14298,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -14105,6 +14444,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -14222,6 +14568,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -14320,6 +14673,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -15629,6 +15989,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -15787,6 +16154,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
@@ -15985,6 +16359,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(RecallMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(RecallMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -16114,6 +16495,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -16252,6 +16640,13 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -17317,6 +17712,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -17422,6 +17824,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -17567,6 +17976,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -17760,6 +18176,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -17898,6 +18321,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -18028,6 +18458,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -18178,6 +18615,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -18531,6 +18975,13 @@ This is an example JSON object for profile settings."#;
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -19421,6 +19872,8 @@ Done."#;
                 use_feishu: false,
                 app_id: "cli_test".to_string(),
                 app_secret: "secret".to_string(),
+                approval_timeout_secs: 300,
+                per_user_session: false,
                 ..Default::default()
             },
         );
