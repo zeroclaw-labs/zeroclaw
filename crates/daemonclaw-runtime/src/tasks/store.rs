@@ -503,15 +503,15 @@ pub fn close_task(
         });
     }
 
-    // Run machine verifications and update satisfaction in-place
+    // Re-verify all machine items fresh (reset before check to prevent TOCTOU)
     let mut has_machine_items = false;
     for item in &mut task.acceptance {
-        if item.kind == "machine" {
+        if item.kind != "human" {
             has_machine_items = true;
-            match verifier.verify(&item.check) {
+            item.satisfied = false;
+            match verifier.verify(&item.kind, &item.check) {
                 Ok(true) => item.satisfied = true,
-                Ok(false) => {}
-                Err(_) => {}
+                Ok(false) | Err(_) => {}
             }
         }
     }
@@ -567,6 +567,24 @@ pub fn close_task(
     .context("Failed to close task")?;
 
     get_task_inner(&conn, task_id)
+}
+
+pub fn reopen_task(
+    workspace_dir: &Path,
+    task_id: &str,
+    actor: &TaskActor,
+    reason: &str,
+    audit: &AuditLogger,
+) -> Result<Task, TaskError> {
+    do_transition(
+        workspace_dir,
+        task_id,
+        Transition::Reopen,
+        actor,
+        Some(reason),
+        None,
+        audit,
+    )
 }
 
 pub fn abandon_task(
@@ -632,6 +650,61 @@ pub fn attest(
     .context("Failed to update acceptance")?;
 
     get_task_inner(&conn, task_id)
+}
+
+pub fn reband_task(
+    workspace_dir: &Path,
+    task_id: &str,
+    new_autonomy: super::Autonomy,
+    actor: &TaskActor,
+    audit: &AuditLogger,
+) -> Result<Task, TaskError> {
+    let task = get_task(workspace_dir, task_id)?;
+
+    let detail = serde_json::json!({
+        "task_id": task_id,
+        "action": "reband",
+        "old_autonomy": task.autonomy.as_str(),
+        "new_autonomy": new_autonomy.as_str(),
+    });
+    let event = AuditEvent::new(AuditEventType::TaskTransition)
+        .with_actor(actor.channel.clone(), actor.id.clone(), None)
+        .with_action(
+            serde_json::to_string(&detail).unwrap_or_default(),
+            "task".to_string(),
+            true,
+            true,
+        );
+    audit.log(&event).map_err(|e| TaskError::Audit(e.to_string()))?;
+
+    let conn = connect(workspace_dir)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE tasks SET autonomy = ?1, updated_at = ?2 WHERE id = ?3",
+        params![new_autonomy.as_str(), now, task_id],
+    )
+    .context("Failed to update task autonomy")?;
+
+    get_task_inner(&conn, task_id)
+}
+
+/// Persist updated acceptance items (used by the close-gate hook to record
+/// verification results without closing the task).
+pub fn update_acceptance(
+    workspace_dir: &Path,
+    task_id: &str,
+    acceptance: &[super::AcceptanceItem],
+) -> Result<()> {
+    let conn = connect(workspace_dir)?;
+    let acceptance_json =
+        serde_json::to_string(acceptance).context("Failed to serialize acceptance")?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE tasks SET acceptance = ?1, updated_at = ?2 WHERE id = ?3",
+        params![acceptance_json, now, task_id],
+    )
+    .context("Failed to update acceptance")?;
+    Ok(())
 }
 
 /// Read task_transition events from audit.db for a given task.

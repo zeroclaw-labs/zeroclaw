@@ -2,6 +2,8 @@ pub mod store;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const MAIN_AGENT_ACTOR_ID: &str = "main";
 
@@ -194,6 +196,7 @@ pub enum Transition {
     Resume,
     Submit,
     Close,
+    Reopen,
     Abandon,
 }
 
@@ -207,6 +210,7 @@ impl Transition {
             Self::Resume => &[TaskStatus::Paused],
             Self::Submit => &[TaskStatus::Active],
             Self::Close => &[TaskStatus::Review],
+            Self::Reopen => &[TaskStatus::Review],
             Self::Abandon => &[
                 TaskStatus::Open,
                 TaskStatus::Active,
@@ -219,7 +223,7 @@ impl Transition {
 
     pub fn target_status(&self) -> TaskStatus {
         match self {
-            Self::Claim | Self::Unblock | Self::Resume => TaskStatus::Active,
+            Self::Claim | Self::Unblock | Self::Resume | Self::Reopen => TaskStatus::Active,
             Self::Block => TaskStatus::Blocked,
             Self::Pause => TaskStatus::Paused,
             Self::Submit => TaskStatus::Review,
@@ -237,28 +241,116 @@ impl Transition {
             Self::Resume => "resume",
             Self::Submit => "submit",
             Self::Close => "close",
+            Self::Reopen => "reopen",
             Self::Abandon => "abandon",
         }
     }
 }
 
 /// Trait seam for machine acceptance verification.
-/// Track E swaps in git_operations/test-runner; Track A provides only the
-/// default implementation that shells out.
+/// Verifiers receive the acceptance item's `kind` (git_clean, tests_pass,
+/// command) and `check` string.
 pub trait AcceptanceVerifier: Send + Sync {
-    fn verify(&self, check: &str) -> std::result::Result<bool, String>;
+    fn verify(&self, kind: &str, check: &str) -> std::result::Result<bool, String>;
 }
 
+/// Minimal verifier that shells out — ignores `kind`, runs `check` as `sh -c`.
 pub struct ShellVerifier;
 
 impl AcceptanceVerifier for ShellVerifier {
-    fn verify(&self, check: &str) -> std::result::Result<bool, String> {
+    fn verify(&self, _kind: &str, check: &str) -> std::result::Result<bool, String> {
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(check)
             .output()
             .map_err(|e| format!("failed to run check: {e}"))?;
         Ok(output.status.success())
+    }
+}
+
+/// Named-kind verifier with git_clean, tests_pass, command support.
+/// Runs commands through SecurityPolicy and enforces a hard timeout.
+pub struct WorkspaceVerifier {
+    workspace_dir: PathBuf,
+    security: Arc<daemonclaw_config::policy::SecurityPolicy>,
+    timeout_secs: u64,
+}
+
+impl WorkspaceVerifier {
+    pub fn new(
+        workspace_dir: PathBuf,
+        security: Arc<daemonclaw_config::policy::SecurityPolicy>,
+        timeout_secs: u64,
+    ) -> Self {
+        Self {
+            workspace_dir,
+            security,
+            timeout_secs,
+        }
+    }
+
+    fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+    ) -> std::result::Result<(bool, String), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd = cmd.to_string();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let wd = self.workspace_dir.clone();
+        let timeout = std::time::Duration::from_secs(self.timeout_secs);
+
+        std::thread::spawn(move || {
+            let result = std::process::Command::new(&cmd)
+                .args(&args)
+                .current_dir(&wd)
+                .output();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(output)) => Ok((
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).to_string(),
+            )),
+            Ok(Err(e)) => Err(format!("command failed: {e}")),
+            Err(_) => Err(format!(
+                "verification timed out after {}s",
+                self.timeout_secs
+            )),
+        }
+    }
+
+    fn verify_git_clean(&self) -> std::result::Result<bool, String> {
+        let (success, stdout) = self.run_with_timeout("git", &["status", "--porcelain=2"])?;
+        if !success {
+            return Err("git status exited with error".to_string());
+        }
+        let is_clean = stdout
+            .lines()
+            .all(|line| line.starts_with('#') || line.is_empty());
+        Ok(is_clean)
+    }
+
+    fn verify_command(&self, check: &str) -> std::result::Result<bool, String> {
+        if check.is_empty() {
+            return Err("empty check command".to_string());
+        }
+        self.security
+            .validate_command_execution(check, true)
+            .map_err(|e| format!("blocked by security policy: {e}"))?;
+        let (success, _) = self.run_with_timeout("sh", &["-c", check])?;
+        Ok(success)
+    }
+}
+
+impl AcceptanceVerifier for WorkspaceVerifier {
+    fn verify(&self, kind: &str, check: &str) -> std::result::Result<bool, String> {
+        match kind {
+            "git_clean" => self.verify_git_clean(),
+            "tests_pass" | "command" | "machine" => self.verify_command(check),
+            other => Err(format!("unknown acceptance kind: {other}")),
+        }
     }
 }
 

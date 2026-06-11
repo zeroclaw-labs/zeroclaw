@@ -753,12 +753,16 @@ enum TaskCommands {
         /// Parent task ID (for subtasks)
         #[arg(long)]
         parent: Option<String>,
-        /// Machine acceptance check (command, exit 0 = pass). Repeatable.
+        /// Machine acceptance check. Supports kind prefixes:
+        ///   git_clean, tests_pass:<cmd>, command:<cmd>, or bare <cmd>.
         #[arg(long = "accept-machine")]
         accept_machine: Vec<String>,
         /// Human acceptance item (description). Repeatable.
         #[arg(long = "accept-human")]
         accept_human: Vec<String>,
+        /// Autonomy band: auto, assisted, gated (default: gated)
+        #[arg(long, default_value = "gated")]
+        autonomy: String,
     },
     /// Show a task by ID (prefix match supported)
     Show {
@@ -840,6 +844,13 @@ enum TaskCommands {
     Activity {
         /// Task ID
         id: String,
+    },
+    /// Change a task's autonomy band (operator-only)
+    Reband {
+        /// Task ID
+        id: String,
+        /// New band: auto, assisted, gated
+        band: String,
     },
 }
 
@@ -4076,12 +4087,20 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
             parent,
             accept_machine,
             accept_human,
+            autonomy,
         } => {
+            let autonomy_band = match autonomy.to_lowercase().as_str() {
+                "auto" => Autonomy::Auto,
+                "assisted" => Autonomy::Assisted,
+                "gated" => Autonomy::Gated,
+                other => anyhow::bail!("invalid autonomy band: {other} (expected: auto, assisted, gated)"),
+            };
             let mut acceptance = Vec::new();
-            for check in &accept_machine {
+            for raw in &accept_machine {
+                let (kind, check) = parse_acceptance_kind(raw);
                 acceptance.push(AcceptanceItem {
-                    kind: "machine".to_string(),
-                    check: check.clone(),
+                    kind,
+                    check,
                     satisfied: false,
                 });
             }
@@ -4099,7 +4118,7 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
                 priority,
                 parent_id: parent.as_deref(),
                 source: &source,
-                autonomy: Autonomy::Gated,
+                autonomy: autonomy_band,
                 execution: Execution::Agentic,
                 tools: &[],
             };
@@ -4283,7 +4302,34 @@ fn handle_task_command(cmd: TaskCommands, config: &Config) -> Result<()> {
             }
             Ok(())
         }
+        TaskCommands::Reband { id, band } => {
+            let new_autonomy = Autonomy::from_str(&band)
+                .ok_or_else(|| anyhow::anyhow!("invalid band '{}': expected auto, assisted, or gated", band))?;
+            let task = resolve_task(workspace, &id)?;
+            let updated = daemonclaw_runtime::tasks::store::reband_task(
+                workspace, &task.id, new_autonomy, &actor, &audit,
+            )?;
+            println!(
+                "Task {} rebanded to {}.",
+                &updated.id[..8],
+                updated.autonomy.as_str()
+            );
+            Ok(())
+        }
     }
+}
+
+fn parse_acceptance_kind(raw: &str) -> (String, String) {
+    const KNOWN_KINDS: &[&str] = &["git_clean", "tests_pass", "command"];
+    for &kind in KNOWN_KINDS {
+        if raw == kind {
+            return (kind.to_string(), String::new());
+        }
+        if let Some(rest) = raw.strip_prefix(kind).and_then(|s| s.strip_prefix(':')) {
+            return (kind.to_string(), rest.to_string());
+        }
+    }
+    ("command".to_string(), raw.to_string())
 }
 
 fn resolve_task(

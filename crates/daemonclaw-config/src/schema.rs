@@ -1502,6 +1502,12 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// Hard timeout in seconds for machine acceptance verifiers (git_clean,
+    /// tests_pass, command). A verification that exceeds this limit is treated
+    /// as unsatisfied. Default: `300` (5 minutes). `None` uses the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_timeout_secs: Option<u64>,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1548,6 +1554,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            verification_timeout_secs: None,
         }
     }
 }

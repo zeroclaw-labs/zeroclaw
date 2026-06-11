@@ -680,6 +680,13 @@ impl Agent {
                     config.workspace_dir.clone(),
                 )));
 
+                runner.register(Box::new(crate::hooks::builtin::CloseGateHook::new(
+                    config.workspace_dir.clone(),
+                    Arc::clone(&security),
+                    config.agent.verification_timeout_secs.unwrap_or(300),
+                    config.security.audit.clone(),
+                )));
+
                 Some(Arc::new(runner))
             } else {
                 None

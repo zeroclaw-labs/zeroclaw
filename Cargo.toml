@@ -3,7 +3,7 @@ members = [".", "crates/daemonclaw-api", "crates/daemonclaw-infra", "crates/daem
 resolver = "2"
 
 [workspace.package]
-version = "0.7.36"
+version = "0.7.37"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeliveryBoyTech/daemonclaw"
