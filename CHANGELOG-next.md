@@ -45,7 +45,7 @@ A daemon started as a service has a stripped-down environment; your terminal has
 
 #### Keybindings
 
-Four built-in presets (default, vim, emacs, arrows-only) plus per-action rebinding through an in-app capture modal. Changes apply live, no restart. Press `?` on any pane for context-aware help showing the bindings that apply right where you are.
+Four built-in presets (default, vim, emacs, arrows-only) plus per-action rebinding through an in-app capture modal. Changes apply live, no restart. **Press `?` on any pane for context-aware help showing the bindings that apply right where you are.**
 
 #### Chat
 
