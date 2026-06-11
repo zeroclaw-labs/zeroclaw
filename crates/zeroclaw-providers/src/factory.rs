@@ -84,6 +84,13 @@ pub trait CompatFamilySpec {
         None
     }
 
+    /// Whether this provider's `/models` endpoint is accessible without an
+    /// API key. When `true`, `list_models()` and `list_models_with_pricing()`
+    /// will query the live endpoint even when no credential is configured.
+    /// Defaults to `false`; set to `true` for providers like Kilo Gateway
+    /// whose model catalog is public.
+    const PUBLIC_MODEL_LISTING: bool = false;
+
     /// Build the base compat provider with both catalog consts applied. Use
     /// this from inside `build_compat` overrides so the catalog hooks ride
     /// along with any family-specific modifiers.
@@ -105,6 +112,9 @@ pub trait CompatFamilySpec {
         }
         if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
             p = p.with_openrouter_vendor_prefix(prefix);
+        }
+        if Self::PUBLIC_MODEL_LISTING {
+            p = p.with_public_model_listing();
         }
         p
     }
@@ -300,19 +310,19 @@ use zeroclaw_config::schema::{
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -856,7 +866,7 @@ fn build_ollama_compat_provider(
         true,
     )
     .with_local_model_tool_sanitize()
-    .with_unauthenticated_model_listing();
+    .with_public_model_listing();
     if opts.merge_system_into_user {
         p = p.with_merge_system_into_user();
     }
@@ -1145,6 +1155,19 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
     }
 }
 
+// ── Kilo AI Gateway (OpenAI-compatible) ────────────────────────────────
+
+impl CompatFamilySpec for KiloModelProviderConfig {
+    const DISPLAY: &'static str = "Kilo";
+    // Canonical gateway host per https://kilo.ai/docs/gateway (api.kilo.ai;
+    // app.kilo.ai is the web-app sign-in). Must stay in lockstep with
+    // `KiloEndpoint::Gateway` in zeroclaw-config — see the
+    // `kilo_gateway_default_url_matches_schema_endpoint` regression test.
+    const DEFAULT_URL: &'static str = "https://api.kilo.ai/api/gateway";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
+
 impl FamilyProviderFactory for LmstudioModelProviderConfig {
     fn create_provider(
         &self,
@@ -1287,6 +1310,9 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             AuthStyle::Bearer,
             true,
         );
+        if opts.native_tools != Some(true) {
+            p = p.without_native_tools();
+        }
         if opts.merge_system_into_user {
             p = p.with_merge_system_into_user();
         }
@@ -1332,6 +1358,24 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::ModelProviderConfig;
+
+    /// Regression for the #7136 review: the Kilo Gateway default exists in two
+    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
+    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
+    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
+    #[test]
+    fn kilo_gateway_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};
+        assert_eq!(
+            <KiloModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            KiloEndpoint::default().uri(),
+            "schema KiloEndpoint and factory DEFAULT_URL disagree on the Kilo Gateway URL"
+        );
+        assert_eq!(
+            KiloEndpoint::default().uri(),
+            "https://api.kilo.ai/api/gateway"
+        );
+    }
 
     #[test]
     fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
@@ -1572,6 +1616,51 @@ mod tests {
             )
             .unwrap();
         assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn custom_factory_disables_native_tools_by_default() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                None,
+                Some("http://10.0.0.15:8000/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            !provider.supports_native_tools(),
+            "custom OpenAI-compatible endpoints must default to prompt-guided tools"
+        );
+    }
+
+    #[test]
+    fn custom_factory_honors_native_tools_override_true() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                ..Default::default()
+            },
+        };
+        let options = ModelProviderRuntimeOptions {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider("vllm", None, Some("http://10.0.0.15:8000/v1"), &options)
+            .unwrap();
+        assert!(
+            provider.supports_native_tools(),
+            "custom endpoints with `native_tools = true` must keep native tool calling available"
+        );
     }
 
     #[test]
