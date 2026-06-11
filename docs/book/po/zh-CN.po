@@ -26681,7 +26681,7 @@ msgstr "目前位于 `gateway/mod.rs` 中的 WhatsApp、WATI、Linq、Nextcloud 
 
 #: src/foundations/index.md
 msgid "The ZeroClaw Maturity Framework"
-msgstr "零爪成熟度框架"
+msgstr "ZeroClaw Maturity Framework"
 
 #: src/tools/overview.md
 msgid "The [autonomy level](../security/autonomy.md) determines what each risk tier can do without operator approval. Default (`Supervised`): low runs, medium asks, high blocks."
@@ -33368,7 +33368,7 @@ msgstr "[`zeroclaw cron`↴](#zeroclaw-cron)"
 
 #: src/reference/cli.md
 msgid "[`zeroclaw daemon`↴](#zeroclaw-daemon)"
-msgstr "[`zeroclaw 守护进程`↴](#zeroclaw-daemon)"
+msgstr "[`zeroclaw daemon`↴](#zeroclaw-daemon)"
 
 #: src/reference/cli.md
 msgid "[`zeroclaw desktop`↴](#zeroclaw-desktop)"
@@ -33912,7 +33912,7 @@ msgstr "_职责：_"
 
 #: src/foundations/index.md
 msgid "_The ZeroClaw Maturity Framework is a living body of work. New documents are added when the team has learned something worth preserving. Each begins as a public RFC discussion and earns its place here through the same process as the six above: open conversation, honest disagreement, and the team's collective decision to carry it forward._"
-msgstr "ZeroClaw 成熟度框架是一个持续演进的文档体系。当团队积累了值得保留的经验时，便会新增相关文档。每份文档最初都以公开 RFC 讨论的形式启动，并通过与上述六份文档相同的流程获得认可：开放对话、坦诚分歧，以及团队集体决定将其纳入并持续推进。"
+msgstr "ZeroClaw Maturity Framework 是一个持续演进的文档体系。当团队积累了值得保留的经验时，便会新增相关文档。每份文档最初都以公开 RFC 讨论的形式启动，并通过与上述六份文档相同的流程获得认可：开放对话、坦诚分歧，以及团队集体决定将其纳入并持续推进。"
 
 #: src/foundations/fnd-003-governance.md
 msgid "_The best governance model is the simplest one the team will actually follow. Start here. Adjust based on what you learn._"
@@ -46212,11 +46212,11 @@ msgstr "`zeroclaw daemon --ephemeral` 会跟踪已连接的客户端，并在最
 
 #: src/hardware/arduino-uno-q-setup.md
 msgid "`zeroclaw daemon --host 127.0.0.1 --port 42617`"
-msgstr "`zeroclaw 守护进程 --host 127.0.0.1 --port 42617`"
+msgstr "`zeroclaw daemon --host 127.0.0.1 --port 42617`"
 
 #: src/reference/cli.md
 msgid "`zeroclaw daemon`"
-msgstr "`zeroclaw 守护进程`"
+msgstr "`zeroclaw daemon`"
 
 #: src/hardware/nucleo-setup.md
 msgid "`zeroclaw daemon` or `zeroclaw agent -a assistant -m \"Turn on LED\"`"

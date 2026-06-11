@@ -1573,11 +1573,21 @@ pub async fn run_tool_call_loop(
         let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
+        // Image markers that came from the user (inbound attachments), as
+        // opposed to tool results. A missing vision capability is handled
+        // differently for the two: a user image must surface an error (we
+        // cannot silently ignore what the user sent), while a tool-result
+        // image may degrade to text-only.
+        let user_image_marker_count = multimodal::count_user_image_markers(history);
 
         // ── Vision model_provider routing ──────────────────────────
         // When the default model_provider lacks vision support but a dedicated
         // vision_model_provider is configured, create it on demand and use it
-        // for this iteration.  Otherwise, preserve the original error.
+        // for this iteration. When no vision route exists at all, either
+        // surface a capability error (the user sent an image) or degrade
+        // gracefully (the markers came only from tool results) — see the
+        // no-vision-route branch below and `degrade_strip_images`.
+        let mut degrade_strip_images = false;
         let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
             && !model_provider.supports_vision()
         {
@@ -1602,6 +1612,9 @@ pub async fn run_tool_call_loop(
                         ))
                     })?;
                 if !vp_instance.supports_vision() {
+                    // Operator misconfiguration (named a non-vision provider as
+                    // the vision route) — surface it loudly rather than silently
+                    // degrading.
                     return Err(ProviderCapabilityError {
                         model_provider: vp.clone(),
                         capability: "vision".to_string(),
@@ -1612,7 +1625,12 @@ pub async fn run_tool_call_loop(
                     .into());
                 }
                 Some(vp_instance)
-            } else {
+            } else if user_image_marker_count > 0 {
+                // The user sent an image we cannot see. Surface a capability
+                // error so the attachment is not silently ignored — channels
+                // render this back to the user (e.g. "⚠️ Error … does not
+                // support vision"). Configuring a `vision_model_provider`
+                // routes around it.
                 return Err(ProviderCapabilityError {
                         model_provider: provider_name.to_string(),
                         capability: "vision".to_string(),
@@ -1621,6 +1639,29 @@ pub async fn run_tool_call_loop(
                         ),
                     }
                     .into());
+            } else {
+                // Markers came only from tool results (e.g. `image_info`,
+                // `screenshot`, `image_gen`). Previously this aborted the
+                // entire turn with a capability error, which turned an
+                // otherwise successful tool call (e.g. `image_info`, which
+                // always returns useful metadata text alongside its `[IMAGE:]`
+                // marker) into a hard failure. Instead, degrade: strip the
+                // image markers from the messages sent to the text-only
+                // provider while preserving the surrounding text, so the
+                // conversation continues and the model still receives any
+                // accompanying metadata/caption.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": provider_name,
+                            "image_marker_count": image_marker_count,
+                        })),
+                    "no vision route for tool-result image marker(s); degrading to text-only (markers stripped)"
+                );
+                degrade_strip_images = true;
+                None
             }
         } else {
             None
@@ -1641,8 +1682,22 @@ pub async fn run_tool_call_loop(
             (model_provider, provider_name, model)
         };
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = if degrade_strip_images {
+            // Text-only fallback: replace every media marker with a
+            // `[media attachment]` placeholder so no filesystem path or data
+            // URI reaches the text-only provider, while surrounding text
+            // (captions, tool metadata) survives.
+            let stripped: Vec<ChatMessage> = history
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: multimodal::strip_media_markers(&m.content),
+                })
+                .collect();
+            multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?
+        } else {
+            multimodal::prepare_messages_for_provider(history, multimodal_config).await?
+        };
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -3811,8 +3866,8 @@ pub async fn run(
                 &config.data_dir,
                 config.skills.install_suggestions.enabled,
             ) {
-                final_output = suggestion.clone();
-                println!("{suggestion}");
+                final_output = suggestion;
+                println!("{final_output}");
                 observer.record_event(&ObserverEvent::TurnComplete);
                 return Ok(final_output);
             }
@@ -4028,8 +4083,8 @@ pub async fn run(
                     }
                 }
             }
-            final_output = response.clone();
-            println!("{response}");
+            final_output = response;
+            println!("{final_output}");
             observer.record_event(&ObserverEvent::TurnComplete);
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
@@ -4178,11 +4233,11 @@ pub async fn run(
                     &config.data_dir,
                     config.skills.install_suggestions.enabled,
                 ) {
-                    final_output = suggestion.clone();
+                    final_output = suggestion;
                     if let Err(e) = zeroclaw_api::channel::Channel::send(
                         &*cli,
                         &zeroclaw_api::channel::SendMessage::new(
-                            format!("\n{suggestion}\n"),
+                            format!("\n{final_output}\n"),
                             "user",
                         ),
                     )
@@ -4454,12 +4509,12 @@ pub async fn run(
                 drop(delta_tx);
                 let _ = consumer_handle.await;
 
-                final_output = response.clone();
+                final_output = response;
                 if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
                     println!();
                 } else if let Err(e) = zeroclaw_api::channel::Channel::send(
                     &*cli,
-                    &zeroclaw_api::channel::SendMessage::new(format!("\n{response}\n"), "user"),
+                    &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
                 )
                 .await
                 {
@@ -6524,6 +6579,10 @@ mod tests {
         }
     }
 
+    /// A **user-supplied** image on a non-vision provider with no configured
+    /// `vision_model_provider` must surface a structured capability error
+    /// (channels render it back to the user) — we never silently ignore an
+    /// image the user actually sent.
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6569,7 +6628,7 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("model_provider without vision support should fail");
+        .expect_err("user image on a non-vision provider should error");
 
         assert!(err.to_string().contains("provider_capability_error"));
         assert!(err.to_string().contains("capability=vision"));
@@ -6695,22 +6754,30 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// When `vision_model_provider` is not set and the default model_provider lacks vision
-    /// support, the original `ProviderCapabilityError` should be returned.
+    /// A **tool-result** image marker (e.g. from `image_info`/`screenshot`)
+    /// on a non-vision provider with no `vision_model_provider` must NOT abort
+    /// the turn. The user did not send an image, so the loop degrades
+    /// gracefully: markers are stripped and the text-only provider is still
+    /// called so the conversation continues (and any accompanying
+    /// text/metadata survives).
     #[tokio::test]
-    async fn run_tool_call_loop_no_vision_provider_config_preserves_error() {
+    async fn run_tool_call_loop_degrades_tool_result_image_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
+        // Marker lives in a tool result, not a user message.
+        let mut history = vec![
+            ChatMessage::user("inspect the screenshot".to_string()),
+            ChatMessage::tool(
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            ),
+        ];
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &model_provider,
             &mut history,
             &tools_registry,
@@ -6742,10 +6809,11 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should fail without vision_model_provider config");
+        .expect("text-only fallback should succeed, not abort the turn");
 
-        assert!(err.to_string().contains("capability=vision"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Provider was invoked (no hard capability error) and returned text.
+        assert_eq!(result, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// When `vision_model_provider` is set but the model_provider factory cannot resolve

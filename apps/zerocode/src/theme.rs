@@ -54,23 +54,15 @@ const TERMINAL: Theme = Theme {
 // source of truth shared with the React dashboard and mdBook docs. See
 // `build.rs` for the var→role mapping. `TERMINAL` and `ICY_BLUE` are authored
 // here because they have no registry entry: `terminal` is the inherit-shell
-// sentinel, and `icy_blue` is the non-macOS default.
+// sentinel, and `icy_blue` is the default.
 include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
 
-pub(crate) const DEFAULT_THEME_NAME: &str = if cfg!(target_os = "macos") {
-    "terminal"
-} else {
-    "icy_blue"
-};
+pub(crate) const DEFAULT_THEME_NAME: &str = "icy_blue";
 
-const DEFAULT_THEME: Theme = if cfg!(target_os = "macos") {
-    TERMINAL
-} else {
-    ICY_BLUE
-};
+const DEFAULT_THEME: Theme = ICY_BLUE;
 
 /// The two authored presets with no dashboard-registry entry: the
-/// inherit-shell sentinel and the non-macOS default. All other presets come
+/// inherit-shell sentinel and the default. All other presets come
 /// from `GENERATED_THEMES`.
 const AUTHORED_THEMES: &[(&str, Theme)] = &[("terminal", TERMINAL), ("icy_blue", ICY_BLUE)];
 
@@ -445,13 +437,8 @@ mod tests {
     }
 
     #[test]
-    fn default_theme_is_platform_conditional() {
-        let expected = if cfg!(target_os = "macos") {
-            "terminal"
-        } else {
-            "icy_blue"
-        };
-        assert_eq!(DEFAULT_THEME_NAME, expected);
+    fn default_theme_is_icy_blue() {
+        assert_eq!(DEFAULT_THEME_NAME, "icy_blue");
         assert!(theme_by_name(DEFAULT_THEME_NAME).is_some());
     }
 }

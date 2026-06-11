@@ -268,8 +268,8 @@ macro_rules! emit_model_providers_struct {
         /// from the same `[model_providers.<type>.<alias>]` block as before.
         ///
         /// Adding a new model_provider family means: define the typed config in
-        /// `schema.rs`, then add one row to `for_each_model_provider_slot!` —
-        /// every helper picks up the new slot automatically.
+        /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
+        /// and every helper picks up the new slot automatically.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
