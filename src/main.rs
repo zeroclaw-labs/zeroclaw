@@ -1081,15 +1081,18 @@ async fn run_quickstart_cli(
         snapshot_state,
     };
 
-    // Guard: dialoguer checklist requires an interactive terminal.
-    // Without a TTY the loop redraws infinitely, flooding stdout (#7507).
-    let stdin_is_tty = std::io::stdin().is_terminal();
-    if !stdin_is_tty {
-        anyhow::bail!(
-            "quickstart requires an interactive terminal.\n\
-             Re-run with all required flags for non-interactive use:\n\
-               zeroclaw quickstart --model-provider <type> --model <name> --api-key <key> --agent <alias>"
+    // Guard: dialoguer reads from Term::stderr() and redraws infinitely
+    // when stderr is redirected or non-attended (#7507).  Check both the
+    // stdin handle (console user input) and stderr (dialoguer output).
+    let terminal_attended =
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if !terminal_attended {
+        let msg = t(
+            "cli-quickstart-needs-tty",
+            "quickstart requires an interactive terminal with both input and output attached.\n\
+             Re-run inside a terminal (or via ZeroCode TUI) to complete setup interactively.",
         );
+        anyhow::bail!("{}", msg);
     }
 
     // ── Form state ──────────────────────────────────────────────
