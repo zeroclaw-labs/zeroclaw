@@ -1130,6 +1130,22 @@ temperature = "hot"
     }
 
     #[test]
+    fn provider_pruner_never_panics_on_non_table_shapes() {
+        // Array-of-tables where a family map is expected, scalar [providers],
+        // array alias value. The salvage path is the daemon's never-fail
+        // loader, and prune_bad_provider_aliases carries expect() calls that
+        // rely on the scalar pre-passes; pin that invariant here.
+        for raw in [
+            "schema_version = 3\nproviders = 3\n",
+            "schema_version = 3\n[[providers.models.ollama]]\nmodel = \"x\"\n",
+            "schema_version = 3\n[providers.models.ollama]\nai = [1, 2]\n",
+            "schema_version = 3\n[providers.models]\nollama = [1]\n",
+        ] {
+            let _ = migrate_to_current_salvaged(raw);
+        }
+    }
+
+    #[test]
     fn scalar_provider_nodes_pruned_without_sinking_section() {
         // A scalar where a family/kind table is required must drop only
         // that node, not the whole [providers] section.
