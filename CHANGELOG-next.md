@@ -99,12 +99,11 @@ A [pluggable memory strategy](https://docs.zeroclawlabs.ai/master/en/agents/inte
 
 ## Security
 
-- **Canvas token theft (GHSA-f385-f6h2-3gqj)**: the dashboard Canvas iframe sandbox is tightened so injected content can no longer steal the gateway token (#6942).
+- **Canvas token theft (GHSA-f385-f6h2-3gqj)**: the dashboard Canvas iframe sandbox is tightened so injected content can no longer exfiltrate the pairing token (#6942).
 - **Bearer-token revocation**: rotating or deleting a paired device now actually invalidates its token at the gateway (#6988).
 - **Secret handling**: redaction now covers every credential-shaped config surface, including nested shapes (#6918, #6982, #7261), and the channel orchestrator no longer falls back to another provider's credentials (#7066).
 - **Outbound request guards**: private-host allowlists for the HTTP request tool (#6981) and for fetches whose DNS resolves to private addresses (#6974).
 - **Tool gating**: per-agent tool allowlists are enforced when channels start (#7064) and on every message (#6960); scheduled agent jobs can no longer modify the scheduler itself by default (#7189); internal telemetry is blocked from the chat WebSocket by default (#7221).
-- **Privacy**: inline model reasoning is stripped before tool output, channel delivery, and logs (#7254).
 - **[Sandboxing](https://docs.zeroclawlabs.ai/master/en/security/sandboxing.html)**: tighter library binds in the Linux sandbox (#6902), and interactive subprocesses can no longer hijack the controlling terminal (#7120).
 - **Dependency advisories**: mail library updated for RUSTSEC-2026-0141 (#6662), the web frontend router bumped to clear five advisories (#7198), and Groq API keys added to the leak scanner (#6812).
 - A partially invalid config can no longer silently default security-critical settings during daemon startup (#7160).
