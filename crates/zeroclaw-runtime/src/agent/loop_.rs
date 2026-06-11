@@ -3228,7 +3228,7 @@ pub async fn run(
         // See `Config::effective_*` helpers for precedence rules.
         let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
         let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
+        let eff_max_context_tokens = config.resolved_max_context_tokens_for_agent(agent_alias);
         let eff_compact_context = config.effective_compact_context(agent_alias);
         let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
         let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
@@ -3971,7 +3971,7 @@ pub async fn run(
                                 agent.resolved.strict_tool_parsing,
                                 agent.resolved.parallel_tools,
                                 agent.resolved.max_tool_result_chars,
-                                agent.resolved.max_context_tokens,
+                                config.resolved_max_context_tokens_for_agent(agent_alias),
                                 None, // shared_budget
                                 None, // channel: CLI mode — uses prompt_cli
                                 None, // receipt_generator
@@ -4376,7 +4376,7 @@ pub async fn run(
                                     agent.resolved.strict_tool_parsing,
                                     agent.resolved.parallel_tools,
                                     agent.resolved.max_tool_result_chars,
-                                    agent.resolved.max_context_tokens,
+                                    config.resolved_max_context_tokens_for_agent(agent_alias),
                                     None, // shared_budget
                                     None, // channel: interactive CLI — uses prompt_cli
                                     None, // receipt_generator
@@ -4653,7 +4653,7 @@ pub async fn process_message(
         // See `Config::effective_*` helpers for precedence rules.
         let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
         let _eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let _eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
+        let _eff_max_context_tokens = config.resolved_max_context_tokens_for_agent(agent_alias);
         let eff_compact_context = config.effective_compact_context(agent_alias);
         let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
         let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);

@@ -666,6 +666,14 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Fallback `max_context_tokens` budget when neither the agent nor its resolved
+/// model provides an explicit value. Conservative 32K matches the historical
+/// default of `AliasedAgentConfig::max_context_tokens` before this field became
+/// optional. Operators wanting to take advantage of long-context models should
+/// set `max_context_window` on the model provider (preferred) or
+/// `max_context_tokens` on the agent.
+pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_000;
+
 /// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -740,6 +748,24 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Maximum context window of this model in tokens, as documented by the provider.
+    /// Used as the default for `agent.max_context_tokens` when the agent does not
+    /// override. `None` (default) means ZeroClaw has no model-side hint, falls back
+    /// to `DEFAULT_MAX_CONTEXT_TOKENS` (32K) unless the agent overrides.
+    ///
+    /// This is the model's INPUT capacity (history + system prompt + user message),
+    /// distinct from `max_tokens` above which is the OUTPUT generation cap.
+    ///
+    /// Common values (operator must check provider docs):
+    ///   - DeepSeek-V4-Pro / V4-Flash: 1_000_000
+    ///   - Claude 3.5/4 Sonnet / Opus: 200_000
+    ///   - GPT-4o / GPT-4-Turbo: 128_000
+    ///   - Qwen3.6 series (dashscope coding plan): 1_000_000
+    ///   - Kimi-K2.5 / K2.6: 262_144
+    ///   - Moonshot-Kimi-K2-Instruct: 131_072
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<usize>,
     /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role, e.g. certain older Mistral variants.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
@@ -3176,6 +3202,23 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Maximum estimated tokens for conversation history before compaction triggers.
+    /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
+    /// are summarized to preserve context while staying within budget.
+    ///
+    /// `None` (default) inherits from the resolved model's `max_context_window`;
+    /// if neither this field nor `max_context_window` is set, falls back to
+    /// `DEFAULT_MAX_CONTEXT_TOKENS` (32K). Set explicitly to override the model hint
+    /// (e.g. for cost capping: even if model supports 1M, you may only want to pay
+    /// for 100K of input per request).
+    ///
+    /// Use `Config::resolved_max_context_tokens_for_agent` or
+    /// `AliasedAgentConfig::resolved_max_context_tokens` to consume this field,
+    /// never read it directly (you'd miss the inheritance chain).
+    #[tab(Tuning)]
+    #[serde(default)]
+    pub max_context_tokens: Option<usize>,
+
     // ── Resolved runtime tunables (populated by `resolved_agent_config`
     // from the runtime profile; not config-settable on the agent). ──
     #[serde(skip)]
@@ -3226,6 +3269,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            max_context_tokens: None,
             resolved: ResolvedRuntime::default(),
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
@@ -3245,6 +3289,21 @@ impl AliasedAgentConfig {
             && !self.model_provider.is_empty()
             && !self.risk_profile.trim().is_empty()
             && !self.runtime_profile.trim().is_empty()
+    }
+
+    /// Returns the effective `max_context_tokens` for this agent.
+    /// Priority: explicit `self.max_context_tokens` > `model_cfg.max_context_window` > `DEFAULT_MAX_CONTEXT_TOKENS` (32K).
+    #[must_use]
+    pub fn resolved_max_context_tokens(&self, model_cfg: Option<&ModelProviderConfig>) -> usize {
+        if let Some(explicit) = self.max_context_tokens {
+            return explicit;
+        }
+        if let Some(mc) = model_cfg
+            && let Some(window) = mc.max_context_window
+        {
+            return window;
+        }
+        DEFAULT_MAX_CONTEXT_TOKENS
     }
 }
 
@@ -3412,6 +3471,21 @@ impl Config {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.keep_tool_context_turns)
             .unwrap_or_else(default_keep_tool_context_turns)
+    }
+
+    /// Returns the effective `max_context_tokens` for the given agent alias.
+    /// Looks up the agent's `model_provider`, then delegates to
+    /// `AliasedAgentConfig::resolved_max_context_tokens`. Returns
+    /// `DEFAULT_MAX_CONTEXT_TOKENS` (32K) when the agent does not exist.
+    ///
+    /// Priority: `agent.max_context_tokens` (explicit) > `model.max_context_window` >
+    /// `DEFAULT_MAX_CONTEXT_TOKENS` (32K).
+    #[must_use]
+    pub fn resolved_max_context_tokens_for_agent(&self, agent_alias: &str) -> usize {
+        let Some(agent) = self.agents.get(agent_alias) else {
+            return DEFAULT_MAX_CONTEXT_TOKENS;
+        };
+        agent.resolved_max_context_tokens(self.model_provider_for_agent(agent_alias))
     }
 
     /// Return a clone of the named agent's `AliasedAgentConfig` with all
@@ -25833,5 +25907,125 @@ allowed_users = []
             .insert("primary".to_string(), entry);
 
         assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn resolved_max_context_tokens_uses_explicit_agent_value() {
+        let agent = AliasedAgentConfig {
+            max_context_tokens: Some(50_000),
+            ..AliasedAgentConfig::default()
+        };
+        let model_cfg = ModelProviderConfig {
+            max_context_window: Some(1_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            agent.resolved_max_context_tokens(Some(&model_cfg)),
+            50_000,
+            "explicit agent override must win over model hint"
+        );
+    }
+
+    #[test]
+    async fn resolved_max_context_tokens_inherits_from_model_when_agent_unset() {
+        let agent = AliasedAgentConfig::default();
+        let model_cfg = ModelProviderConfig {
+            max_context_window: Some(1_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            agent.resolved_max_context_tokens(Some(&model_cfg)),
+            1_000_000,
+            "unset agent must inherit model.max_context_window"
+        );
+    }
+
+    #[test]
+    async fn resolved_max_context_tokens_falls_back_to_default_when_both_unset() {
+        let agent = AliasedAgentConfig::default();
+        let model_cfg = ModelProviderConfig::default();
+        assert_eq!(
+            agent.resolved_max_context_tokens(Some(&model_cfg)),
+            DEFAULT_MAX_CONTEXT_TOKENS,
+            "both unset must fall back to 32K"
+        );
+        assert_eq!(
+            agent.resolved_max_context_tokens(None),
+            DEFAULT_MAX_CONTEXT_TOKENS,
+            "None model_cfg must also fall back"
+        );
+    }
+
+    #[test]
+    async fn config_resolved_max_context_tokens_for_agent_full_inheritance() {
+        let toml = r#"
+            [providers.models.deepseek.default]
+            api_key = "k"
+            model = "deepseek-v4-pro"
+            max_context_window = 1000000
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "deepseek.default"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.resolved_max_context_tokens_for_agent("default"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    async fn config_resolved_max_context_tokens_for_agent_explicit_override() {
+        let toml = r#"
+            [providers.models.deepseek.default]
+            api_key = "k"
+            model = "deepseek-v4-pro"
+            max_context_window = 1000000
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "deepseek.default"
+            risk_profile = "default"
+            max_context_tokens = 50000
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.resolved_max_context_tokens_for_agent("default"),
+            50_000,
+            "explicit agent override must win over model.max_context_window"
+        );
+    }
+
+    #[test]
+    async fn config_resolved_max_context_tokens_for_agent_fallback_32k() {
+        let toml = r#"
+            [providers.models.deepseek.default]
+            api_key = "k"
+            model = "deepseek-v4-pro"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "deepseek.default"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.resolved_max_context_tokens_for_agent("default"),
+            DEFAULT_MAX_CONTEXT_TOKENS
+        );
     }
 }
