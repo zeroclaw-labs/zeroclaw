@@ -19,7 +19,6 @@
 /crates/zeroclaw-config/**           @Audacity88 @singlerider
 /crates/zeroclaw-memory/**           @Audacity88
 /crates/zeroclaw-tool-call-parser/** @Audacity88
-/apps/zerocode/**                    @singlerider @Audacity88
 /src/agent/**                        @Audacity88
 /src/gateway/**                      @Audacity88
 /src/tools/**                        @Audacity88
@@ -43,6 +42,10 @@
 /web/**                       @singlerider
 /dist/**                      @singlerider
 /apps/**                      @singlerider
+
+# Zerocode TUI: paired. Must come AFTER /apps/** (last match wins) or the
+# broad apps rule strips @Audacity88 from zerocode files.
+/apps/zerocode/**             @singlerider @Audacity88
 
 # ---------------------------------------------------------------------------
 # Legacy root crate and common source paths (shared maintainer triage)
@@ -144,17 +147,19 @@
 /docs/** @Audacity88 @singlerider
 
 # ---------------------------------------------------------------------------
-# Architecture docs (high-risk)
+# Architecture docs (high-risk, paired)
 # ---------------------------------------------------------------------------
-/docs/book/src/foundations/** @Audacity88
+/docs/book/src/foundations/** @Audacity88 @singlerider
 
 # ---------------------------------------------------------------------------
 # Governance, release, CI (high-risk)
 # Listed before the security section so narrower /.github/codeql/** and
 # /.github/dependabot.yml rules below can override the broader /.github/**.
+# Review-routing control paths stay paired so no single owner can change
+# who reviews future changes.
 # ---------------------------------------------------------------------------
-/.github/**             @Audacity88
-/.github/CODEOWNERS     @Audacity88
+/.github/**             @Audacity88 @singlerider
+/.github/CODEOWNERS     @Audacity88 @singlerider
 /release-plz.toml       @Audacity88
 /scripts/**             @Audacity88
 /xtask/**               @Audacity88
@@ -188,11 +193,11 @@ Cargo.toml @JordanTheJet
 Cargo.lock @JordanTheJet
 
 # ---------------------------------------------------------------------------
-# Root governance Markdown
+# Root governance Markdown (paired)
 # ---------------------------------------------------------------------------
-/AGENTS.md          @Audacity88
-/CONTRIBUTING.md    @Audacity88
-/CODE_OF_CONDUCT.md @Audacity88
+/AGENTS.md          @Audacity88 @singlerider
+/CONTRIBUTING.md    @Audacity88 @singlerider
+/CODE_OF_CONDUCT.md @Audacity88 @singlerider
 
 # ---------------------------------------------------------------------------
 # Other top-level Markdown, license, notice files (legacy stewardship)
