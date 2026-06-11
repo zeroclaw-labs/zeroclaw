@@ -29,7 +29,7 @@
 # ---------------------------------------------------------------------------
 # singlerider-primary areas (providers, API, infra, hardware, firmware, web)
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-providers/** @singlerider
+/crates/zeroclaw-providers/** @singlerider @Nillth
 /crates/zeroclaw-api/**       @singlerider
 /crates/zeroclaw-infra/**     @singlerider
 /crates/zeroclaw-hardware/**  @singlerider
@@ -37,7 +37,7 @@
 /crates/robot-kit/**          @singlerider
 /crates/zeroclaw-macros/**    @singlerider
 /firmware/**                  @singlerider
-/src/providers/**             @singlerider
+/src/providers/**             @singlerider @Nillth
 /src/hardware/**              @singlerider
 /web/**                       @singlerider
 /dist/**                      @singlerider
@@ -106,8 +106,8 @@
 # ---------------------------------------------------------------------------
 # Channels (Audacity primary + singlerider specialist)
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-channels/** @Audacity88 @singlerider
-/src/channels/**             @Audacity88 @singlerider
+/crates/zeroclaw-channels/** @Audacity88 @singlerider @Nillth
+/src/channels/**             @Audacity88 @singlerider @Nillth
 
 # ---------------------------------------------------------------------------
 # Skills, plugins (per Jordan's suggested patch on PR #6537)
