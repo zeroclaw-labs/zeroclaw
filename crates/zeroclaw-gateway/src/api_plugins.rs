@@ -122,7 +122,6 @@ pub mod plugin_routes {
             };
 
             let config = Config {
-                workspace_dir: workspace.clone(),
                 config_path: config_dir.join("config.toml"),
                 plugins,
                 ..Config::default()
