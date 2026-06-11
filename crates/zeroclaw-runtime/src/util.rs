@@ -77,7 +77,12 @@ pub enum MaybeSet<T> {
 /// free lists instead of `munmap`-ing them, so resident set size stays flat
 /// despite a correct free. This releases the arena tops so the daemon's RSS
 /// actually falls. No-op on targets without glibc's `malloc_trim`.
-#[cfg(target_env = "gnu")]
+///
+/// Gated on Linux + glibc specifically: `libc` is a `cfg(unix)`-only
+/// dependency, and `malloc_trim` is a glibc extension. A bare
+/// `target_env = "gnu"` also matches the `windows-gnu` target, where `libc`
+/// is absent and the call fails to resolve.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn release_freed_heap() {
     // SAFETY: `malloc_trim` only inspects and releases the allocator's own
     // free lists. It takes no Rust-owned pointer and frees nothing the program
@@ -87,7 +92,7 @@ pub fn release_freed_heap() {
     }
 }
 
-#[cfg(not(target_env = "gnu"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn release_freed_heap() {}
 
 #[cfg(test)]

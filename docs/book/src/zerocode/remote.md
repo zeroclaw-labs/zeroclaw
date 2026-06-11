@@ -7,40 +7,46 @@ Connect zerocode on your workstation to a daemon running on another machine
 
 1. **Generate a self-signed TLS certificate:**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
      -keyout ~/.zeroclaw/wss.key \
      -out ~/.zeroclaw/wss.cert \
      -days 3650 -nodes -subj '/CN=zeroclaw'
    ```
 
-2. **Enable WSS.** On a host you can already reach with zerocode, set this in
-   the [Config](./config.md) pane's `[wss]` section. On a fresh headless host,
-   write it to `~/.zeroclaw/config.toml` directly to bootstrap the first
-   connection. The persisted result:
+   </div>
 
-   ```toml
-   [wss]
-   enabled = true
-   cert_path = "/home/youruser/.zeroclaw/wss.cert"
-   key_path = "/home/youruser/.zeroclaw/wss.key"
-   ```
-
-   Use absolute paths. The config does not expand `~`.
+2. **Enable WSS.** Set the `wss` config through the [Config](./config.md) pane (or the gateway / `zeroclaw config set`). Use absolute paths; the config does not expand `~`.
 
 3. **Open the firewall port:**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    sudo ufw allow 9781/tcp
    ```
+
+   </div>
 
    The default WSS port is **9781**. Change it with `port = <number>` in the `[wss]` section.
 
 4. **Start (or restart) the daemon:**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    zeroclaw daemon
    ```
+
+   </div>
 
    You should see a log line confirming the WSS listener started on `0.0.0.0:9781`.
 
@@ -48,9 +54,15 @@ Connect zerocode on your workstation to a daemon running on another machine
 
 1. **Connect with TLS verification skipped:**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    zerocode --connect wss://<remote-ip>:9781 --tls-skip-verify
    ```
+
+   </div>
 
    `--tls-skip-verify` is required for self-signed certificates. The HMAC session signing still authenticates the connection.
 
@@ -58,7 +70,7 @@ That's it. zerocode reconnects automatically if the connection drops.
 
 ## Config reference
 
-The `[wss]` section in `config.toml`:
+The `wss` section:
 
 | Field | Default | Description |
 |-------|---------|-------------|

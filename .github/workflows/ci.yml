@@ -5,8 +5,15 @@ on:
     branches: [master]
   push:
     branches: [master]
+  # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
+  # and fires `merge_group`. The required `CI Required Gate` must report on that
+  # branch or queued PRs stall, so the full gate runs here too.
+  merge_group:
 
 concurrency:
+  # Merge-queue runs key on the unique queue ref (github.ref →
+  # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
+  # never cancel each other; PRs still key on the PR number.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -245,6 +252,23 @@ jobs:
       - name: Evaluate Nix module assertions
         run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
 
+  docs-style:
+    name: Docs Style
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Resolve base SHA
+        id: base
+        run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Docs quality gate (markdown lint + em-dash prose check)
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/ci/docs_quality_gate.sh
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -252,7 +276,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

@@ -748,7 +748,7 @@ struct ResponseToolUseWrapper {
 // ── BedrockModelProvider ─────────────────────────────────────────────
 
 pub struct BedrockModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     auth: Option<BedrockAuth>,
     max_tokens: u32,

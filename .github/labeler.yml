@@ -349,6 +349,13 @@
           - "src/providers/kilocli.rs"
           - "crates/zeroclaw-providers/src/kilocli.rs"
 
+"provider:kilo":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-providers/src/catalog.rs"
+          - "crates/zeroclaw-config/src/schema.rs"
+          - "crates/zeroclaw-providers/src/factory.rs"
+
 "provider:ollama":
   - changed-files:
       - any-glob-to-any-file:
@@ -428,6 +435,13 @@
           - "src/tools/cron_run.rs"
           - "src/tools/cron_runs.rs"
           - "src/tools/cron_update.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_add.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_common.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_list.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_remove.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_run.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_runs.rs"
+          - "crates/zeroclaw-runtime/src/tools/cron_update.rs"
 
 "tool:file":
   - changed-files:
@@ -497,6 +511,11 @@
           - "src/tools/sop_execute.rs"
           - "src/tools/sop_list.rs"
           - "src/tools/sop_status.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_advance.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_approve.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_execute.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_list.rs"
+          - "crates/zeroclaw-runtime/src/tools/sop_status.rs"
 
 "tool:web":
   - changed-files:
@@ -515,6 +534,8 @@
       - any-glob-to-any-file:
           - "src/tools/security_ops.rs"
           - "src/tools/verifiable_intent.rs"
+          - "crates/zeroclaw-runtime/src/tools/security_ops.rs"
+          - "crates/zeroclaw-runtime/src/tools/verifiable_intent.rs"
 
 "tool:cloud":
   - changed-files:
