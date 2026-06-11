@@ -12,7 +12,7 @@ This page contains minimal, working examples for each core extension point.
 
 ## Tool (`crates/zeroclaw-api/src/tool.rs`)
 
-Tools are the agent's hands — they let it interact with the world.
+Tools are the agent's hands: they let it interact with the world.
 
 **Required methods**: `name()`, `description()`, `parameters_schema()`, `execute()`.
 The `spec()` method has a default implementation that composes the others.
@@ -411,7 +411,7 @@ All extension traits follow the same wiring pattern:
 A few invariants that hold across every extension. Breaking these tends to be the source of cross-cutting cleanup PRs later, so internalise them up front:
 
 - **Extend by trait + factory wiring first.** Adding a new provider/channel/tool/peripheral is implementing a trait and registering it in the relevant factory. Avoid cross-module rewrites for what should be an isolated feature.
-- **Dependency direction goes inward to contracts.** Concrete integrations depend on `zeroclaw-api` traits, `zeroclaw-config` schema, and `zeroclaw-infra` utilities — not on each other. Provider code does not import channel internals; tool code does not mutate gateway policy directly.
+- **Dependency direction goes inward to contracts.** Concrete integrations depend on `zeroclaw-api` traits, `zeroclaw-config` schema, and `zeroclaw-infra` utilities, not on each other. Provider code does not import channel internals; tool code does not mutate gateway policy directly.
 - **Module responsibilities stay single-purpose.** Orchestration in `zeroclaw-runtime/src/agent/`, transport in `zeroclaw-channels/`, model I/O in `zeroclaw-providers/`, policy in `zeroclaw-runtime/src/security/`, execution in `zeroclaw-tools/`.
 - **Rule of three for shared abstractions.** Introduce new shared types only after a third real caller materialises. Premature abstractions accrete weight that future contributors have to navigate around.
 - **Config keys are public contract.** Schema changes need defaults, compatibility impact, and a migration/rollback path documented in the PR.
@@ -421,7 +421,7 @@ A few invariants that hold across every extension. Breaking these tends to be th
 Any tool that owns long-lived shared state (rate limiters, connection pools, cached credentials, broadcast channels) follows a small contract that keeps the daemon's per-client isolation guarantees intact:
 
 - **`Arc<RwLock<T>>` handle pattern.** Accept handles at construction; do not create global or static mutable state inside a tool. Tests need to instantiate tools with isolated state, and the daemon needs to construct multiple instances for namespacing.
-- **`ClientId` is daemon-supplied.** Use it to namespace per-client state. Never construct identity keys inside a tool — the daemon owns identity and the tool consumes it.
+- **`ClientId` is daemon-supplied.** Use it to namespace per-client state. Never construct identity keys inside a tool; the daemon owns identity and the tool consumes it.
 - **Security state isolates per client.** Credentials, quotas, anything that can leak between sessions stays per-`ClientId`. Display/broadcast state is allowed to share, with optional namespace prefixing for trace clarity.
 - **Cached validation invalidates on config change.** Tools must re-validate before the next execution when the config-change signal fires. The daemon emits the signal; the tool subscribes.
 

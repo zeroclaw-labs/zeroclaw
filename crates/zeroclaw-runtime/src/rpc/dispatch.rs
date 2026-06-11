@@ -2193,9 +2193,11 @@ impl RpcDispatcher {
             // masked display value back when no real edit happened, and
             // letting that through silently clobbers the live secret with
             // the literal masked string.
-            if info
+            let is_secret_prop = info
                 .as_ref()
                 .is_some_and(|i| i.is_secret || i.derived_from_secret)
+                || zeroclaw_config::schema::Config::prop_is_secret(&req.prop);
+            if is_secret_prop
                 && (value_str == zeroclaw_config::traits::MASKED_SECRET
                     || value_str == "****"
                     || value_str.is_empty())
@@ -2421,7 +2423,8 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
-                    active_sessions: rpc.max(persisted),
+                    live_sessions: rpc,
+                    persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
                 }
             })
@@ -2782,7 +2785,7 @@ impl RpcDispatcher {
                 let completed = wizard
                     .map(|w| zeroclaw_config::sections::section_has_signal(&config, w))
                     .unwrap_or(false);
-                let label = humanize_section_key(&key);
+                let label = zeroclaw_config::sections::humanize_section_key(&key);
                 ConfigSectionEntry {
                     help: section_help(&key).to_string(),
                     has_picker,
@@ -3135,21 +3138,6 @@ impl RpcDispatcher {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-/// Humanize a section key for display (`risk-profiles` → `Risk profiles`).
-fn humanize_section_key(key: &str) -> String {
-    match key {
-        "providers.models" => return "Model providers".to_string(),
-        "providers.tts" => return "TTS providers".to_string(),
-        "providers.transcription" => return "Transcription providers".to_string(),
-        _ => {}
-    }
-    let mut s = key.replace(['_', '-'], " ");
-    if let Some(c) = s.get_mut(0..1) {
-        c.make_ascii_uppercase();
-    }
-    s
-}
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
@@ -4037,6 +4025,51 @@ mod tests {
             stored.as_deref(),
             Some("sk-live-secret"),
             "live secret must NOT be clobbered by a masked write"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_handles_dynamic_http_request_secret_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        });
+
+        let params = json!({
+            "prop": "http_request.secrets.api_token",
+            "value": "Bearer runtime-secret"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(
+            res.is_ok(),
+            "config/set must accept a real dynamic http_request secret: {res:?}"
+        );
+        let cfg = dispatcher.ctx.config.read().clone();
+        assert_eq!(
+            cfg.http_request
+                .secrets
+                .get("api_token")
+                .map(String::as_str),
+            Some("Bearer runtime-secret")
+        );
+
+        for masked in [zeroclaw_config::traits::MASKED_SECRET, "****", ""] {
+            let params = json!({
+                "prop": "http_request.secrets.next_token",
+                "value": masked
+            });
+            let res = dispatcher.handle_config_set(&params).await;
+            assert!(
+                res.is_err(),
+                "config/set must reject masked/empty dynamic secret (`{masked}`), got: {res:?}"
+            );
+        }
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            !cfg_after.http_request.secrets.contains_key("next_token"),
+            "masked dynamic writes must not materialize a secret key"
         );
     }
 
