@@ -28,7 +28,7 @@ const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
 
 #[derive(Clone)]
 pub struct OpenAiCodexModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     auth: AuthService,
     auth_profile_override: Option<String>,

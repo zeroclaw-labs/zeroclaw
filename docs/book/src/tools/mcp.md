@@ -2,13 +2,15 @@
 
 ZeroClaw is an MCP client: it connects to external [Model Context Protocol](https://modelcontextprotocol.io) servers and exposes their tools to the agent. Each MCP tool is namespaced as `<server>__<tool>` (for example `filesystem__read_file`), so tools from different servers never collide.
 
-## Enable MCP
+## Configure MCP
 
-MCP is **off by default**. Set `mcp.enabled = true`, then add one entry per server under `mcp.servers`. Configure through the gateway, zerocode, or `zeroclaw config set`:
+MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers`. Configure through the gateway, zerocode, or `zeroclaw config set`:
 
 ```sh
-zeroclaw config set mcp.enabled true
+zeroclaw config set mcp.servers.filesystem.command npx
 ```
+
+Set `mcp.enabled = false` to disable MCP tool loading without removing server definitions.
 
 ## Transports
 
@@ -38,11 +40,11 @@ Per-server fields (`[[mcp.servers]]`), generated from the schema:
 
 ## Deferred loading
 
-`mcp.deferred_loading` is `true` by default. With it on, only MCP tool **names** are placed in the system prompt; the LLM calls the built-in `tool_search` tool to fetch a tool's full schema before invoking it. This keeps the initial context window small when a server exposes many tools. Set it to `false` to eagerly include every MCP tool's full schema up front.
+`mcp.deferred_loading` is `false` by default, so configured MCP tools are included in the model context eagerly. Set it to `true` to place only MCP tool **names** in the system prompt; the LLM calls the built-in `tool_search` tool to fetch a tool's full schema before invoking it. This keeps the initial context window small when a server exposes many tools.
 
 ## Security and approval
 
-MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`):
+MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`). The `tool_search` discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:
 
 - At autonomy `level = full`, no tool call prompts (MCP tools included).
 - Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.

@@ -431,7 +431,7 @@ enum Commands {
         api_key: Option<String>,
 
         /// ModelProvider name. Used as the type key for the synthesized
-        /// `[model_providers.<type>.default]` entry.
+        /// `[providers.models.<type>.default]` entry.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -3648,109 +3648,105 @@ async fn main() -> Result<()> {
                 // first iteration; reload would otherwise see a moved value.
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
-                let subsystems = daemon::DaemonSubsystems {
-                    #[cfg(feature = "gateway")]
-                    gateway_start: Some(Box::new(
-                        move |host, port, config, tx, reload_tx, tui_registry| {
-                            let canvas_store = canvas_store_for_gateway.clone();
-                            Box::pin(async move {
-                                Box::pin(zeroclaw_gateway::run_gateway(
-                                    &host,
-                                    port,
-                                    config,
-                                    tx,
-                                    reload_tx,
-                                    tui_registry,
-                                    Some(canvas_store),
-                                ))
-                                .await
-                            })
-                        },
-                    )),
-                    #[cfg(not(feature = "gateway"))]
-                    gateway_start: None,
-                    channels_start: Some(Box::new(move |config, cancel| {
-                        let canvas_store = canvas_store_for_channels.clone();
+                let mut registry = daemon::DaemonRegistry::new();
+
+                #[cfg(feature = "gateway")]
+                registry.register_gateway(Box::new(
+                    move |host, port, config, tx, reload_tx, tui_registry| {
+                        let canvas_store = canvas_store_for_gateway.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            Box::pin(zeroclaw_gateway::run_gateway(
+                                &host,
+                                port,
                                 config,
+                                tx,
+                                reload_tx,
+                                tui_registry,
                                 Some(canvas_store),
-                                cancel,
                             ))
                             .await
                         })
-                    })),
-                    #[cfg(feature = "channel-mqtt")]
-                    mqtt_start: Some(Box::new({
-                        use std::sync::{Arc, Mutex};
-                        use zeroclaw_config::schema::SopConfig;
-                        use zeroclaw_memory::NoneMemory;
-                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                        let sop_config = current_config.sop.clone();
-                        let workspace_dir = current_config.data_dir.clone();
-                        move |mqtt_config| {
-                            let engine = if sop_config.sops_dir.is_some() {
-                                let mut e = SopEngine::new(sop_config.clone());
-                                e.reload(&workspace_dir);
-                                e
-                            } else {
-                                SopEngine::new(SopConfig::default())
-                            };
-                            let engine = Arc::new(Mutex::new(engine));
-                            let audit =
-                                Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
-                            Box::pin(async move {
-                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                    &mqtt_config,
-                                    engine,
-                                    audit,
-                                )
-                                .await
-                            })
-                        }
-                    })),
-                    socket_start: Some(Box::new(|ctx, cancel, client_count| {
+                    },
+                ));
+
+                registry.register_channels(Box::new(move |config, cancel| {
+                    let canvas_store = canvas_store_for_channels.clone();
+                    Box::pin(async move {
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            config,
+                            Some(canvas_store),
+                            cancel,
+                        ))
+                        .await
+                    })
+                }));
+
+                #[cfg(feature = "channel-mqtt")]
+                registry.register_mqtt(Box::new({
+                    use std::sync::{Arc, Mutex};
+                    use zeroclaw_config::schema::SopConfig;
+                    use zeroclaw_memory::NoneMemory;
+                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+                    let sop_config = current_config.sop.clone();
+                    let workspace_dir = current_config.data_dir.clone();
+                    move |mqtt_config| {
+                        let engine = if sop_config.sops_dir.is_some() {
+                            let mut e = SopEngine::new(sop_config.clone());
+                            e.reload(&workspace_dir);
+                            e
+                        } else {
+                            SopEngine::new(SopConfig::default())
+                        };
+                        let engine = Arc::new(Mutex::new(engine));
+                        let audit =
+                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
                         Box::pin(async move {
-                            Box::pin(zeroclaw_runtime::rpc::local::run_local_listener(
-                                ctx,
-                                cancel,
-                                client_count,
-                            ))
-                            .await
-                        })
-                    })),
-                    wss_start: Some(Box::new(|ctx, cancel, client_count| {
-                        Box::pin(async move {
-                            let wss_cfg = ctx.config.read().wss.clone();
-                            if !wss_cfg.enabled {
-                                // WSS disabled — park until cancelled.
-                                cancel.cancelled().await;
-                                return Ok(());
-                            }
-                            let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                                &wss_cfg.cert_path,
-                                &wss_cfg.key_path,
-                            )?;
-                            let bind_addr: std::net::SocketAddr =
-                                format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
-                            zeroclaw_runtime::rpc::wss::run_wss_listener(
-                                ctx,
-                                cancel,
-                                client_count,
-                                tls_acceptor,
-                                bind_addr,
+                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                &mqtt_config,
+                                engine,
+                                audit,
                             )
                             .await
                         })
-                    })),
-                    #[cfg(not(feature = "channel-mqtt"))]
-                    mqtt_start: None,
-                };
+                    }
+                }));
+
+                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                    Box::pin(async move {
+                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
+                            .await
+                    })
+                }));
+
+                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                    Box::pin(async move {
+                        let wss_cfg = ctx.config.read().wss.clone();
+                        if !wss_cfg.enabled {
+                            // WSS disabled — park until cancelled.
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
+                            &wss_cfg.cert_path,
+                            &wss_cfg.key_path,
+                        )?;
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
+                        zeroclaw_runtime::rpc::wss::run_wss_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            tls_acceptor,
+                            bind_addr,
+                        )
+                        .await
+                    })
+                }));
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
                     port,
-                    subsystems,
+                    registry,
                     ephemeral,
                 ))
                 .await?;
@@ -4159,8 +4155,8 @@ async fn main() -> Result<()> {
                 }
             }
             println!(
-                "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \
-                 OpenAI-compatible endpoint, or [model_providers.anthropic.<alias>] \
+                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
+                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
                  uri = \"<URL>\" for an Anthropic-compatible endpoint."
             );
             Ok(())

@@ -388,7 +388,7 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
 /// passes a single primary. Per-model failover chains are also test-only —
 /// the schema no longer surfaces them.
 pub struct ReliableModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     model_providers: Vec<(String, Box<dyn ModelProvider>)>,
     max_retries: u32,
