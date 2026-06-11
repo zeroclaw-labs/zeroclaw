@@ -4,7 +4,7 @@
 //!
 //! Every fact about a section (its enum variant, its on-the-wire key,
 //! its UI shape, its help blurb, its canonical position) lives in ONE
-//! table — the [`sections!`] invocation below. The macro expands that
+//! table — the `sections!` invocation below. The macro expands that
 //! table into the [`Section`] enum, every per-variant `match` helper,
 //! and the [`QUICKSTART_SECTIONS`] const, so adding a section is exactly
 //! one row, no hand-listed variant set anywhere else.
@@ -33,6 +33,26 @@ pub enum SectionShape {
     /// flips a top-level field, then the schema form for the chosen
     /// backend/provider renders.
     BackendPicker,
+}
+
+/// Humanize a section wire key for display (`risk_profiles` → `Risk profiles`,
+/// `providers.models` → `Model providers`). Single source of truth for section
+/// labels across the gateway dashboard, zerocode Config pane, and docs. Specific
+/// wording overrides are listed explicitly; everything else is mechanically
+/// title-cased from the key.
+#[must_use]
+pub fn humanize_section_key(key: &str) -> String {
+    match key {
+        "providers.models" => return "Model providers".to_string(),
+        "providers.tts" => return "TTS providers".to_string(),
+        "providers.transcription" => return "Transcription providers".to_string(),
+        _ => {}
+    }
+    let mut s = key.replace(['_', '-'], " ");
+    if let Some(c) = s.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    s
 }
 
 /// Single source of truth for every pickable config section. Each row
@@ -109,6 +129,23 @@ macro_rules! sections {
             pub const fn help(self) -> &'static str {
                 match self {
                     $( Self::$var => $help, )+
+                }
+            }
+
+            /// Human-readable section label shown in every Config surface
+            /// (gateway dashboard sidebar, zerocode Config pane, docs).
+            /// Single source of truth — derived from the canonical wire key
+            /// so the gateway, runtime, and docs cannot disagree.
+            #[must_use]
+            pub fn label(self) -> String {
+                humanize_section_key(self.key())
+            }
+
+            /// The canonical wire key for this section.
+            #[must_use]
+            pub const fn key(self) -> &'static str {
+                match self {
+                    $( Self::$var => $key, )+
                 }
             }
 

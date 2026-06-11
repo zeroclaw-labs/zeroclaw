@@ -752,6 +752,16 @@ mod tests {
     }
 
     #[test]
+    fn non_interactive_tool_search_is_auto_approved() {
+        let config = RiskProfileConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            !mgr.needs_approval("tool_search"),
+            "tool_search discovery must not need approval in non-interactive mode"
+        );
+    }
+
+    #[test]
     fn non_interactive_weather_is_auto_approved() {
         let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);

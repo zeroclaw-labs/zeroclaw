@@ -297,6 +297,9 @@ impl Observer for PrometheusObserver {
             ObserverEvent::AgentStart {
                 model_provider,
                 model,
+                channel: _,
+                agent_alias: _,
+                turn_id: _,
             } => {
                 self.agent_starts
                     .with_label_values(&[model_provider, model])
@@ -308,13 +311,19 @@ impl Observer for PrometheusObserver {
                 duration,
                 tokens_used,
                 cost_usd: _,
+                channel: _,
+                agent_alias: _,
+                turn_id: _,
             } => {
                 // Agent duration is recorded via the histogram with model_provider/model labels
                 self.agent_duration
                     .with_label_values(&[model_provider, model])
                     .observe(duration.as_secs_f64());
-                if let Some(t) = tokens_used {
-                    self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
+                if let Some(usage) = tokens_used {
+                    self.tokens_used.set(
+                        i64::try_from(usage.input_tokens.saturating_add(usage.output_tokens))
+                            .unwrap_or(i64::MAX),
+                    );
                 }
             }
             ObserverEvent::LlmResponse {
@@ -469,13 +478,22 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
-            tokens_used: Some(100),
+            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+            }),
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -483,6 +501,9 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -491,6 +512,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
@@ -499,6 +523,9 @@ mod tests {
             success: false,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -527,6 +554,9 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -535,6 +565,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -569,6 +602,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -577,6 +613,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -585,6 +624,9 @@ mod tests {
             success: false,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let output = obs.encode();
@@ -635,6 +677,9 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -644,6 +689,9 @@ mod tests {
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let output = obs.encode();
@@ -670,6 +718,9 @@ mod tests {
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let output = obs.encode();

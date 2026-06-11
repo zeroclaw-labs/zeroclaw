@@ -1,37 +1,53 @@
 # MCP
 
-ZeroClaw supports the **Model Context Protocol (MCP)**, allowing you to extend the agent's capabilities with external tools and context providers. This guide explains how to register and configure MCP servers.
+ZeroClaw is an MCP client: it connects to external [Model Context Protocol](https://modelcontextprotocol.io) servers and exposes their tools to the agent. Each MCP tool is namespaced as `<server>__<tool>` (for example `filesystem__read_file`), so tools from different servers never collide.
 
-## Overview
+## Configure MCP
 
-MCP servers can be connected via three transport types:
-- **stdio**: Long-running local processes (e.g., Node.js or Python scripts).
-- **sse**: Remote servers via Server-Sent Events.
-- **http**: Simple HTTP POST-based servers.
+MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers`. Configure through the gateway, zerocode, or `zeroclaw config set`:
 
-## Configuration
-
-MCP servers are configured under `[mcp]` and `[[mcp.servers]]` in `config.toml`. The display `name` (used as the tool prefix `name__tool_name`) is required, plus `transport` (`stdio` | `sse` | `http`) and the transport-specific fields. See the [Config reference](../reference/config.md) for the full field index and defaults.
-
-Keep `deferred_loading = true` (the default) to load tool schemas on demand — this minimizes initial token overhead.
-
-## Security and Auto-Approval
-
-By default, any tool execution from an MCP server requires manual approval unless the agent's risk-profile level is set to `full`.
-
-To automatically approve specific tools from an MCP server, add them to `auto_approve` on the agent's risk profile (`[risk_profiles.<alias>]`):
-
-```toml
-[risk_profiles.assistant]
-auto_approve = [
-  "my_local_tool__read_file",   # tool from `my_local_tool` MCP server
-  "my_remote_tool__get_weather" # tool from `my_remote_tool` MCP server
-]
+```sh
+zeroclaw config set mcp.servers.filesystem.command npx
 ```
 
-See [Autonomy levels](../security/autonomy.md) for the full surface of per-profile fields.
+Set `mcp.enabled = false` to disable MCP tool loading without removing server definitions.
 
-## Tips
+## Transports
 
-- **Tool Filtering**: You can limit which MCP tools are exposed to the LLM using `tool_filter_groups` in your project configuration.
-- **Deferred Loading**: Keeping `deferred_loading = true` reduces the initial token overhead by only sending tool names to the LLM. The agent will fetch the full schema only when it decides to use the tool.
+A server is reached over one of three transports (the `transport` field):
+
+| Transport | When to use | Required fields |
+|---|---|---|
+| `stdio` (default) | A local process you spawn (a Node.js or Python MCP server) | `command`, optional `args`, `env` |
+| `http` | A remote server speaking MCP over HTTP POST | `url`, optional `headers` |
+| `sse` | A remote server speaking MCP over HTTP + Server-Sent Events | `url`, optional `headers` |
+
+`env` (stdio) and `headers` (http/sse) are stored as secrets; `headers` commonly carries the `Authorization: Bearer …` token for the upstream server.
+
+Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
+
+## Server fields
+
+Per-server fields (`[[mcp.servers]]`), generated from the schema:
+
+{{#config-fields mcp.servers}}
+
+`tool_timeout_secs` is an optional per-call timeout; it must be greater than 0 and is capped at 600 seconds.
+
+## Top-level fields
+
+{{#config-fields mcp}}
+
+## Deferred loading
+
+`mcp.deferred_loading` is `false` by default, so configured MCP tools are included in the model context eagerly. Set it to `true` to place only MCP tool **names** in the system prompt; the LLM calls the built-in `tool_search` tool to fetch a tool's full schema before invoking it. This keeps the initial context window small when a server exposes many tools.
+
+## Security and approval
+
+MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`). The `tool_search` discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:
+
+- At autonomy `level = full`, no tool call prompts (MCP tools included).
+- Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
+- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
+
+See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.

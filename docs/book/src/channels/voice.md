@@ -4,48 +4,23 @@ Real-time voice input and output. Four channels cover the matrix: inbound calls,
 
 ## ClawdTalk (real-time SIP)
 
-```toml
-[channels.clawdtalk]
-enabled = true
-api_key = "..."                                # Telnyx API key (secret)
-connection_id = "..."                          # Telnyx SIP connection ID
-from_number = "+14155550123"                   # caller-ID for outbound dials
-allowed_destinations = ["+14155551234"]        # destinations allowed for outbound dial; empty = none
-webhook_secret = "..."                         # optional: shared secret for inbound Telnyx webhook verification
-```
-
 Full-duplex SIP voice powered by Telnyx. The agent talks over a real phone call (inbound or outbound). Supports barge-in, mid-turn tool use, and regional number provisioning.
 
-**Pair with:** a `telnyx` model provider for the brain (`crates/zeroclaw-providers/src/telnyx.rs`) and ensure your Telnyx account has a SIP connection with the correct webhook URL pointed at the ZeroClaw gateway.
+{{#config-fields channels.clawdtalk}}
+
+`api_key` (Telnyx) and `webhook_secret` are secrets:
+
+{{#secret-config channels.clawdtalk.<alias>.api_key}}
+
+**Pair with:** a `telnyx` model provider for the brain and ensure your Telnyx account has a SIP connection with the correct webhook URL pointed at the ZeroClaw gateway.
 
 ## Voice Call (Twilio / Telnyx / Plivo)
 
-```toml
-[channels.voice_call]
-enabled = true
-provider = "twilio"                            # "twilio" (default), "telnyx", or "plivo"
-account_id = "..."                             # provider-specific account identifier
-auth_token = "..."                             # provider-specific auth token (secret)
-from_number = "+14155550123"
-webhook_port = 8090                            # default 8090; embedded webhook server
-require_outbound_approval = true               # default true; require operator approval before dialing
-transcription_logging = true                   # default true; persist call transcripts
-# tts_voice = ""                               # optional voice ID override (provider-specific); omit to use provider default
-max_call_duration_secs = 3600                  # default 3600 (1 hour cap)
-# webhook_base_url = ""                        # optional public base URL when behind a tunnel/proxy; omit to use the localhost fallback
-```
+Traditional carrier voice: the agent picks up, transcribes the caller, replies with TTS. Higher latency than ClawdTalk but works with any regular phone number and doesn't require SIP trunk provisioning. Outbound calls hit `from_number` and require operator approval when `require_outbound_approval` is on.
 
-Traditional carrier voice — the agent picks up, transcribes the caller, replies with TTS. Higher latency than ClawdTalk but works with any regular phone number and doesn't require SIP trunk provisioning. Outbound calls hit `from_number` and require operator approval when `require_outbound_approval` is on.
+{{#config-fields channels.voice_call}}
 
 ## Voice Wake (local wake-word)
-
-```toml
-[channels.voice_wake]
-wake_word = "hey zeroclaw"                     # default "hey zeroclaw" (case-insensitive substring match)
-silence_timeout_ms = 2000                      # default 2000; ms of silence before finalising capture
-energy_threshold = 0.01                        # default 0.01; RMS energy below this is treated as silence
-max_capture_secs = 30                          # default 30; hard cap on capture duration
-```
 
 Runs locally, listens on the mic, triggers agent interaction when it hears the wake phrase. Useful for:
 
@@ -53,45 +28,15 @@ Runs locally, listens on the mic, triggers agent interaction when it hears the w
 - Desktop "hotword → ask" workflows
 - Always-listening home-automation agents
 
-The agent doesn't send audio anywhere — wake detection is local. Only post-wake speech is captured and (separately) transcribed before reaching the LLM.
+The agent doesn't send audio anywhere; wake detection is local. Only post-wake speech is captured and (separately) transcribed before reaching the LLM.
+
+{{#config-fields channels.voice_wake}}
 
 > **Build flag:** Voice Wake is gated by the `voice-wake` cargo feature on `zeroclaw-channels`. Build with `--features voice-wake` to include it.
 
 ## TTS (outbound speech synthesis)
 
-TTS lives at the top level under `[tts]`, not under `[channels.*]` — it's an output service that channels can call into, rather than its own inbound channel.
-
-```toml
-[tts]
-enabled = true
-default_provider = "piper"                     # "openai", "elevenlabs", "google", "edge", or "piper"
-default_voice = "en_US-lessac-medium"          # provider-specific default voice ID
-default_format = "mp3"                         # "mp3" (default), "opus", or "wav"
-max_text_length = 4096                         # default 4096
-
-[tts.openai]
-api_key = "..."
-model = "tts-1"                                # default "tts-1"
-speed = 1.0                                    # default 1.0
-
-[tts.elevenlabs]
-api_key = "..."
-model_id = "eleven_monolingual_v1"             # default "eleven_monolingual_v1"
-stability = 0.5                                # default 0.5
-similarity_boost = 0.5                         # default 0.5
-
-[tts.google]
-api_key = "..."
-language_code = "en-US"                        # default "en-US"
-
-[tts.edge]
-binary_path = "edge-tts"                       # path to the edge-tts binary; default "edge-tts"
-
-[tts.piper]
-api_url = "http://127.0.0.1:5000/v1/audio/speech"   # OpenAI-compatible Piper HTTP endpoint
-```
-
-Only the section for the active `default_provider` needs to be filled in. Pair `[tts]` with `voice_wake` for a complete local voice assistant.
+TTS is an output service channels call into, not its own inbound channel. Global defaults live under `tts`. TTS provider instances are configured under `providers.tts.<type>.<alias>` (OpenAI, ElevenLabs, Google, Edge, Piper) and selected per agent via the agent's `tts_provider`. See [Model Providers](../providers/overview.md) for the provider entries and per-agent wiring. Provider API keys are secrets; set them through the gateway, zerocode, or `zeroclaw config set`, never in plaintext.
 
 ---
 
@@ -111,7 +56,7 @@ ClawdTalk shortcuts several of these by keeping the audio stream live; regular `
 
 ## STT
 
-Speech-to-text is configured separately from the voice channels — see the `[transcription]` config in the [Config reference](../reference/config.md). Voice channels invoke whichever transcription provider is active when they need to turn audio into text.
+Speech-to-text is configured separately from the voice channels; see the `[transcription]` config in the [Config reference](../reference/config.md). Voice channels invoke whichever transcription provider is active when they need to turn audio into text.
 
 ## Hardware notes
 

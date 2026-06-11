@@ -6,13 +6,14 @@ use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "image/bmp",
-];
+// MIME types we will inline for vision providers. Deliberately excludes
+// `image/bmp`: no major vision provider (Anthropic, OpenAI) accepts BMP, so
+// inlining it would make the *entire* provider request fail rather than just
+// dropping the one image. Rejecting it here instead surfaces a clean
+// "could not be loaded" note while the request (and any accompanying text or
+// metadata) still goes through. BMP is still detected by `detect_mime` so the
+// skip is logged as an explicit unsupported-MIME event rather than "unknown".
+const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -127,6 +128,7 @@ fn is_loadable_image_reference(candidate: &str) -> bool {
         || candidate.starts_with("https://")
         || candidate.starts_with("data:")
         || is_windows_path(candidate)
+        || is_windows_unc_path(candidate)
 }
 
 /// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
@@ -145,6 +147,29 @@ fn is_windows_path(candidate: &str) -> bool {
         return false;
     }
     matches!(chars.next(), Some('\\') | Some('/'))
+}
+
+/// Returns true for Windows UNC share paths like `\\server\share\…`.
+///
+/// `image_info` emits these after unwrapping the verbatim-UNC prefix
+/// (`\\?\UNC\…`) that `canonicalize` produces on Windows. Without recognizing
+/// the unwrapped form here, [`is_loadable_image_reference`] would reject the
+/// marker (it is neither a `/`-rooted POSIX path nor a `C:\` drive path), so
+/// [`parse_image_markers`] would leave it as literal text and the image would
+/// never be inlined for vision models. Requires a non-empty server component
+/// and at least one further path segment; the verbatim/device prefixes
+/// (`\\?\…`, `\\.\…`) are rejected because they are not plain shares.
+fn is_windows_unc_path(candidate: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(r"\\") else {
+        return false;
+    };
+    if rest.starts_with('?') || rest.starts_with('.') {
+        return false;
+    }
+    let mut parts = rest.splitn(2, ['\\', '/']);
+    let server = parts.next().unwrap_or("");
+    let share = parts.next().unwrap_or("");
+    !server.is_empty() && !share.is_empty()
 }
 
 /// Normalize a marker payload that may have been line-wrapped when pasted
@@ -234,6 +259,23 @@ fn count_image_markers_with_latest_tool_results(
 
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
+}
+
+/// Count image markers that originate from genuine **user** messages (i.e.
+/// inbound attachments), excluding tool-result carriers (`role == "tool"` and
+/// `[Tool results]` user messages).
+///
+/// Callers use this to distinguish "the user sent an image we cannot see"
+/// (which should surface a user-facing capability error so the attachment is
+/// not silently ignored) from "an image marker arrived only via a tool result"
+/// (e.g. `image_info`/`screenshot`/`image_gen`), which can degrade to text-only
+/// on a non-vision provider without misleading the user.
+pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .sum()
 }
 
 /// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
@@ -1287,6 +1329,48 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], "/tmp/a.png");
         assert_eq!(refs[1], "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn is_windows_unc_path_accepts_shares_and_rejects_others() {
+        assert!(is_windows_unc_path(r"\\server\share\pic.png"));
+        assert!(is_windows_unc_path(r"\\server\share\sub\pic.png"));
+        // Verbatim / device prefixes are not plain shares.
+        assert!(!is_windows_unc_path(r"\\?\C:\Users\me\a.png"));
+        assert!(!is_windows_unc_path(r"\\?\UNC\server\share\a.png"));
+        assert!(!is_windows_unc_path(r"\\.\PhysicalDrive0"));
+        // Needs both a server and a further segment.
+        assert!(!is_windows_unc_path(r"\\server"));
+        assert!(!is_windows_unc_path(r"\\"));
+        // Non-UNC inputs.
+        assert!(!is_windows_unc_path("/home/me/a.png"));
+        assert!(!is_windows_unc_path(r"C:\Users\me\a.png"));
+    }
+
+    #[test]
+    fn parse_image_markers_extracts_unc_path() {
+        // Regression for the #7446 Windows follow-up: `image_info` unwraps the
+        // verbatim-UNC prefix (`\\?\UNC\…`) to a plain `\\server\share\…`
+        // path, which must be treated as a loadable image reference (not left
+        // as literal text) so the image reaches vision models.
+        let input = r"File: [IMAGE:\\server\share\pic.png]";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1, "UNC marker should be extracted as a ref");
+        assert_eq!(refs[0], r"\\server\share\pic.png");
+    }
+
+    #[test]
+    fn validate_mime_rejects_bmp_but_accepts_provider_supported_types() {
+        for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            assert!(
+                validate_mime("src", mime).is_ok(),
+                "{mime} should be allowed"
+            );
+        }
+        // BMP is detectable but unsupported by vision providers; it must be
+        // rejected here so it never breaks the whole provider request.
+        let err = validate_mime("src", "image/bmp").unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "unsupported_mime");
     }
 
     #[test]

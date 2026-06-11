@@ -58,7 +58,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
+                "Channel type '{channel_type}' — use `zeroclaw config set channels.{channel_type}.<alias>.<field>=<value>` to configure"
             );
         }
         crate::ChannelCommands::Remove { name } => {

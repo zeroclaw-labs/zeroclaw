@@ -355,6 +355,13 @@ onboard-openai-auth-codex = Codexサブスクリプション
 onboard-openai-codex-followup =
     Codexサブスクリプションの認証はChatGPTアカウントを使用します。
     エージェントを起動する前に `zeroclaw auth login --provider openai-codex` を実行して認証してください。
+cli-web-dist-dir-reason-tilde = 展開されない `~` で始まっています
+cli-web-dist-dir-reason-dollar = 展開されない `$` が含まれています
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = 未設定（自動検出を使用）
+cli-self-test-web-dist-dir-pass-literal = {$path}（リテラルパス）
+cli-self-test-web-dist-dir-fail-expansion = 警告: {$path} — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
 cli-peripherals-none = 周辺機器が設定されていません。
 cli-peripherals-add-hint = 次のコマンドで追加します: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -542,5 +549,5 @@ cli-channels-cli-always = {"  "}✅ CLI (常に利用可能)
 cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = チャンネルを開始するには: zeroclaw channel start
 cli-channels-doctor-hint = 状態を確認するには:    zeroclaw channel doctor
-cli-channels-configure-hint = 設定するには:      zeroclaw onboard
+cli-channels-configure-hint = 設定するには:      zeroclaw config set channels.<name>.<field>=<value>
 cli-onboard-about = ワークスペースと設定を初期化

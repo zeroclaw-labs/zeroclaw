@@ -2,55 +2,47 @@
 
 Install, update, run as a scheduled task / Windows Service, and uninstall on Windows 10 / 11.
 
-`setup.bat` is the Windows counterpart to `install.sh` — same job, different shell. If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
+`setup.bat` is the Windows counterpart to `install.sh`, same job, different shell.
 
 ## Install
-
-### Option 1 — `setup.bat` from a release
-
-Download the latest ZeroClaw release, unzip, and run:
 
 ```cmd
 setup.bat
 ```
 
-Flags:
+That is the whole install: grab `setup.bat` from a ZeroClaw release and run it. It prompts for a build mode, then either downloads the prebuilt binary or (for source modes) installs a stable Rust toolchain via `rustup` and compiles. Either way the binary lands at `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`, and it points you at [`zeroclaw quickstart`](../getting-started/quickstart.md).
 
-| Flag | Behaviour |
-|---|---|
-| `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest — no Rust toolchain needed) |
-| `--minimal` | Build core only (`--no-default-features`; no channels, no hardware) |
-| `--standard` | Build with common channels (Telegram, Discord, Slack, Matrix) |
-| `--full` | Build everything |
+To skip the interactive prompt, pass a build-mode flag: `--prebuilt` (download a release binary, no toolchain), `--minimal` (core only), `--standard`, or `--full`. Run `setup.bat --help` for the authoritative list of modes and the exact feature set each one compiles; that output is generated from the script itself, so it never drifts. With `--minimal`, quickstart is unavailable; configure ZeroClaw manually with `zeroclaw config set` and use the reduced CLI path (`zeroclaw agent ...`).
 
-The script:
+### Scoop
 
-1. Checks for `rustup`; downloads `rustup-init.exe` and installs stable toolchain if missing
-2. Builds (or downloads) the binary
-3. Installs to `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`
-4. Prints mode-specific next steps:
-   - `--prebuilt`, `--standard`, `--full`: run `zeroclaw onboard`
-   - `--minimal`: onboarding is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`)
+<div class="os-tabs-src">
 
-For source builds, `setup.bat` now prints the exact `cargo build ...` command it executes and reports the installed `zeroclaw.exe` size so command shape and artifact expectations stay visible.
-
-### Option 2 — Scoop
+#### cmd
 
 ```cmd
 scoop install zeroclaw
-zeroclaw onboard
 ```
 
-### Option 3 — From source
+</div>
+
+### From source
 
 Requires Rust (`rustup`) and Visual Studio Build Tools:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 git clone https://github.com/zeroclaw-labs/zeroclaw
 cd zeroclaw
 cargo install --locked --path .
-zeroclaw onboard
 ```
+
+</div>
+
+If you're running WSL2, follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
 
 ## System dependencies
 
@@ -59,7 +51,7 @@ Windows builds use the MSVC toolchain. You need:
 - Visual Studio Build Tools (or full Visual Studio) with the "Desktop development with C++" workload
 - Rust stable (via `rustup`)
 
-If you're using `--prebuilt` you don't need the Rust toolchain — the binary is self-contained.
+If you're using `--prebuilt` you don't need the Rust toolchain; the binary is self-contained.
 
 ## Running as a service
 
@@ -67,10 +59,16 @@ Windows has two options: a scheduled task (user session) or a Windows Service (s
 
 ### Scheduled task (recommended for single-user machines)
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 zeroclaw service install
 zeroclaw service start
 ```
+
+</div>
 
 This creates a task that runs under your user account and starts on login. Managed via Task Scheduler (`taskschd.msc`).
 
@@ -80,9 +78,15 @@ Logs go to `%LOCALAPPDATA%\ZeroClaw\logs\`.
 
 Running as a true service requires Administrator privileges during install. Open an elevated `cmd.exe` and:
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 zeroclaw service install
 ```
+
+</div>
 
 When run elevated, the installer registers a Windows Service under `LocalSystem` instead of a user-scoped scheduled task. Consider creating a dedicated service account if the agent touches user-scoped resources.
 
@@ -94,18 +98,34 @@ Full details: [Service management](./service.md).
 
 Re-download the latest release and re-run `setup.bat --prebuilt` (or whichever flag you used originally). Then:
 
+<div class="os-tabs-src">
+
+#### cmd
+
 ```cmd
 zeroclaw service restart
 ```
 
-### Scoop
+</div>
+
+### Scoop update
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 scoop update zeroclaw
 zeroclaw service restart
 ```
 
-### From source
+</div>
+
+### From source update
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 cd C:\path\to\zeroclaw
@@ -114,16 +134,28 @@ cargo install --locked --path . --force
 zeroclaw service restart
 ```
 
+</div>
+
 ## Uninstall
 
 Stop and remove the service:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 zeroclaw service stop
 zeroclaw service uninstall
 ```
 
+</div>
+
 Remove the binary:
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 :: setup.bat
@@ -136,12 +168,20 @@ del "%USERPROFILE%\.cargo\bin\zeroclaw.exe"
 scoop uninstall zeroclaw
 ```
 
-Remove config and workspace (optional — this deletes conversation history):
+</div>
+
+Remove config and workspace (optional, this deletes conversation history):
+
+<div class="os-tabs-src">
+
+#### cmd
 
 ```cmd
 rmdir /s /q "%USERPROFILE%\.zeroclaw"
 rmdir /s /q "%LOCALAPPDATA%\ZeroClaw"
 ```
+
+</div>
 
 ## Gotchas
 
@@ -152,5 +192,5 @@ rmdir /s /q "%LOCALAPPDATA%\ZeroClaw"
 ## Next
 
 - [Service management](./service.md)
-- [Quick start](../getting-started/quick-start.md)
+- [Quickstart](../getting-started/quickstart.md)
 - [Operations → Overview](../ops/overview.md)
