@@ -43,6 +43,15 @@ impl Chord {
     }
 
     pub fn matches(&self, event: &KeyEvent) -> bool {
+        // On macOS, Cmd-C (Super+c) is the system Copy shortcut. Never
+        // consume it as a TUI chord so Copy works regardless of terminal
+        // emulator forwarding behaviour. See #7378.
+        #[cfg(target_os = "macos")]
+        if event.code == KeyCode::Char('c')
+            && event.modifiers.contains(KeyModifiers::SUPER)
+        {
+            return false;
+        }
         event.code == self.code
             && normalise_mods(self.code, self.modifiers)
                 == normalise_mods(event.code, event.modifiers)
