@@ -14099,6 +14099,7 @@ dependencies = [
  "chrono",
  "directories",
  "fantoccini",
+ "fluent",
  "futures-util",
  "glob",
  "hex",

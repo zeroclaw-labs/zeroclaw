@@ -1,6 +1,7 @@
 //! Tool implementations for agent-callable capabilities.
 
 pub mod attribution;
+pub(crate) mod i18n;
 pub mod microsoft365;
 pub mod util_helpers;
 

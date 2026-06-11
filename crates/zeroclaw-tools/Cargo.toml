@@ -20,6 +20,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false }
+fluent = "0.16"
 glob = "0.3"
 hex = "0.4"
 infer = { version = "0.19", default-features = false }
