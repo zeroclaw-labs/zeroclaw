@@ -1953,13 +1953,7 @@ msgstr "# sélecteur interactif\n"
 
 #: src/getting-started/language.md
 msgid "# just CLI strings\n"
-msgstr "Pourriez-vous me communiquer les chaînes CLI à traduire ?"
-"# CLI just\n"
-"\n"
-"\n"
-"Je remarque que cette chaîne semble incomplète. Le titre `# just CLI strings` indique qu'il s'agit probablement d'un en-tête pour une section contenant des chaînes CLI, mais aucune chaîne réelle à traduire n'est fournie.\n"
-"\n"
-"Pourriez-vous me communiquer les chaînes CLI à traduire ?\n"
+msgstr "# seulement les chaînes CLI\n"
 
 #: src/setup/linux.md src/setup/macos.md
 msgid "# kernel only (~6.6 MB)\n"
@@ -26700,7 +26694,7 @@ msgstr "Les gestionnaires de webhooks WhatsApp, WATI, Linq, Nextcloud Talk et Gm
 
 #: src/foundations/index.md
 msgid "The ZeroClaw Maturity Framework"
-msgstr "Le cadre de maturité ZeroClaw"
+msgstr "Le ZeroClaw Maturity Framework"
 
 #: src/tools/overview.md
 msgid "The [autonomy level](../security/autonomy.md) determines what each risk tier can do without operator approval. Default (`Supervised`): low runs, medium asks, high blocks."
@@ -31720,72 +31714,7 @@ msgstr "Rédiger le `AGENTS.md` racine pour `crates/zeroclaw-api` (en prévision
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)"
-msgstr "Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté."
-"Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté.# Document de gouvernance du Registre des Plugins\n"
-"\n"
-"## 1. Introduction\n"
-"\n"
-"Ce document définit la gouvernance du Registre des Plugins. Il établit les règles de contrôle, les processus de révision et les procédures de révocation des plugins compromis.\n"
-"\n"
-"## 2. Contrôle du Registre\n"
-"\n"
-"Le Registre des Plugins est contrôlé par un comité de gouvernance composé de membres clés de l'équipe de développement principale et de représentants de la communauté. Les décisions concernant l'ajout, la modification ou la suppression de plugins sont prises par consensus ou par vote majoritaire au sein de ce comité.\n"
-"\n"
-"### 2.1 Membres du Comité de Gouvernance\n"
-"\n"
-"- **Responsable Technique Principal** : Responsable de la validation technique des plugins.\n"
-"- **Responsable de la Sécurité** : Responsable de l'évaluation des risques de sécurité.\n"
-"- **Représentants de la Communauté** : Membres élus de la communauté qui apportent une perspective utilisateur.\n"
-"\n"
-"### 2.2 Processus de Décision\n"
-"\n"
-"Les décisions sont prises lors des réunions hebdomadaires du comité. Les votes sont enregistrés et les résultats sont publiés sur le site officiel du projet.\n"
-"\n"
-"## 3. Révision des Plugins\n"
-"\n"
-"Tous les plugins soumis au Registre doivent passer par un processus de révision rigoureux pour garantir leur qualité, leur sécurité et leur conformité aux normes du projet.\n"
-"\n"
-"### 3.1 Critères de Révision\n"
-"\n"
-"- **Qualité du Code** : Le code doit être propre, bien documenté et suivre les conventions de codage du projet.\n"
-"- **Sécurité** : Le plugin ne doit pas contenir de vulnérabilités connues ou de comportements malveillants.\n"
-"- **Performance** : Le plugin doit être optimisé pour ne pas dégrader les performances du système.\n"
-"- **Compatibilité** : Le plugin doit être compatible avec les versions supportées du projet.\n"
-"\n"
-"### 3.2 Processus de Révision\n"
-"\n"
-"1. **Soumission** : Les développeurs soumettent leurs plugins via le portail de développement.\n"
-"2. **Examen Initial** : Le comité effectue un examen initial pour vérifier la conformité aux critères de base.\n"
-"3. **Examen Technique** : Un examen technique approfondi est réalisé par le Responsable Technique Principal.\n"
-"4. **Examen de Sécurité** : Le Responsable de la Sécurité évalue les risques potentiels.\n"
-"5. **Validation Finale** : Le comité prend une décision finale basée sur les résultats des examens.\n"
-"\n"
-"## 4. Révocation des Plugins Compromis\n"
-"\n"
-"En cas de découverte de vulnérabilités ou de comportements malveillants, les plugins compromis doivent être révoqués rapidement pour protéger les utilisateurs.\n"
-"\n"
-"### 4.1 Détection des Compromissions\n"
-"\n"
-"Les plugins peuvent être signalés comme compromis par :\n"
-"- Les utilisateurs via le système de signalement.\n"
-"- Les membres du comité de gouvernance lors de leurs audits réguliers.\n"
-"- Les outils de surveillance automatisés.\n"
-"\n"
-"### 4.2 Processus de Révocation\n"
-"\n"
-"1. **Confirmation** : Le comité confirme la nature de la compromission.\n"
-"2. **Notification** : Les développeurs du plugin sont notifiés et invités à corriger le problème.\n"
-"3. **Révocation Immédiate** : Si le problème ne peut pas être corrigé rapidement, le plugin est révoqué immédiatement.\n"
-"4. **Communication** : Une annonce publique est faite pour informer les utilisateurs de la révocation et des mesures à prendre.\n"
-"\n"
-"### 4.3 Mesures Correctives\n"
-"\n"
-"- Les développeurs doivent corriger les problèmes identifiés et soumettre une nouvelle version du plugin.\n"
-"- Le comité réévalue le plugin corrigé avant de le réintégrer au Registre.\n"
-"\n"
-"## 5. Conclusion\n"
-"\n"
-"Ce document de gouvernance vise à assurer la qualité, la sécurité et la fiabilité du Registre des Plugins. Il est régulièrement révisé pour s'adapter aux évolutions du projet et de la communauté."
+msgstr "Rédiger le document de gouvernance de Plugin Registry (qui contrôle le registre, comment les plugins sont examinés et comment les plugins compromis sont révoqués)"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Write the WIT interface documentation alongside the `wit/` files (generated from WIT + hand-written explanation)"
@@ -33996,7 +33925,7 @@ msgstr "_Résponsabilités :_"
 
 #: src/foundations/index.md
 msgid "_The ZeroClaw Maturity Framework is a living body of work. New documents are added when the team has learned something worth preserving. Each begins as a public RFC discussion and earns its place here through the same process as the six above: open conversation, honest disagreement, and the team's collective decision to carry it forward._"
-msgstr "_Le cadre de maturité ZeroClaw est un ensemble de travaux évolutif. De nouveaux documents sont ajoutés lorsque l'équipe a appris quelque chose qui vaut la peine d'être préservé. Chacun commence par une discussion publique au format RFC et gagne sa place ici grâce au même processus que les six précédents : une conversation ouverte, des désaccords honnêtes et la décision collective de l'équipe de le faire avancer._"
+msgstr "_Le ZeroClaw Maturity Framework est un ensemble de travaux évolutif. De nouveaux documents sont ajoutés lorsque l'équipe a appris quelque chose qui vaut la peine d'être préservé. Chacun commence par une discussion publique au format RFC et gagne sa place ici grâce au même processus que les six précédents : une conversation ouverte, des désaccords honnêtes et la décision collective de l'équipe de le faire avancer._"
 
 #: src/foundations/fnd-003-governance.md
 msgid "_The best governance model is the simplest one the team will actually follow. Start here. Adjust based on what you learn._"
@@ -38481,7 +38410,7 @@ msgstr ""
 "```toml\n"
 "[providers.models.<name>]\n"
 "think = false\n"
-"effort_raisonnement = \"aucun\"\n"
+"reasoning_effort = \"none\"\n"
 "```"
 
 #: src/providers/configuration.md
@@ -39488,7 +39417,7 @@ msgid ""
 "```"
 msgstr ""
 "```toml\n"
-"[rélationnabilité]\n"
+"[reliability]\n"
 "api_keys = [\"sk-key-2\", \"sk-key-3\", \"sk-key-4\"]\n"
 "```"
 
@@ -48137,3 +48066,147 @@ msgstr "🔵 Décision de l'équipe"
 #: src/foundations/fnd-005-contribution-culture.md
 msgid "🟡 Conditional"
 msgstr "🟡 Conditionnel"
+
+#: src/SUMMARY.md
+msgid "Channels & Integrations"
+msgstr "Canaux et intégrations"
+
+#: src/SUMMARY.md src/developing/index.md
+msgid "Extending & Plugins"
+msgstr "Extensions et plugins"
+
+#: src/SUMMARY.md
+msgid "Foundations (RFCs)"
+msgstr "Fondations (RFC)"
+
+#: src/SUMMARY.md
+msgid "Hardware & Boards"
+msgstr "Matériel et cartes"
+
+#: src/SUMMARY.md src/setup/index.md
+msgid "Installation"
+msgstr "Installation"
+
+#: src/SUMMARY.md
+msgid "Operations & Deployment"
+msgstr "Opérations et déploiement"
+
+#: src/SUMMARY.md
+msgid "Security & Autonomy"
+msgstr "Sécurité et autonomie"
+
+#: src/SUMMARY.md
+msgid "Standard Operating Procedures"
+msgstr "Procédures opérationnelles standard"
+
+#: src/SUMMARY.md
+msgid "Tools & Extensibility"
+msgstr "Outils et extensibilité"
+
+#: src/getting-started/index.md
+msgid "Start here if you are installing ZeroClaw for the first time or choosing the simplest path to a working agent."
+msgstr "Commencez ici si vous installez ZeroClaw pour la première fois ou si vous cherchez le chemin le plus simple vers un agent fonctionnel."
+
+#: src/getting-started/index.md
+msgid "[Quick start](./quick-start.md) covers installation, onboarding, and the first chat."
+msgstr "[Démarrage rapide](./quick-start.md) couvre l’installation, l’onboarding et la première discussion."
+
+#: src/getting-started/index.md
+msgid "[YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset."
+msgstr "[Mode YOLO](./yolo.md) documente le préréglage de développement local le plus rapide et non sécurisé."
+
+#: src/getting-started/index.md
+msgid "[Multi-model setup](./multi-model-setup.md) explains provider and route basics."
+msgstr "[Configuration multimodèle](./multi-model-setup.md) explique les bases des fournisseurs et du routage."
+
+#: src/getting-started/index.md
+msgid "[zerocode](./tui.md) introduces the terminal UI."
+msgstr "[zerocode](./tui.md) présente l’interface terminal."
+
+#: src/getting-started/index.md
+msgid "[Language and translations](./language.md) covers locale selection."
+msgstr "[Langue et traductions](./language.md) couvre le choix de la locale."
+
+#: src/setup/index.md
+msgid "Choose the installation path for your operating system or deployment target."
+msgstr "Choisissez le parcours d’installation adapté à votre système d’exploitation ou à votre cible de déploiement."
+
+#: src/setup/index.md
+msgid "[Docker and containers](./container.md)"
+msgstr "[Docker et conteneurs](./container.md)"
+
+#: src/reference/index.md
+msgid "Reference material for operators and integrators who need exact command, configuration, environment, and API details."
+msgstr "Référence pour les opérateurs et intégrateurs qui ont besoin de détails exacts sur les commandes, la configuration, l’environnement et les API."
+
+#: src/reference/index.md
+msgid "[CLI](./cli.md)"
+msgstr "[CLI](./cli.md)"
+
+#: src/reference/index.md
+msgid "[Config](./config.md)"
+msgstr "[Configuration](./config.md)"
+
+#: src/reference/index.md
+msgid "[Environment variables](./env-vars.md)"
+msgstr "[Variables d’environnement](./env-vars.md)"
+
+#: src/reference/index.md
+msgid "[API rustdoc](../api.md)"
+msgstr "[API rustdoc](../api.md)"
+
+#: src/reference/index.md
+msgid "[Gateway HTTP API](../gateway/api.md)"
+msgstr "[API HTTP de la passerelle](../gateway/api.md)"
+
+#: src/reference/index.md
+msgid "[Web dashboard](../gateway/web-dashboard.md)"
+msgstr "[Tableau de bord web](../gateway/web-dashboard.md)"
+
+#: src/developing/index.md
+msgid "Use these pages when extending ZeroClaw or working on project tooling."
+msgstr "Utilisez ces pages pour étendre ZeroClaw ou travailler sur l’outillage du projet."
+
+#: src/developing/index.md
+msgid "[Plugin protocol](./plugin-protocol.md)"
+msgstr "[Protocole des plugins](./plugin-protocol.md)"
+
+#: src/developing/index.md
+msgid "[Extension examples](./extension-examples.md)"
+msgstr "[Exemples d’extensions](./extension-examples.md)"
+
+#: src/developing/index.md
+msgid "[Building the docs locally](./building-docs.md)"
+msgstr "[Construire la documentation en local](./building-docs.md)"
+
+#: src/developing/index.md
+msgid "[Building the web dashboard](./web.md)"
+msgstr "[Construire le tableau de bord web](./web.md)"
+
+#: src/contributing/index.md
+msgid "Start here before opening issues, proposing architecture changes, or submitting pull requests."
+msgstr "Commencez ici avant d’ouvrir des issues, de proposer des changements d’architecture ou de soumettre des pull requests."
+
+#: src/contributing/index.md
+msgid "[Architecture and contribution map](./architecture-map.md)"
+msgstr "[Carte de l’architecture et des contributions](./architecture-map.md)"
+
+#: src/contributing/index.md
+msgid "[Privacy and PII discipline](./privacy.md)"
+msgstr "[Règles de confidentialité et de PII](./privacy.md)"
+
+#: src/contributing/index.md
+msgid "[Testing](./testing.md)"
+msgstr "[Tests](./testing.md)"
+
+#: src/contributing/index.md
+msgid "[PR review protocol](./pr-review-protocol.md)"
+msgstr "[Protocole de revue de PR](./pr-review-protocol.md)"
+
+#: src/contributing/index.md
+msgid "[Multi-agent setup](./multi-agent-setup.md)"
+msgstr "[Configuration multi-agent](./multi-agent-setup.md)"
+
+#: src/contributing/index.md
+msgid "[Contributor License Agreement](./cla.md)"
+msgstr "[Accord de licence contributeur](./cla.md)"

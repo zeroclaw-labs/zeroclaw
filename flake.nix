@@ -37,8 +37,16 @@
           "rustc"
           "rustfmt"
         ];
+        nixosModuleEvalTests = import ./nix/eval-tests.nix {
+          inherit nixpkgs system;
+        };
       in {
         packages.default = fenix.packages.${system}.stable.toolchain;
+        checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
+            builtins.toJSON nixosModuleEvalTests
+          );
+        };
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain

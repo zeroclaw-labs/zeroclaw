@@ -635,6 +635,7 @@ async fn handle_socket(
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event
                     && event_matches_session(&event, &session_id)
+                    && !is_observability_telemetry(&event)
                 {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
@@ -709,6 +710,13 @@ fn persist_conversation_messages(
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
 ) {
+    // #7126: if the user deleted the session between the turn starting and
+    // the post-turn persistence, don't resurrect it. The `aborted` / `done`
+    // / `error` frames are still sent to the client; we just refuse to
+    // re-create the row that `DELETE /api/sessions/{id}` just wiped.
+    if !backend.session_exists(session_key) {
+        return;
+    }
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
@@ -744,11 +752,58 @@ fn needs_onboarding_ws_error(
     }))
 }
 
+/// Returns true when a broadcast frame should be forwarded to the chat
+/// WebSocket subscribed to `session_id`.
+///
+/// Contract (mirrors `sse.rs::is_public_sse_event`): broadcast events must
+/// not include `session_id` unless they are intentionally scoped to that
+/// session. Frames without a `session_id` are therefore **global
+/// monitoring/observability events** — they belong on `/api/events`, not in
+/// per-session chat channels. The chat WebSocket only forwards a frame when
+/// it is either:
+///
+/// * explicitly scoped to this session via `session_id == session`, or
+/// * a global system event the chat UI is known to render (whitelisted in
+///   [`is_global_chat_event`]) — currently just `cron_result`.
+///
+/// Everything else (observability telemetry, log records, error broadcasts
+/// from unrelated subsystems, …) is dropped. Before #7151 this defaulted to
+/// `None => true`, which leaked `BroadcastObserver` telemetry — including a
+/// red `error` bubble — into every active chat user's view.
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
-        None => true,
+        None => is_global_chat_event(event),
     }
+}
+
+/// Whitelist of broadcast event `type` values that all chat WebSockets
+/// should receive even without a `session_id` scope.
+///
+/// Today this is just `cron_result` (the scheduler's automatic cron output
+/// and the manual `/api/cron/<id>/trigger` rebroadcast, both rendered by
+/// `AgentContext.tsx` as a markdown bubble). New entries must be backed by
+/// a matching `case` in the frontend message dispatcher — otherwise the
+/// frame is dead weight on the wire.
+fn is_global_chat_event(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("cron_result")
+    )
+}
+
+/// Defense-in-depth check for observability telemetry frames that leak onto
+/// the chat broadcast bus.
+///
+/// After #7151 the primary defense is [`event_matches_session`]'s inverted
+/// default — any frame without `session_id` is dropped unless explicitly
+/// whitelisted. This helper exists as a belt-and-braces guard for the case
+/// where a future emitter forgets `session_id` *and* its event type collides
+/// with a global-whitelisted one (e.g. someone adding `cron_result`-shaped
+/// telemetry). The discriminator is the `"source": "observability"` tag
+/// that `BroadcastObserver` (sse.rs) stamps on every emission.
+fn is_observability_telemetry(event: &serde_json::Value) -> bool {
+    event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -768,21 +823,20 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
-    let provider_label = {
-        let cfg = state.config.read();
-        cfg.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    // Attribute telemetry, broadcasts, and cost to THIS agent's actual model
+    // (resolved per-turn), not the global default model or the first configured
+    // provider. Previously `provider_label` took the first `providers.models`
+    // entry and the model came from `model_label` (the global default), so every
+    // gateway_ws_turn / agent_start / cost record mislabelled the model.
+    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
+    let provider_label = turn_provider.clone();
+    let model_label = turn_model.clone();
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "model_provider": provider_label,
-        "model": state.model,
+        "model": model_label,
     }));
 
     // Set session state to running
@@ -815,7 +869,6 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let turn_fut = async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
@@ -1051,31 +1104,52 @@ async fn process_chat_message(
 
     if was_cancelled {
         if let Some(ref backend) = state.session_backend {
-            match &result {
-                Err(error) if !error.new_messages.is_empty() => {
-                    persist_conversation_messages(
-                        backend.as_ref(),
-                        session_key,
-                        &error.new_messages,
-                    );
-                    if !has_assistant_chat_message(&error.new_messages) {
+            // #7126: `DELETE /api/sessions/{id}` cancels the token and then
+            // synchronously wipes the session row. The streaming task then
+            // wakes up here with `was_cancelled = true`. If we blindly
+            // append "[interrupted by user]" we resurrect both the
+            // `sessions` row and the `session_metadata` row (via the
+            // upsert inside `append`), and the next reconnect re-seeds the
+            // resurrected history. Skip every write when the session no
+            // longer exists — the `aborted` frame below still tells the
+            // client the turn ended.
+            let still_exists = backend.session_exists(session_key);
+            if still_exists {
+                match &result {
+                    Err(error) if !error.new_messages.is_empty() => {
+                        persist_conversation_messages(
+                            backend.as_ref(),
+                            session_key,
+                            &error.new_messages,
+                        );
+                        if !has_assistant_chat_message(&error.new_messages) {
+                            let truncated = if accumulated_text.is_empty() {
+                                "[interrupted by user]".to_string()
+                            } else {
+                                format!("{accumulated_text}\n\n[interrupted by user]")
+                            };
+                            let assistant_msg =
+                                zeroclaw_providers::ChatMessage::assistant(&truncated);
+                            // Re-check before the raw append — the user can
+                            // delete the session between the outer check and
+                            // here; `persist_conversation_messages` already
+                            // re-checks internally.
+                            if backend.session_exists(session_key) {
+                                let _ = backend.append(session_key, &assistant_msg);
+                            }
+                        }
+                    }
+                    _ => {
                         let truncated = if accumulated_text.is_empty() {
                             "[interrupted by user]".to_string()
                         } else {
                             format!("{accumulated_text}\n\n[interrupted by user]")
                         };
                         let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        let _ = backend.append(session_key, &assistant_msg);
+                        if backend.session_exists(session_key) {
+                            let _ = backend.append(session_key, &assistant_msg);
+                        }
                     }
-                }
-                _ => {
-                    let truncated = if accumulated_text.is_empty() {
-                        "[interrupted by user]".to_string()
-                    } else {
-                        format!("{accumulated_text}\n\n[interrupted by user]")
-                    };
-                    let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                    let _ = backend.append(session_key, &assistant_msg);
                 }
             }
         }
@@ -1084,8 +1158,14 @@ async fn process_chat_message(
         let aborted = serde_json::json!({ "type": "aborted" });
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
-        // Set session state to idle
-        if let Some(ref backend) = state.session_backend {
+        // Set session state to idle — but only for sessions that still
+        // exist (#7126). `set_session_state` UPDATEs `session_metadata`,
+        // so on a deleted session it's a harmless no-op (0 rows updated)
+        // for SQLite but we still guard for cheap consistency with the
+        // append path above.
+        if let Some(ref backend) = state.session_backend
+            && backend.session_exists(session_key)
+        {
             let _ = backend.set_session_state(session_key, "idle", None);
         }
 
@@ -1093,7 +1173,7 @@ async fn process_chat_message(
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
             "model_provider": provider_label,
-            "model": state.model,
+            "model": model_label,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1104,7 +1184,7 @@ async fn process_chat_message(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model_provider": provider_label,
-                    "model": state.model,
+                    "model": model_label,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1125,22 +1205,22 @@ async fn process_chat_message(
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
-                let mem = state.mem.clone();
+                let memory_strategy = state.memory_strategy.clone();
                 let model_provider = state.model_provider.clone();
                 let model = state.model.clone();
                 let temperature = state.temperature;
                 let user_msg = content.to_string();
                 let assistant_resp = outcome.response.clone();
                 zeroclaw_spawn::spawn!(async move {
-                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        model_provider.as_ref(),
-                        &model,
-                        temperature,
-                        mem.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
+                    if let Err(e) = memory_strategy
+                        .consolidate_turn(
+                            &user_msg,
+                            &assistant_resp,
+                            model_provider.as_ref(),
+                            &model,
+                            temperature,
+                        )
+                        .await
                     {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -1167,7 +1247,7 @@ async fn process_chat_message(
             let cost_usd = record_turn_cost(
                 state,
                 &provider_label,
-                &state.model,
+                &model_label,
                 total_input_tokens,
                 total_output_tokens,
                 None,
@@ -1180,7 +1260,7 @@ async fn process_chat_message(
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
                 "cost_usd": cost_usd,
-                "model": state.model,
+                "model": model_label,
                 "provider": provider_label,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
@@ -1194,7 +1274,7 @@ async fn process_chat_message(
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "model_provider": provider_label,
-                "model": state.model,
+                "model": model_label,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1206,7 +1286,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": state.model,
+                        "model": model_label,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
@@ -1272,7 +1352,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": state.model,
+                        "model": model_label,
                         "session_key": session_key,
                         "error": sanitized,
                         "error_code": error_code,
@@ -1458,14 +1538,126 @@ mod tests {
             "session_id": "operator-2",
             "content": "different session"
         });
-        let global_event = serde_json::json!({
+        // No session_id and not on the global whitelist → dropped.
+        let nameless_observability = serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model": "gpt-4o"
+        });
+        // No session_id but on the global whitelist (`cron_result`) → forwarded.
+        let cron = serde_json::json!({
             "type": "cron_result",
-            "content": "global notification"
+            "output": "global notification"
         });
 
         assert!(event_matches_session(&target_event, "operator-1"));
         assert!(!event_matches_session(&other_event, "operator-1"));
-        assert!(event_matches_session(&global_event, "operator-1"));
+        assert!(!event_matches_session(
+            &nameless_observability,
+            "operator-1"
+        ));
+        assert!(event_matches_session(&cron, "operator-1"));
+    }
+
+    #[test]
+    fn event_matches_session_defaults_drops_unwhitelisted_no_session_frames() {
+        // The pre-#7151 contract was `None => true`, which silently leaked
+        // every BroadcastObserver telemetry frame (including `error`) into
+        // every chat WebSocket. The fix flips the default; verify each
+        // observed-in-the-wild leak shape is now blocked.
+        for ty in [
+            "agent_start",
+            "agent_end",
+            "llm_request",
+            "tool_call",
+            "tool_call_start",
+            "error",
+        ] {
+            let frame = serde_json::json!({
+                "type": ty,
+                "source": "observability",
+                "timestamp": "2026-06-04T00:00:00Z",
+            });
+            assert!(
+                !event_matches_session(&frame, "operator-1"),
+                "{ty} observability frame must be dropped from chat WS"
+            );
+        }
+    }
+
+    #[test]
+    fn event_matches_session_passes_session_scoped_chat_messages() {
+        // /api/sessions/{id}/messages broadcasts a session-scoped assistant
+        // injection — that frame must reach the chat for its session.
+        let assistant_inject = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "role": "assistant",
+            "content": "hello",
+        });
+        assert!(event_matches_session(&assistant_inject, "operator-1"));
+        assert!(!event_matches_session(&assistant_inject, "operator-2"));
+    }
+
+    #[test]
+    fn observability_tagged_frames_are_filtered() {
+        // The defense-in-depth helper: any frame with source="observability"
+        // is telemetry, regardless of type or session_id presence.
+        let obs = serde_json::json!({
+            "type": "tool_call",
+            "source": "observability",
+            "tool": "shell",
+        });
+        assert!(is_observability_telemetry(&obs));
+
+        let chat = serde_json::json!({
+            "type": "tool_call",
+            "id": "call-1",
+            "name": "file_write",
+            "args": {"path": "/tmp/x"},
+        });
+        assert!(!is_observability_telemetry(&chat));
+    }
+
+    #[test]
+    fn observability_telemetry_filter_handles_malformed_source_field() {
+        // Edge cases the previous tool-frame discriminator covered: ensure
+        // the source-tag check doesn't false-positive on weird `source`
+        // values that happen to coexist with chat-shaped frames.
+        for source in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(42),
+            serde_json::json!("api"),
+            serde_json::json!({"nested": "x"}),
+        ] {
+            let frame = serde_json::json!({
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "file_write",
+                "source": source,
+            });
+            assert!(
+                !is_observability_telemetry(&frame),
+                "frame with source={frame:?} must not be flagged as observability telemetry",
+            );
+        }
+    }
+
+    #[test]
+    fn chat_tool_frames_pass_through_when_session_scoped() {
+        // Real chat tool frames (ws.rs process_chat_message) are streamed
+        // over the per-turn channel, not the broadcast bus, but if anything
+        // ever rebroadcasts one with the right session_id it must pass.
+        let chat_tool_call = serde_json::json!({
+            "type": "tool_call",
+            "session_id": "operator-1",
+            "id": "call-1",
+            "name": "file_write",
+            "args": {"path": "/tmp/x"},
+        });
+        assert!(event_matches_session(&chat_tool_call, "operator-1"));
+        assert!(!is_observability_telemetry(&chat_tool_call));
     }
 
     #[test]
@@ -1614,6 +1806,73 @@ mod tests {
                 session_id: "gw_test".into(),
             }),
             "SESSION_QUEUE_TIMEOUT"
+        );
+    }
+
+    // ── #7126 regression ──────────────────────────────────────────────
+    //
+    // A `SessionBackend` mock that pretends the session has been deleted
+    // (`session_exists` → false). `persist_conversation_messages` must
+    // not call `append` against it — otherwise the SQLite backend's
+    // `INSERT INTO sessions` + the metadata-upsert resurrect both rows
+    // for a session the user explicitly wiped via
+    // `DELETE /api/sessions/{id}` during a streaming turn, and the next
+    // reconnect re-seeds the partial pre-clear history.
+    //
+    // Manual repro (no automated harness for the full streaming flow):
+    //   1. start a long turn (e.g. ask the agent to count slowly).
+    //   2. while the assistant is still streaming, click "Clear all".
+    //   3. wait for the WebSocket to reconnect.
+    //   4. ask "what did we talk about?" — pre-fix, the agent recalls
+    //      the partial pre-clear conversation; post-fix, it does not.
+    struct DeletedSessionBackend {
+        append_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.append_calls.lock().unwrap().push(format!(
+                "{}:{}:{}",
+                session_key, message.role, message.content
+            ));
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            // The user deleted the session between cancel and append.
+            false
+        }
+    }
+
+    #[test]
+    fn persist_conversation_messages_skips_deleted_session() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+        let backend = DeletedSessionBackend {
+            append_calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
+        ];
+
+        persist_conversation_messages(&backend, "gw_deleted", &messages);
+
+        assert!(
+            backend.append_calls.lock().unwrap().is_empty(),
+            "persist_conversation_messages must not resurrect a session whose \
+             session_exists() returned false (see #7126)"
         );
     }
 }

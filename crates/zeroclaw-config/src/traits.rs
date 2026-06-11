@@ -46,6 +46,14 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    /// Terminal field names whose values must be redacted when this type is
+    /// displayed as an object/object-array prop. Most prop kinds have no
+    /// nested secret surface; Configurable object-array element types can
+    /// override this by delegating to their generated `secret_field_terminals`.
+    fn display_secret_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -79,6 +87,9 @@ impl HasPropKind for Vec<String> {
 // strings too.
 impl HasPropKind for crate::providers::ModelProviderRef {
     const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
 }
 impl HasPropKind for crate::providers::TtsProviderRef {
     const PROP_KIND: PropKind = PropKind::String;
@@ -145,6 +156,10 @@ impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
 }
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -757,7 +772,7 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
-/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+/// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     /// Canonical kebab-case identifier used in config TOML
