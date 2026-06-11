@@ -1,4 +1,4 @@
-// Schema-driven config editor (#6175). Same building blocks as /onboard
+// Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
 // to instantiate a new entry.
@@ -12,9 +12,9 @@
 // SectionPicker + FieldForm components. NO hardcoded section names, field
 // labels, dropdown options, or provider lists.
 
-import { useEffect, useMemo, useState } from 'react';
-import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, ChevronRight, FolderOpen, Plus, Sparkles, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { ArrowLeft, ChevronRight, Plus, Sparkles, Trash2 } from "lucide-react";
 import {
   ApiError,
   deleteMapKey,
@@ -25,18 +25,23 @@ import {
   patchConfig,
   selectSectionItem,
   type DriftEntry,
+  type ListResponseEntry,
   type PickerItem,
   type SectionInfo,
-} from '../lib/api';
-import FieldForm, { clearFieldFormCatalogCaches } from '../components/onboard/FieldForm';
-import PersonalityEditor from '../components/onboard/PersonalityEditor';
-import SkillsBundleEditor from '../components/onboard/SkillsBundleEditor';
-import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
-import SectionPicker from '../components/onboard/SectionPicker';
-import SectionTabs, { type SectionTabSpec } from '../components/onboard/SectionTabs';
+} from "../lib/api";
+import FieldForm, {
+  clearFieldFormCatalogCaches,
+} from "../components/sections/FieldForm";
+import PersonalityEditor from "../components/sections/PersonalityEditor";
+import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
+import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
+import SectionPicker from "../components/sections/SectionPicker";
+import SectionTabs, {
+  type SectionTabSpec,
+} from "../components/sections/SectionTabs";
 import CostRatesEditor, {
   type CostRatesCategory,
-} from '../components/onboard/CostRatesEditor';
+} from "../components/sections/CostRatesEditor";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -46,22 +51,22 @@ import CostRatesEditor, {
 // Foundation leads — Workspace / Providers / Channels / Memory /
 // Hardware / Tunnel are the most-edited sections, surfaced first inside
 // the Config explorer instead of as duplicate top-level nav entries.
-// The setup wizard at /onboard walks the same six (reachable via the
+// The Quickstart flow walks the same six (reachable via the
 // "Run setup again" link in the breadcrumb row).
 const GROUP_ORDER = [
-  'Foundation',
-  'Agent',
-  'Multi-agent',
-  'Tools',
-  'Integrations',
-  'Network',
-  'Storage',
-  'Operations',
-  'Other',
+  "Foundation",
+  "Agent",
+  "Multi-agent",
+  "Tools",
+  "Integrations",
+  "Network",
+  "Storage",
+  "Operations",
+  "Other",
 ] as const;
 
 // Foundation order is gateway-provided: the server returns sections
-// pre-ordered by `zeroclaw_config::sections::ONBOARDING_SECTIONS`
+// pre-ordered by `zeroclaw_config::sections::QUICKSTART_SECTIONS`
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
@@ -78,7 +83,9 @@ export default function Config() {
   } = useParams<{ section?: string; type?: string; alias?: string }>();
   const location = useLocation();
   const navigate = useNavigate();
-  const lockedSection = location.pathname.startsWith('/setup/') ? sectionParam : undefined;
+  const lockedSection = location.pathname.startsWith("/setup/")
+    ? sectionParam
+    : undefined;
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -100,9 +107,10 @@ export default function Config() {
       .then((resp) => {
         if (cancelled) return;
         setSections(resp.sections);
-        const initialKey = sectionParam && resp.sections.find((s) => s.key === sectionParam)
-          ? sectionParam
-          : resp.sections[0]?.key ?? null;
+        const initialKey =
+          sectionParam && resp.sections.find((s) => s.key === sectionParam)
+            ? sectionParam
+            : (resp.sections[0]?.key ?? null);
         setActiveKey(initialKey);
       })
       .catch((e) => {
@@ -110,17 +118,24 @@ export default function Config() {
         if (e instanceof ApiError) {
           setError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
-          setError(`Couldn't load sections: ${e instanceof Error ? e.message : String(e)}`);
+          setError(
+            `Couldn't load sections: ${e instanceof Error ? e.message : String(e)}`,
+          );
         }
       })
       .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (!sectionParam || sections.length === 0) return;
-    if (sections.some((s) => s.key === sectionParam) && sectionParam !== activeKey) {
+    if (
+      sections.some((s) => s.key === sectionParam) &&
+      sectionParam !== activeKey
+    ) {
       setActiveKey(sectionParam);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -147,12 +162,18 @@ export default function Config() {
 
   // Navigate to alias list for a provider/channel type.
   const goToType = (sectionKey: string, typeKey: string) => {
-    navigate(`/config/${encodeURIComponent(sectionKey)}/${encodeURIComponent(typeKey)}`);
+    navigate(
+      `/config/${encodeURIComponent(sectionKey)}/${encodeURIComponent(typeKey)}`,
+    );
   };
 
   // Navigate to the form for a specific alias. Calls selectSectionItem
   // to instantiate the entry if needed, then navigates to the alias URL.
-  const goToAlias = async (sectionKey: string, typeKey: string, alias: string) => {
+  const goToAlias = async (
+    sectionKey: string,
+    typeKey: string,
+    alias: string,
+  ) => {
     try {
       await selectSectionItem(sectionKey, typeKey, alias);
       navigate(
@@ -172,7 +193,10 @@ export default function Config() {
       <div className="flex items-center justify-center h-64">
         <div
           className="h-8 w-8 border-2 rounded-full animate-spin"
-          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
         />
       </div>
     );
@@ -184,9 +208,9 @@ export default function Config() {
         <div
           className="rounded-xl border p-4 text-sm"
           style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
+            background: "rgba(239, 68, 68, 0.08)",
+            borderColor: "rgba(239, 68, 68, 0.2)",
+            color: "#f87171",
           }}
         >
           {error}
@@ -200,27 +224,19 @@ export default function Config() {
   // Server-emitted shape (from `WizardSection::shape()` in the Rust
   // config crate) decides whether this section needs a type→alias picker
   // or a flat alias list — no hardcoded section keys on the client.
-  const needsAliasTier = activeSection?.shape === 'typed_family_map';
-  const isOneTierAliasSection = activeSection?.shape === 'one_tier_alias_map';
+  const needsAliasTier = activeSection?.shape === "typed_family_map";
+  const isOneTierAliasSection = activeSection?.shape === "one_tier_alias_map";
 
   const mainContent = (() => {
     if (!activeSection) return null;
 
     if (!activeSection.has_picker) {
-      const tabs = sectionTabsForDirectForm(activeSection.key, {
-        reloadKey,
-        title: activeSection.label,
-        onSaved: fetchDrift,
-        drifted,
-      });
-      if (tabs) {
-        return <SectionTabs tabs={tabs} />;
-      }
       return (
-        <FieldForm
-          key={reloadKey}
+        <WireTabForm
+          key={`${reloadKey}-${activeSection.key}`}
           prefix={activeSection.key}
           title={activeSection.label}
+          reloadKey={reloadKey}
           onSaved={fetchDrift}
           drift={drifted}
         />
@@ -230,16 +246,10 @@ export default function Config() {
     // /config/:section/:type/:alias — field form
     if (typeParam && aliasParam) {
       const fieldsPrefix = needsAliasTier
-        ? activeSection.key === 'channels'
+        ? activeSection.key === "channels"
           ? `channels.${typeParam}.${aliasParam}`
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
-      const tabs = sectionTabsForAliasForm(activeSection.key, fieldsPrefix, {
-        reloadKey,
-        title: `${typeParam} / ${aliasParam}`,
-        onSaved: fetchDrift,
-        drifted,
-      });
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
           <button
@@ -250,17 +260,14 @@ export default function Config() {
             <ArrowLeft className="h-4 w-4" />
             Back
           </button>
-          {tabs ? (
-            <SectionTabs tabs={tabs} />
-          ) : (
-            <FieldForm
-              key={`${reloadKey}-${fieldsPrefix}`}
-              prefix={fieldsPrefix}
-              title={`${typeParam} / ${aliasParam}`}
-              onSaved={fetchDrift}
-              drift={drifted}
-            />
-          )}
+          <WireTabForm
+            key={`${reloadKey}-${fieldsPrefix}`}
+            prefix={fieldsPrefix}
+            title={`${typeParam} / ${aliasParam}`}
+            reloadKey={reloadKey}
+            onSaved={fetchDrift}
+            drift={drifted}
+          />
         </div>
       );
     }
@@ -269,79 +276,69 @@ export default function Config() {
     // (agents). The URL's :type slot carries the alias directly.
     if (typeParam && isOneTierAliasSection) {
       const fieldsPrefix = `${activeSection.key}.${typeParam}`;
-      const isAgent = activeSection.key === 'agents';
-      const isSkillBundle = activeSection.key === 'skill-bundles';
-      const settingsTab = (
-        <FieldForm
-          key={`${reloadKey}-${fieldsPrefix}`}
-          prefix={fieldsPrefix}
-          title={typeParam}
-          onSaved={fetchDrift}
-          drift={drifted}
-        />
-      );
-      const body = isAgent ? (
-        <SectionTabs
-          tabs={[
-            ...agentSettingsTabs(fieldsPrefix, {
-              reloadKey,
-              title: typeParam,
-              onSaved: fetchDrift,
-              drifted,
-            }),
-            {
-              key: 'peer-groups',
-              label: 'Peer Groups',
-              render: () => (
-                <AgentPeerGroupsTab
-                  key={`${reloadKey}-${typeParam}-peer-groups`}
-                  agentAlias={typeParam}
-                  onSaved={fetchDrift}
-                />
-              ),
-            },
-            {
-              key: 'personality',
-              label: 'Personality',
-              render: () => (
-                <PersonalityEditor
-                  key={`${reloadKey}-${typeParam}-personality`}
-                  agent={typeParam}
-                />
-              ),
-            },
-          ]}
-        />
-      ) : isSkillBundle ? (
-        <SectionTabs
-          tabs={[
-            { key: 'settings', label: 'Settings', render: () => settingsTab },
-            {
-              key: 'skills',
-              label: 'Skills',
-              render: () => (
-                <SkillsBundleEditor
-                  key={`${reloadKey}-${typeParam}-skills`}
-                  bundle={typeParam}
-                />
-              ),
-            },
-          ]}
-        />
-      ) : (
-        settingsTab
-      );
+      const isAgent = activeSection.key === "agents";
+      const isSkillBundle = activeSection.key === "skill_bundles";
+
+      // Composite tabs that sit alongside the wire-driven field tabs.
+      const extraTabs: SectionTabSpec[] = [];
+      if (isAgent) {
+        extraTabs.push(
+          {
+            key: "peer_groups",
+            label: "Peer Groups",
+            render: () => (
+              <AgentPeerGroupsTab
+                key={`${reloadKey}-${typeParam}-peer_groups`}
+                agentAlias={typeParam}
+                onSaved={fetchDrift}
+              />
+            ),
+          },
+          {
+            key: "personality",
+            label: "Personality",
+            render: () => (
+              <PersonalityEditor
+                key={`${reloadKey}-${typeParam}-personality`}
+                agent={typeParam}
+              />
+            ),
+          },
+        );
+      } else if (isSkillBundle) {
+        extraTabs.push({
+          key: "skills",
+          label: "Skills",
+          render: () => (
+            <SkillsBundleEditor
+              key={`${reloadKey}-${typeParam}-skills`}
+              bundle={typeParam}
+            />
+          ),
+        });
+      }
+
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
           <button
             type="button"
-            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            onClick={() =>
+              navigate(`/config/${encodeURIComponent(activeSection.key)}`)
+            }
             className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
           >
             <ArrowLeft className="h-4 w-4" />
             Back to {activeSection.label}
           </button>
-          {body}
+          <WireTabForm
+            key={`${reloadKey}-${fieldsPrefix}`}
+            prefix={fieldsPrefix}
+            title={typeParam}
+            reloadKey={reloadKey}
+            onSaved={fetchDrift}
+            drift={drifted}
+            extraTabs={extraTabs.length > 0 ? extraTabs : undefined}
+          />
         </div>
       );
     }
@@ -359,7 +356,9 @@ export default function Config() {
               `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(alias)}`,
             );
           }}
-          onBack={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+          onBack={() =>
+            navigate(`/config/${encodeURIComponent(activeSection.key)}`)
+          }
         />
       );
       const costsCategory = costCategoryForSection(activeSection.key);
@@ -367,10 +366,10 @@ export default function Config() {
         return (
           <SectionTabs
             tabs={[
-              { key: 'aliases', label: 'Aliases', render: () => aliasListPane },
+              { key: "aliases", label: "Aliases", render: () => aliasListPane },
               {
-                key: 'costs',
-                label: 'Costs',
+                key: "costs",
+                label: "Costs",
                 render: () => (
                   <CostRatesEditor
                     category={costsCategory}
@@ -393,7 +392,9 @@ export default function Config() {
         <div className="flex flex-col gap-3 flex-1 min-h-0">
           <button
             type="button"
-            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            onClick={() =>
+              navigate(`/config/${encodeURIComponent(activeSection.key)}`)
+            }
             className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
           >
             <ArrowLeft className="h-4 w-4" />
@@ -424,7 +425,7 @@ export default function Config() {
               `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(alias)}`,
             );
           }}
-          onBack={() => navigate('/config')}
+          onBack={() => navigate("/config")}
         />
       );
     }
@@ -439,7 +440,10 @@ export default function Config() {
           } else {
             void (async () => {
               try {
-                const resp = await selectSectionItem(activeSection.key, typeKey);
+                const resp = await selectSectionItem(
+                  activeSection.key,
+                  typeKey,
+                );
                 // BackendPicker sections (Memory, Tunnel) collapse the
                 // pick into a single field on the section root
                 // (memory.backend, tunnel.tunnel-provider). The form
@@ -448,17 +452,21 @@ export default function Config() {
                 // Two-tier paths (providers/channels) still navigate
                 // through the type slot because their alias forms live
                 // under `<section>.<type>.<alias>`.
-                const target = resp.fields_prefix.includes('.')
-                  ? `/config/${resp.fields_prefix.split('.').map(encodeURIComponent).join('/')}`
+                const target = resp.fields_prefix.includes(".")
+                  ? `/config/${resp.fields_prefix.split(".").map(encodeURIComponent).join("/")}`
                   : `/config/${encodeURIComponent(resp.fields_prefix)}`;
-                navigate(target, { state: { fieldsPrefix: resp.fields_prefix } });
+                navigate(target, {
+                  state: { fieldsPrefix: resp.fields_prefix },
+                });
               } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
               }
             })();
           }
         }}
-        onPickAlias={(typeKey, alias) => void goToAlias(activeSection.key, typeKey, alias)}
+        onPickAlias={(typeKey, alias) =>
+          void goToAlias(activeSection.key, typeKey, alias)
+        }
         sectionUrl={`/config/${encodeURIComponent(activeSection.key)}`}
         reloadKey={reloadKey}
         fetchDrift={fetchDrift}
@@ -469,15 +477,22 @@ export default function Config() {
 
   // Breadcrumb segments
   const crumbs: Array<{ label: string; url?: string }> = [
-    { label: 'Config', url: '/config' },
+    { label: "Config", url: "/config" },
     {
-      label: activeSection?.label ?? '',
+      label: activeSection?.label ?? "",
       url: activeSection
         ? `/config/${encodeURIComponent(activeSection.key)}`
         : undefined,
     },
   ];
-  if (typeParam) crumbs.push({ label: typeParam, url: typeParam && aliasParam ? `/config/${encodeURIComponent(sectionParam ?? '')}/${encodeURIComponent(typeParam)}` : undefined });
+  if (typeParam)
+    crumbs.push({
+      label: typeParam,
+      url:
+        typeParam && aliasParam
+          ? `/config/${encodeURIComponent(sectionParam ?? "")}/${encodeURIComponent(typeParam)}`
+          : undefined,
+    });
   if (aliasParam) crumbs.push({ label: aliasParam });
 
   return (
@@ -485,22 +500,26 @@ export default function Config() {
       {!lockedSection && (
         <aside
           className="w-56 flex-shrink-0 border-r overflow-y-auto"
-          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            background: "var(--pc-bg-surface)",
+          }}
         >
           <nav className="flex flex-col">
             {GROUP_ORDER.map((groupName) => {
               const known = new Set(GROUP_ORDER);
               const items = sections
                 .filter((s) =>
-                  groupName === 'Other'
-                    ? s.group === 'Other' || !known.has(s.group as typeof GROUP_ORDER[number])
+                  groupName === "Other"
+                    ? s.group === "Other" ||
+                      !known.has(s.group as (typeof GROUP_ORDER)[number])
                     : s.group === groupName,
                 )
                 .sort((a, b) => {
                   // Foundation: preserve server-provided canonical order
-                  // (driven by `ONBOARDING_SECTIONS` in the Rust config
+                  // (driven by `QUICKSTART_SECTIONS` in the Rust config
                   // crate). Other groups: alphabetize by label.
-                  if (groupName === 'Foundation') {
+                  if (groupName === "Foundation") {
                     return sections.indexOf(a) - sections.indexOf(b);
                   }
                   return a.label.localeCompare(b.label);
@@ -510,7 +529,7 @@ export default function Config() {
                 <div key={groupName}>
                   <div
                     className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
-                    style={{ color: 'var(--pc-text-secondary)' }}
+                    style={{ color: "var(--pc-text-secondary)" }}
                   >
                     {groupName}
                   </div>
@@ -521,16 +540,25 @@ export default function Config() {
                       onClick={() => goToSection(s.key)}
                       className="flex items-center justify-between gap-2 px-4 py-2 text-sm text-left transition-colors"
                       style={{
-                        background: s.key === activeKey ? 'var(--pc-accent-glow)' : 'transparent',
-                        color: s.key === activeKey ? 'var(--pc-accent)' : 'var(--pc-text-primary)',
+                        background:
+                          s.key === activeKey
+                            ? "var(--pc-accent-glow)"
+                            : "transparent",
+                        color:
+                          s.key === activeKey
+                            ? "var(--pc-accent)"
+                            : "var(--pc-text-primary)",
                         fontWeight: s.key === activeKey ? 600 : 400,
-                        borderLeft: s.key === activeKey
-                          ? '2px solid var(--pc-accent)'
-                          : '2px solid transparent',
+                        borderLeft:
+                          s.key === activeKey
+                            ? "2px solid var(--pc-accent)"
+                            : "2px solid transparent",
                       }}
                     >
                       <span>{s.label}</span>
-                      {s.key === activeKey && <ChevronRight className="h-3.5 w-3.5" />}
+                      {s.key === activeKey && (
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      )}
                     </button>
                   ))}
                 </div>
@@ -553,20 +581,25 @@ export default function Config() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div
                 className="text-sm flex items-center gap-1.5 flex-wrap"
-                style={{ color: 'var(--pc-text-muted)' }}
+                style={{ color: "var(--pc-text-muted)" }}
               >
                 {crumbs.map((crumb, i) => (
                   <span key={i} className="flex items-center gap-1.5">
                     {i > 0 && <ChevronRight className="h-3 w-3" />}
                     {crumb.url && i < crumbs.length - 1 ? (
                       <span
-                        style={{ color: 'var(--pc-text-secondary)', cursor: 'pointer' }}
+                        style={{
+                          color: "var(--pc-text-secondary)",
+                          cursor: "pointer",
+                        }}
                         onClick={() => navigate(crumb.url!)}
                       >
                         {crumb.label}
                       </span>
                     ) : (
-                      <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                      <span
+                        style={{ color: "var(--pc-accent)", fontWeight: 600 }}
+                      >
                         {crumb.label}
                       </span>
                     )}
@@ -575,12 +608,12 @@ export default function Config() {
               </div>
               <div className="flex items-center gap-2">
                 <Link
-                  to="/onboard"
+                  to="/quickstart"
                   className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
-                  title="Walk the first-run onboarding wizard again"
+                  title="Run Quickstart again"
                 >
                   <Sparkles className="h-3.5 w-3.5" />
-                  Run onboarding again
+                  Run Quickstart again
                 </Link>
                 <ReloadDaemonButton
                   onReloaded={() => {
@@ -610,21 +643,25 @@ function ConfigAliasHelpBox() {
     <div
       className="rounded-md border px-3 py-2 text-xs"
       style={{
-        borderColor: 'var(--pc-border)',
-        background: 'var(--pc-bg-surface-subtle)',
-        color: 'var(--pc-text-secondary)',
+        borderColor: "var(--pc-border)",
+        background: "var(--pc-bg-surface-subtle)",
+        color: "var(--pc-text-secondary)",
       }}
     >
       <p className="mb-1">
         <strong>Alias.</strong> A short stable name you’ll use everywhere else
         in config to point at this entry (agents, routes, and per-channel
-        bindings reference it as <code>{'<type>'}.{'<alias>'}</code>). Aliases
-        let you have several entries of the same type — a <code>work</code>{' '}
-        credential and a <code>personal</code> one, for example.
+        bindings reference it as{" "}
+        <code>
+          {"<type>"}.{"<alias>"}
+        </code>
+        ). Aliases let you have several entries of the same type — a{" "}
+        <code>work</code> credential and a <code>personal</code> one, for
+        example.
       </p>
       <p className="mb-0">
         Rules: lowercase letters, digits, single underscores; 1–63 chars; no
-        leading/trailing/double underscores, no dots, hyphens, or spaces.{' '}
+        leading/trailing/double underscores, no dots, hyphens, or spaces.{" "}
         <strong>Aliases can’t be renamed in v0.8.0</strong> — pick something
         you’ll keep, or delete and recreate.
       </p>
@@ -634,17 +671,17 @@ function ConfigAliasHelpBox() {
 
 function suggestConfigAlias(aliases: string[]): string {
   const used = new Set(aliases);
-  if (!used.has('default')) return 'default';
+  if (!used.has("default")) return "default";
   for (let i = 2; i < 100; i += 1) {
     const candidate = `default_${i}`;
     if (!used.has(candidate)) return candidate;
   }
-  return 'default_100';
+  return "default_100";
 }
 
 function validateConfigAlias(alias: string): string | null {
   if (/^(?!_)(?!.*__)(?!.*_$)[a-z0-9_]{1,63}$/.test(alias)) return null;
-  return 'Alias must use lowercase letters, digits, or single underscores only; no hyphens, dots, spaces, leading/trailing underscores, or double underscores.';
+  return "Alias must use lowercase letters, digits, or single underscores only; no hyphens, dots, spaces, leading/trailing underscores, or double underscores.";
 }
 
 function AliasListView({
@@ -667,7 +704,7 @@ function AliasListView({
 }) {
   const [aliases, setAliases] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
-  const [newAlias, setNewAlias] = useState('');
+  const [newAlias, setNewAlias] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [aliasError, setAliasError] = useState<string | null>(null);
 
@@ -680,15 +717,21 @@ function AliasListView({
     let cancelled = false;
     setLoading(true);
     getMapKeys(mapPath)
-      .then((r) => { if (!cancelled) setAliases(r.keys); })
+      .then((r) => {
+        if (!cancelled) setAliases(r.keys);
+      })
       .catch((e) => {
         if (!cancelled) {
           setAliases([]);
           setError(e instanceof Error ? e.message : String(e));
         }
       })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [mapPath]);
 
   const submit = async () => {
@@ -703,7 +746,11 @@ function AliasListView({
       await onSelectAlias(trimmed);
     } catch (e) {
       setAliasError(
-        e instanceof ApiError ? e.envelope.message : (e instanceof Error ? e.message : String(e)),
+        e instanceof ApiError
+          ? e.envelope.message
+          : e instanceof Error
+            ? e.message
+            : String(e),
       );
     }
   };
@@ -722,7 +769,7 @@ function AliasListView({
       {sectionHelp && (
         <p
           className="text-sm leading-relaxed"
-          style={{ color: 'var(--pc-text-secondary)' }}
+          style={{ color: "var(--pc-text-secondary)" }}
         >
           {sectionHelp}
         </p>
@@ -733,7 +780,11 @@ function AliasListView({
       {error && (
         <div
           className="rounded-xl border p-3 text-sm"
-          style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.2)', color: '#f87171' }}
+          style={{
+            background: "rgba(239,68,68,0.08)",
+            borderColor: "rgba(239,68,68,0.2)",
+            color: "#f87171",
+          }}
         >
           {error}
         </div>
@@ -743,13 +794,16 @@ function AliasListView({
         <div className="flex items-center justify-center py-12">
           <div
             className="h-8 w-8 border-2 rounded-full animate-spin"
-            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
         </div>
       ) : (
         <div
           className="surface-panel divide-y"
-          style={{ borderColor: 'var(--pc-border)' }}
+          style={{ borderColor: "var(--pc-border)" }}
         >
           {aliases.map((alias) => (
             <AliasRow
@@ -761,7 +815,9 @@ function AliasListView({
                   setError(
                     e instanceof ApiError
                       ? `[${e.envelope.code}] ${e.envelope.message}`
-                      : (e instanceof Error ? e.message : String(e)),
+                      : e instanceof Error
+                        ? e.message
+                        : String(e),
                   );
                 })
               }
@@ -780,8 +836,13 @@ function AliasListView({
                 className="input-electric flex-1 px-3 py-1.5 text-sm"
                 placeholder={suggestConfigAlias(aliases)}
                 value={newAlias}
-                onChange={(e) => { setNewAlias(e.target.value); setAliasError(null); }}
-                onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+                onChange={(e) => {
+                  setNewAlias(e.target.value);
+                  setAliasError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void submit();
+                }}
               />
               <button
                 type="button"
@@ -792,7 +853,12 @@ function AliasListView({
               </button>
             </div>
             {aliasError && (
-              <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>{aliasError}</p>
+              <p
+                className="text-xs"
+                style={{ color: "var(--color-status-error)" }}
+              >
+                {aliasError}
+              </p>
             )}
           </div>
         </div>
@@ -801,77 +867,32 @@ function AliasListView({
   );
 }
 
-
-// Per-section tab partition for top-level DirectForm sections (e.g.
-// MCP: Settings vs Servers). Returns null when the section doesn't
-// need tabs.
 // BackendPicker sections have a discriminator field that the top picker
 // sets; the settings form below excludes it to avoid the duplicate input.
 const BACKEND_PICKER_FIELD: Record<string, string> = {
-  tunnel: 'tunnel.tunnel-provider',
-  memory: 'memory.backend',
+  tunnel: "tunnel.tunnel-provider",
+  memory: "memory.backend",
 };
 
-function sectionTabsForDirectForm(
-  sectionKey: string,
-  ctx: {
-    reloadKey: number;
-    title: string;
-    onSaved: () => void;
-    drifted: DriftEntry[];
-  },
-): SectionTabSpec[] | null {
-  const makeForm = (filter: (path: string) => boolean) => (
-    <FieldForm
-      key={`${ctx.reloadKey}-${sectionKey}`}
-      prefix={sectionKey}
-      title={ctx.title}
-      onSaved={ctx.onSaved}
-      drift={ctx.drifted}
-      includePath={filter}
-    />
-  );
-
-  if (sectionKey === 'mcp') {
-    return [
-      {
-        key: 'settings',
-        label: 'Settings',
-        render: () => makeForm((p) => p !== 'mcp.servers'),
-      },
-      {
-        key: 'servers',
-        label: 'Servers',
-        render: () => makeForm((p) => p === 'mcp.servers'),
-      },
-    ];
-  }
-  if (sectionKey === 'cost') {
-    return [
-      {
-        key: 'limits',
-        label: 'Limits',
-        render: () => makeForm((p) => !p.startsWith('cost.rates.')),
-      },
-    ];
-  }
-  return null;
-}
-
 function costCategoryForSection(sectionKey: string): CostRatesCategory | null {
-  if (sectionKey === 'providers.models') return 'models';
-  if (sectionKey === 'providers.tts') return 'tts';
-  if (sectionKey === 'providers.transcription') return 'transcription';
+  if (sectionKey === "providers.models") return "models";
+  if (sectionKey === "providers.tts") return "tts";
+  if (sectionKey === "providers.transcription") return "transcription";
   return null;
 }
 
-// Per-section tab partition for `<type>.<alias>` alias forms. Returns
-// `null` when the section doesn't need tabs (falls back to a single
-// FieldForm). The partition is name-based against the kebab leaf
-// segment of each prop path under `fieldsPrefix`.
-function sectionTabsForAliasForm(
-  sectionKey: string,
-  fieldsPrefix: string,
+/**
+ * Build `SectionTabSpec[]` from the `tab` field on wire entries.
+ *
+ * Each distinct non-empty `tab` value becomes one tab whose `FieldForm`
+ * filters via `includePath` on the set of paths belonging to that tab.
+ * Tab order follows first-occurrence in the entries array (which matches
+ * field-declaration order from the Rust schema). Returns `null` when no
+ * entries carry a `tab` value (flat display, no tab bar).
+ */
+function wireTabSpecs(
+  entries: ListResponseEntry[],
+  prefix: string,
   ctx: {
     reloadKey: number;
     title: string;
@@ -879,178 +900,97 @@ function sectionTabsForAliasForm(
     drifted: DriftEntry[];
   },
 ): SectionTabSpec[] | null {
-  const leaf = (path: string): string => {
-    const rest = path.startsWith(`${fieldsPrefix}.`) ? path.slice(fieldsPrefix.length + 1) : path;
-    return rest.split('.', 1)[0] ?? '';
-  };
-
-  const makeForm = (filter: (path: string) => boolean) => (
-    <FieldForm
-      key={`${ctx.reloadKey}-${fieldsPrefix}`}
-      prefix={fieldsPrefix}
-      title={ctx.title}
-      onSaved={ctx.onSaved}
-      drift={ctx.drifted}
-      includePath={filter}
-    />
-  );
-
-  if (sectionKey === 'providers.models') {
-    const connection = new Set(['api-key', 'uri', 'requires-openai-auth', 'extra-headers']);
-    const model = new Set(['model', 'temperature', 'max-tokens', 'top-p', 'timeout-secs']);
-    return [
-      { key: 'connection', label: 'Connection', render: () => makeForm((p) => connection.has(leaf(p))) },
-      { key: 'model', label: 'Model', render: () => makeForm((p) => model.has(leaf(p))) },
-      {
-        key: 'advanced',
-        label: 'Advanced',
-        render: () => makeForm((p) => !connection.has(leaf(p)) && !model.has(leaf(p))),
-      },
-    ];
+  // Group paths by tab, preserving first-occurrence order.
+  const tabOrder: string[] = [];
+  const tabPaths = new Map<string, Set<string>>();
+  for (const e of entries) {
+    const t = e.tab;
+    if (!t) continue;
+    if (!tabPaths.has(t)) {
+      tabOrder.push(t);
+      tabPaths.set(t, new Set());
+    }
+    tabPaths.get(t)!.add(e.path);
   }
-  if (sectionKey === 'channels') {
-    const connection = new Set([
-      'api-key',
-      'bot-token',
-      'access-token',
-      'webhook-secret',
-      'password',
-      'app-secret',
-      'allowed-rooms',
-      'allowed-users',
-      'allowed-chats',
-      'homeserver',
-      'user-id',
-      'device-id',
-      'recovery-key',
-    ]);
-    const behavior = new Set([
-      'enabled',
-      'reply-in-thread',
-      'mention-only',
-      'interrupt-on-new-message',
-      'stream-mode',
-      'draft-update-interval-ms',
-      'multi-message-delay-ms',
-      'approval-timeout-secs',
-      'ack-reactions',
-      'excluded-tools',
-    ]);
-    return [
-      { key: 'connection', label: 'Connection', render: () => makeForm((p) => connection.has(leaf(p))) },
-      { key: 'behavior', label: 'Behavior', render: () => makeForm((p) => behavior.has(leaf(p))) },
-      {
-        key: 'advanced',
-        label: 'Advanced',
-        render: () => makeForm((p) => !connection.has(leaf(p)) && !behavior.has(leaf(p))),
-      },
-    ];
-  }
-  return null;
+  if (tabOrder.length === 0) return null;
+
+  return tabOrder.map((tab) => {
+    const paths = tabPaths.get(tab)!;
+    return {
+      key: tab.toLowerCase().replace(/\s+/g, "-"),
+      label: tab,
+      render: () => (
+        <FieldForm
+          key={`${ctx.reloadKey}-${prefix}-${tab}`}
+          prefix={prefix}
+          title={ctx.title}
+          onSaved={ctx.onSaved}
+          drift={ctx.drifted}
+          includePath={(p) => paths.has(p)}
+        />
+      ),
+    };
+  });
 }
 
 /**
- * Split the ~50 `agents.<alias>.*` fields into navigable buckets so the
- * edit page reads as a structured form instead of a fuzzy-filter
- * scroll. Each tab is a FieldForm with an `includePath` predicate; the
- * predicate gets the full dotted path of the entry.
+ * Self-contained component: fetches entries for `prefix`, groups by `tab`,
+ * and renders a `SectionTabs` when tabs are present or a plain `FieldForm`
+ * when they aren't. Extra tabs (e.g. Personality, PeerGroups) can be
+ * appended via `extraTabs`.
  */
-function agentSettingsTabs(
-  fieldsPrefix: string,
-  ctx: {
-    reloadKey: number;
-    title: string;
-    onSaved: () => void;
-    drifted: DriftEntry[];
-  },
-): SectionTabSpec[] {
-  const leaf = (path: string): string => {
-    const rest = path.startsWith(`${fieldsPrefix}.`)
-      ? path.slice(fieldsPrefix.length + 1)
-      : path;
-    return rest.split('.', 1)[0] ?? '';
-  };
-  const branch = (path: string, name: string): boolean =>
-    path.startsWith(`${fieldsPrefix}.${name}.`) || leaf(path) === name;
+function WireTabForm({
+  prefix,
+  title,
+  reloadKey,
+  onSaved,
+  drift,
+  extraTabs,
+}: {
+  prefix: string;
+  title: string;
+  reloadKey: number;
+  onSaved: () => void;
+  drift: DriftEntry[];
+  extraTabs?: SectionTabSpec[];
+}) {
+  const [entries, setEntries] = useState<ListResponseEntry[] | null>(null);
 
-  const makeForm = (filter: (path: string) => boolean, key: string) => (
+  useEffect(() => {
+    let cancelled = false;
+    void listProps(prefix).then((resp) => {
+      if (!cancelled) setEntries(resp.entries);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [prefix, reloadKey]);
+
+  if (!entries) return null; // loading
+
+  const ctx = { reloadKey, title, onSaved, drifted: drift };
+  const tabs = wireTabSpecs(entries, prefix, ctx);
+
+  if (tabs || extraTabs) {
+    const all = [...(tabs ?? []), ...(extraTabs ?? [])];
+    return <SectionTabs tabs={all} />;
+  }
+
+  return (
     <FieldForm
-      key={`${ctx.reloadKey}-${fieldsPrefix}-${key}`}
-      prefix={fieldsPrefix}
-      title={ctx.title}
-      onSaved={ctx.onSaved}
-      drift={ctx.drifted}
-      includePath={filter}
+      key={reloadKey}
+      prefix={prefix}
+      title={title}
+      onSaved={onSaved}
+      drift={drift}
     />
   );
-
-  const generalKeys = new Set([
-    'risk-profile',
-    'runtime-profile',
-  ]);
-  const providerKeys = new Set([
-    'model-provider',
-    'tts-provider',
-    'transcription-provider',
-  ]);
-  const inGeneral = (p: string) => generalKeys.has(leaf(p));
-  const inProviders = (p: string) => providerKeys.has(leaf(p));
-  const inChannels = (p: string) => leaf(p) === 'channels';
-  const inBundles = (p: string) => {
-    const k = leaf(p);
-    return k === 'skill-bundles' || k === 'knowledge-bundles' || k === 'mcp-bundles';
-  };
-  const inCron = (p: string) => leaf(p) === 'cron-jobs';
-  const inMemory = (p: string) => branch(p, 'memory');
-  const inWorkspace = (p: string) => branch(p, 'workspace');
-  const explicit = (p: string) =>
-    inGeneral(p) ||
-    inProviders(p) ||
-    inChannels(p) ||
-    inBundles(p) ||
-    inCron(p) ||
-    inMemory(p) ||
-    inWorkspace(p);
-
-  const agentAlias = fieldsPrefix.startsWith('agents.')
-    ? fieldsPrefix.slice('agents.'.length)
-    : null;
-
-  const workspaceTab = (
-    <div className="flex flex-col gap-3">
-      {agentAlias && (
-        <Link
-          to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
-          className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
-        >
-          <FolderOpen className="h-4 w-4" />
-          Open file explorer →
-        </Link>
-      )}
-      {makeForm(inWorkspace, 'workspace')}
-    </div>
-  );
-
-  return [
-    { key: 'general', label: 'General', render: () => makeForm(inGeneral, 'general') },
-    { key: 'providers', label: 'Providers', render: () => makeForm(inProviders, 'providers') },
-    { key: 'channels', label: 'Channels', render: () => makeForm(inChannels, 'channels') },
-    { key: 'bundles', label: 'Bundles', render: () => makeForm(inBundles, 'bundles') },
-    { key: 'cron', label: 'Cron', render: () => makeForm(inCron, 'cron') },
-    { key: 'memory', label: 'Memory', render: () => makeForm(inMemory, 'memory') },
-    { key: 'workspace', label: 'Workspace', render: () => workspaceTab },
-    {
-      key: 'tuning',
-      label: 'Tuning',
-      render: () => makeForm((p) => !explicit(p), 'tuning'),
-    },
-  ];
 }
 
 /**
- * Peer Groups tab on the agent edit page. Walks `peer-groups.*` for
+ * Peer Groups tab on the agent edit page. Walks `peer_groups.*` for
  * groups containing the bound agent, then embeds the SAME FieldForm
- * used at `/config/peer-groups/<alias>` — no duplicated authoring
+ * used at `/config/peer_groups/<alias>` — no duplicated authoring
  * surface. Plus an "Add to group" picker that appends this agent to a
  * group's `agents` array via patchConfig.
  */
@@ -1066,19 +1006,19 @@ function AgentPeerGroupsTab({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
-  const [pickerValue, setPickerValue] = useState('');
+  const [pickerValue, setPickerValue] = useState("");
 
   const reload = async () => {
     setLoading(true);
     setError(null);
     try {
-      const { keys } = await getMapKeys('peer-groups');
+      const { keys } = await getMapKeys("peer_groups");
       const memberships: string[] = [];
       const others: string[] = [];
       for (const pg of keys) {
-        const { entries } = await listProps(`peer-groups.${pg}`);
+        const { entries } = await listProps(`peer_groups.${pg}`);
         const agentsEntry = entries.find(
-          (e) => e.path === `peer-groups.${pg}.agents`,
+          (e) => e.path === `peer_groups.${pg}.agents`,
         );
         const list = parseAgentsList(agentsEntry?.value);
         if (list.includes(agentAlias)) memberships.push(pg);
@@ -1103,22 +1043,22 @@ function AgentPeerGroupsTab({
     setAdding(true);
     setError(null);
     try {
-      const { entries } = await listProps(`peer-groups.${pickerValue}`);
+      const { entries } = await listProps(`peer_groups.${pickerValue}`);
       const agentsEntry = entries.find(
-        (e) => e.path === `peer-groups.${pickerValue}.agents`,
+        (e) => e.path === `peer_groups.${pickerValue}.agents`,
       );
       const list = parseAgentsList(agentsEntry?.value);
       if (!list.includes(agentAlias)) {
         const next = [...list, agentAlias];
         await patchConfig([
           {
-            op: 'replace',
-            path: `peer-groups.${pickerValue}.agents`,
+            op: "replace",
+            path: `peer_groups.${pickerValue}.agents`,
             value: next,
           },
         ]);
       }
-      setPickerValue('');
+      setPickerValue("");
       await reload();
       onSaved();
     } catch (e) {
@@ -1131,15 +1071,15 @@ function AgentPeerGroupsTab({
   const removeFromGroup = async (pg: string) => {
     setError(null);
     try {
-      const { entries } = await listProps(`peer-groups.${pg}`);
+      const { entries } = await listProps(`peer_groups.${pg}`);
       const agentsEntry = entries.find(
-        (e) => e.path === `peer-groups.${pg}.agents`,
+        (e) => e.path === `peer_groups.${pg}.agents`,
       );
       const list = parseAgentsList(agentsEntry?.value).filter(
         (a) => a !== agentAlias,
       );
       await patchConfig([
-        { op: 'replace', path: `peer-groups.${pg}.agents`, value: list },
+        { op: "replace", path: `peer_groups.${pg}.agents`, value: list },
       ]);
       await reload();
       onSaved();
@@ -1150,7 +1090,7 @@ function AgentPeerGroupsTab({
 
   if (loading) {
     return (
-      <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+      <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
         Loading peer groups…
       </p>
     );
@@ -1162,9 +1102,9 @@ function AgentPeerGroupsTab({
         <div
           className="rounded-xl border p-3 text-sm"
           style={{
-            background: 'var(--color-status-error-alpha-08)',
-            borderColor: 'var(--color-status-error-alpha-20)',
-            color: 'var(--color-status-error)',
+            background: "var(--color-status-error-alpha-08)",
+            borderColor: "var(--color-status-error-alpha-20)",
+            color: "var(--color-status-error)",
           }}
         >
           {error}
@@ -1173,9 +1113,9 @@ function AgentPeerGroupsTab({
 
       <div
         className="flex items-center gap-2 rounded-xl p-3"
-        style={{ background: 'var(--pc-bg-elevated)' }}
+        style={{ background: "var(--pc-bg-elevated)" }}
       >
-        <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+        <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
           Add this agent to:
         </span>
         <select
@@ -1185,7 +1125,7 @@ function AgentPeerGroupsTab({
           className="input-electric text-xs px-2 py-1 appearance-none cursor-pointer"
         >
           <option value="">
-            {nonMembers.length === 0 ? 'no other groups' : 'select a group…'}
+            {nonMembers.length === 0 ? "no other groups" : "select a group…"}
           </option>
           {nonMembers.map((g) => (
             <option key={g} value={g}>
@@ -1199,12 +1139,12 @@ function AgentPeerGroupsTab({
           disabled={!pickerValue || adding}
           className="btn-electric text-xs px-3 py-1 rounded-lg disabled:opacity-50"
         >
-          {adding ? 'Adding…' : 'Add'}
+          {adding ? "Adding…" : "Add"}
         </button>
         <Link
-          to="/config/peer-groups"
+          to="/config/peer_groups"
           className="text-xs ml-auto hover:underline"
-          style={{ color: 'var(--pc-text-muted)' }}
+          style={{ color: "var(--pc-text-muted)" }}
         >
           Create new →
         </Link>
@@ -1214,8 +1154,8 @@ function AgentPeerGroupsTab({
         <p
           className="text-sm rounded-xl p-4 text-center"
           style={{
-            color: 'var(--pc-text-muted)',
-            background: 'var(--pc-bg-elevated)',
+            color: "var(--pc-text-muted)",
+            background: "var(--pc-bg-elevated)",
           }}
         >
           {agentAlias} is not a member of any peer group.
@@ -1225,33 +1165,33 @@ function AgentPeerGroupsTab({
           <div
             key={pg}
             className="rounded-xl border"
-            style={{ borderColor: 'var(--pc-border)' }}
+            style={{ borderColor: "var(--pc-border)" }}
           >
             <div
               className="flex items-center justify-between px-4 py-2 border-b"
-              style={{ borderColor: 'var(--pc-border)' }}
+              style={{ borderColor: "var(--pc-border)" }}
             >
               <Link
-                to={`/config/peer-groups/${encodeURIComponent(pg)}`}
+                to={`/config/peer_groups/${encodeURIComponent(pg)}`}
                 className="text-sm font-mono hover:underline"
-                style={{ color: 'var(--pc-text-primary)' }}
+                style={{ color: "var(--pc-text-primary)" }}
               >
-                peer-groups.{pg}
+                peer_groups.{pg}
               </Link>
               <button
                 type="button"
                 onClick={() => removeFromGroup(pg)}
                 className="text-xs hover:underline"
-                style={{ color: 'var(--color-status-error)' }}
-                title={`Remove ${agentAlias} from peer-groups.${pg}`}
+                style={{ color: "var(--color-status-error)" }}
+                title={`Remove ${agentAlias} from peer_groups.${pg}`}
               >
                 Remove from group
               </button>
             </div>
             <div className="p-4">
               <FieldForm
-                key={`peer-groups-embed-${pg}`}
-                prefix={`peer-groups.${pg}`}
+                key={`peer_groups-embed-${pg}`}
+                prefix={`peer_groups.${pg}`}
                 onSaved={onSaved}
                 showDelete={false}
               />
@@ -1265,7 +1205,7 @@ function AgentPeerGroupsTab({
 
 function parseAgentsList(raw: unknown): string[] {
   if (Array.isArray(raw)) return raw.map(String);
-  if (typeof raw !== 'string' || raw.length === 0) return [];
+  if (typeof raw !== "string" || raw.length === 0) return [];
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) return parsed.map(String);
@@ -1273,9 +1213,9 @@ function parseAgentsList(raw: unknown): string[] {
     // fall through
   }
   return raw
-    .replace(/^\[|\]$/g, '')
+    .replace(/^\[|\]$/g, "")
     .split(/[,\n]/)
-    .map((s) => s.trim().replace(/^"|"$/g, ''))
+    .map((s) => s.trim().replace(/^"|"$/g, ""))
     .filter(Boolean);
 }
 
@@ -1337,29 +1277,41 @@ function AliasRow({
         className="flex-1 min-w-0 flex items-center justify-between gap-3 text-left"
       >
         <div className="min-w-0">
-          <span style={{ color: 'var(--pc-text-primary)', fontWeight: 500 }}>{alias}</span>
+          <span style={{ color: "var(--pc-text-primary)", fontWeight: 500 }}>
+            {alias}
+          </span>
           <code
             className="block text-xs mt-0.5"
-            style={{ color: 'var(--pc-text-faint)' }}
+            style={{ color: "var(--pc-text-faint)" }}
           >
             {mapPath}.{alias}
           </code>
         </div>
-        <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
+        <ChevronRight
+          className="h-4 w-4 flex-shrink-0"
+          style={{ color: "var(--pc-text-muted)" }}
+        />
       </button>
       <button
         type="button"
         onClick={onTrashClick}
         disabled={deleting}
-        title={armed ? 'Click again to confirm delete' : 'Delete this alias'}
+        title={armed ? "Click again to confirm delete" : "Delete this alias"}
         className="btn-icon flex-shrink-0"
         style={
           armed
-            ? { color: 'var(--color-status-error, #f87171)', borderColor: 'var(--color-status-error, #f87171)' }
+            ? {
+                color: "var(--color-status-error, #f87171)",
+                borderColor: "var(--color-status-error, #f87171)",
+              }
             : undefined
         }
       >
-        {armed ? <span className="text-xs px-1">Confirm</span> : <Trash2 className="h-4 w-4" />}
+        {armed ? (
+          <span className="text-xs px-1">Confirm</span>
+        ) : (
+          <Trash2 className="h-4 w-4" />
+        )}
       </button>
     </div>
   );
@@ -1387,7 +1339,7 @@ function SectionOverview({
   // and the "configured items" list don't fit single-choice semantics.
   // Render the picker plus the section's own fields (memory.auto_save,
   // hygiene, etc.) inline.
-  const isBackendPicker = section.shape === 'backend_picker';
+  const isBackendPicker = section.shape === "backend_picker";
   if (isBackendPicker) {
     // The discriminator field is the picker; rendering it again in the
     // settings form below is a duplicate input that confuses users.
@@ -1426,7 +1378,10 @@ function SectionOverview({
         <SectionPicker
           sectionKey={section.key}
           help={section.help}
-          onPick={(item) => { setShowPicker(false); onPickType(item.key); }}
+          onPick={(item) => {
+            setShowPicker(false);
+            onPickType(item.key);
+          }}
           onSkip={() => setShowPicker(false)}
         />
       </div>
@@ -1436,7 +1391,7 @@ function SectionOverview({
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
-        <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+        <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
           {section.help}
         </p>
         <button
@@ -1465,7 +1420,10 @@ interface ConfiguredOnlyPickerProps {
   sectionUrl: string;
 }
 
-function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps) {
+function ConfiguredOnlyPicker({
+  section,
+  onPickType,
+}: ConfiguredOnlyPickerProps) {
   const [items, setItems] = useState<PickerItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1474,13 +1432,13 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
     let cancelled = false;
     setLoading(true);
     setError(null);
-    import('../lib/api').then(({ getSectionPicker }) =>
+    import("../lib/api").then(({ getSectionPicker }) =>
       getSectionPicker(section.key)
         .then((resp) => {
           if (cancelled) return;
           setItems(
             resp.items.filter(
-              (i) => i.badge === 'configured' || i.badge === 'active',
+              (i) => i.badge === "configured" || i.badge === "active",
             ),
           );
         })
@@ -1489,12 +1447,16 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
           if (e instanceof ApiError) {
             setError(`[${e.envelope.code}] ${e.envelope.message}`);
           } else {
-            setError(`Couldn't load configured items: ${e instanceof Error ? e.message : String(e)}`);
+            setError(
+              `Couldn't load configured items: ${e instanceof Error ? e.message : String(e)}`,
+            );
           }
         })
         .finally(() => !cancelled && setLoading(false)),
     );
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [section.key]);
 
   if (loading) {
@@ -1502,7 +1464,10 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
       <div className="flex items-center justify-center py-12">
         <div
           className="h-8 w-8 border-2 rounded-full animate-spin"
-          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
         />
       </div>
     );
@@ -1513,9 +1478,9 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
       <div
         className="rounded-xl border p-3 text-sm"
         style={{
-          background: 'rgba(239, 68, 68, 0.08)',
-          borderColor: 'rgba(239, 68, 68, 0.2)',
-          color: '#f87171',
+          background: "rgba(239, 68, 68, 0.08)",
+          borderColor: "rgba(239, 68, 68, 0.2)",
+          color: "#f87171",
         }}
       >
         {error}
@@ -1527,9 +1492,9 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
     return (
       <div
         className="surface-panel p-8 text-center text-sm"
-        style={{ color: 'var(--pc-text-muted)' }}
+        style={{ color: "var(--pc-text-muted)" }}
       >
-        Nothing configured under <strong>{section.label}</strong> yet. Click{' '}
+        Nothing configured under <strong>{section.label}</strong> yet. Click{" "}
         <strong>+ Add</strong> to get started.
       </div>
     );
@@ -1538,7 +1503,7 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
   return (
     <div
       className="surface-panel divide-y"
-      style={{ borderColor: 'var(--pc-border)' }}
+      style={{ borderColor: "var(--pc-border)" }}
     >
       {items.map((item) => (
         <button
@@ -1550,20 +1515,20 @@ function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps
           <div className="flex-1 min-w-0">
             <div
               className="text-sm font-medium"
-              style={{ color: 'var(--pc-text-primary)' }}
+              style={{ color: "var(--pc-text-primary)" }}
             >
               {item.label}
             </div>
             <code
               className="block text-xs mt-0.5"
-              style={{ color: 'var(--pc-text-faint)' }}
+              style={{ color: "var(--pc-text-faint)" }}
             >
               {item.key}
             </code>
           </div>
           <ChevronRight
             className="h-4 w-4 flex-shrink-0"
-            style={{ color: 'var(--pc-text-muted)' }}
+            style={{ color: "var(--pc-text-muted)" }}
           />
         </button>
       ))}

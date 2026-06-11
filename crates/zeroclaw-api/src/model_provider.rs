@@ -68,11 +68,30 @@ pub struct ToolCall {
 }
 
 /// Raw token counts from a single LLM API response.
+///
+/// Contract: `input_tokens` is the **total prompt size** sent to the model
+/// (every token the model saw, regardless of cache state).
+/// `cached_input_tokens` is the **subset** of `input_tokens` that was served
+/// from the prompt cache. So `cached_input_tokens <= input_tokens`, and the
+/// billable uncached portion is `input_tokens - cached_input_tokens`.
+///
+/// Providers normalize to this shape:
+/// - OpenAI/Compatible: `prompt_tokens` is already total, `cached_tokens` is
+///   already a subset — used directly.
+/// - Anthropic: the API reports three DISJOINT buckets per
+///   <https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>:
+///   `total_input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens`,
+///   where Anthropic's `input_tokens` is *only* the tokens after the last
+///   cache breakpoint. The adapter sums all three to produce the total here.
+///   `cached_input_tokens` is set to `cache_read_input_tokens` (the
+///   discount-billed subset).
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    /// Total prompt size: uncached + cached input tokens.
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    /// Tokens served from the model_provider's prompt cache (Anthropic `cache_read_input_tokens`,
+    /// Subset of `input_tokens` that was served from the model_provider's
+    /// prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `prompt_tokens_details.cached_tokens`).
     pub cached_input_tokens: Option<u64>,
 }
@@ -344,6 +363,37 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 /// classic chat completions shape.
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
+/// Per-token pricing for a model. All values are per-token rates as strings
+/// expressed in USD per token — e.g. `"0.000005"` = $5.00 per 1M tokens.
+///
+/// Deserialized from the `pricing` object in OpenAI-compatible `/models`
+/// responses (Kilo Gateway, OpenRouter, etc.).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelPricing {
+    /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Output/completion tokens per-token rate (USD per token, e.g. `"0.000020"` = $20/1M tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    /// Cached input read rate — per-token charge for reading cached prompt data
+    /// (USD per token, e.g. `"0.000001"` = $1/1M tokens). Kilo Gateway specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cache_read: Option<String>,
+    /// Cached input write rate — per-token charge for writing prompt data to cache
+    /// (USD per token, e.g. `"0.000001"` = $1/1M tokens). Kilo Gateway specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cache_write: Option<String>,
+}
+
+/// Model info with optional pricing — returned by `list_models_with_pricing`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// Query model_provider capabilities.
@@ -352,13 +402,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     }
 
     // ── ModelProvider-family defaults ────────────────────────────────────────────
-    // Called by every chat/stream method's `temperature.unwrap_or(self.default_temperature())`
-    // and by `zeroclaw onboard` to prefill prompts with a visible default.
-    // Baselines are the industry-neutral fallback; override per family where
-    // the API docs disagree (Anthropic → 1.0, Ollama → 0.0 for deterministic
-    // local inference).
+    // `temperature` is `Option<f64>` end-to-end on the wire. `None` from the
+    // caller means "do not send a `temperature` field"; serialization handles
+    // that via `#[serde(skip_serializing_if)]`. The `default_temperature()`
+    // method below documents the family's preferred default for non-wire uses
+    // (introspection, tests). It is NOT consulted to substitute a value for
+    // `None` in chat methods.
 
-    /// Temperature used when the caller passes `None`. Override per family.
+    /// Family-preferred temperature default. Override per family. Documented
+    /// for introspection only; never use to convert `None` into a wire value.
     fn default_temperature(&self) -> f64 {
         BASELINE_TEMPERATURE
     }
@@ -397,8 +449,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
-    /// `temperature == None` means "use `self.default_temperature()`". The
-    /// unwrap lives inside each model_provider impl, not at every call site.
+    /// `temperature == None` means the field is omitted on the wire.
     async fn simple_chat(
         &self,
         message: &str,
@@ -427,6 +478,19 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// catalog (no auth required) in `zeroclaw_providers::models_dev`.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("live model listing is not supported for this model_provider")
+    }
+
+    /// Fetch the list of available models with pricing data for this
+    /// model_provider. Default delegates to `list_models` and returns no
+    /// pricing. Concrete providers that receive pricing from their `/models`
+    /// endpoint override this to return enriched data.
+    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|id| ModelInfo { id, pricing: None })
+            .collect())
     }
 
     /// Multi-turn conversation. See `simple_chat` for the `temperature`
@@ -606,12 +670,12 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         self.as_ref().capabilities()
     }
 
-    fn default_temperature(&self) -> f64 {
-        self.as_ref().default_temperature()
-    }
-
     fn default_max_tokens(&self) -> u32 {
         self.as_ref().default_max_tokens()
+    }
+
+    fn default_temperature(&self) -> f64 {
+        self.as_ref().default_temperature()
     }
 
     fn default_timeout_secs(&self) -> u64 {

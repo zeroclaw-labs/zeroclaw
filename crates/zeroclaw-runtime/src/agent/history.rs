@@ -11,8 +11,20 @@ use zeroclaw_providers::ChatMessage;
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
+// Matches a local image path that a tool printed as bare text so it can be
+// promoted to an `[IMAGE:…]` marker. Three rooted forms are recognized:
+//   - POSIX absolute:      `/path/to/a.png`
+//   - Windows drive:       `C:\path\a.png` or `C:/path/a.png`
+//   - Windows UNC share:   `\\server\share\a.png`
+// Only rooted paths are promoted; `is_existing_local_image_path` further
+// requires the path to be absolute and to point at a real file, so on
+// non-Windows hosts the Windows forms match here but are filtered out there
+// (their `is_absolute()` is false), leaving behavior unchanged off-Windows.
 static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"/[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#).expect("valid image path regex")
+    Regex::new(
+        r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
+    )
+    .expect("valid image path regex")
 });
 
 /// Find the largest byte index `<= i` that is a valid char boundary.
@@ -145,11 +157,35 @@ fn is_existing_local_image_path(path: &str) -> bool {
             })
 }
 
+/// Collect the inner payloads of every explicit `[IMAGE:…]` marker already
+/// present in `output`. A bare path matching one of these must not be promoted
+/// into a *second* marker, otherwise the same image would be counted (and
+/// inlined) twice. This lets a tool emit both a durable human-readable path
+/// line and an explicit marker for the same file (e.g. `image_info`, which
+/// keeps a `File: <path>` line so the path survives in history after the image
+/// marker is stripped from older turns) without the pipeline double-counting.
+fn existing_marker_payloads(output: &str) -> std::collections::HashSet<&str> {
+    const OPEN: &str = "[IMAGE:";
+    let mut set = std::collections::HashSet::new();
+    let mut from = 0usize;
+    while let Some(rel) = output[from..].find(OPEN) {
+        let inner_start = from + rel + OPEN.len();
+        let Some(rel_end) = output[inner_start..].find(']') else {
+            break;
+        };
+        let inner_end = inner_start + rel_end;
+        set.insert(output[inner_start..inner_end].trim());
+        from = inner_end + 1;
+    }
+    set
+}
+
 /// Rewrite real local image file paths in tool output into `[IMAGE:...]`
 /// markers so the multimodal pipeline can normalize them before the next
 /// provider call. This targets shell/skill outputs that print filesystem
 /// paths directly rather than returning explicit media markers.
 pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
+    let existing_markers = existing_marker_payloads(output);
     let mut rewritten = String::with_capacity(output.len());
     let mut cursor = 0usize;
     let mut changed = false;
@@ -161,6 +197,13 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
 
         // Skip paths that are already part of an explicit media marker.
         if output[..start].ends_with("[IMAGE:") {
+            continue;
+        }
+
+        // Skip a bare path that already appears inside an explicit marker
+        // elsewhere in the same output — promoting it would double-count the
+        // image (see `existing_marker_payloads`).
+        if existing_markers.contains(path) {
             continue;
         }
 
@@ -315,9 +358,15 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
 }
 
 /// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
+///
+/// Preserves: the system prompt (if any), the first user message (the framing
+/// anchor — losing it is what caused the silent-amnesia bug where models said
+/// "the first message I have is 'Continue'"), and the most recent
+/// `max_history` messages (minus one slot already taken by the anchor).
+///
+/// Drops from the middle. Emits a WARN with counts on every fire so silent
+/// amnesia is impossible to miss again.
 pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -329,11 +378,67 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
         return;
     }
 
-    let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let system_offset = usize::from(has_system);
+
+    // Find the first user message (the framing anchor). If `max_history` is
+    // too small to fit both the anchor and any recent context, fall back to
+    // the old tail-only behaviour rather than producing a degenerate window.
+    let anchor_idx = history
+        .iter()
+        .enumerate()
+        .skip(system_offset)
+        .find(|(_, m)| m.role == "user")
+        .map(|(i, _)| i);
+
+    let messages_before = history.len();
+
+    let dropped_range = match anchor_idx {
+        Some(anchor) if max_history >= 2 => {
+            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
+            let tail_keep = max_history - 1;
+            let tail_start = history.len().saturating_sub(tail_keep);
+            // Middle range to drop: (anchor + 1) .. tail_start.
+            let drop_start = anchor + 1;
+            if tail_start <= drop_start {
+                // Anchor is already inside the tail window — nothing in the
+                // middle to drop. Fall through to plain head-drop below.
+                None
+            } else {
+                Some(drop_start..tail_start)
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(range) = dropped_range {
+        history.drain(range);
+    } else {
+        // No anchor, or `max_history < 2`: original head-drop behaviour.
+        let to_remove = non_system_count - max_history;
+        history.drain(system_offset..system_offset + to_remove);
+    }
+
     remove_orphaned_tool_messages(history);
     normalize_system_messages(history);
+
+    let dropped = messages_before.saturating_sub(history.len());
+    if dropped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "messages_before": messages_before,
+                    "messages_after": history.len(),
+                    "dropped": dropped,
+                    "max_history": max_history,
+                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                })),
+            "trim_history fired: middle of conversation dropped. Raise \
+             [runtime_profiles.<name>] max_history_messages or enable \
+             compact_context to avoid silent context loss."
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +529,27 @@ mod tests {
         let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
         let output = canonicalize_tool_result_media_markers(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_dedups_path_already_in_marker() {
+        // `image_info` emits a durable `File: <path>` line *and* an explicit
+        // `[IMAGE:<path>]` marker for the same file (so the path survives in
+        // history once the marker is stripped from older turns). The promoter
+        // must not wrap the bare `File:` path into a second marker, which would
+        // double-count the image. Order-independent: the bare path appears
+        // before the marker here.
+        let input = "File: /tmp/pic.png\nFormat: png\n[IMAGE:/tmp/pic.png]";
+        let output = canonicalize_tool_result_media_markers(input);
+        assert_eq!(
+            output, input,
+            "bare path duplicating an existing marker must not be promoted"
+        );
+        assert_eq!(
+            output.matches("[IMAGE:").count(),
+            1,
+            "exactly one image marker expected, got: {output}"
+        );
     }
 
     /// Regression: when `truncate_tool_result`'s head boundary fell inside an

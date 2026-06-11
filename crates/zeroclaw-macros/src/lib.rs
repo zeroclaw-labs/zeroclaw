@@ -126,7 +126,9 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         display_name,
         description,
         integration,
-        resource_key
+        resource_key,
+        credential_class,
+        tab
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -174,12 +176,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut prop_field_entries = Vec::new();
     let mut prop_names: Vec<String> = Vec::new();
     let mut prop_kind_tokens = Vec::new();
+    let mut prop_display_secret_terminal_arms = Vec::new();
     let mut prop_is_option_flags = Vec::new();
     let mut prop_is_secret_arms = Vec::new();
     let mut nested_prop_fields = Vec::new();
     let mut nested_get_prop = Vec::new();
     let mut nested_set_prop = Vec::new();
     let mut nested_prop_is_secret = Vec::new();
+    let mut dynamic_secret_map_prop_fields = Vec::new();
+    let mut dynamic_secret_map_get_prop = Vec::new();
+    let mut dynamic_secret_map_set_prop = Vec::new();
+    let mut dynamic_secret_map_prop_is_secret = Vec::new();
     let mut init_defaults_ops = Vec::new();
 
     // ── Map-key (HashMap<String, T>) and List (Vec<T:Configurable>) section
@@ -234,6 +241,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let credential_class_expr = match extract_credential_class(&field.attrs) {
+            Ok(expr) => expr,
+            Err(err) => return err.to_compile_error().into(),
+        };
+        let tab_token = match extract_tab_variant(&field.attrs) {
+            Some(variant) => quote! { crate::config::ConfigTab::#variant },
+            None => quote! { crate::config::ConfigTab::None },
+        };
 
         // ── Secret handling ──
         //
@@ -320,6 +335,74 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         #full_name_lit => { self.#field_ident = value; Ok(()) }
                     });
                 }
+            } else if is_hashmap_string_string {
+                let description = extract_doc(&field.attrs);
+                let description_lit = description.as_str();
+                let map_expr = if is_option {
+                    quote! { self.#field_ident.as_ref() }
+                } else {
+                    quote! { Some(&self.#field_ident) }
+                };
+                let map_mut_expr = if is_option {
+                    quote! { self.#field_ident.get_or_insert_with(std::collections::HashMap::new) }
+                } else {
+                    quote! { &mut self.#field_ident }
+                };
+                dynamic_secret_map_prop_fields.push(quote! {
+                    if let Some(map) = #map_expr {
+                        for (key, value) in map {
+                            fields.push(crate::config::PropFieldInfo {
+                                name: format!("{}.{}", #full_name_lit, key),
+                                category: #category_lit,
+                                display_value: if value.is_empty() {
+                                    crate::config::UNSET_DISPLAY.to_string()
+                                } else {
+                                    "****".to_string()
+                                },
+                                type_hint: "String",
+                                kind: crate::config::PropKind::String,
+                                is_secret: true,
+                                enum_variants: None::<fn() -> Vec<String>>,
+                                description: #description_lit,
+                                derived_from_secret: false,
+                                credential_class: #credential_class_expr,
+                                tab: #tab_token,
+                            });
+                        }
+                    }
+                });
+                dynamic_secret_map_get_prop.push(quote! {
+                    if let Some(key) = name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .filter(|key| !key.is_empty())
+                    {
+                        if let Some(map) = #map_expr
+                            && map.contains_key(key)
+                        {
+                            return Ok("****".to_string());
+                        }
+                    }
+                });
+                dynamic_secret_map_set_prop.push(quote! {
+                    if let Some(key) = name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .filter(|key| !key.is_empty())
+                    {
+                        (#map_mut_expr).insert(key.to_string(), value_str.to_string());
+                        return Ok(());
+                    }
+                });
+                dynamic_secret_map_prop_is_secret.push(quote! {
+                    if name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .is_some_and(|key| !key.is_empty())
+                    {
+                        return true;
+                    }
+                });
             }
         }
 
@@ -1638,6 +1721,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
         prop_names.push(full_name.clone());
         prop_kind_tokens.push(kind_token.clone());
+        let prop_idx = prop_names.len() - 1;
+        prop_display_secret_terminal_arms.push(quote! {
+            #prop_idx => <#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
+        });
         prop_is_option_flags.push(is_option);
 
         if is_vec {
@@ -1668,12 +1755,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             prop_field_entries.push(quote! {
                 {
                     let display_value: String = match #inner_value_expr {
-                        None => "<unset>".to_string(),
-                        Some(v) if v.is_empty() => "<unset>".to_string(),
+                        None => crate::config::UNSET_DISPLAY.to_string(),
+                        Some(v) if v.is_empty() => crate::config::UNSET_DISPLAY.to_string(),
                         Some(v) => match <#inner_ty as crate::config::HasPropKind>::PROP_KIND {
                             crate::config::PropKind::ObjectArray => {
-                                serde_json::to_string(v)
-                                    .unwrap_or_else(|_| "[]".to_string())
+                                crate::config::object_array_json_display_value(
+                                    v,
+                                    &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
+                                )
                             }
                             _ => match toml::Value::try_from(v) {
                                 Ok(tv) => tv.to_string(),
@@ -1691,6 +1780,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         enum_variants: #enum_variants_expr,
                         description: #description_lit,
                         derived_from_secret: #derived_from_secret,
+                        credential_class: #credential_class_expr,
+                        tab: #tab_token,
                     }
                 }
             });
@@ -1707,6 +1798,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #enum_variants_expr,
                     #description_lit,
                     #derived_from_secret,
+                    #credential_class_expr,
+                    #tab_token,
+                    &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
                 )
             });
         }
@@ -1782,22 +1876,36 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     .and_then(|v| match v { toml::Value::Table(t) => Some(t), _ => None });
                 let mut fields = vec![#(#prop_field_entries),*];
                 #(#nested_prop_fields)*
+                #(#dynamic_secret_map_prop_fields)*
                 fields
             }
 
             /// Get a property value by its full dotted name, returning it as a display string.
             pub fn get_prop(&self, name: &str) -> anyhow::Result<String> {
                 #(#nested_get_prop)*
+                #(#dynamic_secret_map_get_prop)*
                 const KNOWN: &[&str] = &[#(#prop_names),*];
-                if !KNOWN.contains(&name) {
-                    anyhow::bail!("Unknown property '{}'", name);
-                }
-                crate::config::serde_get_prop(self, Self::configurable_prefix(), name, Self::prop_is_secret(name))
+                const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
+                let idx = KNOWN.iter().position(|&n| n == name)
+                    .ok_or_else(|| ::anyhow::Error::msg(::std::format!("Unknown property '{}'", name)))?;
+                let display_secret_terminals = match idx {
+                    #(#prop_display_secret_terminal_arms)*
+                    _ => Vec::new(),
+                };
+                crate::config::serde_get_prop(
+                    self,
+                    Self::configurable_prefix(),
+                    name,
+                    Self::prop_is_secret(name),
+                    KINDS[idx],
+                    &display_secret_terminals,
+                )
             }
 
             /// Set a property value by its full dotted name, parsing from string.
             pub fn set_prop(&mut self, name: &str, value_str: &str) -> anyhow::Result<()> {
                 #(#nested_set_prop)*
+                #(#dynamic_secret_map_set_prop)*
                 const KNOWN: &[&str] = &[#(#prop_names),*];
                 const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
                 const IS_OPTION: &[bool] = &[#(#prop_is_option_flags),*];
@@ -1812,6 +1920,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #(#prop_is_secret_arms)*
                     _ => {
                         #(#nested_prop_is_secret)*
+                        #(#dynamic_secret_map_prop_is_secret)*
                         false
                     }
                 }
@@ -1989,7 +2098,7 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
 }
 
 fn snake_to_kebab(s: &str) -> String {
-    s.replace('_', "-")
+    s.to_string()
 }
 
 /// Title-case a snake_case identifier for use as a default display name
@@ -2007,6 +2116,21 @@ fn snake_to_title(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Read the `#[tab(Variant)]` field-level attribute and return the variant
+/// ident (e.g. `Connection`), or `None` when the attribute is absent.
+fn extract_tab_variant(attrs: &[syn::Attribute]) -> Option<syn::Ident> {
+    for attr in attrs {
+        if !attr.path().is_ident("tab") {
+            continue;
+        }
+        // Parse #[tab(Ident)] — parenthesised single ident.
+        if let Ok(ident) = attr.parse_args::<syn::Ident>() {
+            return Some(ident);
+        }
+    }
+    None
 }
 
 /// Read the `&str` value of a `#[name = "value"]` field-level attribute,
@@ -2030,6 +2154,35 @@ fn extract_string_attr(attrs: &[syn::Attribute], name: &str) -> Option<String> {
         return Some(lit_str.value());
     }
     None
+}
+
+fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(class) = extract_string_attr(attrs, "credential_class") else {
+        return Ok(quote! { None });
+    };
+
+    let variant = match class.as_str() {
+        "encrypted_secret" => quote! { EncryptedSecret },
+        "path_only_reference" => quote! { PathOnlyReference },
+        "public_value" => quote! { PublicValue },
+        "external_auth_store" => quote! { ExternalAuthStore },
+        "legacy_env_path" => quote! { LegacyEnvPath },
+        "requires_follow_up" => quote! { RequiresFollowUp },
+        _ => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "unknown credential_class `{class}`; expected encrypted_secret, \
+                     path_only_reference, public_value, external_auth_store, \
+                     legacy_env_path, or requires_follow_up"
+                ),
+            ));
+        }
+    };
+
+    Ok(quote! {
+        Some(crate::config::CredentialSurfaceClass::#variant)
+    })
 }
 
 /// Build the `pub fn integration_descriptor(&self) -> IntegrationDescriptor`
@@ -2188,10 +2341,10 @@ mod tests {
     use syn::parse_quote;
 
     #[test]
-    fn snake_to_kebab_converts_underscores() {
-        assert_eq!(snake_to_kebab("access_token"), "access-token");
-        assert_eq!(snake_to_kebab("api_key"), "api-key");
-        assert_eq!(snake_to_kebab("bot_token"), "bot-token");
+    fn snake_to_kebab_is_identity_passthrough() {
+        assert_eq!(snake_to_kebab("access_token"), "access_token");
+        assert_eq!(snake_to_kebab("api_key"), "api_key");
+        assert_eq!(snake_to_kebab("bot_token"), "bot_token");
         assert_eq!(snake_to_kebab("simple"), "simple");
     }
 

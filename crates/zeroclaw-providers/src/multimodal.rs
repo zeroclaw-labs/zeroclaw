@@ -1,18 +1,82 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "image/bmp",
-];
+// MIME types we will inline for vision providers. Deliberately excludes
+// `image/bmp`: no major vision provider (Anthropic, OpenAI) accepts BMP, so
+// inlining it would make the *entire* provider request fail rather than just
+// dropping the one image. Rejecting it here instead surfaces a clean
+// "could not be loaded" note while the request (and any accompanying text or
+// metadata) still goes through. BMP is still detected by `detect_mime` so the
+// skip is logged as an explicit unsupported-MIME event rather than "unknown".
+const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Per-path cache for resolved local image data URIs. Keyed by absolute
+/// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
+/// = immutable upload). LRU evicts by both entry count and total bytes.
+#[derive(Debug, Default)]
+pub struct LocalImageCache {
+    entries: HashMap<String, (u64, i64, String)>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+const LOCAL_IMAGE_CACHE_MAX_ENTRIES: usize = 32;
+const LOCAL_IMAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+impl LocalImageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&mut self, path: &str, len: u64, mtime: i64) -> Option<&str> {
+        let (cached_len, cached_mtime, _) = self.entries.get(path)?;
+        let immutable = *cached_len == 0 && *cached_mtime == 0;
+        let fresh = *cached_len == len && *cached_mtime == mtime;
+        if !immutable && !fresh {
+            return None;
+        }
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            let key = self.order.remove(pos).expect("position valid");
+            self.order.push_back(key);
+        }
+        self.entries.get(path).map(|(_, _, uri)| uri.as_str())
+    }
+
+    fn insert(&mut self, path: String, len: u64, mtime: i64, data_uri: String) {
+        if let Some((_, _, old)) = self.entries.remove(&path) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+            if let Some(pos) = self.order.iter().position(|p| p == &path) {
+                self.order.remove(pos);
+            }
+        }
+        self.bytes += data_uri.len();
+        self.entries.insert(path.clone(), (len, mtime, data_uri));
+        self.order.push_back(path);
+        while self.entries.len() > LOCAL_IMAGE_CACHE_MAX_ENTRIES
+            || self.bytes > LOCAL_IMAGE_CACHE_MAX_BYTES
+        {
+            let Some(victim) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, _, uri)) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(uri.len());
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedMessages {
@@ -64,6 +128,7 @@ fn is_loadable_image_reference(candidate: &str) -> bool {
         || candidate.starts_with("https://")
         || candidate.starts_with("data:")
         || is_windows_path(candidate)
+        || is_windows_unc_path(candidate)
 }
 
 /// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
@@ -82,6 +147,29 @@ fn is_windows_path(candidate: &str) -> bool {
         return false;
     }
     matches!(chars.next(), Some('\\') | Some('/'))
+}
+
+/// Returns true for Windows UNC share paths like `\\server\share\…`.
+///
+/// `image_info` emits these after unwrapping the verbatim-UNC prefix
+/// (`\\?\UNC\…`) that `canonicalize` produces on Windows. Without recognizing
+/// the unwrapped form here, [`is_loadable_image_reference`] would reject the
+/// marker (it is neither a `/`-rooted POSIX path nor a `C:\` drive path), so
+/// [`parse_image_markers`] would leave it as literal text and the image would
+/// never be inlined for vision models. Requires a non-empty server component
+/// and at least one further path segment; the verbatim/device prefixes
+/// (`\\?\…`, `\\.\…`) are rejected because they are not plain shares.
+fn is_windows_unc_path(candidate: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(r"\\") else {
+        return false;
+    };
+    if rest.starts_with('?') || rest.starts_with('.') {
+        return false;
+    }
+    let mut parts = rest.splitn(2, ['\\', '/']);
+    let server = parts.next().unwrap_or("");
+    let share = parts.next().unwrap_or("");
+    !server.is_empty() && !share.is_empty()
 }
 
 /// Normalize a marker payload that may have been line-wrapped when pasted
@@ -171,6 +259,23 @@ fn count_image_markers_with_latest_tool_results(
 
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
+}
+
+/// Count image markers that originate from genuine **user** messages (i.e.
+/// inbound attachments), excluding tool-result carriers (`role == "tool"` and
+/// `[Tool results]` user messages).
+///
+/// Callers use this to distinguish "the user sent an image we cannot see"
+/// (which should surface a user-facing capability error so the attachment is
+/// not silently ignored) from "an image marker arrived only via a tool result"
+/// (e.g. `image_info`/`screenshot`/`image_gen`), which can degrade to text-only
+/// on a non-vision provider without misleading the user.
+pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .sum()
 }
 
 /// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
@@ -324,6 +429,8 @@ async fn normalize_native_tool_result_json(
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
+    ctx: &ImageNormalizeCtx<'_>,
+    cache: Option<&mut LocalImageCache>,
 ) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
@@ -339,7 +446,8 @@ async fn normalize_native_tool_result_json(
         return None;
     }
 
-    let normalized = normalize_image_references(&refs, config, max_bytes, remote_client).await;
+    let normalized =
+        normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
     let new_inner = compose_multimodal_content(
         &cleaned_text,
         &normalized.data_uris,
@@ -357,6 +465,25 @@ async fn normalize_native_tool_result_json(
 pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
+) -> anyhow::Result<PreparedMessages> {
+    prepare_messages_inner(messages, config, None).await
+}
+
+/// Like [`prepare_messages_for_provider`] but reuses a [`LocalImageCache`]
+/// across calls so each unique local image file is read from disk at most
+/// once per session (or once per modification for mutable files).
+pub async fn prepare_messages_for_provider_cached(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    cache: &mut LocalImageCache,
+) -> anyhow::Result<PreparedMessages> {
+    prepare_messages_inner(messages, config, Some(cache)).await
+}
+
+async fn prepare_messages_inner(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    mut cache: Option<&mut LocalImageCache>,
 ) -> anyhow::Result<PreparedMessages> {
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
@@ -382,6 +509,17 @@ pub async fn prepare_messages_for_provider(
     // prevents conversations from becoming permanently stuck once the
     // cumulative image count crosses the threshold.
     let trimmed = if total_images > max_images {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "total_images": total_images,
+                    "max_images": max_images,
+                    "trimmed_to": max_images,
+                })),
+            "multimodal: trimming oldest images — conversation exceeds image limit"
+        );
         trim_old_images(messages, max_images)
     } else {
         messages.to_vec()
@@ -418,6 +556,11 @@ pub async fn prepare_messages_for_provider(
                 config,
                 max_bytes,
                 &remote_client,
+                &ImageNormalizeCtx {
+                    message_index: index,
+                    role: &message.role,
+                },
+                cache.as_deref_mut(),
             )
             .await
         {
@@ -435,7 +578,18 @@ pub async fn prepare_messages_for_provider(
             continue;
         }
 
-        let normalized = normalize_image_references(&refs, config, max_bytes, &remote_client).await;
+        let normalized = normalize_image_references(
+            &refs,
+            config,
+            max_bytes,
+            &remote_client,
+            &ImageNormalizeCtx {
+                message_index: index,
+                role: &message.role,
+            },
+            cache.as_deref_mut(),
+        )
+        .await;
         let content = compose_multimodal_content(
             &cleaned_text,
             &normalized.data_uris,
@@ -449,19 +603,102 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
+    // Apply age-based trimming when configured: strip images from user messages
+    // older than `max_image_turns` turns back from the end of history.
+    // `max_image_turns == 0` means disabled — no age trimming.
+    let age_trimmed = if config.max_image_turns > 0 {
+        let before = count_image_markers(&normalized_messages);
+        let trimmed = trim_images_by_age(&normalized_messages, config.max_image_turns);
+        let after = count_image_markers(&trimmed);
+        if after < before {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "max_image_turns": config.max_image_turns,
+                        "images_before": before,
+                        "images_after": after,
+                        "images_dropped": before - after,
+                    })),
+                "multimodal: age-trimmed old images from conversation history"
+            );
+        }
+        trimmed
+    } else {
+        normalized_messages
+    };
+
     // Apply the per-request image cap after normalization so failed image refs
     // do not consume budget and evict older images that could still be sent.
-    let capped_messages =
-        if has_successful_images && count_image_markers(&normalized_messages) > max_images {
-            trim_old_images(&normalized_messages, max_images)
-        } else {
-            normalized_messages
-        };
+    let capped_messages = if has_successful_images && count_image_markers(&age_trimmed) > max_images
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "images_after_normalization": count_image_markers(&age_trimmed),
+                    "max_images": max_images,
+                })),
+            "multimodal: post-normalization image cap exceeded — trimming oldest images"
+        );
+        trim_old_images(&age_trimmed, max_images)
+    } else {
+        age_trimmed
+    };
 
     Ok(PreparedMessages {
         contains_images: count_image_markers(&capped_messages) > 0,
         messages: capped_messages,
     })
+}
+/// Strip images from user messages that are more than `max_turns` turns back
+/// from the end of `messages`.  A "turn" here is counted as a user-role
+/// message, so `max_turns = 2` keeps images in the two most recent user
+/// messages and strips them from all earlier ones.  Tool-result images are
+/// handled by the stale-tool-result mechanism and are left untouched.
+fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
+    // Count user messages from the end to find the cutoff index.
+    let mut user_turn_count = 0usize;
+    let mut cutoff = 0usize; // messages at index < cutoff are "too old"
+    for (i, m) in messages.iter().enumerate().rev() {
+        if m.role == "user" {
+            user_turn_count += 1;
+            if user_turn_count > max_turns {
+                // Everything up to and including this index is too old.
+                cutoff = i + 1;
+                break;
+            }
+        }
+    }
+
+    if cutoff == 0 {
+        return messages.to_vec();
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if i < cutoff && m.role == "user" {
+                let (cleaned, refs) = parse_image_markers(&m.content);
+                if refs.is_empty() {
+                    return m.clone();
+                }
+                let text = if cleaned.trim().is_empty() {
+                    "[image removed from history]".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage {
+                    role: m.role.clone(),
+                    content: text,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 /// Strip image markers from older messages (oldest first) until total image
@@ -543,32 +780,86 @@ struct NormalizedImageReferences {
     skipped_count: usize,
 }
 
+/// Context attached to image-skip log events so callers can be identified.
+struct ImageNormalizeCtx<'a> {
+    /// Zero-based index of this message in the conversation history.
+    message_index: usize,
+    /// Role of the message containing the image reference.
+    role: &'a str,
+}
+
 async fn normalize_image_references(
     refs: &[String],
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
+    ctx: &ImageNormalizeCtx<'_>,
+    mut cache: Option<&mut LocalImageCache>,
 ) -> NormalizedImageReferences {
     let mut data_uris = Vec::with_capacity(refs.len());
     let mut skipped_count = 0usize;
 
     for reference in refs {
-        match normalize_image_reference(reference, config, max_bytes, remote_client).await {
+        match normalize_image_reference(
+            reference,
+            config,
+            max_bytes,
+            remote_client,
+            cache.as_deref_mut(),
+        )
+        .await
+        {
             Ok(data_uri) => data_uris.push(data_uri),
             Err(error) => {
                 skipped_count += 1;
                 let error_reason = multimodal_error_reason(&error);
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "source_kind": image_reference_kind(reference),
-                            "error_kind": multimodal_error_kind(&error),
-                            "reason": error_reason.as_deref().unwrap_or(""),
-                        })),
-                    "skipping multimodal image that could not be loaded"
+                // Truncate the raw reference so we don't dump a full base64
+                // payload into the log, but keep enough to identify the source.
+                let marker_preview: String = reference.chars().take(120).collect();
+                let error_kind = multimodal_error_kind(&error);
+                let attrs = ::serde_json::json!({
+                    "message_index": ctx.message_index,
+                    "message_role": ctx.role,
+                    "source_kind": image_reference_kind(reference),
+                    "error_kind": error_kind,
+                    "reason": error_reason.as_deref().unwrap_or(""),
+                    "marker_preview": marker_preview,
+                });
+                // Severity rules:
+                //   - For inbound user attachments, any failure is a real
+                //     loss the operator cares about → WARN.
+                //   - For tool-result content, marker-looking strings often
+                //     come from tool output that just happened to contain
+                //     `[IMAGE:...]` patterns (e.g. an agent reading a test
+                //     fixture, a code search hitting an assertion, log
+                //     snippets). Treat best-effort recoverable failures as
+                //     DEBUG so they stop drowning real signal. Keep WARN
+                //     only for configuration/limit problems that the
+                //     operator can actually act on.
+                let is_tool_role = ctx.role == "tool";
+                let is_recoverable_load_failure = matches!(
+                    error_kind,
+                    "image_source_not_found"
+                        | "local_read_failed"
+                        | "remote_fetch_failed"
+                        | "invalid_marker"
                 );
+                if is_tool_role && is_recoverable_load_failure {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(attrs),
+                        "skipping multimodal marker in tool result (likely not a real attachment)"
+                    );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(attrs),
+                        "skipping multimodal image that could not be loaded"
+                    );
+                }
             }
         }
     }
@@ -657,6 +948,7 @@ async fn normalize_image_reference(
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
+    cache: Option<&mut LocalImageCache>,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
         return normalize_data_uri(source, max_bytes);
@@ -673,7 +965,10 @@ async fn normalize_image_reference(
         return normalize_remote_image(source, max_bytes, remote_client).await;
     }
 
-    normalize_local_image(source, max_bytes).await
+    match cache {
+        Some(c) => normalize_local_image_cached(source, max_bytes, c).await,
+        None => normalize_local_image(source, max_bytes).await,
+    }
 }
 
 fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
@@ -813,6 +1108,79 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
     validate_mime(source, &mime)?;
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
+/// Cache-aware local image loader. On a hit (path + metadata unchanged) returns
+/// the stored data URI without touching the filesystem. Files under `/uploads/`
+/// are content-addressed and treated as immutable — checked once, never re-read.
+async fn normalize_local_image_cached(
+    source: &str,
+    max_bytes: usize,
+    cache: &mut LocalImageCache,
+) -> anyhow::Result<String> {
+    let path = Path::new(source);
+    if !path.exists() || !path.is_file() {
+        return Err(MultimodalError::ImageSourceNotFound {
+            input: source.to_string(),
+        }
+        .into());
+    }
+
+    let metadata =
+        tokio::fs::metadata(path)
+            .await
+            .map_err(|error| MultimodalError::LocalReadFailed {
+                input: source.to_string(),
+                reason: error.to_string(),
+            })?;
+
+    let file_len = metadata.len();
+    let is_immutable = source.contains("/uploads/");
+    let mtime: i64 = if is_immutable {
+        0
+    } else {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+            })
+            .unwrap_or(0)
+    };
+    let cache_len = if is_immutable { 0 } else { file_len };
+
+    if let Some(cached) = cache.get(source, cache_len, mtime) {
+        return Ok(cached.to_string());
+    }
+
+    validate_size(
+        source,
+        usize::try_from(file_len).unwrap_or(usize::MAX),
+        max_bytes,
+    )?;
+
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| MultimodalError::LocalReadFailed {
+            input: source.to_string(),
+            reason: error.to_string(),
+        })?;
+
+    validate_size(source, bytes.len(), max_bytes)?;
+
+    let mime =
+        detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
+            input: source.to_string(),
+            mime: "unknown".to_string(),
+        })?;
+
+    validate_mime(source, &mime)?;
+
+    let data_uri = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
+    cache.insert(source.to_string(), cache_len, mtime, data_uri.clone());
+    Ok(data_uri)
 }
 
 fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {
@@ -961,6 +1329,48 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], "/tmp/a.png");
         assert_eq!(refs[1], "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn is_windows_unc_path_accepts_shares_and_rejects_others() {
+        assert!(is_windows_unc_path(r"\\server\share\pic.png"));
+        assert!(is_windows_unc_path(r"\\server\share\sub\pic.png"));
+        // Verbatim / device prefixes are not plain shares.
+        assert!(!is_windows_unc_path(r"\\?\C:\Users\me\a.png"));
+        assert!(!is_windows_unc_path(r"\\?\UNC\server\share\a.png"));
+        assert!(!is_windows_unc_path(r"\\.\PhysicalDrive0"));
+        // Needs both a server and a further segment.
+        assert!(!is_windows_unc_path(r"\\server"));
+        assert!(!is_windows_unc_path(r"\\"));
+        // Non-UNC inputs.
+        assert!(!is_windows_unc_path("/home/me/a.png"));
+        assert!(!is_windows_unc_path(r"C:\Users\me\a.png"));
+    }
+
+    #[test]
+    fn parse_image_markers_extracts_unc_path() {
+        // Regression for the #7446 Windows follow-up: `image_info` unwraps the
+        // verbatim-UNC prefix (`\\?\UNC\…`) to a plain `\\server\share\…`
+        // path, which must be treated as a loadable image reference (not left
+        // as literal text) so the image reaches vision models.
+        let input = r"File: [IMAGE:\\server\share\pic.png]";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1, "UNC marker should be extracted as a ref");
+        assert_eq!(refs[0], r"\\server\share\pic.png");
+    }
+
+    #[test]
+    fn validate_mime_rejects_bmp_but_accepts_provider_supported_types() {
+        for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            assert!(
+                validate_mime("src", mime).is_ok(),
+                "{mime} should be allowed"
+            );
+        }
+        // BMP is detectable but unsupported by vision providers; it must be
+        // rejected here so it never breaks the whole provider request.
+        let err = validate_mime("src", "image/bmp").unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "unsupported_mime");
     }
 
     #[test]

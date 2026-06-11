@@ -6,21 +6,35 @@ language = "en"
 src = "src"
 
 [output.html]
-default-theme = "ayu"
-preferred-dark-theme = "ayu"
+default-theme = "default-dark"
+preferred-dark-theme = "default-dark"
 git-repository-url = "https://github.com/zeroclaw-labs/zeroclaw"
 edit-url-template = "https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/{path}"
 site-url = "/"
-additional-js = ["theme/lang-switcher.js", "mermaid.min.js", "mermaid-init.js"]
-additional-css = ["theme/custom.css"]
+additional-js = [
+  "theme/version-selector.js",
+  "theme/lang-switcher.js",
+  "theme/pc-enhance.js",
+  "mermaid.min.js",
+  "mermaid-init.js",
+]
+additional-css = ["theme/pc-themes.css", "theme/custom.css"]
 
 [output.html.search]
 enable = true
 limit-results = 30
 use-boolean-and = true
 
+[output.html.fold]
+enable = true
+level = 0
+
 [preprocessor.gettext]
 after = ["links"]
+
+[preprocessor.peer-groups]
+command = "../../target/release/mdbook preprocess"
+before = ["links"]
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

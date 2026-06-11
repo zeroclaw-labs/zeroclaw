@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -214,9 +215,13 @@ fn apply_jitter(delay_ms: u64) -> u64 {
     jittered
 }
 
-/// Parse a `Retry-After` header value. Supports integer seconds and
-/// decimal seconds (truncated to whole seconds). HTTP-date form is not supported.
+/// Parse a `Retry-After` header value. Supports integer seconds, decimal
+/// seconds (truncated to whole seconds), and HTTP-date values.
 fn parse_retry_after_ms(value: &str) -> Option<u64> {
+    parse_retry_after_ms_at(value, Utc::now())
+}
+
+fn parse_retry_after_ms_at(value: &str, now: DateTime<Utc>) -> Option<u64> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -228,7 +233,30 @@ fn parse_retry_after_ms(value: &str) -> Option<u64> {
         .split_once('.')
         .map(|(whole, _)| whole)
         .unwrap_or(trimmed);
-    whole.parse::<u64>().ok().map(|s| s.saturating_mul(1000))
+    if let Ok(seconds) = whole.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+
+    parse_retry_after_http_date(trimmed).map(|date| {
+        let delay_ms = date.signed_duration_since(now).num_milliseconds();
+        if delay_ms <= 0 {
+            0
+        } else {
+            u64::try_from(delay_ms).unwrap_or(u64::MAX)
+        }
+    })
+}
+
+fn parse_retry_after_http_date(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(date) = NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(DateTime::from_naive_utc_and_offset(date, Utc));
+    }
+    if let Ok(date) = NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT") {
+        return Some(DateTime::from_naive_utc_and_offset(date, Utc));
+    }
+    NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+        .ok()
+        .map(|date| DateTime::from_naive_utc_and_offset(date, Utc))
 }
 
 /// Outcome of a single send attempt.
@@ -666,6 +694,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_after_http_date() {
+        let now = DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:37 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after_ms_at("Sun, 06 Nov 1994 08:49:39 GMT", now),
+            Some(2_000)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_obsolete_http_dates() {
+        let now = DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:37 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after_ms_at("Sunday, 06-Nov-94 08:49:39 GMT", now),
+            Some(2_000)
+        );
+        assert_eq!(
+            parse_retry_after_ms_at("Sun Nov  6 08:49:39 1994", now),
+            Some(2_000)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_past_http_date_as_zero() {
+        let now = DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:39 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after_ms_at("Sun, 06 Nov 1994 08:49:37 GMT", now),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn parse_retry_after_rejects_non_numeric() {
         assert_eq!(parse_retry_after_ms("later"), None);
     }
@@ -885,6 +950,53 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(900),
             "expected to wait ~1s for Retry-After, elapsed = {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn send_honors_retry_after_http_date_header() {
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let retry_at = (Utc::now() + chrono::Duration::seconds(60))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        Mock::given(method("POST"))
+            .and(path("/cb"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", retry_at))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cb"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ch = WebhookChannel::new(
+            "test-hook".into(),
+            8080,
+            None,
+            Some(format!("{}/cb", mock.uri())),
+            None,
+            None,
+            None,
+            Some(2),
+            Some(10),
+            Some(150),
+        );
+
+        let start = Instant::now();
+        ch.send(&test_message()).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "expected to wait for date-form Retry-After, elapsed = {:?}",
             elapsed
         );
     }

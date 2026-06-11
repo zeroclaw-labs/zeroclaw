@@ -615,14 +615,6 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-/// Some Bedrock models (the Claude opus-4-7 family) reject `temperature` in
-/// `inferenceConfig` with a 400 "temperature is deprecated for this model".
-/// Substring match covers region/profile prefixes (e.g. `us.anthropic.…`)
-/// and version suffixes (e.g. `-v1:0`).
-fn bedrock_model_omits_temperature(model: &str) -> bool {
-    model.contains("claude-opus-4-7")
-}
-
 /// Whether a Bedrock model accepts the fixed-budget native-thinking shape
 /// (`additionalModelRequestFields.thinking = {"type": "enabled", "budget_tokens": N}`).
 /// AWS's Opus 4.7 model card states the model only supports adaptive thinking
@@ -632,6 +624,20 @@ fn bedrock_model_omits_temperature(model: &str) -> bool {
 /// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html>
 fn bedrock_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
+}
+
+/// Whether a Bedrock model accepts `cachePoint` blocks for prompt caching.
+///
+/// Only Anthropic Claude and Amazon Nova models support prompt caching on
+/// Bedrock; other families (Qwen, Llama, Mistral, DeepSeek, …) reject a request
+/// that contains a `cachePoint` with a 400: "You invoked an unsupported model or
+/// your request did not allow prompt caching". Caching is purely an
+/// optimization, so we allowlist the known-supported families and skip
+/// `cachePoint` insertion everywhere else rather than risk that error.
+/// AWS docs: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
+fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude") || model.contains("nova")
 }
 
 #[derive(Debug, Serialize)]
@@ -1491,14 +1497,14 @@ impl ModelProvider for BedrockModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
                 text: text.to_string(),
             })];
-            if Self::should_cache_system(text) {
+            if supports_caching && Self::should_cache_system(text) {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
                 }));
@@ -1517,11 +1523,7 @@ impl ModelProvider for BedrockModelProvider {
             messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature: if bedrock_model_omits_temperature(model) {
-                    None
-                } else {
-                    Some(temperature)
-                },
+                temperature,
             }),
             tool_config: None,
             additional_model_request_fields: None,
@@ -1546,7 +1548,6 @@ impl ModelProvider for BedrockModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1554,12 +1555,17 @@ impl ModelProvider for BedrockModelProvider {
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
 
+        // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
+        // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
+        // insertion on model support (see issue #7312).
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
+
         // Apply cachePoint to system if large.
         let system = system_blocks.map(|mut blocks| {
             let has_large_system = blocks
                 .iter()
                 .any(|b| matches!(b, SystemBlock::Text(tb) if Self::should_cache_system(&tb.text)));
-            if has_large_system {
+            if supports_caching && has_large_system {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
                 }));
@@ -1568,7 +1574,8 @@ impl ModelProvider for BedrockModelProvider {
         });
 
         // Apply cachePoint to last message if conversation is long.
-        if Self::should_cache_conversation(request.messages)
+        if supports_caching
+            && Self::should_cache_conversation(request.messages)
             && let Some(last_msg) = converse_messages.last_mut()
         {
             last_msg
@@ -1580,13 +1587,9 @@ impl ModelProvider for BedrockModelProvider {
 
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
-        // Extended thinking support. Gate fixed-budget thinking off for
-        // models that only support adaptive thinking (e.g. Opus 4.7) — those
-        // requests would otherwise 400 at the provider. Caller-supplied
-        // `thinking` is treated as a hint; the agent loop's prompt-based
-        // reasoning prefix is already in the message list.
-        let native_thinking_active =
-            request.thinking.is_some() && bedrock_model_supports_native_thinking(model);
+        // Native thinking forces temperature=1.0 (Anthropic API requirement).
+        // Otherwise the caller's Option<f64> flows through verbatim; None
+        // omits the field via skip_serializing_if.
         let (effective_temperature, additional_fields, effective_max_tokens) = match request
             .thinking
         {
@@ -1603,10 +1606,9 @@ impl ModelProvider for BedrockModelProvider {
                         "budget_tokens": params.budget_tokens
                     }
                 });
-                // Bedrock requires max_tokens > budget_tokens (strictly greater).
                 let min_required = params.budget_tokens + 1;
                 let max_tokens = self.max_tokens.max(min_required);
-                (1.0, Some(fields), max_tokens)
+                (Some(1.0), Some(fields), max_tokens)
             }
             Some(_) => {
                 ::zeroclaw_log::record!(
@@ -1620,23 +1622,12 @@ impl ModelProvider for BedrockModelProvider {
             None => (temperature, None, self.max_tokens),
         };
 
-        // When native thinking is active, Anthropic requires temperature=1.0 and
-        // we must send it explicitly even on models that would otherwise omit it.
-        // Otherwise, respect the per-model omit list (e.g. Opus 4.7).
-        let serialized_temperature = if native_thinking_active {
-            Some(effective_temperature)
-        } else if bedrock_model_omits_temperature(model) {
-            None
-        } else {
-            Some(effective_temperature)
-        };
-
         let converse_request = ConverseRequest {
             system,
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: effective_max_tokens,
-                temperature: serialized_temperature,
+                temperature: effective_temperature,
             }),
             tool_config,
             additional_model_request_fields: additional_fields,
@@ -2089,31 +2080,6 @@ mod tests {
         assert!(json.contains("maxTokens"));
     }
 
-    // ── Opus 4.7 temperature-omission tests (issue #6095) ────────
-
-    #[test]
-    fn bedrock_model_omits_temperature_matches_opus_4_7() {
-        assert!(bedrock_model_omits_temperature(
-            "us.anthropic.claude-opus-4-7"
-        ));
-        assert!(bedrock_model_omits_temperature(
-            "anthropic.claude-opus-4-7-v1:0"
-        ));
-    }
-
-    #[test]
-    fn bedrock_model_omits_temperature_skips_other_models() {
-        assert!(!bedrock_model_omits_temperature(
-            "us.anthropic.claude-opus-4-6-v1"
-        ));
-        assert!(!bedrock_model_omits_temperature(
-            "us.anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(!bedrock_model_omits_temperature(
-            "us.anthropic.claude-haiku-4-5-v1"
-        ));
-    }
-
     #[test]
     fn bedrock_model_supports_native_thinking_excludes_opus_4_7() {
         // Per AWS Bedrock model card, Opus 4.7 only supports adaptive thinking;
@@ -2137,6 +2103,46 @@ mod tests {
         assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-haiku-4-5-v1"
         ));
+    }
+
+    #[test]
+    fn prompt_caching_supported_for_claude_and_nova() {
+        for model in [
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-sonnet-4-6-v1",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "amazon.nova-pro-v1:0",
+            "us.amazon.nova-lite-v1:0",
+        ] {
+            assert!(
+                bedrock_model_supports_prompt_caching(model),
+                "expected prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_for_other_families() {
+        // Regression for #7312: Qwen (and other non-Claude/Nova families) reject
+        // cachePoint blocks, so caching must be disabled for them.
+        for model in [
+            "qwen.qwen3-coder-next",
+            "meta.llama3-1-70b-instruct-v1:0",
+            "mistral.mistral-large-2407-v1:0",
+            "deepseek.r1-v1:0",
+        ] {
+            assert!(
+                !bedrock_model_supports_prompt_caching(model),
+                "expected NO prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_match_is_case_insensitive() {
+        assert!(bedrock_model_supports_prompt_caching("ANTHROPIC.CLAUDE-X"));
+        assert!(bedrock_model_supports_prompt_caching("Amazon.Nova-Pro"));
+        assert!(!bedrock_model_supports_prompt_caching("QWEN.qwen3"));
     }
 
     #[test]

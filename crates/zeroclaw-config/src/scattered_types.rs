@@ -138,7 +138,7 @@ fn default_collapse() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.history-pruning"]
+#[prefix = "agent.history_pruning"]
 pub struct HistoryPrunerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -167,7 +167,7 @@ fn default_cost_optimized_hint() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.auto-classify"]
+#[prefix = "agent.auto_classify"]
 pub struct AutoClassifyConfig {
     #[serde(default)]
     pub simple_hint: Option<String>,
@@ -252,7 +252,7 @@ fn default_tool_result_retrim_chars() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.context-compression"]
+#[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
@@ -352,7 +352,7 @@ fn default_browser_task_timeout() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "browser-delegate"]
+#[prefix = "browser_delegate"]
 pub struct BrowserDelegateConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -661,7 +661,7 @@ fn default_max_call_duration() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.voice-call"]
+#[prefix = "channels.voice_call"]
 pub struct VoiceCallConfig {
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false` so an operator who pastes a partial

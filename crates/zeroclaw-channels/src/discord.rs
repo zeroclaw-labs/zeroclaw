@@ -16,6 +16,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_runtime::i18n;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -404,10 +405,11 @@ fn channel_passes_filter(
 /// Returns the text block appended to the agent's prompt and the structured
 /// `MediaAttachment` list consumed by the media pipeline. Each attachment is
 /// downloaded at most once: text/* is inlined as text, audio is transcribed
-/// inline when a transcription manager is configured (otherwise it goes
-/// through the media pipeline), and image/video/document attachments are
-/// saved to the workspace and emitted as `[KIND:<path>]` markers plus a
-/// `MediaAttachment` for vision-capable providers.
+/// inline when a transcription manager is configured and returns non-empty
+/// text (otherwise it falls through to the media pipeline), and
+/// image/video/document attachments are saved to the workspace and emitted as
+/// `[KIND:<path>]` markers plus a `MediaAttachment` for vision-capable
+/// providers.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -467,6 +469,7 @@ async fn process_attachments(
         // Audio with channel-level transcription configured: transcribe
         // inline so the agent receives `[Voice] <transcript>` text rather
         // than opaque bytes through the media pipeline.
+        let mut downloaded_audio_bytes = None;
         if is_audio && let Some(manager) = transcription_manager {
             let bytes = match download_attachment_bytes(client, url, name).await {
                 Some(b) => b,
@@ -489,6 +492,7 @@ async fn process_attachments(
                             )
                         );
                         text_parts.push(format!("[Voice] {trimmed}"));
+                        continue;
                     }
                 }
                 Err(e) => {
@@ -503,14 +507,17 @@ async fn process_attachments(
                     );
                 }
             }
-            continue;
+            downloaded_audio_bytes = Some(bytes);
         }
 
         let marker_kind = marker_kind_for(ct, is_audio);
 
-        let bytes = match download_attachment_bytes(client, url, name).await {
+        let bytes = match downloaded_audio_bytes {
             Some(b) => b,
-            None => continue,
+            None => match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            },
         };
 
         let marker_target = match workspace_dir {
@@ -901,11 +908,7 @@ fn validate_marker_target(
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
     workspace_dir: Option<&Path>,
-) -> (
-    Vec<PathBuf>,
-    Vec<String>,
-    Vec<(String, DiscordMarkerFailure)>,
-) {
+) -> (Vec<PathBuf>, Vec<String>, Vec<DiscordMarkerFailure>) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
     let mut failures = Vec::new();
@@ -920,7 +923,7 @@ fn classify_outgoing_attachments(
                     DiscordMarkerFailure::NotFound => "not found",
                 };
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
-                failures.push((attachment.target.clone(), e.kind()));
+                failures.push(e.kind());
             }
         }
     }
@@ -928,23 +931,23 @@ fn classify_outgoing_attachments(
     (local_files, remote_urls, failures)
 }
 
-/// Build the Matrix-style "(note: I couldn't deliver ...)" tail appended
-/// to the bot's reply when at least one marker was dropped. Returns
-/// `None` when the failure list is empty so callers can keep the body
-/// untouched.
-fn delivery_failure_note(failures: &[(String, DiscordMarkerFailure)]) -> Option<String> {
+/// Build the count-only delivery failure tail appended to the bot's reply
+/// when at least one marker was dropped. Returns `None` when the failure
+/// list is empty so callers can keep the body untouched.
+fn delivery_failure_note(failures: &[DiscordMarkerFailure]) -> Option<String> {
     if failures.is_empty() {
         return None;
     }
-    let targets: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
-    Some(if targets.len() == 1 {
-        format!("(note: I couldn't deliver the file at {}.)", targets[0])
+    let count = failures.len().to_string();
+    let key = if failures.len() == 1 {
+        "channel-discord-delivery-failure-note-one"
     } else {
-        format!(
-            "(note: I couldn't deliver these files: {}.)",
-            targets.join(", ")
-        )
-    })
+        "channel-discord-delivery-failure-note-many"
+    };
+    Some(i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
 }
 
 /// Compose the final reply body with the delivery-failure note appended.
@@ -962,17 +965,17 @@ fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
 /// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
 /// ⚠️ signals a post-validation delivery failure. Both can fire on the
 /// same message when a batch mixes refusals and not-found targets.
-fn decide_failure_reactions(failures: &[(String, DiscordMarkerFailure)]) -> Vec<&'static str> {
+fn decide_failure_reactions(failures: &[DiscordMarkerFailure]) -> Vec<&'static str> {
     let mut out = Vec::new();
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::Refused))
+        .any(|k| matches!(k, DiscordMarkerFailure::Refused))
     {
         out.push("🚫");
     }
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::NotFound))
+        .any(|k| matches!(k, DiscordMarkerFailure::NotFound))
     {
         out.push("⚠️");
     }
@@ -1371,6 +1374,18 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Whether a Discord message `type` represents a real user turn the bot should
+/// act on, versus a system/auto message it must ignore.
+///
+/// Only `DEFAULT` (0) and `REPLY` (19) are conversational. Everything else is a
+/// system message: notably `THREAD_CREATED` (18) — posted in the parent channel
+/// when a thread is created — and `THREAD_STARTER_MESSAGE` (21), plus joins,
+/// pins, boosts, etc. Acting on `THREAD_CREATED` is what made the bot "respond
+/// to a thread's birth message".
+fn is_conversational_message_type(message_type: u64) -> bool {
+    matches!(message_type, 0 | 19)
+}
+
 /// Decide whether an inbound Discord message passes the listener gate.
 /// Returns the cleaned text body when admitted, or `None` to drop the
 /// message. Attachment-only messages (empty `content` plus at least one
@@ -1684,7 +1699,7 @@ impl Channel for DiscordChannel {
         // is assembled in the select! loop where `sequence` lives.
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
         let hb_interval = heartbeat_interval;
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
             loop {
                 interval.tick().await;
@@ -1879,6 +1894,20 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
+                    // Skip non-conversational system messages. Discord posts a
+                    // MESSAGE_CREATE of type 18 (THREAD_CREATED) in the parent
+                    // channel when a thread is born — authored by the human who
+                    // created it, with the thread name as content — which would
+                    // otherwise pass the admit gate and make the bot "reply" to
+                    // the thread's birth. Type 21 (THREAD_STARTER_MESSAGE), pins,
+                    // joins, etc. are likewise not user turns. Only DEFAULT (0)
+                    // and REPLY (19) are real messages to act on. Absent `type`
+                    // defaults to 0 for forward-compatibility.
+                    let message_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if !is_conversational_message_type(message_type) {
+                        continue;
+                    }
+
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
                     if author_id == bot_user_id {
@@ -2057,7 +2086,7 @@ impl Channel for DiscordChannel {
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
                         let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
+                        zeroclaw_spawn::spawn!(async move {
                             if let Err(err) = reaction_channel
                                 .add_reaction(
                                     &reaction_channel_id,
@@ -2150,7 +2179,7 @@ impl Channel for DiscordChannel {
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
             loop {
                 let _ = client
@@ -2849,6 +2878,19 @@ mod tests {
     }
 
     #[test]
+    fn thread_created_and_system_messages_are_not_conversational() {
+        // The bug: THREAD_CREATED (18) was treated as a normal message, so the
+        // bot replied to a thread's birth. It and other system types must be
+        // rejected; only DEFAULT (0) and REPLY (19) are real user turns.
+        assert!(is_conversational_message_type(0)); // DEFAULT
+        assert!(is_conversational_message_type(19)); // REPLY
+        assert!(!is_conversational_message_type(18)); // THREAD_CREATED
+        assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
+        assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
+        assert!(!is_conversational_message_type(7)); // USER_JOIN
+    }
+
+    #[test]
     fn admit_discord_message_requires_mention_when_enabled() {
         let cleaned = admit_discord_message("hello there", false, true, "12345");
         assert!(cleaned.is_none());
@@ -3401,6 +3443,118 @@ mod tests {
         assert!(media.is_empty());
     }
 
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_fails() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "stt unavailable"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_is_empty() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": ""})))
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    fn local_whisper_transcription_config(
+        server: &wiremock::MockServer,
+    ) -> zeroclaw_config::schema::TranscriptionConfig {
+        zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn marker_kind_for_classifies_each_mime_family() {
         assert_eq!(marker_kind_for("image/png", false), "IMAGE");
@@ -3541,7 +3695,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::NotFound);
+        assert_eq!(failures[0], DiscordMarkerFailure::NotFound);
     }
 
     #[test]
@@ -3564,7 +3718,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3580,7 +3734,7 @@ mod tests {
         assert!(locals.is_empty(), "relative paths must be refused");
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3606,7 +3760,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 3);
-        for (_, kind) in &failures {
+        for kind in &failures {
             assert_eq!(*kind, DiscordMarkerFailure::Refused);
         }
     }
@@ -3625,7 +3779,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3663,28 +3817,43 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[(
-            "/workspace/missing.png".to_string(),
-            DiscordMarkerFailure::NotFound,
-        )])
-        .expect("one failure should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver the file at /workspace/missing.png.)"
+        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
+            .expect("one failure should produce a note");
+        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        assert!(
+            !note.contains("/workspace/missing.png"),
+            "user-facing failure note must not echo local marker targets"
         );
     }
 
     #[test]
-    fn delivery_failure_note_plural_lists_targets_in_order() {
+    fn delivery_failure_note_plural_redacts_targets() {
         let note = delivery_failure_note(&[
-            ("a.png".to_string(), DiscordMarkerFailure::Refused),
-            ("b.pdf".to_string(), DiscordMarkerFailure::NotFound),
-            ("c.mp4".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
+            DiscordMarkerFailure::Refused,
         ])
         .expect("multiple failures should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver these files: a.png, b.pdf, c.mp4.)"
+        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        assert!(
+            !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
+            "user-facing failure note must not echo failed marker targets"
+        );
+    }
+
+    #[test]
+    fn composed_delivery_failure_note_redacts_parsed_marker_target() {
+        let content = "Done\n[IMAGE: /workspace/missing.png]";
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(content);
+        let (_locals, _remotes, failures) =
+            classify_outgoing_attachments(&parsed_attachments, None);
+        let note = delivery_failure_note(&failures);
+        let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
+
+        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        assert!(
+            !composed.contains("/workspace/missing.png"),
+            "composed outbound body must not echo failed marker targets"
         );
     }
 
@@ -3720,23 +3889,23 @@ mod tests {
     #[test]
     fn decide_failure_reactions_emits_refused_only() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::Refused,
         ]);
         assert_eq!(r, vec!["🚫"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_not_found_only() {
-        let r = decide_failure_reactions(&[("a".to_string(), DiscordMarkerFailure::NotFound)]);
+        let r = decide_failure_reactions(&[DiscordMarkerFailure::NotFound]);
         assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_both_when_mixed() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::NotFound),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
         ]);
         assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
     }

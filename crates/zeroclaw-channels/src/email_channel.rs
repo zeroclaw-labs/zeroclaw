@@ -83,15 +83,15 @@ impl EmailChannel {
 
     /// Pure, testable predicate that applies the email-allowlist match
     /// semantics against an already-resolved peer list.
+    ///
+    /// Domain-class email matching (`@host` / bare `host` admit a whole
+    /// domain; `user@host` is a full case-insensitive address) can't be
+    /// expressed by the `crate::allowlist::Match` modes, so the per-entry
+    /// comparison runs through `crate::allowlist::is_user_allowed_by`. `peers`
+    /// is the caller's freshly-resolved list; no allowlist state is cached.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
-        if peers.is_empty() {
-            return false; // Empty = deny all
-        }
-        if peers.iter().any(|a| a == "*") {
-            return true; // Wildcard = allow all
-        }
-        let email_lower = email.to_lowercase();
-        peers.iter().any(|allowed| {
+        crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
+            let email_lower = email.to_lowercase();
             if allowed.starts_with('@') {
                 // Domain match with @ prefix: "@example.com"
                 email_lower.ends_with(&allowed.to_lowercase())
@@ -619,16 +619,10 @@ impl EmailChannel {
     }
 
     fn smtp_credentials(&self) -> Credentials {
-        let user = self
-            .config
-            .smtp_username
-            .as_deref()
+        let user = smtp_credential_override(self.config.smtp_username.as_deref())
             .unwrap_or(&self.config.username)
             .to_owned();
-        let pass = self
-            .config
-            .smtp_password
-            .as_deref()
+        let pass = smtp_credential_override(self.config.smtp_password.as_deref())
             .unwrap_or(&self.config.password)
             .to_owned();
         Credentials::new(user, pass)
@@ -687,6 +681,11 @@ fn markdown_to_html(md: &str) -> String {
     html::push_html(&mut html_output, parser);
     html_output
 }
+
+fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 #[async_trait]
 
 impl Channel for EmailChannel {
@@ -1449,6 +1448,40 @@ mod tests {
         let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
         let creds = channel.smtp_credentials();
         let expected = Credentials::new("smtp@example.com".to_string(), "smtp_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_ignore_blank_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("   ".to_string()),
+            smtp_password: Some("".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected =
+            Credentials::new("shared@example.com".to_string(), "shared_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_preserve_nonblank_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("  smtp@example.com  ".to_string()),
+            smtp_password: Some("  smtp_pass  ".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected = Credentials::new(
+            "  smtp@example.com  ".to_string(),
+            "  smtp_pass  ".to_string(),
+        );
         assert_eq!(creds, expected);
     }
 }

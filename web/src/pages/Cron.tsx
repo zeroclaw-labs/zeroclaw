@@ -1,11 +1,12 @@
 import type { CronSettings } from '@/lib/api';
 import {
   addCronJob,
+  ApiError,
   deleteCronJob,
-  getAgentOptions,
   getCronJobs,
   getCronRuns,
   getCronSettings,
+  getQuickstartState,
   patchCronJob,
   patchCronSettings,
   triggerCronJob,
@@ -58,6 +59,24 @@ function scheduleTimezone(job: CronJob): string | null {
     return schedule.tz;
   }
   return null;
+}
+
+function describeCronSettingsError(err: unknown) {
+  if (err instanceof ApiError) {
+    return {
+      name: err.name,
+      status: err.status,
+      code: err.envelope.code,
+      path: err.envelope.path,
+      op_index: err.envelope.op_index,
+    };
+  }
+
+  if (err instanceof Error) {
+    return { name: err.name };
+  }
+
+  return { type: typeof err };
 }
 
 function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?: number }) {
@@ -271,7 +290,9 @@ export default function Cron() {
   };
 
   const fetchSettings = () => {
-    getCronSettings().then(setSettings).catch(() => { });
+    getCronSettings().then(setSettings).catch((err) => {
+      console.warn('[ZeroClaw] Failed to load cron settings:', describeCronSettingsError(err));
+    });
   };
 
   const toggleCatchUp = async () => {
@@ -282,8 +303,8 @@ export default function Cron() {
         catch_up_on_startup: !settings.catch_up_on_startup,
       });
       setSettings(updated);
-    } catch {
-      // silently fail — user can retry
+    } catch (err: unknown) {
+      console.warn('[ZeroClaw] Failed to update cron settings:', describeCronSettingsError(err));
     } finally {
       setTogglingCatchUp(false);
     }
@@ -292,7 +313,7 @@ export default function Cron() {
   useEffect(() => {
     fetchJobs();
     fetchSettings();
-    void getAgentOptions()
+    void getQuickstartState()
       .then((opts) => {
         setAgentOptions(opts.agents);
         // Pre-seed the agent field with the first option so the

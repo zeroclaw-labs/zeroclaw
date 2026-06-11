@@ -326,7 +326,8 @@ impl Channel for AcpChannel {
         _recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-        let options = [
+        let is_edit_tool = matches!(request.tool_name.as_str(), "file_edit" | "file_write");
+        let mut options = vec![
             json!({
                 "optionId": "allow-once",
                 "name": "Allow once",
@@ -337,12 +338,19 @@ impl Channel for AcpChannel {
                 "name": "Always allow",
                 "kind": "allow_always",
             }),
-            json!({
-                "optionId": "reject-once",
-                "name": "Reject",
-                "kind": "reject_once",
-            }),
         ];
+        if is_edit_tool {
+            options.push(json!({
+                "optionId": "reject-with-edit",
+                "name": "Reject with edit",
+                "kind": "reject_with_edit",
+            }));
+        }
+        options.push(json!({
+            "optionId": "reject-once",
+            "name": "Reject",
+            "kind": "reject_once",
+        }));
 
         let tool_call_id = format!("approval-{}", uuid::Uuid::new_v4());
         let title = format!("Approve {}?", request.tool_name);
@@ -353,17 +361,29 @@ impl Channel for AcpChannel {
             &request.raw_arguments,
             &request.arguments_summary,
         );
+
+        // For edit tools, also surface the new_string (or content) directly so that
+        // "reject-with-edit" can present exactly the proposed replacement for editing,
+        // without the surrounding path/old_string fields and with newlines preserved.
+        let mut tool_call = json!({
+            "toolCallId": tool_call_id,
+            "title": title,
+            "kind": kind,
+            "status": "pending",
+            "rawInput": raw_input,
+            "content": content,
+        });
+        if is_edit_tool
+            && let Some(args) = &request.raw_arguments
+            && let Some(new_text) = args.get("new_string").or_else(|| args.get("content"))
+            && let Some(s) = new_text.as_str()
+        {
+            tool_call["proposedEdit"] = json!(s);
+        }
         let params = json!({
             "sessionId": self.session_id,
             "options": options,
-            "toolCall": {
-                "toolCallId": tool_call_id,
-                "title": title,
-                "kind": kind,
-                "status": "pending",
-                "rawInput": raw_input,
-                "content": content,
-            }
+            "toolCall": tool_call,
         });
 
         let call = self.rpc.request("session/request_permission", params);
@@ -393,6 +413,14 @@ impl Channel for AcpChannel {
                     "allow-once" => Ok(Some(ChannelApprovalResponse::Approve)),
                     "allow-always" => Ok(Some(ChannelApprovalResponse::AlwaysApprove)),
                     "reject-once" | "reject-always" => Ok(Some(ChannelApprovalResponse::Deny)),
+                    "reject-with-edit" => {
+                        let replacement = outcome
+                            .and_then(|o| o.get("replacementContent"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Ok(Some(ChannelApprovalResponse::DenyWithEdit { replacement }))
+                    }
                     other => anyhow::bail!("ACP returned unknown permission optionId: {other}"),
                 }
             }
@@ -408,11 +436,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
-        // Fabricate an RpcOutbound that writes into a test mpsc instead of
-        // stdout. Uses RpcOutbound's public constructor surface via the
-        // re-exported `for_testing` helper.
         let (tx, rx) = mpsc::channel::<String>(16);
-        (Arc::new(RpcOutbound::for_testing(tx)), rx)
+        (Arc::new(RpcOutbound::new(tx)), rx)
     }
 
     #[tokio::test]
@@ -499,7 +524,7 @@ mod tests {
 
         // Spawn the request; capture the outbound id, then dispatch a
         // matching "selected" response so the await resolves.
-        let task = tokio::spawn(async move {
+        let task = zeroclaw_spawn::spawn!(async move {
             ch.request_choice("Confirm?", &choices, Duration::from_secs(5))
                 .await
         });
@@ -513,7 +538,7 @@ mod tests {
         let id = req["id"].as_str().unwrap().to_string();
 
         // Simulate the ACP client picking "Option B" (choice-1).
-        rpc_for_resp.dispatch_response_for_test(
+        rpc_for_resp.dispatch_response(
             &id,
             Some(json!({"outcome": {"outcome": "selected", "optionId": "choice-1"}})),
             None,
@@ -531,7 +556,7 @@ mod tests {
 
         let choices = vec!["Yes".to_string(), "No".to_string()];
 
-        let task = tokio::spawn(async move {
+        let task = zeroclaw_spawn::spawn!(async move {
             ch.request_choice("Confirm?", &choices, Duration::from_secs(5))
                 .await
         });
@@ -540,7 +565,7 @@ mod tests {
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         let id = req["id"].as_str().unwrap().to_string();
 
-        rpc_for_resp.dispatch_response_for_test(
+        rpc_for_resp.dispatch_response(
             &id,
             Some(json!({"outcome": {"outcome": "cancelled"}})),
             None,
@@ -574,7 +599,7 @@ mod tests {
             raw_arguments: None,
         };
 
-        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
 
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -591,7 +616,7 @@ mod tests {
         );
         let id = req["id"].as_str().unwrap().to_string();
 
-        rpc_for_resp.dispatch_response_for_test(
+        rpc_for_resp.dispatch_response(
             &id,
             Some(json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}})),
             None,
@@ -612,12 +637,12 @@ mod tests {
             raw_arguments: None,
         };
 
-        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         let id = req["id"].as_str().unwrap().to_string();
 
-        rpc_for_resp.dispatch_response_for_test(
+        rpc_for_resp.dispatch_response(
             &id,
             Some(json!({"outcome": {"outcome": "selected", "optionId": "allow-always"}})),
             None,
@@ -635,11 +660,11 @@ mod tests {
             arguments_summary: "git push".to_string(),
             raw_arguments: None,
         };
-        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         let id = req["id"].as_str().unwrap().to_string();
-        rpc_for_resp.dispatch_response_for_test(
+        rpc_for_resp.dispatch_response(
             &id,
             Some(json!({"outcome": {"outcome": "cancelled"}})),
             None,
@@ -665,7 +690,7 @@ mod tests {
             })),
         };
 
-        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
 
@@ -683,7 +708,7 @@ mod tests {
         assert_eq!(content[0]["newText"], "let x = 2;");
 
         let id = req["id"].as_str().unwrap().to_string();
-        rpc_for_resp.dispatch_response_for_test(
+        rpc_for_resp.dispatch_response(
             &id,
             Some(json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}})),
             None,
@@ -717,5 +742,151 @@ mod tests {
         assert_eq!(arr[0]["type"], "content");
         assert_eq!(arr[0]["content"]["type"], "text");
         assert_eq!(arr[0]["content"]["text"], "ls -la");
+    }
+
+    #[tokio::test]
+    async fn request_approval_maps_reject_with_edit_to_deny_with_edit() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let request = ChannelApprovalRequest {
+            tool_name: "file_edit".to_string(),
+            arguments_summary: "edit foo.rs".to_string(),
+            raw_arguments: Some(serde_json::json!({
+                "path": "foo.rs",
+                "old_string": "let x = 1;",
+                "new_string": "let x = 2;"
+            })),
+        };
+
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "reject-with-edit",
+                    "replacementContent": "let x = 99;"
+                }
+            })),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        match result {
+            Some(ChannelApprovalResponse::DenyWithEdit { replacement }) => {
+                assert_eq!(replacement, "let x = 99;");
+            }
+            other => panic!("expected DenyWithEdit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_edit_approval_includes_reject_with_edit_option() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let request = ChannelApprovalRequest {
+            tool_name: "file_edit".to_string(),
+            arguments_summary: "edit foo.rs".to_string(),
+            raw_arguments: Some(serde_json::json!({
+                "path": "foo.rs",
+                "old_string": "a",
+                "new_string": "b"
+            })),
+        };
+
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        let options = req["params"]["options"].as_array().unwrap();
+        let has_reject_edit = options.iter().any(|o| o["optionId"] == "reject-with-edit");
+        assert!(
+            has_reject_edit,
+            "file_edit approval must offer reject-with-edit"
+        );
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(serde_json::json!({"outcome": {"outcome": "cancelled"}})),
+            None,
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_with_edit_missing_replacement_defaults_to_empty() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let request = ChannelApprovalRequest {
+            tool_name: "file_edit".to_string(),
+            arguments_summary: "edit foo.rs".to_string(),
+            raw_arguments: None,
+        };
+
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+
+        // Response has optionId but no replacementContent.
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "reject-with-edit"
+                }
+            })),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        // Absent replacementContent defaults to empty string — caller must guard.
+        assert!(
+            matches!(result, Some(ChannelApprovalResponse::DenyWithEdit { replacement }) if replacement.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_approval_includes_reject_with_edit_option() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let request = ChannelApprovalRequest {
+            tool_name: "file_write".to_string(),
+            arguments_summary: "write bar.rs".to_string(),
+            raw_arguments: None,
+        };
+
+        let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        let options = req["params"]["options"].as_array().unwrap();
+        let has_reject_edit = options.iter().any(|o| o["optionId"] == "reject-with-edit");
+        assert!(
+            has_reject_edit,
+            "file_write approval must offer reject-with-edit"
+        );
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(serde_json::json!({"outcome": {"outcome": "cancelled"}})),
+            None,
+        );
+        task.await.unwrap().unwrap();
     }
 }

@@ -2,6 +2,7 @@ import { Suspense } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import {
+  AcpConsole,
   AgentChat,
   AgentWorkspaceExplorer,
   AgentsList,
@@ -12,8 +13,8 @@ import {
   Doctor,
   Integrations,
   Logs,
-  Onboard,
   Pairing,
+  Quickstart,
   Tools,
 } from './lazyPages';
 
@@ -50,7 +51,8 @@ export const Router = () => (
         <Route path="/doctor" element={<Doctor />} />
         <Route path="/pairing" element={<Pairing />} />
         <Route path="/canvas" element={<Canvas />} />
-        <Route path="/onboard" element={<Onboard />} />
+        <Route path="/acp-console" element={<AcpConsole />} />
+        <Route path="/quickstart" element={<Quickstart />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

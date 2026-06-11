@@ -40,20 +40,20 @@ interface IdentityField {
 // `ChannelsConfig` and the picker derives from there; this table only
 // names which field to surface alongside the composite.
 const CHANNEL_IDENTITY: Record<string, IdentityField> = {
-  matrix: { field: 'user-id', label: 'user' },
-  discord: { field: 'guild-ids', label: 'guilds' },
-  slack: { field: 'channel-ids', label: 'channels' },
-  mattermost: { field: 'channel-ids', label: 'channels' },
-  telegram: { field: 'bot-token', label: '' }, // bot identity, no separate id
-  signal: { field: 'user-id', label: 'user' },
-  imessage: { field: 'user-id', label: 'user' },
-  whatsapp: { field: 'user-id', label: 'user' },
+  matrix: { field: 'user_id', label: 'user' },
+  discord: { field: 'guild_ids', label: 'guilds' },
+  slack: { field: 'channel_ids', label: 'channels' },
+  mattermost: { field: 'channel_ids', label: 'channels' },
+  telegram: { field: 'bot_token', label: '' }, // bot identity, no separate id
+  signal: { field: 'user_id', label: 'user' },
+  imessage: { field: 'user_id', label: 'user' },
+  whatsapp: { field: 'user_id', label: 'user' },
   email: { field: 'address', label: '' },
   gmail_push: { field: 'address', label: '' },
   'gmail-push': { field: 'address', label: '' },
   irc: { field: 'nickname', label: 'nick' },
-  nextcloud_talk: { field: 'user-id', label: 'user' },
-  'nextcloud-talk': { field: 'user-id', label: 'user' },
+  nextcloud_talk: { field: 'user_id', label: 'user' },
+  'nextcloud-talk': { field: 'user_id', label: 'user' },
 };
 
 /** Parse a config-encoded value into a short identity string. The

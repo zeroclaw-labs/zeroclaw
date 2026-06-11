@@ -316,6 +316,11 @@ jobs:
           else
             $BUILD_CMD --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
           fi
+          # Build the zerocode TUI alongside the main binary so it ships in the
+          # release archive. Skipped on Android, which lacks the terminal deps.
+          if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
+            $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}
+          fi
 
       - name: Check binary size
         shell: bash
@@ -328,9 +333,14 @@ jobs:
         run: |
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          extra=""
+          if [ -f target/${{ matrix.target }}/release/zerocode ]; then
+            cp target/${{ matrix.target }}/release/zerocode staging/
+            extra="zerocode"
+          fi
           cp -r web/dist staging/web/dist
           cd staging
-          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
+          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -338,9 +348,14 @@ jobs:
         run: |
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          extra=""
+          if [ -f target/${{ matrix.target }}/release/zerocode.exe ]; then
+            cp target/${{ matrix.target }}/release/zerocode.exe staging/
+            extra="zerocode.exe"
+          fi
           cp -r web/dist staging/web/dist
           cd staging
-          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
+          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -536,27 +551,7 @@ jobs:
           path: artifacts/
 
       - name: Prepare Docker context with pre-built binaries
-        run: |
-          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
-          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
-          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
-
-          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/data
-          printf '%s\n' \
-            'api_key = ""' \
-            'default_provider = "openrouter"' \
-            'default_model = "anthropic/claude-sonnet-4-20250514"' \
-            'default_temperature = 0.7' \
-            '' \
-            '[gateway]' \
-            'port = 42617' \
-            'host = "[::]"' \
-            'allow_public_bind = true' \
-            'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
-            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
-
-          cp Dockerfile.ci docker-ctx/Dockerfile
-          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
+        run: bash scripts/ci/prepare_docker_context.sh from-artifacts docker-ctx artifacts
 
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
@@ -616,16 +611,6 @@ jobs:
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       dry_run: false
-    secrets: inherit
-
-  # ── Post-publish: sync marketplace templates (Coolify, Dokploy, EasyPanel) ──
-  marketplace:
-    name: Sync Marketplace Templates
-    needs: [validate, docker]
-    if: ${{ !cancelled() && needs.docker.result == 'success' }}
-    uses: ./.github/workflows/sync-marketplace-templates.yml
-    with:
-      release_tag: ${{ needs.validate.outputs.tag }}
     secrets: inherit
 
   # ── Post-publish: announce after release + website are live ───────────

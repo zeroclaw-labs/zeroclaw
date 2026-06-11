@@ -20,7 +20,7 @@
 //!   through the same channel beta is configured on.
 //!
 //!   This path is fire-and-forget: the recipient runs on a detached
-//!   `tokio::spawn`, so the sender's `ToolResult.success = true`
+//!   `zeroclaw_spawn::spawn!`, so the sender's `ToolResult.success = true`
 //!   means "accepted for processing", not "completed". Recipient
 //!   errors do NOT surface to the sender; they are emitted via
 //!   `tracing::warn!` inside the spawned task and via the recipient
@@ -225,7 +225,7 @@ impl Tool for SendMessageToPeerTool {
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let body = message.clone();
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 if let Err(e) =
                     crate::agent::loop_::process_message(cfg, &recipient_alias, &body, None).await
                 {
