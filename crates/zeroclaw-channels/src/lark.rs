@@ -730,7 +730,6 @@ impl LarkChannel {
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
             per_user_session: false,
-            ack_reactions: None,
             ack_reactions: true,
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
