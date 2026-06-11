@@ -2808,3 +2808,142 @@ description = "fine"
         );
     }
 }
+
+#[cfg(test)]
+mod workspace_dir_regression_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_config_with_agent_workspace(
+        install_root: &Path,
+        data_dir: &Path,
+        agent_alias: &str,
+        workspace_path: PathBuf,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: install_root.join("config.toml"),
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
+
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace_path),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.agents.insert(agent_alias.to_string(), agent);
+        config
+    }
+
+    fn write_test_skill(workspace: &Path, skill_name: &str) {
+        let skill_dir = workspace.join("skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                r#"[skill]
+name = "{skill_name}"
+description = "regression test skill"
+version = "0.1.0"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Regression test for #7236: `load_skills_for_agent` must load skills
+    /// from the per-agent workspace directory, not from `data_dir`.
+    ///
+    /// The bug: three call sites passed `&config.data_dir` instead of
+    /// `&config.agent_workspace_dir(agent_alias)`, causing skills placed in
+    /// `<install>/agents/<alias>/workspace/skills/` to be silently ignored.
+    ///
+    /// This test constructs a config where `data_dir` and
+    /// `agent_workspace_dir(agent_alias)` are distinct paths, places a skill
+    /// only in the agent workspace, and verifies:
+    /// 1. Calling with `agent_workspace_dir` finds the skill (correct behavior)
+    /// 2. Calling with `data_dir` does NOT find the skill (the bug)
+    #[test]
+    fn load_skills_for_agent_uses_workspace_dir_not_data_dir() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let agent_alias = "test-agent";
+        let skill_name = "workspace-only-regression-skill";
+
+        write_test_skill(agent_workspace.path(), skill_name);
+
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        let workspace_dir = config.agent_workspace_dir(agent_alias);
+        assert_eq!(
+            workspace_dir,
+            agent_workspace.path(),
+            "agent_workspace_dir must resolve to the custom workspace path"
+        );
+        assert_ne!(
+            workspace_dir, config.data_dir,
+            "workspace_dir and data_dir must be distinct for this test to be meaningful"
+        );
+
+        let skills_from_workspace = load_skills_for_agent(&workspace_dir, &config, agent_alias);
+        let workspace_skill_names: Vec<&str> = skills_from_workspace
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            workspace_skill_names.contains(&skill_name),
+            "skill in agent workspace must be loaded when passing agent_workspace_dir; got: {workspace_skill_names:?}"
+        );
+
+        let skills_from_data_dir = load_skills_for_agent(&config.data_dir, &config, agent_alias);
+        let data_dir_skill_names: Vec<&str> = skills_from_data_dir
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !data_dir_skill_names.contains(&skill_name),
+            "skill in agent workspace must NOT be loaded when passing data_dir (this was the bug); got: {data_dir_skill_names:?}"
+        );
+    }
+
+    /// Verifies that `load_skills_for_agent` with an empty `skill_bundles`
+    /// list falls back to the install-wide skill set from the workspace dir.
+    /// This pins the contract that the first argument controls where
+    /// workspace skills are discovered.
+    #[test]
+    fn load_skills_for_agent_empty_bundles_uses_workspace_dir() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let agent_alias = "bundle-fallback-agent";
+        let skill_name = "workspace-fallback-skill";
+
+        write_test_skill(agent_workspace.path(), skill_name);
+
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        let workspace_dir = config.agent_workspace_dir(agent_alias);
+        let skills = load_skills_for_agent(&workspace_dir, &config, agent_alias);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&skill_name),
+            "with empty skill_bundles, workspace skills must still load; got: {names:?}"
+        );
+    }
+}
