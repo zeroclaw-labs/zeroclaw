@@ -1611,6 +1611,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
+        // Security/privacy fallback pin: with no alias-level `uri`, the blanket
+        // compat route must hand OpenCode's DEFAULT_URL to the responses
+        // provider. If it stopped doing so, the provider would silently default
+        // to OpenAI's /v1/responses and send OpenCode credentials to the wrong
+        // host.
+        assert_eq!(
+            provider.default_base_url(),
+            Some("https://opencode.ai/zen/v1/responses")
+        );
     }
 
     #[test]

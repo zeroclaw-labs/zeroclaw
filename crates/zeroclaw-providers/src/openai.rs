@@ -935,8 +935,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         }
     }
 
+    /// Reports the instance's resolved endpoint so callers can verify which
+    /// host a responses provider will actually hit (e.g. a compat family's
+    /// default base vs. OpenAI's).
     fn default_base_url(&self) -> Option<&str> {
-        Some(RESPONSES_URL)
+        Some(&self.responses_url)
     }
 
     fn default_wire_api(&self) -> &str {
