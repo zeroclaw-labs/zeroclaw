@@ -17259,6 +17259,24 @@ struct NaturalKeySection {
 /// keeps the writer correct when a future `#[natural_key]` Vec lands
 /// inside another section.
 ///
+/// Returns the `<section_path>` (e.g. `"mcp.servers"`) and the
+/// `<natural_key_field>` (e.g. `"name"`) the writer needs to locate
+/// the matching `[[<section_path>]]` element on disk.
+///
+/// Section paths are exact-matched against the leading segments of
+/// `dotted`; the function does **not** apply the kebab→snake fallback
+/// that the inner segment resolver (`resolve_dirty_segments`) uses.
+/// That is deliberate and mirrors the in-memory routing macro's
+/// `section_path == expected` check in
+/// `crates/zeroclaw-macros/src/lib.rs` (the `get_map_keys` /
+/// `route_vec_path` arms) — making either side dash-tolerant in
+/// isolation would let the dispatcher and the writer disagree on
+/// which call participates in this branch, which is exactly the
+/// memory-vs-disk divergence this PR exists to eliminate. If a
+/// future natural-key section needs an underscore in its path AND
+/// must be addressable via a kebab wire path, change **both** sides
+/// together (the macro arm and this match).
+///
 /// Plain `Kind::List` Vec sections without `#[natural_key]` (their
 /// `natural_key` is `None`) are intentionally excluded — those use the
 /// legacy whole-array `ObjectArray` save path and don't need the
@@ -17274,15 +17292,21 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
         let Some(natural_key_field) = section.natural_key else {
             continue;
         };
-        let prefix = format!("{}.", section.path);
-        if !dotted.starts_with(&prefix) {
+        // strip_prefix avoids the allocation `format!("{}.", ...)`
+        // would do per section per dirty path, and makes the "must
+        // have *something* after the dot" guard a natural fallout of
+        // the second `strip_prefix('.')` rather than a length check.
+        let Some(after) = dotted
+            .strip_prefix(section.path)
+            .and_then(|s| s.strip_prefix('.'))
+        else {
             continue;
-        }
+        };
         // Empty alias segment ("mcp.servers." with nothing after) can't
         // be addressed by name; skip to avoid matching every otherwise-
         // unmatched path via the empty prefix. Same guard the in-memory
         // `route_vec_path` applies to empty natural keys.
-        if dotted.len() == prefix.len() {
+        if after.is_empty() {
             continue;
         }
         let better = best
@@ -17326,12 +17350,27 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
 /// natural-key field matches `<alias>`. The `<inner>` recursion reuses
 /// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
 /// helpers against the located entry's table.
+///
+/// **Order-independence invariant.** `Config::dirty_paths` is a
+/// `HashSet<String>`, so the three shapes above can apply in any
+/// interleaving within a single `save_dirty` batch — in particular,
+/// a rename emits both the old and new aliases dirty without an
+/// ordering guarantee, and a create-then-edit sequence may walk the
+/// per-field path before the whole-element write. Convergence under
+/// every ordering is load-bearing here and works only because every
+/// branch derives its write from the current in-memory state and the
+/// case-1 delete fires only on mem-absence (not on default
+/// equivalence). Future edits — e.g. an early-exit that assumes
+/// whole-element writes run before per-field ones, or a "skip if
+/// already written" optimization keyed on the doc shape — would
+/// break this. Preserve commutativity across the three shapes for
+/// any single (section, alias) tuple.
 fn apply_dirty_natural_key_path(
     root: &mut toml_edit::Table,
     section: &NaturalKeySection,
     dotted: &str,
     full_table: &toml::Table,
-    default_table: &toml::Table,
+    _default_table: &toml::Table,
 ) {
     // `dotted` is known to start with `<section_path>.` thanks to
     // `find_natural_key_section_for_path`; split the alias and inner
@@ -17391,12 +17430,23 @@ fn apply_dirty_natural_key_path(
         // the delete-on-default rule degrades the same way the HashMap
         // path already does (i.e. it doesn't catch "field is set to
         // its serde default"; that limitation is shared and not a
-        // regression from this fix).
-        let _ = default_table; // currently unused — see note above.
+        // regression from this fix). The `_default_table` parameter
+        // is intentionally unused for this reason — kept on the
+        // signature so the call site in `save_dirty` stays uniform
+        // with `apply_dirty_path`, which does consume it.
 
         let inner_raw: Vec<&str> = inner.split('.').collect();
+        // Same dash-aware segment resolution the top-level Table-shaped
+        // walker uses (`apply_dirty_path` → `resolve_dirty_segments`), but
+        // rooted at the natural-key entry's own serialized table so kebab
+        // inner segments like `mcp.servers.fs.tool-timeout-secs` resolve
+        // to the snake `tool_timeout_secs` field on disk. Sharing the
+        // helper instead of forking is load-bearing: this PR exists
+        // because two parallel walks (in-memory vs on-disk) drifted apart;
+        // a forked copy here would recreate exactly that hazard, so any
+        // future fix to dash handling lands in both code paths at once.
         let inner_segments: Vec<String> = match mem_entry {
-            Some(table) => resolve_dirty_segments_in(table, &inner_raw),
+            Some(table) => resolve_dirty_segments(table, &inner_raw),
             None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
         };
         let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
@@ -17483,36 +17533,52 @@ fn apply_dirty_natural_key_path(
     }
 }
 
-/// Same dash-aware segment resolution as [`resolve_dirty_segments`] but
-/// rooted at an arbitrary `toml::Table` (the natural-key element's own
-/// serialized form), so per-field inner suffixes inside an
-/// `[[mcp.servers]]` entry get the same `headers.<auth-key>` vs
-/// `tool_timeout_secs` treatment the top-level walker uses.
-fn resolve_dirty_segments_in(root: &toml::Table, raw: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    let mut current: Option<&toml::Value> = None;
-    for seg in raw {
-        let table_opt: Option<&toml::Table> = if out.is_empty() {
-            Some(root)
-        } else {
-            current.and_then(|v| v.as_table())
-        };
-        let resolved = match table_opt {
-            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
-            Some(t) => {
-                let snake = seg.replace('-', "_");
-                if t.contains_key(&snake) {
-                    snake
-                } else {
-                    (*seg).to_string()
-                }
-            }
-            None => (*seg).to_string(),
-        };
-        current = table_opt.and_then(|t| t.get(&resolved));
-        out.push(resolved);
-    }
-    out
+/// Emit a single `WARN` event when a natural-key writer (ensure /
+/// find / delete) bails because the on-disk node has the wrong shape
+/// — for example an operator hand-edited `mcp.servers = "foo"`, or
+/// wrote `servers = [{ name = "fs", ... }]` (an inline array of
+/// tables, which `toml_edit` parses as `Item::Value(Value::Array)`
+/// rather than the `Item::ArrayOfTables` this writer produces).
+///
+/// Without this, `config/set` returns success, the in-memory mutation
+/// and the dashboard/TUI both reflect the new value, and the on-disk
+/// file silently stays stale — the exact symptom the underlying
+/// natural-key persistence bug (#7267 fix) exists to eliminate. The
+/// `WARN` shape mirrors the 0600-permissions fallback below: same
+/// `Action::Note` / `EventOutcome::Unknown` / module path, so log
+/// scrapers that already understand the schema warnings will surface
+/// these the same way.
+///
+/// `op` is `"ensure"`, `"find"`, or `"delete"` — which writer bailed.
+/// `kind` is `"parent_segment"` or `"array_key"` — which node was
+/// wrong-shaped. `which` is the specific seg/key name involved.
+fn warn_natural_key_doc_kind_mismatch(
+    parent_segs: &[&str],
+    array_key: &str,
+    alias: &str,
+    kind: &str,
+    which: &str,
+    op: &str,
+) {
+    let section_path = if parent_segs.is_empty() {
+        array_key.to_string()
+    } else {
+        format!("{}.{array_key}", parent_segs.join("."))
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "section_path": section_path,
+                "alias": alias,
+                "node_kind": kind,
+                "node_name": which,
+                "operation": op,
+            })),
+        "natural-key writer: refusing to clobber hand-edited config.toml node; \
+         on-disk file may diverge from in-memory state"
+    );
 }
 
 /// Locate or create the `[[<section_path>]]` entry whose natural-key
@@ -17531,9 +17597,14 @@ fn resolve_dirty_segments_in(root: &toml::Table, raw: &[&str]) -> Vec<String> {
 ///
 /// Returns `None` only when an existing doc node at `parent_segs` or
 /// `array_key` has the wrong kind (e.g. an operator hand-edited
-/// `mcp.servers = "foo"`); in that case we refuse to clobber the
-/// hand-edit and let the save bail silently rather than data-loss the
-/// user's file.
+/// `mcp.servers = "foo"`, or wrote an inline `servers = [{ ... }]`
+/// array-of-tables that parses as `Item::Value(Value::Array)` rather
+/// than the `Item::ArrayOfTables` shape this writer expects); in that
+/// case we refuse to clobber the hand-edit and let the save bail
+/// rather than data-loss the user's file. A `WARN`-level event is
+/// emitted on every wrong-kind bail so the divergence between memory
+/// and disk is observable in logs — silent bails were what let the
+/// underlying #7267 bug ship.
 fn ensure_array_of_tables_entry<'a>(
     root: &'a mut toml_edit::Table,
     parent_segs: &[&str],
@@ -17546,7 +17617,19 @@ fn ensure_array_of_tables_entry<'a>(
         if !cursor.contains_key(seg) {
             cursor.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
         }
-        cursor = cursor.get_mut(seg).and_then(|i| i.as_table_mut())?;
+        let next = cursor.get_mut(seg).and_then(|i| i.as_table_mut());
+        if next.is_none() {
+            warn_natural_key_doc_kind_mismatch(
+                parent_segs,
+                array_key,
+                alias,
+                "parent_segment",
+                seg,
+                "ensure",
+            );
+            return None;
+        }
+        cursor = next?;
     }
     if !cursor.contains_key(array_key) {
         cursor.insert(
@@ -17556,7 +17639,18 @@ fn ensure_array_of_tables_entry<'a>(
     }
     let aot = cursor
         .get_mut(array_key)
-        .and_then(|i| i.as_array_of_tables_mut())?;
+        .and_then(|i| i.as_array_of_tables_mut());
+    let Some(aot) = aot else {
+        warn_natural_key_doc_kind_mismatch(
+            parent_segs,
+            array_key,
+            alias,
+            "array_key",
+            array_key,
+            "ensure",
+        );
+        return None;
+    };
 
     let pos = aot
         .iter()
@@ -17576,7 +17670,10 @@ fn ensure_array_of_tables_entry<'a>(
 /// Read-only counterpart to [`ensure_array_of_tables_entry`] used by
 /// the delete path: never creates a missing array or entry, just
 /// locates one if present. Returning `None` on a miss lets the caller
-/// skip the doc-mutation step entirely.
+/// skip the doc-mutation step entirely. Distinguishes "node doesn't
+/// exist" (silent no-op — the legitimate fresh-alias case) from "node
+/// exists but has the wrong kind" (a `WARN`-logged bail — the
+/// hand-edited inline-array hazard).
 fn find_array_of_tables_entry_mut<'a>(
     root: &'a mut toml_edit::Table,
     parent_segs: &[&str],
@@ -17586,11 +17683,32 @@ fn find_array_of_tables_entry_mut<'a>(
 ) -> Option<&'a mut toml_edit::Table> {
     let mut cursor: &mut toml_edit::Table = root;
     for seg in parent_segs {
-        cursor = cursor.get_mut(seg).and_then(|i| i.as_table_mut())?;
+        let item = cursor.get_mut(seg)?;
+        let Some(next) = item.as_table_mut() else {
+            warn_natural_key_doc_kind_mismatch(
+                parent_segs,
+                array_key,
+                alias,
+                "parent_segment",
+                seg,
+                "find",
+            );
+            return None;
+        };
+        cursor = next;
     }
-    let aot = cursor
-        .get_mut(array_key)
-        .and_then(|i| i.as_array_of_tables_mut())?;
+    let item = cursor.get_mut(array_key)?;
+    let Some(aot) = item.as_array_of_tables_mut() else {
+        warn_natural_key_doc_kind_mismatch(
+            parent_segs,
+            array_key,
+            alias,
+            "array_key",
+            array_key,
+            "find",
+        );
+        return None;
+    };
     let pos = aot
         .iter()
         .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias))?;
@@ -17611,17 +17729,40 @@ fn delete_array_of_tables_entry(
 ) {
     let mut cursor: &mut toml_edit::Table = root;
     for seg in parent_segs {
-        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
-            Some(t) => t,
-            None => return,
+        let Some(item) = cursor.get_mut(seg) else {
+            return;
         };
+        match item.as_table_mut() {
+            Some(next) => cursor = next,
+            None => {
+                warn_natural_key_doc_kind_mismatch(
+                    parent_segs,
+                    array_key,
+                    alias,
+                    "parent_segment",
+                    seg,
+                    "delete",
+                );
+                return;
+            }
+        }
     }
-    let aot = match cursor
-        .get_mut(array_key)
-        .and_then(|i| i.as_array_of_tables_mut())
-    {
+    let Some(item) = cursor.get_mut(array_key) else {
+        return;
+    };
+    let aot = match item.as_array_of_tables_mut() {
         Some(a) => a,
-        None => return,
+        None => {
+            warn_natural_key_doc_kind_mismatch(
+                parent_segs,
+                array_key,
+                alias,
+                "array_key",
+                array_key,
+                "delete",
+            );
+            return;
+        }
     };
     let pos = aot
         .iter()
@@ -23291,6 +23432,219 @@ group_policy = "disabled"
             );
         assert_eq!(anthropic.kind, crate::traits::MapKeyKind::Map);
         assert_eq!(anthropic.natural_key, None);
+    }
+
+    /// A dirty path with a kebab-shaped inner field (e.g.
+    /// `mcp.servers.fs.tool-timeout-secs`) must resolve through the
+    /// shared `resolve_dirty_segments` helper inside the natural-key
+    /// branch the same way the top-level Table walker does — landing
+    /// on the snake `tool_timeout_secs` field on disk. This pins the
+    /// dash-aware resolution that's load-bearing for any future
+    /// natural-key struct field whose snake_case name is multi-word.
+    /// Without this, a UI client that emits kebab field names would
+    /// recreate the exact symptom the PR fixes (memory updates, disk
+    /// stays stale) for any such field.
+    #[test]
+    async fn save_dirty_persists_mcp_server_kebab_inner_field_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            tool_timeout_secs: Some(45),
+            ..Default::default()
+        });
+
+        // mark_dirty directly with a kebab leaf segment so the
+        // dash-aware resolver inside `resolve_dirty_segments` is the
+        // only thing that can possibly land this on disk. set_prop /
+        // set_prop_persistent route through the macro which has its
+        // own snake-only field-name lookup; this test isolates the
+        // writer-side resolution. The in-memory mutation above
+        // simulates the dispatcher having already routed the
+        // set_prop side; what we're testing here is the save side.
+        config.mark_dirty("mcp.servers.fs.tool-timeout-secs");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("tool_timeout_secs = 45"),
+            "kebab dirty segment must resolve to the snake on-disk field; \
+             got:\n{written}"
+        );
+        assert!(
+            !written.contains("tool-timeout-secs"),
+            "kebab field name must never appear on disk; got:\n{written}"
+        );
+        // Other fields on the entry survive the targeted edit.
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "fs");
+        assert_eq!(reparsed.mcp.servers[0].command, "/usr/bin/mcp-fs");
+        assert_eq!(reparsed.mcp.servers[0].tool_timeout_secs, Some(45));
+    }
+
+    /// An explicit per-field unset (the in-memory field reverts to
+    /// `None`, but the dirty path still names that specific inner
+    /// field rather than the whole element) must drive the case-1
+    /// `mem missing → delete` branch — removing the field from the
+    /// `[[mcp.servers]]` entry on disk without touching its siblings.
+    /// The pre-existing whole-element delete test covers a different
+    /// path (the rename source / `delete_map_key`); this one pins
+    /// the per-field delete branch independently. Without it, a
+    /// future refactor that collapses case-1's `None` branch into
+    /// the whole-element path would silently break "clear this field"
+    /// edits — the field would survive on disk while showing as
+    /// unset in the UI.
+    #[test]
+    async fn save_dirty_unset_per_field_drops_field_from_mcp_server_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an entry with tool_timeout_secs set — this is the
+        // field we'll unset via a per-field dirty path.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n\
+             tool_timeout_secs = 45\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        // In-memory mirror without the optional field set — i.e. the
+        // UI user just cleared `tool_timeout_secs`.
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            tool_timeout_secs: None,
+            ..Default::default()
+        });
+        // Per-field dirty path — exactly what a UI "clear this
+        // field" affordance emits. The whole-element bare alias
+        // `mcp.servers.fs` is intentionally NOT marked: the bare
+        // alias is the rename/delete shape; the bug-prone case is
+        // the per-field one.
+        config.mark_dirty("mcp.servers.fs.tool_timeout_secs");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("tool_timeout_secs"),
+            "explicit per-field unset must drop the field from disk; got:\n{written}"
+        );
+        // Siblings survive: the entry isn't deleted, just the one
+        // field, and the natural-key field itself must stay so
+        // subsequent loads still know which alias this entry is.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key field must survive a per-field unset; got:\n{written}"
+        );
+        assert!(
+            written.contains("command = \"/usr/bin/mcp-fs\""),
+            "sibling fields must survive a per-field unset; got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "fs");
+        assert_eq!(reparsed.mcp.servers[0].tool_timeout_secs, None);
+    }
+
+    /// When the on-disk node at `mcp.servers` exists but has the
+    /// wrong kind — e.g. a hand-edited `mcp.servers = "foo"`, or an
+    /// inline-array-of-tables literal `servers = [{ ... }]` that
+    /// `toml_edit` parses as `Item::Value(Value::Array)` rather than
+    /// `Item::ArrayOfTables` — the writer must refuse to clobber
+    /// rather than data-loss the user's hand-edit. The bail is
+    /// observable (a `WARN`-level log event), but here we just pin
+    /// the don't-clobber behavior at the disk level: the original
+    /// shape survives the save unchanged. This is the explicit
+    /// contract test for the wrong-kind bail surface; without it,
+    /// a refactor that "fixes" the bail by overwriting silently
+    /// would corrupt every operator who has either of these
+    /// (otherwise valid) TOML shapes in their config.
+    #[test]
+    async fn save_dirty_refuses_to_clobber_wrong_kind_mcp_servers_node() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Hand-edited file: operator wrote `mcp.servers` as a scalar.
+        // This is invalid against the schema but is what
+        // `Item::Value(Value::String)` looks like in toml_edit, and
+        // it's representative of the wrong-kind case (the same bail
+        // path also fires for `Item::Value(Value::Array)` inline
+        // arrays). Schema validation would reject this on load; the
+        // test forces the writer to face the shape regardless.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [mcp]\n\
+             servers = \"hand-edited-scalar\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        // In-memory has a real server; the per-field edit would
+        // normally land on `[[mcp.servers]]` on disk.
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        config.mark_dirty("mcp.servers.fs.command");
+
+        // The save itself must succeed — bail is a no-op for the
+        // wrong-kind node, not an error.
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        // The hand-edited scalar shape survives untouched: we'd
+        // rather a load-time validation error the operator sees than
+        // a silent overwrite of their (possibly intentional) file
+        // surgery.
+        assert!(
+            written.contains("servers = \"hand-edited-scalar\""),
+            "wrong-kind `mcp.servers` node must survive the save unchanged; \
+             got:\n{written}"
+        );
+        assert!(
+            !written.contains("[[mcp.servers]]"),
+            "writer must not synthesize an array-of-tables next to a scalar \
+             hand-edit; got:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "in-memory command must not leak past a wrong-kind bail; \
+             got:\n{written}"
+        );
     }
 
     #[test]
