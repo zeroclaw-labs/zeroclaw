@@ -267,12 +267,13 @@ pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
     _use_cache: bool,
+    show_model_names: bool,
 ) -> Result<()> {
     let targets = doctor_model_targets(config, provider_override);
 
     if targets.is_empty() {
         anyhow::bail!(
-            "No configured model_providers to probe — run `zeroclaw onboard model_providers` first"
+            "No configured model_providers to probe — run `zeroclaw quickstart` to set one up first"
         );
     }
 
@@ -298,6 +299,11 @@ pub async fn run_models(
             Ok(models) => {
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
+                if show_model_names && !models.is_empty() {
+                    for m in &models {
+                        println!("      • {}", m);
+                    }
+                }
                 matrix_rows.push((
                     provider_name.clone(),
                     ModelProbeOutcome::Ok,
@@ -642,6 +648,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
     }
 
+    // gateway.web_dist_dir: flag values that rely on shell expansion the
+    // gateway does not perform. Parallel check lives in
+    // `src/commands/self_test.rs::check_web_dist_dir`; keep the wording
+    // and predicate in sync.
+    check_web_dist_dir(config, items);
+
     // Channel: at least one configured
     let cc = &config.channels;
     let has_channel = cc.channels().iter().any(|info| info.configured);
@@ -651,7 +663,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(
             cat,
-            "no channels configured — run `zeroclaw onboard` to set one up",
+            "no channels configured — run `zeroclaw quickstart` to set one up",
         ));
     }
 
@@ -675,6 +687,49 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ),
             ));
         }
+    }
+}
+
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw doctor` time
+/// instead of at runtime. Parallel check lives in
+/// `src/commands/self_test.rs::check_web_dist_dir`.
+///
+/// User-facing message goes through Fluent
+/// (`cli-doctor-web-dist-dir-expansion-warning`) per AGENTS.md §
+/// Localization — no bare Rust literals for CLI output. Reason phrases
+/// are Fluent keys too (`cli-web-dist-dir-reason-{tilde,dollar}`).
+fn check_web_dist_dir(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    match config.gateway.web_dist_dir.as_deref() {
+        None => {}
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
+            None => {}
+            Some(reason_key) => {
+                let reason = crate::i18n::get_required_cli_string(reason_key);
+                let message = crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-web-dist-dir-expansion-warning",
+                    &[("path", value), ("reason", reason.as_str())],
+                );
+                items.push(DiagItem::warn(cat, message));
+            }
+        },
+    }
+}
+
+/// Return the Fluent reason key when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("cli-web-dist-dir-reason-tilde")
+    } else if value.contains('$') {
+        Some("cli-web-dist-dir-reason-dollar")
+    } else {
+        None
     }
 }
 
@@ -1334,6 +1389,87 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
         );
+    }
+
+    #[test]
+    fn diagnose_flags_web_dist_dir_with_tilde() {
+        // Asserts the localized Fluent message resolves and inlines the path +
+        // the tilde reason — the diagnostic now goes through Fluent per
+        // AGENTS.md (#6961 Round 3).
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let expected_reason = crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-web-dist-dir-expansion-warning",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+
+        let results = diagnose(&config);
+        let hit = results
+            .iter()
+            .find(|item| item.category == "config" && item.message == expected_message);
+        assert!(
+            hit.is_some(),
+            "doctor should flag web_dist_dir = \"~/web-dist\" with the localized warning; \
+             expected message: {expected_message:?}; got: {results:?}"
+        );
+        assert_eq!(hit.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_flags_web_dist_dir_with_env_var() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("$HOME/web-dist".to_string());
+
+        let expected_reason =
+            crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-dollar");
+        let expected_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-web-dist-dir-expansion-warning",
+            &[
+                ("path", "$HOME/web-dist"),
+                ("reason", expected_reason.as_str()),
+            ],
+        );
+
+        let results = diagnose(&config);
+        let hit = results
+            .iter()
+            .find(|item| item.category == "config" && item.message == expected_message);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_accepts_literal_web_dist_dir() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let results = diagnose(&config);
+        assert!(
+            !results
+                .iter()
+                .any(|item| item.message.contains("gateway.web_dist_dir")),
+            "literal web_dist_dir paths should produce no doctor diagnostic"
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_expansion_reason_key_detects_tilde_and_env() {
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
     }
 
     #[test]

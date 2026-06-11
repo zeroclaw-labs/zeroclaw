@@ -214,6 +214,7 @@ schedule = { kind = "every", every_ms = 60000 }
 [channels_config]
 cli = true
 message_timeout_secs = 300
+max_concurrent_per_channel = 4
 ack_reactions = true
 show_tool_calls = false
 session_persistence = true
@@ -555,6 +556,7 @@ allowed_domains = ["*"]
 max_response_size = 1000000
 timeout_secs = 30
 allow_private_hosts = false
+allowed_private_hosts = []
 
 [multimodal]
 max_images = 4

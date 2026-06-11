@@ -223,7 +223,49 @@ impl McpServer {
         if let Some(err) = resp.error {
             bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
         }
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+
+        let result = resp.result.unwrap_or(serde_json::Value::Null);
+
+        // MCP servers signal *tool-execution* failures (as opposed to JSON-RPC
+        // protocol errors) with HTTP 200 + `result.isError: true` and the detail
+        // in `result.content[].text`, per the MCP spec. Without surfacing this,
+        // the error envelope is returned as a normal success — so the failure is
+        // invisible to the model and the daemon log, and callers only ever see a
+        // generic "error during tool call" with no detail.
+        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+            let detail = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|s: &String| !s.is_empty())
+                .unwrap_or_else(|| "(no error detail returned by server)".to_string());
+            // Server-controlled text: scrub secrets (sk-/ghp_/…) and bound length
+            // (`sanitize_api_error` truncates to MAX_API_ERROR_CHARS) before it
+            // reaches the daemon log or the returned error.
+            let detail = zeroclaw_providers::sanitize_api_error(&detail);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &inner.config.name,
+                        "tool": tool_name,
+                        "detail": &detail,
+                    })),
+                "mcp_client: tool returned isError:true"
+            );
+            bail!(
+                "MCP tool `{tool_name}` (server `{}`) returned isError: {detail}",
+                inner.config.name
+            );
+        }
+
+        Ok(result)
     }
 }
 
@@ -447,5 +489,148 @@ mod tests {
         assert_eq!(registry.server_count(), 0);
         assert_eq!(registry.tool_count(), 0);
         assert!(registry.is_empty());
+    }
+
+    // ── McpServer::call_tool isError handling ──────────────────────────────
+    //
+    // These exercise the `result.isError == true` branch added to the
+    // *inherent* `McpServer::call_tool` (the one that talks to the transport,
+    // not the `McpRegistry::call_tool` wrapper). A fake transport returns a
+    // canned result so no live server is needed.
+
+    /// Transport that ignores the request and always returns one preset result.
+    struct FakeTransport {
+        result: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl McpTransportConn for FakeTransport {
+        async fn send_and_recv(
+            &mut self,
+            _request: &JsonRpcRequest,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            Ok(crate::mcp_protocol::JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(1)),
+                result: Some(self.result.clone()),
+                error: None,
+            })
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an `McpServer` whose transport yields `result` on every call.
+    fn server_returning(result: serde_json::Value) -> McpServer {
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: "fake".into(),
+                ..Default::default()
+            },
+            transport: Box::new(FakeTransport { result }),
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![],
+        };
+        McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_iserror_err_is_sanitized_and_bounded() {
+        // A secret token in the server-controlled detail must be redacted
+        // before it reaches the returned error (and, by the same code path,
+        // the daemon log).
+        let server = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": "auth failed using sk-supersecrettoken12345abcdef" }],
+        }));
+        let err = server
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err");
+        let msg = err.to_string();
+        assert!(msg.contains("returned isError"), "got: {msg}");
+        assert!(msg.contains("[REDACTED]"), "secret not scrubbed: {msg}");
+        assert!(
+            !msg.contains("supersecrettoken"),
+            "raw secret leaked: {msg}"
+        );
+
+        // Oversized server text must be truncated; sanitize_api_error caps the
+        // detail at 500 chars and appends an ellipsis.
+        let huge = "A".repeat(5000);
+        let server = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": huge }],
+        }));
+        let msg = server
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err")
+            .to_string();
+        assert!(
+            msg.contains("..."),
+            "bounded detail should be truncated: {msg}"
+        );
+        assert!(
+            msg.len() < 1000,
+            "5000-char payload not bounded: len={}",
+            msg.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_success_returns_ok_result() {
+        // isError absent → Ok with the raw result untouched.
+        let payload = serde_json::json!({
+            "content": [{ "type": "text", "text": "all good" }],
+        });
+        let out = server_returning(payload.clone())
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect("absent isError must be Ok");
+        assert_eq!(out, payload);
+
+        // isError explicitly false → still Ok.
+        let payload = serde_json::json!({ "isError": false, "value": 42 });
+        let out = server_returning(payload.clone())
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect("isError:false must be Ok");
+        assert_eq!(out, payload);
+    }
+
+    #[tokio::test]
+    async fn call_tool_iserror_empty_detail_falls_back() {
+        // isError true but no content array → fallback message.
+        let msg = server_returning(serde_json::json!({ "isError": true }))
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err")
+            .to_string();
+        assert!(
+            msg.contains("(no error detail returned by server)"),
+            "got: {msg}"
+        );
+
+        // isError true with content present but empty text → same fallback.
+        let msg = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": "" }],
+        }))
+        .call_tool("do_thing", serde_json::json!({}))
+        .await
+        .expect_err("isError:true must map to Err")
+        .to_string();
+        assert!(
+            msg.contains("(no error detail returned by server)"),
+            "got: {msg}"
+        );
     }
 }

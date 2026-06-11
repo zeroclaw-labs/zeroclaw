@@ -80,11 +80,12 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
-    pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
+    pub const SESSION_KILL: &str = "session/kill";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -474,7 +475,7 @@ impl RpcClient {
 
     /// Connect to the daemon via WebSocket Secure (WSS).
     ///
-    /// Same handshake and reconnect semantics as [`connect`] — pass
+    /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
     /// When `tls_skip_verify` is true, certificate verification is
@@ -698,14 +699,6 @@ impl RpcClient {
     /// Current connection state. Cheap mutex read, safe to call on every frame.
     pub fn connection_state(&self) -> ConnectionState {
         self.connection_state.lock().unwrap().clone()
-    }
-
-    /// Returns `true` when the daemon connection is known to be dead.
-    pub fn is_disconnected(&self) -> bool {
-        matches!(
-            self.connection_state(),
-            ConnectionState::Disconnected { .. }
-        )
     }
 
     // ── Notifications ─────────────────────────────────────────────
@@ -999,7 +992,7 @@ impl RpcClient {
         self.session_new_with_id(agent_alias, cwd, None).await
     }
 
-    /// Like [`session_new_with_id`] but sets `exclude_memory: true` so the
+    /// Like [`Self::session_new_with_id`] but sets `exclude_memory: true` so the
     /// daemon strips memory tools and uses a NoneMemory backend. Used by the
     /// ACP pane, which should never have access to persistent memory.
     pub async fn session_new_acp(
@@ -1048,6 +1041,22 @@ impl RpcClient {
         .await
     }
 
+    /// Apply session-scoped overrides (model, model_provider, temperature) to a
+    /// live session. The daemon applies them immediately and returns the merged
+    /// set. A `model_provider` override triggers a live provider-box rebuild
+    /// daemon-side.
+    pub async fn session_configure(
+        &self,
+        session_id: &str,
+        overrides: SessionOverrides,
+    ) -> Result<SessionConfigureResult> {
+        self.call(
+            method::SESSION_CONFIGURE,
+            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+        )
+        .await
+    }
+
     pub async fn session_git_branch(&self, session_id: &str) -> Result<SessionGitBranchResult> {
         self.call(
             method::SESSION_GIT_BRANCH,
@@ -1081,16 +1090,14 @@ impl RpcClient {
         .await
     }
 
-    pub async fn session_rename(
-        &self,
-        session_id: &str,
-        name: &str,
-    ) -> Result<SessionRenameResult> {
-        self.call(
-            method::SESSION_RENAME,
-            serde_json::json!({ "session_id": session_id, "name": name }),
-        )
-        .await
+    pub async fn session_kill(&self, session_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .call(
+                method::SESSION_KILL,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(())
     }
 
     // ── Dashboard helpers ────────────────────────────────────────
@@ -1642,20 +1649,43 @@ pub struct SessionNewResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
 
+/// Session-scoped overrides mirror of
+/// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
+/// `session/configure`; every field is optional and omitted when `None`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureResult {
+    /// Echoed by the daemon; retained to lock the wire shape even though the
+    /// TUI keys off the caller's own session id.
+    #[allow(dead_code)]
+    pub session_id: String,
+    #[serde(default)]
+    pub overrides: SessionOverrides,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionGitBranchResult {
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionApproveResult {}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SessionRenameResult {}
 
 #[derive(Debug, Clone)]
 pub enum ApprovalDecision {
@@ -1713,7 +1743,10 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
-    pub active_sessions: usize,
+    #[serde(default)]
+    pub live_sessions: usize,
+    #[serde(default)]
+    pub persisted_sessions: usize,
     #[serde(default)]
     pub channels: Vec<String>,
 }
@@ -1855,6 +1888,37 @@ pub struct SessionMessagesResult {
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+}
+
+impl MessageEntry {
+    /// Classify the wire `role` string into the closed set the UI renders.
+    /// Unknown roles map to [`MessageRole::Other`] so surfaces can fall back
+    /// without string-matching at the call site.
+    pub fn role(&self) -> MessageRole {
+        MessageRole::from_wire(&self.role)
+    }
+}
+
+/// Closed taxonomy of persisted message roles, as they arrive over the
+/// `session/messages` wire. The daemon emits these as strings; this is the
+/// single place that maps the wire form into a type the UI matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Other,
+}
+
+impl MessageRole {
+    fn from_wire(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "system" => Self::System,
+            _ => Self::Other,
+        }
+    }
 }
 
 // ── TUI identity types ───────────────────────────────────────────

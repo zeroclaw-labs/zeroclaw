@@ -17,6 +17,8 @@ pub mod capabilities_tool;
 #[cfg(feature = "hardware")]
 pub mod nucleo_flash;
 #[cfg(feature = "hardware")]
+pub mod smartroom;
+#[cfg(feature = "hardware")]
 pub mod uno_q_bridge;
 #[cfg(feature = "hardware")]
 pub mod uno_q_setup;
@@ -133,6 +135,23 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
                         &format!("Arduino upload tool added (port: {})", path)
                     );
                 }
+
+                // Smart-room named device tools (ESP32 / ESP32 simulator).
+                // Lets the model use device names instead of guessing pin numbers.
+                if board.board == "esp32" || board.board == "esp32-sim" {
+                    let transport = p.transport();
+                    tools.push(Box::new(smartroom::SetDeviceTool {
+                        transport: transport.clone(),
+                    }));
+                    tools.push(Box::new(smartroom::ReadDeviceTool { transport }));
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"board": board.board})),
+                        "Smart-room device tools added (set_device, read_device)"
+                    );
+                }
+
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

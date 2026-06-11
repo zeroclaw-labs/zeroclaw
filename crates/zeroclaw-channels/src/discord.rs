@@ -405,10 +405,11 @@ fn channel_passes_filter(
 /// Returns the text block appended to the agent's prompt and the structured
 /// `MediaAttachment` list consumed by the media pipeline. Each attachment is
 /// downloaded at most once: text/* is inlined as text, audio is transcribed
-/// inline when a transcription manager is configured (otherwise it goes
-/// through the media pipeline), and image/video/document attachments are
-/// saved to the workspace and emitted as `[KIND:<path>]` markers plus a
-/// `MediaAttachment` for vision-capable providers.
+/// inline when a transcription manager is configured and returns non-empty
+/// text (otherwise it falls through to the media pipeline), and
+/// image/video/document attachments are saved to the workspace and emitted as
+/// `[KIND:<path>]` markers plus a `MediaAttachment` for vision-capable
+/// providers.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -468,6 +469,7 @@ async fn process_attachments(
         // Audio with channel-level transcription configured: transcribe
         // inline so the agent receives `[Voice] <transcript>` text rather
         // than opaque bytes through the media pipeline.
+        let mut downloaded_audio_bytes = None;
         if is_audio && let Some(manager) = transcription_manager {
             let bytes = match download_attachment_bytes(client, url, name).await {
                 Some(b) => b,
@@ -490,6 +492,7 @@ async fn process_attachments(
                             )
                         );
                         text_parts.push(format!("[Voice] {trimmed}"));
+                        continue;
                     }
                 }
                 Err(e) => {
@@ -504,14 +507,17 @@ async fn process_attachments(
                     );
                 }
             }
-            continue;
+            downloaded_audio_bytes = Some(bytes);
         }
 
         let marker_kind = marker_kind_for(ct, is_audio);
 
-        let bytes = match download_attachment_bytes(client, url, name).await {
+        let bytes = match downloaded_audio_bytes {
             Some(b) => b,
-            None => continue,
+            None => match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            },
         };
 
         let marker_target = match workspace_dir {
@@ -1368,6 +1374,18 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Whether a Discord message `type` represents a real user turn the bot should
+/// act on, versus a system/auto message it must ignore.
+///
+/// Only `DEFAULT` (0) and `REPLY` (19) are conversational. Everything else is a
+/// system message: notably `THREAD_CREATED` (18) — posted in the parent channel
+/// when a thread is created — and `THREAD_STARTER_MESSAGE` (21), plus joins,
+/// pins, boosts, etc. Acting on `THREAD_CREATED` is what made the bot "respond
+/// to a thread's birth message".
+fn is_conversational_message_type(message_type: u64) -> bool {
+    matches!(message_type, 0 | 19)
+}
+
 /// Decide whether an inbound Discord message passes the listener gate.
 /// Returns the cleaned text body when admitted, or `None` to drop the
 /// message. Attachment-only messages (empty `content` plus at least one
@@ -1875,6 +1893,20 @@ impl Channel for DiscordChannel {
                     let Some(d) = event.get("d") else {
                         continue;
                     };
+
+                    // Skip non-conversational system messages. Discord posts a
+                    // MESSAGE_CREATE of type 18 (THREAD_CREATED) in the parent
+                    // channel when a thread is born — authored by the human who
+                    // created it, with the thread name as content — which would
+                    // otherwise pass the admit gate and make the bot "reply" to
+                    // the thread's birth. Type 21 (THREAD_STARTER_MESSAGE), pins,
+                    // joins, etc. are likewise not user turns. Only DEFAULT (0)
+                    // and REPLY (19) are real messages to act on. Absent `type`
+                    // defaults to 0 for forward-compatibility.
+                    let message_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if !is_conversational_message_type(message_type) {
+                        continue;
+                    }
 
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
@@ -2846,6 +2878,19 @@ mod tests {
     }
 
     #[test]
+    fn thread_created_and_system_messages_are_not_conversational() {
+        // The bug: THREAD_CREATED (18) was treated as a normal message, so the
+        // bot replied to a thread's birth. It and other system types must be
+        // rejected; only DEFAULT (0) and REPLY (19) are real user turns.
+        assert!(is_conversational_message_type(0)); // DEFAULT
+        assert!(is_conversational_message_type(19)); // REPLY
+        assert!(!is_conversational_message_type(18)); // THREAD_CREATED
+        assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
+        assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
+        assert!(!is_conversational_message_type(7)); // USER_JOIN
+    }
+
+    #[test]
     fn admit_discord_message_requires_mention_when_enabled() {
         let cleaned = admit_discord_message("hello there", false, true, "12345");
         assert!(cleaned.is_none());
@@ -3396,6 +3441,118 @@ mod tests {
         let (text, media) = process_attachments(&[], &client, None, None).await;
         assert!(text.is_empty());
         assert!(media.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_fails() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "stt unavailable"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_is_empty() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": ""})))
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    fn local_whisper_transcription_config(
+        server: &wiremock::MockServer,
+    ) -> zeroclaw_config::schema::TranscriptionConfig {
+        zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        }
     }
 
     #[test]

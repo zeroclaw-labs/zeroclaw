@@ -357,40 +357,14 @@ pub async fn run(
         let sessions = std::sync::Arc::new(SessionStore::new(64, session_queue.clone()));
 
         {
-            let reaper_sessions = std::sync::Arc::clone(&sessions);
             let reaper_queue = std::sync::Arc::clone(&session_queue);
             zeroclaw_spawn::spawn!(async move {
-                const TICK: std::time::Duration = std::time::Duration::from_secs(15);
+                const TICK: std::time::Duration = std::time::Duration::from_secs(60);
                 let mut interval = tokio::time::interval(TICK);
                 interval.tick().await;
                 loop {
                     interval.tick().await;
-                    let evicted = reaper_sessions.evict_expired().await;
                     let queue_evicted = reaper_queue.evict_idle().await;
-                    for ev in &evicted {
-                        let span = ::zeroclaw_log::info_span!(
-                            target: "zeroclaw_log_internal_scope",
-                            "zeroclaw_scope",
-                            session_key = %ev.session_key,
-                            agent_alias = %ev.agent_alias,
-                            owner_tui_id = %ev.owner_tui_id.as_deref().unwrap_or(""),
-                            channel = "rpc",
-                        );
-                        let _guard = span.enter();
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_attrs(::serde_json::json!({
-                                "reason": ev.reason,
-                                "idle_secs": ev.idle_secs,
-                            })),
-                            "Session reaper freed agent and conversation history"
-                        );
-                    }
                     if queue_evicted > 0 {
                         let span = ::zeroclaw_log::info_span!(
                             target: "zeroclaw_log_internal_scope",
@@ -408,30 +382,9 @@ pub async fn run(
                             .with_attrs(::serde_json::json!({
                                 "evicted_queue_slots": queue_evicted,
                             })),
-                            "Session reaper released idle actor-queue slots"
+                            "Session queue: released idle actor-queue slots"
                         );
-                    }
-                    if !evicted.is_empty() || queue_evicted > 0 {
                         crate::util::release_freed_heap();
-                        let span = ::zeroclaw_log::info_span!(
-                            target: "zeroclaw_log_internal_scope",
-                            "zeroclaw_scope",
-                            channel = "rpc",
-                        );
-                        let _guard = span.enter();
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_attrs(::serde_json::json!({
-                                "evicted_sessions": evicted.len(),
-                                "evicted_queue_slots": queue_evicted,
-                            })),
-                            "Trimmed glibc arenas after session reaper sweep"
-                        );
                     }
                 }
             });
@@ -666,6 +619,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("state")
         .join("daemon_state.json")
 }
 
@@ -1543,12 +1497,12 @@ mod tests {
     }
 
     #[test]
-    fn state_file_path_uses_config_directory() {
+    fn state_file_path_uses_config_state_directory() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
         let path = state_file_path(&config);
-        assert_eq!(path, tmp.path().join("daemon_state.json"));
+        assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
     }
 
     #[tokio::test]
@@ -1625,6 +1579,8 @@ mod tests {
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config.channels.discord.insert(
@@ -1645,6 +1601,8 @@ mod tests {
                 approval_timeout_secs: 0,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(!has_supervised_channels(&config));
@@ -1666,6 +1624,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1706,6 +1666,8 @@ mod tests {
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1761,6 +1723,8 @@ mod tests {
                 auth_header: None,
                 secret: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
                 max_retries: None,
                 retry_base_delay_ms: None,
                 retry_max_delay_ms: None,
@@ -1840,6 +1804,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -1865,6 +1831,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.
