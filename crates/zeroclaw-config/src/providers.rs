@@ -265,7 +265,7 @@ macro_rules! emit_model_providers_struct {
         /// extras visible at the type level).
         ///
         /// TOML shape is preserved byte-identical: each named field deserializes
-        /// from the same `[model_providers.<type>.<alias>]` block as before.
+        /// from the same `[providers.models.<type>.<alias>]` block as before.
         ///
         /// Adding a new model_provider family means: define the typed config in
         /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
@@ -445,6 +445,21 @@ impl ModelProviders {
             };
         }
         for_each_model_provider_slot!(emit_aliases)
+    }
+
+    /// Canonical family slot names, straight from
+    /// `for_each_model_provider_slot!`. Use this to distinguish "unknown
+    /// family" from "known family, missing alias" in validation messages,
+    /// and to detect raw-TOML sections that deserialization silently drops.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        macro_rules! emit_slot_names {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                &[$($type_str),+]
+            };
+        }
+        const NAMES: &[&str] = for_each_model_provider_slot!(emit_slot_names);
+        NAMES
     }
 
     /// Remove the entry for `<provider_type>.<alias>`, returning whether it

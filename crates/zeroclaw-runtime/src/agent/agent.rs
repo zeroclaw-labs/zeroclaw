@@ -1111,7 +1111,7 @@ impl Agent {
                     if !agent_ref.is_empty() {
                         anyhow::bail!(
                             "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
-                             resolve to a configured [model_providers.<type>.<alias>] entry"
+                             resolve to a configured [providers.models.<type>.<alias>] entry"
                         );
                     }
                     // V3 schema requires every agent to set model_provider.
@@ -1293,7 +1293,7 @@ impl Agent {
             Some(m) => m.to_string(),
             None => anyhow::bail!(
                 "agents.{agent_alias}.model_provider resolves to a model_provider entry \
-                 with no `model` set. Configure [model_providers.{provider_name}.<alias>] \
+                 with no `model` set. Configure [providers.models.{provider_name}.<alias>] \
                  model = \"...\".",
             ),
         };

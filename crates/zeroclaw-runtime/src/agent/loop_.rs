@@ -3516,7 +3516,7 @@ pub async fn run(
             Some(m) => m.to_string(),
             None => anyhow::bail!(
                 "no model configured for agent {agent_alias}: \
-             [model_providers.{provider_name}.<alias>].model is unset and --model was not passed"
+             [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
 
@@ -4668,7 +4668,7 @@ pub async fn process_message(
                 if !agent_ref.is_empty() {
                     anyhow::bail!(
                         "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not resolve to \
-                     a configured [model_providers.<type>.<alias>] entry"
+                     a configured [providers.models.<type>.<alias>] entry"
                     );
                 }
                 anyhow::bail!(
@@ -4868,7 +4868,7 @@ pub async fn process_message(
             Some(m) => m.to_string(),
             None => anyhow::bail!(
                 "agents.{agent_alias}.model_provider resolves to a model_provider entry with no \
-             `model` set. Configure [model_providers.{provider_name}.<alias>] model = \"...\"."
+             `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
             ),
         };
         let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(

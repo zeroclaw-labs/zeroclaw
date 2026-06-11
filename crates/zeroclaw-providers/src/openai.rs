@@ -22,7 +22,7 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
 pub struct OpenAiModelProvider {
-    /// `[model_providers.openai.<alias>]` config-key alias.
+    /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
     credential: Option<String>,

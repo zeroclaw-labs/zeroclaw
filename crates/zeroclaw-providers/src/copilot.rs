@@ -189,7 +189,7 @@ struct ResponseMessage {
 /// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
 /// automatically.
 pub struct CopilotModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     github_token: Option<String>,
     /// Mutex ensures only one caller refreshes tokens at a time,
