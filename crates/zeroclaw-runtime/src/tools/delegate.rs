@@ -13,8 +13,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, DelegateToolConfig, ModelProviderConfig, RiskProfileConfig,
-    RuntimeProfileConfig, SkillBundleConfig,
+    AliasedAgentConfig, Config, DelegateToolConfig, ModelProviderConfig, ResolvedRuntime,
+    RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
@@ -112,6 +112,10 @@ pub struct DelegateTool {
 }
 
 impl DelegateTool {
+    /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
+    /// rename cannot desync the two.
+    pub const NAME: &'static str = "delegate";
+
     pub fn new(
         agents: HashMap<String, AliasedAgentConfig>,
         global_credential: Option<String>,
@@ -485,16 +489,41 @@ impl DelegateTool {
             .unwrap_or(false)
     }
 
-    /// Resolve max tool iterations from the named runtime profile (default: 10).
-    fn resolve_max_iterations(&self, runtime_profile: &str) -> usize {
-        if runtime_profile.is_empty() {
-            return 10;
+    /// Resolve the runtime-profile knobs the delegate sub-loop consumes.
+    ///
+    /// Production DelegateTool instances carry `root_config`, so use the
+    /// canonical config resolver there. The fallback only serves legacy unit
+    /// constructors that build DelegateTool from raw maps without a full Config.
+    fn resolve_loop_runtime(
+        &self,
+        agent_alias: &str,
+        agent_config: &AliasedAgentConfig,
+    ) -> ResolvedRuntime {
+        if let Some(root_config) = self.root_config.as_ref()
+            && let Some(resolved_config) = root_config.resolved_agent_config(agent_alias)
+        {
+            return resolved_config.resolved;
         }
-        self.runtime_profiles
-            .get(runtime_profile)
-            .map(|p| p.max_tool_iterations)
-            .filter(|&i| i > 0)
-            .unwrap_or(10)
+
+        let mut resolved = agent_config.resolved.clone();
+
+        if let Some(profile) = self.runtime_profiles.get(&agent_config.runtime_profile) {
+            if profile.max_tool_iterations > 0 {
+                resolved.max_tool_iterations = profile.max_tool_iterations;
+            }
+            if let Some(max_context_tokens) = profile.max_context_tokens {
+                resolved.max_context_tokens = max_context_tokens;
+            }
+            if let Some(parallel_tools) = profile.parallel_tools {
+                resolved.parallel_tools = parallel_tools;
+            }
+            if let Some(max_tool_result_chars) = profile.max_tool_result_chars {
+                resolved.max_tool_result_chars = max_tool_result_chars;
+            }
+            resolved.strict_tool_parsing = profile.strict_tool_parsing;
+        }
+
+        resolved
     }
 
     /// Resolve allowed tools list from the named risk profile (authorization).
@@ -550,7 +579,7 @@ impl DelegateTool {
 #[async_trait]
 impl Tool for DelegateTool {
     fn name(&self) -> &str {
-        "delegate"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
@@ -1655,12 +1684,14 @@ impl DelegateTool {
             });
         }
 
-        let max_iterations = self.resolve_max_iterations(&agent_config.runtime_profile);
+        let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
+        let mut prompt_agent_config = agent_config.clone();
+        prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            agent_config,
+            &prompt_agent_config,
             model,
             &sub_tools,
             &self.workspace_dir,
@@ -1704,7 +1735,7 @@ impl DelegateTool {
                 "delegate",
                 None,
                 &self.multimodal_config,
-                max_iterations,
+                loop_runtime.max_tool_iterations,
                 Some(self.cancellation_token.child_token()),
                 None,
                 None,
@@ -1713,10 +1744,12 @@ impl DelegateTool {
                 None,
                 None,
                 &zeroclaw_config::schema::PacingConfig::default(),
-                agent_config.resolved.strict_tool_parsing,
-                agent_config.resolved.parallel_tools,
-                0,    // max_tool_result_chars: inherit from parent config in future
-                0,    // context_token_budget: 0 = disabled for subagents
+                loop_runtime.strict_tool_parsing,
+                loop_runtime.parallel_tools,
+                loop_runtime.max_tool_result_chars,
+                // Keep delegate subagent context pruning aligned with top-level
+                // agents instead of preserving the old disabled-by-zero path.
+                loop_runtime.max_context_tokens,
                 None, // shared_budget: TODO thread from parent in future
                 None, // channel: delegate subagents don't support approval
                 receipt_generator,
@@ -1979,6 +2012,76 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OneToolThenFinalModelProvider"
+        }
+    }
+
+    struct EchoToolResultThenFinalModelProvider {
+        tool_message: std::sync::Mutex<Option<String>>,
+    }
+
+    impl EchoToolResultThenFinalModelProvider {
+        fn new() -> Self {
+            Self {
+                tool_message: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn tool_message(&self) -> Option<String> {
+            self.tool_message.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EchoToolResultThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
+                *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo_tool".to_string(),
+                        arguments: format!("{{\"value\":\"{}\"}}", "tool-result-limit ".repeat(16)),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for EchoToolResultThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EchoToolResultThenFinalModelProvider"
         }
     }
 
@@ -2619,18 +2722,24 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_strict_tool_parsing_uses_target_agent_policy() {
-        let mut config = agentic_agent_config();
-        config.resolved.strict_tool_parsing = true;
+        let config = agentic_agent_config();
+        let mut runtime_profiles = agentic_runtime_profiles(10);
+        runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .strict_tool_parsing = true;
         let prompt_tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_runtime_profiles(runtime_profiles)
             .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let mut prompt_config = config.clone();
+        prompt_config.resolved = tool.resolve_loop_runtime("agentic", &config);
 
         let prompt = tool
             .build_enriched_system_prompt(
                 "agentic",
-                &config,
+                &prompt_config,
                 "model-test",
                 &prompt_tools,
                 Path::new("/tmp"),
@@ -2736,6 +2845,44 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("maximum tool iterations (2)")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_applies_target_profile_tool_result_limit() {
+        let config = agentic_agent_config();
+        let mut runtime_profiles = agentic_runtime_profiles(10);
+        runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .max_tool_result_chars = Some(80);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(runtime_profiles)
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let model_provider = EchoToolResultThenFinalModelProvider::new();
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let tool_message = model_provider
+            .tool_message()
+            .expect("tool message captured");
+        assert!(
+            tool_message.contains("characters truncated"),
+            "delegate sub-loop should apply the target runtime profile's max_tool_result_chars, got: {}",
+            tool_message
         );
     }
 

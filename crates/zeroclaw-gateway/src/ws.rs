@@ -1388,7 +1388,7 @@ fn record_turn_cost(
     // V3 per-provider pricing lookup. Mirrors how the channels
     // orchestrator and the gateway lib.rs cost-tracking scope build
     // their `ModelProviderPricing`: walk every
-    // `[model_providers.<type>.<alias>]` and key the per-profile
+    // `[providers.models.<type>.<alias>]` and key the per-profile
     // pricing map by `<type>.<alias>`. The streaming and non-streaming
     // paths derive identical costs because both bottom out in the same
     // `<type>.<alias>` key shape.

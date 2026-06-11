@@ -229,6 +229,50 @@ pub fn apply_policy_tool_filter(
     });
 }
 
+pub(crate) fn mcp_tool_access_policy(
+    security: &zeroclaw_config::policy::SecurityPolicy,
+    caller_allowed: Option<&[String]>,
+) -> Option<zeroclaw_tools::tool_search::ToolAccessPolicy> {
+    zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+        security.allowed_tools.as_deref(),
+        security.excluded_tools.as_deref(),
+        caller_allowed,
+    )
+}
+
+pub(crate) fn eager_mcp_tool_allowed(
+    name: &str,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> bool {
+    policy.is_none_or(|policy| policy.is_tool_allowed(name))
+}
+
+pub(crate) fn mcp_allowed_tool_count<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> usize {
+    names
+        .into_iter()
+        .filter(|name| eager_mcp_tool_allowed(name, policy))
+        .count()
+}
+
+pub(crate) fn register_eager_mcp_tool_if_allowed(
+    wrapper: std::sync::Arc<dyn Tool>,
+    tools: &mut Vec<Box<dyn Tool>>,
+    delegate_handle: Option<&tools::DelegateParentToolsHandle>,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> bool {
+    if !eager_mcp_tool_allowed(wrapper.name(), policy) {
+        return false;
+    }
+    if let Some(handle) = delegate_handle {
+        handle.write().push(std::sync::Arc::clone(&wrapper));
+    }
+    tools.push(Box::new(tools::ArcToolRef(wrapper)));
+    true
+}
+
 /// Apply the SecurityPolicy built-in tool filter on the channel/daemon
 /// (`process_message`) path.
 ///
@@ -2643,7 +2687,8 @@ pub async fn run_tool_call_loop(
                     serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
                 (tool_name.trim().to_ascii_lowercase(), args_json)
             };
-            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
+            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name)
+                || crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
             if !dedup_exempt && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
@@ -2994,11 +3039,15 @@ pub async fn run_tool_call_loop(
                 history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
             }
         } else {
-            for (native_call, (_, result)) in
-                native_tool_calls.iter().zip(individual_results.iter())
-            {
+            // `zip` would drop trailing results on any length divergence,
+            // leaving a native tool_use id with no matching tool_result.
+            // Pair on each result's own id instead.
+            for (idx, (tool_call_id, result)) in individual_results.iter().enumerate() {
+                let resolved_id = tool_call_id
+                    .clone()
+                    .or_else(|| native_tool_calls.get(idx).map(|call| call.id.clone()));
                 let tool_msg = serde_json::json!({
-                    "tool_call_id": native_call.id,
+                    "tool_call_id": resolved_id,
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
@@ -3466,9 +3515,8 @@ pub async fn run(
         // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
         // NOTE: MCP tools are injected after built-in tool filtering
         // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
-        // MCP servers are user-declared external integrations; the built-in allow/deny
-        // filter is not appropriate for them and would silently drop all MCP tools when
-        // a restrictive allowlist is configured. Keep this block after any such filter call.
+        // MCP registration and deferred discovery then apply the same policy
+        // explicitly so denied MCP tools never surface in context or delegate handles.
         //
         // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
         // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
@@ -3492,6 +3540,8 @@ pub async fn run(
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
+                    let mcp_policy =
+                        mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -3510,33 +3560,40 @@ pub async fn run(
                                 registry.server_count()
                             )
                         );
-                        // Build access policy from SecurityPolicy so blocked
-                        // MCP tools never surface anywhere in context.
-                        let mcp_policy =
-                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                                security.allowed_tools.as_deref(),
-                                security.excluded_tools.as_deref(),
-                                allowed_tools.as_deref(),
-                            );
+                        let allowed_stub_count = mcp_allowed_tool_count(
+                            deferred_set
+                                .stubs
+                                .iter()
+                                .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy.as_ref(),
+                        );
                         deferred_section = crate::tools::build_deferred_tools_section_filtered(
                             &deferred_set,
                             mcp_policy.as_ref(),
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::tools::ActivatedToolSet::new(),
-                        ));
-                        activated_handle = Some(std::sync::Arc::clone(&activated));
-                        let mut tool_search =
-                            crate::tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy {
-                            tool_search = tool_search.with_access_policy(policy);
+                        if allowed_stub_count > 0 {
+                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::tools::ActivatedToolSet::new(),
+                            ));
+                            activated_handle = Some(std::sync::Arc::clone(&activated));
+                            let mut tool_search =
+                                crate::tools::ToolSearchTool::new(deferred_set, activated);
+                            if let Some(policy) = mcp_policy {
+                                tool_search = tool_search.with_access_policy(policy);
+                            }
+                            tools_registry.push(Box::new(tool_search));
                         }
-                        tools_registry.push(Box::new(tool_search));
                     } else {
-                        // Eager path: register all MCP tools directly
+                        // Eager path: register only MCP tools admitted by the
+                        // same policy used by deferred MCP discovery.
                         let names = registry.tool_names();
                         let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
                             if let Some(def) = registry.get_tool_def(&name).await {
                                 let wrapper: std::sync::Arc<dyn Tool> =
                                     std::sync::Arc::new(crate::tools::McpToolWrapper::new(
@@ -3544,11 +3601,14 @@ pub async fn run(
                                         def,
                                         std::sync::Arc::clone(&registry),
                                     ));
-                                if let Some(ref handle) = delegate_handle {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut tools_registry,
+                                    delegate_handle.as_ref(),
+                                    mcp_policy.as_ref(),
+                                ) {
+                                    registered += 1;
                                 }
-                                tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                                registered += 1;
                             }
                         }
                         ::zeroclaw_log::record!(
@@ -3558,9 +3618,10 @@ pub async fn run(
                                 ::zeroclaw_log::Action::Note
                             ),
                             &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
+                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
-                                registry.server_count()
+                                registry.server_count(),
+                                skipped
                             )
                         );
                     }
@@ -3605,7 +3666,7 @@ pub async fn run(
             Some(m) => m.to_string(),
             None => anyhow::bail!(
                 "no model configured for agent {agent_alias}: \
-             [model_providers.{provider_name}.<alias>].model is unset and --model was not passed"
+             [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
 
@@ -4757,7 +4818,7 @@ pub async fn process_message(
                 if !agent_ref.is_empty() {
                     anyhow::bail!(
                         "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not resolve to \
-                     a configured [model_providers.<type>.<alias>] entry"
+                     a configured [providers.models.<type>.<alias>] entry"
                     );
                 }
                 anyhow::bail!(
@@ -4845,9 +4906,9 @@ pub async fn process_message(
         filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
 
         // ── Wire MCP tools (non-fatal) — process_message path ────────
-        // NOTE: Same ordering contract as the CLI path above — MCP tools must be
-        // injected after the policy tool filter to avoid MCP tools being
-        // silently dropped by a restrictive allowlist.
+        // NOTE: Same ordering contract as the CLI path above. MCP tools are
+        // initialized after built-in filtering, then registration/discovery is
+        // gated explicitly by the agent's security policy.
         let mut deferred_section = String::new();
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
@@ -4867,6 +4928,7 @@ pub async fn process_message(
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
+                    let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -4884,30 +4946,38 @@ pub async fn process_message(
                                 registry.server_count()
                             )
                         );
-                        let mcp_policy_pm =
-                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                                security.allowed_tools.as_deref(),
-                                security.excluded_tools.as_deref(),
-                                None, // no caller-supplied allowlist in channel path
-                            );
+                        let allowed_stub_count_pm = mcp_allowed_tool_count(
+                            deferred_set
+                                .stubs
+                                .iter()
+                                .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy_pm.as_ref(),
+                        );
                         deferred_section = crate::tools::build_deferred_tools_section_filtered(
                             &deferred_set,
                             mcp_policy_pm.as_ref(),
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::tools::ActivatedToolSet::new(),
-                        ));
-                        activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                        let mut tool_search_pm =
-                            crate::tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy_pm {
-                            tool_search_pm = tool_search_pm.with_access_policy(policy);
+                        if allowed_stub_count_pm > 0 {
+                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::tools::ActivatedToolSet::new(),
+                            ));
+                            activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                            let mut tool_search_pm =
+                                crate::tools::ToolSearchTool::new(deferred_set, activated);
+                            if let Some(policy) = mcp_policy_pm {
+                                tool_search_pm = tool_search_pm.with_access_policy(policy);
+                            }
+                            tools_registry.push(Box::new(tool_search_pm));
                         }
-                        tools_registry.push(Box::new(tool_search_pm));
                     } else {
                         let names = registry.tool_names();
                         let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy_pm.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
                             if let Some(def) = registry.get_tool_def(&name).await {
                                 let wrapper: std::sync::Arc<dyn Tool> =
                                     std::sync::Arc::new(crate::tools::McpToolWrapper::new(
@@ -4915,11 +4985,14 @@ pub async fn process_message(
                                         def,
                                         std::sync::Arc::clone(&registry),
                                     ));
-                                if let Some(ref handle) = delegate_handle_pm {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut tools_registry,
+                                    delegate_handle_pm.as_ref(),
+                                    mcp_policy_pm.as_ref(),
+                                ) {
+                                    registered += 1;
                                 }
-                                tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                                registered += 1;
                             }
                         }
                         ::zeroclaw_log::record!(
@@ -4929,9 +5002,10 @@ pub async fn process_message(
                                 ::zeroclaw_log::Action::Note
                             ),
                             &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
+                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
-                                registry.server_count()
+                                registry.server_count(),
+                                skipped
                             )
                         );
                     }
@@ -4957,7 +5031,7 @@ pub async fn process_message(
             Some(m) => m.to_string(),
             None => anyhow::bail!(
                 "agents.{agent_alias}.model_provider resolves to a model_provider entry with no \
-             `model` set. Configure [model_providers.{provider_name}.<alias>] model = \"...\"."
+             `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
             ),
         };
         let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
@@ -6003,6 +6077,39 @@ mod tests {
         fn with_native_tool_support(mut self) -> Self {
             self.capabilities.native_tool_calling = true;
             self
+        }
+
+        /// Build a native-tool-calling provider: one turn of structured
+        /// `tool_calls`, then a plain-text turn.
+        fn from_native_tool_calls(calls: Vec<(&str, &str, &str)>, final_text: &str) -> Self {
+            let tool_turn = ChatResponse {
+                text: None,
+                tool_calls: calls
+                    .into_iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                        extra_content: None,
+                    })
+                    .collect(),
+                usage: None,
+                reasoning_content: None,
+            };
+            let final_turn = ChatResponse {
+                text: Some(final_text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            };
+            let capabilities = ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            };
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::from(vec![tool_turn, final_turn]))),
+                capabilities,
+            }
         }
     }
 
@@ -7373,6 +7480,112 @@ mod tests {
         );
     }
 
+    /// Regression: a native provider emitting multiple parallel tool calls
+    /// in one turn must yield one role=tool message per call, each keyed to
+    /// its own tool_call_id and output.
+    #[tokio::test]
+    async fn run_tool_call_loop_native_emits_tool_message_per_parallel_call() {
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![
+                ("call_a", "delay_a", r#"{"value":"A"}"#),
+                ("call_b", "delay_b", r#"{"value":"B"}"#),
+                ("call_c", "delay_c", r#"{"value":"C"}"#),
+            ],
+            "done",
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_c",
+                10,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+        ];
+
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run three tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            true, // parallel_tools
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("native parallel execution should complete");
+
+        assert!(result.ends_with("done"), "got: {result}");
+
+        let tool_messages: Vec<&ChatMessage> =
+            history.iter().filter(|msg| msg.role == "tool").collect();
+        assert_eq!(
+            tool_messages.len(),
+            3,
+            "every parallel native call must yield its own role=tool message, got: {tool_messages:?}"
+        );
+
+        for (id, value) in [("call_a", "A"), ("call_b", "B"), ("call_c", "C")] {
+            let msg = tool_messages
+                .iter()
+                .find(|m| m.content.contains(id))
+                .unwrap_or_else(|| panic!("missing tool message for {id}: {tool_messages:?}"));
+            assert!(
+                msg.content.contains(&format!("ok:{value}")),
+                "tool_call_id {id} must carry its own output ok:{value}, got: {}",
+                msg.content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
@@ -7742,6 +7955,75 @@ mod tests {
         assert!(
             !tool_results.content.contains("Skipped duplicate tool call"),
             "exempt tool calls should not be suppressed"
+        );
+    }
+
+    /// Identical-prompt calls to re-entrant agent tools (spawn_subagent /
+    /// delegate) must both run even with no config exemption — fan-out is
+    /// intentional, not a duplicate to collapse.
+    #[tokio::test]
+    async fn run_tool_call_loop_reentrant_agent_tools_are_dedup_exempt_by_default() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"spawn_subagent","arguments":{"prompt":"same"}}
+</tool_call>
+<tool_call>
+{"name":"spawn_subagent","arguments":{"prompt":"same"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "spawn_subagent",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("fan out two identical subagents"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[], // no config-provided dedup exemptions
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("loop should finish running both identical subagent calls");
+
+        assert!(result.ends_with("done"), "got: {result}");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "both identical spawn_subagent calls must execute"
         );
     }
 
@@ -12258,6 +12540,10 @@ Let me check the result."#;
         Box::new(NamedMockTool { the_name: name })
     }
 
+    fn mock_tool_arc(name: &'static str) -> std::sync::Arc<dyn TestTool> {
+        std::sync::Arc::new(NamedMockTool { the_name: name })
+    }
+
     fn tool_names(tools: &[Box<dyn TestTool>]) -> Vec<&str> {
         tools.iter().map(|t| t.name()).collect()
     }
@@ -12350,6 +12636,106 @@ Let me check the result."#;
             tools.is_empty(),
             "Some(vec![]) on policy must deny every tool"
         );
+    }
+
+    #[test]
+    fn eager_mcp_policy_allows_only_names_that_pass_policy_and_caller_gates() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["fs__read_file".into(), "slack__post".into()]),
+            excluded_tools: Some(vec!["slack__post".into()]),
+            ..TestPolicy::default()
+        };
+        let caller = vec!["fs__read_file".to_string(), "github__search".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        assert!(
+            super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "name admitted by both policy and caller gates must be registered eagerly"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("slack__post", access_policy.as_ref()),
+            "policy excluded_tools must block eager MCP registration"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "caller allowlist must compose with SecurityPolicy for run() eager MCP"
+        );
+    }
+
+    #[test]
+    fn eager_mcp_policy_uses_security_policy_without_caller_gate_on_process_message() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        let access_policy = super::mcp_tool_access_policy(&policy, None);
+
+        assert!(
+            super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "process_message eager MCP should use the agent SecurityPolicy allowlist"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "non-allowlisted eager MCP names must not be registered on process_message"
+        );
+    }
+
+    #[test]
+    fn deferred_mcp_allowed_count_honors_deny_all_policy() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec![]),
+            ..TestPolicy::default()
+        };
+        let access_policy = super::mcp_tool_access_policy(&policy, None);
+
+        assert_eq!(
+            super::mcp_allowed_tool_count(
+                ["fs__read_file", "github__search"],
+                access_policy.as_ref()
+            ),
+            0,
+            "deferred MCP must not register tool_search when policy admits no MCP stubs"
+        );
+    }
+
+    #[test]
+    fn register_eager_mcp_tool_filters_tools_and_delegate_handle_together() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["fs__read_file".into()]),
+            excluded_tools: Some(vec!["slack__post".into()]),
+            ..TestPolicy::default()
+        };
+        let access_policy = super::mcp_tool_access_policy(&policy, None);
+        let delegate_handle: crate::tools::DelegateParentToolsHandle =
+            std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let mut tools: Vec<Box<dyn TestTool>> = Vec::new();
+
+        assert!(super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("fs__read_file"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("github__search"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("slack__post"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+
+        assert_eq!(tool_names(&tools), vec!["fs__read_file"]);
+        let delegate_names: Vec<String> = delegate_handle
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(delegate_names, vec!["fs__read_file"]);
     }
 
     // ── agent_provider_composite regression ───────────────────────────────
