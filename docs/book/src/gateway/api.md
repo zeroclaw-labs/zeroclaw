@@ -38,7 +38,7 @@ Two endpoints answer the question "what can I do here?":
 `OPTIONS` returns capabilities. `GET /api/config/prop` and `GET /api/config/list`
 return the user's current values. Forms in the dashboard issue `OPTIONS` once
 at load time to learn types and constraints, then `GET` to populate fields,
-then `PUT`/`PATCH` to write. There is no whole-file `GET /api/config` —
+then `PUT`/`PATCH` to write. There is no whole-file `GET /api/config`,
 deliberately. Walk the per-property surface; the schema is the source of truth
 for what fields exist.
 
@@ -60,7 +60,7 @@ returned.
 | `POST` | `/api/config/init?section=...` | Instantiate `None` nested sections with defaults. Mirrors `zeroclaw config init`. |
 | `POST` | `/api/config/migrate` | Apply on-disk schema migration in place. Mirrors `zeroclaw config migrate`. |
 
-## Atomic batch writes — JSON Patch
+## Atomic batch writes: JSON Patch
 
 `PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported op
 subset is `add`, `replace`, `remove`, `test`. Each op runs against an
@@ -71,7 +71,7 @@ state are unchanged.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
 rewriting is not part of this surface. `test` against a `#[secret]` path is
-rejected with `secret_test_forbidden` — a differential outcome would be the
+rejected with `secret_test_forbidden`: a differential outcome would be the
 only signal a client could read, and that would leak the value.
 
 Path syntax: JSON Pointer (`/agents/researcher/model_provider`) or the
@@ -82,11 +82,11 @@ The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
 the same op set against the local Config and returns the same structured
 response shape (`--json` for scripts).
 
-## Secrets — write-only over HTTP
+## Secrets: write-only over HTTP
 
 Secret fields (those marked `#[secret]` or `#[derived_from_secret]` in the
 schema) are **never** readable over HTTP in any form. Responses for secrets
-carry `{populated: bool}` only — no value, no length, no masked stand-in, no
+carry `{populated: bool}` only, no value, no length, no masked stand-in, no
 hash. This is enforced at the response layer regardless of which endpoint is
 called.
 
@@ -119,7 +119,7 @@ from the same `schemars` annotations the daemon uses, so the documentation
 cannot lie about the runtime surface.
 
 The explorer's authentication panel binds to the `bearerAuth` scheme declared
-in the spec — paste your pairing-derived bearer token there before issuing
+in the spec, paste your pairing-derived bearer token there before issuing
 live calls. The CLI shortcut for the URL is `zeroclaw config docs`.
 
 If the Scalar bundle can't load from the CDN (offline / air-gapped install),

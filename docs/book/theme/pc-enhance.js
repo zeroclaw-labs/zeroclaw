@@ -115,9 +115,9 @@
       // Subtitle is intentionally hardcoded here: it is product positioning,
       // not page content, and changes rarely. If it needs to vary per build,
       // promote it to a data-hero-sub attribute read from the landing Markdown.
-      '<p class="pc-hero-sub">Your personal AI assistant — one static binary, runs anywhere, no vendor lock-in.</p>' +
+      '<p class="pc-hero-sub">Your personal AI assistant: one static binary, runs anywhere, no vendor lock-in.</p>' +
       '<div class="pc-hero-actions">' +
-      '<a class="pc-btn pc-btn-primary" href="getting-started/quick-start.html">Quick start →</a>' +
+      '<a class="pc-btn pc-btn-primary" href="getting-started/quickstart.html">Quick start →</a>' +
       '<a class="pc-btn pc-btn-secondary" href="https://github.com/zeroclaw-labs/zeroclaw">GitHub</a>' +
       '</div></div>';
     // Insert the page-derived heading as text, never as HTML, so a crafted
@@ -174,11 +174,86 @@
     obs.observe(box, { childList: true, subtree: true });
   }
 
+  // ── OS tabs ────────────────────────────────────────────────────────────
+  // Authoring: wrap the divergent content in a single
+  //   <div class="os-tabs-src"> ... </div>
+  // with one H3/H4 heading per OS (Linux / macOS / Windows). Each heading and
+  // the markdown beneath it (labelled fenced blocks, prose) becomes a tab
+  // panel. This transform replaces the source div with the radio/label/panel
+  // widget, generating unique ids per instance so multiple pickers coexist.
+  let osTabsSeq = 0;
+  function installOsTabs() {
+    const sources = document.querySelectorAll('.os-tabs-src');
+    sources.forEach(function (src) {
+      const headings = Array.from(src.children).filter(function (el) {
+        return el.tagName === 'H3' || el.tagName === 'H4';
+      });
+      if (headings.length < 1) return;
+
+      const group = 'os-tabs-' + ++osTabsSeq;
+      const wrap = document.createElement('div');
+      wrap.className = 'os-tabs';
+
+      const labels = document.createElement('nav');
+      labels.className = 'os-tab-labels';
+
+      const panels = [];
+      const labelEls = [];
+      headings.forEach(function (h, i) {
+        const id = group + '-' + i;
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = group;
+        radio.id = id;
+        if (i === 0) radio.checked = true;
+        wrap.appendChild(radio);
+
+        const label = document.createElement('label');
+        label.setAttribute('for', id);
+        label.textContent = h.textContent.replace(/\u00B6/g, '').trim();
+        labels.appendChild(label);
+        labelEls.push(label);
+
+        const panel = document.createElement('div');
+        panel.className = 'os-tab-panel';
+        let node = h.nextElementSibling;
+        while (node && node.tagName !== 'H3' && node.tagName !== 'H4') {
+          const next = node.nextElementSibling;
+          panel.appendChild(node);
+          node = next;
+        }
+        panels.push(panel);
+
+        // Active-state is driven here (any number of tabs), not by positional
+        // CSS selectors, so adding a tab needs no CSS change.
+        radio.addEventListener('change', function () {
+          panels.forEach(function (p, j) {
+            p.classList.toggle('is-active', j === i);
+          });
+          labelEls.forEach(function (l, j) {
+            l.classList.toggle('is-active', j === i);
+          });
+        });
+        if (i === 0) {
+          panel.classList.add('is-active');
+          label.classList.add('is-active');
+        }
+      });
+
+      wrap.appendChild(labels);
+      panels.forEach(function (p) {
+        wrap.appendChild(p);
+      });
+      src.replaceWith(wrap);
+    });
+  }
+
   ready(function () {
     installProgressBar();
     installHero();
     installToc();
     wrapTables();
     installFoldableRows();
+    installOsTabs();
   });
 })();

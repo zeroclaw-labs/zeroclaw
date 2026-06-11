@@ -21,6 +21,29 @@ use std::sync::Arc;
 /// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
 
+/// Upper bound on rendered secret-mask bullets. A pasted API key can be
+/// 100+ chars; one bullet per character wraps the masked value across
+/// rows and pushes later fields and the footer out of view. Beyond this
+/// the mask is clipped and a `(+N)` suffix reports the hidden length.
+const SECRET_MASK_MAX: usize = 24;
+
+/// Render a bounded secret mask. One bullet per character lets a pasted
+/// API key wrap across rows and shove later fields off-screen; past
+/// `SECRET_MASK_MAX` the mask is clipped and the hidden length reported
+/// as `(+N)` so the user still has feedback that input was captured.
+fn masked_secret(buf: &str) -> String {
+    let count = buf.chars().count();
+    if count > SECRET_MASK_MAX {
+        format!(
+            "{} (+{})",
+            "•".repeat(SECRET_MASK_MAX),
+            count - SECRET_MASK_MAX
+        )
+    } else {
+        "•".repeat(count)
+    }
+}
+
 use crate::client::{
     QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor, QuickstartFieldSection,
     QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
@@ -45,10 +68,9 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 8] = [
+    const ALL: [Selector; 7] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
-        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -85,6 +107,48 @@ impl Selector {
             Selector::Submit => QuickstartStep::Agent,
         }
     }
+
+    /// Localised title for the selector that owns a validation step, so
+    /// a field error can name where the problem lives (e.g.
+    /// `Model provider / alias: …`) instead of only a count.
+    fn title_for_step(step: QuickstartStep) -> String {
+        let sel = match step {
+            QuickstartStep::ModelProvider => Selector::ModelProvider,
+            QuickstartStep::RiskProfile => Selector::RiskProfile,
+            QuickstartStep::RuntimeProfile => Selector::RuntimeProfile,
+            QuickstartStep::Memory => Selector::Memory,
+            QuickstartStep::Channels => Selector::Channels,
+            QuickstartStep::PeerGroups => Selector::PeerGroups,
+            QuickstartStep::Agent => Selector::Agent,
+        };
+        sel.title()
+    }
+}
+
+/// Drop validation errors for selectors the user hasn't filled yet.
+///
+/// `revalidate` runs after every selector commit, and the runtime
+/// validates the *whole* submission, short-circuiting at the first
+/// failing step. Mid-build that first failure is almost always a
+/// selector the user simply hasn't reached — e.g. the empty risk
+/// profile, surfacing the instant the model provider is committed. Shown
+/// as a red "1 error(s) — fix selectors and resubmit", it reads as if the
+/// step they just finished broke. Keep only errors for selectors the user
+/// has actually filled; unfilled ones are already tracked as `[ ]` in the
+/// checklist, and submit re-validates the full set with nothing empty to
+/// short-circuit on.
+fn retain_filled_selector_errors(
+    form: &FormState,
+    errors: Vec<QuickstartError>,
+) -> Vec<QuickstartError> {
+    errors
+        .into_iter()
+        .filter(|e| {
+            Selector::ALL
+                .iter()
+                .any(|s| form.is_satisfied(*s) && s.step() == e.step)
+        })
+        .collect()
 }
 
 fn opt(value: &str, label: impl Into<String>, help: impl Into<String>) -> PickerOption {
@@ -447,10 +511,9 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        let runtime_profile = match self.runtime_mode {
-            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
-            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
-        };
+        // Runtime profile picker removed from all surfaces; apply silently
+        // forces the `unbounded` preset. Submit it so the field is well-formed.
+        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -541,6 +604,23 @@ struct TextInputModal {
     peer_group_channel: Option<String>,
 }
 
+/// Lifecycle of the live model catalog for a ModelProvider FieldForm.
+/// The form opens immediately in `Pending` so the modal paints a
+/// loading row instead of the picker blocking on the catalog RPC; a
+/// later `tick` resolves it to `Loaded` (model row upgraded to an
+/// enum picker) or `Empty` (catalog unavailable → free-text fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCatalogState {
+    /// Section has no model row (channels) — nothing to load.
+    NotApplicable,
+    /// Catalog fetch not yet started or in flight.
+    Pending,
+    /// Catalog returned variants; model row is a picker.
+    Loaded,
+    /// Catalog was empty or unavailable; model row is free-text.
+    Empty,
+}
+
 struct FieldFormModal {
     selector: Selector,
     /// Provider / channel type chosen in the preceding picker step.
@@ -549,6 +629,7 @@ struct FieldFormModal {
     alias: String,
     fields: Vec<FieldFormRow>,
     cursor: usize,
+    model_catalog: ModelCatalogState,
 }
 
 struct FieldFormRow {
@@ -623,6 +704,7 @@ pub struct QuickstartPane {
     /// `open_modal_for`.
     selector_list_rect: Option<Rect>,
     selector_row_rects: Vec<Rect>,
+    leave_requested: bool,
 }
 
 impl QuickstartPane {
@@ -645,7 +727,12 @@ impl QuickstartPane {
             modal_row_rects: Vec::new(),
             selector_list_rect: None,
             selector_row_rects: Vec::new(),
+            leave_requested: false,
         }
+    }
+
+    pub fn take_leave_request(&mut self) -> bool {
+        std::mem::take(&mut self.leave_requested)
     }
 
     pub async fn init(&mut self) -> anyhow::Result<()> {
@@ -657,13 +744,16 @@ impl QuickstartPane {
 
     pub fn help_context(&self) -> HelpNode {
         HelpNode::entries(vec![
-            HelpEntry::new(vec!["↑/↓"], crate::i18n::t("zc-quickstart-help-move")),
+            HelpEntry::new(
+                vec!["j", "k", "↑/↓"],
+                crate::i18n::t("zc-quickstart-help-move"),
+            ),
             HelpEntry::new(vec!["Enter"], crate::i18n::t("zc-quickstart-help-open")),
             HelpEntry::key(
                 "c",
                 crate::i18n::t_args("zc-quickstart-help-create", &[("enter", "Enter")]),
             ),
-            HelpEntry::key("Esc", crate::i18n::t("zc-quickstart-help-leave")),
+            HelpEntry::new(vec!["q", "Esc"], crate::i18n::t("zc-quickstart-help-leave")),
         ])
     }
 
@@ -743,6 +833,10 @@ impl QuickstartPane {
                 if self.can_create() {
                     self.submit().await;
                 }
+                false
+            }
+            Some(QuickstartTabAction::Back) => {
+                self.leave_requested = true;
                 false
             }
             _ => false,
@@ -1467,7 +1561,7 @@ impl QuickstartPane {
                 self.last_errors.clear();
             }
             Ok(crate::client::QuickstartValidateResult::Errors { errors }) => {
-                self.last_errors = errors;
+                self.last_errors = retain_filled_selector_errors(&self.form, errors);
             }
             Err(_) => {
                 // Validation failures on the wire are non-fatal —
@@ -1494,26 +1588,17 @@ impl QuickstartPane {
                 return;
             }
         };
-        // For the model-provider section, upgrade the `model` row with
-        // live catalog options so it renders as a picker. Empty catalog
-        // → free-text fallback (descriptor unchanged).
-        let model_catalog: Option<Vec<String>> =
-            if matches!(section, QuickstartFieldSection::ModelProvider) {
-                match self.rpc.catalog_models(&type_key).await {
-                    Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-        let rows: Vec<FieldFormRow> = fields
+        // The model catalog is fetched lazily in `tick` so the modal
+        // paints a visible "Loading models…" row instead of freezing
+        // the picker while the catalog RPC is in flight. Bool fields
+        // are seeded here as two-value toggles so the runtime's
+        // `kind: bool` metadata renders as `‹ false › / ‹ true ›`
+        // rather than a raw text input the user has to type into.
+        let mut rows: Vec<FieldFormRow> = fields
             .into_iter()
             .map(|mut d| {
-                if let Some(ref models) = model_catalog
-                    && d.key.eq_ignore_ascii_case("model")
-                {
-                    d.kind = crate::client::QuickstartFieldKind::Enum;
-                    d.enum_variants = Some(models.clone());
+                if matches!(d.kind, crate::client::QuickstartFieldKind::Bool) {
+                    d.enum_variants = Some(vec!["false".to_string(), "true".to_string()]);
                 }
                 // For enum fields, default the buffer to the first
                 // variant so the user lands on a valid value. ←/→
@@ -1537,6 +1622,32 @@ impl QuickstartPane {
                 FieldFormRow { descriptor: d, buf }
             })
             .collect();
+        let model_catalog = if matches!(section, QuickstartFieldSection::ModelProvider) {
+            ModelCatalogState::Pending
+        } else {
+            ModelCatalogState::NotApplicable
+        };
+        // Prepend an editable alias row for ModelProvider so users can
+        // choose a custom alias instead of the hardcoded "default".
+        if matches!(section, QuickstartFieldSection::ModelProvider) {
+            let default_alias = "default".to_string();
+            rows.insert(
+                0,
+                FieldFormRow {
+                    descriptor: QuickstartFieldDescriptor {
+                        key: "alias".to_string(),
+                        label: crate::i18n::t("zc-quickstart-field-label-alias"),
+                        help: crate::i18n::t("zc-quickstart-field-help-alias"),
+                        kind: crate::client::QuickstartFieldKind::String,
+                        is_secret: false,
+                        enum_variants: None,
+                        required: true,
+                        default: Some(default_alias.clone()),
+                    },
+                    buf: default_alias,
+                },
+            );
+        }
         let alias = match section {
             QuickstartFieldSection::ModelProvider => "default".to_string(),
             _ => type_key.clone(),
@@ -1547,7 +1658,55 @@ impl QuickstartPane {
             alias,
             fields: rows,
             cursor: 0,
+            model_catalog,
         }));
+    }
+
+    /// Per-frame poll. Resolves a `Pending` model catalog for an open
+    /// ModelProvider FieldForm: the modal opens immediately so the
+    /// loading row paints, then this fetch upgrades the `model` row to
+    /// an enum picker (`Loaded`) or leaves it as free text (`Empty`)
+    /// when no live catalog is available. Driven from the app idle
+    /// loop the same way Dashboard/Logs panes refresh.
+    pub async fn tick(&mut self) {
+        let pending_type = match self.active_modal.as_ref() {
+            Some(Modal::FieldForm(f)) if f.model_catalog == ModelCatalogState::Pending => {
+                Some(f.type_key.clone())
+            }
+            _ => None,
+        };
+        let Some(type_key) = pending_type else {
+            return;
+        };
+        let models: Option<Vec<String>> = match self.rpc.catalog_models(&type_key).await {
+            Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
+            _ => None,
+        };
+        let Some(Modal::FieldForm(f)) = self.active_modal.as_mut() else {
+            return;
+        };
+        // Re-check identity: the user may have cancelled and reopened a
+        // different type while the catalog RPC was in flight.
+        if f.type_key != type_key || f.model_catalog != ModelCatalogState::Pending {
+            return;
+        }
+        match models {
+            Some(models) => {
+                if let Some(row) = f
+                    .fields
+                    .iter_mut()
+                    .find(|r| r.descriptor.key.eq_ignore_ascii_case("model"))
+                {
+                    row.descriptor.kind = crate::client::QuickstartFieldKind::Enum;
+                    row.descriptor.enum_variants = Some(models.clone());
+                    if !models.contains(&row.buf) {
+                        row.buf = models[0].clone();
+                    }
+                }
+                f.model_catalog = ModelCatalogState::Loaded;
+            }
+            None => f.model_catalog = ModelCatalogState::Empty,
+        }
     }
 
     /// Commit the active FieldFormModal into [`FormState`]. Returns
@@ -1586,11 +1745,11 @@ impl QuickstartPane {
                 let mut provider_fields: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 for row in &f.fields {
-                    // `model` is hoisted to `FormState::model` for the
-                    // summary line; every other descriptor flows
-                    // through `provider_fields` keyed by its schema
-                    // identifier (kebab-case).
-                    if row.descriptor.key == "model" {
+                    // `model` and `alias` are hoisted to FormState
+                    // fields; every other descriptor flows through
+                    // `provider_fields` keyed by its schema identifier
+                    // (kebab-case).
+                    if row.descriptor.key == "model" || row.descriptor.key == "alias" {
                         continue;
                     }
                     let value = row.buf.trim();
@@ -1599,7 +1758,15 @@ impl QuickstartPane {
                     }
                 }
                 self.form.provider_type = f.type_key.clone();
-                self.form.provider_alias = f.alias.clone();
+                // Read alias from the editable field row; fall back to
+                // `f.alias` for backward compatibility (non-ModelProvider
+                // sections keep the auto-generated alias path).
+                let alias_value = pick("alias");
+                self.form.provider_alias = if alias_value.is_empty() {
+                    f.alias.clone()
+                } else {
+                    alias_value
+                };
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
@@ -1766,10 +1933,34 @@ impl QuickstartPane {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
             crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
-        } else if !self.last_errors.is_empty() {
+        } else if let Some(first) = self.last_errors.first() {
+            // Name the first actionable field error so the user knows
+            // which field is invalid, instead of only a count. The
+            // daemon's message often already carries the specifics
+            // (e.g. "alias openai.default already exists").
+            let where_ = Selector::title_for_step(first.step);
+            let field_part = if first.field.is_empty() {
+                String::new()
+            } else {
+                format!(" / {}", first.field)
+            };
+            let more = self.last_errors.len().saturating_sub(1);
+            let suffix = if more > 0 {
+                crate::i18n::t_args(
+                    "zc-quickstart-status-more-errors",
+                    &[("count", &more.to_string())],
+                )
+            } else {
+                String::new()
+            };
             crate::i18n::t_args(
-                "zc-quickstart-status-errors",
-                &[("count", &self.last_errors.len().to_string())],
+                "zc-quickstart-status-first-error",
+                &[
+                    ("where", where_.trim()),
+                    ("field", &field_part),
+                    ("message", first.message.trim()),
+                    ("more", &suffix),
+                ],
             )
         } else if can_create {
             crate::i18n::t_args("zc-quickstart-status-can-create", &[("chord", "c")])
@@ -1803,6 +1994,32 @@ fn generate_run_id() -> String {
         .unwrap_or(0);
     let pid = std::process::id();
     format!("{now:x}-{pid:x}")
+}
+
+/// Wrapped visual-row height of each logical line at `width`, using the
+/// same word-wrap (`Wrap { trim: false }`) the modal body renders with.
+/// Every line occupies at least one row — a blank line still takes a row.
+///
+/// Sizing the modal by logical line count alone left it too short
+/// whenever content soft-wrapped: long risk-profile blurbs pushed the
+/// `yolo` option off-screen, and a long pasted `api_key` pushed the
+/// `model` picker out of view. These heights drive both the box size and
+/// the cursor-tracking scroll so the geometry survives wrapping.
+fn wrapped_row_heights(lines: &[Line], width: u16) -> Vec<u16> {
+    lines
+        .iter()
+        .map(|line| {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1) as u16
+        })
+        .collect()
+}
+
+/// Total wrapped rows a block of lines occupies at `width`.
+fn wrapped_total(lines: &[Line], width: u16) -> u16 {
+    wrapped_row_heights(lines, width).iter().copied().sum()
 }
 
 /// Paint the modal and return `(inner_rect, row_to_cursor)` so the
@@ -1862,7 +2079,7 @@ fn draw_modal(
         }
         Modal::TextInput(t) => {
             let display = if t.is_secret {
-                "•".repeat(t.buf.chars().count())
+                masked_secret(&t.buf)
             } else {
                 t.buf.clone()
             };
@@ -1896,8 +2113,6 @@ fn draw_modal(
                     theme::dim_style(),
                 ),
                 Span::styled(f.type_key.as_str(), theme::accent_style()),
-                Span::styled("    Alias: ", theme::dim_style()),
-                Span::styled(f.alias.as_str(), theme::body_style()),
             ]));
             lines.push(Line::from(""));
             for (i, row) in f.fields.iter().enumerate() {
@@ -1909,23 +2124,50 @@ fn draw_modal(
                 } else {
                     theme::body_style()
                 };
+                let is_model_row = row.descriptor.key.eq_ignore_ascii_case("model");
+                // Secret fields render a bounded mask so a pasted,
+                // realistic-length API key cannot wrap across rows and
+                // push later fields and the footer out of view.
                 let raw_display = if row.descriptor.is_secret {
-                    "•".repeat(row.buf.chars().count())
+                    masked_secret(&row.buf)
                 } else {
                     row.buf.clone()
                 };
-                let is_ghost = raw_display.is_empty();
-                let display = if is_ghost {
-                    row.descriptor.default.clone().unwrap_or_default()
-                } else {
-                    raw_display
-                };
-                let value_style = if is_ghost {
-                    theme::dim_style().add_modifier(Modifier::ITALIC)
-                } else {
-                    theme::dim_style()
-                };
+                let is_empty_buf = raw_display.is_empty();
                 let is_enum = row.descriptor.enum_variants.is_some();
+                // Ghost text (the field default) is a placeholder for an
+                // empty buffer, but only when the row is NOT focused.
+                // Showing it on the focused row makes the default look
+                // like real, editable text the user cannot Backspace
+                // away — the alias `default` ghost-state defect. The
+                // focused empty row renders empty so the cursor sits
+                // where typing lands.
+                let show_ghost = is_empty_buf && !is_cursor && !is_enum;
+                let (display, value_style) =
+                    if is_model_row && f.model_catalog == ModelCatalogState::Pending {
+                        (
+                            crate::i18n::t_args(
+                                "zc-quickstart-model-loading",
+                                &[("provider", f.type_key.as_str())],
+                            ),
+                            theme::dim_style().add_modifier(Modifier::ITALIC),
+                        )
+                    } else if is_model_row
+                        && f.model_catalog == ModelCatalogState::Empty
+                        && is_empty_buf
+                    {
+                        (
+                            crate::i18n::t("zc-quickstart-model-catalog-empty"),
+                            theme::dim_style().add_modifier(Modifier::ITALIC),
+                        )
+                    } else if show_ghost {
+                        (
+                            row.descriptor.default.clone().unwrap_or_default(),
+                            theme::dim_style().add_modifier(Modifier::ITALIC),
+                        )
+                    } else {
+                        (raw_display, theme::dim_style())
+                    };
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
                     Span::styled(format!("{:14}", row.descriptor.label), label_style),
@@ -1933,7 +2175,7 @@ fn draw_modal(
                     Span::styled(if is_enum { "‹ " } else { "" }, theme::accent_style()),
                     Span::styled(display, value_style),
                     Span::styled(if is_enum { " ›" } else { "" }, theme::accent_style()),
-                    if is_cursor {
+                    if is_cursor && !is_enum {
                         Span::styled("█", theme::accent_style())
                     } else {
                         Span::raw("")
@@ -2184,15 +2426,40 @@ fn draw_modal(
     };
 
     let box_w = area.width.saturating_sub(8).min(80);
-    let header_h = header_lines.len() as u16;
-    let total_content = header_h + body_lines.len() as u16;
-    let box_h = (total_content + 4).min(area.height.saturating_sub(4));
+    let block = theme::modal_block(&title).padding(Padding::horizontal(1));
+    // Width left for wrapped text inside the block (its borders plus the
+    // horizontal padding). Measured off the block so it tracks any future
+    // border/padding change rather than hard-coding `box_w - 4`.
+    let inner_width = block
+        .inner(Rect::new(area.x, area.y, box_w, area.height))
+        .width;
+
+    // Size the box from the *wrapped* row counts, not the logical line
+    // counts. Long picker blurbs and long pasted field values (e.g. an
+    // `api_key`) soft-wrap across several rows; sizing by line count alone
+    // left the box too short, so later rows — the `yolo` risk option, the
+    // `model` picker — fell outside the viewport entirely.
+    let body_heights = wrapped_row_heights(&body_lines, inner_width);
+    let header_rows = wrapped_total(&header_lines, inner_width);
+    // Prefix sums: where each logical body line begins in wrapped-row
+    // space. `row_starts[i]` is line `i`'s first row; the trailing entry
+    // is the total wrapped-row count.
+    let mut row_starts: Vec<u16> = Vec::with_capacity(body_heights.len() + 1);
+    let mut acc = 0u16;
+    for h in &body_heights {
+        row_starts.push(acc);
+        acc = acc.saturating_add(*h);
+    }
+    row_starts.push(acc);
+    let body_rows = acc;
+    // content rows + top/bottom border + footer row (+1 slack).
+    let box_h = (header_rows.saturating_add(body_rows).saturating_add(4))
+        .min(area.height.saturating_sub(4));
     let x = area.x + area.width.saturating_sub(box_w) / 2;
     let y = area.y + area.height.saturating_sub(box_h) / 2;
     let rect = Rect::new(x, y, box_w, box_h);
 
     frame.render_widget(Clear, rect);
-    let block = theme::modal_block(&title).padding(Padding::horizontal(1));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -2200,7 +2467,7 @@ fn draw_modal(
     // space is split between an optional header band (per-field help)
     // and the body (form rows / picker entries).
     let inner_content_h = inner.height.saturating_sub(1);
-    let effective_header_h = header_h.min(inner_content_h);
+    let effective_header_h = header_rows.min(inner_content_h);
     let header_rect = Rect::new(inner.x, inner.y, inner.width, effective_header_h);
     let body_rect = Rect::new(
         inner.x,
@@ -2209,24 +2476,35 @@ fn draw_modal(
         inner_content_h.saturating_sub(effective_header_h),
     );
 
-    let body_h = body_rect.height as usize;
-    let body_len = body_lines.len();
-    let scroll_offset: u16 = if body_len > body_h && body_h > 0 {
-        // Pick the cursor line that should stay visible. Modals without
-        // a row cursor (TextInput) leave this as None and the body just
-        // top-aligns; everything else (Picker, FieldForm, ChannelList)
-        // keeps the selected row inside the viewport.
-        let selected_line = match modal {
-            Modal::Picker(p) => cursor_lines.get(p.cursor).copied(),
-            Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
-            Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
-            Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
-            Modal::Agent(a) => cursor_lines.get(a.cursor).copied(),
-            Modal::TextInput(_) => None,
-        };
+    let body_h = body_rect.height;
+    // Which cursor row must stay visible. TextInput has no row cursor, so
+    // its body just top-aligns; everything else keeps the selected row in
+    // view. `selected_line` is a logical body-line index; `row_starts`
+    // maps it into wrapped-row space so the scroll math survives wrapping.
+    let selected_line = match modal {
+        Modal::Picker(p) => cursor_lines.get(p.cursor).copied(),
+        Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
+        Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
+        Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
+        Modal::Agent(a) => cursor_lines.get(a.cursor).copied(),
+        Modal::TextInput(_) => None,
+    };
+    let scroll_offset: u16 = if body_rows > body_h && body_h > 0 {
         match selected_line {
-            Some(sel) if sel >= body_h => (sel + 1 - body_h) as u16,
-            _ => 0,
+            Some(line) => {
+                let start = row_starts.get(line).copied().unwrap_or(0);
+                let end = row_starts.get(line + 1).copied().unwrap_or(body_rows);
+                if end <= body_h {
+                    // Selected row ends within the first screenful — no scroll.
+                    0
+                } else {
+                    // Bring the selected row's bottom to the viewport bottom,
+                    // but never past its top (handles a row taller than the
+                    // viewport, e.g. a long pasted secret rendered as bullets).
+                    (end - body_h).min(start)
+                }
+            }
+            None => 0,
         }
     } else {
         0
@@ -2265,10 +2543,20 @@ fn draw_modal(
     let row_rects: Vec<Rect> = cursor_lines
         .into_iter()
         .map(|line_idx| {
-            let scrolled = (line_idx as u16).checked_sub(scroll_offset);
-            match scrolled {
+            let start = row_starts.get(line_idx).copied().unwrap_or(0);
+            let height = body_heights.get(line_idx).copied().unwrap_or(1).max(1);
+            match start.checked_sub(scroll_offset) {
                 Some(dy) if dy < body_rect.height => {
-                    Rect::new(body_rect.x, body_rect.y + dy, body_rect.width, 1)
+                    // Span the row's full wrapped height (clipped to the
+                    // viewport) so a click on a wrapped continuation row
+                    // still resolves to the right cursor.
+                    let visible = height.min(body_rect.height - dy);
+                    Rect::new(
+                        body_rect.x,
+                        body_rect.y + dy,
+                        body_rect.width,
+                        visible.max(1),
+                    )
                 }
                 _ => Rect::new(0, 0, 0, 0),
             }
@@ -2319,6 +2607,48 @@ mod tests {
         assert!(!f.all_selectors_satisfied());
     }
 
+    fn err(step: QuickstartStep) -> QuickstartError {
+        QuickstartError {
+            step,
+            field: String::new(),
+            message: "boom".into(),
+        }
+    }
+
+    #[test]
+    fn revalidate_hides_errors_for_unfilled_selectors() {
+        // Regression: committing the model provider triggered a full
+        // re-validate. The runtime short-circuits at the first failing
+        // step, so the still-empty risk profile came back as a single
+        // error and the status strip flashed "1 error(s) — fix selectors
+        // and resubmit", as if the provider step had failed.
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+        assert!(f.is_satisfied(Selector::ModelProvider));
+        assert!(!f.is_satisfied(Selector::RiskProfile));
+
+        let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::RiskProfile)]);
+        assert!(
+            kept.is_empty(),
+            "an unfilled selector's error must not surface mid-build: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn revalidate_keeps_errors_for_filled_selectors() {
+        // A real problem with a selector the user *has* filled (e.g. an
+        // alias collision on the model provider) must still surface.
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+
+        let kept = retain_filled_selector_errors(&f, vec![err(QuickstartStep::ModelProvider)]);
+        assert_eq!(kept.len(), 1, "filled-selector errors must be retained");
+    }
+
     #[test]
     fn name_field_accepts_hotkey_letters() {
         // Regression: e/t/c/d double as Agent-modal hotkeys (edit in
@@ -2359,5 +2689,150 @@ mod tests {
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
             .unwrap_or_default();
         assert!(seeded.is_empty());
+    }
+
+    #[test]
+    fn secret_mask_is_bounded() {
+        // A short secret masks one bullet per char; a realistic-length
+        // key clips at the cap and reports the hidden remainder so it
+        // can never wrap across rows and hide later fields/footer.
+        assert_eq!(masked_secret("abc"), "•••");
+        assert_eq!(masked_secret(""), "");
+        let long = "x".repeat(100);
+        let masked = masked_secret(&long);
+        assert_eq!(
+            masked.chars().filter(|&c| c == '•').count(),
+            SECRET_MASK_MAX
+        );
+        assert!(masked.ends_with(&format!("(+{})", 100 - SECRET_MASK_MAX)));
+    }
+
+    #[test]
+    fn step_titles_round_trip_through_selector() {
+        // Every validation step must resolve to its owning selector's
+        // title so a field error can name where the problem lives. A
+        // dropped arm would panic the title lookup or mislabel an error.
+        for step in [
+            QuickstartStep::ModelProvider,
+            QuickstartStep::RiskProfile,
+            QuickstartStep::RuntimeProfile,
+            QuickstartStep::Memory,
+            QuickstartStep::Channels,
+            QuickstartStep::PeerGroups,
+            QuickstartStep::Agent,
+        ] {
+            assert!(!Selector::title_for_step(step).is_empty());
+        }
+    }
+
+    #[test]
+    fn wrapped_total_counts_soft_wrapped_rows() {
+        // Regression: the modal box was sized from logical line count, so
+        // a picker blurb (or pasted value) wider than the box still
+        // counted as one row — leaving later options like `yolo` outside
+        // the viewport. `wrapped_total` must report the real wrapped
+        // height the body Paragraph renders.
+        let long = Line::from("a".repeat(40));
+        assert_eq!(wrapped_total(std::slice::from_ref(&long), 10), 4);
+        // A blank line still occupies one row.
+        let blank = Line::from("");
+        assert_eq!(wrapped_total(std::slice::from_ref(&blank), 10), 1);
+    }
+
+    #[test]
+    fn wrapped_row_heights_are_measured_per_line() {
+        // Each logical line wraps independently; the per-line heights feed
+        // the prefix sums that keep scroll + click hit-testing aligned
+        // when an earlier row (e.g. a long api_key) wraps.
+        let lines = vec![
+            Line::from("short"),
+            Line::from("x".repeat(25)), // 25 / 10 -> 3 rows
+            Line::from("ok"),
+        ];
+        assert_eq!(wrapped_row_heights(&lines, 10), vec![1, 3, 1]);
+        assert_eq!(wrapped_total(&lines, 10), 5);
+    }
+
+    /// Render a modal through a headless `TestBackend` and return the
+    /// `(box_rect, per-cursor hit-rects)` `draw_modal` produced — the same
+    /// geometry the live render path uses, so a test can assert on the
+    /// post-scroll, wrapped-row layout instead of just the measurement
+    /// primitives.
+    fn render_modal_rects(area: Rect, modal: &Modal) -> (Rect, Vec<Rect>) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut out = None;
+        terminal
+            .draw(|frame| {
+                out = Some(draw_modal(frame, area, modal, &[], &[]));
+            })
+            .expect("draw");
+        out.expect("draw_modal ran")
+    }
+
+    fn risk_picker(cursor: usize, help: &str) -> Modal {
+        Modal::Picker(PickerModal {
+            selector: Selector::RiskProfile,
+            purpose: PickerPurpose::DirectChoice,
+            options: vec![
+                opt("locked_down", "Locked Down", help),
+                opt("balanced", "Balanced", help),
+                opt("yolo", "YOLO", help),
+            ],
+            cursor,
+        })
+    }
+
+    #[test]
+    fn picker_keeps_every_option_visible_when_blurbs_wrap() {
+        // #7359 headline: each risk-profile option carries an inline help
+        // blurb that wraps to two rows. The old box was sized from the
+        // logical line count (3), so the last option (`yolo`) fell off the
+        // bottom. With wrapped sizing the box grows to fit all three, and
+        // the hit-rects are spaced by *wrapped* height (>=2 rows apart),
+        // not logical lines (which would be 1 apart — the pre-fix bug).
+        let help = "Applies specific filesystem and approval defaults for day-to-day operation.";
+        let modal = risk_picker(2, help);
+        let area = Rect::new(0, 0, 60, 24);
+        let (rect, rects) = render_modal_rects(area, &modal);
+        assert_eq!(rects.len(), 3);
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.height > 0, "option {i} must be visible, got {r:?}");
+            assert!(
+                in_rect(r.x, r.y, rect),
+                "option {i} must sit inside the modal box {rect:?}, got {r:?}"
+            );
+        }
+        assert!(
+            rects[1].y >= rects[0].y + 2 && rects[2].y >= rects[1].y + 2,
+            "hit-rects must be spaced by wrapped height, not logical lines: {rects:?}"
+        );
+    }
+
+    #[test]
+    fn picker_scrolls_to_keep_selected_option_visible() {
+        // When even the grown box can't fit every wrapped row, the selected
+        // row must scroll into view: its hit-rect is non-zero while an
+        // earlier row that scrolled off the top collapses to a zero rect.
+        // This exercises the row_starts -> scroll_offset -> row_rects chain
+        // that the measurement-helper tests don't reach. On the pre-fix code
+        // (logical-line scroll) the first option's rect stayed non-zero.
+        let help = "Applies specific filesystem and approval defaults, with extra \
+                    explanation to force several wrapped rows inside a narrow modal box.";
+        let modal = risk_picker(2, help);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_rect, rects) = render_modal_rects(area, &modal);
+        assert_eq!(rects.len(), 3);
+        assert!(
+            rects[2].height > 0,
+            "selected option must scroll into view, got {:?}",
+            rects[2]
+        );
+        assert_eq!(
+            rects[0].height, 0,
+            "first option must scroll off the top, got {:?}",
+            rects[0]
+        );
     }
 }

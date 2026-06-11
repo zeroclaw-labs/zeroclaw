@@ -3,8 +3,8 @@ use crate::multimodal;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
-    TokenUsage, ToolCall as ProviderToolCall,
+    ModelInfo, ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
@@ -528,6 +528,15 @@ impl ModelProvider for OpenRouterModelProvider {
         Ok(ids)
     }
 
+    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        // OpenRouter's public `/models` payload carries a `pricing` object per
+        // model. The default trait impl would discard it (delegates to
+        // `list_models` → `pricing: None`); override to surface pricing so the
+        // cost-rates editor can prefill rates for the first-class `openrouter`
+        // slot, matching the OpenAI-compatible vendor-fallback path.
+        crate::openrouter_catalog::list_all_models_with_pricing().await
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -544,7 +553,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
 
@@ -622,7 +631,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
 
@@ -694,7 +703,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
 
@@ -786,7 +795,7 @@ impl ModelProvider for OpenRouterModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                        "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.".to_string(),
                     ))
                 })
                 .boxed();
@@ -889,7 +898,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
 
