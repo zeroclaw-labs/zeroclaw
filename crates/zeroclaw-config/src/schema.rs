@@ -15303,15 +15303,23 @@ impl Config {
             // Unknown provider families are dropped by serde, so an alias
             // created under a typo'd or unsupported family silently vanishes
             // on reload while agents.*.model_provider still references it.
-            for family in Self::unknown_provider_families(&contents) {
+            for entry in Self::unknown_provider_families(&contents) {
+                let (kind, family) = entry.split_once('.').unwrap_or(("models", entry.as_str()));
+                let reference = if kind == "models" {
+                    "any agents.*.model_provider referencing them will fail to resolve; \
+                     run `zeroclaw providers` for valid family names"
+                } else {
+                    "references to its aliases will fail to resolve"
+                };
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"family": family})),
-                    "[providers.models.<family>] section dropped: not a known provider family. \
-                     Its aliases will not load and any agents.*.model_provider referencing them \
-                     will fail to resolve. Run `zeroclaw providers` for valid family names."
+                        .with_attrs(::serde_json::json!({"kind": kind, "family": family})),
+                    &format!(
+                        "[providers.{kind}.{family}] section dropped: not a known {kind} \
+                         provider family. Its aliases will not load and {reference}."
+                    )
                 );
             }
             // Set computed paths that are skipped during serialization

@@ -790,34 +790,6 @@ macro_rules! for_each_tts_provider_slot {
     };
 }
 
-impl TtsProviders {
-    /// Canonical TTS family slot names. Mirrors
-    /// `ModelProviders::slot_names`; closed set, listed inline because
-    /// `for_each_tts_provider_slot!` carries a rate-type parameter that
-    /// makes it awkward for name-only collection. The
-    /// `provider_slot_names_match_struct_fields` test guards drift.
-    #[must_use]
-    pub fn slot_names() -> &'static [&'static str] {
-        &["openai", "elevenlabs", "google", "edge", "piper"]
-    }
-}
-
-impl TranscriptionProviders {
-    /// Canonical transcription family slot names. See
-    /// [`TtsProviders::slot_names`] for the drift guard.
-    #[must_use]
-    pub fn slot_names() -> &'static [&'static str] {
-        &[
-            "groq",
-            "openai",
-            "deepgram",
-            "assemblyai",
-            "google",
-            "local_whisper",
-        ]
-    }
-}
-
 /// Slot list for transcription providers.
 #[macro_export]
 macro_rules! for_each_transcription_provider_slot {
@@ -832,6 +804,36 @@ macro_rules! for_each_transcription_provider_slot {
             (local_whisper, "local_whisper"),
         }
     };
+}
+
+/// Collect the `$type_str` names out of a rate-typed slot macro
+/// (`for_each_tts_provider_slot!` / `for_each_transcription_provider_slot!`).
+/// The `$rate_ty` head is consumed and ignored; the macro exists so
+/// `slot_names()` derives from the same source the structs are built from.
+macro_rules! collect_rate_slot_names {
+    ($rate_ty:ty, $(($field:ident, $type_str:literal)),+ $(,)?) => {
+        &[$($type_str),+]
+    };
+}
+
+impl TtsProviders {
+    /// Canonical TTS family slot names, derived from
+    /// `for_each_tts_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_tts_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
+}
+
+impl TranscriptionProviders {
+    /// Canonical transcription family slot names, derived from
+    /// `for_each_transcription_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_transcription_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
 }
 
 /// Emit a `<Family>CostRatesByProvider` struct from a slot list. Used
