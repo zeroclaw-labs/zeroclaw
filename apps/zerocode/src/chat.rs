@@ -4366,7 +4366,7 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
 pub async fn open_editor_for_content(content: &str) -> String {
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
+        .unwrap_or_else(|_| "nano".to_string());
 
     let tmp = match tempfile::NamedTempFile::new() {
         Ok(f) => f,

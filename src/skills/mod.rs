@@ -543,7 +543,7 @@ fn prompt_for_description(description: Option<String>) -> Result<String> {
 }
 
 fn open_in_editor(path: &std::path::Path) -> Result<()> {
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
     let status = std::process::Command::new(&editor).arg(path).status()?;
     if !status.success() {
         anyhow::bail!("{editor} exited with non-zero status");

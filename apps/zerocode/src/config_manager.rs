@@ -3923,7 +3923,7 @@ fn edit_in_external_editor(
             if cfg!(windows) {
                 "notepad".into()
             } else {
-                "vi".into()
+                "nano".into()
             }
         });
 
