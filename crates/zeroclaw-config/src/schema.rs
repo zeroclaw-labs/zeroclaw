@@ -12812,6 +12812,13 @@ pub struct LarkConfig {
     #[serde(default)]
     pub per_user_session: bool,
 
+    /// Override for the top-level `ack_reactions` setting. When `None`, the
+    /// channel falls back to `[channels].ack_reactions`. When set
+    /// explicitly, it takes precedence.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
+
     /// Streaming mode for the LLM response: `off` (default) routes every
     /// response through `send()`; `partial` opens a Feishu interactive
     /// card and edits it incrementally via `update_draft` /
