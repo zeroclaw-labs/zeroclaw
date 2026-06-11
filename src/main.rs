@@ -39,7 +39,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
@@ -1080,6 +1080,17 @@ async fn run_quickstart_cli(
         FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
         snapshot_state,
     };
+
+    // Guard: dialoguer checklist requires an interactive terminal.
+    // Without a TTY the loop redraws infinitely, flooding stdout (#7507).
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if !stdin_is_tty {
+        anyhow::bail!(
+            "quickstart requires an interactive terminal.\n\
+             Re-run with all required flags for non-interactive use:\n\
+               zeroclaw quickstart --model-provider <type> --model <name> --api-key <key> --agent <alias>"
+        );
+    }
 
     // ── Form state ──────────────────────────────────────────────
     //
