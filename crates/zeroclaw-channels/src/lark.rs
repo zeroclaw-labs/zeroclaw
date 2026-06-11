@@ -17,7 +17,48 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
+    "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
+];
+const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
+    "OK",
+    "JIAYI",
+    "APPLAUSE",
+    "THUMBSUP",
+    "FINGERHEART",
+    "SMILE",
+    "DONE",
+];
+const LARK_ACK_REACTIONS_EN: &[&str] = &[
+    "OK",
+    "THUMBSUP",
+    "THANKS",
+    "MUSCLE",
+    "FINGERHEART",
+    "APPLAUSE",
+    "SMILE",
+    "DONE",
+];
+const LARK_ACK_REACTIONS_JA: &[&str] = &[
+    "OK",
+    "THUMBSUP",
+    "THANKS",
+    "MUSCLE",
+    "FINGERHEART",
+    "APPLAUSE",
+    "SMILE",
+    "DONE",
+];
+
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LarkAckLocale {
+    ZhCn,
+    ZhTw,
+    En,
+    Ja,
+}
 
 /// Map a unicode emoji used by generic callers of [`Channel::add_reaction`]
 /// (e.g. Reply-Intent Precheck, no-reply ack heuristics) to a Lark/Feishu
@@ -3452,6 +3493,201 @@ fn inferred_audio_filename(file_key: &str) -> String {
     } else {
         "voice.m4a".to_string()
     }
+}
+
+fn pick_uniform_index(len: usize) -> usize {
+    debug_assert!(len > 0);
+    let upper = len as u64;
+    let reject_threshold = (u64::MAX / upper) * upper;
+
+    loop {
+        let value = rand::random::<u64>();
+        if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
+            return (value % upper) as usize;
+        }
+    }
+}
+
+fn random_from_pool(pool: &'static [&'static str]) -> &'static str {
+    pool[pick_uniform_index(pool.len())]
+}
+
+fn lark_ack_pool(locale: LarkAckLocale) -> &'static [&'static str] {
+    match locale {
+        LarkAckLocale::ZhCn => LARK_ACK_REACTIONS_ZH_CN,
+        LarkAckLocale::ZhTw => LARK_ACK_REACTIONS_ZH_TW,
+        LarkAckLocale::En => LARK_ACK_REACTIONS_EN,
+        LarkAckLocale::Ja => LARK_ACK_REACTIONS_JA,
+    }
+}
+
+fn map_locale_tag(tag: &str) -> Option<LarkAckLocale> {
+    let normalized = tag.trim().to_ascii_lowercase().replace('-', "_");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if normalized.starts_with("ja") {
+        return Some(LarkAckLocale::Ja);
+    }
+    if normalized.starts_with("en") {
+        return Some(LarkAckLocale::En);
+    }
+    if normalized.contains("hant")
+        || normalized.starts_with("zh_tw")
+        || normalized.starts_with("zh_hk")
+        || normalized.starts_with("zh_mo")
+    {
+        return Some(LarkAckLocale::ZhTw);
+    }
+    if normalized.starts_with("zh") {
+        return Some(LarkAckLocale::ZhCn);
+    }
+    None
+}
+
+fn find_locale_hint(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "locale",
+                "language",
+                "lang",
+                "i18n_locale",
+                "user_locale",
+                "locale_id",
+            ] {
+                if let Some(locale) = map.get(key).and_then(serde_json::Value::as_str) {
+                    return Some(locale.to_string());
+                }
+            }
+
+            for child in map.values() {
+                if let Some(locale) = find_locale_hint(child) {
+                    return Some(locale);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                if let Some(locale) = find_locale_hint(child) {
+                    return Some(locale);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn detect_locale_from_post_content(content: &str) -> Option<LarkAckLocale> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let obj = parsed.as_object()?;
+    for key in obj.keys() {
+        if let Some(locale) = map_locale_tag(key) {
+            return Some(locale);
+        }
+    }
+    None
+}
+
+fn is_japanese_kana(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3040..=0x309F | // Hiragana
+        0x30A0..=0x30FF | // Katakana
+        0x31F0..=0x31FF // Katakana Phonetic Extensions
+    )
+}
+
+fn is_cjk_han(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | // CJK Extension A
+        0x4E00..=0x9FFF // CJK Unified Ideographs
+    )
+}
+
+fn is_traditional_only_han(ch: char) -> bool {
+    matches!(
+        ch,
+        '奮' | '鬥'
+            | '強'
+            | '體'
+            | '國'
+            | '臺'
+            | '萬'
+            | '與'
+            | '為'
+            | '這'
+            | '學'
+            | '機'
+            | '開'
+            | '裡'
+    )
+}
+
+fn is_simplified_only_han(ch: char) -> bool {
+    matches!(
+        ch,
+        '奋' | '斗'
+            | '强'
+            | '体'
+            | '国'
+            | '台'
+            | '万'
+            | '与'
+            | '为'
+            | '这'
+            | '学'
+            | '机'
+            | '开'
+            | '里'
+    )
+}
+
+fn detect_locale_from_text(text: &str) -> Option<LarkAckLocale> {
+    if text.chars().any(is_japanese_kana) {
+        return Some(LarkAckLocale::Ja);
+    }
+    if text.chars().any(is_traditional_only_han) {
+        return Some(LarkAckLocale::ZhTw);
+    }
+    if text.chars().any(is_simplified_only_han) {
+        return Some(LarkAckLocale::ZhCn);
+    }
+    if text.chars().any(is_cjk_han) {
+        return Some(LarkAckLocale::ZhCn);
+    }
+    None
+}
+
+fn detect_lark_ack_locale(
+    payload: Option<&serde_json::Value>,
+    fallback_text: &str,
+) -> LarkAckLocale {
+    if let Some(payload) = payload {
+        if let Some(locale) = find_locale_hint(payload).and_then(|hint| map_locale_tag(&hint)) {
+            return locale;
+        }
+
+        let message_content = payload
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/event/message/content")
+                    .and_then(serde_json::Value::as_str)
+            });
+
+        if let Some(locale) = message_content.and_then(detect_locale_from_post_content) {
+            return locale;
+        }
+    }
+
+    detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
 }
 
 /// Detect image MIME type from magic bytes, falling back to Content-Type header.
