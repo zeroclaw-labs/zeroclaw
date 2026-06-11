@@ -548,14 +548,34 @@ fn prune_bad_provider_aliases(value: &mut toml::Value, dropped: &mut Vec<String>
         return;
     };
 
+    // Non-table nodes where a kind/family map is required (e.g.
+    // `[providers.models] ollama = "oops"`) would otherwise still sink the
+    // whole section in prune_bad_top_level_sections. Drop just the node.
+    let scalar_kinds: Vec<String> = provider_kinds
+        .iter()
+        .filter(|(_, v)| !v.is_table())
+        .map(|(k, _)| k.clone())
+        .collect();
+    for kind in scalar_kinds {
+        provider_kinds.remove(&kind);
+        dropped.push(format!("providers.{kind}"));
+    }
+
     for (kind, families) in provider_kinds.iter_mut() {
-        let Some(family_table) = families.as_table_mut() else {
-            continue;
-        };
+        let family_table = families.as_table_mut().expect("scalar kinds pruned above");
+        let scalar_families: Vec<String> = family_table
+            .iter()
+            .filter(|(_, v)| !v.is_table())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for family in scalar_families {
+            family_table.remove(&family);
+            dropped.push(format!("providers.{kind}.{family}"));
+        }
         for (family, aliases) in family_table.iter_mut() {
-            let Some(alias_table) = aliases.as_table_mut() else {
-                continue;
-            };
+            let alias_table = aliases
+                .as_table_mut()
+                .expect("scalar families pruned above");
             let invalid: Vec<String> = alias_table
                 .iter()
                 .filter(|(_, v)| provider_alias_is_invalid(kind, family, v))
@@ -1106,6 +1126,32 @@ temperature = "hot"
                 .find("custom", "broken")
                 .is_none(),
             "only the malformed alias is pruned"
+        );
+    }
+
+    #[test]
+    fn scalar_provider_nodes_pruned_without_sinking_section() {
+        // A scalar where a family/kind table is required must drop only
+        // that node, not the whole [providers] section.
+        let raw = r#"
+schema_version = 3
+
+[providers.models]
+ollama = "oops"
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "m"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(load.dropped, vec!["providers.models.ollama"]);
+        assert!(
+            load.config
+                .providers
+                .models
+                .find("custom", "rag_bot")
+                .is_some(),
+            "valid alias must survive a scalar sibling family"
         );
     }
 
