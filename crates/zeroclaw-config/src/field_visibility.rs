@@ -73,7 +73,9 @@ pub fn is_excluded(path: &str, excludes: &[String]) -> bool {
 /// not match `agents.aaalore.workspace`.
 pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     match path.strip_prefix(prefix) {
-        Some(rest) => rest.is_empty() || rest.starts_with('.') || prefix.ends_with('.'),
+        Some(rest) => {
+            prefix.is_empty() || rest.is_empty() || rest.starts_with('.') || prefix.ends_with('.')
+        }
         None => false,
     }
 }
@@ -145,5 +147,9 @@ mod tests {
         assert!(path_matches_prefix("memory.backend", "memory"));
         assert!(!path_matches_prefix("memory.backend", "mem"));
         assert!(!path_matches_prefix("unrelated", "agents.aaa"));
+        // Empty prefix matches everything (no-filter semantics, parity
+        // with the bare starts_with behavior it replaced).
+        assert!(path_matches_prefix("anything.at.all", ""));
+        assert!(path_matches_prefix("", ""));
     }
 }
