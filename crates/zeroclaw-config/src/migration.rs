@@ -383,6 +383,7 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     let mut dropped: Vec<String> = Vec::new();
     prune_bad_channel_aliases(&mut salvaged, &mut dropped);
     prune_bad_channel_types(&mut salvaged, &mut dropped);
+    prune_bad_provider_aliases(&mut salvaged, &mut dropped);
     prune_bad_top_level_sections(&mut salvaged, &mut dropped);
 
     let mut whole_config_lost = false;
@@ -530,6 +531,57 @@ fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>)
             dropped.push(format!("channels.{chan_type}.{alias}"));
         }
     }
+}
+
+/// Drop each `[providers.<kind>.<family>.<alias>]` that fails to deserialize,
+/// checked in isolation so valid siblings survive. Without this, one
+/// malformed provider alias makes `prune_bad_top_level_sections` drop the
+/// whole `providers` section: every model/tts/transcription provider
+/// vanishes on reload while agents.*.model_provider references dangle.
+/// Appends `providers.<kind>.<family>.<alias>`.
+fn prune_bad_provider_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(provider_kinds) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("providers"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    for (kind, families) in provider_kinds.iter_mut() {
+        let Some(family_table) = families.as_table_mut() else {
+            continue;
+        };
+        for (family, aliases) in family_table.iter_mut() {
+            let Some(alias_table) = aliases.as_table_mut() else {
+                continue;
+            };
+            let invalid: Vec<String> = alias_table
+                .iter()
+                .filter(|(_, v)| provider_alias_is_invalid(kind, family, v))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for alias in invalid {
+                alias_table.remove(&alias);
+                dropped.push(format!("providers.{kind}.{family}.{alias}"));
+            }
+        }
+    }
+}
+
+/// True when `[providers.<kind>.<family>.<alias>]`, wrapped alone, fails to
+/// deserialize. Unknown families pass (serde ignores them); only a
+/// known-family alias with bad field data is invalid.
+fn provider_alias_is_invalid(kind: &str, family: &str, alias_value: &toml::Value) -> bool {
+    let mut inner = toml::value::Table::new();
+    inner.insert("probe".to_string(), alias_value.clone());
+    let mut family_table = toml::value::Table::new();
+    family_table.insert(family.to_string(), toml::Value::Table(inner));
+    let mut kind_table = toml::value::Table::new();
+    kind_table.insert(kind.to_string(), toml::Value::Table(family_table));
+    let mut root = toml::value::Table::new();
+    root.insert("providers".to_string(), toml::Value::Table(kind_table));
+    toml::Value::Table(root).try_into::<Config>().is_err()
 }
 
 /// Drop each `[channels.<type>]` block still blocking the load after alias
@@ -1010,6 +1062,50 @@ from_address = "a@example.com"
         assert!(
             !cfg.channels.email.contains_key("fakeemail"),
             "invalid alias must be pruned"
+        );
+    }
+
+    #[test]
+    fn valid_provider_aliases_survive_broken_sibling() {
+        // Repro for the zerocode "all providers vanish after restart" report:
+        // one malformed provider alias must not take the whole [providers]
+        // section (and every other provider) down with it.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.ollama.ai]
+model = "qwen3:30b"
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "m"
+
+[providers.models.custom.broken]
+uri = "http://localhost:9000/v1"
+model = "m"
+temperature = "hot"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(load.dropped, vec!["providers.models.custom.broken"]);
+        assert!(
+            load.config.providers.models.find("ollama", "ai").is_some(),
+            "valid alias in another family must survive"
+        );
+        assert!(
+            load.config
+                .providers
+                .models
+                .find("custom", "rag_bot")
+                .is_some(),
+            "valid sibling alias must survive"
+        );
+        assert!(
+            load.config
+                .providers
+                .models
+                .find("custom", "broken")
+                .is_none(),
+            "only the malformed alias is pruned"
         );
     }
 
