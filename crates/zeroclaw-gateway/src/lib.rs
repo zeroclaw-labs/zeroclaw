@@ -2533,6 +2533,9 @@ async fn handle_webhook(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
     state.observer.record_event(
@@ -2540,6 +2543,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
 
@@ -2554,13 +2560,17 @@ async fn handle_webhook(
             let duration = started_at.elapsed();
             // Per-turn token / cost annotation captured from the cost-tracking
             // scope inside `run_gateway_chat_with_tools` (None outside of test
-            // / when no LLM call recorded). Cost is also persisted to
-            // /api/cost and costs.jsonl via the same scope.
-            let tokens_used = input_tokens
-                .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
+            // / when no LLM call recorded). `TurnUsage` always carries the real
+            // input/output split together, so `.zip` either gives both or
+            // neither — never fabricate `output_tokens: 0` from an aggregate.
+            // Cost is also persisted to /api/cost and costs.jsonl via the same
+            // scope.
+            let tokens_used = input_tokens.zip(output_tokens).map(|(i, o)| {
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                }
+            });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     model_provider: provider_label.clone(),
@@ -2568,8 +2578,11 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens,
+                    output_tokens,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2582,6 +2595,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -2601,6 +2617,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2619,6 +2638,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -3816,7 +3838,7 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
@@ -3953,6 +3975,27 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
+        let dist_dir = tmp.path().join("web").join("dist");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(
+            dist_dir.join("index.html"),
+            r#"<!DOCTYPE html><html><head></head><body>dashboard shell</body></html>"#,
+        )
+        .unwrap();
+
+        let mut state = admin_paircode_state(tmp, false, false);
+        state.web_dist_dir = Some(dist_dir);
+        state
+    }
+
+    async fn spa_fallback_response(
+        path: &'static str,
+        state: AppState,
+    ) -> axum::response::Response {
+        static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
     }
 
     /// Pair a device into both the pairing guard and the device registry,
@@ -4176,6 +4219,96 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_not_html_for_unknown_api_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json")),
+            "unknown API paths must not be served as HTML"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "not_found");
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_api_root_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_path_prefixed_api_miss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = spa_fallback_state(&tmp);
+        state.path_prefix = "/gw".to_string();
+
+        let response = spa_fallback_response("/gw/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_still_serves_dashboard_routes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/config", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "dashboard routes should still receive the SPA shell"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("dashboard shell"));
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_does_not_treat_api_like_spa_paths_as_api() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/apiary", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "similarly named SPA routes should not be reserved as API paths"
+        );
     }
 
     /// Regression: the gateway must boot with zero configured agents so
@@ -5318,6 +5451,7 @@ mod tests {
                 zeroclaw_runtime::observability::ObserverEvent::AgentStart {
                     model_provider,
                     model,
+                    ..
                 } if model_provider == &expected_provider && model == "agent-model"
             )),
             "expected AgentStart to use the explicit agent model; events were: {events:?}"

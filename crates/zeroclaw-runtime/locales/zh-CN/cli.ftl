@@ -354,6 +354,13 @@ onboard-openai-auth-codex = Codex 订阅
 onboard-openai-codex-followup =
     Codex 订阅身份验证使用您的 ChatGPT 账户。
     在启动代理之前，运行 `zeroclaw auth login --provider openai-codex` 进行身份验证。
+cli-web-dist-dir-reason-tilde = 以不会被展开的 `~` 开头
+cli-web-dist-dir-reason-dollar = 包含不会被展开的 `$`
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
+cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
+cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}示例: zeroclaw peripheral add nucleo-f401re <serial-path>

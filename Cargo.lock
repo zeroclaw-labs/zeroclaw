@@ -14255,6 +14255,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "unic-langid",
  "unicode-width 0.2.2",
+ "zeroclaw-providers",
 ]
 
 [[package]]
