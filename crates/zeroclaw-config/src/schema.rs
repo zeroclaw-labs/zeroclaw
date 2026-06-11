@@ -24507,6 +24507,16 @@ model = "gpt-4o"
             vec!["tts.bogustts".to_string()]
         );
         assert!(Config::unknown_provider_families("not even toml {{{").is_empty());
+        // Hostile shapes: scalar providers node, scalar kind node,
+        // array-of-tables family. as_table() filters all of them; the
+        // detector must stay silent rather than panic or false-positive.
+        assert!(Config::unknown_provider_families("providers = 3\n").is_empty());
+        assert!(Config::unknown_provider_families("[providers]\nmodels = 3\n").is_empty());
+        assert_eq!(
+            Config::unknown_provider_families("[[providers.models.weird]]\nx = 1\n"),
+            vec!["models.weird".to_string()],
+            "array-of-tables under an unknown family is still an unknown family"
+        );
     }
 
     #[test]
