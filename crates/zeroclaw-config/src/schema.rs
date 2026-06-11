@@ -3041,7 +3041,6 @@ pub struct ResolvedRuntime {
     pub max_system_prompt_chars: usize,
     pub thinking: crate::scattered_types::ThinkingConfig,
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
-    pub context_aware_tools: bool,
     pub eval: crate::scattered_types::EvalConfig,
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
@@ -3065,7 +3064,6 @@ impl Default for ResolvedRuntime {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
@@ -3394,13 +3392,6 @@ impl Config {
     }
 
     #[must_use]
-    pub fn effective_context_aware_tools(&self, agent_alias: &str) -> bool {
-        self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.context_aware_tools)
-            .unwrap_or(false)
-    }
-
-    #[must_use]
     pub fn effective_max_tool_result_chars(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_tool_result_chars)
@@ -3439,7 +3430,6 @@ impl Config {
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
             tool_call_dedup_exempt: self.effective_tool_call_dedup_exempt(agent_alias),
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
-            context_aware_tools: self.effective_context_aware_tools(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
             ..ResolvedRuntime::default()
@@ -9739,8 +9729,6 @@ pub struct RuntimeProfileConfig {
     pub tool_call_dedup_exempt: Vec<String>,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
-    /// Enable context-aware tool filtering per iteration. `None` inherits.
-    pub context_aware_tools: Option<bool>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
@@ -9782,7 +9770,6 @@ impl Default for RuntimeProfileConfig {
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             max_system_prompt_chars: None,
-            context_aware_tools: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
             memory_recall_limit: None,
