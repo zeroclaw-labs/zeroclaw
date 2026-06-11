@@ -1205,7 +1205,10 @@ async fn run_quickstart_cli(
             let mut fields: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
-                fields.insert("api-key".to_string(), key.to_string());
+                // Submission field keys are snake_case (`api_key`) — the apply
+                // path round-trips them verbatim into `set_prop_persistent`,
+                // which rejects kebab-case with "Unknown property".
+                fields.insert("api_key".to_string(), key.to_string());
             }
             form.provider = Some(ProviderChoice::Fresh {
                 kind: found.kind.clone(),
