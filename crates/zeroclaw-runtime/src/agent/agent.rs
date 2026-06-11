@@ -883,6 +883,11 @@ impl Agent {
         self.temperature = temperature;
     }
 
+    #[cfg(test)]
+    pub fn temperature_for_test(&self) -> Option<f64> {
+        self.temperature
+    }
+
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
     }
@@ -1177,10 +1182,9 @@ impl Agent {
         // `file_write`. Filtering here, before skill registration, is also
         // what lets a scoped elevation wrapper survive: the raw target is
         // removed while the distinct prefixed `{skill}__{tool}` wrapper is
-        // appended later. MCP tools are injected after this gate and are
-        // intentionally exempt from the built-in allow/deny filter (a
-        // restrictive allowlist must not silently drop all MCP tools); the
-        // risk-profile denylist below still applies to them.
+        // appended later. MCP tools are initialized after this built-in
+        // filter, then MCP registration and deferred discovery apply the same
+        // SecurityPolicy explicitly so denied MCP tools do not surface.
         let before_policy_filter = tools.len();
         crate::agent::loop_::apply_policy_tool_filter(&mut tools, Some(security.as_ref()), None);
         if tools.len() != before_policy_filter {
@@ -1217,6 +1221,8 @@ impl Agent {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
+                    let mcp_policy =
+                        crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
                     if config.mcp.deferred_loading {
                         let deferred_set = tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -1234,17 +1240,36 @@ impl Agent {
                                 registry.server_count()
                             )
                         );
-                        let activated =
-                            Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                        activated_tools = Some(Arc::clone(&activated));
-                        tools.push(Box::new(tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let allowed_stub_count = crate::agent::loop_::mcp_allowed_tool_count(
+                            deferred_set
+                                .stubs
+                                .iter()
+                                .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy.as_ref(),
+                        );
+                        if allowed_stub_count > 0 {
+                            let activated =
+                                Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                            activated_tools = Some(Arc::clone(&activated));
+                            let mut tool_search =
+                                tools::ToolSearchTool::new(deferred_set, activated);
+                            if let Some(policy) = mcp_policy {
+                                tool_search = tool_search.with_access_policy(policy);
+                            }
+                            tools.push(Box::new(tool_search));
+                        }
                     } else {
                         let names = registry.tool_names();
                         let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
+                            if !crate::agent::loop_::eager_mcp_tool_allowed(
+                                &name,
+                                mcp_policy.as_ref(),
+                            ) {
+                                skipped += 1;
+                                continue;
+                            }
                             if let Some(def) = registry.get_tool_def(&name).await {
                                 let wrapper: std::sync::Arc<dyn tools::Tool> =
                                     std::sync::Arc::new(tools::McpToolWrapper::new(
@@ -1252,11 +1277,14 @@ impl Agent {
                                         def,
                                         std::sync::Arc::clone(&registry),
                                     ));
-                                if let Some(ref handle) = delegate_handle {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                if crate::agent::loop_::register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut tools,
+                                    delegate_handle.as_ref(),
+                                    mcp_policy.as_ref(),
+                                ) {
+                                    registered += 1;
                                 }
-                                tools.push(Box::new(tools::ArcToolRef(wrapper)));
-                                registered += 1;
                             }
                         }
                         ::zeroclaw_log::record!(
@@ -1266,9 +1294,10 @@ impl Agent {
                                 ::zeroclaw_log::Action::Note
                             ),
                             &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
+                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
-                                registry.server_count()
+                                registry.server_count(),
+                                skipped
                             )
                         );
                     }

@@ -229,6 +229,50 @@ pub fn apply_policy_tool_filter(
     });
 }
 
+pub(crate) fn mcp_tool_access_policy(
+    security: &zeroclaw_config::policy::SecurityPolicy,
+    caller_allowed: Option<&[String]>,
+) -> Option<zeroclaw_tools::tool_search::ToolAccessPolicy> {
+    zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+        security.allowed_tools.as_deref(),
+        security.excluded_tools.as_deref(),
+        caller_allowed,
+    )
+}
+
+pub(crate) fn eager_mcp_tool_allowed(
+    name: &str,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> bool {
+    policy.is_none_or(|policy| policy.is_tool_allowed(name))
+}
+
+pub(crate) fn mcp_allowed_tool_count<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> usize {
+    names
+        .into_iter()
+        .filter(|name| eager_mcp_tool_allowed(name, policy))
+        .count()
+}
+
+pub(crate) fn register_eager_mcp_tool_if_allowed(
+    wrapper: std::sync::Arc<dyn Tool>,
+    tools: &mut Vec<Box<dyn Tool>>,
+    delegate_handle: Option<&tools::DelegateParentToolsHandle>,
+    policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+) -> bool {
+    if !eager_mcp_tool_allowed(wrapper.name(), policy) {
+        return false;
+    }
+    if let Some(handle) = delegate_handle {
+        handle.write().push(std::sync::Arc::clone(&wrapper));
+    }
+    tools.push(Box::new(tools::ArcToolRef(wrapper)));
+    true
+}
+
 /// Apply the SecurityPolicy built-in tool filter on the channel/daemon
 /// (`process_message`) path.
 ///
@@ -918,6 +962,75 @@ impl StreamTextGuard {
     }
 }
 
+#[derive(Debug, Default)]
+struct StreamThinkTagStripper {
+    pending: String,
+    in_think: bool,
+}
+
+impl StreamThinkTagStripper {
+    const START_TAG: &'static str = "<think>";
+    const END_TAG: &'static str = "</think>";
+
+    fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        let mut input = std::mem::take(&mut self.pending);
+        input.push_str(chunk);
+        let mut visible = String::new();
+
+        loop {
+            if self.in_think {
+                if let Some(end) = input.find(Self::END_TAG) {
+                    input = input[end + Self::END_TAG.len()..].to_string();
+                    self.in_think = false;
+                    continue;
+                }
+
+                let keep_len = longest_suffix_matching_prefix(&input, Self::END_TAG);
+                if keep_len > 0 {
+                    self.pending = input[input.len() - keep_len..].to_string();
+                }
+                return visible;
+            }
+
+            if let Some(start) = input.find(Self::START_TAG) {
+                visible.push_str(&input[..start]);
+                input = input[start + Self::START_TAG.len()..].to_string();
+                self.in_think = true;
+                continue;
+            }
+
+            let keep_len = longest_suffix_matching_prefix(&input, Self::START_TAG);
+            if keep_len > 0 {
+                let emit_len = input.len() - keep_len;
+                visible.push_str(&input[..emit_len]);
+                self.pending = input[emit_len..].to_string();
+            } else {
+                visible.push_str(&input);
+            }
+            return visible;
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        if self.in_think {
+            self.pending.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize {
+    (1..pattern.len())
+        .rev()
+        .find(|&len| text.ends_with(&pattern[..len]))
+        .unwrap_or(0)
+}
+
 fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let mut earliest: Option<usize> = None;
@@ -1124,6 +1237,7 @@ async fn consume_provider_streaming_response(
     let mut delta_sender = on_delta;
     let mut suppress_forwarding = false;
     let mut text_guard = StreamTextGuard::new(request_tools);
+    let mut think_stripper = StreamThinkTagStripper::default();
 
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
@@ -1184,7 +1298,12 @@ async fn consume_provider_streaming_response(
                     continue;
                 }
 
-                outcome.response_text.push_str(&chunk.delta);
+                let sanitized_delta = think_stripper.push(&chunk.delta);
+                if sanitized_delta.is_empty() {
+                    continue;
+                }
+
+                outcome.response_text.push_str(&sanitized_delta);
 
                 if suppress_forwarding {
                     continue;
@@ -1193,14 +1312,14 @@ async fn consume_provider_streaming_response(
                 if strict_tool_parsing {
                     if let Some(tx) = delta_sender {
                         outcome.forwarded_live_deltas = true;
-                        if tx.send(StreamDelta::Text(chunk.delta)).await.is_err() {
+                        if tx.send(StreamDelta::Text(sanitized_delta)).await.is_err() {
                             delta_sender = None;
                         }
                     }
                     continue;
                 }
 
-                let Some(forward_text) = text_guard.push(&chunk.delta) else {
+                let Some(forward_text) = text_guard.push(&sanitized_delta) else {
                     continue;
                 };
 
@@ -1209,6 +1328,28 @@ async fn consume_provider_streaming_response(
                     if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
                         delta_sender = None;
                     }
+                }
+            }
+        }
+    }
+
+    let trailing_delta = think_stripper.finish();
+    if !trailing_delta.is_empty() {
+        outcome.response_text.push_str(&trailing_delta);
+        if !suppress_forwarding {
+            if strict_tool_parsing {
+                if let Some(tx) = delta_sender {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(trailing_delta)).await.is_err() {
+                        delta_sender = None;
+                    }
+                }
+            } else if let Some(forward_text) = text_guard.push(&trailing_delta)
+                && let Some(tx) = delta_sender
+            {
+                outcome.forwarded_live_deltas = true;
+                if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
+                    delta_sender = None;
                 }
             }
         }
@@ -1949,11 +2090,7 @@ pub async fn run_tool_call_loop(
                     .as_ref()
                     .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
-                let mut response_text = if tool_specs.is_empty() {
-                    strip_think_tags(resp.text_or_empty())
-                } else {
-                    resp.text_or_empty().to_string()
-                };
+                let response_text = strip_think_tags(resp.text_or_empty());
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the model_provider returned no native calls —
@@ -1974,10 +2111,6 @@ pub async fn run_tool_call_loop(
                         .collect()
                 };
                 let mut parsed_text = String::new();
-
-                if strict_tool_parsing && calls.is_empty() {
-                    response_text = strip_think_tags(&response_text);
-                }
 
                 if calls.is_empty()
                     && !tool_specs.is_empty()
@@ -3382,9 +3515,8 @@ pub async fn run(
         // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
         // NOTE: MCP tools are injected after built-in tool filtering
         // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
-        // MCP servers are user-declared external integrations; the built-in allow/deny
-        // filter is not appropriate for them and would silently drop all MCP tools when
-        // a restrictive allowlist is configured. Keep this block after any such filter call.
+        // MCP registration and deferred discovery then apply the same policy
+        // explicitly so denied MCP tools never surface in context or delegate handles.
         //
         // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
         // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
@@ -3408,6 +3540,8 @@ pub async fn run(
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
+                    let mcp_policy =
+                        mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -3426,33 +3560,40 @@ pub async fn run(
                                 registry.server_count()
                             )
                         );
-                        // Build access policy from SecurityPolicy so blocked
-                        // MCP tools never surface anywhere in context.
-                        let mcp_policy =
-                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                                security.allowed_tools.as_deref(),
-                                security.excluded_tools.as_deref(),
-                                allowed_tools.as_deref(),
-                            );
+                        let allowed_stub_count = mcp_allowed_tool_count(
+                            deferred_set
+                                .stubs
+                                .iter()
+                                .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy.as_ref(),
+                        );
                         deferred_section = crate::tools::build_deferred_tools_section_filtered(
                             &deferred_set,
                             mcp_policy.as_ref(),
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::tools::ActivatedToolSet::new(),
-                        ));
-                        activated_handle = Some(std::sync::Arc::clone(&activated));
-                        let mut tool_search =
-                            crate::tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy {
-                            tool_search = tool_search.with_access_policy(policy);
+                        if allowed_stub_count > 0 {
+                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::tools::ActivatedToolSet::new(),
+                            ));
+                            activated_handle = Some(std::sync::Arc::clone(&activated));
+                            let mut tool_search =
+                                crate::tools::ToolSearchTool::new(deferred_set, activated);
+                            if let Some(policy) = mcp_policy {
+                                tool_search = tool_search.with_access_policy(policy);
+                            }
+                            tools_registry.push(Box::new(tool_search));
                         }
-                        tools_registry.push(Box::new(tool_search));
                     } else {
-                        // Eager path: register all MCP tools directly
+                        // Eager path: register only MCP tools admitted by the
+                        // same policy used by deferred MCP discovery.
                         let names = registry.tool_names();
                         let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
                             if let Some(def) = registry.get_tool_def(&name).await {
                                 let wrapper: std::sync::Arc<dyn Tool> =
                                     std::sync::Arc::new(crate::tools::McpToolWrapper::new(
@@ -3460,11 +3601,14 @@ pub async fn run(
                                         def,
                                         std::sync::Arc::clone(&registry),
                                     ));
-                                if let Some(ref handle) = delegate_handle {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut tools_registry,
+                                    delegate_handle.as_ref(),
+                                    mcp_policy.as_ref(),
+                                ) {
+                                    registered += 1;
                                 }
-                                tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                                registered += 1;
                             }
                         }
                         ::zeroclaw_log::record!(
@@ -3474,9 +3618,10 @@ pub async fn run(
                                 ::zeroclaw_log::Action::Note
                             ),
                             &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
+                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
-                                registry.server_count()
+                                registry.server_count(),
+                                skipped
                             )
                         );
                     }
@@ -4761,9 +4906,9 @@ pub async fn process_message(
         filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
 
         // ── Wire MCP tools (non-fatal) — process_message path ────────
-        // NOTE: Same ordering contract as the CLI path above — MCP tools must be
-        // injected after the policy tool filter to avoid MCP tools being
-        // silently dropped by a restrictive allowlist.
+        // NOTE: Same ordering contract as the CLI path above. MCP tools are
+        // initialized after built-in filtering, then registration/discovery is
+        // gated explicitly by the agent's security policy.
         let mut deferred_section = String::new();
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
@@ -4783,6 +4928,7 @@ pub async fn process_message(
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
+                    let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -4800,30 +4946,38 @@ pub async fn process_message(
                                 registry.server_count()
                             )
                         );
-                        let mcp_policy_pm =
-                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                                security.allowed_tools.as_deref(),
-                                security.excluded_tools.as_deref(),
-                                None, // no caller-supplied allowlist in channel path
-                            );
+                        let allowed_stub_count_pm = mcp_allowed_tool_count(
+                            deferred_set
+                                .stubs
+                                .iter()
+                                .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy_pm.as_ref(),
+                        );
                         deferred_section = crate::tools::build_deferred_tools_section_filtered(
                             &deferred_set,
                             mcp_policy_pm.as_ref(),
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::tools::ActivatedToolSet::new(),
-                        ));
-                        activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                        let mut tool_search_pm =
-                            crate::tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy_pm {
-                            tool_search_pm = tool_search_pm.with_access_policy(policy);
+                        if allowed_stub_count_pm > 0 {
+                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::tools::ActivatedToolSet::new(),
+                            ));
+                            activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                            let mut tool_search_pm =
+                                crate::tools::ToolSearchTool::new(deferred_set, activated);
+                            if let Some(policy) = mcp_policy_pm {
+                                tool_search_pm = tool_search_pm.with_access_policy(policy);
+                            }
+                            tools_registry.push(Box::new(tool_search_pm));
                         }
-                        tools_registry.push(Box::new(tool_search_pm));
                     } else {
                         let names = registry.tool_names();
                         let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy_pm.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
                             if let Some(def) = registry.get_tool_def(&name).await {
                                 let wrapper: std::sync::Arc<dyn Tool> =
                                     std::sync::Arc::new(crate::tools::McpToolWrapper::new(
@@ -4831,11 +4985,14 @@ pub async fn process_message(
                                         def,
                                         std::sync::Arc::clone(&registry),
                                     ));
-                                if let Some(ref handle) = delegate_handle_pm {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut tools_registry,
+                                    delegate_handle_pm.as_ref(),
+                                    mcp_policy_pm.as_ref(),
+                                ) {
+                                    registered += 1;
                                 }
-                                tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                                registered += 1;
                             }
                         }
                         ::zeroclaw_log::record!(
@@ -4845,9 +5002,10 @@ pub async fn process_message(
                                 ::zeroclaw_log::Action::Note
                             ),
                             &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
+                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
-                                registry.server_count()
+                                registry.server_count(),
+                                skipped
                             )
                         );
                     }
@@ -6155,6 +6313,7 @@ mod tests {
     enum NativeStreamTurn {
         ToolCall(ToolCall),
         Text(String),
+        TextChunks(Vec<String>),
         /// Emit a single text delta with associated reasoning content. Used by
         /// regression tests for issue #6059 (DeepSeek V4 thinking-mode replay).
         TextWithReasoning {
@@ -6257,6 +6416,14 @@ mod tests {
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                     Ok(StreamEvent::Final),
                 ])),
+                NativeStreamTurn::TextChunks(chunks) => {
+                    let mut events: Vec<_> = chunks
+                        .into_iter()
+                        .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
+                        .collect();
+                    events.push(Ok(StreamEvent::Final));
+                    Box::pin(futures_util::stream::iter(events))
+                }
                 NativeStreamTurn::TextWithReasoning { text, reasoning } => {
                     Box::pin(futures_util::stream::iter(vec![
                         Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
@@ -9249,11 +9416,14 @@ This is an example, not an invocation."#;
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
+    async fn run_tool_call_loop_sanitizes_native_tool_call_text_before_display_and_history() {
         let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
                 ChatResponse {
-                    text: Some("Task started. Waiting 30 seconds before checking status.".into()),
+                    text: Some(
+                        "<think>private chain of thought</think>Task started. Waiting 30 seconds before checking status."
+                            .into(),
+                    ),
                     tool_calls: vec![ToolCall {
                         id: "call_wait".into(),
                         name: "count_tool".into(),
@@ -9261,7 +9431,7 @@ This is an example, not an invocation."#;
                         extra_content: None,
                     }],
                     usage: None,
-                    reasoning_content: None,
+                    reasoning_content: Some("provider reasoning".into()),
                 },
                 ChatResponse {
                     text: Some("Final answer".into()),
@@ -9332,7 +9502,7 @@ This is an example, not an invocation."#;
             deltas
                 .iter()
                 .any(|delta| matches!(delta, StreamDelta::Text(t) if t == "Task started. Waiting 30 seconds before checking status.\n")),
-            "native assistant text should be relayed to on_delta"
+            "native assistant text should be sanitized and relayed to on_delta"
         );
         assert!(
             deltas
@@ -9344,6 +9514,35 @@ This is an example, not an invocation."#;
             result, "Final answer",
             "final delivered result should not include intermediate tool-call narration"
         );
+        assert!(!result.contains("private chain of thought"));
+        assert!(!result.contains("<think>"));
+        assert!(
+            deltas.iter().all(|delta| match delta {
+                StreamDelta::Status(text) | StreamDelta::Text(text) =>
+                    !text.contains("private chain of thought") && !text.contains("<think>"),
+            }),
+            "draft deltas must not expose inline think tags: {deltas:?}"
+        );
+        let assistant_tool_history = history
+            .iter()
+            .find(|message| message.content.contains("\"tool_calls\""))
+            .expect("native tool-call turn should persist assistant history");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&assistant_tool_history.content).unwrap();
+        assert_eq!(
+            parsed["content"].as_str(),
+            Some("Task started. Waiting 30 seconds before checking status.")
+        );
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("provider reasoning")
+        );
+        assert!(
+            !assistant_tool_history
+                .content
+                .contains("private chain of thought")
+        );
+        assert!(!assistant_tool_history.content.contains("<think>"));
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
@@ -10356,6 +10555,53 @@ This is an example, not an invocation."#;
         );
         assert_eq!(model_provider.chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_strips_split_think_tags_before_forwarding() {
+        let model_provider =
+            StreamingNativeToolEventModelProvider::with_turns(vec![NativeStreamTurn::TextChunks(
+                vec![
+                    "<thi".to_string(),
+                    "nk>private stream reasoning</thi".to_string(),
+                    "nk>visible answer".to_string(),
+                ],
+            )]);
+        let messages = vec![ChatMessage::user("hi")];
+        let tools = [crate::tools::ToolSpec {
+            name: "count_tool".to_string(),
+            description: "Count values".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &model_provider,
+            &messages,
+            Some(&tools),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+            true,
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(outcome.response_text, "visible answer");
+        assert_eq!(visible_deltas, "visible answer");
+        assert!(!outcome.response_text.contains("private stream reasoning"));
+        assert!(!outcome.response_text.contains("<think>"));
+        assert!(!visible_deltas.contains("private stream reasoning"));
+        assert!(!visible_deltas.contains("<think>"));
     }
 
     #[tokio::test]
@@ -12294,6 +12540,10 @@ Let me check the result."#;
         Box::new(NamedMockTool { the_name: name })
     }
 
+    fn mock_tool_arc(name: &'static str) -> std::sync::Arc<dyn TestTool> {
+        std::sync::Arc::new(NamedMockTool { the_name: name })
+    }
+
     fn tool_names(tools: &[Box<dyn TestTool>]) -> Vec<&str> {
         tools.iter().map(|t| t.name()).collect()
     }
@@ -12386,6 +12636,106 @@ Let me check the result."#;
             tools.is_empty(),
             "Some(vec![]) on policy must deny every tool"
         );
+    }
+
+    #[test]
+    fn eager_mcp_policy_allows_only_names_that_pass_policy_and_caller_gates() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["fs__read_file".into(), "slack__post".into()]),
+            excluded_tools: Some(vec!["slack__post".into()]),
+            ..TestPolicy::default()
+        };
+        let caller = vec!["fs__read_file".to_string(), "github__search".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        assert!(
+            super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "name admitted by both policy and caller gates must be registered eagerly"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("slack__post", access_policy.as_ref()),
+            "policy excluded_tools must block eager MCP registration"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "caller allowlist must compose with SecurityPolicy for run() eager MCP"
+        );
+    }
+
+    #[test]
+    fn eager_mcp_policy_uses_security_policy_without_caller_gate_on_process_message() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        let access_policy = super::mcp_tool_access_policy(&policy, None);
+
+        assert!(
+            super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "process_message eager MCP should use the agent SecurityPolicy allowlist"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "non-allowlisted eager MCP names must not be registered on process_message"
+        );
+    }
+
+    #[test]
+    fn deferred_mcp_allowed_count_honors_deny_all_policy() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec![]),
+            ..TestPolicy::default()
+        };
+        let access_policy = super::mcp_tool_access_policy(&policy, None);
+
+        assert_eq!(
+            super::mcp_allowed_tool_count(
+                ["fs__read_file", "github__search"],
+                access_policy.as_ref()
+            ),
+            0,
+            "deferred MCP must not register tool_search when policy admits no MCP stubs"
+        );
+    }
+
+    #[test]
+    fn register_eager_mcp_tool_filters_tools_and_delegate_handle_together() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["fs__read_file".into()]),
+            excluded_tools: Some(vec!["slack__post".into()]),
+            ..TestPolicy::default()
+        };
+        let access_policy = super::mcp_tool_access_policy(&policy, None);
+        let delegate_handle: crate::tools::DelegateParentToolsHandle =
+            std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let mut tools: Vec<Box<dyn TestTool>> = Vec::new();
+
+        assert!(super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("fs__read_file"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("github__search"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("slack__post"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+
+        assert_eq!(tool_names(&tools), vec!["fs__read_file"]);
+        let delegate_names: Vec<String> = delegate_handle
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(delegate_names, vec!["fs__read_file"]);
     }
 
     // ── agent_provider_composite regression ───────────────────────────────

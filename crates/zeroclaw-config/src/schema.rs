@@ -4109,12 +4109,12 @@ pub struct McpServerConfig {
 pub struct McpConfig {
     /// Enable MCP tool loading.
     #[tab(Settings)]
-    #[serde(default)]
+    #[serde(default = "default_mcp_enabled")]
     pub enabled: bool,
     /// Load MCP tool schemas on-demand via `tool_search` instead of eagerly
-    /// including them in the LLM context window. When `true` (the default),
-    /// only tool names are listed in the system prompt; the LLM must call
-    /// `tool_search` to fetch full schemas before invoking a deferred tool.
+    /// including them in the LLM context window. When enabled, only tool names
+    /// are listed in the system prompt; the LLM must call `tool_search` to fetch
+    /// full schemas before invoking a deferred tool.
     #[tab(Settings)]
     #[serde(default = "default_deferred_loading")]
     pub deferred_loading: bool,
@@ -4129,14 +4129,18 @@ pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
 }
 
-fn default_deferred_loading() -> bool {
+fn default_mcp_enabled() -> bool {
     true
+}
+
+fn default_deferred_loading() -> bool {
+    false
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_mcp_enabled(),
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
         }
@@ -9537,6 +9541,7 @@ fn default_auto_approve() -> Vec<String> {
         "content_search".into(),
         "image_info".into(),
         "weather".into(),
+        "tool_search".into(),
         "browser".into(),
         "browser_open".into(),
     ]
@@ -18664,6 +18669,12 @@ auto_approve = ["my_custom_tool", "another_tool"]
         }
     }
 
+    #[test]
+    async fn default_auto_approve_includes_tool_search() {
+        let defaults = default_auto_approve();
+        assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
     /// Regression test: empty auto_approve still gets defaults merged.
     #[test]
     async fn auto_approve_empty_list_gets_defaults() {
@@ -22922,10 +22933,45 @@ require_otp_to_resume = true
     }
 
     #[test]
-    async fn mcp_config_default_disabled_with_empty_servers() {
+    async fn mcp_config_defaults_enabled_eager_loading_with_empty_servers() {
         let cfg = McpConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
+        assert!(!cfg.deferred_loading);
         assert!(cfg.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_config_parsed_missing_flags_uses_enabled_eager_defaults() {
+        let raw = r#"
+[mcp]
+
+[[mcp.servers]]
+name = "svc"
+transport = "http"
+url = "http://localhost:8080/mcp"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.mcp.enabled);
+        assert!(!parsed.mcp.deferred_loading);
+        assert_eq!(parsed.mcp.servers.len(), 1);
+    }
+
+    #[test]
+    async fn mcp_config_explicit_disable_and_deferred_loading_are_respected() {
+        let raw = r#"
+[mcp]
+enabled = false
+deferred_loading = true
+
+[[mcp.servers]]
+name = "svc"
+transport = "http"
+url = "http://localhost:8080/mcp"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(!parsed.mcp.enabled);
+        assert!(parsed.mcp.deferred_loading);
+        assert_eq!(parsed.mcp.servers.len(), 1);
     }
 
     #[test]
