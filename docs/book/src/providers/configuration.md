@@ -27,9 +27,9 @@ Every slot, its default endpoint, and whether it runs locally is in the [Catalog
 Supported credential input and storage forms:
 
 1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
-2. **1Password references** — set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
+2. **1Password references**: set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
 3. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
-4. **Generic env override** — `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+4. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
 Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or `op://` value on disk.
 
