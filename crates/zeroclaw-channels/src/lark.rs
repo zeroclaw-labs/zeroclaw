@@ -730,7 +730,7 @@ impl LarkChannel {
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             ack_reactions: true,
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
@@ -4324,7 +4324,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4352,7 +4352,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4391,7 +4391,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4422,7 +4422,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4453,7 +4453,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 456,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4773,7 +4773,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };

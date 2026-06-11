@@ -22736,7 +22736,7 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
         };
@@ -22765,7 +22765,7 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
-                ack_reactions: None,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
         };
