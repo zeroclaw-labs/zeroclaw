@@ -4523,8 +4523,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0}
                 ]
             })),
             None,
@@ -4566,8 +4566,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 1}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 1}
                 ]
             })),
             None,
@@ -4695,8 +4695,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0}
                 ]
             })),
             None,

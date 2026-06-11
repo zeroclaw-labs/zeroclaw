@@ -66,10 +66,12 @@ pub async fn handle_catalog_models(
     }
     let _ = state;
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
-    let (models, live) = zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+    let (models, pricing, live) =
+        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
+        pricing,
         local,
         live,
     })
@@ -418,7 +420,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
             ConfigSectionEntry {
                 completed: completed.contains(&key),
                 ready: section_ready(&cfg, &key, completed.contains(&key)),
-                label: humanize_section(&key),
+                label: zeroclaw_config::sections::humanize_section_key(&key),
                 help: section_help(&key).to_string(),
                 has_picker,
                 group: section_group(&key).to_string(),
@@ -461,23 +463,6 @@ const HIDDEN_TOP_LEVEL: &[&str] = &[
     "env_overridden_paths",
     "pre_override_snapshots",
 ];
-
-/// Humanize a section key for display (`google_workspace` → `Google workspace`).
-/// Keeps things simple and predictable; specific wording overrides go in
-/// the section-help table or per-section labels if/when we add them.
-fn humanize_section(key: &str) -> String {
-    match key {
-        "providers.models" => return "Model providers".to_string(),
-        "providers.tts" => return "TTS providers".to_string(),
-        "providers.transcription" => return "Transcription providers".to_string(),
-        _ => {}
-    }
-    let mut s = key.replace(['_', '-'], " ");
-    if let Some(c) = s.get_mut(0..1) {
-        c.make_ascii_uppercase();
-    }
-    s
-}
 
 /// Display group for a section. Hand-curated until v3 / #5947 lands a
 /// schema attribute that encodes grouping declaratively. Unknown keys

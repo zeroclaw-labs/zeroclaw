@@ -1086,7 +1086,6 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "lambda-ai" => "lambda_ai",
         "github-models" => "github_models",
         "step" => "stepfun",
-        "kilo" => "kilocli",
         // Moonshot / Kimi (regional + code variants fold to one family).
         "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
         | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
@@ -1644,6 +1643,59 @@ pub struct ModelProviderInfo {
     pub display_name: &'static str,
     /// Whether the model model_provider runs locally (no API key required)
     pub local: bool,
+    /// Registry category, the grouping the CLI list and docs render by.
+    pub category: ModelProviderCategory,
+}
+
+/// Grouping for a model-provider family. Replaces the section comments in the
+/// registry list with data so surfaces (CLI list, docs capability table) can
+/// group families without re-typing the membership. Mirrors the registry's
+/// own sections exactly; locality is the separate `local` flag, not a category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProviderCategory {
+    /// First-party / flagship vendor APIs.
+    Primary,
+    /// OpenAI-compatible HTTP endpoints, each with its own canonical slot.
+    OpenAiCompatible,
+    /// Low-latency inference endpoints.
+    FastInference,
+    /// Model-hosting / aggregation platforms.
+    ModelHosting,
+    /// Chinese AI model providers.
+    ChineseAi,
+    /// Cloud-vendor AI endpoints.
+    CloudEndpoint,
+}
+
+impl ModelProviderCategory {
+    /// Stable identifier for this category, matching the Rust variant name.
+    /// Surfaces address a category by this token (CLI filters, docs directives)
+    /// without re-typing the variant set.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "Primary",
+            Self::OpenAiCompatible => "OpenAiCompatible",
+            Self::FastInference => "FastInference",
+            Self::ModelHosting => "ModelHosting",
+            Self::ChineseAi => "ChineseAi",
+            Self::CloudEndpoint => "CloudEndpoint",
+        }
+    }
+
+    /// Every category, in registry display order. Lets surfaces walk the set
+    /// instead of hardcoding it.
+    #[must_use]
+    pub fn all() -> &'static [ModelProviderCategory] {
+        &[
+            Self::Primary,
+            Self::OpenAiCompatible,
+            Self::FastInference,
+            Self::ModelHosting,
+            Self::ChineseAi,
+            Self::CloudEndpoint,
+        ]
+    }
 }
 
 /// Canonical base URL for `name`, mirroring what `create_model_provider`
@@ -1720,360 +1772,173 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Append a section of provider families under one category. DRY builder so the
+/// registry lists `(name, display_name, local)` once per family and the category
+/// is stamped from the section, not repeated on every entry.
+fn push_family(
+    out: &mut Vec<ModelProviderInfo>,
+    category: ModelProviderCategory,
+    families: &[(&'static str, &'static str, bool)],
+) {
+    out.extend(
+        families
+            .iter()
+            .map(|&(name, display_name, local)| ModelProviderInfo {
+                name,
+                display_name,
+                local,
+                category,
+            }),
+    );
+}
+
 /// Return the list of all known model_providers for display in `zeroclaw model_providers list`.
 ///
 /// This is intentionally separate from the factory match in `create_model_provider`
 /// (display concern vs. construction concern).
+///
+/// This handwritten list and the `for_each_model_provider_slot!` macro in
+/// `zeroclaw-config` are a dual-maintenance surface: the macro carries the
+/// canonical slot set, this list adds display-only fields (`display_name`,
+/// `local`). The `listed_model_providers_match_canonical_slots` test enforces
+/// that the two cover exactly the same slots, so a provider added to the macro
+/// without a display entry here (or vice versa) fails `cargo test`.
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
-    vec![
-        // ── Primary model_providers ────────────────────────────────
-        ModelProviderInfo {
-            name: "openrouter",
-            display_name: "OpenRouter",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "anthropic",
-            display_name: "Anthropic",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "openai",
-            display_name: "OpenAI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "telnyx",
-            display_name: "Telnyx",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "azure",
-            display_name: "Azure OpenAI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "ollama",
-            display_name: "Ollama",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "gemini",
-            display_name: "Google Gemini",
-            local: false,
-        },
-        // ── OpenAI-compatible model_providers ──────────────────────
-        ModelProviderInfo {
-            name: "venice",
-            display_name: "Venice",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "vercel",
-            display_name: "Vercel AI Gateway",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "cloudflare",
-            display_name: "Cloudflare AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "moonshot",
-            display_name: "Moonshot",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "synthetic",
-            display_name: "Synthetic",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "opencode",
-            display_name: "OpenCode",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "zai",
-            display_name: "Z.AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "glm",
-            display_name: "GLM (Zhipu)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "minimax",
-            display_name: "MiniMax",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "bedrock",
-            display_name: "Amazon Bedrock",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "qianfan",
-            display_name: "Qianfan (Baidu)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "doubao",
-            display_name: "Doubao (Volcengine)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "qwen",
-            display_name: "Qwen (DashScope / Qwen Code OAuth)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "groq",
-            display_name: "Groq",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "mistral",
-            display_name: "Mistral",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "xai",
-            display_name: "xAI (Grok)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "deepseek",
-            display_name: "DeepSeek",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "together",
-            display_name: "Together AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "fireworks",
-            display_name: "Fireworks AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "novita",
-            display_name: "Novita AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "perplexity",
-            display_name: "Perplexity",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "cohere",
-            display_name: "Cohere",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "copilot",
-            display_name: "GitHub Copilot",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "gemini_cli",
-            display_name: "Gemini CLI",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "kilocli",
-            display_name: "KiloCLI",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "lmstudio",
-            display_name: "LM Studio",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "llamacpp",
-            display_name: "llama.cpp server",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "sglang",
-            display_name: "SGLang",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "vllm",
-            display_name: "vLLM",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "osaurus",
-            display_name: "Osaurus",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "nvidia",
-            display_name: "NVIDIA NIM",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "siliconflow",
-            display_name: "SiliconFlow",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "aihubmix",
-            display_name: "AiHubMix",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "litellm",
-            display_name: "LiteLLM",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "atomic_chat",
-            display_name: "Atomic Chat",
-            local: true,
-        },
-        // ── Fast inference ────────────────────────────────────
-        ModelProviderInfo {
-            name: "cerebras",
-            display_name: "Cerebras",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "sambanova",
-            display_name: "SambaNova",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "hyperbolic",
-            display_name: "Hyperbolic",
-            local: false,
-        },
-        // ── Model hosting platforms ──────────────────────────
-        ModelProviderInfo {
-            name: "deepinfra",
-            display_name: "DeepInfra",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "huggingface",
-            display_name: "Hugging Face",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "ai21",
-            display_name: "AI21 Labs",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "reka",
-            display_name: "Reka",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "baseten",
-            display_name: "Baseten",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "nscale",
-            display_name: "Nscale",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "anyscale",
-            display_name: "Anyscale",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "nebius",
-            display_name: "Nebius AI Studio",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "friendli",
-            display_name: "Friendli AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "lepton",
-            display_name: "Lepton AI",
-            local: false,
-        },
-        // ── Chinese AI model_providers ─────────────────────────────
-        ModelProviderInfo {
-            name: "stepfun",
-            display_name: "Stepfun",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "baichuan",
-            display_name: "Baichuan",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "yi",
-            display_name: "01.AI (Yi)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "hunyuan",
-            display_name: "Tencent Hunyuan",
-            local: false,
-        },
-        // ── Cloud AI endpoints ───────────────────────────────
-        ModelProviderInfo {
-            name: "ovh",
-            display_name: "OVHcloud AI Endpoints",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "avian",
-            display_name: "Avian",
-            local: false,
-        },
-        // ── OpenAI-compatible aggregators & inference hosts ────
-        ModelProviderInfo {
-            name: "morph",
-            display_name: "Morph (Fast Apply)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "github_models",
-            display_name: "GitHub Models",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "upstage",
-            display_name: "Upstage Solar",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "featherless",
-            display_name: "Featherless AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "arcee",
-            display_name: "Arcee AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "lambda_ai",
-            display_name: "Lambda AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "inception",
-            display_name: "Inception Labs (Mercury)",
-            local: false,
-        },
-    ]
+    let mut out: Vec<ModelProviderInfo> = Vec::new();
+    push_family(
+        &mut out,
+        ModelProviderCategory::Primary,
+        &[
+            ("openrouter", "OpenRouter", false),
+            ("anthropic", "Anthropic", false),
+            ("openai", "OpenAI", false),
+            ("telnyx", "Telnyx", false),
+            ("azure", "Azure OpenAI", false),
+            ("ollama", "Ollama", true),
+            ("gemini", "Google Gemini", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::OpenAiCompatible,
+        &[
+            ("venice", "Venice", false),
+            ("vercel", "Vercel AI Gateway", false),
+            ("cloudflare", "Cloudflare AI", false),
+            ("moonshot", "Moonshot", false),
+            ("synthetic", "Synthetic", false),
+            ("opencode", "OpenCode", false),
+            ("zai", "Z.AI", false),
+            ("glm", "GLM (Zhipu)", false),
+            ("minimax", "MiniMax", false),
+            ("bedrock", "Amazon Bedrock", false),
+            ("qianfan", "Qianfan (Baidu)", false),
+            ("doubao", "Doubao (Volcengine)", false),
+            ("qwen", "Qwen (DashScope / Qwen Code OAuth)", false),
+            ("groq", "Groq", false),
+            ("mistral", "Mistral", false),
+            ("xai", "xAI (Grok)", false),
+            ("deepseek", "DeepSeek", false),
+            ("together", "Together AI", false),
+            ("fireworks", "Fireworks AI", false),
+            ("novita", "Novita AI", false),
+            ("perplexity", "Perplexity", false),
+            ("cohere", "Cohere", false),
+            ("copilot", "GitHub Copilot", false),
+            ("gemini_cli", "Gemini CLI", true),
+            ("kilocli", "KiloCLI", true),
+            ("kilo", "Kilo", false),
+            ("lmstudio", "LM Studio", true),
+            ("llamacpp", "llama.cpp server", true),
+            ("sglang", "SGLang", true),
+            ("vllm", "vLLM", true),
+            ("osaurus", "Osaurus", true),
+            ("nvidia", "NVIDIA NIM", false),
+            ("siliconflow", "SiliconFlow", false),
+            ("aihubmix", "AiHubMix", false),
+            ("litellm", "LiteLLM", false),
+            ("atomic_chat", "Atomic Chat", true),
+            ("astrai", "Astrai", false),
+            ("deepmyst", "DeepMyst", false),
+            ("morph", "Morph (Fast Apply)", false),
+            ("github_models", "GitHub Models", false),
+            ("upstage", "Upstage Solar", false),
+            ("featherless", "Featherless AI", false),
+            ("arcee", "Arcee AI", false),
+            ("lambda_ai", "Lambda AI", false),
+            ("inception", "Inception Labs (Mercury)", false),
+            ("custom", "Custom (OpenAI-compatible)", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::FastInference,
+        &[
+            ("cerebras", "Cerebras", false),
+            ("sambanova", "SambaNova", false),
+            ("hyperbolic", "Hyperbolic", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::ModelHosting,
+        &[
+            ("deepinfra", "DeepInfra", false),
+            ("huggingface", "Hugging Face", false),
+            ("ai21", "AI21 Labs", false),
+            ("reka", "Reka", false),
+            ("baseten", "Baseten", false),
+            ("nscale", "Nscale", false),
+            ("anyscale", "Anyscale", false),
+            ("nebius", "Nebius AI Studio", false),
+            ("friendli", "Friendli AI", false),
+            ("lepton", "Lepton AI", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::ChineseAi,
+        &[
+            ("stepfun", "Stepfun", false),
+            ("baichuan", "Baichuan", false),
+            ("yi", "01.AI (Yi)", false),
+            ("hunyuan", "Tencent Hunyuan", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::CloudEndpoint,
+        &[
+            ("ovh", "OVHcloud AI Endpoints", false),
+            ("avian", "Avian", false),
+        ],
+    );
+    debug_assert_eq!(
+        out.iter()
+            .map(|p| p.name)
+            .collect::<std::collections::BTreeSet<_>>(),
+        canonical_model_provider_slots()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "list_model_providers() drifted from for_each_model_provider_slot!: \
+         every canonical slot needs exactly one display entry and vice versa"
+    );
+    out
+}
+
+/// Canonical model-provider slot names, generated directly from the
+/// `for_each_model_provider_slot!` macro in `zeroclaw-config`. This is the
+/// single source of truth for *which* provider families exist; the display
+/// metadata in [`list_model_providers`] is keyed against this set and a drift
+/// guard fails loudly if the two diverge.
+#[must_use]
+pub fn canonical_model_provider_slots() -> Vec<&'static str> {
+    macro_rules! collect_slot_names {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            vec![$($type_str),+]
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(collect_slot_names)
 }
 
 /// Shared test utilities for model_provider modules.
@@ -2836,6 +2701,11 @@ mod tests {
     }
 
     #[test]
+    fn factory_kilo() {
+        assert!(create_model_provider("kilo", Some("kilo-test-key")).is_ok());
+    }
+
+    #[test]
     fn factory_nvidia() {
         assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
     }
@@ -3193,6 +3063,26 @@ mod tests {
                 model_provider.name
             );
         }
+    }
+
+    /// `list_model_providers()` must cover exactly the canonical slot set the
+    /// `for_each_model_provider_slot!` macro emits — no missing display entries
+    /// (a constructible provider invisible in the list / docs / dashboard) and
+    /// no phantom entries (a display row for a slot the factory can't build).
+    /// Adding a slot to the macro without a matching display entry fails here.
+    #[test]
+    fn listed_model_providers_match_canonical_slots() {
+        let listed: std::collections::BTreeSet<&str> =
+            list_model_providers().iter().map(|p| p.name).collect();
+        let canonical: std::collections::BTreeSet<&str> =
+            canonical_model_provider_slots().into_iter().collect();
+        let missing: Vec<&&str> = canonical.difference(&listed).collect();
+        let phantom: Vec<&&str> = listed.difference(&canonical).collect();
+        assert!(
+            missing.is_empty() && phantom.is_empty(),
+            "list_model_providers() drift — missing display entries: {missing:?}; \
+             phantom entries (no factory slot): {phantom:?}"
+        );
     }
 
     #[test]

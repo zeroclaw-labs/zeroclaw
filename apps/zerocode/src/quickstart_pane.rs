@@ -21,6 +21,29 @@ use std::sync::Arc;
 /// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
 
+/// Upper bound on rendered secret-mask bullets. A pasted API key can be
+/// 100+ chars; one bullet per character wraps the masked value across
+/// rows and pushes later fields and the footer out of view. Beyond this
+/// the mask is clipped and a `(+N)` suffix reports the hidden length.
+const SECRET_MASK_MAX: usize = 24;
+
+/// Render a bounded secret mask. One bullet per character lets a pasted
+/// API key wrap across rows and shove later fields off-screen; past
+/// `SECRET_MASK_MAX` the mask is clipped and the hidden length reported
+/// as `(+N)` so the user still has feedback that input was captured.
+fn masked_secret(buf: &str) -> String {
+    let count = buf.chars().count();
+    if count > SECRET_MASK_MAX {
+        format!(
+            "{} (+{})",
+            "•".repeat(SECRET_MASK_MAX),
+            count - SECRET_MASK_MAX
+        )
+    } else {
+        "•".repeat(count)
+    }
+}
+
 use crate::client::{
     QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor, QuickstartFieldSection,
     QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
@@ -45,10 +68,9 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 8] = [
+    const ALL: [Selector; 7] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
-        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -84,6 +106,22 @@ impl Selector {
             Selector::Agent => QuickstartStep::Agent,
             Selector::Submit => QuickstartStep::Agent,
         }
+    }
+
+    /// Localised title for the selector that owns a validation step, so
+    /// a field error can name where the problem lives (e.g.
+    /// `Model provider / alias: …`) instead of only a count.
+    fn title_for_step(step: QuickstartStep) -> String {
+        let sel = match step {
+            QuickstartStep::ModelProvider => Selector::ModelProvider,
+            QuickstartStep::RiskProfile => Selector::RiskProfile,
+            QuickstartStep::RuntimeProfile => Selector::RuntimeProfile,
+            QuickstartStep::Memory => Selector::Memory,
+            QuickstartStep::Channels => Selector::Channels,
+            QuickstartStep::PeerGroups => Selector::PeerGroups,
+            QuickstartStep::Agent => Selector::Agent,
+        };
+        sel.title()
     }
 }
 
@@ -473,10 +511,9 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        let runtime_profile = match self.runtime_mode {
-            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
-            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
-        };
+        // Runtime profile picker removed from all surfaces; apply silently
+        // forces the `unbounded` preset. Submit it so the field is well-formed.
+        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -567,6 +604,23 @@ struct TextInputModal {
     peer_group_channel: Option<String>,
 }
 
+/// Lifecycle of the live model catalog for a ModelProvider FieldForm.
+/// The form opens immediately in `Pending` so the modal paints a
+/// loading row instead of the picker blocking on the catalog RPC; a
+/// later `tick` resolves it to `Loaded` (model row upgraded to an
+/// enum picker) or `Empty` (catalog unavailable → free-text fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCatalogState {
+    /// Section has no model row (channels) — nothing to load.
+    NotApplicable,
+    /// Catalog fetch not yet started or in flight.
+    Pending,
+    /// Catalog returned variants; model row is a picker.
+    Loaded,
+    /// Catalog was empty or unavailable; model row is free-text.
+    Empty,
+}
+
 struct FieldFormModal {
     selector: Selector,
     /// Provider / channel type chosen in the preceding picker step.
@@ -575,6 +629,7 @@ struct FieldFormModal {
     alias: String,
     fields: Vec<FieldFormRow>,
     cursor: usize,
+    model_catalog: ModelCatalogState,
 }
 
 struct FieldFormRow {
@@ -1533,26 +1588,17 @@ impl QuickstartPane {
                 return;
             }
         };
-        // For the model-provider section, upgrade the `model` row with
-        // live catalog options so it renders as a picker. Empty catalog
-        // → free-text fallback (descriptor unchanged).
-        let model_catalog: Option<Vec<String>> =
-            if matches!(section, QuickstartFieldSection::ModelProvider) {
-                match self.rpc.catalog_models(&type_key).await {
-                    Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        // The model catalog is fetched lazily in `tick` so the modal
+        // paints a visible "Loading models…" row instead of freezing
+        // the picker while the catalog RPC is in flight. Bool fields
+        // are seeded here as two-value toggles so the runtime's
+        // `kind: bool` metadata renders as `‹ false › / ‹ true ›`
+        // rather than a raw text input the user has to type into.
         let mut rows: Vec<FieldFormRow> = fields
             .into_iter()
             .map(|mut d| {
-                if let Some(ref models) = model_catalog
-                    && d.key.eq_ignore_ascii_case("model")
-                {
-                    d.kind = crate::client::QuickstartFieldKind::Enum;
-                    d.enum_variants = Some(models.clone());
+                if matches!(d.kind, crate::client::QuickstartFieldKind::Bool) {
+                    d.enum_variants = Some(vec!["false".to_string(), "true".to_string()]);
                 }
                 // For enum fields, default the buffer to the first
                 // variant so the user lands on a valid value. ←/→
@@ -1576,6 +1622,11 @@ impl QuickstartPane {
                 FieldFormRow { descriptor: d, buf }
             })
             .collect();
+        let model_catalog = if matches!(section, QuickstartFieldSection::ModelProvider) {
+            ModelCatalogState::Pending
+        } else {
+            ModelCatalogState::NotApplicable
+        };
         // Prepend an editable alias row for ModelProvider so users can
         // choose a custom alias instead of the hardcoded "default".
         if matches!(section, QuickstartFieldSection::ModelProvider) {
@@ -1607,7 +1658,55 @@ impl QuickstartPane {
             alias,
             fields: rows,
             cursor: 0,
+            model_catalog,
         }));
+    }
+
+    /// Per-frame poll. Resolves a `Pending` model catalog for an open
+    /// ModelProvider FieldForm: the modal opens immediately so the
+    /// loading row paints, then this fetch upgrades the `model` row to
+    /// an enum picker (`Loaded`) or leaves it as free text (`Empty`)
+    /// when no live catalog is available. Driven from the app idle
+    /// loop the same way Dashboard/Logs panes refresh.
+    pub async fn tick(&mut self) {
+        let pending_type = match self.active_modal.as_ref() {
+            Some(Modal::FieldForm(f)) if f.model_catalog == ModelCatalogState::Pending => {
+                Some(f.type_key.clone())
+            }
+            _ => None,
+        };
+        let Some(type_key) = pending_type else {
+            return;
+        };
+        let models: Option<Vec<String>> = match self.rpc.catalog_models(&type_key).await {
+            Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
+            _ => None,
+        };
+        let Some(Modal::FieldForm(f)) = self.active_modal.as_mut() else {
+            return;
+        };
+        // Re-check identity: the user may have cancelled and reopened a
+        // different type while the catalog RPC was in flight.
+        if f.type_key != type_key || f.model_catalog != ModelCatalogState::Pending {
+            return;
+        }
+        match models {
+            Some(models) => {
+                if let Some(row) = f
+                    .fields
+                    .iter_mut()
+                    .find(|r| r.descriptor.key.eq_ignore_ascii_case("model"))
+                {
+                    row.descriptor.kind = crate::client::QuickstartFieldKind::Enum;
+                    row.descriptor.enum_variants = Some(models.clone());
+                    if !models.contains(&row.buf) {
+                        row.buf = models[0].clone();
+                    }
+                }
+                f.model_catalog = ModelCatalogState::Loaded;
+            }
+            None => f.model_catalog = ModelCatalogState::Empty,
+        }
     }
 
     /// Commit the active FieldFormModal into [`FormState`]. Returns
@@ -1834,10 +1933,34 @@ impl QuickstartPane {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
             crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
-        } else if !self.last_errors.is_empty() {
+        } else if let Some(first) = self.last_errors.first() {
+            // Name the first actionable field error so the user knows
+            // which field is invalid, instead of only a count. The
+            // daemon's message often already carries the specifics
+            // (e.g. "alias openai.default already exists").
+            let where_ = Selector::title_for_step(first.step);
+            let field_part = if first.field.is_empty() {
+                String::new()
+            } else {
+                format!(" / {}", first.field)
+            };
+            let more = self.last_errors.len().saturating_sub(1);
+            let suffix = if more > 0 {
+                crate::i18n::t_args(
+                    "zc-quickstart-status-more-errors",
+                    &[("count", &more.to_string())],
+                )
+            } else {
+                String::new()
+            };
             crate::i18n::t_args(
-                "zc-quickstart-status-errors",
-                &[("count", &self.last_errors.len().to_string())],
+                "zc-quickstart-status-first-error",
+                &[
+                    ("where", where_.trim()),
+                    ("field", &field_part),
+                    ("message", first.message.trim()),
+                    ("more", &suffix),
+                ],
             )
         } else if can_create {
             crate::i18n::t_args("zc-quickstart-status-can-create", &[("chord", "c")])
@@ -1956,7 +2079,7 @@ fn draw_modal(
         }
         Modal::TextInput(t) => {
             let display = if t.is_secret {
-                "•".repeat(t.buf.chars().count())
+                masked_secret(&t.buf)
             } else {
                 t.buf.clone()
             };
@@ -2001,23 +2124,50 @@ fn draw_modal(
                 } else {
                     theme::body_style()
                 };
+                let is_model_row = row.descriptor.key.eq_ignore_ascii_case("model");
+                // Secret fields render a bounded mask so a pasted,
+                // realistic-length API key cannot wrap across rows and
+                // push later fields and the footer out of view.
                 let raw_display = if row.descriptor.is_secret {
-                    "•".repeat(row.buf.chars().count())
+                    masked_secret(&row.buf)
                 } else {
                     row.buf.clone()
                 };
-                let is_ghost = raw_display.is_empty();
-                let display = if is_ghost {
-                    row.descriptor.default.clone().unwrap_or_default()
-                } else {
-                    raw_display
-                };
-                let value_style = if is_ghost {
-                    theme::dim_style().add_modifier(Modifier::ITALIC)
-                } else {
-                    theme::dim_style()
-                };
+                let is_empty_buf = raw_display.is_empty();
                 let is_enum = row.descriptor.enum_variants.is_some();
+                // Ghost text (the field default) is a placeholder for an
+                // empty buffer, but only when the row is NOT focused.
+                // Showing it on the focused row makes the default look
+                // like real, editable text the user cannot Backspace
+                // away — the alias `default` ghost-state defect. The
+                // focused empty row renders empty so the cursor sits
+                // where typing lands.
+                let show_ghost = is_empty_buf && !is_cursor && !is_enum;
+                let (display, value_style) =
+                    if is_model_row && f.model_catalog == ModelCatalogState::Pending {
+                        (
+                            crate::i18n::t_args(
+                                "zc-quickstart-model-loading",
+                                &[("provider", f.type_key.as_str())],
+                            ),
+                            theme::dim_style().add_modifier(Modifier::ITALIC),
+                        )
+                    } else if is_model_row
+                        && f.model_catalog == ModelCatalogState::Empty
+                        && is_empty_buf
+                    {
+                        (
+                            crate::i18n::t("zc-quickstart-model-catalog-empty"),
+                            theme::dim_style().add_modifier(Modifier::ITALIC),
+                        )
+                    } else if show_ghost {
+                        (
+                            row.descriptor.default.clone().unwrap_or_default(),
+                            theme::dim_style().add_modifier(Modifier::ITALIC),
+                        )
+                    } else {
+                        (raw_display, theme::dim_style())
+                    };
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
                     Span::styled(format!("{:14}", row.descriptor.label), label_style),
@@ -2025,7 +2175,7 @@ fn draw_modal(
                     Span::styled(if is_enum { "‹ " } else { "" }, theme::accent_style()),
                     Span::styled(display, value_style),
                     Span::styled(if is_enum { " ›" } else { "" }, theme::accent_style()),
-                    if is_cursor {
+                    if is_cursor && !is_enum {
                         Span::styled("█", theme::accent_style())
                     } else {
                         Span::raw("")
@@ -2539,6 +2689,40 @@ mod tests {
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
             .unwrap_or_default();
         assert!(seeded.is_empty());
+    }
+
+    #[test]
+    fn secret_mask_is_bounded() {
+        // A short secret masks one bullet per char; a realistic-length
+        // key clips at the cap and reports the hidden remainder so it
+        // can never wrap across rows and hide later fields/footer.
+        assert_eq!(masked_secret("abc"), "•••");
+        assert_eq!(masked_secret(""), "");
+        let long = "x".repeat(100);
+        let masked = masked_secret(&long);
+        assert_eq!(
+            masked.chars().filter(|&c| c == '•').count(),
+            SECRET_MASK_MAX
+        );
+        assert!(masked.ends_with(&format!("(+{})", 100 - SECRET_MASK_MAX)));
+    }
+
+    #[test]
+    fn step_titles_round_trip_through_selector() {
+        // Every validation step must resolve to its owning selector's
+        // title so a field error can name where the problem lives. A
+        // dropped arm would panic the title lookup or mislabel an error.
+        for step in [
+            QuickstartStep::ModelProvider,
+            QuickstartStep::RiskProfile,
+            QuickstartStep::RuntimeProfile,
+            QuickstartStep::Memory,
+            QuickstartStep::Channels,
+            QuickstartStep::PeerGroups,
+            QuickstartStep::Agent,
+        ] {
+            assert!(!Selector::title_for_step(step).is_empty());
+        }
     }
 
     #[test]

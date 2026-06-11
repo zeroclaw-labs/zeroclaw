@@ -80,6 +80,8 @@ pub(crate) struct Dashboard {
     cron_jobs: Vec<CronJobEntry>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
+    cost_error: Option<String>,
+    sessions_loaded: bool,
     /// Lazy-loaded full payload for the currently-open Memory detail
     /// row. Fetched via `memory/get` on selection (the list rows store
     /// only previews, with `content` truncated to ~200 bytes by the
@@ -141,6 +143,8 @@ impl Dashboard {
             cron_jobs: Vec::new(),
             memories: Vec::new(),
             memory_error: None,
+            cost_error: None,
+            sessions_loaded: false,
             memory_detail: None,
             memory_detail_key: None,
             tuis: Vec::new(),
@@ -199,8 +203,20 @@ impl Dashboard {
         // Fetch tab-specific data
         match self.tab {
             Tab::Overview => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
-                    self.cost = Some(c);
+                match self.rpc.cost_query(None).await {
+                    Ok(c) => {
+                        self.cost = Some(c);
+                        self.cost_error = None;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("not available") {
+                            self.cost_error =
+                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                        } else {
+                            self.cost_error = Some(msg);
+                        }
+                    }
                 }
                 if let Ok(a) = self.rpc.agents_status().await {
                     self.agents = a.agents;
@@ -218,6 +234,7 @@ impl Dashboard {
                 };
                 if let Ok(s) = self.rpc.session_list(query).await {
                     self.sessions = s.sessions;
+                    self.sessions_loaded = true;
                 }
             }
             Tab::Agents => {
@@ -254,11 +271,20 @@ impl Dashboard {
                 }
             }
             Tab::Health => {} // health already fetched above
-            Tab::Cost => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
+            Tab::Cost => match self.rpc.cost_query(None).await {
+                Ok(c) => {
                     self.cost = Some(c);
+                    self.cost_error = None;
                 }
-            }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not available") {
+                        self.cost_error = Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                    } else {
+                        self.cost_error = Some(msg);
+                    }
+                }
+            },
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
@@ -565,7 +591,14 @@ impl Dashboard {
                     ),
                     Span::styled(&a.alias, theme::body_style()),
                     Span::styled(
-                        format!("  ({} active)", a.active_sessions),
+                        if a.persisted_sessions > 0 {
+                            format!(
+                                "  ({} live, {} saved)",
+                                a.live_sessions, a.persisted_sessions
+                            )
+                        } else {
+                            format!("  ({} live)", a.live_sessions)
+                        },
                         theme::dim_style(),
                     ),
                 ]))
@@ -676,13 +709,15 @@ impl Dashboard {
             })
             .collect();
 
+        let title = if self.sessions_loaded {
+            format!(" Sessions ({}) ", filtered.len())
+        } else {
+            " Sessions ".to_string()
+        };
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(Span::styled(
-                        format!(" Sessions ({}) ", filtered.len()),
-                        theme::title_style(),
-                    ))
+                    .title(Span::styled(title, theme::title_style()))
                     .borders(Borders::ALL)
                     .border_style(theme::dim_style()),
             )
@@ -850,7 +885,14 @@ impl Dashboard {
                         status_style,
                     ),
                     Span::styled(
-                        format!("  sessions: {}", a.active_sessions),
+                        if a.persisted_sessions > 0 {
+                            format!(
+                                "  {} live / {} saved",
+                                a.live_sessions, a.persisted_sessions
+                            )
+                        } else {
+                            format!("  {} live", a.live_sessions)
+                        },
                         theme::dim_style(),
                     ),
                 ]))
@@ -903,10 +945,16 @@ impl Dashboard {
                 },
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-sessions"),
-                &a.active_sessions.to_string(),
+                &crate::i18n::t("zc-dashboard-detail-live-sessions"),
+                &a.live_sessions.to_string(),
             ),
         ];
+        if a.persisted_sessions > 0 {
+            lines.push(detail_line(
+                &crate::i18n::t("zc-dashboard-detail-persisted-sessions"),
+                &a.persisted_sessions.to_string(),
+            ));
+        }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1304,6 +1352,15 @@ impl Dashboard {
             .border_style(theme::dim_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        if let Some(ref err) = self.cost_error {
+            frame.render_widget(
+                Paragraph::new(Span::styled(err.as_str(), theme::warn_style()))
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
 
         let Some(ref c) = self.cost else {
             frame.render_widget(

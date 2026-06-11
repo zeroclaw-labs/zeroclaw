@@ -35,6 +35,26 @@ pub enum SectionShape {
     BackendPicker,
 }
 
+/// Humanize a section wire key for display (`risk_profiles` → `Risk profiles`,
+/// `providers.models` → `Model providers`). Single source of truth for section
+/// labels across the gateway dashboard, zerocode Config pane, and docs. Specific
+/// wording overrides are listed explicitly; everything else is mechanically
+/// title-cased from the key.
+#[must_use]
+pub fn humanize_section_key(key: &str) -> String {
+    match key {
+        "providers.models" => return "Model providers".to_string(),
+        "providers.tts" => return "TTS providers".to_string(),
+        "providers.transcription" => return "Transcription providers".to_string(),
+        _ => {}
+    }
+    let mut s = key.replace(['_', '-'], " ");
+    if let Some(c) = s.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    s
+}
+
 /// Single source of truth for every pickable config section. Each row
 /// maps 1:1 to a dashboard `/config/<key>` page, a CLI
 /// `zeroclaw quickstart` flow and the gateway section picker handler.
@@ -109,6 +129,23 @@ macro_rules! sections {
             pub const fn help(self) -> &'static str {
                 match self {
                     $( Self::$var => $help, )+
+                }
+            }
+
+            /// Human-readable section label shown in every Config surface
+            /// (gateway dashboard sidebar, zerocode Config pane, docs).
+            /// Single source of truth — derived from the canonical wire key
+            /// so the gateway, runtime, and docs cannot disagree.
+            #[must_use]
+            pub fn label(self) -> String {
+                humanize_section_key(self.key())
+            }
+
+            /// The canonical wire key for this section.
+            #[must_use]
+            pub const fn key(self) -> &'static str {
+                match self {
+                    $( Self::$var => $key, )+
                 }
             }
 

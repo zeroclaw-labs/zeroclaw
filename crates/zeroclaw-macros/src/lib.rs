@@ -184,6 +184,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut nested_get_prop = Vec::new();
     let mut nested_set_prop = Vec::new();
     let mut nested_prop_is_secret = Vec::new();
+    let mut dynamic_secret_map_prop_fields = Vec::new();
+    let mut dynamic_secret_map_get_prop = Vec::new();
+    let mut dynamic_secret_map_set_prop = Vec::new();
+    let mut dynamic_secret_map_prop_is_secret = Vec::new();
     let mut init_defaults_ops = Vec::new();
 
     // ── Map-key (HashMap<String, T>) and List (Vec<T:Configurable>) section
@@ -333,6 +337,74 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         #full_name_lit => { self.#field_ident = value; Ok(()) }
                     });
                 }
+            } else if is_hashmap_string_string {
+                let description = extract_doc(&field.attrs);
+                let description_lit = description.as_str();
+                let map_expr = if is_option {
+                    quote! { self.#field_ident.as_ref() }
+                } else {
+                    quote! { Some(&self.#field_ident) }
+                };
+                let map_mut_expr = if is_option {
+                    quote! { self.#field_ident.get_or_insert_with(std::collections::HashMap::new) }
+                } else {
+                    quote! { &mut self.#field_ident }
+                };
+                dynamic_secret_map_prop_fields.push(quote! {
+                    if let Some(map) = #map_expr {
+                        for (key, value) in map {
+                            fields.push(crate::config::PropFieldInfo {
+                                name: format!("{}.{}", #full_name_lit, key),
+                                category: #category_lit,
+                                display_value: if value.is_empty() {
+                                    crate::config::UNSET_DISPLAY.to_string()
+                                } else {
+                                    "****".to_string()
+                                },
+                                type_hint: "String",
+                                kind: crate::config::PropKind::String,
+                                is_secret: true,
+                                enum_variants: None::<fn() -> Vec<String>>,
+                                description: #description_lit,
+                                derived_from_secret: false,
+                                credential_class: #credential_class_expr,
+                                tab: #tab_token,
+                            });
+                        }
+                    }
+                });
+                dynamic_secret_map_get_prop.push(quote! {
+                    if let Some(key) = name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .filter(|key| !key.is_empty())
+                    {
+                        if let Some(map) = #map_expr
+                            && map.contains_key(key)
+                        {
+                            return Ok("****".to_string());
+                        }
+                    }
+                });
+                dynamic_secret_map_set_prop.push(quote! {
+                    if let Some(key) = name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .filter(|key| !key.is_empty())
+                    {
+                        (#map_mut_expr).insert(key.to_string(), value_str.to_string());
+                        return Ok(());
+                    }
+                });
+                dynamic_secret_map_prop_is_secret.push(quote! {
+                    if name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .is_some_and(|key| !key.is_empty())
+                    {
+                        return true;
+                    }
+                });
             }
         }
 
@@ -2225,12 +2297,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     .and_then(|v| match v { toml::Value::Table(t) => Some(t), _ => None });
                 let mut fields = vec![#(#prop_field_entries),*];
                 #(#nested_prop_fields)*
+                #(#dynamic_secret_map_prop_fields)*
                 fields
             }
 
             /// Get a property value by its full dotted name, returning it as a display string.
             pub fn get_prop(&self, name: &str) -> anyhow::Result<String> {
                 #(#nested_get_prop)*
+                #(#dynamic_secret_map_get_prop)*
                 const KNOWN: &[&str] = &[#(#prop_names),*];
                 const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
                 let idx = KNOWN.iter().position(|&n| n == name)
@@ -2252,6 +2326,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             /// Set a property value by its full dotted name, parsing from string.
             pub fn set_prop(&mut self, name: &str, value_str: &str) -> anyhow::Result<()> {
                 #(#nested_set_prop)*
+                #(#dynamic_secret_map_set_prop)*
                 const KNOWN: &[&str] = &[#(#prop_names),*];
                 const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
                 const IS_OPTION: &[bool] = &[#(#prop_is_option_flags),*];
@@ -2266,6 +2341,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #(#prop_is_secret_arms)*
                     _ => {
                         #(#nested_prop_is_secret)*
+                        #(#dynamic_secret_map_prop_is_secret)*
                         false
                     }
                 }
