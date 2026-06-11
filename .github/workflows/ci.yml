@@ -5,8 +5,15 @@ on:
     branches: [master]
   push:
     branches: [master]
+  # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
+  # and fires `merge_group`. The required `CI Required Gate` must report on that
+  # branch or queued PRs stall, so the full gate runs here too.
+  merge_group:
 
 concurrency:
+  # Merge-queue runs key on the unique queue ref (github.ref →
+  # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
+  # never cancel each other; PRs still key on the PR number.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
