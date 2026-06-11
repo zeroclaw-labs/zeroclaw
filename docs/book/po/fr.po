@@ -26694,7 +26694,7 @@ msgstr "Les gestionnaires de webhooks WhatsApp, WATI, Linq, Nextcloud Talk et Gm
 
 #: src/foundations/index.md
 msgid "The ZeroClaw Maturity Framework"
-msgstr "Le cadre de maturité ZeroClaw"
+msgstr "Le ZeroClaw Maturity Framework"
 
 #: src/tools/overview.md
 msgid "The [autonomy level](../security/autonomy.md) determines what each risk tier can do without operator approval. Default (`Supervised`): low runs, medium asks, high blocks."
@@ -33925,7 +33925,7 @@ msgstr "_Résponsabilités :_"
 
 #: src/foundations/index.md
 msgid "_The ZeroClaw Maturity Framework is a living body of work. New documents are added when the team has learned something worth preserving. Each begins as a public RFC discussion and earns its place here through the same process as the six above: open conversation, honest disagreement, and the team's collective decision to carry it forward._"
-msgstr "_Le cadre de maturité ZeroClaw est un ensemble de travaux évolutif. De nouveaux documents sont ajoutés lorsque l'équipe a appris quelque chose qui vaut la peine d'être préservé. Chacun commence par une discussion publique au format RFC et gagne sa place ici grâce au même processus que les six précédents : une conversation ouverte, des désaccords honnêtes et la décision collective de l'équipe de le faire avancer._"
+msgstr "_Le ZeroClaw Maturity Framework est un ensemble de travaux évolutif. De nouveaux documents sont ajoutés lorsque l'équipe a appris quelque chose qui vaut la peine d'être préservé. Chacun commence par une discussion publique au format RFC et gagne sa place ici grâce au même processus que les six précédents : une conversation ouverte, des désaccords honnêtes et la décision collective de l'équipe de le faire avancer._"
 
 #: src/foundations/fnd-003-governance.md
 msgid "_The best governance model is the simplest one the team will actually follow. Start here. Adjust based on what you learn._"
@@ -38410,7 +38410,7 @@ msgstr ""
 "```toml\n"
 "[providers.models.<name>]\n"
 "think = false\n"
-"effort_raisonnement = \"aucun\"\n"
+"reasoning_effort = \"none\"\n"
 "```"
 
 #: src/providers/configuration.md
@@ -39417,7 +39417,7 @@ msgid ""
 "```"
 msgstr ""
 "```toml\n"
-"[rélationnabilité]\n"
+"[reliability]\n"
 "api_keys = [\"sk-key-2\", \"sk-key-3\", \"sk-key-4\"]\n"
 "```"
 

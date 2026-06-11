@@ -9,7 +9,7 @@ rationale behind every `daemon(8)` flag — is in the handbook under
 
 | File | Installs as | Purpose |
 |---|---|---|
-| `zeroclaw-run.sh` | `/usr/local/libexec/zeroclaw-run.sh` | Launcher: sets `HOME`/`PATH`, execs `zeroclaw daemon`. |
+| `zeroclaw-run.sh` | `/usr/local/libexec/zeroclaw-run.sh` | Launcher: sets `PATH`, execs `zeroclaw daemon`. `HOME` comes from `daemon -u`. |
 | `zeroclaw.rc` | `/usr/local/etc/rc.d/zeroclaw` | Basic single-instance service. |
 | `zeroclaw-hardened.rc` | `/usr/local/etc/rc.d/zeroclaw` | Hardened variant for unattended/remote operation. Use this **or** `zeroclaw.rc`, not both. |
 | `rc.conf.zeroclaw` | `/etc/rc.conf.d/zeroclaw` | Optional per-service `rc.conf` drop-in (`zeroclaw_enable`, `zeroclaw_runas`) — a file alternative to the `sysrc` lines below. |
@@ -18,8 +18,8 @@ rationale behind every `daemon(8)` flag — is in the handbook under
 
 The two `rc.d` scripts carry a `@@ZEROCLAW_USER@@` placeholder for the owning
 account — substitute it on install. The launcher needs no substitution: it runs
-through `daemon -u <user>`, so it derives `HOME` from the service account at
-runtime.
+through `daemon -u <user>`, which sets `HOME` from the service account's passwd
+entry before exec.
 
 ## Install (hardened variant)
 

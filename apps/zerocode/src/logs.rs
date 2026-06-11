@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::Value;
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 
 use crate::client::{LogsQueryParams, RpcClient, RpcNotification};
@@ -457,8 +459,8 @@ impl LogDetail {
 
 // ── Logs pane ────────────────────────────────────────────────────
 
-pub(crate) struct Logs<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Logs {
+    rpc: Arc<RpcClient>,
     notif_rx: broadcast::Receiver<RpcNotification>,
     events: Vec<LogEntry>,
     list_state: ListState,
@@ -493,11 +495,12 @@ pub(crate) struct Logs<'a> {
     double_click: crate::mouse::DoubleClickTracker,
 }
 
-impl<'a> Logs<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient) -> Self {
+impl Logs {
+    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+        let notif_rx = rpc.subscribe_notifications();
         Self {
             rpc,
-            notif_rx: rpc.subscribe_notifications(),
+            notif_rx,
             events: Vec::new(),
             list_state: ListState::default(),
             follow: true,
@@ -1203,7 +1206,7 @@ impl<'a> Logs<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Logs<'_> {
+impl crate::widgets::HelpContext for Logs {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
         if self.search_active {

@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use std::sync::Arc;
+
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
     MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
@@ -63,8 +65,8 @@ impl Tab {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-pub(crate) struct Dashboard<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Dashboard {
+    rpc: Arc<RpcClient>,
     connect_label: String,
     insecure_tls: bool,
     tab: Tab,
@@ -78,6 +80,8 @@ pub(crate) struct Dashboard<'a> {
     cron_jobs: Vec<CronJobEntry>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
+    cost_error: Option<String>,
+    sessions_loaded: bool,
     /// Lazy-loaded full payload for the currently-open Memory detail
     /// row. Fetched via `memory/get` on selection (the list rows store
     /// only previews, with `content` truncated to ~200 bytes by the
@@ -123,8 +127,8 @@ pub(crate) struct Dashboard<'a> {
     double_click: mouse::DoubleClickTracker,
 }
 
-impl<'a> Dashboard<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, connect_label: &str, insecure_tls: bool) -> Self {
+impl Dashboard {
+    pub(crate) fn new(rpc: Arc<RpcClient>, connect_label: &str, insecure_tls: bool) -> Self {
         Self {
             rpc,
             connect_label: connect_label.to_string(),
@@ -139,6 +143,8 @@ impl<'a> Dashboard<'a> {
             cron_jobs: Vec::new(),
             memories: Vec::new(),
             memory_error: None,
+            cost_error: None,
+            sessions_loaded: false,
             memory_detail: None,
             memory_detail_key: None,
             tuis: Vec::new(),
@@ -197,8 +203,20 @@ impl<'a> Dashboard<'a> {
         // Fetch tab-specific data
         match self.tab {
             Tab::Overview => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
-                    self.cost = Some(c);
+                match self.rpc.cost_query(None).await {
+                    Ok(c) => {
+                        self.cost = Some(c);
+                        self.cost_error = None;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("not available") {
+                            self.cost_error =
+                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                        } else {
+                            self.cost_error = Some(msg);
+                        }
+                    }
                 }
                 if let Ok(a) = self.rpc.agents_status().await {
                     self.agents = a.agents;
@@ -216,6 +234,7 @@ impl<'a> Dashboard<'a> {
                 };
                 if let Ok(s) = self.rpc.session_list(query).await {
                     self.sessions = s.sessions;
+                    self.sessions_loaded = true;
                 }
             }
             Tab::Agents => {
@@ -252,11 +271,20 @@ impl<'a> Dashboard<'a> {
                 }
             }
             Tab::Health => {} // health already fetched above
-            Tab::Cost => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
+            Tab::Cost => match self.rpc.cost_query(None).await {
+                Ok(c) => {
                     self.cost = Some(c);
+                    self.cost_error = None;
                 }
-            }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not available") {
+                        self.cost_error = Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                    } else {
+                        self.cost_error = Some(msg);
+                    }
+                }
+            },
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
@@ -563,7 +591,14 @@ impl<'a> Dashboard<'a> {
                     ),
                     Span::styled(&a.alias, theme::body_style()),
                     Span::styled(
-                        format!("  ({} active)", a.active_sessions),
+                        if a.persisted_sessions > 0 {
+                            format!(
+                                "  ({} live, {} saved)",
+                                a.live_sessions, a.persisted_sessions
+                            )
+                        } else {
+                            format!("  ({} live)", a.live_sessions)
+                        },
                         theme::dim_style(),
                     ),
                 ]))
@@ -674,13 +709,15 @@ impl<'a> Dashboard<'a> {
             })
             .collect();
 
+        let title = if self.sessions_loaded {
+            format!(" Sessions ({}) ", filtered.len())
+        } else {
+            " Sessions ".to_string()
+        };
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(Span::styled(
-                        format!(" Sessions ({}) ", filtered.len()),
-                        theme::title_style(),
-                    ))
+                    .title(Span::styled(title, theme::title_style()))
                     .borders(Borders::ALL)
                     .border_style(theme::dim_style()),
             )
@@ -750,11 +787,15 @@ impl<'a> Dashboard<'a> {
             )));
             lines.push(Line::from(""));
             for msg in &self.session_messages {
-                let role_style = match msg.role.as_str() {
-                    "user" => theme::user_label_style(),
-                    "assistant" => theme::agent_label_style(),
-                    "system" => theme::dim_style().add_modifier(Modifier::BOLD),
-                    _ => theme::body_style().add_modifier(Modifier::BOLD),
+                let role_style = match msg.role() {
+                    crate::client::MessageRole::User => theme::user_label_style(),
+                    crate::client::MessageRole::Assistant => theme::agent_label_style(),
+                    crate::client::MessageRole::System => {
+                        theme::dim_style().add_modifier(Modifier::BOLD)
+                    }
+                    crate::client::MessageRole::Other => {
+                        theme::body_style().add_modifier(Modifier::BOLD)
+                    }
                 };
                 lines.push(Line::from(Span::styled(
                     format!("[{}]", msg.role),
@@ -844,7 +885,14 @@ impl<'a> Dashboard<'a> {
                         status_style,
                     ),
                     Span::styled(
-                        format!("  sessions: {}", a.active_sessions),
+                        if a.persisted_sessions > 0 {
+                            format!(
+                                "  {} live / {} saved",
+                                a.live_sessions, a.persisted_sessions
+                            )
+                        } else {
+                            format!("  {} live", a.live_sessions)
+                        },
                         theme::dim_style(),
                     ),
                 ]))
@@ -897,10 +945,16 @@ impl<'a> Dashboard<'a> {
                 },
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-sessions"),
-                &a.active_sessions.to_string(),
+                &crate::i18n::t("zc-dashboard-detail-live-sessions"),
+                &a.live_sessions.to_string(),
             ),
         ];
+        if a.persisted_sessions > 0 {
+            lines.push(detail_line(
+                &crate::i18n::t("zc-dashboard-detail-persisted-sessions"),
+                &a.persisted_sessions.to_string(),
+            ));
+        }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1298,6 +1352,15 @@ impl<'a> Dashboard<'a> {
             .border_style(theme::dim_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        if let Some(ref err) = self.cost_error {
+            frame.render_widget(
+                Paragraph::new(Span::styled(err.as_str(), theme::warn_style()))
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
 
         let Some(ref c) = self.cost else {
             frame.render_widget(
@@ -1984,7 +2047,7 @@ impl<'a> Dashboard<'a> {
     }
 }
 
-impl crate::widgets::HelpContext for Dashboard<'_> {
+impl crate::widgets::HelpContext for Dashboard {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
 
@@ -2000,7 +2063,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
             ),
             E::key("1–7", crate::i18n::t("zc-dashboard-help-jump-tab")),
             E::key("r", crate::i18n::t("zc-dashboard-help-refresh")),
-            E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
             E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
         ];
 
@@ -2036,7 +2098,6 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::key("r", crate::i18n::t("zc-dashboard-help-refresh-short")),
                 E::key("/", crate::i18n::t("zc-dashboard-help-search")),
                 E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
-                E::key("q", crate::i18n::t("zc-dashboard-help-quit")),
                 E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
             ];
             if self.tab == Tab::Sessions {
