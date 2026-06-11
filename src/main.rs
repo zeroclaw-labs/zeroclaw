@@ -2110,7 +2110,7 @@ async fn run_quickstart_cli(
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
-                "  zeroclaw agent {}  # chat with this agent in your terminal",
+                "  zeroclaw agent -a {}  # chat with this agent in your terminal",
                 applied.alias
             );
             if which_zerocode_on_path() {
