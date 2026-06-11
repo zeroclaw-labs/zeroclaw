@@ -580,3 +580,21 @@ impl Tool for GpioAardvarkTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::AARDVARK_TOOLS;
+
+    #[test]
+    fn aardvark_tool_names_match_catalog() {
+        let devices = Arc::new(RwLock::new(DeviceRegistry::new()));
+        let tools = aardvark_tools(devices);
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        names.push("datasheet");
+        names.sort_unstable();
+        let mut catalog: Vec<&str> = AARDVARK_TOOLS.to_vec();
+        catalog.sort_unstable();
+        assert_eq!(names, catalog);
+    }
+}

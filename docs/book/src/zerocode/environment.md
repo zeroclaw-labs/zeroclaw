@@ -27,7 +27,11 @@ This is why `SSH_AUTH_SOCK` works when you run zerocode from a terminal that
 has an ssh-agent running, even if the daemon was started as a service with no
 agent:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Terminal has SSH_AUTH_SOCK set by ssh-agent or a hardware token (YubiKey, etc.)
 echo $SSH_AUTH_SOCK
 # /run/user/1000/gnupg/S.gpg-agent.ssh
@@ -36,6 +40,8 @@ echo $SSH_AUTH_SOCK
 # zerocode forwards its env at connect time, so any shell command the agent
 # runs (git push, ssh, gpg-sign) gets SSH_AUTH_SOCK from your terminal.
 ```
+
+</div>
 
 zerocode sends its full environment. On a shared or remote daemon where that's
 a concern, use WSS with a dedicated user account.
@@ -74,11 +80,6 @@ originating client have no effect on running sessions.
 useful when you want specific vars available regardless of whether zerocode is
 connected, for example on a headless server where the daemon itself has the
 vars set.
-
-```toml
-[risk_profiles.default]
-shell_env_passthrough = ["SSH_AUTH_SOCK", "GPG_AGENT_INFO"]
-```
 
 Subagents cannot expand this list beyond what the parent policy allows: adding
 a var not present on the parent's list is rejected as a policy escalation.
