@@ -3,7 +3,7 @@
 
 use super::context::TurnCtx;
 use super::events::StreamDelta;
-use super::outcome::ToolLoopCancelled;
+use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
 use crate::agent::cost::check_tool_loop_budget;
@@ -24,6 +24,10 @@ use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
 /// - The streaming-fallback cancel yields `Err` as the `chat_result` VALUE —
 ///   it flows through the loop's `match chat_result` Err arm (observer
 ///   failure + recovery) exactly as before.
+/// - A cancel that fires while consuming the stream is also an inner `Err`
+///   (and skips the non-streaming fallback entirely): the loop records the
+///   observer failure with the fixed cancellation message, matching the
+///   pre-consolidation streaming engine.
 pub(crate) struct ProviderCallOutcome {
     pub(crate) chat_result: Result<ChatResponse>,
     pub(crate) streamed_live_deltas: bool,
@@ -167,6 +171,20 @@ pub(crate) async fn call_provider(
                     usage: streamed.usage,
                     reasoning_content,
                 })
+            }
+            Err(stream_err)
+                if is_tool_loop_cancelled(&stream_err)
+                    || stream_err
+                        .downcast_ref::<StreamInterruptedAfterOutput>()
+                        .is_some() =>
+            {
+                // No fallback: the consumer either cancelled the turn (a
+                // retry is a doomed request) or already saw streamed output
+                // (a retry duplicates visible text on append-only
+                // consumers). Surfaced as the inner chat_result so the
+                // loop's Err arm records the observer failure, exactly as
+                // the pre-consolidation streaming engine did.
+                Err(stream_err)
             }
             Err(stream_err) => {
                 ::zeroclaw_log::record!(

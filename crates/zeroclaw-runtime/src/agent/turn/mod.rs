@@ -414,6 +414,17 @@ pub async fn run_tool_call_loop(
                 if recovered {
                     continue;
                 }
+                // A stream that died after caller-visible output: persist the
+                // partial with the interruption marker so wrappers/channels
+                // can commit what the consumer already saw.
+                if let Some(interrupted) = e.downcast_ref::<outcome::StreamInterruptedAfterOutput>()
+                    && !interrupted.partial_text.is_empty()
+                {
+                    history.push(ChatMessage::assistant(format!(
+                        "{}\n\n[stream interrupted]",
+                        interrupted.partial_text
+                    )));
+                }
                 return Err(e);
             }
         };
@@ -576,7 +587,7 @@ pub async fn run_tool_call_loop(
         )
         .await;
 
-        let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
+        let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
             execute_tools_parallel(
                 &executable_calls,
                 tools_registry,
@@ -585,7 +596,7 @@ pub async fn run_tool_call_loop(
                 cancellation_token.as_ref(),
                 receipt_generator,
             )
-            .await?
+            .await
         } else {
             execute_tools_sequential(
                 &executable_calls,
@@ -595,8 +606,70 @@ pub async fn run_tool_call_loop(
                 cancellation_token.as_ref(),
                 receipt_generator,
             )
-            .await?
+            .await
         };
+        let executed_outcomes = match execution_result {
+            Ok(outcomes) => outcomes,
+            // Cancelled mid-batch (parallel path): no per-call outcomes
+            // survive; every call synthesizes as interrupted below.
+            Err(e) if is_tool_loop_cancelled(&e) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
+        // Cancelled mid-batch: persist the round atomically (assistant
+        // tool-call message + per-call results, completed outcomes kept,
+        // never-ran calls synthesized as interrupted — #1043 semantics),
+        // then surface the cancellation. Appending the results together
+        // with the assistant message keeps the no-orphaned-tool-call
+        // invariant the Responses API requires.
+        if executed_outcomes.len() < executable_calls.len() {
+            for (outcome, slot) in executed_outcomes.into_iter().zip(&executable_indices) {
+                let call = &tool_calls[*slot];
+                ordered_results[*slot] =
+                    Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+            }
+            for (idx, call) in tool_calls.iter().enumerate() {
+                if ordered_results[idx].is_none() {
+                    ordered_results[idx] = Some((
+                        call.name.clone(),
+                        call.tool_call_id.clone(),
+                        crate::agent::tool_execution::ToolExecutionOutcome {
+                            output: "[interrupted by user before this tool produced a result]"
+                                .to_string(),
+                            success: false,
+                            error_reason: None,
+                            duration: std::time::Duration::ZERO,
+                            receipt: None,
+                        },
+                    ));
+                }
+            }
+            let CollectedResults {
+                individual_results,
+                tool_results,
+                ..
+            } = collect_tool_results(
+                ordered_results,
+                &tool_calls,
+                history,
+                &mut loop_detector,
+                &loop_ignore_tools,
+                max_tool_result_chars,
+                collected_receipts,
+                model,
+                iteration,
+                &turn_id,
+            )?;
+            append_tool_round_to_history(
+                history,
+                assistant_history_content,
+                &native_tool_calls,
+                &individual_results,
+                &tool_results,
+                use_native_tools,
+            );
+            return Err(ToolLoopCancelled.into());
+        }
 
         record_executed_outcomes(
             &ctx,

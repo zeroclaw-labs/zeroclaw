@@ -5,7 +5,7 @@
 use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
-use super::events::StreamDelta;
+use super::events::{StreamDelta, emit_tool_call_pair};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -75,17 +75,21 @@ pub(crate) async fn prepare_tool_calls(
                             )))
                             .await;
                     }
-                    ordered_results[idx] = Some((
-                        call.name.clone(),
-                        call.tool_call_id.clone(),
-                        ToolExecutionOutcome {
-                            output: cancelled,
-                            success: false,
-                            error_reason: Some(scrub_credentials(&reason)),
-                            duration: Duration::ZERO,
-                            receipt: None,
-                        },
-                    ));
+                    let outcome = ToolExecutionOutcome {
+                        output: cancelled,
+                        success: false,
+                        error_reason: Some(scrub_credentials(&reason)),
+                        duration: Duration::ZERO,
+                        receipt: None,
+                    };
+                    // Streaming consumers still see the call and its
+                    // hook-cancel outcome as a ToolCall/ToolResult pair,
+                    // as the direct execution path always emitted.
+                    if let Some(tx) = ctx.event_tx {
+                        emit_tool_call_pair(tx, call, &outcome).await;
+                    }
+                    ordered_results[idx] =
+                        Some((call.name.clone(), call.tool_call_id.clone(), outcome));
                     continue;
                 }
                 crate::hooks::HookResult::Continue((name, args)) => {
@@ -108,6 +112,12 @@ pub(crate) async fn prepare_tool_calls(
         let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
             ApprovalGateOutcome::Proceed { approved } => approved,
             ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
+                // Streaming consumers see the denied/replaced call and its
+                // synthesized result (e.g. a DenyWithEdit replacement) as a
+                // ToolCall/ToolResult pair, as the direct path always did.
+                if let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pair(tx, call, &outcome).await;
+                }
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
                 continue;

@@ -21,6 +21,27 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// A provider stream failed *after* caller-visible output (text chunks,
+/// thinking, pre-executed tool events) was already forwarded on `event_tx`.
+///
+/// Carries the text accumulated before the failure so the loop can persist
+/// the visible partial. Unlike a pre-output stream failure, this must NOT
+/// trigger the non-streaming fallback: a retry would duplicate already
+/// delivered output on append-only consumers (WS/RPC/ACP).
+#[derive(Debug)]
+pub(crate) struct StreamInterruptedAfterOutput {
+    pub(crate) partial_text: String,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for StreamInterruptedAfterOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamInterruptedAfterOutput {}
+
 #[derive(Debug)]
 pub struct ModelSwitchRequested {
     pub model_provider: String,

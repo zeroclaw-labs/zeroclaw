@@ -1,5 +1,6 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
+use super::outcome::is_tool_loop_cancelled;
 use crate::agent::history::{emergency_history_trim, fast_trim_tool_results};
 use crate::observability::{Observer, ObserverEvent};
 use std::time::Instant;
@@ -16,7 +17,13 @@ pub(crate) fn record_llm_failure(
     turn_id: &str,
     e: &anyhow::Error,
 ) {
-    let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
+    // User cancellation gets the fixed message the streaming consumers have
+    // always seen (and pin), never a raw error string.
+    let safe_error = if is_tool_loop_cancelled(e) {
+        "request cancelled by user".to_string()
+    } else {
+        zeroclaw_providers::sanitize_api_error(&e.to_string())
+    };
     observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: provider_name.to_string(),
         model: model.to_string(),

@@ -1,7 +1,7 @@
 //! Streaming provider-response consumption for the turn loop.
 
 use super::events::{DraftEvent, StreamDelta};
-use super::outcome::ToolLoopCancelled;
+use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled};
 use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -64,6 +64,11 @@ pub(crate) async fn consume_provider_streaming_response(
         String,
         std::collections::VecDeque<String>,
     > = std::collections::HashMap::new();
+    // Tracks event_tx-visible output only (Chunk/Thinking/pre-executed tool
+    // events). Draft (`on_delta`) forwards don't count: drafts are mutable
+    // surfaces, so a non-streaming retry after a stream error overwrites
+    // rather than duplicates.
+    let mut visible_event_output = false;
 
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
@@ -79,16 +84,27 @@ pub(crate) async fn consume_provider_streaming_response(
             break;
         };
 
-        let event = event_result.map_err(|err| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "model_provider stream emitted an error event"
-            );
-            anyhow::Error::msg(format!("model_provider stream error: {err}"))
-        })?;
+        let event = match event_result {
+            Ok(event) => event,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "model_provider stream emitted an error event"
+                );
+                let message = format!("model_provider stream error: {err}");
+                if visible_event_output {
+                    return Err(StreamInterruptedAfterOutput {
+                        partial_text: outcome.response_text,
+                        message,
+                    }
+                    .into());
+                }
+                return Err(anyhow::Error::msg(message));
+            }
+        };
         match event {
             StreamEvent::Final => break,
             StreamEvent::Usage(usage) => {
@@ -109,6 +125,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     .or_default()
                     .push_back(id.clone());
                 if let Some(tx) = event_tx {
+                    visible_event_output = true;
                     let _ = tx
                         .send(TurnEvent::ToolCall {
                             id,
@@ -124,6 +141,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     .and_then(|ids| ids.pop_front())
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
                 if let Some(tx) = event_tx {
+                    visible_event_output = true;
                     let _ = tx.send(TurnEvent::ToolResult { id, name, output }).await;
                 }
             }
@@ -144,6 +162,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     // Thinking is surfaced as its own TurnEvent variant; it
                     // must never reach the Chunk/draft text surfaces.
                     if let Some(tx) = event_tx {
+                        visible_event_output = true;
                         let _ = tx
                             .send(TurnEvent::Thinking {
                                 delta: reasoning.to_string(),
@@ -173,6 +192,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     // are Some and drops them when on_delta is None.
                     if let Some(tx) = event_tx {
                         outcome.forwarded_live_deltas = true;
+                        visible_event_output = true;
                         let _ = tx
                             .send(TurnEvent::Chunk {
                                 delta: sanitized_delta.clone(),
@@ -194,6 +214,7 @@ pub(crate) async fn consume_provider_streaming_response(
 
                 if let Some(tx) = event_tx {
                     outcome.forwarded_live_deltas = true;
+                    visible_event_output = true;
                     let _ = tx
                         .send(TurnEvent::Chunk {
                             delta: forward_text.clone(),
