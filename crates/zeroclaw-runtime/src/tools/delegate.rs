@@ -540,14 +540,53 @@ impl DelegateTool {
     }
 
     /// Resolve allowed tools list from the named risk profile (authorization).
+    /// When the profile has an explicit allow-list we also union in any
+    /// MCP tools that have been injected into the parent_tools registry so
+    /// that the post-#7464 eager-MCP default actually works for agents.
     fn resolve_allowed_tools(&self, risk_profile: &str) -> Vec<String> {
         if risk_profile.is_empty() {
             return Vec::new();
         }
-        self.risk_profiles
+        let base = self
+            .risk_profiles
             .get(risk_profile)
             .map(|p| p.allowed_tools.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        if base.is_empty() {
+            return base;
+        }
+
+        // Collect names of any MCP tools present in parent_tools
+        let mcp_names: Vec<String> = {
+            let parent = self.parent_tools.read();
+            parent
+                .iter()
+                .filter_map(|t| {
+                    let n = t.name();
+                    // Heuristic: MCP tools are either "server__tool" or come from the
+                    // McpToolWrapper (we just check for the double-underscore pattern
+                    // that the MCP layer uses).
+                    if n.contains("__") {
+                        Some(n.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if mcp_names.is_empty() {
+            return base;
+        }
+
+        let mut out = base;
+        for n in mcp_names {
+            if !out.iter().any(|x| x == &n) {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// Resolve every configured skill bundle alias to its directory.
