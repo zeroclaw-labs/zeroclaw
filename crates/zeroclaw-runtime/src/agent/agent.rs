@@ -3327,6 +3327,12 @@ pub async fn run(
     Ok(())
 }
 
+// #7415 safety net (child module so fixtures can reach Agent internals the
+// same way `mod tests` does).
+#[cfg(test)]
+#[path = "safety_net.rs"]
+mod safety_net;
+
 #[cfg(test)]
 mod tests {
     use super::*;
