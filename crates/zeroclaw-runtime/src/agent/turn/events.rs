@@ -12,9 +12,6 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
