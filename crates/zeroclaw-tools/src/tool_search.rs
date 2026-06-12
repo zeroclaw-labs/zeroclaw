@@ -57,6 +57,18 @@ impl ToolAccessPolicy {
     }
 
     pub fn is_tool_allowed(&self, name: &str) -> bool {
+        // MCP tools (names containing "__") discovered at runtime are
+        // implicitly admitted when an explicit allow-list is present,
+        // mirroring the fix in DelegateTool::resolve_allowed_tools.
+        // They can still be blocked via excluded_tools / denied.
+        if name.contains("__") {
+            let in_deny = self
+                .denied
+                .as_ref()
+                .is_some_and(|list| list.iter().any(|t| t == name));
+            return !in_deny;
+        }
+
         let in_allow = self
             .allowed
             .as_ref()

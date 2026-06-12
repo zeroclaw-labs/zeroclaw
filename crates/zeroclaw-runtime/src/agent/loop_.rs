@@ -12677,9 +12677,10 @@ Let me check the result."#;
             !super::eager_mcp_tool_allowed("slack__post", access_policy.as_ref()),
             "policy excluded_tools must block eager MCP registration"
         );
+        // github__search contains "__" → auto-admitted even though not in caller list
         assert!(
-            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "caller allowlist must compose with SecurityPolicy for run() eager MCP"
+            super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "runtime-discovered MCP tools are auto-admitted (subject only to excluded_tools)"
         );
     }
 
@@ -12695,9 +12696,10 @@ Let me check the result."#;
             super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
             "process_message eager MCP should use the agent SecurityPolicy allowlist"
         );
+        // github__search contains "__" → auto-admitted even though not in allowed_tools
         assert!(
-            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "non-allowlisted eager MCP names must not be registered on process_message"
+            super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "runtime-discovered MCP tools are auto-admitted (subject only to excluded_tools)"
         );
     }
 
@@ -12737,12 +12739,14 @@ Let me check the result."#;
             Some(&delegate_handle),
             access_policy.as_ref(),
         ));
-        assert!(!super::register_eager_mcp_tool_if_allowed(
+        // github__search contains "__" → auto-admitted
+        assert!(super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("github__search"),
             &mut tools,
             Some(&delegate_handle),
             access_policy.as_ref(),
         ));
+        // slack__post is explicitly excluded → denied
         assert!(!super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("slack__post"),
             &mut tools,
@@ -12750,13 +12754,13 @@ Let me check the result."#;
             access_policy.as_ref(),
         ));
 
-        assert_eq!(tool_names(&tools), vec!["fs__read_file"]);
+        assert_eq!(tool_names(&tools), vec!["fs__read_file", "github__search"]);
         let delegate_names: Vec<String> = delegate_handle
             .read()
             .iter()
             .map(|tool| tool.name().to_string())
             .collect();
-        assert_eq!(delegate_names, vec!["fs__read_file"]);
+        assert_eq!(delegate_names, vec!["fs__read_file", "github__search"]);
     }
 
     // ── agent_provider_composite regression ───────────────────────────────
