@@ -7,30 +7,15 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-pub mod acp;
 pub mod api;
-pub mod api_config;
-pub mod api_onboard;
-pub mod api_pairing;
-pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
-pub mod api_plugins;
 #[cfg(feature = "webauthn")]
-pub mod api_webauthn;
 pub mod auth_rate_limit;
-pub mod canvas;
-pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
-pub mod openapi;
 pub mod session_queue;
-pub mod sse;
-pub mod static_files;
-pub mod tls;
 #[cfg(feature = "gateway-voice-duplex")]
-pub mod voice_duplex;
 pub mod ws;
-pub mod ws_approval;
 
 use anyhow::{Context, Result};
 use axum::{
