@@ -234,7 +234,12 @@ impl<'de> Deserialize<'de> for Chord {
 
 #[cfg(target_os = "macos")]
 fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
-    if m.contains(KeyModifiers::CONTROL) {
+    // Translate Ctrl→⌘ on macOS so Linux `Ctrl+K` and macOS `⌘K`
+    // map to the same chord.  Skip this translation for the `c` key
+    // because ⌘C is the system copy chord — mapping it to Ctrl+C
+    // would cause Quit to fire on a copy gesture. (#7378)
+    let is_c_key = matches!(code, KeyCode::Char('c') | KeyCode::Char('C'));
+    if m.contains(KeyModifiers::CONTROL) && !is_c_key {
         m.remove(KeyModifiers::CONTROL);
         m.insert(KeyModifiers::SUPER);
     }
