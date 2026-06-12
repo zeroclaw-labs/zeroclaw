@@ -29,8 +29,7 @@ pub(crate) async fn finish_after_max_iterations(
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
-    new_messages_out: Option<&mut Vec<ChatMessage>>,
-    initial_history_len: usize,
+    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
         WARN,
@@ -58,12 +57,16 @@ pub(crate) async fn finish_after_max_iterations(
             .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
         "Max iterations reached, requesting final summary"
     );
-    history.push(ChatMessage::user(
+    let summary_prompt = ChatMessage::user(
         "You have reached the maximum number of tool iterations. \
          Please provide your best answer based on the work completed so far. \
          Summarize what you accomplished and what remains to be done."
             .to_string(),
-    ));
+    );
+    if let Some(out) = &mut new_messages_out {
+        out.push(summary_prompt.clone());
+    }
+    history.push(summary_prompt);
 
     let summary_request = zeroclaw_providers::ChatRequest {
         messages: history,
@@ -114,9 +117,6 @@ pub(crate) async fn finish_after_max_iterations(
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
-            if let Some(out) = new_messages_out {
-                *out = history[initial_history_len..].to_vec();
-            }
             Ok(accumulated_display_text)
         }
         Err(e) => {

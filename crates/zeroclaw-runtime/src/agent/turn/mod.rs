@@ -138,9 +138,17 @@ pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
-/// Append a receipt footer to the response text if any receipts were collected.
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
+///
+/// `new_messages_out` is an append-log: every message the loop adds to
+/// `history` is mirrored into it at push time (a clone taken before any
+/// later in-loop history maintenance), so it is populated on **every** exit
+/// — success, error, and cancellation — and never derived from history
+/// indices, which in-loop pruning can invalidate. Loop-detection system
+/// notes are the one exception (merged into the existing system message;
+/// only reachable when pattern loop detection is enabled, which no
+/// `new_messages_out` consumer turns on).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tool_call_loop(
     model_provider: &dyn ModelProvider,
@@ -204,7 +212,6 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
-    let initial_history_len = history.len();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -242,7 +249,11 @@ pub async fn run_tool_call_loop(
         // Steering: fold caller-pushed mid-turn messages into history before
         // this iteration's provider request.
         for steering_message in drain_steering_messages(&mut steering) {
-            history.push(ChatMessage::user(steering_message));
+            let msg = ChatMessage::user(steering_message);
+            if let Some(out) = new_messages_out.as_deref_mut() {
+                out.push(msg.clone());
+            }
+            history.push(msg);
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -418,10 +429,14 @@ pub async fn run_tool_call_loop(
                 if let Some(interrupted) = e.downcast_ref::<outcome::StreamInterruptedAfterOutput>()
                     && !interrupted.partial_text.is_empty()
                 {
-                    history.push(ChatMessage::assistant(format!(
+                    let msg = ChatMessage::assistant(format!(
                         "{}\n\n[stream interrupted]",
                         interrupted.partial_text
-                    )));
+                    ));
+                    if let Some(out) = new_messages_out.as_deref_mut() {
+                        out.push(msg.clone());
+                    }
+                    history.push(msg);
                 }
                 return Err(e);
             }
@@ -469,13 +484,17 @@ pub async fn run_tool_call_loop(
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
                 // output has no valid tool_call_id to attach a role=tool message to.
-                history.push(ChatMessage::user(
+                let msg = ChatMessage::user(
                     "[Tool call parse error]\n\
                      Your previous response looked like an internal tool-call protocol payload, \
                      but ZeroClaw could not parse it into a valid tool call. Use the supported \
                      tool-call schema, or answer in natural language if no tool is needed."
                         .to_string(),
-                ));
+                );
+                if let Some(out) = new_messages_out.as_deref_mut() {
+                    out.push(msg.clone());
+                }
+                history.push(msg);
                 continue;
             }
 
@@ -485,10 +504,11 @@ pub async fn run_tool_call_loop(
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
-            history.push(ChatMessage::assistant(fallback.to_string()));
+            let msg = ChatMessage::assistant(fallback.to_string());
             if let Some(out) = new_messages_out.as_deref_mut() {
-                *out = history[initial_history_len..].to_vec();
+                out.push(msg.clone());
             }
+            history.push(msg);
             return Ok(accumulated_display_text);
         }
 
@@ -537,10 +557,11 @@ pub async fn run_tool_call_loop(
                     .await?;
             }
 
-            history.push(ChatMessage::assistant(response_text.clone()));
+            let msg = ChatMessage::assistant(response_text.clone());
             if let Some(out) = new_messages_out.as_deref_mut() {
-                *out = history[initial_history_len..].to_vec();
+                out.push(msg.clone());
             }
+            history.push(msg);
             return Ok(accumulated_display_text);
         }
 
@@ -658,6 +679,7 @@ pub async fn run_tool_call_loop(
                 iteration,
                 &turn_id,
             )?;
+            let appended_from = history.len();
             append_tool_round_to_history(
                 history,
                 assistant_history_content,
@@ -666,6 +688,9 @@ pub async fn run_tool_call_loop(
                 &tool_results,
                 use_native_tools,
             );
+            if let Some(out) = new_messages_out.as_deref_mut() {
+                out.extend_from_slice(&history[appended_from..]);
+            }
             return Err(ToolLoopCancelled.into());
         }
 
@@ -707,6 +732,7 @@ pub async fn run_tool_call_loop(
             &turn_id,
         )?;
 
+        let appended_from = history.len();
         append_tool_round_to_history(
             history,
             assistant_history_content,
@@ -715,6 +741,9 @@ pub async fn run_tool_call_loop(
             &tool_results,
             use_native_tools,
         );
+        if let Some(out) = new_messages_out.as_deref_mut() {
+            out.extend_from_slice(&history[appended_from..]);
+        }
     }
 
     finish_after_max_iterations(
@@ -730,7 +759,6 @@ pub async fn run_tool_call_loop(
         &turn_id,
         knobs,
         new_messages_out,
-        initial_history_len,
     )
     .await
 }

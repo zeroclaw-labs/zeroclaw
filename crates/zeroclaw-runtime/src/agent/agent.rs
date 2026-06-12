@@ -2272,14 +2272,18 @@ impl Agent {
             guard.total_output_tokens = usage.output_tokens;
             guard.saw_usage = true;
         }
-        let response = loop_result?;
-
         // Replay the loop's transcript additions into the conversation
-        // history; `replay_loop_messages` reverses the loop's provider
-        // encodings back into structured `ConversationMessage`s.
+        // history BEFORE propagating any loop error: rounds that already
+        // executed carry side effects (tools ran), and the pre-consolidation
+        // engine pushed them into `self.history` incrementally per iteration,
+        // so they survived a later-iteration provider failure. The loop's
+        // `new_messages_out` append-log is populated on error exits too;
+        // `replay_loop_messages` reverses the loop's provider encodings back
+        // into structured `ConversationMessage`s.
         for replayed in Self::replay_loop_messages(&loop_new_messages) {
             self.history.push(replayed);
         }
+        let response = loop_result?;
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
@@ -2523,7 +2527,6 @@ impl Agent {
         }
 
         let mut loop_history = provider_messages;
-        let mut last_committed_len = loop_history.len();
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
@@ -2584,7 +2587,11 @@ impl Agent {
                 }
             }
 
-            let last_persisted_len = loop_history.len();
+            // Per-round append-log: the loop mirrors every message it adds to
+            // `loop_history` into this capture at push time, on success AND
+            // error exits — never derived from history indices, which the
+            // loop's own preflight pruning can invalidate.
+            let mut round_added: Vec<ChatMessage> = Vec::new();
             let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     Some(cost_context.clone()),
@@ -2620,7 +2627,7 @@ impl Agent {
                         None,
                         Some(event_tx.clone()),
                         None,
-                        None,
+                        Some(&mut round_added),
                         &knobs,
                     ),
                 )
@@ -2637,13 +2644,10 @@ impl Agent {
             }
 
             // Replay everything the loop appended this round into the
-            // conversation history and the persistence capture. Slice-based
-            // rather than `new_messages_out` so the error paths (which the
-            // loop never writes back) replay their partial rounds too.
-            let round_added = loop_history.get(last_persisted_len..).unwrap_or(&[]);
+            // conversation history and the persistence capture.
             let single_text_exchange =
                 round == 0 && round_added.len() == 1 && round_added[0].role == "assistant";
-            for replayed in Self::replay_loop_messages(round_added) {
+            for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
             }
@@ -2654,7 +2658,6 @@ impl Agent {
                     // history/new_msgs (replay above) and committed_response
                     // before any steering continuation is folded in.
                     committed_response.push_str(&response);
-                    last_committed_len = loop_history.len();
                     self.trim_history();
 
                     let has_more_steering =
@@ -2685,9 +2688,7 @@ impl Agent {
                     // assistant output (e.g. a persisted stream partial) when
                     // no prior round committed anything.
                     if committed_response.is_empty() {
-                        for replayed in Self::replay_loop_messages(
-                            loop_history.get(last_committed_len..).unwrap_or(&[]),
-                        ) {
+                        for replayed in Self::replay_loop_messages(&round_added) {
                             if let ConversationMessage::Chat(message) = &replayed
                                 && message.role == "assistant"
                             {

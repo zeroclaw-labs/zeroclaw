@@ -1090,3 +1090,213 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
         "output tokens must sum across all loop iterations"
     );
 }
+
+// ── seam 10: turn survives in-loop history pruning ──────────────────────
+// The loop's preflight maintenance prunes `history` in place when the token
+// estimate exceeds `max_context_tokens`. `new_messages_out` (Agent::turn)
+// and the streamed wrapper's per-round capture must not be derived from
+// pre-prune history indices: that panics (slice start past the shrunken
+// length) or silently persists the wrong messages.
+
+#[tokio::test]
+async fn safety_net_turn_survives_in_loop_history_pruning() {
+    let filler = "x".repeat(400);
+    let runtime = zeroclaw_config::schema::ResolvedRuntime {
+        // ~40 seeded messages × (100 tokens content + 4 framing) ≫ 500.
+        max_context_tokens: 500,
+        ..zeroclaw_config::schema::ResolvedRuntime::default()
+    };
+
+    // Agent::turn (new_messages_out path)
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![tool_call("tc-prune", "echo")]),
+            text_response("pruned-final"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+        runtime.clone(),
+    );
+    for i in 0..20 {
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                "seed-{i} {filler}"
+            ))));
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                "reply-{i} {filler}"
+            ))));
+    }
+    let response = agent
+        .turn("after a long conversation")
+        .await
+        .expect("turn must survive in-loop pruning of the seeded history");
+    assert_eq!(response, "pruned-final");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "tool round must execute");
+    assert!(
+        agent.history.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "pruned-final"
+        )),
+        "the final assistant reply must persist into conversation history"
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "the executed tool round must persist into conversation history"
+    );
+
+    // turn_streamed_with_steering_state (per-round capture path)
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![tool_call("tc-prune-s", "echo")]),
+            text_response("pruned-final-streamed"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+        runtime,
+    );
+    for i in 0..20 {
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                "seed-{i} {filler}"
+            ))));
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                "reply-{i} {filler}"
+            ))));
+    }
+    let (tx, _rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("after a long conversation", tx, None, None)
+        .await
+        .expect("streamed turn must survive in-loop pruning");
+    assert_eq!(outcome.response, "pruned-final-streamed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "tool round must execute");
+    assert!(
+        outcome
+            .new_messages
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "new_messages must contain the executed tool round despite pruning"
+    );
+    assert!(
+        outcome.new_messages.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(c)
+                if c.role == "assistant" && c.content == "pruned-final-streamed"
+        )),
+        "new_messages must contain the final assistant reply despite pruning"
+    );
+    assert!(
+        !outcome.new_messages.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(c) if c.content.starts_with("seed-")
+        )),
+        "pre-existing history must never leak into new_messages"
+    );
+}
+
+// ── seam 11: Agent::turn keeps executed rounds on a later-call error ────
+// Tools that ran carry side effects. The pre-consolidation engine pushed
+// each round into `self.history` as it happened, so rounds survived a
+// later-iteration provider failure; losing them makes a retry re-run
+// side-effecting work the model can no longer see.
+
+/// Scripted responses, then a hard provider error once exhausted.
+struct ErrAfterScriptProvider {
+    responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
+}
+
+#[async_trait]
+impl ModelProvider for ErrAfterScriptProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok("ok".into())
+    }
+
+    async fn chat(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        self.responses
+            .lock()
+            .pop_front()
+            .ok_or_else(|| anyhow::Error::msg("provider 500: scripted mid-turn failure"))
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for ErrAfterScriptProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ErrAfterScriptProvider"
+    }
+}
+
+#[tokio::test]
+async fn safety_net_agent_turn_error_path_keeps_executed_rounds() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ErrAfterScriptProvider {
+            responses: parking_lot::Mutex::new(
+                vec![tool_response(vec![tool_call("tc-err", "echo")])].into(),
+            ),
+        }),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+    let err = agent
+        .turn("do work then fail")
+        .await
+        .expect_err("second provider call is scripted to fail");
+    assert!(
+        err.to_string().contains("provider 500"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the tool round executed before the failure"
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "executed tool round (assistant side) must survive the turn error"
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::ToolResults(_))),
+        "executed tool round (results side) must survive the turn error"
+    );
+}
