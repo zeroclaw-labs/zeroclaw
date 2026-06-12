@@ -30,10 +30,21 @@ grep -q "forked_from" Cargo.toml 2>/dev/null && report 0 "Cargo.toml has fork pr
 # PLAN-02 FILL — deny.toml + CI workflow
 test -f deny.toml && report 0 "deny.toml present" || report 1 "deny.toml missing"
 grep -qF "AGPL-3.0" deny.toml 2>/dev/null && report 0 "deny.toml lists AGPL-3.0 banlist target" || report 1 "deny.toml missing AGPL ban"
-test -f .github/workflows/ci.yml && grep -qF "EmbarkStudios/cargo-deny-action@" .github/workflows/ci.yml && report 0 "ci.yml uses cargo-deny-action" || report 1 "ci.yml missing or no cargo-deny-action"
+test -f .github/workflows/osagent-policy.yml && grep -qF "EmbarkStudios/cargo-deny-action@" .github/workflows/osagent-policy.yml && report 0 "osagent-policy.yml wires cargo-deny-action" || report 1 "osagent-policy.yml missing or no cargo-deny-action"
 
-# PLAN-03 FILL — UPSTREAM_SYNC.md exists in sibling repo
-test -f ../sovereign-shield-backup/documentation/osAgent/UPSTREAM_SYNC.md && report 0 "UPSTREAM_SYNC.md present in sibling repo" || report 1 "UPSTREAM_SYNC.md missing"
+# PLAN-03 FILL — UPSTREAM_SYNC.md exists in sibling repo.
+# This file lands on feat/osagent-upstream-sync-runbook in sovereign-shield-backup;
+# it does NOT appear on that repo's main until the PR is merged. The check below
+# explicitly tolerates the pre-merge gap so Phase 1.1 quick-gate doesn't flap.
+SS_SYNC_BACKUP=../sovereign-shield-backup/documentation/osAgent/UPSTREAM_SYNC.md
+SS_SYNC_BRANCH=$(cd ../sovereign-shield-backup 2>/dev/null && git show feat/osagent-upstream-sync-runbook:documentation/osAgent/UPSTREAM_SYNC.md 2>/dev/null | head -1)
+if [ -f "$SS_SYNC_BACKUP" ]; then
+  report 0 "UPSTREAM_SYNC.md present on sibling repo main"
+elif [ -n "$SS_SYNC_BRANCH" ]; then
+  report 0 "UPSTREAM_SYNC.md present on feat/osagent-upstream-sync-runbook (PR pending merge)"
+else
+  report 1 "UPSTREAM_SYNC.md missing on both main and feat branch"
+fi
 
 echo "=== $PASS passed, $FAIL failed ==="
 [ $FAIL -eq 0 ]
