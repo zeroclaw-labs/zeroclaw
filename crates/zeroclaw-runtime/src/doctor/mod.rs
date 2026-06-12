@@ -1413,9 +1413,11 @@ mod tests {
     /// `data_dir` (so `check_workspace` doesn't early-return) and no agents.
     /// `config_path` anchors `install_root_dir()` → `agent_workspace_dir()`.
     fn workspace_test_config(root: &Path) -> Config {
-        let mut config = Config::default();
-        config.config_path = root.join("config.toml");
-        config.data_dir = root.join("data");
+        let mut config = Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config.agents.clear();
         config
