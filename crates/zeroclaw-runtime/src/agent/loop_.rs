@@ -616,6 +616,7 @@ pub async fn agent_turn(
 // The turn engine lives in `super::turn` — `run_tool_call_loop` plus one
 // file per step (run sheet in agent/turn/mod.rs). `crate::agent::loop_`
 // stays the canonical public path via these re-exports.
+pub(crate) use super::turn::StreamCancelledAfterOutput;
 #[cfg(test)]
 pub(crate) use super::turn::{
     DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,

@@ -1619,3 +1619,49 @@ async fn safety_net_graceful_summary_persists_assistant_summary() {
         "the persisted transcript must end with the assistant summary, not the synthetic user prompt"
     );
 }
+
+/// Companion to seam 14: when the summary call itself FAILS, the synthetic
+/// prompt must not persist either — a transcript ending on the unanswered
+/// "provide your best answer" prompt is the incoherence under test, and the
+/// failure branch must not reintroduce it.
+#[tokio::test]
+async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent_with_runtime(
+        Box::new(ErrAfterScriptProvider {
+            responses: parking_lot::Mutex::new(
+                vec![
+                    tool_response(vec![tool_call("f1", "echo")]),
+                    tool_response(vec![tool_call("f2", "echo")]),
+                ]
+                .into(),
+            ),
+        }),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 2,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    let err = agent
+        .turn_streamed_with_steering_state("exhaust then fail summary", tx, None, None)
+        .await
+        .expect_err("the summary call is scripted to fail");
+    assert!(
+        err.error.to_string().contains("maximum tool iterations"),
+        "unexpected error: {}",
+        err.error
+    );
+    assert!(
+        !err.new_messages.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(c)
+                if c.role == "user" && c.content.contains("maximum number of tool iterations")
+        )),
+        "the unanswered synthetic summary prompt must not persist when the summary call fails"
+    );
+}

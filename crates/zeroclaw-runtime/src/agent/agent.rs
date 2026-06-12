@@ -2698,20 +2698,20 @@ impl Agent {
                     }
                     if crate::agent::loop_::is_tool_loop_cancelled(&error) {
                         // When the cancel arrived after event-visible
-                        // streamed text, the loop already persisted
-                        // "{partial}\n\n[interrupted by user]" (replayed
-                        // into history/new_msgs above, and into
-                        // committed_response by the empty-committed rebuild).
-                        // Synthesize the bare marker only when no
-                        // interruption text was committed this round.
-                        let persisted_interruption = round_added
-                            .iter()
-                            .rev()
-                            .find(|m| {
-                                m.role == "assistant"
-                                    && m.content.ends_with("[interrupted by user]")
-                            })
-                            .map(|m| m.content.clone());
+                        // streamed text, the error itself carries the
+                        // partial the loop persisted (replayed into
+                        // history/new_msgs above, and into
+                        // committed_response by the empty-committed
+                        // rebuild). Provenance, not content sniffing:
+                        // model-authored text can end with the marker
+                        // literal, so suffix-matching round_added would
+                        // misfire. Synthesize the bare marker only when no
+                        // interruption text was persisted this round.
+                        let persisted_interruption = error
+                            .downcast_ref::<crate::agent::loop_::StreamCancelledAfterOutput>()
+                            .map(|cancelled| {
+                                format!("{}\n\n[interrupted by user]", cancelled.partial_text)
+                            });
                         match persisted_interruption {
                             Some(text) => {
                                 if !committed_response.ends_with("[interrupted by user]") {

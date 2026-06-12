@@ -63,74 +63,70 @@ pub(crate) async fn finish_after_max_iterations(
          Summarize what you accomplished and what remains to be done."
             .to_string(),
     );
-    if let Some(out) = &mut new_messages_out {
-        out.push(summary_prompt.clone());
-    }
+    // Pushed into history for the request below, but mirrored into the
+    // append-log (and kept in history) only when the summary call SUCCEEDS:
+    // a failed/cancelled/timed-out/empty summary must not persist an
+    // unanswered synthetic prompt into wrapper transcripts — every failure
+    // exit pops it back off.
+    let summary_prompt_mirror = summary_prompt.clone();
     history.push(summary_prompt);
 
-    let summary_request = zeroclaw_providers::ChatRequest {
-        messages: history,
-        tools: None, // No tools — force a text response
-        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten(),
+    enum SummaryCall {
+        Cancelled,
+        TimedOut(u64),
+        Done(Result<zeroclaw_providers::ChatResponse>),
+    }
+    let summary_call = {
+        let summary_request = zeroclaw_providers::ChatRequest {
+            messages: history,
+            tools: None, // No tools — force a text response
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        };
+        let summary_future = model_provider.chat(summary_request, model, temperature);
+        match pacing.step_timeout_secs {
+            Some(step_secs) if step_secs > 0 => {
+                let step_timeout = Duration::from_secs(step_secs);
+                if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => SummaryCall::Cancelled,
+                        result = tokio::time::timeout(step_timeout, summary_future) => match result {
+                            Ok(inner) => SummaryCall::Done(inner),
+                            Err(_) => SummaryCall::TimedOut(step_secs),
+                        },
+                    }
+                } else {
+                    match tokio::time::timeout(step_timeout, summary_future).await {
+                        Ok(inner) => SummaryCall::Done(inner),
+                        Err(_) => SummaryCall::TimedOut(step_secs),
+                    }
+                }
+            }
+            _ => {
+                if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => SummaryCall::Cancelled,
+                        result = summary_future => SummaryCall::Done(result),
+                    }
+                } else {
+                    SummaryCall::Done(summary_future.await)
+                }
+            }
+        }
     };
-    let summary_future = model_provider.chat(summary_request, model, temperature);
-    let summary_call = match pacing.step_timeout_secs {
-        Some(step_secs) if step_secs > 0 => {
-            let step_timeout = Duration::from_secs(step_secs);
-            if let Some(token) = cancellation_token {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = tokio::time::timeout(step_timeout, summary_future) => match result {
-                        Ok(inner) => inner,
-                        Err(_) => anyhow::bail!(
-                            "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
-                        ),
-                    },
-                }
-            } else {
-                match tokio::time::timeout(step_timeout, summary_future).await {
-                    Ok(inner) => inner,
-                    Err(_) => anyhow::bail!(
-                        "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
-                    ),
-                }
-            }
+
+    let resp = match summary_call {
+        SummaryCall::Cancelled => {
+            history.pop();
+            return Err(ToolLoopCancelled.into());
         }
-        _ => {
-            if let Some(token) = cancellation_token {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = summary_future => result,
-                }
-            } else {
-                summary_future.await
-            }
+        SummaryCall::TimedOut(step_secs) => {
+            history.pop();
+            anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
         }
-    };
-    match summary_call {
-        Ok(resp) => {
-            let text = resp.text.unwrap_or_default();
-            if text.is_empty() {
-                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
-            }
-            // Persist the summary like every other final assistant response:
-            // without it, persistent-history callers (the streamed wrapper's
-            // replay, new_messages consumers) store a transcript ending on
-            // the synthetic user prompt with no answer — the delivered
-            // summary would be absent and the model re-answers the synthetic
-            // prompt next turn.
-            let summary_msg = ChatMessage::assistant(text.clone());
-            if let Some(out) = &mut new_messages_out {
-                out.push(summary_msg.clone());
-            }
-            history.push(summary_msg);
-            accumulated_display_text.push_str(&text);
-            Ok(accumulated_display_text)
-        }
-        Err(e) => {
+        SummaryCall::Done(Err(e)) => {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -144,7 +140,29 @@ pub(crate) async fn finish_after_max_iterations(
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
+            history.pop();
             anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
         }
+        SummaryCall::Done(Ok(resp)) => resp,
+    };
+
+    let text = resp.text.unwrap_or_default();
+    if text.is_empty() {
+        history.pop();
+        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
     }
+    // Persist the answered prompt + summary like every other final assistant
+    // response: without the summary message, persistent-history callers (the
+    // streamed wrapper's replay, new_messages consumers) store a transcript
+    // ending on the synthetic user prompt with no answer — the delivered
+    // summary would be absent and the model re-answers the synthetic prompt
+    // next turn.
+    let summary_msg = ChatMessage::assistant(text.clone());
+    if let Some(out) = &mut new_messages_out {
+        out.push(summary_prompt_mirror);
+        out.push(summary_msg.clone());
+    }
+    history.push(summary_msg);
+    accumulated_display_text.push_str(&text);
+    Ok(accumulated_display_text)
 }
