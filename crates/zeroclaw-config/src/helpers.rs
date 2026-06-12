@@ -1,6 +1,6 @@
 //! Property helpers used by the `Configurable` derive macro and the `zeroclaw config` CLI.
 
-use crate::traits::{ConfigTab, PropFieldInfo, PropKind};
+use crate::traits::{ConfigTab, CredentialSurfaceClass, PropFieldInfo, PropKind};
 
 /// For a `#[nested] HashMap<String, T>` field, parse a `get_prop`/`set_prop`
 /// path of the form `<my_prefix>.<field_name>.<hm_key>.<inner_suffix>` and
@@ -87,6 +87,131 @@ pub fn route_double_hashmap_path<'a>(
     Some((outer_key, inner_key, inner_name))
 }
 
+/// For a `#[nested] Vec<T>` field whose element type `T` carries a
+/// natural-key field (e.g. `McpServerConfig::name`), parse a path of the
+/// form `<my_prefix>.<field_name>.<natural_key>.<inner_suffix>` and
+/// return `(matched_natural_key_index_in_vec, fully-qualified inner name
+/// for T::get_prop / set_prop)`.
+///
+/// `natural_keys` is an iterator over `(index, key)` pairs from the live
+/// `Vec<T>`: typically `self.<field>.iter().enumerate().map(|(i, e)|
+/// (i, e.<natural_key_field>.as_str()))` from the derive.
+///
+/// Matching is longest-key-wins (same as [`route_hashmap_path`]) so dotted
+/// natural keys disambiguate against their shorter siblings.
+///
+/// Ambiguity (two elements sharing the same natural key) is *not* resolved
+/// silently: when two or more indices match the same longest natural key,
+/// the returned [`VecRoute`] is [`VecRoute::Ambiguous`] carrying the key
+/// and the duplicate count. Callers (get_prop / set_prop / prop_is_secret
+/// dispatch sites) surface this as an error rather than mutating one of
+/// the duplicates by accident — the schema validator catches the broken
+/// state at save time, but until the operator fixes it, in-flight edits
+/// must refuse to route.
+///
+/// Returns [`VecRoute::Miss`] when the path doesn't match this field's
+/// prefix, letting the derive's generated code fall through to the next
+/// nested field (same fall-through contract as [`route_hashmap_path`]).
+pub fn route_vec_path<'a, 'k, I>(
+    name: &'a str,
+    my_prefix: &str,
+    field_name: &str,
+    inner_prefix: &str,
+    natural_keys: I,
+) -> VecRoute<'a>
+where
+    I: IntoIterator<Item = (usize, &'k str)>,
+{
+    let key_prefix = if my_prefix.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{my_prefix}.{field_name}")
+    };
+    let Some(rest) = name
+        .strip_prefix(&key_prefix)
+        .and_then(|s| s.strip_prefix('.'))
+    else {
+        return VecRoute::Miss;
+    };
+
+    // Longest-match against live natural keys, collecting every index that
+    // hits the same maximal key so duplicates surface as Ambiguous.
+    let mut best_len: Option<usize> = None;
+    let mut best_hits: Vec<usize> = Vec::new();
+    for (idx, key) in natural_keys {
+        if key.is_empty() {
+            // Empty natural-key slots can't be addressed by name; skip so
+            // they don't soak up every otherwise-unmatched path via the
+            // empty prefix.
+            continue;
+        }
+        if rest
+            .strip_prefix(key)
+            .and_then(|s| s.strip_prefix('.'))
+            .is_some()
+            || rest == key
+        {
+            match best_len {
+                Some(len) if key.len() < len => continue,
+                Some(len) if key.len() == len => best_hits.push(idx),
+                _ => {
+                    best_len = Some(key.len());
+                    best_hits.clear();
+                    best_hits.push(idx);
+                }
+            }
+        }
+    }
+    let Some(key_len) = best_len else {
+        return VecRoute::Miss;
+    };
+    let key_slice = &rest[..key_len];
+    if best_hits.len() > 1 {
+        return VecRoute::Ambiguous {
+            key: key_slice,
+            count: best_hits.len(),
+        };
+    }
+    let idx = best_hits[0];
+    // `rest == key` means the inner suffix is empty (i.e. the path
+    // addresses the element itself, not a property on it). Treat as a
+    // miss for routing-into-properties; callers asking about the whole
+    // element use map_keys / map_key_create instead.
+    if rest.len() == key_len {
+        return VecRoute::Miss;
+    }
+    let inner_suffix = &rest[key_len + 1..];
+    let inner_name = if inner_prefix.is_empty() {
+        inner_suffix.to_string()
+    } else {
+        format!("{inner_prefix}.{inner_suffix}")
+    };
+    VecRoute::Hit {
+        index: idx,
+        inner_name,
+    }
+}
+
+/// Outcome of routing a `<prefix>.<field>.<natural_key>.<suffix>` path
+/// into a `#[nested] Vec<T>` field. See [`route_vec_path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VecRoute<'a> {
+    /// Path is not addressed at this field at all (wrong prefix, or
+    /// addresses the element itself rather than a sub-property). Caller
+    /// should fall through to the next nested field.
+    Miss,
+    /// Path resolved to a unique element. `index` is the element's
+    /// position in the underlying `Vec`; `inner_name` is the property
+    /// path to pass to `T::get_prop` / `T::set_prop`.
+    Hit { index: usize, inner_name: String },
+    /// Path's natural key matches two or more elements. Callers must
+    /// surface this as an error: editing either duplicate silently is
+    /// a correctness hazard. The schema's per-section validator
+    /// (`validate_mcp_config` for `mcp.servers`) is the source of truth
+    /// for the on-save check; this variant is the in-flight equivalent.
+    Ambiguous { key: &'a str, count: usize },
+}
+
 /// Return a comma-separated string of valid enum variant names for display in error messages.
 #[cfg(feature = "schema-export")]
 pub fn enum_variants<T: schemars::JsonSchema>() -> String {
@@ -137,7 +262,9 @@ pub fn make_prop_field(
     enum_variants: Option<fn() -> Vec<String>>,
     description: &'static str,
     derived_from_secret: bool,
+    credential_class: Option<CredentialSurfaceClass>,
     tab: ConfigTab,
+    display_secret_terminals: &[&str],
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -148,7 +275,11 @@ pub fn make_prop_field(
             _ => crate::traits::UNSET_DISPLAY.to_string(),
         }
     } else {
-        toml_value_to_display(table.and_then(|t| t.get(serde_name)))
+        toml_value_to_display_for_kind(
+            table.and_then(|t| t.get(serde_name)),
+            kind,
+            display_secret_terminals,
+        )
     };
     PropFieldInfo {
         name: name.to_string(),
@@ -160,6 +291,7 @@ pub fn make_prop_field(
         enum_variants,
         description,
         derived_from_secret,
+        credential_class,
         tab,
     }
 }
@@ -170,14 +302,18 @@ pub fn serde_get_prop<T: serde::Serialize>(
     prefix: &str,
     name: &str,
     is_secret: bool,
+    kind: PropKind,
+    display_secret_terminals: &[&str],
 ) -> anyhow::Result<String> {
     if is_secret {
         return Ok("**** (encrypted)".to_string());
     }
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let table = toml::Value::try_from(target)?;
-    Ok(toml_value_to_display(
+    Ok(toml_value_to_display_for_kind(
         table.as_table().and_then(|t| t.get(&serde_name)),
+        kind,
+        display_secret_terminals,
     ))
 }
 
@@ -209,6 +345,122 @@ fn toml_value_to_display(value: Option<&toml::Value>) -> String {
         Some(toml::Value::String(s)) => s.clone(),
         Some(v) => v.to_string(),
     }
+}
+
+fn toml_value_to_display_for_kind(
+    value: Option<&toml::Value>,
+    kind: PropKind,
+    display_secret_terminals: &[&str],
+) -> String {
+    match kind {
+        PropKind::Object | PropKind::ObjectArray => match value {
+            None => crate::traits::UNSET_DISPLAY.to_string(),
+            Some(toml::Value::String(s)) => s.clone(),
+            Some(v) => {
+                let mut redacted = v.clone();
+                redact_toml_display_secrets(&mut redacted, display_secret_terminals);
+                redacted.to_string()
+            }
+        },
+        _ => toml_value_to_display(value),
+    }
+}
+
+pub fn object_array_json_display_value(
+    value: &impl serde::Serialize,
+    display_secret_terminals: &[&str],
+) -> String {
+    match serde_json::to_value(value) {
+        Ok(mut value) => {
+            redact_json_display_secrets(&mut value, display_secret_terminals);
+            serde_json::to_string(&value).unwrap_or_else(|_| "[]".to_string())
+        }
+        Err(_) => "[]".to_string(),
+    }
+}
+
+fn redact_json_display_secrets(value: &mut serde_json::Value, display_secret_terminals: &[&str]) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_display_secrets(item, display_secret_terminals);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map.iter_mut() {
+                if display_key_is_secret_terminal(key, display_secret_terminals) {
+                    mask_json_value(nested);
+                } else {
+                    redact_json_display_secrets(nested, display_secret_terminals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_toml_display_secrets(value: &mut toml::Value, display_secret_terminals: &[&str]) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                redact_toml_display_secrets(item, display_secret_terminals);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (key, nested) in table.iter_mut() {
+                if display_key_is_secret_terminal(key, display_secret_terminals) {
+                    mask_toml_value(nested);
+                } else {
+                    redact_toml_display_secrets(nested, display_secret_terminals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mask_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                mask_json_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values_mut() {
+                mask_json_value(nested);
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => *value = serde_json::Value::String("****".to_string()),
+    }
+}
+
+fn mask_toml_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                mask_toml_value(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, nested) in table.iter_mut() {
+                mask_toml_value(nested);
+            }
+        }
+        _ => *value = toml::Value::String("****".to_string()),
+    }
+}
+
+fn display_key_is_secret_terminal(key: &str, display_secret_terminals: &[&str]) -> bool {
+    let normalized = normalize_display_key(key);
+    display_secret_terminals
+        .iter()
+        .any(|terminal| normalize_display_key(terminal) == normalized)
+}
+
+fn normalize_display_key(key: &str) -> String {
+    key.replace('-', "_").to_ascii_lowercase()
 }
 
 fn prop_name_to_serde_field(prefix: &str, name: &str) -> anyhow::Result<String> {
@@ -512,6 +764,178 @@ mod tests {
         assert_eq!(
             got,
             Some(("custom:https://example/v1", "api-key".to_string()))
+        );
+    }
+
+    // ── route_vec_path ────────────────────────────────────────────────────
+
+    #[test]
+    fn route_vec_path_hits_single_element_with_inner_suffix() {
+        let keys = [(0usize, "fs"), (1, "github")];
+        let got = route_vec_path(
+            "mcp.servers.fs.url",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            VecRoute::Hit {
+                index: 0,
+                inner_name: "mcp.servers.url".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_vec_path_routes_deep_inner_path() {
+        // McpServerConfig has `headers` which is a HashMap; full path is
+        // `mcp.servers.<name>.headers.<header-key>`. The router must
+        // forward `headers.<header-key>` as the inner name.
+        let keys = [(0usize, "primary")];
+        let got = route_vec_path(
+            "mcp.servers.primary.headers.authorization",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            VecRoute::Hit {
+                index: 0,
+                inner_name: "mcp.servers.headers.authorization".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_vec_path_misses_on_wrong_prefix() {
+        let keys = [(0usize, "fs")];
+        let got = route_vec_path(
+            "providers.models.anthropic.default.api-key",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(got, VecRoute::Miss);
+    }
+
+    #[test]
+    fn route_vec_path_misses_on_unknown_natural_key() {
+        let keys = [(0usize, "fs"), (1, "github")];
+        let got = route_vec_path(
+            "mcp.servers.unknown.url",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(got, VecRoute::Miss);
+    }
+
+    #[test]
+    fn route_vec_path_picks_longest_dotted_natural_key() {
+        // An operator may name an MCP server `acme.tools` (TOML allows
+        // any string for `name`). The router must prefer the longer
+        // key when one is a prefix of another.
+        let keys = [(0usize, "acme"), (1, "acme.tools")];
+        let got = route_vec_path(
+            "mcp.servers.acme.tools.url",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            VecRoute::Hit {
+                index: 1,
+                inner_name: "mcp.servers.url".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_vec_path_reports_ambiguous_duplicates() {
+        // Two entries share the same `name`. validate_mcp_config catches
+        // this at save time, but until the user repairs the config the
+        // router must refuse to silently edit one of them.
+        let keys = [(0usize, "fs"), (1, "fs")];
+        let got = route_vec_path(
+            "mcp.servers.fs.url",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            VecRoute::Ambiguous {
+                key: "fs",
+                count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn route_vec_path_skips_empty_natural_keys() {
+        // A newly-inserted entry that hasn't had `name` set yet must
+        // not match every otherwise-unmatched path via the empty key.
+        let keys = [(0usize, ""), (1, "fs")];
+        let got = route_vec_path(
+            "mcp.servers.fs.url",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            VecRoute::Hit {
+                index: 1,
+                inner_name: "mcp.servers.url".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_vec_path_treats_bare_element_path_as_miss() {
+        // `mcp.servers.fs` with no trailing field addresses the element
+        // itself, not a property; routing into properties must miss so
+        // callers fall through to map_keys-shaped APIs.
+        let keys = [(0usize, "fs")];
+        let got = route_vec_path(
+            "mcp.servers.fs",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(got, VecRoute::Miss);
+    }
+
+    #[test]
+    fn route_vec_path_honours_my_prefix() {
+        // Same field name nested under a non-empty outer prefix
+        // (the way the derive will actually call it for the top-level
+        // Mcp section: my_prefix="mcp", field_name="servers").
+        let keys = [(0usize, "fs")];
+        let got = route_vec_path(
+            "mcp.servers.fs.transport",
+            "mcp",
+            "servers",
+            "mcp.servers",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            VecRoute::Hit {
+                index: 0,
+                inner_name: "mcp.servers.transport".to_string(),
+            }
         );
     }
 

@@ -69,7 +69,8 @@ pub struct OpenAiCompatibleModelProvider {
     /// Some OpenAI-compatible local servers, such as Ollama, expose `/models`
     /// without authentication. Keep the default credential-gated for hosted
     /// providers so missing credentials still fall through to catalog sources.
-    unauthenticated_model_listing: bool,
+    /// When `true`, the `/models` endpoint is treated as publicly accessible.
+    public_model_listing: bool,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -151,6 +152,12 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Pricing data from the provider's `/models` endpoint.
+    /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
+    /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
+    /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
+    #[serde(default)]
+    pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -162,6 +169,36 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+/// Extract model IDs with pricing from a ModelsResponse.
+/// Returns sorted list of `ModelInfo` with pricing data where available.
+fn normalize_models_with_pricing(
+    body: ModelsResponse,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    let mut models: Vec<ModelInfo> = body
+        .data
+        .into_iter()
+        .filter(|e| !e.id.trim().is_empty())
+        .map(|e| ModelInfo {
+            id: e.id.trim().to_string(),
+            pricing: e.pricing,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
+}
+
+/// Convert models.dev IDs into `ModelInfo` entries without pricing.
+/// The models.dev catalog does not serve pricing data, so this function
+/// documents the intentional data-loss contract: callers should expect
+/// `pricing: None` on every returned entry.
+fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    ids.into_iter()
+        .map(|id| ModelInfo { id, pricing: None })
+        .collect()
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -284,7 +321,7 @@ impl OpenAiCompatibleModelProvider {
             models_dev_key: None,
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
-            unauthenticated_model_listing: false,
+            public_model_listing: false,
         }
     }
     /// Opt this provider into per-model conservative tool-schema sanitization.
@@ -298,8 +335,8 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
-    pub fn with_unauthenticated_model_listing(mut self) -> Self {
-        self.unauthenticated_model_listing = true;
+    pub fn with_public_model_listing(mut self) -> Self {
+        self.public_model_listing = true;
         self
     }
 
@@ -621,25 +658,22 @@ impl OpenAiCompatibleModelProvider {
             .next()
             .unwrap_or(model)
             .to_ascii_lowercase();
+        // gpt-5*-chat-latest (gpt-5-chat-latest, gpt-5.1-chat-latest, ...) are
+        // OpenAI's non-reasoning chat-router models; the Chat Completions API
+        // rejects reasoning_effort for them. Treat them as a distinct family, the
+        // same way the native openai.rs provider already special-cases them.
+        let is_gpt5_chat_latest = id.starts_with("gpt-5") && id.ends_with("-chat-latest");
         let is_openai_reasoning_model = id == "o1"
             || id.starts_with("o1-")
             || id == "o3"
             || id.starts_with("o3-")
             || id == "o4"
             || id.starts_with("o4-")
-            || id.starts_with("gpt-5");
+            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
         let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
 
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
     }
-}
-
-/// Kimi K2.5/K2.6 models enforce fixed temperatures per mode (1.0 thinking,
-/// 0.6 instant) and reject any other value with HTTP 400. Omit `temperature`
-/// for kimi-k2.* models so the backend chooses the correct mode default.
-/// Substring match covers k2.5, k2.6, and future k2.x variants.
-fn compatible_model_omits_temperature(model: &str) -> bool {
-    model.contains("kimi-k2")
 }
 
 #[derive(Debug, Serialize)]
@@ -2121,10 +2155,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
-        // servers that explicitly allow unauthenticated listing use the same
-        // path without an Authorization header.
+        // servers with a public catalog use the same path without an Authorization header.
         let list_credential = self.credential.as_deref();
-        if list_credential.is_some() || self.unauthenticated_model_listing {
+        if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential)
@@ -2190,6 +2223,81 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
+    async fn list_models_with_pricing(
+        &self,
+    ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
+        // When a credential is present, hit the provider's native /models
+        // endpoint — this returns pricing data that we can capture.
+        let list_credential = self.credential.as_deref();
+        if list_credential.is_some() || self.public_model_listing {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), list_credential)
+                .send()
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": &self.name,
+                                "url": &url,
+                                "phase": "model_list_request",
+                                "error": super::format_error_chain(&e),
+                            })),
+                        "compatible: model list request failed"
+                    );
+                    anyhow::Error::msg(format!(
+                        "{} model list request failed: {url}: {e}",
+                        self.name
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "phase": "model_list_parse",
+                            "error": super::format_error_chain(&e),
+                        })),
+                    "compatible: model list returned invalid JSON"
+                );
+                anyhow::Error::msg(format!(
+                    "{} model list returned invalid JSON: {e}",
+                    self.name
+                ))
+            })?;
+            return Ok(normalize_models_with_pricing(body));
+        }
+        // No credential — try models.dev first (no pricing from that source),
+        // then fall back to OpenRouter which does include pricing.
+        if let Some(key) = &self.models_dev_key {
+            match crate::models_dev::list_models_for(key).await {
+                Ok(models) if !models.is_empty() => {
+                    return Ok(models_dev_to_model_info(models));
+                }
+                Ok(_) => {} // empty → fall through to openrouter
+                Err(_) if self.openrouter_vendor_prefix.is_none() => {
+                    return Ok(Vec::new());
+                }
+                Err(_) => {} // fall through to openrouter
+            }
+        }
+        match &self.openrouter_vendor_prefix {
+            Some(prefix) => {
+                crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -2197,11 +2305,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         // Normalize image markers (e.g. local file paths from channel
@@ -2314,11 +2417,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2400,11 +2498,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2512,11 +2605,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
@@ -2625,11 +2713,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
@@ -2778,11 +2861,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let provider = self.clone();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
@@ -2920,11 +2998,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
-            None
-        } else {
-            Some(temperature.unwrap_or(self.default_temperature()))
-        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
@@ -3928,6 +4001,16 @@ mod tests {
         assert_eq!(
             model_provider.reasoning_effort_for_model("openai/gpt-5"),
             Some("high".to_string())
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5-chat-latest"),
+            None,
+            "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5.1-chat-latest"),
+            None,
+            "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
         );
         assert_eq!(
             model_provider.reasoning_effort_for_model("gpt-4-codex"),
@@ -5528,20 +5611,76 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compatible_model_omits_temperature_matches_kimi_k2() {
-        assert!(compatible_model_omits_temperature("kimi-k2.5"));
-        assert!(compatible_model_omits_temperature("kimi-k2.6"));
-        assert!(compatible_model_omits_temperature("kimi-k2.7"));
-        assert!(compatible_model_omits_temperature("kimi-k2"));
+    fn minimal_request(temperature: Option<f64>) -> ApiChatRequest {
+        ApiChatRequest {
+            model: "any-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            temperature,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        }
     }
 
     #[test]
-    fn compatible_model_omits_temperature_skips_other_models() {
-        assert!(!compatible_model_omits_temperature("kimi-k1"));
-        assert!(!compatible_model_omits_temperature("kimi-latest"));
-        assert!(!compatible_model_omits_temperature("gpt-4o"));
-        assert!(!compatible_model_omits_temperature("claude-sonnet-4-6"));
-        assert!(!compatible_model_omits_temperature("llama-3.1-70b"));
+    fn unset_temperature_is_omitted_from_wire() {
+        // `None` must honor the `Option<f64>` contract: no `temperature` field
+        // on the wire, regardless of model name. Generalizes the former
+        // kimi-k2-only special case (issue #7145).
+        let body = serde_json::to_value(minimal_request(None)).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "unset temperature must be omitted from the request body, got: {body}"
+        );
+    }
+
+    #[test]
+    fn explicit_temperature_is_sent_on_wire() {
+        let body = serde_json::to_value(minimal_request(Some(0.5))).unwrap();
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "explicit temperature must be sent verbatim, got: {body}"
+        );
+    }
+
+    #[test]
+    fn models_dev_to_model_info_returns_no_pricing() {
+        // The models.dev catalog does not serve pricing data; every entry
+        // must have `pricing: None`. This documents the intentional contract.
+        let ids = vec![
+            "openai/gpt-4o".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
+        ];
+        let models = models_dev_to_model_info(ids);
+        assert_eq!(models.len(), 2);
+        // Preserves input order (no sorting — caller decides).
+        assert_eq!(models[0].id, "openai/gpt-4o");
+        assert!(models[0].pricing.is_none());
+        assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
+        assert!(models[1].pricing.is_none());
+    }
+
+    #[test]
+    fn public_model_listing_flag_defaults_false() {
+        // Providers without explicit public_model_listing must default to false,
+        // preserving existing behavior for all established providers.
+        let p = make_model_provider("test", "https://example.com", None);
+        assert!(!p.public_model_listing);
+    }
+
+    #[test]
+    fn public_model_listing_flag_can_be_set() {
+        // Verify the builder correctly enables public_model_listing.
+        let p =
+            make_model_provider("test", "https://example.com", None).with_public_model_listing();
+        assert!(p.public_model_listing);
     }
 }

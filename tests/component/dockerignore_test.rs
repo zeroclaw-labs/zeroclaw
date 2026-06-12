@@ -15,7 +15,6 @@ const MUST_EXCLUDE: &[&str] = &[
     "target",
     "docs",
     "examples",
-    "tests",
     "*.md",
     "*.png",
     "*.db",

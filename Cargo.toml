@@ -4,28 +4,29 @@ resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.8.0-beta-2"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-2" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-2" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-2", default-features = false }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-2" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.0-beta-2" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-2" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-2" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-2", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-2" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-2", default-features = false }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-2" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-2" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-2" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-2" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-2" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.0" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0", default-features = false }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0" }
+zerocode = { path = "apps/zerocode", version = "0.8.0-beta-2" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 
@@ -204,10 +205,10 @@ tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 regex = "1.10"
 hostname = { version = "0.4.2", optional = true }
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rustls-pki-types = { version = "1.14.0", optional = true }
-tokio-rustls = { version = "0.26.4", optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
@@ -274,7 +275,7 @@ channels-full = [
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
-    "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt",
+    "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
@@ -300,6 +301,7 @@ channel-slack = ["zeroclaw-channels/channel-slack"]
 channel-signal = ["zeroclaw-channels/channel-signal"]
 channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
 channel-irc = ["zeroclaw-channels/channel-irc"]
+channel-twitch = ["zeroclaw-channels/channel-twitch"]
 channel-imessage = ["zeroclaw-channels/channel-imessage"]
 channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
 channel-qq = ["zeroclaw-channels/channel-qq"]
@@ -308,6 +310,7 @@ channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
 channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
+channel-amqp = ["zeroclaw-channels/channel-amqp"]
 channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
 channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]

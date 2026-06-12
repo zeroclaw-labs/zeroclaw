@@ -1,6 +1,6 @@
 # Request Lifecycle
 
-What happens between "user sends a message" and "agent replies" — the full path, with streaming, tool calls, and security gates annotated.
+What happens between "user sends a message" and "agent replies": the full path, with streaming, tool calls, and security gates annotated.
 
 ## Inbound
 
@@ -8,14 +8,14 @@ What happens between "user sends a message" and "agent replies" — the full pat
 flowchart LR
     A[External event] -->|webhook / push / poll / WS| B[Channel adapter]
     B -->|decode, dedup, pair-check| C[Inbound envelope]
-    C -->|workspace binding| D[Runtime: deliver_message]
+    C -->|workspace binding| D[Runtime: process_message]
 ```
 
 A channel adapter (e.g. `discord.rs`, `telegram.rs`, `email_channel.rs`) receives platform-native events and converts them into a uniform inbound envelope. The adapter handles:
 
-- **Decoding** — platform-specific payload → canonical message format
-- **Deduplication** — prevents replaying the same message twice (restarts, retries)
-- **Pair-check** — enforces the `[channels.<name>.allowed_users]` / IAM policy before the event reaches the runtime
+- **Decoding**: platform-specific payload → canonical message format
+- **Deduplication**: prevents replaying the same message twice (restarts, retries)
+- **Pair-check**: enforces the `[channels.<name>.allowed_users]` / IAM policy before the event reaches the runtime
 
 If the channel is not paired or the user isn't allowed, the event is dropped before the runtime sees it.
 
@@ -30,7 +30,7 @@ sequenceDiagram
     participant PR as Provider
     participant TL as Tool
 
-    CH->>RT: deliver_message(envelope)
+    CH->>RT: process_message(envelope)
     RT->>MEM: load_context(conversation_id)
     MEM-->>RT: prior messages + retrieved facts
     RT->>PR: chat(system, history, tools)
@@ -39,7 +39,7 @@ sequenceDiagram
         RT-->>CH: draft update (if channel supports it)
     end
     PR-->>RT: StreamEvent::ToolCall(args)
-    RT->>SEC: validate_tool_call(name, args, risk)
+    RT->>SEC: evaluate_tool_access(name, args, risk)
     alt Blocked
         SEC-->>RT: Err(reason)
         RT->>PR: chat(..., + tool_error)
@@ -62,12 +62,12 @@ Key properties:
 
 - **Streaming is end-to-end.** The provider streams tokens. If the channel adapter reports `supports_draft_updates()`, the runtime edits a sent message in place as text arrives. Discord, Slack, and Telegram support this.
 - **Tool calls are mid-stream.** The model can emit a tool call while still generating text. The runtime pauses the stream, validates, invokes, feeds the result back, and resumes.
-- **Security gates every tool call.** `validate_tool_call` consults the [autonomy level](../security/autonomy.md), allow/deny lists, and path boundaries. Medium-risk calls under `Supervised` autonomy go to the operator-approval path.
-- **Memory is persistent.** The full conversation, tool calls, tool results, and receipts are written to the memory backend.
+- **Security gates every tool call.** `evaluate_tool_access` consults the [autonomy level](../security/autonomy.md), allow/deny lists, and path boundaries. Medium-risk calls under `Supervised` autonomy go to the operator-approval path.
+- **Memory is persistent.** The conversation, tool calls, and tool results are written to the memory backend. (Receipts ride in-band in the conversation text rather than as a separate persisted artifact.)
 
 ## Tool receipts
 
-Every tool invocation produces a signed receipt written to the tool-receipts log. See [Tool receipts](../security/tool-receipts.md). Receipts are chained — each one includes the hash of the previous — so tampering with any receipt invalidates the rest of the log.
+Every tool invocation produces an HMAC-SHA256 receipt that is appended to the tool-result text and passed back to the model in the conversation, proving the tool actually ran. The HMAC is keyed by a per-daemon-process key and computed over `tool_name || args || result || timestamp`. Receipts are not written to a separate on-disk log and are not chained; the model can echo them but cannot forge a new valid one without the key. See [Tool receipts](../security/tool-receipts.md).
 
 ## Outbound
 
@@ -75,7 +75,7 @@ Outbound messages go back through the same channel adapter. Adapters with multi-
 
 ## Where it lives in code
 
-- Agent loop: `crates/zeroclaw-runtime/src/agent/loop_.rs`
-- Tool-call validation: `crates/zeroclaw-runtime/src/security/`
+- Agent loop: `crates/zeroclaw-runtime/src/agent/loop_.rs` (`process_message`)
+- Tool-call access checks: `crates/zeroclaw-runtime/src/security/` (`iam_policy.rs` `evaluate_tool_access`)
 - Channel orchestration: `crates/zeroclaw-channels/src/orchestrator/`
-- Provider streaming: `crates/zeroclaw-providers/src/traits.rs` (`StreamEvent` enum), `compatible.rs` (SSE parser)
+- Provider streaming: `crates/zeroclaw-api/src/model_provider.rs` (`StreamEvent` enum, re-exported from `zeroclaw-providers`), `compatible.rs` (SSE parser)

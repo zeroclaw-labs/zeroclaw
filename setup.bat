@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --standard | --full | --help]
 :: ============================================================================
 
-set "VERSION=0.8.0-beta-2"
+set "VERSION=0.8.0"
 set "RUST_MIN_VERSION=1.87"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
@@ -308,11 +308,11 @@ echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
 if /I "%MODE%"=="minimal" (
-echo     2. Minimal build excludes onboarding ^(zeroclaw onboard is unavailable^)
+echo     2. Minimal build excludes quickstart ^(zeroclaw quickstart is unavailable^)
 echo     3. Configure model providers manually in %%USERPROFILE%%\.zeroclaw\config.toml
 echo     4. Use reduced CLI path: zeroclaw agent --message "Hello"
 ) else (
-echo     2. Run: zeroclaw onboard
+echo     2. Run: zeroclaw quickstart
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
 echo     4. Launch the TUI: zerocode
 )
