@@ -53,4 +53,39 @@ mod tests {
         assert_eq!(floor_char_boundary(text, 5), 3);
         assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
     }
+
+    #[test]
+    fn clean_verbatim_path_strips_unc_prefix_on_windows() {
+        // Simulate a Windows verbatim UNC path
+        let verbatim_path = std::path::Path::new(r"\\?\C:\Users\me\repo");
+        let cleaned = clean_verbatim_path(verbatim_path);
+        // On Windows, the prefix should be stripped; on other platforms, unchanged
+        #[cfg(target_os = "windows")]
+        assert_eq!(cleaned.to_string_lossy(), r"C:\Users\me\repo");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(cleaned.to_string_lossy(), r"\\?\C:\Users\me\repo");
+    }
+
+    #[test]
+    fn clean_verbatim_path_leaves_normal_path_unchanged() {
+        let normal_path = std::path::Path::new(r"C:\Users\me\repo");
+        let cleaned = clean_verbatim_path(normal_path);
+        assert_eq!(cleaned.to_string_lossy(), r"C:\Users\me\repo");
+    }
+
+    #[test]
+    fn clean_verbatim_path_leaves_unix_path_unchanged() {
+        let unix_path = std::path::Path::new("/home/me/repo");
+        let cleaned = clean_verbatim_path(unix_path);
+        assert_eq!(cleaned.to_string_lossy(), "/home/me/repo");
+    }
+
+    #[test]
+    fn clean_verbatim_path_does_not_strip_unc_driveless_path() {
+        // UNC path without drive letter (e.g. \\?\UNC\server\share) should not be stripped
+        let unc_server_path = std::path::Path::new(r"\\?\UNC\server\share");
+        let cleaned = clean_verbatim_path(unc_server_path);
+        // Should remain unchanged since there's no drive letter at position 5
+        assert_eq!(cleaned.to_string_lossy(), r"\\?\UNC\server\share");
+    }
 }

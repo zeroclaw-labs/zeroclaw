@@ -461,4 +461,38 @@ mod tests {
         assert!(config.system_prompt.is_none());
         assert_eq!(config.allowed_tools, vec!["Read", "Edit", "Bash", "Write"]);
     }
+
+    #[test]
+    fn safe_env_vars_includes_windows_system_variables() {
+        // Verify that SAFE_ENV_VARS contains the Windows system-level
+        // variables required for subprocess execution. This test ensures
+        // the Windows-specific environment allowlist is not accidentally
+        // removed during future cleanup.
+        let safe_vars: Vec<&str> = SAFE_ENV_VARS.to_vec();
+
+        // Windows system variables must be present
+        assert!(
+            safe_vars.contains(&"USERPROFILE"),
+            "USERPROFILE must be in SAFE_ENV_VARS for Windows subprocess execution"
+        );
+        assert!(
+            safe_vars.contains(&"APPDATA"),
+            "APPDATA must be in SAFE_ENV_VARS for Windows subprocess execution"
+        );
+        assert!(
+            safe_vars.contains(&"LOCALAPPDATA"),
+            "LOCALAPPDATA must be in SAFE_ENV_VARS for Windows subprocess execution"
+        );
+        assert!(
+            safe_vars.contains(&"SystemRoot"),
+            "SystemRoot must be in SAFE_ENV_VARS for Windows subprocess execution"
+        );
+
+        // Standard Unix/common variables must also be present
+        assert!(safe_vars.contains(&"PATH"));
+        assert!(safe_vars.contains(&"HOME"));
+        assert!(safe_vars.contains(&"TERM"));
+        assert!(safe_vars.contains(&"LANG"));
+        assert!(safe_vars.contains(&"USER"));
+    }
 }
