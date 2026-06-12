@@ -370,57 +370,21 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
-        Arc::new(PushoverTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
         Arc::new(CalculatorTool::new()),
-        Arc::new(WeatherTool::new()),
-        Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
 
-    // Register discord_search if discord_history channel is configured
-    if root_config.channels.discord_history.is_some() {
-        match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {
-            Ok(discord_mem) => {
-                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
-            }
-            Err(e) => {
-                tracing::warn!("discord_search: failed to open discord.db: {e}");
-            }
-        }
-    }
-
-    // LLM task tool — always registered when a provider is configured
-    {
-        let llm_task_provider = root_config
-            .providers
-            .fallback
-            .clone()
-            .unwrap_or_else(|| "openrouter".to_string());
-        let llm_task_model = root_config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.model.clone())
-            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(root_config);
-        tool_arcs.push(Arc::new(LlmTaskTool::new(
-            security.clone(),
-            llm_task_provider,
-            llm_task_model,
-            root_config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7),
-            root_config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.clone()),
-            llm_task_runtime_options,
-        )));
-    }
+    // Phase 1.5 strip:
+    //   - PushoverTool        (alerts; not shipping)
+    //   - WeatherTool         (productivity; not shipping)
+    //   - CanvasTool          (image-canvas UI; not shipping)
+    //   - DiscordSearchTool   (discord_history channel dropped)
+    //   - LlmTaskTool         (in-band escalation; dropped)
+    // All these tool registrations were removed here. The corresponding
+    // config sections (`root_config.notion`, `root_config.web_search`,
+    // `root_config.text_browser`, `browser_config`, `http_config`,
+    // `web_fetch_config`, `root_config.channels.discord_history`,
+    // `root_config.browser_delegate`) remain in the config schema for now;
+    // a follow-up phase will trim them.
 
     if matches!(
         root_config.skills.prompt_injection_mode,
@@ -434,91 +398,12 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if browser_config.enabled {
-        // Add legacy browser_open tool for simple URL opening
-        tool_arcs.push(Arc::new(BrowserOpenTool::new(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-        )));
-        // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-            browser_config.session_name.clone(),
-            browser_config.backend.clone(),
-            browser_config.native_headless,
-            browser_config.native_webdriver_url.clone(),
-            browser_config.native_chrome_path.clone(),
-            ComputerUseConfig {
-                endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
-                timeout_ms: browser_config.computer_use.timeout_ms,
-                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
-                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
-                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
-            },
-        )));
-    }
-
-    // Browser delegation tool (conditionally registered; requires shell access)
-    if root_config.browser_delegate.enabled {
-        if has_shell_access {
-            tool_arcs.push(Arc::new(BrowserDelegateTool::new(
-                security.clone(),
-                root_config.browser_delegate.clone(),
-            )));
-        } else {
-            tracing::warn!(
-                "browser_delegate: skipped registration because the current runtime does not allow shell access"
-            );
-        }
-    }
-
-    if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
-            security.clone(),
-            http_config.allowed_domains.clone(),
-            http_config.max_response_size,
-            http_config.timeout_secs,
-            http_config.allow_private_hosts,
-        )));
-    }
-
-    if web_fetch_config.enabled {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
-            security.clone(),
-            web_fetch_config.allowed_domains.clone(),
-            web_fetch_config.blocked_domains.clone(),
-            web_fetch_config.max_response_size,
-            web_fetch_config.timeout_secs,
-            web_fetch_config.firecrawl.clone(),
-            web_fetch_config.allowed_private_hosts.clone(),
-        )));
-    }
-
-    // Text browser tool (headless text-based browser rendering)
-    if root_config.text_browser.enabled {
-        tool_arcs.push(Arc::new(TextBrowserTool::new(
-            security.clone(),
-            root_config.text_browser.preferred_browser.clone(),
-            root_config.text_browser.timeout_secs,
-        )));
-    }
-
-    // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
-            root_config.web_search.provider.clone(),
-            root_config.web_search.brave_api_key.clone(),
-            root_config.web_search.tavily_api_key.clone(),
-            root_config.web_search.searxng_instance_url.clone(),
-            root_config.web_search.max_results,
-            root_config.web_search.timeout_secs,
-            root_config.config_path.clone(),
-            root_config.secrets.encrypt,
-        )));
-    }
+    // Phase 1.5 strip: browser stack (BrowserTool, BrowserDelegateTool,
+    // BrowserOpenTool, TextBrowserTool), HTTP request tool, WebFetch,
+    // WebSearch — all sandbox-blocked / not shipping per decisions #1-#3.
+    // The wrapping if-blocks (browser_config.enabled, http_config.enabled,
+    // etc.) are also unreachable now; left in place to minimize diff churn,
+    // a follow-up trims the config schema.
 
     // Notion API tool (conditionally registered)
     if root_config.notion.enabled {
