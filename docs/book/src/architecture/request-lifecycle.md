@@ -75,16 +75,16 @@ Outbound messages go back through the same channel adapter. Adapters with multi-
 
 ## Where it lives in code
 
-- Agent loop: `crates/zeroclaw-runtime/src/agent/turn/` (`run_tool_call_loop`) — entry points in `crates/zeroclaw-runtime/src/agent/loop_.rs` (`process_message`, `run`)
+- Agent loop: `crates/zeroclaw-runtime/src/agent/turn/` (`run_tool_call_loop`), with entry points in `crates/zeroclaw-runtime/src/agent/loop_.rs` (`process_message`, `run`)
 - Tool-call access checks: `crates/zeroclaw-runtime/src/security/` (`iam_policy.rs` `evaluate_tool_access`)
 - Channel orchestration: `crates/zeroclaw-channels/src/orchestrator/`
 - Provider streaming: `crates/zeroclaw-api/src/model_provider.rs` (`StreamEvent` enum, re-exported from `zeroclaw-providers`), `compatible.rs` (SSE parser)
 
-Since #7415, every transport — channels, CLI, cron, gateway WebSocket, RPC (zerocode), ACP, and the embedded `Agent` API — runs the same turn engine: `run_tool_call_loop` in `crates/zeroclaw-runtime/src/agent/turn/`. The streaming and embedded entry points are thin wrappers in `agent.rs` that set per-caller knobs (dedup, iteration-cap behavior, event emission) around the shared loop. The `turn/` module is one file per step:
+Since #7415, every transport (channels, CLI, cron, gateway WebSocket, RPC/zerocode, ACP, and the embedded `Agent` API) runs the same turn engine: `run_tool_call_loop` in `crates/zeroclaw-runtime/src/agent/turn/`. The streaming and embedded entry points are thin wrappers in `agent.rs` that set per-caller knobs (dedup, iteration-cap behavior, event emission) around the shared loop. The `turn/` module is one file per step:
 
 | File(s) | Step |
 |---|---|
-| `mod.rs` | orchestrator — iteration control, knobs, steering drain |
+| `mod.rs` | orchestrator: iteration control, knobs, steering drain |
 | `history_window.rs` · `tool_specs.rs` · `vision_route.rs` | pre-call: history maintenance, tool specs, vision routing |
 | `provider_call.rs` · `stream_consume.rs` · `stream_guard.rs` | the LLM call, stream consumption, mid-stream protocol guarding |
 | `parse_response.rs` · `protocol_detect.rs` · `context_recovery.rs` | response interpretation, parse-issue detection, overflow recovery |
