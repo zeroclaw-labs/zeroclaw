@@ -105,26 +105,18 @@ With the official image you can omit the {{#env-var-name gateway.allow_public_bi
 ### Rootless Compose with the Debian image
 
 For rootless Docker or Podman Compose deployments that need shell tools inside
-the container, use the Debian image and bind a host data directory. This mirrors
-the tested v0.7.5 Debian layout while keeping the dashboard bundle outside the
-mutable data mount:
+the container, use the current Debian image and bind a host data directory:
 
 ```yaml
 services:
   zeroclaw:
-    image: ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5-debian
+    image: ghcr.io/zeroclaw-labs/zeroclaw:debian
     container_name: zeroclaw
     restart: unless-stopped
-    environment:
-      ZEROCLAW_GATEWAY_HOST: 0.0.0.0
-      ZEROCLAW_GATEWAY_PORT: "42617"
-      ZEROCLAW_ALLOW_PUBLIC_BIND: "1"
-      ZEROCLAW_WEB_DIST_DIR: /dist
     ports:
       - "42617:42617"
     volumes:
       - ./data:/zeroclaw-data
-      - ./dist:/dist:ro
     healthcheck:
       test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
       interval: 60s
@@ -133,10 +125,13 @@ services:
       start_period: 10s
 ```
 
-Build the dashboard into `./dist` before starting this service if you set
-`ZEROCLAW_WEB_DIST_DIR=/dist`. If you use an image that already contains the
-dashboard bundle, remove that environment variable and the `./dist:/dist:ro`
-mount so the gateway can auto-detect the packaged bundle.
+The current Debian image carries the packaged dashboard outside
+`/zeroclaw-data`, so the bind mount does not hide it and no
+`gateway.web_dist_dir` override is needed. The official image also carries the
+container-friendly gateway bind defaults. Only add an `environment:` block if
+you bind-mount your own localhost-default config; use the schema-mirror env-var
+spelling shown by {{#env-var-name gateway.allow_public_bind}} rather than the
+legacy all-uppercase aliases.
 
 ## macOS: OrbStack vs Colima
 
