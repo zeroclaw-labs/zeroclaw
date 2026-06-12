@@ -1,3 +1,58 @@
+osAgent
+Copyright 2026 osAgent contributors (https://github.com/andreas2301/osAgent)
+
+This product is a fork of ZeroClaw (https://github.com/zeroclaw-labs/zeroclaw)
+tailored for the sovereign-shield self-hosted security platform.
+
+================================================================================
+osAgent is NOT ZeroClaw
+================================================================================
+
+osAgent is an independent fork. We do not represent ZeroClaw Labs and we do not
+claim affiliation with the ZeroClaw project, its trademark, or its branding.
+For the official upstream ZeroClaw distribution, see:
+
+  https://github.com/zeroclaw-labs/zeroclaw
+
+osAgent diverges from upstream in material ways:
+  - Two compile-time-separated binaries (`engineer`, `wizard`) replacing one daemon
+  - The `wizard` binary has zero MCP capability, enforced at the crate-dependency layer
+  - ~26 chat/social channels, ~50 LLM providers, ~35 tools, and the hardware/robotics/
+    desktop crates are stripped at the source level
+  - A native AMQP-mTLS bridge tool, file-exchange channel, lifecycle gates, and a
+    customer-keyed sqlcipher memory layer are added
+
+If you need ZeroClaw, get ZeroClaw. If you need osAgent's particular shape, you
+are in the right place.
+
+================================================================================
+Fork Provenance
+================================================================================
+
+Forked from:  zeroclaw-labs/zeroclaw
+Forked at:    tag v0.7.5
+Upstream SHA: a2988f0dfffa0c14fa56e218c7bb9f28da494da4
+Fork date:    2026-06-12
+
+Upstream sync policy: see sovereign-shield-backup/documentation/osAgent/UPSTREAM_SYNC.md
+
+================================================================================
+License
+================================================================================
+
+osAgent inherits ZeroClaw's dual-license model.
+This software is available under either of:
+
+  1. MIT License — see LICENSE-MIT
+  2. Apache License 2.0 — see LICENSE-APACHE
+
+You may use either license. Contributions to osAgent are licensed under the
+same dual-license terms.
+
+================================================================================
+Upstream NOTICE (preserved verbatim per Apache-2.0 §4(d))
+================================================================================
+
 ZeroClaw
 Copyright 2025 ZeroClaw Labs
 
