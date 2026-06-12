@@ -1084,8 +1084,7 @@ async fn run_quickstart_cli(
     // Guard: dialoguer reads from Term::stderr() and redraws infinitely
     // when stderr is redirected or non-attended (#7507).  Check both the
     // stdin handle (console user input) and stderr (dialoguer output).
-    let terminal_attended =
-        std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let terminal_attended = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if !terminal_attended {
         let msg = t(
             "cli-quickstart-needs-tty",

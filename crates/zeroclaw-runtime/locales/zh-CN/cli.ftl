@@ -443,6 +443,7 @@ cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
+cli-quickstart-needs-tty = quickstart requires an interactive terminal with both input and output attached.n    Re-run inside a terminal (or via ZeroCode TUI) to complete setup interactively.
 cli-no-channels-compiled = {"  "}此二进制文件中未编译任何通道类型。
 cli-quickstart-complete = Quickstart 完成。已创建 agent `{$alias}`。
 cli-next-steps = 后续步骤：

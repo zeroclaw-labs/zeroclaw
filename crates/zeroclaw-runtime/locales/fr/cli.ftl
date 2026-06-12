@@ -447,6 +447,7 @@ cli-press-enter = Appuyez sur Entrée pour quitter...
 cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
 cli-quickstart-cancelled = Quickstart annulé. Aucune configuration écrite.
 cli-quickstart-incomplete = {"  "}Tous les sélecteurs ne sont pas encore renseignés.
+cli-quickstart-needs-tty = quickstart requires an interactive terminal with both input and output attached.n    Re-run inside a terminal (or via ZeroCode TUI) to complete setup interactively.
 cli-no-channels-compiled = {"  "}Aucun type de canal n'est compilé dans ce binaire.
 cli-quickstart-complete = Quickstart terminé. Agent `{$alias}` créé.
 cli-next-steps = Étapes suivantes :

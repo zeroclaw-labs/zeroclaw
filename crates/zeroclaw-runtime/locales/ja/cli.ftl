@@ -444,6 +444,7 @@ cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
 cli-quickstart-cancelled = クイックスタートをキャンセルしました。設定は書き込まれていません。
 cli-quickstart-incomplete = {"  "}すべてのセレクターがまだ入力されていません。
+cli-quickstart-needs-tty = quickstart requires an interactive terminal with both input and output attached.n    Re-run inside a terminal (or via ZeroCode TUI) to complete setup interactively.
 cli-no-channels-compiled = {"  "}このバイナリにコンパイルされているチャンネルタイプはありません。
 cli-quickstart-complete = クイックスタートが完了しました。エージェント `{$alias}` を作成しました。
 cli-next-steps = 次のステップ:
