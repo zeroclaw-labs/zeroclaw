@@ -40,6 +40,38 @@ done
 # STRIP-07: i18n non-en locales stripped.
 # Mozilla Fluent pipeline retained; only en-US .ftl files survive.
 # ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────
+# STRIP-03: providers stripped to v1 set.
+# Keep: anthropic, gemini, openai (base for openai-compatible/openrouter),
+#       ollama, openrouter, plus compatible/multimodal/router/reliable/traits/
+#       models_dev support modules.
+# ──────────────────────────────────────────────────────────────────────────
+echo "--- STRIP-03 (providers) ---"
+DROPPED_PROVIDERS=(azure_openai bedrock claude_code copilot gemini_cli glm kilocli openai_codex telnyx)
+for p in "${DROPPED_PROVIDERS[@]}"; do
+  assert_file_absent "crates/zeroclaw-providers/src/$p.rs"     "STRIP-03 $p.rs source absent"
+  assert_no_grep    "^pub mod $p;"  "crates/zeroclaw-providers/src/lib.rs" "STRIP-03 $p mod declaration absent"
+done
+
+# ──────────────────────────────────────────────────────────────────────────
+# STRIP-04: tools stripped — keep file ops + memory + git_operations + a few
+# support modules; drop browser/web/hardware/social/desktop tools.
+# ──────────────────────────────────────────────────────────────────────────
+echo "--- STRIP-04 (tools) ---"
+DROPPED_TOOLS=(
+  browser browser_delegate browser_open canvas claude_code claude_code_runner
+  codex_cli composio discord_search escalate gemini_cli google_workspace
+  hardware_board_info hardware_memory_map hardware_memory_read http_request
+  image_gen jira_tool linkedin linkedin_client llm_task microsoft365
+  notion_tool opencode_cli project_intel pushover reaction screenshot swarm
+  text_browser weather_tool web_fetch web_search_provider_routing
+  web_search_tool cloud_ops cloud_patterns backup_tool
+)
+for t in "${DROPPED_TOOLS[@]}"; do
+  assert_file_absent "crates/zeroclaw-tools/src/$t.rs"        "STRIP-04 $t.rs source absent"
+  assert_no_grep    "^pub mod $t;" "crates/zeroclaw-tools/src/lib.rs" "STRIP-04 $t mod declaration absent"
+done
+
 echo "--- STRIP-07 (non-en locales) ---"
 # Fluent locales live under crates/zeroclaw-runtime/locales/<lang>/ in v0.7.5.
 LOCALES_DIR=crates/zeroclaw-runtime/locales

@@ -18,24 +18,16 @@
 
 pub mod anthropic;
 pub mod auth;
-pub mod azure_openai;
-pub mod bedrock;
-pub mod claude_code;
 pub mod compatible;
-pub mod copilot;
 pub mod gemini;
-pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
-pub mod kilocli;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
 pub mod openai;
-pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
-pub mod telnyx;
 pub mod traits;
 
 #[allow(unused_imports)]
