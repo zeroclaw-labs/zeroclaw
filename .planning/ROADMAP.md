@@ -35,7 +35,11 @@ osAgent is a tailored fork of zeroclaw v0.7.5 producing two compile-time-separat
   2. `sovereign-shield-backup/documentation/osAgent/UPSTREAM_SYNC.md` exists and documents: quarterly cadence (Q1/Q2/Q3/Q4 first-week), diff-stat budget per merge, conflict-resolution log format, out-of-cycle critical-security-fix criteria, append-only conflict log
   3. `cargo deny check` passes in CI on every PR with license allowlist (MIT/Apache-2.0/BSD-2/BSD-3/ISC/Unicode-DFS-2016) and explicit bans for AGPL-3.0 crates (presage, libsignal-service, libsignal, libsignal-protocol, libsignal-client, libsignal-bridge) and WTFPL (frankenstein)
   4. Advisory database currency check (`cargo deny check advisories`) runs in CI and blocks merge on RUSTSEC matches
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 01.1-00-PLAN.md — Wave 0 preflight (tooling install, namespace-type discovery, phone-home grep, validation harness skeletons)
+- [ ] 01.1-01-PLAN.md — GitHub fork + remotes + osagent-main + NOTICE + Cargo.toml metadata + branch protection [FORK-01]
+- [ ] 01.1-02-PLAN.md — deny.toml + .github/workflows/ci.yml (SHA-pinned cargo-deny-action) + required-status-checks update [FORK-03]
+- [ ] 01.1-03-PLAN.md — UPSTREAM_SYNC.md runbook on sovereign-shield-backup with Touch/Change/Impact/Rollback PR [FORK-02]
 
 Notes:
 - Slow-burn failure mode: without UPSTREAM_SYNC.md as binding ritual, the fork drifts within a quarter. Runbook discipline is what makes Q4 not catastrophic.
@@ -134,7 +138,7 @@ Phases execute in numeric order: 1.1 → 1.2 → 1.3 → 1.4 → 1.5 → 1.6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1.1 Fork & Attribution & Sync Runbook | 0/TBD | Not started | - |
+| 1.1 Fork & Attribution & Sync Runbook | 0/4 | Not started | - |
 | 1.2 Workspace Skeleton & Binary Split | 0/TBD | Not started | - |
 | 1.3 MCP Boundary & 4-Layer CI Gate | 0/TBD | Not started | - |
 | 1.4 Whole-Crate Drops & Telemetry Audit | 0/TBD | Not started | - |
@@ -146,3 +150,4 @@ Phases execute in numeric order: 1.1 → 1.2 → 1.3 → 1.4 → 1.5 → 1.6
 *Roadmap created: 2026-06-12*
 *Granularity: standard (6 phases for M1, within 5-8 band)*
 *M1 coverage: 20/20 v1 requirements mapped, 0 orphans*
+*Phase 1.1 planned: 2026-06-12 — 4 plans, 2 waves (wave 0 preflight + wave 1 fork + wave 2 deny.toml/CI || UPSTREAM_SYNC.md)*
